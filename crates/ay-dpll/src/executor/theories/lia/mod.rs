@@ -414,6 +414,44 @@ impl Executor {
         deadline.is_none_or(|dl| Instant::now() + r1_elapsed.saturating_mul(4) < dl)
     }
 
+    /// Decline when the only core this arm could publish is the FULL assumption
+    /// set (#uc-lia-100pct-core).
+    ///
+    /// Measured on the SMT-COMP 2025 UC QF_LinearIntArith dominant families
+    /// (2026-07-30, same-metal race vs Yices2 2.7.0): **23 of AY's 61 unsat
+    /// answers published a core whose size EQUALLED the assertion count** —
+    /// 70,303 of 70,303 on SharedMemory-PT-000100, and similarly on
+    /// RwMutex-PT-r0010w2000 / r0010w1000. Those 23 instances forfeit 1,243,577
+    /// of reduction; Yices2 earns 1,064,482 on exactly them; and the total
+    /// division deficit was 1,068,711. **They account for the entire loss.**
+    ///
+    /// Why the existing `uc_probe_should_decline` does not catch them: it
+    /// requires `now + 4 * r1 < deadline`, but r1 is already allowed ~40% of the
+    /// remaining budget, so on any instance where r1 is slow — exactly the large
+    /// ones that exceed `MAX_MINIMIZE_ASSUMPTIONS` — the test fails and this arm
+    /// publishes the padded core, pre-empting the lazy assume-split arm that
+    /// harvests a genuine failed-assumption core from the SAT solver for free.
+    ///
+    /// The decisive asymmetry: **a 100%-assumption core scores exactly ZERO** on
+    /// the UnsatCore metric (`asserts - core_size` = 0), and declining also
+    /// scores zero if nothing better follows. So declining is never WORSE on
+    /// score and is frequently much better. It costs only the `unsat` ANSWER
+    /// itself — which earns no points here, and un-answering is not an error.
+    ///
+    /// Gated on `produce_unsat_cores_enabled()` so non-UC solving is untouched,
+    /// and on the same `AY_NO_UC_LIA_PROBE_FALLTHROUGH` escape hatch.
+    fn uc_probe_should_decline_padded_core(&self, core_len: usize, n_assumptions: usize) -> bool {
+        if !self.produce_unsat_cores_enabled() {
+            return false;
+        }
+        if std::env::var_os("AY_NO_UC_LIA_PROBE_FALLTHROUGH").is_some() {
+            return false;
+        }
+        // Only when NO minimization happened at all: the core is every
+        // assumption, so its reduction is zero by construction.
+        core_len >= n_assumptions && n_assumptions > 0
+    }
+
     fn try_lia_eager_assume_unsat_probe(
         &mut self,
         assumptions: &[TermId],
@@ -524,7 +562,9 @@ impl Executor {
                     }
                 }
             }
-        } else if self.uc_probe_should_decline(r1_elapsed, saved_deadline) {
+        } else if self.uc_probe_should_decline(r1_elapsed, saved_deadline)
+            || self.uc_probe_should_decline_padded_core(core.len(), assumptions.len())
+        {
             // We cannot afford to minimize, so the only core this arm can
             // publish is `assumptions.to_vec()` — every assumption, 100% of
             // them. That is CORRECT but worth exactly ZERO on the UnsatCore
@@ -602,7 +642,7 @@ impl Executor {
         // proof artifacts are not yet validated (plan §3.6); CHC BMC/PDR/
         // Houdini traffic does not consume proofs.
         let eager_routing =
-            self.lia_incremental_eager_override.unwrap_or(true) && !self.produce_proofs_enabled();
+            self.lia_incremental_eager_override.unwrap_or(true) && !self.is_producing_proofs();
         if eager_routing {
             let saved_state = self.incr_theory_state.take();
             self.incr_theory_state = Some(crate::incremental_state::IncrementalTheoryState::new());
@@ -895,6 +935,23 @@ impl Executor {
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
 
+        // #nia-clausal-sls: ONE shared wall cutoff for the clausal
+        // local-search lane, computed here — before the split loop — because
+        // the loop rebuilds `NiaSolver` on every iteration. A per-instance
+        // budget compounds across those rebuilds until the lane owns the whole
+        // deadline; that cost a QF_NIA `unsat` needing 12.3s of a 15s budget.
+        // Capping the lane's TOTAL share leaves the remainder to the rest of
+        // the pipeline. Completeness-only: the lane never emits `unsat`.
+        const LOCAL_SEARCH_WALL_SHARE_PCT: u32 = 60;
+        let local_search_cutoff = solve_deadline.get().map(|dl| {
+            let now = Instant::now();
+            if dl <= now {
+                now
+            } else {
+                now + (dl - now) * LOCAL_SEARCH_WALL_SHARE_PCT / 100
+            }
+        });
+
         solve_incremental_split_loop_pipeline!(self,
             tag: "NIA",
             persistent_sat_field: persistent_sat,
@@ -907,6 +964,17 @@ impl Executor {
                 let mut theory = NiaSolver::new(&self.ctx.terms);
                 if let Some(dl) = solve_deadline.get() {
                     theory.set_deadline(dl);
+                }
+                // #nia-clausal-sls: hand the theory the solve's assertion
+                // FORMULAS (Boolean structure intact). `assert_lit` only ever
+                // delivers ATOMS under the SAT trail, which is enough for the
+                // box-shaped fallbacks but destroys the clause structure the
+                // clausal local-search lane searches over. Read-only there, and
+                // used exclusively on the SAT side (witness construction and
+                // exact re-verification), so it cannot affect any UNSAT.
+                theory.set_root_assertions(self.ctx.assertions.clone());
+                if let Some(cutoff) = local_search_cutoff {
+                    theory.set_local_search_deadline(cutoff);
                 }
                 theory
             },

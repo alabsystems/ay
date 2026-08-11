@@ -58,7 +58,7 @@
 //! an error (and `Z3_fixedpoint_query` returns `Z3_L_UNDEF`); it never silently
 //! produces a wrong verdict.
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_uint};
 use std::ptr;
 
 use ay_chc::{
@@ -66,13 +66,14 @@ use ay_chc::{
     ClauseBody, ClauseHead, Counterexample, HornClause, InvariantModel, PdrConfig, PredicateId,
     VerifiedChcResult,
 };
-use ay_dpll::api::{Solver, Term, TermKind};
+use ay_dpll::api::{Solver, Sort, Term, TermKind};
 
 use super::{
-    cache_string, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
-    require_term_ast_or_return, FixedpointHandle, FixedpointLemmaHint, RegisteredRelation, Z3_ast,
-    Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol, Z3_L_FALSE, Z3_L_TRUE,
-    Z3_L_UNDEF, Z3_OK,
+    cache_string, ffi_count_within_limit, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
+    ffi_guard_ptr, ffi_guard_void, finite_set_decision_gate, record_ast_sort,
+    require_term_ast_or_return, term_to_ast, FixedpointHandle, FixedpointLemmaHint,
+    RegisteredRelation, Z3_ast, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol,
+    Z3_INVALID_ARG, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 // ---- Fixedpoint lifecycle ----
@@ -236,6 +237,19 @@ pub unsafe extern "C" fn Z3_fixedpoint_query(
             let query_term =
                 require_term_ast_or_return!(ctx, query, "Z3_fixedpoint_query", "query", Z3_L_UNDEF);
             let handle = &mut *d;
+            let mut finite_set_roots = handle.rules.clone();
+            finite_set_roots.extend(handle.assertions.iter().copied());
+            finite_set_roots.push(query_term);
+            if finite_set_decision_gate(ctx, &finite_set_roots).uses_finite_set {
+                let outcome = QueryOutcome::undef(
+                    "FiniteSet public carrier/application semantics are not transferable \
+                     to AY's independent fixedpoint engine; returning unknown fail-closed"
+                        .to_string(),
+                );
+                let status = record_outcome(handle, outcome);
+                ctx.last_error = Z3_OK;
+                return status;
+            }
             // Recursive-definition gate (P1.1): the fixedpoint path neither
             // injects the defining axioms nor expands rec-f applications, so
             // a rule/assertion/query mentioning a `Z3_add_rec_def` name would
@@ -307,18 +321,44 @@ pub(super) fn record_outcome(handle: &mut FixedpointHandle, outcome: QueryOutcom
     outcome.status
 }
 
-/// Render the fixedpoint rule set as a string (best-effort, context-owned).
+/// Render the fixedpoint rule set and optional additional queries as a string.
 ///
 /// # Safety
-/// All pointers must be valid.
+/// All pointers must be valid. When `num_queries > 0`, `queries` must point to
+/// at least `num_queries` live AST handles from `c`.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_fixedpoint_to_string(c: Z3_context, d: Z3_fixedpoint) -> Z3_string {
+pub unsafe extern "C" fn Z3_fixedpoint_to_string(
+    c: Z3_context,
+    d: Z3_fixedpoint,
+    num_queries: c_uint,
+    queries: *mut Z3_ast,
+) -> Z3_string {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_fixedpoint_to_string queries", num_queries) } {
+        return ptr::null();
+    }
     if d.is_null() {
         return ptr::null();
     }
+    let query_asts = if num_queries == 0 {
+        Some(Vec::new())
+    } else if queries.is_null() {
+        None
+    } else {
+        // SAFETY: the caller guarantees an array of `num_queries` handles; the
+        // count was bounded and the pointer was null-checked above.
+        Some(unsafe { std::slice::from_raw_parts(queries, num_queries as usize) }.to_vec())
+    };
     // SAFETY: see ffi_guard_const_ptr; `d` is kept alive by the context arena.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            let Some(query_asts) = query_asts else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_fixedpoint_to_string: null queries with num_queries > 0".to_string());
+                return ptr::null();
+            };
             let handle = &*d;
             let mut out = String::new();
             for rel in &handle.relations {
@@ -344,35 +384,51 @@ pub unsafe extern "C" fn Z3_fixedpoint_to_string(c: Z3_context, d: Z3_fixedpoint
                 out.push_str(&super::ffi_surface_text(ctx, &rendered));
                 out.push_str(")\n");
             }
+            for query in query_asts {
+                let query = require_term_ast_or_return!(
+                    ctx,
+                    query,
+                    "Z3_fixedpoint_to_string",
+                    "query",
+                    ptr::null()
+                );
+                out.push_str("(query ");
+                let rendered = ctx.solver.format_term(query);
+                out.push_str(&super::ffi_surface_text(ctx, &rendered));
+                out.push_str(")\n");
+            }
             let out = super::ffi_surface_text(ctx, &out);
             cache_string(ctx, out)
         })
     }
 }
 
-/// Return the last query answer as a string (`"sat"` / `"unsat"` / `"unknown"`).
+/// Return an AST encoding the last fixedpoint query answer.
 ///
-/// Z3 returns a derivation/ground answer AST here; AY exposes the verdict text
-/// since it does not synthesize a Datalog answer relation. The returned pointer
-/// is context-owned.
+/// AY currently returns the Boolean reachability value: `true` for a reachable
+/// query and `false` for an unreachable query. An inconclusive query has no
+/// authoritative answer AST and therefore returns the null AST.
 ///
 /// # Safety
 /// All pointers must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_fixedpoint_get_answer(c: Z3_context, d: Z3_fixedpoint) -> Z3_string {
+pub unsafe extern "C" fn Z3_fixedpoint_get_answer(c: Z3_context, d: Z3_fixedpoint) -> Z3_ast {
     if d.is_null() {
-        return ptr::null();
+        return 0;
     }
-    // SAFETY: see ffi_guard_const_ptr; `d` is kept alive by the context arena.
+    // SAFETY: see ffi_guard_ast; `d` is kept alive by the context arena.
     unsafe {
-        ffi_guard_const_ptr(c, |ctx| {
+        ffi_guard_ast(c, |ctx| {
             let handle = &*d;
-            let verdict = match handle.last_status {
-                Z3_L_TRUE => "sat",
-                Z3_L_FALSE => "unsat",
-                _ => "unknown",
+            let value = match handle.last_status {
+                Z3_L_TRUE => true,
+                Z3_L_FALSE => false,
+                _ => return 0,
             };
-            cache_string(ctx, verdict.to_string())
+            let term = ctx.solver.bool_const(value);
+            let ast = term_to_ast(ctx, term);
+            record_ast_sort(ctx, ast, Sort::Bool);
+            ast
         })
     }
 }

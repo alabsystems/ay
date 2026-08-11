@@ -357,13 +357,30 @@ pub(crate) fn validate_euf_congruent_pred(
         });
     }
 
-    // Premise equalities (all literals except the last two)
+    // Premise equalities (all literals except the last two).
+    //
+    // An argument position whose two terms are the SAME term id needs no
+    // premise: `t = t` holds by reflexivity, and the corresponding disjunct
+    // `¬(t = t)` is false, so dropping it from the clause preserves validity.
+    // Requiring one anyway rejected valid congruence lemmas over predicates
+    // that share a literal argument — e.g. `(<= 0 A)` against `(<= 0 B)`, where
+    // only the second position differs. That is a COMPLETENESS gap: accepting a
+    // clause with fewer premises, exactly at positions where the arguments are
+    // syntactically identical, cannot admit an invalid lemma, because the
+    // omitted premise was entailed unconditionally.
+    //
+    // Both spellings are accepted, so proof producers that do emit the
+    // reflexive premise keep validating unchanged: walk the argument positions
+    // in order and consume a premise for a position only when the next unused
+    // premise actually matches it; a position with no premise must have
+    // identical arguments. Every premise must be consumed, so a spurious or
+    // out-of-order premise is still rejected.
     let premises = &clause[..clause.len() - 2];
-    if premises.len() != p_args.len() {
+    if premises.len() > p_args.len() {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
             reason: format!(
-                "EufCongruentPred: expected {} premise equalities for {}-ary predicate, got {}",
+                "EufCongruentPred: {}-ary predicate admits at most {} premise equalities, got {}",
                 p_args.len(),
                 p_args.len(),
                 premises.len()
@@ -371,29 +388,50 @@ pub(crate) fn validate_euf_congruent_pred(
         });
     }
 
-    for (i, &lit) in premises.iter().enumerate() {
-        let (inner, negated) = strip_not(terms, lit);
-        if !negated {
-            return Err(ProofCheckError::InvalidTheoryLemma {
-                step: step_id,
-                reason: format!("EufCongruentPred: premise {i} must be a negated equality"),
-            });
-        }
-        let (a, b) =
-            decode_eq(terms, inner).ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
-                step: step_id,
-                reason: format!("EufCongruentPred: premise {i} is not an equality"),
-            })?;
+    let mut next_premise = 0usize;
+    for i in 0..p_args.len() {
+        let consumed = if next_premise < premises.len() {
+            let lit = premises[next_premise];
+            let (inner, negated) = strip_not(terms, lit);
+            if !negated {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!(
+                        "EufCongruentPred: premise {next_premise} must be a negated equality"
+                    ),
+                });
+            }
+            let (a, b) =
+                decode_eq(terms, inner).ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!("EufCongruentPred: premise {next_premise} is not an equality"),
+                })?;
+            let matches = (a == p_args[i] && b == q_args[i]) || (a == q_args[i] && b == p_args[i]);
+            if matches {
+                next_premise += 1;
+            }
+            matches
+        } else {
+            false
+        };
 
-        let matches = (a == p_args[i] && b == q_args[i]) || (a == q_args[i] && b == p_args[i]);
-        if !matches {
+        if !consumed && p_args[i] != q_args[i] {
             return Err(ProofCheckError::InvalidTheoryLemma {
                 step: step_id,
                 reason: format!(
-                    "EufCongruentPred: premise {i} does not match argument position {i}"
+                    "EufCongruentPred: argument position {i} differs but has no premise equality"
                 ),
             });
         }
+    }
+
+    if next_premise != premises.len() {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!(
+                "EufCongruentPred: premise {next_premise} does not match any argument position"
+            ),
+        });
     }
 
     Ok(())

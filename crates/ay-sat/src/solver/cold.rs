@@ -565,6 +565,22 @@ pub(crate) struct ColdState {
     /// Number of arena locality compactions performed (CaDiCaL arenatype=3, #8030).
     /// Incremented by `compact_arena_locality()` in `arena_gc.rs`.
     pub(super) num_arena_compactions: u64,
+    /// Arena compactions the trigger asked for but that bailed out before
+    /// doing anything. `should_compact_arena` firing while this counter
+    /// climbs and `num_arena_compactions` stays at 0 is the signature of the
+    /// quiescence guard swallowing every attempt.
+    pub(super) num_arena_compaction_skips: u64,
+    /// Times each `FactorSkipReason` stopped a scheduled factorization pass.
+    /// Kissat 4.x factors aggressively (545 variables on a 510-variable
+    /// SAT-COMP 2026 instance); without this there is no way to see from a run
+    /// whether AY's factor pass is losing to a schedule gate or genuinely
+    /// finding nothing.
+    pub(super) factor_skip_counts: [u64; crate::solver::inprocessing::FactorSkipReason::COUNT],
+    /// Set when `should_compact_arena` fires at a moment the solver is not
+    /// quiescent (inside `reduce_db`, where conflict analysis has just
+    /// enqueued the asserting literal). The search loop performs the
+    /// compaction at its next post-BCP scheduling point instead.
+    pub(super) arena_compaction_pending: bool,
     /// Number of scoped clauses reclaimed by gc_scoped_clauses() during pop (#1444).
     /// Equivalent to Z3's gc_vars clause removal count.
     pub(super) scoped_clauses_reclaimed: u64,
@@ -839,6 +855,21 @@ pub(crate) struct ColdState {
     /// Clause IDs for LRAT proofs (maps clause index to clause ID)
     /// Original clauses get IDs 1..n, learned clauses get n+1, n+2, etc.
     pub(super) clause_ids: Vec<u64>,
+    /// Opt-OUT of maintaining [`Self::clause_ids`].
+    ///
+    /// `clause_ids` is indexed by ARENA WORD OFFSET rather than by clause, so it
+    /// costs 8 bytes per arena word — twice the clause arena itself — and it is
+    /// `resize`-written, so every slot is resident. On the 18 M-clause SAT-COMP
+    /// 2026 reference instance that is 760 MB of a 4.75 GB peak.
+    ///
+    /// Default `false`, i.e. every existing path is untouched. Only a caller
+    /// that knows no consumer exists sets it — today just the DIMACS
+    /// no-proof CLI route. The consumers that DO read it, found by gating the
+    /// writes and watching the suite fail, are: the backward-proof streaming
+    /// core, the `bcp_learned_1963` identity profile, the decision trace, ER
+    /// extension-definition logs in factorize/sbva, theory unit promotion, BVE
+    /// LRAT candidate preflight, and vivify LRAT standalone validation.
+    pub(super) clause_ids_disabled: bool,
     /// Learned-clause birth conflict count for default-off 19-63 identity profiling.
     pub(super) bcp_learned_clause_birth_conflicts: Vec<u64>,
     /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): per-clause
@@ -889,6 +920,19 @@ pub(crate) struct ColdState {
     /// pass on every UNSAT (`SatResult::Unsat` then carries
     /// `ProofCertificate::empty()`).
     pub(super) unsat_certificate_enabled: bool,
+    /// Whether process-global environment hooks may read or write artifacts.
+    /// Bounded in-memory APIs disable this before clause ingestion so their
+    /// solve is free of ambient filesystem I/O. Authority-gated proof paths
+    /// remain fail-closed when this is disabled.
+    pub(super) ambient_artifacts_enabled: bool,
+    /// Whether backward LRAT steps are retained in the returned
+    /// `ProofCertificate` after they have been emitted to the proof writer.
+    pub(super) retain_unsat_certificate: bool,
+    /// Optional retained-memory/count envelope for deferred backward LRAT
+    /// reconstruction.
+    pub(super) backward_proof_limits: Option<backward_proof::BackwardProofLimits>,
+    /// First bounded backward-reconstruction exhaustion from the last solve.
+    pub(super) backward_proof_failure: Option<backward_proof::BackwardProofFailure>,
     /// Default-off internal route for the checker-covered dense
     /// factor->BVE LRAT composition. This only relaxes central LRAT clamps
     /// for factor and BVE when a solver-internal driver explicitly opts in.
@@ -956,6 +1000,20 @@ pub(crate) struct ColdState {
     /// reconstruction-based model recovery interacts unsoundly with learned
     /// clauses from scoped solving (#3662).
     pub(super) has_been_incremental: bool,
+    /// Whether this solver is a ONE-SHOT SAT solve, so structural symmetry
+    /// breaking may run.
+    ///
+    /// Orbitopal fixing and the aux-free PHP refutation are
+    /// satisfiability-preserving for the FORMULA, but they remove models. Under
+    /// assumptions that is unsound: an assumption satisfiable only in a removed
+    /// model flips to UNSAT, and an unsat core can name assumptions that are not
+    /// really responsible. `has_been_incremental` cannot protect against this
+    /// because it is false during the FIRST solve, which is where the units get
+    /// added.
+    ///
+    /// Defaults false so every embedder (SMT, CHC, IC3, MaxSAT) is safe by
+    /// construction; the DIMACS one-shot runner opts in.
+    pub(super) symmetry_oneshot: bool,
     /// External variable indices from newly added clauses since last solve (#8369).
     pub(super) tainted_vars: Vec<usize>,
     /// Whether push() has ever been called. Once set, the `original_ledger`
@@ -1836,6 +1894,9 @@ impl ColdState {
             flush_inc: FLUSH_INIT,
             num_flushes: 0,
             num_arena_compactions: 0,
+            num_arena_compaction_skips: 0,
+            factor_skip_counts: [0; crate::solver::inprocessing::FactorSkipReason::COUNT],
+            arena_compaction_pending: false,
             scoped_clauses_reclaimed: 0,
             eager_subsumed: 0,
             max_learned_clauses: None,
@@ -1915,6 +1976,7 @@ impl ColdState {
             // reconstruction and must be tracked even when LRAT mode is not
             // explicitly enabled.
             clause_ids: Vec::with_capacity(clauses_capacity),
+            clause_ids_disabled: false,
             bcp_learned_clause_birth_conflicts: Vec::new(),
             clause_birth_solve: Vec::new(),
             level0_proof_id: vec![0; num_vars],
@@ -1925,6 +1987,10 @@ impl ColdState {
             next_original_clause_id: 1,
             lrat_enabled,
             unsat_certificate_enabled: true,
+            ambient_artifacts_enabled: true,
+            retain_unsat_certificate: true,
+            backward_proof_limits: None,
+            backward_proof_failure: None,
             dense_factor_bve_lrat_route_enabled: false,
             circuit_bve_lrat_route_enabled: false,
             bve_lrat_scout_route_enabled: false,
@@ -1941,6 +2007,7 @@ impl ColdState {
             #[cfg(debug_assertions)]
             scope_selector_axiom_ids: Vec::new(),
             has_been_incremental: false,
+            symmetry_oneshot: false,
             tainted_vars: Vec::new(),
             has_ever_scoped: false,
             has_solved_once: false,

@@ -411,7 +411,7 @@ pub unsafe extern "C" fn Z3_mk_solver_from_tactic(c: Z3_context, t: Z3_tactic) -
     }
 }
 
-/// Get a textual help/description for `Z3_mk_tactic`'s recognized names.
+/// Get a textual help/description for a tactic.
 ///
 /// Returns a context-owned string listing the supported, verdict-preserving
 /// tactic names — derived from the shared registry
@@ -419,14 +419,19 @@ pub unsafe extern "C" fn Z3_mk_solver_from_tactic(c: Z3_context, t: Z3_tactic) -
 /// `Z3_mk_tactic` actually accepts. (Introspection convenience.)
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must be a valid context pointer and `t` a live tactic handle from `c`.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_tactic_get_help(c: Z3_context) -> Z3_string {
+pub unsafe extern "C" fn Z3_tactic_get_help(c: Z3_context, t: Z3_tactic) -> Z3_string {
     use super::{cache_string, ffi_guard_const_ptr};
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; `ffi_guard_const_ptr`
     // handles the null case internally and catches any unwinding panic.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            if t.is_null() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some("Z3_tactic_get_help: null tactic handle".to_string());
+                return ptr::null();
+            }
             let mut help = String::from("Supported (verdict-preserving) tactics:\n");
             for name in ay_frontend::SUPPORTED_TACTIC_NAMES {
                 help.push_str("  ");

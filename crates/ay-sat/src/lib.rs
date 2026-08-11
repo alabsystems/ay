@@ -213,6 +213,7 @@ pub(crate) mod proof_manager;
 pub(crate) mod reconstruct;
 pub(crate) mod replay_trace;
 pub mod resolution_dag;
+mod resolution_validate;
 pub mod sat_proof_manager;
 pub(crate) mod sbva;
 pub(crate) mod solver;
@@ -326,7 +327,7 @@ impl Default for InprocessingFeatureProfile {
 // -- Public API: types used by downstream crates and integration tests --
 pub use adaptive::adjust_features_for_instance;
 pub use clause_provenance::{ClauseProvenance, CoreProvenanceSummary};
-pub use clause_trace::{ClauseTrace, ClauseTraceEntry};
+pub use clause_trace::{ClauseTrace, ClauseTraceEntry, HintOmission, HintOmissionStats};
 pub use cube_and_conquer::CubeAndConquerSolver;
 pub use decision_trace::{
     decision_trace_suppressed_after_public_mismatch, finish_reserved_decision_trace,
@@ -350,18 +351,28 @@ pub use portfolio::PortfolioSolver;
 pub use preprocess_transaction::PreprocessTransactionStats;
 pub use proof::{DratWriter, LratWriter, ProofOutput, MAX_LRAT_ORIGINAL_CLAUSES};
 pub use proof_certificate::{ProofCertificate, ProofStep};
-pub use resolution_dag::{prove_unsat_resolution_dag, ResolutionDag, ResolutionDagError, RupStep};
+pub use resolution_dag::{
+    prove_unsat_resolution_dag, prove_unsat_resolution_dag_with_limits,
+    solve_resolution_dag_with_limits, ResolutionDag, ResolutionDagError, ResolutionProofError,
+    ResolutionProofLimits, ResolutionProofPhase, ResolutionProofResource, ResolutionSolveOutcome,
+    RupStep,
+};
+pub use resolution_validate::{
+    ResolutionDagValidateError, ResolutionValidationError, ResolutionValidationLimits,
+    ResolutionValidationResource,
+};
 pub use solver::{
     AssumeResult, BcpLongScanStats, BcpSavedPosStats, DecomposeLratPreflightStats, FactorStats,
     LookaheadStats, LratMaterializationStats, RephaseAttributionStats, RestartAttributionStats,
     SatResult, SatUnknownReason, SetSolutionError, Solver, TheoryPropResult, VarAssignmentKind,
     VerifiedAssumeResult, VerifiedSatResult,
 };
+pub use symmetry::SymmetryReport;
 pub use technique::SatTechnique;
 pub use tla_trace::TlaTraceWriter;
 pub use tla_traceable::TlaTraceable;
 #[cfg(feature = "unsat-cert")]
-pub use unsat_cert::{prove_cnf_unsat_dimacs, CnfCertError, ResolutionDagValidateError};
+pub use unsat_cert::{prove_cnf_unsat_dimacs, CnfCertError};
 pub use variant::{
     SolverVariant, VariantBranchPolicy, VariantConfig, VariantHotPathConfig, VariantInput,
     VariantProfilePlan, VariantRestartPolicy, VariantRouteProfile, VariantStartupPolicy,

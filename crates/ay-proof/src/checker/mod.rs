@@ -17,25 +17,42 @@ mod boolean;
 mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
+pub(crate) use bv_bitblast::validate_proof_producing_bv_budget;
 pub use bv_bitblast::{
-    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
+    recognize_bv_ground_evaluate, MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
 };
 mod clausification;
 mod datatype_axiom;
-pub use datatype_axiom::{recognize_datatype_distinct, recognize_datatype_selector_project};
+pub use datatype_axiom::{
+    recognize_datatype_distinct, recognize_datatype_selector_project,
+    recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
+};
 mod euf;
 mod euf_step_rules;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
+mod nra_interval;
+mod nra_poly;
+mod nra_univariate;
+pub use nra_interval::recognize_nra_interval_unsat;
+pub use nra_univariate::recognize_nra_univariate_unsat;
+mod order_ite;
+pub use order_ite::recognize_order_ite_tautology;
 mod regex_empty;
 pub use regex_empty::recognize_regex_intersect_empty;
 mod rounding_mode;
+#[path = "set_axiom.rs"]
+mod set_axiom;
 pub use rounding_mode::recognize_rounding_mode_domain;
+pub use set_axiom::EmptySetRegistry;
 pub use string_ground::recognize_string_ground_eval;
 mod fp_bounded;
 pub use fp_bounded::{
     recognize_fp_classification, recognize_fp_classification_op, recognize_fp_rounding_mode_domain,
 };
+mod fp_forward_error;
+pub use fp_forward_error::recognize_fp_forward_error;
 mod fp_to_bv;
 mod lia;
 mod lra_farkas;
@@ -54,7 +71,7 @@ use thiserror::Error;
 
 use euf::{validate_euf_congruent, validate_euf_congruent_pred, validate_euf_transitive};
 use euf_step_rules::{validate_cong, validate_refl, validate_symm, validate_trans};
-use resolution::{is_valid_binary_resolution, is_valid_rup_step, validate_binary_resolution_rule};
+use resolution::{is_valid_binary_resolution, is_valid_rup_step, validate_resolution_rule};
 
 /// Validation failure returned by [`check_proof`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -135,7 +152,9 @@ pub enum ProofCheckError {
         /// Invalid step ID.
         step: ProofId,
     },
-    /// The checker only supports binary resolution for this rule.
+    /// The step's premise count cannot denote a resolution at all. Arity 2 is
+    /// checked binarily and arity > 2 as a left-to-right chain
+    /// (#dt-premise-binding), so this now fires only for 0 or 1 premises.
     #[error("step {step} uses {rule} with unsupported premise count {premise_count}")]
     UnsupportedResolutionArity {
         /// Invalid step ID.
@@ -285,6 +304,8 @@ pub fn check_proof_collecting_trust_with_context(
         return Err(ProofCheckError::EmptyProof);
     }
 
+    validate_proof_producing_bv_budget(proof, terms)?;
+
     if let Some(assertions) = problem_assertions {
         validate_problem_assumptions(proof, terms, assertions)?;
     }
@@ -296,6 +317,10 @@ pub fn check_proof_collecting_trust_with_context(
         Some(assertions) => Some(ExtDiffRegistry::collect(proof, terms, assertions)?),
         None => None,
     };
+    // Same provenance discipline: built once from the PROBLEM, `None` without
+    // it so `SetCardEmptyByAssertion` fails closed.
+    let empty_sets = problem_assertions
+        .map(|assertions| set_axiom::EmptySetRegistry::collect(terms, assertions));
 
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
     let mut collected: Vec<(ProofId, Vec<TermId>)> = Vec::new();
@@ -310,6 +335,7 @@ pub fn check_proof_collecting_trust_with_context(
             dt_decls,
             ctor_selectors,
             ext_diff.as_ref(),
+            empty_sets.as_ref(),
             Some(&mut collected),
         )?;
     }
@@ -403,6 +429,7 @@ pub(crate) fn validate_step(
         None,
         None,
         None,
+        None,
         trust_collector,
     )
 }
@@ -428,6 +455,9 @@ pub(crate) fn validate_step_with_datatypes(
     // assertions. `None` (no problem assertion set available) keeps
     // `TheoryLemmaKind::ArrayExtensionality` fail-closed.
     ext_diff: Option<&ExtDiffRegistry>,
+    // Problem-derived registry of sets asserted empty; `None` keeps
+    // `SetCardEmptyByAssertion` fail-closed.
+    empty_sets: Option<&set_axiom::EmptySetRegistry>,
     // Deferred-trust recovery (see [`validate_step`]): when `Some`, a strict
     // `Trust` step is collected for independent discharge instead of rejected.
     mut trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
@@ -447,20 +477,23 @@ pub(crate) fn validate_step_with_datatypes(
             farkas,
             lia,
             ..
-        } => validate_theory_lemma(
-            terms,
-            derived_clauses,
-            step_id,
-            clause,
-            farkas.as_ref(),
-            *kind,
-            lia.as_ref(),
-            strict,
-            dt_decls,
-            ctor_selectors,
-            ext_diff,
-            trust_collector.as_deref_mut(),
-        )?,
+        } => {
+            validate_theory_lemma(
+                terms,
+                derived_clauses,
+                step_id,
+                clause,
+                farkas.as_ref(),
+                *kind,
+                lia.as_ref(),
+                strict,
+                dt_decls,
+                ctor_selectors,
+                ext_diff,
+                empty_sets,
+                trust_collector.as_deref_mut(),
+            )?;
+        }
         // An `array_ext_diff_intro` is a DEFINITION, not an inference: it
         // records that a fresh symbol is the extensionality difference witness
         // for one array pair. It is validated for shape here and recorded as
@@ -499,17 +532,36 @@ pub(crate) fn validate_step_with_datatypes(
             premises,
             args,
         } => {
-            if strict && matches!(rule, AletheRule::Trust) {
-                match trust_collector {
-                    // DEFERRED-TRUST mode: record the trust clause for an
-                    // independent semantic discharge and fall through so the
-                    // clause is admitted into the derived-clause table (as the
-                    // non-strict checker does), keeping resolution/DRUP linkage
-                    // intact. This is NOT an accept: the caller MUST re-discharge
-                    // every collected clause as a genuine theory tautology.
+            // `Hole` belongs here alongside `Trust`. AY treats the two as one
+            // family everywhere else: `executor/proof_euf_lemma.rs` and
+            // `executor/proof.rs` match `Trust | Hole` in a single pattern,
+            // `terminal_trust.rs` counts holes as reachable trust, and
+            // `arrays_to_lia.rs` DOWNGRADES a real step to `Hole` while keeping
+            // its clause — so a hole carries an obligation, not a placeholder.
+            // Only this collector disagreed, which made the rescue path dead for
+            // every hole-bearing refutation; a census of nine `ay-dpll` buckets
+            // put "uses unsupported hole rule" at the top of what remained after
+            // the shape-rule fixes. Same correction as the one already recorded
+            // for `TheoryLemmaKind::Generic` in `unsat_cert.rs`: a different
+            // error VARIANT for semantically the same situation.
+            let deferrable = strict && matches!(rule, AletheRule::Trust | AletheRule::Hole);
+            if deferrable {
+                match &mut trust_collector {
+                    // DEFERRED-TRUST mode: record the clause for an independent
+                    // semantic discharge and fall through so it is admitted into
+                    // the derived-clause table (as the non-strict checker does),
+                    // keeping resolution/DRUP linkage intact. This is NOT an
+                    // accept: the caller MUST re-discharge every collected clause
+                    // as a genuine theory tautology.
                     Some(collector) => collector.push((step_id, clause.to_vec())),
-                    // Plain strict mode: trust steps are unverified → reject.
-                    None => return Err(ProofCheckError::TrustStep { step: step_id }),
+                    // Plain strict mode: nobody will discharge the obligation, so
+                    // it stays a hard rejection.
+                    None => {
+                        return Err(match rule {
+                            AletheRule::Hole => ProofCheckError::HoleStep { step: step_id },
+                            _ => ProofCheckError::TrustStep { step: step_id },
+                        })
+                    }
                 }
             }
             validate_generic_step(
@@ -521,6 +573,8 @@ pub(crate) fn validate_step_with_datatypes(
                 premises,
                 args,
                 strict,
+                // Only a hole that WAS collected may skip its own rejection.
+                deferrable && trust_collector.is_some(),
             )?;
         }
         ProofStep::Anchor { .. } => derived_clauses.push(None),
@@ -543,6 +597,10 @@ fn validate_theory_lemma(
     dt_decls: Option<datatype_axiom::DatatypeDecls<'_>>,
     ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
     ext_diff: Option<&ExtDiffRegistry>,
+    // Problem-derived registry of sets asserted empty. `None` keeps
+    // `TheoryLemmaKind::SetCardEmptyByAssertion` fail-closed, exactly as a
+    // `None` `ext_diff` does for array extensionality.
+    empty_sets: Option<&set_axiom::EmptySetRegistry>,
     // When `Some` AND a strict trust-kind (`Generic`) theory lemma is encountered,
     // the lemma is DEFERRED (its clause collected for independent re-discharge)
     // instead of rejected — the theory-lemma analogue of the `Step{rule:Trust}`
@@ -553,6 +611,13 @@ fn validate_theory_lemma(
         match kind {
             TheoryLemmaKind::EufTransitive => {
                 validate_euf_transitive(terms, step_id, clause)?;
+            }
+            // Reflexivity is checked by the same routine that backs the
+            // `eq_reflexive` Alethe rule: exactly one literal, a binary
+            // equality, and both sides the SAME term. Nothing about the
+            // conflict that produced it is taken on trust.
+            TheoryLemmaKind::EufReflexive => {
+                boolean_derived::validate_eq_reflexive(terms, step_id, clause)?;
             }
             TheoryLemmaKind::EufCongruent => {
                 validate_euf_congruent(terms, step_id, clause)?;
@@ -565,6 +630,14 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::LiaGeneric => {
                 lia::validate_lia_generic(terms, step_id, clause, farkas, lia_ann)?;
+            }
+            TheoryLemmaKind::LiaModRange => {
+                ay_core::proof_validation::validate_lia_mod_range(terms, clause).map_err(|e| {
+                    ProofCheckError::InvalidTheoryLemma {
+                        step: step_id,
+                        reason: e.to_string(),
+                    }
+                })?;
             }
             // BV bit-blast lemmas: bounded semantic validation (#8820).
             //
@@ -592,6 +665,13 @@ fn validate_theory_lemma(
             TheoryLemmaKind::IteSame => {
                 ite_axiom::validate_ite_same(terms, step_id, clause)?;
             }
+            // Exact bounded decision procedure for formulas whose numeric
+            // terms are pure `ite` trees selecting Int/Real variables.  The
+            // checker enumerates one representative of every total preorder;
+            // anything outside that fragment fails closed.
+            TheoryLemmaKind::OrderIteTautology => {
+                order_ite::validate_order_ite_tautology(terms, step_id, clause)?;
+            }
             TheoryLemmaKind::FpClassification { .. } => {
                 fp_bounded::validate_fp_classification(terms, step_id, clause)?;
             }
@@ -600,6 +680,16 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::RoundingModeDomain => {
                 rounding_mode::validate_rounding_mode_domain(terms, step_id, clause)?;
+            }
+            // FP forward-error lemma: the clause is the disjunction of the
+            // NEGATED premises of a rounding-error refutation. The validator
+            // independently re-derives the whole analysis from the clause —
+            // fact mining, RNE/no-overflow side conditions, exact-rational
+            // half-ulp enclosure propagation, mirror-polynomial identity, and
+            // the strict claim contradiction — failing closed on anything
+            // unrecognized.
+            TheoryLemmaKind::FpForwardError => {
+                fp_forward_error::validate_fp_forward_error(terms, step_id, clause)?;
             }
             TheoryLemmaKind::BvBitBlastGate { gate_type, width } => {
                 bv_bitblast::validate_bv_bitblast(
@@ -626,6 +716,26 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::ArrayRowChain => {
                 array_axiom::validate_array_row_chain(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::ArrayDefaultConst => {
+                array_axiom::validate_array_default_const(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SetCardNonNegative => {
+                set_axiom::validate_set_card_non_negative(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SetCardMemberLowerBound => {
+                set_axiom::validate_set_card_member_lower_bound(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SetCardEmpty => {
+                set_axiom::validate_set_card_empty(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SetCardMemberCount => {
+                set_axiom::validate_set_card_member_count(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SetCardEmptyByAssertion => {
+                set_axiom::validate_set_card_empty_by_assertion(
+                    terms, step_id, clause, empty_sets,
+                )?;
             }
             // Skolemized extensionality: NOT a tautology, so shape alone can
             // never license it. Accepted only against the whole-proof
@@ -726,6 +836,37 @@ fn validate_theory_lemma(
                     });
                 }
             },
+            // Pure-NRA interval refutation (#nra-cert): the checker's OWN
+            // bounded exact-rational interval propagation re-refutes the
+            // negated clause from the terms alone — no payload, nothing to
+            // forge. Fail-closed on any shape/degree/budget surprise.
+            TheoryLemmaKind::NraIntervalUnsat => {
+                nra_interval::validate_nra_interval_unsat(terms, step_id, clause)?;
+            }
+            // Pure-NRA univariate refutation (#nra-cert): the checker's OWN
+            // exact Sturm-based cell decomposition re-decides the negated
+            // one-variable system, algebraically correct at irrational roots
+            // (the sqrt(2) trap). Fail-closed everywhere.
+            TheoryLemmaKind::NraUnivariateUnsat => {
+                nra_univariate::validate_nra_univariate_unsat(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::DatatypeTesterEval => match dt_decls {
+                Some(decls) => {
+                    datatype_axiom::validate_datatype_tester_eval(
+                        terms,
+                        step_id,
+                        clause,
+                        decls,
+                        ctor_selectors,
+                    )?;
+                }
+                None => {
+                    return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
+                        step: step_id,
+                        kind,
+                    });
+                }
+            },
             other => {
                 // A trust-kind (`Generic`) theory lemma has no dedicated strict
                 // validator (e.g. an integer-arithmetic lemma over an `ite` whose
@@ -784,6 +925,9 @@ fn validate_generic_step(
     premises: &[ProofId],
     args: &[TermId],
     strict: bool,
+    // The caller collected this step's clause for independent discharge, so the
+    // by-name rejection below must not fire. Never set without a collector.
+    deferred: bool,
 ) -> Result<(), ProofCheckError> {
     let premise_clauses: Vec<&[TermId]> = premises
         .iter()
@@ -791,7 +935,10 @@ fn validate_generic_step(
         .collect::<Result<_, _>>()?;
 
     match rule {
-        AletheRule::Resolution | AletheRule::ThResolution => validate_binary_resolution_rule(
+        // Alethe resolution is N-ARY (#dt-premise-binding). Arity 2 keeps the
+        // binary check verbatim; other arities fold the chain, which is what
+        // lets emitters replace an O(n^2)-text binary triangle with one step.
+        AletheRule::Resolution | AletheRule::ThResolution => validate_resolution_rule(
             terms,
             step_id,
             rule,
@@ -804,8 +951,8 @@ fn validate_generic_step(
                 return Err(ProofCheckError::InvalidDrup { step: step_id });
             }
         }
-        AletheRule::Hole => return Err(ProofCheckError::HoleStep { step: step_id }),
-        AletheRule::Trust => {}
+        AletheRule::Hole if !deferred => return Err(ProofCheckError::HoleStep { step: step_id }),
+        AletheRule::Hole | AletheRule::Trust => {}
         AletheRule::AndPos(i) if strict => {
             boolean::validate_and_pos(terms, step_id, clause, *i, args.first().copied())?;
         }

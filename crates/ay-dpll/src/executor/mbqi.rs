@@ -176,6 +176,9 @@ impl Executor {
             return None;
         }
 
+        // Any Sat produced below is a sample unless BV-MBQI proves otherwise.
+        self.bv_quantifier_full_domain_proof = false;
+
         // Only process universal quantifiers, excluding any marked "E-matching
         // only" (`mark_no_mbqi`) — those must not be MBQI-discharged (they fail
         // closed to Unknown at the quantifier-loop caller instead).
@@ -204,8 +207,11 @@ impl Executor {
                     Ok(SolveResult::Unsat(_)) => return Some(result),
                     Ok(SolveResult::Sat) if other_quants.is_empty() => return Some(result),
                     // BV-MBQI returned SAT but there are non-BV quantifiers remaining —
-                    // fall through to generic MBQI for those.
-                    Ok(SolveResult::Sat) => {}
+                    // fall through to generic MBQI for those. The BV proof does
+                    // not cover them, so the certificate is withdrawn.
+                    Ok(SolveResult::Sat) => {
+                        self.bv_quantifier_full_domain_proof = false;
+                    }
                     other => return Some(other),
                 }
             }
@@ -3640,10 +3646,44 @@ impl Executor {
                 return false;
             }
         }
+        // Preserve the ground projection of the exhibited interpretation for
+        // the public validation funnel. The extracted theory model is allowed
+        // to omit precisely these constrained UF applications; without the
+        // projection, a logically certified Sat is demoted merely because the
+        // output evaluator cannot reconstruct M' from those lossy tables.
+        self.install_left_inverse_certificate_pins(&memo);
+        self.mbqi_sat_cert_grant_active = true;
         if debug {
             eprintln!("CERT/left-inverse: granted");
         }
         true
+    }
+
+    fn install_left_inverse_certificate_pins(&mut self, memo: &HashMap<TermId, Option<LiValue>>) {
+        let mut values: Vec<(TermId, LiValue)> = memo
+            .iter()
+            .filter_map(|(&term, value)| value.clone().map(|value| (term, value)))
+            .collect();
+        values.sort_by_key(|(term, _)| term.0);
+
+        let mut elements: HashMap<LiElem, String> = HashMap::default();
+        self.mbqi_sat_cert_pins.clear();
+        for (term, value) in values {
+            let value = match value {
+                LiValue::Bool(value) => EvalValue::Bool(value),
+                LiValue::BitVec { value, width } => EvalValue::BitVec { value, width },
+                LiValue::Int(value) => EvalValue::Rational(value.into()),
+                LiValue::Elem(element) => {
+                    let next = elements.len();
+                    let name = elements
+                        .entry(element)
+                        .or_insert_with(|| format!("@ay_li!{next}"))
+                        .clone();
+                    EvalValue::Element(name)
+                }
+            };
+            self.mbqi_sat_cert_pins.insert(term, value);
+        }
     }
 
     /// Evaluate every term of `terms` under the current partial `M'`;
@@ -3997,7 +4037,35 @@ impl Executor {
             {
                 return None;
             }
-            if !matches!(self.ctx.terms.sort(*inner), Sort::Uninterpreted(_)) {
+            // SOUNDNESS (#left-inverse-datatype-codomain): the whole
+            // construction rests on `Box`'s codomain being ENLARGEABLE — the
+            // materialization mints one fresh `BoxPoint` per domain point and
+            // needs the universe to accommodate all of them. A `declare-
+            // datatypes` sort surfaces as `Sort::Uninterpreted(name)` (see
+            // `binder_sort_is_datatype`), but its carrier is FIXED by its
+            // constructors and admits no fresh elements, so the bare
+            // `Sort::Uninterpreted` test is not the property this needs.
+            //
+            // Without the datatype exclusion the certificate accepts a
+            // left-inverse axiom whose codomain is FINITE, and an injection
+            // from an infinite domain into a finite carrier does not exist:
+            //
+            //   (declare-datatypes ((C 0)) (((c1) (c2))))
+            //   (declare-fun bx (Int) C) (declare-fun ubx (C) Int)
+            //   (assert (forall ((a Int)) (= (ubx (bx a)) a)))
+            //
+            // is UNSAT by pigeonhole (z3 agrees), and the certificate GRANTED
+            // it — measured at 608020b1ad, where the wrong `sat` was masked
+            // only by a downstream consumer declining. Masking is not a
+            // guarantee; the same certificate feeds paths that do publish.
+            //
+            // The three sibling gates already carry this exclusion
+            // (`mbqi.rs:1230`, `:2061`, `:2178`, the last with the same
+            // rationale in prose). This one was missed.
+            let inner_sort = self.ctx.terms.sort(*inner);
+            if !matches!(inner_sort, Sort::Uninterpreted(_))
+                || self.binder_sort_is_datatype(inner_sort)
+            {
                 return None;
             }
             Some((
@@ -4822,6 +4890,11 @@ impl Executor {
             }
             other => other,
         };
+        // PUBLISH what this sub-solve actually decided, while the instance set
+        // is still the installed assertion set (#eu-uf-interp).
+        if matches!(result, Ok(SolveResult::Sat)) {
+            self.publish_singleton_universe_uf_tables(&empty_sort_names);
+        }
         self.ctx.assertions = saved_assertions;
         self.incr_theory_state = saved_theory_state;
         self.incr_bv_state = saved_bv_state;
@@ -4857,6 +4930,191 @@ impl Executor {
                 None
             }
         }
+    }
+
+    /// Materialize into the ADOPTED sub-model the function interpretations the
+    /// singleton-universe sub-solve actually decided (#eu-uf-interp).
+    ///
+    /// THE GAP THIS CLOSES. The doc on
+    /// [`Self::mbqi_empty_universe_singleton_decide`] promises that the
+    /// adopted sub-model "carries the finite universe incl. the witness and
+    /// every UF value at it". For the BV lanes that promise was FALSE: they
+    /// ACKERMANNIZE `f(u)` into a fresh bit-blasted term
+    /// (`theories/bv_axioms_euf.rs`) and build no EUF function table, so the
+    /// adopted `euf_model.function_tables` came back EMPTY even though
+    /// `(get-value ((f u)))` answers from the bit-blasted assignment. Two
+    /// consumers then read the silence as "no interpretation exists":
+    /// `(get-model)`'s ground-application fallback OMITS the symbol (its
+    /// scope limit refuses to publish a total `define-fun` for a symbol that
+    /// occurs under a quantifier), and the quantified model-check gate's
+    /// `quantified_gate_uf_interps` drops the head "(no table)", defers, and
+    /// the deferral fails the `sat` CLOSED. The solver decided a value and
+    /// threw it away; this publishes it.
+    ///
+    /// WHY THE PUBLISHED TABLE IS EXACT, NOT A COMPLETION DEFAULT. A symbol is
+    /// published only when EVERY one of its argument sorts is an
+    /// EMPTY-universe uninterpreted sort. The caller's guards 2 and 4 prove
+    /// that such a sort has NO term anywhere in the snapshot other than the
+    /// single witness this lane synthesized (no generating function returns
+    /// it, no composite sort smuggles it in), so the sort's model domain is
+    /// exactly that one element and the function's domain is exactly ONE
+    /// point. The instance set applies the function AT that point, so the one
+    /// row read back is a TOTAL interpretation — the printer's one-row body is
+    /// the row's own value, never a fabricated sort default. Nothing is
+    /// invented: the key is the model's own element token for the witness and
+    /// the value is read back through the same `term_value_string` path
+    /// `(get-value)` uses.
+    ///
+    /// FAIL-CLOSED EVERYWHERE. A symbol is skipped — leaving today's deferring
+    /// behaviour exactly as it is — when it already has a table, is a
+    /// conflicted/defined/internal symbol, has any argument outside the
+    /// singleton domain, has an unreadable argument or result value, is
+    /// applied at more than the single domain point, or disagrees with itself
+    /// at one point (a congruence violation, never papered over). The pass
+    /// only FILLS an `euf_model` the solve already built: it never creates
+    /// one, because materializing an otherwise-absent EUF component would
+    /// change the `euf_backed` evidence the downstream validation gates read.
+    fn publish_singleton_universe_uf_tables(&mut self, empty_sort_names: &HashSet<String>) {
+        let Some(mut model) = self.last_model.take() else {
+            return;
+        };
+        if model.euf_model.is_none() {
+            self.last_model = Some(model);
+            return;
+        }
+
+        // Ground uninterpreted-function applications of the INSTANCE set (the
+        // caller has not restored the outer assertions yet).
+        let mut apps: HashMap<(String, usize), Vec<(TermId, Vec<TermId>)>> = HashMap::default();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        for &assertion in &self.ctx.assertions {
+            self.collect_uf_applications(assertion, &mut apps, &mut visited);
+        }
+
+        // Deterministic order: the model is a published artifact.
+        let mut candidates: Vec<(String, Vec<Sort>)> = Vec::new();
+        for (surface, info) in self.ctx.symbol_iter() {
+            if info.arg_sorts.is_empty() {
+                continue;
+            }
+            if self.ctx.is_defined_fun(surface) || self.ctx.is_internal_symbol(surface) {
+                continue;
+            }
+            let identity = self.ctx.symbol_identity_name(surface, info);
+            if self.is_dt_internal_symbol(identity) {
+                continue;
+            }
+            // Every argument must range over a synthesized singleton domain.
+            if !info.arg_sorts.iter().all(|s| match s {
+                Sort::Uninterpreted(name) => empty_sort_names.contains(name),
+                _ => false,
+            }) {
+                continue;
+            }
+            candidates.push((identity.to_string(), info.arg_sorts.clone()));
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        let mut published = 0usize;
+        for (identity, arg_sorts) in candidates {
+            let euf = model
+                .euf_model
+                .as_ref()
+                .expect("euf component checked present above");
+            if euf.function_tables.contains_key(&identity)
+                || euf.function_table_conflicts.contains(&identity)
+            {
+                continue;
+            }
+            let Some(applications) = apps.get(&(identity.clone(), arg_sorts.len())) else {
+                continue;
+            };
+
+            // Read every application back. `term_values` is EUF's own table
+            // spelling (an `@Sort!n` element token, or a formatted scalar);
+            // `term_value_string` is the `(get-value)` path. Either is a value
+            // the model already commits to — neither invents one.
+            let read_back = |exec: &Self, m: &Model, t: TermId| -> Option<String> {
+                if let Some(v) = m
+                    .euf_model
+                    .as_ref()
+                    .and_then(|e| e.term_values.get(&t))
+                    .cloned()
+                {
+                    return Some(v);
+                }
+                exec.term_value_string(m, t).ok()
+            };
+
+            let mut rows: std::collections::BTreeMap<Vec<String>, String> =
+                std::collections::BTreeMap::new();
+            let mut usable = true;
+            let mut source_terms: Vec<TermId> = Vec::new();
+            for (app, args) in applications {
+                let mut key = Vec::with_capacity(args.len());
+                for &arg in args {
+                    // The key must be the model's ELEMENT TOKEN for the
+                    // witness; anything else is not a domain point this model
+                    // names, so the row could not be checked against it.
+                    match model
+                        .euf_model
+                        .as_ref()
+                        .and_then(|e| e.term_values.get(&arg))
+                        .cloned()
+                    {
+                        Some(token) if token.starts_with('@') => key.push(token),
+                        _ => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                if !usable {
+                    break;
+                }
+                let Some(value) = read_back(self, &model, *app) else {
+                    usable = false;
+                    break;
+                };
+                match rows.get(&key) {
+                    // Two applications at one domain point disagreeing is a
+                    // congruence violation; publishing either would be a
+                    // falsifying witness.
+                    Some(prev) if *prev != value => {
+                        usable = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        rows.insert(key, value);
+                        source_terms.push(*app);
+                    }
+                }
+            }
+            // The domain is the cross-product of one witness per argument —
+            // exactly one point. Anything else means the instance set did not
+            // determine the function totally.
+            if !usable || rows.len() != 1 {
+                continue;
+            }
+            let euf = model
+                .euf_model
+                .as_mut()
+                .expect("euf component checked present above");
+            euf.function_tables.insert(
+                identity.clone(),
+                rows.into_iter().collect::<Vec<(Vec<String>, String)>>(),
+            );
+            euf.function_table_terms.insert(identity, source_terms);
+            published += 1;
+        }
+
+        if published > 0 {
+            self.last_statistics
+                .set_int("model_completion.singleton_universe_ufs", published as u64);
+        }
+        self.last_model = Some(model);
     }
 
     /// `true` iff no subterm of `root` is of an empty binder sort (except a
@@ -5042,7 +5300,11 @@ impl Executor {
         if self.external_stop_reason().is_some() {
             return None;
         }
-        let model = self.last_model.clone()?;
+        // The ground solve may simplify every authored UF point equality away
+        // before model extraction, leaving no retained candidate at all.  The
+        // certificate constructs its own completed interpretation, so an empty
+        // base is sufficient; every value it relies on is still checked below.
+        let mut model = self.last_model.clone().unwrap_or_else(Model::empty);
 
         // ---- 1. Partition the snapshot; reject any non-top-level-forall
         //         quantifier occurrence (exists, Not(forall), nested, ...).
@@ -5106,6 +5368,42 @@ impl Executor {
             });
         }
 
+        // Re-materialize exact numeric UF pins from authored unit equalities.
+        // Ground propagation is allowed to consume `(= (f c) k)`, but that
+        // equality is itself authoritative model information. Installing only
+        // its literal RHS into the disposable certificate model is therefore a
+        // forced interpretation choice, not a guess; conflicting/congruent
+        // points are still rejected by ground re-evaluation and table
+        // collection below.
+        {
+            let euf = model.euf_model.get_or_insert_with(Default::default);
+            for &ground in &grounds {
+                let TermData::App(eq, args) = self.ctx.terms.get(ground) else {
+                    continue;
+                };
+                if eq.name() != "=" || args.len() != 2 {
+                    continue;
+                }
+                for (app, value) in [(args[0], args[1]), (args[1], args[0])] {
+                    let TermData::App(sym, app_args) = self.ctx.terms.get(app) else {
+                        continue;
+                    };
+                    if !table_syms.contains_key(sym.name())
+                        || app_args.iter().any(|&arg| {
+                            contains_quantifier(&self.ctx.terms, arg)
+                                || matches!(self.ctx.terms.get(arg), TermData::Var(..))
+                        })
+                        || !matches!(self.ctx.terms.get(value), TermData::Const(_))
+                        || !matches!(self.ctx.terms.sort(app), Sort::Int | Sort::Real)
+                    {
+                        continue;
+                    }
+                    euf.func_app_const_terms.insert(app, value);
+                }
+            }
+        }
+        super::model::eval_memo_clear();
+
         // ---- 3. Independent re-verification: M must make every ground
         //         original definitely true (no delegation, no completion
         //         guessing — a definite Bool(true) from the evaluator).
@@ -5118,6 +5416,12 @@ impl Executor {
         // ---- 4. Build the finite tables from EVERY ground application of a
         //         table symbol anywhere in the snapshot.
         let tables = self.finite_table_collect(&model, snapshot, &table_syms)?;
+        // `snapshot` is the exact pre-preprocessing solve obligation; do not
+        // mix in the current working assertion window, which may contain
+        // solver-generated residual/probe terms outside the certificate
+        // fragment. Every authored ground point is already in `grounds`.
+        let pin_roots = grounds.clone();
+        let ground_pins = self.finite_table_ground_pins(&model, &pin_roots, &table_syms)?;
 
         // ---- 5. Bounded default-vector enumeration.
         let mut sym_names: Vec<String> = table_syms.keys().cloned().collect();
@@ -5275,11 +5579,59 @@ impl Executor {
             )? {
                 if std::env::var_os("AY_DEBUG_CERT").is_some() {
                     eprintln!(
-                        "CERT/finite-table: certified SAT ({} foralls, {} table syms)",
+                        "CERT/finite-table: certified SAT ({} foralls, {} grounds, {} table syms, {} pins)",
                         infos.len(),
-                        sym_names.len()
+                        grounds.len(),
+                        sym_names.len(),
+                        ground_pins.len(),
                     );
                 }
+                // Residual validity checks are isolated nested solves and may
+                // replace `last_model` with their temporary counterexample or
+                // refutation model. The certificate, however, constructed M'
+                // from this saved outer `model` and proved every ground
+                // original agrees with it at all observed table points. Put
+                // that model back before handing Sat to the public validation
+                // funnel; otherwise ground applications can disappear and a
+                // certified Sat is spuriously demoted to Unknown.
+                let mut emitted_model = model.clone();
+                let euf = emitted_model.euf_model.get_or_insert_with(Default::default);
+                for (term, value) in &ground_pins {
+                    let TermData::App(sym, _) = self.ctx.terms.get(*term) else {
+                        continue;
+                    };
+                    if !table_syms.contains_key(sym.name()) {
+                        continue;
+                    }
+                    let raw = match value {
+                        EvalValue::Bool(value) => value.to_string(),
+                        EvalValue::Rational(value) => {
+                            crate::executor_format::format_rational(value)
+                        }
+                        _ => continue,
+                    };
+                    euf.term_values.insert(*term, raw);
+                }
+                // The certificate proves the TOTAL interpretation M', not
+                // merely its observed ground projection. Publish that exact
+                // structure: explicit rows first and the certified default as
+                // the final (printer/evaluator else) row. Without this step an
+                // all-quantifier formula such as `forall x. P(x)` could grant
+                // Sat while parking an empty EUF model, and a table-plus-
+                // default formula could print an unrelated sort default at an
+                // unlisted point.
+                self.install_finite_table_model(
+                    &mut emitted_model,
+                    &table_syms,
+                    &tables,
+                    &defaults,
+                )?;
+                // Install immediately for the internal SAT/model postcondition,
+                // and retain an identical parked copy for the public emission
+                // funnel in case a later mapper probe overwrites `last_model`.
+                self.last_model = Some(emitted_model.clone());
+                self.finite_table_cert_pending_witness =
+                    Some((emitted_model, ground_pins.iter().cloned().collect()));
                 return Some(());
             }
 
@@ -5299,6 +5651,165 @@ impl Executor {
                 return None; // all combos exhausted
             }
         }
+    }
+
+    /// Materialize the exact total interpretation certified by CAP-1 into a
+    /// model. Function-table consumers treat the final row as the default;
+    /// preceding rows are the explicitly observed points.
+    fn install_finite_table_model(
+        &self,
+        model: &mut Model,
+        table_syms: &HashMap<String, TableCertSort>,
+        tables: &HashMap<String, HashMap<TableCertKey, TableCertVal>>,
+        defaults: &HashMap<String, TableCertVal>,
+    ) -> Option<()> {
+        fn rational_atom(value: &num_rational::BigRational) -> String {
+            if value.is_integer() {
+                value.numer().to_string()
+            } else {
+                format!("(/ {} {})", value.numer(), value.denom())
+            }
+        }
+
+        fn value_atom(value: &TableCertVal) -> String {
+            match value {
+                TableCertVal::Bool(value) => value.to_string(),
+                TableCertVal::Int(value) => value.to_string(),
+                TableCertVal::Rat(value) => rational_atom(value),
+            }
+        }
+
+        let euf = model
+            .euf_model
+            .get_or_insert_with(ay_euf::EufModel::default);
+        let mut names: Vec<&String> = table_syms.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            let symbol = self.ctx.symbol_info(name)?;
+            let rows = tables.get(name)?;
+            let default = defaults.get(name)?;
+            let mut sorted_rows: Vec<(&TableCertKey, &TableCertVal)> = rows.iter().collect();
+            sorted_rows.sort_by(|a, b| a.0.cmp(b.0));
+
+            let mut table = Vec::with_capacity(sorted_rows.len() + 1);
+            for ((prefix, point), value) in sorted_rows {
+                let mut key = prefix.clone();
+                key.push(point.clone());
+                if key.len() != symbol.arg_sorts.len() {
+                    return None;
+                }
+                for (arg, sort) in key.iter().zip(&symbol.arg_sorts) {
+                    if !matches!(sort, Sort::Int | Sort::Real)
+                        || matches!(sort, Sort::Int) && !arg.is_integer()
+                    {
+                        return None;
+                    }
+                }
+                table.push((key.iter().map(rational_atom).collect(), value_atom(value)));
+            }
+
+            // The final row carries the certified DEFAULT: the positional
+            // consumers (`format_function_body`, the quantified-model gate,
+            // `uf_unlisted_point_value`) read the LAST row as the `else` and
+            // never print its argument tuple as a condition.
+            //
+            // #cert-default-row-key: the tuple is nevertheless NOT free. The
+            // printer's dedup/consistency backstop audits every row as a
+            // genuine point — it must, since an EUF-extracted table's last row
+            // IS a real point (the U4_rand_24 wrong-printed-model class turns
+            // on that). A fabricated all-zeros key therefore ALIASES a
+            // certified row that happens to sit at the all-zeros point, and a
+            // perfectly valid certified model fails closed as a non-function.
+            //
+            // Key the row one past the largest first coordinate in the
+            // certified point set instead. That is not merely non-colliding:
+            // the certified interpretation maps every UNLISTED point to
+            // `default`, so the row is TRUE read as a point. Every row of the
+            // installed table is now a real point of the interpretation the
+            // solver validated, which is exactly the backstop's premise.
+            let arity = symbol.arg_sorts.len();
+            let mut default_key =
+                vec![num_rational::BigRational::from_integer(num_bigint::BigInt::from(0)); arity];
+            if let (true, Some(max_first)) = (
+                arity > 0,
+                rows.keys()
+                    .map(|(prefix, point)| prefix.first().unwrap_or(point))
+                    .max()
+                    .cloned(),
+            ) {
+                default_key[0] = max_first
+                    + num_rational::BigRational::from_integer(num_bigint::BigInt::from(1));
+            }
+            table.push((
+                default_key.iter().map(rational_atom).collect(),
+                value_atom(default),
+            ));
+            euf.function_tables.insert(name.clone(), table);
+            euf.function_table_terms.remove(name);
+            euf.function_table_conflicts.remove(name);
+        }
+        Some(())
+    }
+
+    /// Capture exactly the ground applications whose interpretation is fixed
+    /// by a finite-table certificate. Residual validity probes run as nested
+    /// solves and can erase these per-term values from the retained model; the
+    /// pins preserve the certified table-point projection for the public gate.
+    fn finite_table_ground_pins(
+        &self,
+        model: &Model,
+        grounds: &[TermId],
+        table_syms: &HashMap<String, TableCertSort>,
+    ) -> Option<Vec<(TermId, EvalValue)>> {
+        let mut pins = Vec::new();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut stack = grounds.to_vec();
+        while let Some(term) = stack.pop() {
+            if !visited.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::App(sym, args) => {
+                    stack.extend(args.iter().copied());
+                    let value = self.evaluate_term(model, term);
+                    if table_syms.contains_key(sym.name()) && matches!(value, EvalValue::Unknown) {
+                        return None;
+                    }
+                    if !matches!(value, EvalValue::Unknown) {
+                        pins.push((term, value));
+                    }
+                }
+                TermData::Not(inner) => {
+                    stack.push(*inner);
+                    let value = self.evaluate_term(model, term);
+                    if !matches!(value, EvalValue::Unknown) {
+                        pins.push((term, value));
+                    }
+                }
+                TermData::Ite(condition, then_term, else_term) => {
+                    stack.extend([*condition, *then_term, *else_term]);
+                    let value = self.evaluate_term(model, term);
+                    if !matches!(value, EvalValue::Unknown) {
+                        pins.push((term, value));
+                    }
+                }
+                TermData::Let(bindings, body) => {
+                    stack.extend(bindings.iter().map(|(_, value)| *value));
+                    stack.push(*body);
+                }
+                TermData::Forall(..) | TermData::Exists(..) => return None,
+                TermData::Const(_) => {}
+                TermData::Var(_, _) => {
+                    let value = self.evaluate_term(model, term);
+                    if !matches!(value, EvalValue::Unknown) {
+                        pins.push((term, value));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        pins.sort_by_key(|(term, _)| term.0);
+        Some(pins)
     }
 
     // =====================================================================
@@ -5955,7 +6466,28 @@ impl Executor {
                 .iter()
                 .map(|(k, v)| (k.iter().map(int_atom).collect(), val_atom(v)))
                 .collect();
-            table.push((vec!["0".to_string(); arity], val_atom(default)));
+            // #cert-default-row-key: same rule as `install_finite_table_model`
+            // — the default row's key is read as a genuine point by the
+            // printer's consistency backstop, so an all-zeros filler aliases a
+            // certified row at the all-zeros point and fails a valid model
+            // closed. One past the largest first coordinate cannot collide,
+            // and (every unlisted point maps to `default`) is a TRUE point of
+            // the certified interpretation.
+            let mut default_key = vec![num_bigint::BigInt::from(0); arity];
+            if let (true, Some(max_first)) = (
+                arity > 0,
+                sorted_rows
+                    .iter()
+                    .filter_map(|row| row.0.first())
+                    .max()
+                    .cloned(),
+            ) {
+                default_key[0] = max_first + num_bigint::BigInt::from(1);
+            }
+            table.push((
+                default_key.iter().map(int_atom).collect(),
+                val_atom(default),
+            ));
             euf.function_tables.insert(name.clone(), table);
             euf.function_table_terms.remove(name);
             euf.function_table_conflicts.remove(name);
@@ -9170,6 +9702,1468 @@ impl Executor {
             }
         }
     }
+
+    // =====================================================================
+    // CONSTANT-INTERPRETATION SAT certificate (`AY_CONST_INTERP_CERT`).
+    // =====================================================================
+
+    /// # The CONSTANT-INTERPRETATION SAT certificate (grant-only)
+    ///
+    /// For a snapshot whose assertions are ALL top-level `forall`s, pick a
+    /// candidate interpretation `I` mapping some uninterpreted heads to
+    /// CONSTANT functions, substitute `I` into each quantified body, replace
+    /// the binders with FRESH constants, and require the NEGATED body to be
+    /// UNSAT. That proves the body valid under `I` for every binder value, so
+    /// `I` satisfies every axiom, so the snapshot is `Sat`.
+    ///
+    /// ## Why this is a certificate and not a model guesser
+    ///
+    /// Candidate SELECTION — which heads, which constants, in which order — is
+    /// a pure heuristic that is never trusted: a bug there can only lose a
+    /// grant we could have had, never manufacture one we could not. Each
+    /// candidate must still DISCHARGE every axiom, in one of exactly two ways:
+    ///
+    /// - (A) the substituted body is the literal constant `true`, i.e. the
+    ///   `mk_*` rebuild folded it outright. Trusted base: the constructors'
+    ///   documented contract that every rewrite they perform is
+    ///   semantics-preserving. This is the strongest form — the body is a
+    ///   syntactic tautology under `I` — and it is what discharges the simplest
+    ///   axioms (`∀s. 0 <= seq_len(s)` under `seq_len := 0` folds to `true`
+    ///   with NO nested solve at all).
+    /// - (B) otherwise, an `Unsat` on the negated body from
+    ///   [`Self::isolated_ground_solve_is_unsat`], AY's own fail-closed ground
+    ///   funnel. Trusted base: that `Unsat`.
+    ///
+    /// Both legs are checked per axiom; a combination is accepted only when
+    /// EVERY axiom passes one of them. The single genuine soundness surface
+    /// they share is the SUBSTITUTION, which is why
+    /// [`Self::const_interp_substitution`] is deliberately mechanical and
+    /// commented line by line.
+    ///
+    /// ## The theorem, spelled out
+    ///
+    /// Let the snapshot be `A_1 .. A_n` with `A_j = ∀ x̄_j. B_j(x̄_j)`, every
+    /// `B_j` quantifier-free. Let `I` map a set `H` of uninterpreted heads
+    /// `f ↦ c_f` where each `c_f` is a CLOSED term of `f`'s result sort, and
+    /// let `I(f)` denote the constant function `λ ȳ. c_f`. Write `B_j[I]` for
+    /// `B_j` with every application `f(t̄)`, `f ∈ H`, rewritten to `c_f`, and
+    /// `k̄_j` for a vector of constants FRESH everywhere.
+    ///
+    /// Suppose that for every `j` the ground solver reports
+    /// `¬ B_j[I][x̄_j := k̄_j]` UNSAT. Fix any interpretation `J` of the
+    /// symbols NOT in `H` (residual heads, and there is always at least one
+    /// such `J` because SMT-LIB sorts are non-empty). If some `ā` in the
+    /// binder domain made `B_j` false under `I ∪ J`, then extending `J` with
+    /// `k̄_j := ā` would satisfy `¬ B_j[I][k̄_j]` — contradicting UNSAT, which
+    /// says NO interpretation of that formula's free symbols satisfies it.
+    /// Hence `I ∪ J ⊨ ∀ x̄_j. B_j` for every `j`.
+    ///
+    /// The `j`s share ONE `I` (the combination loop assigns each head a single
+    /// value across all axioms), and `J` is arbitrary, so a single structure
+    /// `I ∪ J` satisfies the WHOLE snapshot simultaneously. The snapshot is
+    /// therefore `Sat`, and since the consult sites pass a snapshot that is
+    /// the original assertions plus their instantiation consequences, the
+    /// original problem is `Sat`.
+    ///
+    /// ## Fail-closed perimeter
+    ///
+    /// Everything below returns `None` (decline):
+    /// - a non-`forall` assertion anywhere in the snapshot (so any GROUND
+    ///   assertion declines — the theorem above is stated for an all-`forall`
+    ///   problem and is not extended here);
+    /// - an `exists`, a nested quantifier, or a `let` inside a body;
+    /// - a `no_mbqi` (Hilbert-choose / E-matching-only) `forall`;
+    /// - a non-`Bool` body, an empty binder list;
+    /// - any `TermData` variant not explicitly handled (including future ones);
+    /// - a head whose result sort has no closed constant candidate is simply
+    ///   LEFT UNINTERPRETED (sound: `J` ranges over it), but a head whose
+    ///   occurrences disagree on sort or arity declines;
+    /// - more than [`MAX_CONST_INTERP_HEADS`] interpreted heads, more than
+    ///   [`MAX_CONST_INTERP_COMBOS`] combinations, more than
+    ///   [`MAX_CONST_INTERP_SOLVER_CALLS`] nested solves, or the wall-clock
+    ///   budget expiring;
+    /// - re-entrancy: a nested validity solve that reaches this function again
+    ///   declines at depth > 0 (see [`CONST_INTERP_CERT_DEPTH`]);
+    /// - WITNESS: when nothing else produced a model (`last_model` was `None` at
+    ///   entry), a pinned head whose interpretation cannot be rendered as a
+    ///   `(define-fun ...)` under the name `(get-model)` looks for — see
+    ///   [`Self::const_interp_witness_shape`]. The certificate is the sole
+    ///   source of a model on that route, and `I` is ONE structure: publishing
+    ///   it minus a head is not a witness, so the whole certificate declines.
+    ///
+    /// Grant-only: this function returns `Some(())` or `None`. It never
+    /// produces, influences, or blocks an `Unsat` verdict.
+    ///
+    /// ## The model it grants
+    ///
+    /// On a grant with no other model, the certificate installs `I` itself:
+    /// [`Self::install_const_interp_cert_witness`] records the pinned heads as
+    /// printable model entries and completes every other declared symbol with
+    /// [`Self::completed_default_model`] — a concrete `J`, which the theorem
+    /// admits because it holds for EVERY `J`. `(get-model)` then reports the
+    /// interpretation the certificate actually checked, and the evaluator reads
+    /// the same one, so `(get-value)` cannot contradict it.
+    /// CLOSED-VALID-SENTENCE SAT certificate.
+    ///
+    /// Discharges the class the quantified fail-closed gate cannot: an
+    /// assertion set whose every member is a CLOSED sentence containing NO
+    /// uninterpreted symbol of any arity, each of which is VALID.
+    ///
+    /// ## Why this class needs its own certificate
+    ///
+    /// `apply_quantified_model_failclosed_gate` confirms a quantified
+    /// assertion by evaluating it against the EMITTED MODEL. When the sentence
+    /// mentions no uninterpreted symbol there is nothing for a model to say
+    /// about it: the witness pins no interpretation because there is no
+    /// interpretation to pin. The gate's own `closed` branch recognises the
+    /// shape and returns `Deferred`, and a deferred conjunct is (rightly) not
+    /// model evidence — so the gate fails closed and publishes a correct `Sat`
+    /// as `unknown`. Measured on `∀x:Int. ∃y:Int. y*y > -3 ∧ y = x-2` and
+    /// `∀x:Int. (2|x ∨ 2|x+1)`: `model_check_gate.quantified =
+    /// "deferred-failclosed"`, `:unknown.phase = "independent-model-check-gate"`.
+    ///
+    /// The missing evidence is not an interpretation — it is a VALIDITY PROOF,
+    /// which is exactly what the sibling constant-interpretation certificate
+    /// already accepts on: an independent solver `Unsat` on the negated body.
+    /// This certificate is that argument with the interpretation part empty.
+    ///
+    /// ## Soundness
+    ///
+    /// For each assertion `A` the accepting step is an independent solve of
+    /// `¬A` returning `Unsat`. `Unsat` means NO structure satisfies `¬A` (a
+    /// solver's `Unsat` quantifies over every interpretation of the formula's
+    /// free symbols), i.e. `A` holds in EVERY structure. So every assertion is
+    /// true in every structure, the whole set is simultaneously satisfiable,
+    /// and — the part the gate needs — each is true in the emitted model too,
+    /// whatever that model happens to be. No interpretation is owed because
+    /// the partition admits no uninterpreted symbol to interpret.
+    ///
+    /// ## Fail-closed perimeter
+    ///
+    /// - GRANT-ONLY: returns `None` on every doubt; a decline leaves the
+    ///   caller's verdict exactly as it was. It can only turn a fail-closed
+    ///   `Unknown` (or a gate-doomed `Sat`) into a certified `Sat`, and never
+    ///   touches an `Unsat`.
+    /// - The partition is checked SYNTACTICALLY on the sentence
+    ///   ([`Self::closed_sentence_without_uninterpreted_symbols`]) — "no
+    ///   uninterpreted head" means the term genuinely contains none, NOT that
+    ///   the model failed to pin one. That distinction is the whole soundness
+    ///   margin: keying off "the witness pinned nothing" would rubber-stamp
+    ///   the auflia-model escape class (∀∃ over a printed `f`), where
+    ///   substitution consumes every model symbol and leaves nothing to pin.
+    ///   A single declared symbol anywhere in the sentence — constant or
+    ///   function, under any binder — declines.
+    /// - Anything short of a definitive `Unsat` on `¬A` (Sat / Unknown /
+    ///   deadline / error) declines.
+    /// - Depth 0 only ([`VALID_SENTENCE_CERT_DEPTH`]): the accepting step is a
+    ///   nested solve that can re-enter the quantifier lane's consult sites.
+    /// - Never EXTENDS the enclosing deadline — takes the earlier of (outer
+    ///   deadline, our slice) and restores the outer one on the single return.
+    pub(in crate::executor) fn try_valid_closed_sentence_sat_certificate(
+        &mut self,
+        snapshot: &[TermId],
+        fallback_category: LogicCategory,
+    ) -> Option<()> {
+        let debug = std::env::var_os("AY_DEBUG_CERT").is_some();
+        if snapshot.is_empty() {
+            return None;
+        }
+        // Never extend a solve that is already past its deadline/interrupt.
+        if self.external_stop_reason().is_some() {
+            return None;
+        }
+        if VALID_SENTENCE_CERT_DEPTH.with(|depth| depth.get()) > 0 {
+            return None;
+        }
+
+        // At least one quantifier, or this is a ground problem the ordinary
+        // pipeline already owns end-to-end (and whose model the gate can check
+        // without help). Cheapest discriminator, so it runs first.
+        if !snapshot
+            .iter()
+            .any(|&a| contains_quantifier(&self.ctx.terms, a))
+        {
+            return None;
+        }
+        // ---- PARTITION: every assertion closed and free of uninterpreted
+        // symbols. Checked BEFORE any nested solve, so a decline is free. The
+        // declared-symbol set is built ONCE and shared across the assertions —
+        // rebuilding it per assertion would be O(assertions x symbols) on a
+        // snapshot that never mentions a declared symbol.
+        let declared: HashSet<String> = self
+            .ctx
+            .symbol_iter()
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
+            .collect();
+        for &assertion in snapshot {
+            if !self.closed_sentence_without_uninterpreted_symbols(assertion, &declared) {
+                if debug {
+                    eprintln!(
+                        "CERT/valid-sentence decline: {assertion:?} is not a closed sentence \
+                         free of uninterpreted symbols"
+                    );
+                }
+                return None;
+            }
+        }
+
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                VALID_SENTENCE_CERT_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
+        }
+        VALID_SENTENCE_CERT_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _depth_guard = DepthGuard;
+
+        let saved_deadline = self.solve_deadline.get();
+        let slice = ay_core::time::Instant::now()
+            + std::time::Duration::from_millis(VALID_SENTENCE_CERT_BUDGET_MS);
+        self.set_deadline(match saved_deadline {
+            Some(d) if d < slice => Some(d),
+            _ => Some(slice),
+        });
+
+        // ---- ACCEPTING STEP: refute `¬A` for every assertion.
+        let mut granted = true;
+        for &assertion in snapshot {
+            if self.external_stop_reason().is_some() {
+                granted = false;
+                break;
+            }
+            let negated = self.ctx.terms.mk_not(assertion);
+            if !self.isolated_solve_is_unsat_allowing_quantifiers(negated, fallback_category) {
+                if debug {
+                    eprintln!("CERT/valid-sentence decline: negation of {assertion:?} not refuted");
+                }
+                granted = false;
+                break;
+            }
+        }
+        self.set_deadline(saved_deadline);
+        if !granted {
+            return None;
+        }
+        if debug {
+            eprintln!(
+                "CERT/valid-sentence: certified SAT ({} valid closed sentences)",
+                snapshot.len()
+            );
+        }
+        Some(())
+    }
+
+    /// Partition test for [`Self::try_valid_closed_sentence_sat_certificate`]:
+    /// `root` is a CLOSED sentence (every `Var` bound by an enclosing binder)
+    /// that mentions NO user-declared symbol of any arity.
+    ///
+    /// Declared CONSTANTS count. `∀x:Int. x >= c` pins nothing and is not
+    /// valid; admitting arity-0 symbols would hand the certificate a sentence
+    /// whose truth genuinely depends on an interpretation, and the accepting
+    /// `Unsat` would then be doing real work on a formula the gate was right
+    /// to guard. Excluding them keeps "nothing to interpret" literally true.
+    ///
+    /// FAIL-CLOSED on everything it does not model exactly: an unexpanded
+    /// `Let`, or a term larger than [`VALID_SENTENCE_PARTITION_NODE_CAP`]
+    /// visits, declines. The walk carries the binder scope explicitly and does
+    /// NOT memoise — memoising by `TermId` alone would conflate a shared
+    /// subterm's different scopes and could accept a free variable.
+    fn closed_sentence_without_uninterpreted_symbols(
+        &self,
+        root: TermId,
+        declared: &HashSet<String>,
+    ) -> bool {
+        let mut stack: Vec<(TermId, Vec<String>)> = vec![(root, Vec::new())];
+        let mut visits: u32 = 0;
+        while let Some((term, bound)) = stack.pop() {
+            visits += 1;
+            if visits > VALID_SENTENCE_PARTITION_NODE_CAP {
+                return false;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::Const(_) => {}
+                TermData::Var(name, _) => {
+                    if !bound.iter().any(|b| b == name) {
+                        return false;
+                    }
+                }
+                TermData::App(sym, args) => {
+                    if declared.contains(sym.name()) {
+                        return false;
+                    }
+                    let args = args.clone();
+                    for a in args {
+                        stack.push((a, bound.clone()));
+                    }
+                }
+                TermData::Not(inner) => {
+                    let inner = *inner;
+                    stack.push((inner, bound));
+                }
+                TermData::Ite(c, t, e) => {
+                    let (c, t, e) = (*c, *t, *e);
+                    stack.push((c, bound.clone()));
+                    stack.push((t, bound.clone()));
+                    stack.push((e, bound));
+                }
+                TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                    let names: Vec<String> = vars.iter().map(|(v, _)| v.clone()).collect();
+                    let body = *body;
+                    let triggers: Vec<TermId> =
+                        triggers.iter().flat_map(|g| g.iter().copied()).collect();
+                    let mut inner = bound;
+                    inner.extend(names);
+                    for t in triggers {
+                        stack.push((t, inner.clone()));
+                    }
+                    stack.push((body, inner));
+                }
+                // Unexpanded `Let` is not modelled here — decline rather than
+                // guess at its scoping. `TermData` is `#[non_exhaustive]`, so
+                // the wildcard catches any variant added later: an unmodelled
+                // node must DECLINE, never be silently treated as symbol-free.
+                TermData::Let(..) => return false,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    pub(in crate::executor) fn try_const_interp_sat_certificate(
+        &mut self,
+        snapshot: &[TermId],
+        fallback_category: LogicCategory,
+    ) -> Option<()> {
+        // `AY_CONST_INTERP_CERT` gate. `Off` => byte-identical (no scan, no
+        // mint, no nested solve, no log).
+        let mode = const_interp_cert_mode();
+        if matches!(mode, ConstInterpCertMode::Off) {
+            return None;
+        }
+        // Never extend a solve that is already past its deadline/interrupt.
+        if self.external_stop_reason().is_some() {
+            return None;
+        }
+
+        // RE-ENTRANCY (requirement 2, modelled on `TRUST_DISCHARGE_DEPTH`).
+        // The accepting step is a nested solve, and a nested solve can reach
+        // the quantifier lane's certificate consult sites. Depth 0 only: a
+        // nested validity solve must never recurse back into this certificate.
+        // A `&mut self` flag would NOT do — `isolated_ground_solve_is_unsat`
+        // is in-place today, but any future fresh-`Executor` probe resets
+        // every field, and a thread-local survives that.
+        if CONST_INTERP_CERT_DEPTH.with(|depth| depth.get()) > 0 {
+            return None;
+        }
+
+        // WITNESS REQUIRED. A `Sat` must carry a model — `check_sat_internal`'s
+        // boundary postcondition (#4642) says so, and a `sat` nobody can inspect
+        // is not a solved problem.
+        //
+        // This certificate proves "interpretation I satisfies every axiom", so
+        // the model IS I, and step 3b below MATERIALIZES I as printable model
+        // entries (`ConstInterpWitnessEntry`) whenever there is no other model
+        // to carry it. That is the whole of the change that made this guard
+        // unnecessary: it used to read `if self.last_model.is_none() { decline }`
+        // because AY had no way to REPRESENT a constant function — the only
+        // route to a function-valued model entry,
+        // `try_register_native_adopted_macro_interp`, refuses any symbol with
+        // `constraints_mention_symbol(name)`, which is exactly the symbol
+        // occurring in the quantified axiom.
+        //
+        // The obligation itself is UNCHANGED and non-negotiable: step 3b
+        // declines outright for any head whose interpretation it cannot render,
+        // so a `Sat` still never escapes without a model.
+        // Does this certificate OWN the model? Read HERE, at entry, and carried
+        // down — never re-read after the nested solves.
+        //
+        // `isolated_ground_solve_is_unsat` saves and restores `last_model`
+        // around its probe today (measured: entry and grant agree on every
+        // shape reached in the corpus), but it is documented as "in-place
+        // today", and the accepting step is the one place where a model
+        // belonging to a DIFFERENT formula — the negated, substituted body —
+        // can transit this field. Deciding from the entry snapshot means a
+        // future probe that forgets to restore can neither suppress a witness
+        // we owe nor let a foreign model stand in for one.
+        let owns_model = self.last_model.is_none();
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                CONST_INTERP_CERT_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
+        }
+        CONST_INTERP_CERT_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _depth_guard = DepthGuard;
+
+        // WALL-CLOCK BUDGET. Never EXTEND the enclosing solve's deadline —
+        // take the earlier of (outer deadline, our slice), and restore the
+        // outer one on every exit path (the `outcome` binding below is the
+        // single return).
+        let saved_deadline = self.solve_deadline.get();
+        let slice = ay_core::time::Instant::now()
+            + std::time::Duration::from_millis(CONST_INTERP_CERT_BUDGET_MS);
+        self.set_deadline(match saved_deadline {
+            Some(d) if d < slice => Some(d),
+            _ => Some(slice),
+        });
+        // TWO PASSES, STRICTLY ADDITIVE.
+        //
+        // Pass 1 is EXACTLY the certificate as it was: the fixed closed-constant
+        // family (`false/true`, `0/1`, const-`0` array) per head. Every snapshot
+        // that grants today grants here, in the same combination order, under
+        // the same budgets — byte-identical.
+        //
+        // Pass 2 runs ONLY when pass 1 declined, and only widens the CANDIDATE
+        // SET (see `const_interp_widened_candidates`): the constants the PROBLEM
+        // ITSELF already names for a head. Nothing else moves — same partition,
+        // same accepting step (substitute `I`, refute the negated body with an
+        // independent solver `Unsat`), same witness-shape guard, same wall-clock
+        // slice (`slice` is shared, so pass 2 can only use what pass 1 left).
+        //
+        // Running it as a SECOND pass rather than a bigger first pass is
+        // deliberate: extra candidates enlarge the mixed-radix combination
+        // space, which would push some of today's grants past
+        // `MAX_CONST_INTERP_COMBOS` / `MAX_CONST_INTERP_SOLVER_CALLS` and turn
+        // them into declines. A certificate must never LOSE a grant to a
+        // widening.
+        let outcome = self
+            .const_interp_cert_inner(
+                snapshot,
+                fallback_category,
+                mode,
+                slice,
+                owns_model,
+                ConstInterpCandidateSource::FixedFamily,
+            )
+            .or_else(|| {
+                self.const_interp_cert_inner(
+                    snapshot,
+                    fallback_category,
+                    mode,
+                    slice,
+                    owns_model,
+                    ConstInterpCandidateSource::WithProblemConstants,
+                )
+            });
+        self.set_deadline(saved_deadline);
+        outcome
+    }
+
+    /// Extra candidate constants for one head, drawn from the PROBLEM ITSELF.
+    ///
+    /// # Why this is not a soundness surface
+    ///
+    /// A candidate is a GUESS. The certificate's accepting step is unchanged:
+    /// substitute the guess into every assertion and require an INDEPENDENT
+    /// solver `Unsat` on the negation. `Unsat` there means the substituted
+    /// assertion holds in every structure, so where the guess came from is
+    /// irrelevant to the theorem — only that it is a CLOSED CONSTANT of exactly
+    /// the head's result sort, which the caller re-checks defensively before any
+    /// nested solve. A worthless guess costs one refuted combination.
+    ///
+    /// # The two sources
+    ///
+    /// 1. SYNTACTIC PINS. A closed constant `k` occurring opposite an
+    ///    occurrence of the head in an equality anywhere in the snapshot —
+    ///    `(= a 1.5)`, `(= (f 0) (- 2))`. This is what makes the certificate
+    ///    able to answer a problem that NAMES its own witness value: the fixed
+    ///    `0/1` family can never satisfy `a = 3/2`.
+    /// 2. THE EMITTED MODEL, for a NULLARY head only. `I(c) = M(c)` is then not
+    ///    an approximation of the model but literally its value, so a grant
+    ///    certifies an interpretation the published model already agrees with.
+    ///    Restricted to arity 0 on purpose: for a function head the model's
+    ///    value at one point says nothing about the constant function `λȳ. c`,
+    ///    and pretending otherwise would just burn a combination.
+    ///
+    /// Both are capped at [`MAX_CONST_INTERP_EXTRA_CANDIDATES`] extras per head
+    /// so the combination space stays inside the existing budgets.
+    fn const_interp_widened_candidates(
+        &mut self,
+        snapshot: &[TermId],
+        name: &str,
+        sort: &Sort,
+        arity: usize,
+        base: &[TermId],
+    ) -> Vec<TermId> {
+        let mut out: Vec<TermId> = base.to_vec();
+        let mut extras: Vec<TermId> = Vec::new();
+        // The head's own nullary occurrence, needed to ask the model for its
+        // value. Recovered by WALKING the snapshot for the same reason
+        // `const_interp_substitution` does: `mk_var(name, sort)` would mint a
+        // different `TermId` that matches nothing.
+        let mut nullary_occurrence: Option<TermId> = None;
+
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = snapshot.to_vec();
+        let mut work = MAX_CONST_INTERP_SCAN_WORK;
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if work == 0 {
+                break;
+            }
+            work -= 1;
+            // Does `t` mention the head at the right arity, at its own node?
+            let is_head_occurrence = match self.ctx.terms.get(t) {
+                TermData::Var(var_name, _) => arity == 0 && var_name.as_str() == name,
+                TermData::App(Symbol::Named(app_name), args) => {
+                    app_name.as_str() == name && args.len() == arity
+                }
+                _ => false,
+            };
+            if is_head_occurrence && arity == 0 && nullary_occurrence.is_none() {
+                nullary_occurrence = Some(t);
+            }
+            // SYNTACTIC PIN: `(= <head occurrence> <closed const>)`, either way
+            // round. Only a literal `Const` node counts — an arbitrary term
+            // would not be a closed constant and could not be published.
+            if let TermData::App(Symbol::Named(op), args) = self.ctx.terms.get(t) {
+                if op.as_str() == "=" && args.len() == 2 {
+                    let (a, b) = (args[0], args[1]);
+                    for (occ, konst) in [(a, b), (b, a)] {
+                        let occ_is_head = match self.ctx.terms.get(occ) {
+                            TermData::Var(var_name, _) => arity == 0 && var_name.as_str() == name,
+                            TermData::App(Symbol::Named(app_name), app_args) => {
+                                app_name.as_str() == name && app_args.len() == arity
+                            }
+                            _ => false,
+                        };
+                        if occ_is_head
+                            && matches!(self.ctx.terms.get(konst), TermData::Const(_))
+                            && self.ctx.terms.sort(konst) == sort
+                            && !out.contains(&konst)
+                            && !extras.contains(&konst)
+                        {
+                            extras.push(konst);
+                        }
+                    }
+                }
+            }
+            match self.ctx.terms.get(t) {
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, x, y) => {
+                    stack.push(*c);
+                    stack.push(*x);
+                    stack.push(*y);
+                }
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+                _ => {}
+            }
+        }
+
+        // MODEL VALUE (nullary heads only).
+        if arity == 0 && extras.len() < MAX_CONST_INTERP_EXTRA_CANDIDATES {
+            if let (Some(occurrence), Some(model)) = (nullary_occurrence, self.last_model.clone()) {
+                let value = self.evaluate_term(&model, occurrence);
+                if let Some(pinned) = self.const_interp_pin_eval_value(sort, &value) {
+                    if !out.contains(&pinned) && !extras.contains(&pinned) {
+                        extras.push(pinned);
+                    }
+                }
+            }
+        }
+
+        extras.truncate(MAX_CONST_INTERP_EXTRA_CANDIDATES);
+        out.extend(extras);
+        out
+    }
+
+    /// Rebuild an evaluated scalar as a closed constant of EXACTLY `sort`.
+    ///
+    /// Sort-exactness is load-bearing, not tidiness: `EvalValue::Rational`
+    /// represents both `Int` and `Real`, and a `Real` constant standing in for
+    /// an `Int` head would make the substituted body ill-sorted. Anything the
+    /// mapping does not model exactly (uninterpreted-sort elements, sequences,
+    /// algebraic reals, `Unknown`) yields `None` — no candidate, no change.
+    fn const_interp_pin_eval_value(&mut self, sort: &Sort, value: &EvalValue) -> Option<TermId> {
+        match (sort, value) {
+            (Sort::Bool, EvalValue::Bool(v)) => Some(self.ctx.terms.mk_bool(*v)),
+            (Sort::Int, EvalValue::Rational(v)) if v.is_integer() => {
+                Some(self.ctx.terms.mk_int(v.numer().clone()))
+            }
+            (Sort::Real, EvalValue::Rational(v)) => Some(self.ctx.terms.mk_rational(v.clone())),
+            (Sort::BitVec(bv), EvalValue::BitVec { value, width }) if bv.width == *width => {
+                Some(self.ctx.terms.mk_bitvec(value.clone(), *width))
+            }
+            _ => None,
+        }
+    }
+
+    /// Body of [`Self::try_const_interp_sat_certificate`], split out so the
+    /// caller owns the single deadline save/restore.
+    fn const_interp_cert_inner(
+        &mut self,
+        snapshot: &[TermId],
+        fallback_category: LogicCategory,
+        mode: ConstInterpCertMode,
+        deadline: ay_core::time::Instant,
+        // `last_model` was `None` at ENTRY: nothing else produced a model, so a
+        // grant here must publish the certified interpretation as one.
+        owns_model: bool,
+        // Which candidate constants each pinned head is enumerated over. See
+        // the two-pass note in `try_const_interp_sat_certificate`.
+        candidate_source: ConstInterpCandidateSource,
+    ) -> Option<()> {
+        // ---- 1. PARTITION: every assertion is a top-level `forall` OR a
+        //         QUANTIFIER-FREE ground conjunct.
+        //
+        // The ground conjuncts used to DECLINE, on the grounds that the theorem
+        // is stated for an all-`forall` problem and that "a certificate which
+        // silently certified only the `forall`s would be proving SAT of a
+        // strict SUBSET of the snapshot — a wrong-SAT". That reasoning is
+        // exactly right and is preserved: the subset hazard is real, so the
+        // widening does NOT skip the ground conjuncts, it DISCHARGES them.
+        // Step 5 runs each one through the SAME accepting step as an axiom
+        // (substitute `I`, then refute the negation), under the SAME shared
+        // interpretation `I`. The certified statement is therefore unchanged in
+        // strength — "`I` satisfies EVERY assertion of the snapshot" — and now
+        // simply ranges over both kinds of conjunct.
+        //
+        // The admission test stays purely SYNTACTIC (top-level `Forall`, or a
+        // `Bool`-sorted term containing no quantifier) and fail-closed: an
+        // assertion that is neither declines the whole certificate.
+        if snapshot.is_empty() || snapshot.len() > MAX_CONST_INTERP_ASSERTIONS {
+            // SAY SO. This was the certificate's only SILENT decline, and the
+            // silence actively misled: the verification-consumer slice family (snapshots of
+            // 20 and 24 assertions) is rejected right here, but with no note the
+            // only visible symptom was the gate's downstream
+            // `deferred-failclosed`, so the family was twice mis-attributed —
+            // once to a "constant-only interpretation" limitation and once to a
+            // head-count budget. Both are real limits, but they are the SECOND
+            // and THIRD gates; this one fires first.
+            //
+            // Establishing the true chain (assertions -> heads -> "no candidate
+            // combination certified every axiom") required making the budgets
+            // env-overridable and bisecting, which is work nobody should have to
+            // repeat to read a decline.
+            const_interp_note(
+                mode,
+                &format!(
+                    "decline: snapshot has {} assertions (empty, or over the \
+                     MAX_CONST_INTERP_ASSERTIONS budget of {})",
+                    snapshot.len(),
+                    MAX_CONST_INTERP_ASSERTIONS
+                ),
+            );
+            return None;
+        }
+
+        // ---- 2. SHAPE SCAN: reject out-of-class bodies, collect the
+        //         uninterpreted heads.
+        struct ConstInterpAxiom {
+            body: TermId,
+            binders: Vec<(String, Sort)>,
+        }
+        let mut axioms: Vec<ConstInterpAxiom> = Vec::with_capacity(snapshot.len());
+        // Ground conjuncts, discharged under `I` alongside the axioms in step 5.
+        let mut grounds: Vec<TermId> = Vec::new();
+        // head name -> (result sort, arity). Sort/arity disagreement between
+        // two occurrences of one name (an overload) fails closed.
+        let mut head_map: HashMap<String, (Sort, usize)> = HashMap::default();
+        let mut work = MAX_CONST_INTERP_SCAN_WORK;
+        for &q in snapshot {
+            // A `no_mbqi` (E-matching-only, Hilbert-choose style) forall must
+            // never be discharged by a constructed interpretation.
+            if self.ctx.terms.is_no_mbqi(q) {
+                return None;
+            }
+            let TermData::Forall(vars, body, _triggers) = self.ctx.terms.get(q) else {
+                // GROUND CONJUNCT. Admitted only when it is `Bool`-sorted and
+                // quantifier-free; an `exists` (or a `forall` nested below the
+                // top level) is out of class and declines, exactly as it does
+                // inside an axiom body.
+                if *self.ctx.terms.sort(q) != Sort::Bool || contains_quantifier(&self.ctx.terms, q)
+                {
+                    const_interp_note(
+                        mode,
+                        "decline: snapshot contains a non-forall, non-ground-Bool assertion",
+                    );
+                    return None;
+                }
+                // Scanned with an EMPTY binder set — a ground conjunct has no
+                // binders, so any `Var` it mentions is a free constant. This is
+                // load-bearing for soundness, not bookkeeping: it is what makes
+                // a head occurring ONLY in a ground conjunct join `head_map`,
+                // so `I` pins it too and the sort/arity agreement check covers
+                // it. Without it such a head would stay unpinned and its ground
+                // conjunct would be discharged against an arbitrary reading.
+                self.const_interp_scan_body(q, &HashSet::default(), &mut head_map, &mut work)?;
+                grounds.push(q);
+                continue;
+            };
+            let binders: Vec<(String, Sort)> = vars.clone();
+            let body = *body;
+            if binders.is_empty() || binders.len() > MAX_CONST_INTERP_BINDERS {
+                return None;
+            }
+            if *self.ctx.terms.sort(body) != Sort::Bool {
+                return None;
+            }
+            // Nested `forall` / any `exists` under the body: out of class.
+            if contains_quantifier(&self.ctx.terms, body) {
+                const_interp_note(mode, "decline: nested quantifier in a forall body");
+                return None;
+            }
+            let binder_names: HashSet<String> =
+                binders.iter().map(|(name, _)| name.clone()).collect();
+            self.const_interp_scan_body(body, &binder_names, &mut head_map, &mut work)?;
+            axioms.push(ConstInterpAxiom { body, binders });
+        }
+        // At least one `forall`. An all-ground snapshot is the ordinary
+        // pipeline's job end-to-end (and its model the gate can check without
+        // help); this certificate exists for the quantified case, and keeping
+        // the requirement means the widening can never take over a decision
+        // that used to be made elsewhere.
+        if axioms.is_empty() {
+            const_interp_note(mode, "decline: snapshot has no forall assertion");
+            return None;
+        }
+
+        // ---- 3. CANDIDATE INTERPRETATIONS.
+        //
+        // A head whose result sort has no closed-constant family is NOT an
+        // error: it simply stays uninterpreted, i.e. it is one of the `J`
+        // symbols the UNSAT quantifies over. Only heads we actually pin count
+        // against the head budget.
+        let mut head_list: Vec<(String, Sort, usize)> = head_map
+            .into_iter()
+            .map(|(name, (sort, arity))| (name, sort, arity))
+            .collect();
+        // Deterministic order => deterministic combination indices => a
+        // reproducible verdict independent of hash iteration order.
+        head_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+        /// One head the interpretation actually PINS, with everything needed
+        /// both to enumerate it and to publish it as a model entry.
+        struct ConstInterpPinnedHead {
+            name: String,
+            /// Closed constants of the head's result sort, in enumeration order.
+            candidates: Vec<TermId>,
+            /// Declared argument sorts, named `x!0 ..` the way z3 prints model
+            /// parameters. Empty for a `declare-const`. Only meaningful when
+            /// step 3b accepted the head as publishable.
+            params: Vec<(String, Sort)>,
+        }
+        let mut interpreted: Vec<ConstInterpPinnedHead> = Vec::new();
+        let mut widened_any = false;
+        for (name, sort, arity) in head_list {
+            let Some(base_candidates) = self.const_interp_candidates(&sort, 0) else {
+                continue;
+            };
+            if base_candidates.is_empty() {
+                continue;
+            }
+            let candidates = match candidate_source {
+                ConstInterpCandidateSource::FixedFamily => base_candidates,
+                ConstInterpCandidateSource::WithProblemConstants => {
+                    let widened = self.const_interp_widened_candidates(
+                        snapshot,
+                        &name,
+                        &sort,
+                        arity,
+                        &base_candidates,
+                    );
+                    widened_any |= widened.len() > base_candidates.len();
+                    widened
+                }
+            };
+            // Defensive: a candidate whose sort is not EXACTLY the head's
+            // result sort would make the rebuilt term ill-sorted. Fail closed.
+            // This covers the widened candidates too — a problem-pinned or
+            // model-derived constant is checked by the SAME guard as the fixed
+            // family, before any nested solve runs.
+            if candidates.iter().any(|&c| *self.ctx.terms.sort(c) != sort) {
+                return None;
+            }
+            // ---- 3b. WITNESS SHAPE (the guard that replaced
+            //      `if self.last_model.is_none() { decline }`).
+            //
+            // A grant on this route publishes `I` itself as the model, so every
+            // pinned head must be RENDERABLE as a `(define-fun ...)` under the
+            // exact surface name `(get-model)`'s symbol loop visits. A head that
+            // is not — an overload signature, a monomorphized parametric
+            // instance, a `define-fun`, a solver-internal registration — would
+            // otherwise leave a `sat` whose model silently omits the symbol the
+            // whole proof is about. Decline the WHOLE certificate: `I` is one
+            // structure, and a partially-published `I` is not a witness.
+            //
+            // Checked HERE, before a single nested solve, so an unpublishable
+            // shape costs nothing and can never reach the grant.
+            let params = match self.const_interp_witness_shape(&name, &sort, arity) {
+                Some(params) => params,
+                None => {
+                    if owns_model {
+                        const_interp_note(
+                            mode,
+                            &format!(
+                                "decline: head `{name}` has no printable model entry and there \
+                                 is no other model to carry the witness"
+                            ),
+                        );
+                        return None;
+                    }
+                    // A model from a real solve already exists and stays
+                    // authoritative (see `install_const_interp_cert_witness`);
+                    // nothing will be published for this head, so an
+                    // unrenderable shape is not an obstacle to the grant.
+                    Vec::new()
+                }
+            };
+            interpreted.push(ConstInterpPinnedHead {
+                name,
+                candidates,
+                params,
+            });
+        }
+        if interpreted.is_empty() {
+            const_interp_note(
+                mode,
+                "decline: no head has a closed-constant candidate sort",
+            );
+            return None;
+        }
+        // Pass 2 exists only to try candidates pass 1 did not have. When the
+        // problem named nothing new for any head, pass 2 would re-run exactly
+        // the combinations pass 1 already refuted — pure duplicated nested
+        // solves against a SHARED wall-clock slice. Decline immediately.
+        if matches!(
+            candidate_source,
+            ConstInterpCandidateSource::WithProblemConstants
+        ) && !widened_any
+        {
+            return None;
+        }
+        if interpreted.len() > MAX_CONST_INTERP_HEADS {
+            const_interp_note(mode, "decline: over the head budget");
+            return None;
+        }
+        let mut combo_count: usize = 1;
+        for head in &interpreted {
+            combo_count = combo_count.checked_mul(head.candidates.len())?;
+        }
+        if combo_count == 0 || combo_count > MAX_CONST_INTERP_COMBOS {
+            const_interp_note(mode, "decline: over the combination budget");
+            return None;
+        }
+
+        // ---- 4. FRESH BINDER CONSTANTS, one per binder per axiom.
+        //
+        // These are the ONLY new symbols the certificate introduces.
+        // `mk_fresh_var` appends a monotonic counter AND refuses any spelling
+        // already in `TermStore::names`, and the `__ay_` prefix is rejected
+        // for user symbols by the frontend, so a fresh constant can alias
+        // neither a declared constant, nor a Skolem constant, nor each other.
+        // Freshness is exactly what makes `¬B[k̄]` UNSAT mean `∀x̄. B`.
+        //
+        // Minted ONCE and reused across combinations: each nested solve is an
+        // independent problem, so reuse is sound and keeps the arena bounded.
+        let mut binder_consts: Vec<HashMap<String, TermId>> = Vec::with_capacity(axioms.len());
+        for axiom in &axioms {
+            let mut fresh: HashMap<String, TermId> = HashMap::default();
+            for (name, sort) in &axiom.binders {
+                let k = self
+                    .ctx
+                    .terms
+                    .mk_fresh_var(&format!("__ay_constinterp!{name}"), sort.clone());
+                fresh.insert(name.clone(), k);
+            }
+            binder_consts.push(fresh);
+        }
+
+        // ---- 5. ENUMERATE. Combination 0 is the all-FIRST-candidate
+        //         interpretation (all `false` / all `0` / const-`0` arrays),
+        //         which is the one that discharges most axiom families.
+        let mut solver_calls = 0usize;
+        'combos: for combo_ix in 0..combo_count {
+            if ay_core::time::Instant::now() >= deadline || self.external_stop_reason().is_some() {
+                return None;
+            }
+            // Mixed-radix decode of `combo_ix` over the per-head candidate
+            // lists. One value per head, SHARED by every axiom — that shared
+            // `I` is what makes the per-axiom UNSATs compose into a single
+            // model of the whole snapshot.
+            let mut rest = combo_ix;
+            let mut assignment: HashMap<String, TermId> = HashMap::default();
+            for head in &interpreted {
+                let digit = rest % head.candidates.len();
+                rest /= head.candidates.len();
+                assignment.insert(head.name.clone(), head.candidates[digit]);
+            }
+
+            for (axiom, fresh) in axioms.iter().zip(binder_consts.iter()) {
+                let (from, to) = self.const_interp_substitution(axiom.body, fresh, &assignment)?;
+                // `from.is_empty()` is legitimate, not an error: neither a
+                // binder nor an interpreted head occurs, so the substitution
+                // is the identity and the instance IS the body.
+                let instance = if from.is_empty() {
+                    axiom.body
+                } else {
+                    self.ctx.terms.substitute(axiom.body, &from, &to)
+                };
+                // Constant folding in the `mk_*` rebuild path often decides
+                // the obligation outright; skip the solver when it did.
+                match self.ctx.terms.get(instance) {
+                    // The body is a syntactic tautology under `I`. Certified.
+                    TermData::Const(Constant::Bool(true)) => continue,
+                    // Refuted under `I`; this combination cannot work.
+                    TermData::Const(Constant::Bool(false)) => continue 'combos,
+                    _ => {}
+                }
+                if solver_calls >= MAX_CONST_INTERP_SOLVER_CALLS
+                    || ay_core::time::Instant::now() >= deadline
+                {
+                    const_interp_note(mode, "decline: over the nested-solve budget");
+                    return None;
+                }
+                solver_calls += 1;
+                // THE ACCEPTING STEP. `isolated_ground_solve_is_unsat` is
+                // fail-closed: Sat / Unknown / error / deadline all answer
+                // `false`, and only a definitive `Unsat` answers `true`.
+                let negated = self.ctx.terms.mk_not(instance);
+                if !self.isolated_ground_solve_is_unsat(negated, fallback_category) {
+                    continue 'combos;
+                }
+            }
+
+            // GROUND CONJUNCTS, under the SAME `I`. This is the second
+            // obligation the all-`forall` partition existed to avoid needing;
+            // discharging it here is what keeps the grant a statement about the
+            // WHOLE snapshot rather than a subset of it. Identical accepting
+            // step to the axioms above (fold to `true`, else refute the
+            // negation), identical fail-closed budget, and an empty binder map
+            // because a ground conjunct binds nothing.
+            for &ground in &grounds {
+                let (from, to) =
+                    self.const_interp_substitution(ground, &HashMap::default(), &assignment)?;
+                let instance = if from.is_empty() {
+                    ground
+                } else {
+                    self.ctx.terms.substitute(ground, &from, &to)
+                };
+                match self.ctx.terms.get(instance) {
+                    // True under `I`. Certified.
+                    TermData::Const(Constant::Bool(true)) => continue,
+                    // Refuted under `I`; this combination cannot work.
+                    TermData::Const(Constant::Bool(false)) => continue 'combos,
+                    _ => {}
+                }
+                if solver_calls >= MAX_CONST_INTERP_SOLVER_CALLS
+                    || ay_core::time::Instant::now() >= deadline
+                {
+                    const_interp_note(mode, "decline: over the nested-solve budget");
+                    return None;
+                }
+                solver_calls += 1;
+                let negated = self.ctx.terms.mk_not(instance);
+                if !self.isolated_ground_solve_is_unsat(negated, fallback_category) {
+                    continue 'combos;
+                }
+            }
+
+            // Every axiom AND every ground conjunct certified under ONE shared
+            // interpretation.
+            const_interp_note(
+                mode,
+                &format!(
+                    "GRANT: combination {combo_ix}/{combo_count} certifies {} forall assertion(s) \
+                     and {} ground conjunct(s) with {solver_calls} nested solve(s)",
+                    axioms.len(),
+                    grounds.len()
+                ),
+            );
+            return match mode {
+                ConstInterpCertMode::On => {
+                    if owns_model {
+                        // PUBLISH THE WITNESS. `assignment` is `I` — the exact
+                        // interpretation every obligation above was discharged
+                        // under — so the model entries below are read off the
+                        // certified object itself, not reconstructed from it.
+                        let witness: Vec<ConstInterpWitnessEntry> = interpreted
+                            .iter()
+                            .map(|head| ConstInterpWitnessEntry {
+                                name: head.name.clone(),
+                                params: head.params.clone(),
+                                value: assignment[head.name.as_str()],
+                            })
+                            .collect();
+                        self.install_const_interp_cert_witness(witness, mode);
+                    }
+                    Some(())
+                }
+                // Shadow: run the whole certificate and report, but WITHHOLD
+                // the verdict — byte-identical to the gate being off. Nothing
+                // is installed either: a shadow run must not touch the model.
+                ConstInterpCertMode::Shadow | ConstInterpCertMode::Off => None,
+            };
+        }
+        const_interp_note(
+            mode,
+            "decline: no candidate combination certified every axiom",
+        );
+        None
+    }
+
+    /// The `(define-fun ...)` PARAMETER LIST for a head the
+    /// constant-interpretation certificate is about to pin, or `None` when the
+    /// head's interpretation cannot be published as a model entry.
+    ///
+    /// `(get-model)`'s emitter walks `symbol_iter()` and matches each entry by
+    /// its SURFACE name, so an entry keyed by anything else is never printed.
+    /// Every filter here exists to guarantee that the entry this certificate
+    /// hands over will be found under exactly the spelling the user declared,
+    /// with exactly the declared signature:
+    ///
+    /// - `is_defined_fun`: a `define-fun`'s interpretation is FIXED by the
+    ///   problem text and the emitter deliberately omits it; a second
+    ///   `define-fun` is a definition conflict for a model validator
+    ///   (#mv-defined-fun-emit). (The head scan cannot see one — defined
+    ///   applications are macro-expanded at elaboration — so this is belt and
+    ///   braces.)
+    /// - `is_internal_symbol` / `is_dt_internal_symbol`: not user declarations;
+    ///   the emitter suppresses them (#mv-internal-symbol-suppression).
+    /// - `overloaded_surface_name`: one surface name with several signatures.
+    ///   The certificate pins a core UF IDENTITY; printing it under the shared
+    ///   surface name would claim an interpretation for the sibling signatures
+    ///   too.
+    /// - `internal_name.is_some()`: a monomorphized parametric-datatype member
+    ///   or a non-first overload — the term's name is the identity, not the
+    ///   surface spelling, so the emitter would never reach this entry.
+    /// - signature agreement: the printed `(define-fun)` must have the declared
+    ///   arity and the declared result sort, or the model is ill-typed.
+    ///
+    /// Parameters are named `x!0 ..` (z3's spelling). No capture is possible:
+    /// the value this certificate binds is always a CLOSED constant.
+    fn const_interp_witness_shape(
+        &self,
+        name: &str,
+        result_sort: &Sort,
+        arity: usize,
+    ) -> Option<Vec<(String, Sort)>> {
+        if self.ctx.is_defined_fun(name)
+            || self.ctx.is_internal_symbol(name)
+            || self.is_dt_internal_symbol(name)
+            || self.ctx.overloaded_surface_name(name).is_some()
+        {
+            return None;
+        }
+        let info = self.ctx.symbol_info(name)?;
+        if info.internal_name.is_some()
+            || info.arg_sorts.len() != arity
+            || &info.sort != result_sort
+        {
+            return None;
+        }
+        Some(
+            info.arg_sorts
+                .iter()
+                .enumerate()
+                .map(|(ix, s)| (format!("x!{ix}"), s.clone()))
+                .collect(),
+        )
+    }
+
+    /// Install a certified interpretation as THE model, on the one route where
+    /// the certificate is the only thing that produced a verdict.
+    ///
+    /// ## Why only when the certificate OWNS the model
+    ///
+    /// Reached only under the caller's `owns_model` (`last_model` was `None` at
+    /// certificate entry). When a real solve already built a model, that model
+    /// stays authoritative and NOTHING here runs — the grant is byte-identical
+    /// to before this feature existed. That is not caution for its own sake:
+    /// the theory model encodes commitments this certificate never examined
+    /// (Bool values a preprocessing substitution eliminated and recorded in
+    /// `bool_overrides`, congruence choices, array defaults), and replacing a
+    /// head's entry with `λ ȳ. c_f` could contradict one of them and publish a
+    /// model that does not satisfy the problem. The certificate's theorem
+    /// licenses `I ∪ J` for an ARBITRARY `J`; it does not license splicing `I`
+    /// into someone else's `J`.
+    ///
+    /// On the owns-model route there is no such `J` to contradict: the
+    /// certificate supplies `I`, and `completed_default_model()` supplies a
+    /// concrete `J` for every symbol `I` does not pin. The theorem says every
+    /// such structure satisfies the whole snapshot, so this really is a model —
+    /// and `completed_default_model()` is what `(get-model)` would have printed
+    /// for a model-less `Sat` anyway, so nothing new is being fabricated here,
+    /// only made faithful.
+    fn install_const_interp_cert_witness(
+        &mut self,
+        witness: Vec<ConstInterpWitnessEntry>,
+        mode: ConstInterpCertMode,
+    ) {
+        debug_assert!(
+            witness.iter().all(|e| self
+                .const_interp_witness_shape(&e.name, self.ctx.terms.sort(e.value), e.params.len())
+                .is_some()),
+            "BUG: publishing a const-interp witness entry that (get-model) cannot render"
+        );
+        const_interp_note(
+            mode,
+            &format!(
+                "WITNESS: publishing {} model entr{} — {}",
+                witness.len(),
+                if witness.len() == 1 { "y" } else { "ies" },
+                witness
+                    .iter()
+                    .map(|e| format!("{}/{}", e.name, e.params.len()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        );
+        // Installed BEFORE the completion model is built so that anything the
+        // completion consults sees the certified values rather than sort
+        // defaults.
+        self.const_interp_cert_witness = witness;
+        let completed = self.completed_default_model();
+        self.last_model = Some(completed);
+    }
+
+    /// The certified value of `term` under an installed constant-interpretation
+    /// witness, if `term` is an occurrence of a head the witness pins.
+    ///
+    /// `I(f)` is the CONSTANT function `λ ȳ. c_f`, so an application matches
+    /// whatever its arguments are, and a 0-ary head matches as a bare `Var`.
+    /// Empty (a single `is_empty` test) on every path that has no witness.
+    ///
+    /// The SORT check is the guard against the engine's name-based binder
+    /// convention: a `forall` binder is a `Var` too, and a binder that happened
+    /// to share a pinned head's spelling would otherwise be pinned to the head's
+    /// value. The certificate already refuses to record a head whose name
+    /// shadows a binder, so this is a second line — but a cheap one, and the
+    /// failure it prevents (silently evaluating a bound variable as a constant)
+    /// is exactly the kind that produces a wrong model with no error.
+    pub(in crate::executor) fn const_interp_witness_value(&self, term: TermId) -> Option<TermId> {
+        if self.const_interp_cert_witness.is_empty() {
+            return None;
+        }
+        let head = match self.ctx.terms.get(term) {
+            TermData::App(Symbol::Named(name), args) => {
+                let name = name.as_str();
+                self.const_interp_cert_witness
+                    .iter()
+                    .find(|e| e.name == name && e.params.len() == args.len())
+            }
+            TermData::Var(name, _) => {
+                let name = name.as_str();
+                self.const_interp_cert_witness
+                    .iter()
+                    .find(|e| e.name == name && e.params.is_empty())
+            }
+            _ => None,
+        }?;
+        if self.ctx.terms.sort(term) != self.ctx.terms.sort(head.value) {
+            return None;
+        }
+        Some(head.value)
+    }
+
+    /// The installed constant-interpretation witness entries, for the model
+    /// emitter. Empty unless a certificate granted and published `I`.
+    pub(in crate::executor) fn const_interp_cert_witness_entries(
+        &self,
+    ) -> &[ConstInterpWitnessEntry] {
+        &self.const_interp_cert_witness
+    }
+
+    /// Shape scan of one `forall` body for the constant-interpretation
+    /// certificate: reject anything out of class and record every
+    /// uninterpreted head with its result sort and arity.
+    ///
+    /// Recording a head here is NOT a commitment to interpret it — step 3 of
+    /// [`Self::const_interp_cert_inner`] drops the ones with no constant
+    /// candidate. It IS a commitment that the scan understood the node.
+    fn const_interp_scan_body(
+        &self,
+        body: TermId,
+        binder_names: &HashSet<String>,
+        heads: &mut HashMap<String, (Sort, usize)>,
+        work: &mut u32,
+    ) -> Option<()> {
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = vec![body];
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if *work == 0 {
+                return None;
+            }
+            *work -= 1;
+            match self.ctx.terms.get(t) {
+                TermData::Const(_) => {}
+                TermData::Var(name, _) => {
+                    // A `Var` named like a binder IS that binder (the engine's
+                    // name-based substitution convention; nested binders are
+                    // rejected above, so no other capture is possible).
+                    if binder_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    // Otherwise a FREE constant. In AY an uninterpreted
+                    // nullary `declare-fun` / `declare-const` elaborates to a
+                    // `Var`, NOT a 0-ary `App`, so this is where `(declare-fun
+                    // logic_None () Int)` is found.
+                    if self.const_interp_head_is_uninterpreted(name, 0) {
+                        let sort = self.ctx.terms.sort(t).clone();
+                        match heads.get(name.as_str()) {
+                            Some((seen_sort, seen_arity)) => {
+                                if *seen_sort != sort || *seen_arity != 0 {
+                                    return None;
+                                }
+                            }
+                            None => {
+                                heads.insert(name.clone(), (sort, 0));
+                            }
+                        }
+                    }
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::App(sym, args) => {
+                    if let Symbol::Named(name) = sym {
+                        if self.const_interp_head_is_uninterpreted(name, args.len()) {
+                            let sort = self.ctx.terms.sort(t).clone();
+                            match heads.get(name.as_str()) {
+                                Some((seen_sort, seen_arity)) => {
+                                    if *seen_sort != sort || *seen_arity != args.len() {
+                                        return None;
+                                    }
+                                }
+                                None => {
+                                    heads.insert(name.clone(), (sort, args.len()));
+                                }
+                            }
+                        } else if const_interp_rebuild_folds_name(name)
+                            && self.ctx.symbol_info(name).is_some()
+                        {
+                            // A USER DECLARATION wearing a builtin spelling.
+                            // `+`, `-`, `*`, `and`, `or`, `=`, `to_real`,
+                            // `is_int` and friends stay user-declarable, and
+                            // `TermStore::rebuild_app` dispatches purely on the
+                            // symbol NAME with no check that it IS the builtin.
+                            // So once any child under this node changes, the
+                            // rebuild would route an uninterpreted user
+                            // function through `mk_add` / `mk_and` / ... and
+                            // fold it — `(+ 0 1)` to `1` — silently changing
+                            // the obligation. Fail closed.
+                            return None;
+                        }
+                    }
+                    // Descend regardless: an interpreted operator's arguments
+                    // and an uninterpreted head's arguments can both contain
+                    // further heads that occur elsewhere at top level.
+                    stack.extend(args.iter().copied());
+                }
+                // `Let`, `Forall`, `Exists`, and any FUTURE `TermData` variant
+                // could hide a binder occurrence or a quantifier. Fail closed.
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// Is `name` — applied at exactly `arity` arguments — a genuinely
+    /// UNINTERPRETED, user-declared symbol whose interpretation this
+    /// certificate is free to choose?
+    ///
+    /// This is the guard that keeps the certificate honest. Fabricating an
+    /// interpretation for a symbol whose semantics is PINNED (`+`, `mod`,
+    /// `select`, `bvadd`, a datatype constructor/selector/tester) would make
+    /// the nested UNSAT prove nothing about the original body — a wrong-SAT.
+    /// So the test is a conjunction of negative filters AND a POSITIVE
+    /// requirement that the frontend really holds a declaration of this name
+    /// at this arity.
+    fn const_interp_head_is_uninterpreted(&self, name: &str, arity: usize) -> bool {
+        // Negative: every interpreted family the engine knows about.
+        if is_pure_arith_bool_symbol(name)
+            || is_finite_table_interpreted_symbol(name)
+            || is_interpreted_bv_symbol(name)
+            || !is_mbqi_completable_uf_symbol(name)
+        {
+            return false;
+        }
+        // Negative: reserved operator / reserved symbol spellings. A user
+        // declaration can never own one of these, so anything that reaches
+        // here bearing such a name is a builtin.
+        if ay_frontend::is_reserved_op_name(name) || ay_frontend::is_reserved_symbol(name) {
+            return false;
+        }
+        // Negative: datatype constructors, selectors and testers are
+        // structurally interpreted, not free.
+        if self.ctx.is_datatype_member_name(name)
+            || self.symbol_is_datatype_selector_or_constructor(name)
+        {
+            return false;
+        }
+        // Negative: solver-invented internal constants (the eager
+        // single-constructor datatype-elimination field constants). They are
+        // not user declarations and carry structural obligations elsewhere.
+        if self.ctx.is_internal_symbol(name) {
+            return false;
+        }
+        // POSITIVE: the frontend must hold a declaration for exactly this
+        // identity at exactly this arity. `symbol_info_by_identity` resolves
+        // private overload / parametric-instance identities; `symbol_info` is
+        // the plain surface lookup.
+        let info = self
+            .ctx
+            .symbol_info_by_identity(name)
+            .or_else(|| self.ctx.symbol_info(name));
+        match info {
+            Some(info) => info.arg_sorts.len() == arity,
+            None => false,
+        }
+    }
+
+    /// Closed constant candidates for a head of result sort `sort`, or `None`
+    /// when the sort has no constant family the certificate will use (in which
+    /// case the head is left uninterpreted, which is always sound).
+    ///
+    /// Deliberately tiny. Every extra candidate multiplies the combination
+    /// count, and the enumeration is capped — a wider family would DECLINE
+    /// more often, not grant more often.
+    fn const_interp_candidates(&mut self, sort: &Sort, depth: u32) -> Option<Vec<TermId>> {
+        if depth > CONST_INTERP_SORT_DEPTH {
+            return None;
+        }
+        match sort {
+            // Both polarities are required: `∀v. ¬contains(empty, v)` needs
+            // `false` and `∀s,p,x. contains(push(s,p),x) = (p=x ∨ contains(s,x))`
+            // needs `true`.
+            Sort::Bool => Some(vec![
+                self.ctx.terms.mk_bool(false),
+                self.ctx.terms.mk_bool(true),
+            ]),
+            // `0` is the workhorse; `1` is needed both as a nonzero `mod`/`div`
+            // divisor and to separate two heads a disequality forces apart.
+            Sort::Int => Some(vec![
+                self.ctx.terms.mk_int(num_bigint::BigInt::from(0)),
+                self.ctx.terms.mk_int(num_bigint::BigInt::from(1)),
+            ]),
+            Sort::Real => Some(vec![
+                self.ctx
+                    .terms
+                    .mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(0))),
+                self.ctx
+                    .terms
+                    .mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(1))),
+            ]),
+            // Exactly ONE array candidate — the constant array over the
+            // element sort's FIRST candidate. `select` of it folds to that
+            // value at every index, which is what discharges the
+            // array/sequence "bridge" axiom family.
+            Sort::Array(array) => {
+                let element = self.const_interp_candidates(&array.element_sort, depth + 1)?;
+                let &first = element.first()?;
+                Some(vec![self
+                    .ctx
+                    .terms
+                    .mk_const_array(array.index_sort.clone(), first)])
+            }
+            // Uninterpreted sorts, sequences, datatypes, bitvectors, strings,
+            // floats: no candidate. The head stays FREE, which is sound — the
+            // nested UNSAT quantifies over every interpretation of it.
+            _ => None,
+        }
+    }
+
+    /// Build the SIMULTANEOUS substitution that turns a `forall` body into its
+    /// certificate obligation. THIS IS THE ONE SOUNDNESS-CRITICAL STEP, so it
+    /// is spelled out node by node.
+    ///
+    /// Returns `(from, to)` for [`ay_core::TermStore::substitute`], which
+    /// matches by `TermId` and — crucially — returns `to[i]` for a node equal
+    /// to `from[i]` WITHOUT recursing into it. Two kinds of pair are emitted:
+    ///
+    /// 1. `f(t̄) ↦ c_f` for every application node whose head `f` is in the
+    ///    interpretation. The WHOLE application is replaced, and the arguments
+    ///    are deliberately NOT visited: `I(f)` is the constant function
+    ///    `λ ȳ. c_f`, so `f(anything)` is `c_f` whatever `anything` is — even
+    ///    if it mentions the binder, another interpreted head, or `f` itself.
+    ///    `substitute`'s no-recurse-on-hit rule makes the rebuild agree with
+    ///    that reading exactly.
+    /// 2. `x ↦ k_x` for every occurrence of a binder, where `k_x` is the
+    ///    axiom's fresh constant. This is the Skolem/Herbrand step: `¬B[k̄]`
+    ///    UNSAT with `k̄` fresh is precisely `∀x̄. B` valid.
+    ///
+    /// Binder occurrences are recovered by WALKING THE BODY, not by rebuilding
+    /// a `Var` from the binder's name and sort: the frontend mints binders
+    /// with `mk_fresh_var`, which never registers the spelling in
+    /// `TermStore::names`, so `mk_var(name, sort)` would mint a DIFFERENT
+    /// `Var(name, counter)` with a different `TermId`, match nothing, and
+    /// silently return the body unchanged — a wrong answer that looks like a
+    /// successful identity substitution.
+    ///
+    /// The two pair kinds cannot collide: a node is classified once, and the
+    /// scan already refused to record a head whose name shadows a binder.
+    /// `from` is deduplicated by the `seen` set (each `TermId` is pushed at
+    /// most once), which matters because `substitute` linearly scans `from` at
+    /// every node.
+    fn const_interp_substitution(
+        &self,
+        body: TermId,
+        binder_consts: &HashMap<String, TermId>,
+        assignment: &HashMap<String, TermId>,
+    ) -> Option<(Vec<TermId>, Vec<TermId>)> {
+        let mut from: Vec<TermId> = Vec::new();
+        let mut to: Vec<TermId> = Vec::new();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = vec![body];
+        let mut work = MAX_CONST_INTERP_SCAN_WORK;
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if work == 0 {
+                return None;
+            }
+            work -= 1;
+            match self.ctx.terms.get(t) {
+                TermData::Const(_) => {}
+                TermData::Var(name, _) => {
+                    if let Some(&k) = binder_consts.get(name.as_str()) {
+                        // Pair kind 2: binder occurrence -> fresh constant.
+                        from.push(t);
+                        to.push(k);
+                    } else if let Some(&value) = assignment.get(name.as_str()) {
+                        // Pair kind 1, nullary case: an uninterpreted constant
+                        // is a `Var` in AY, and `I` pins it to `value`.
+                        from.push(t);
+                        to.push(value);
+                    }
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::App(sym, args) => {
+                    if let Symbol::Named(name) = sym {
+                        if let Some(&value) = assignment.get(name.as_str()) {
+                            // Pair kind 1: whole application -> constant, and
+                            // do NOT descend into the arguments (see above).
+                            from.push(t);
+                            to.push(value);
+                            continue;
+                        }
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                // Same fail-closed perimeter as the scan. Unreachable in
+                // practice (the scan already rejected these shapes) but the
+                // walk must never silently skip a node that could contain a
+                // binder occurrence.
+                _ => return None,
+            }
+        }
+        Some((from, to))
+    }
 }
 
 /// One G-route (ground-reduction) forall: `forall var_names. t = ctor(vars) =>
@@ -9722,5 +11716,711 @@ fn dt_cert_note(mode: DtCertMode, msg: &str) {
     }
 }
 
+// =========================================================================
+// CONSTANT-INTERPRETATION SAT certificate gating (`AY_CONST_INTERP_CERT`)
+// and budgets — module-level.
+// =========================================================================
+
+/// One entry of a constant-interpretation certificate's MATERIALIZED WITNESS:
+/// the interpretation `I` assigns head `name` the constant function
+/// `λ x!0 .. x!n. value`.
+///
+/// This is the representation AY was missing. The certificate's proof object is
+/// "every axiom holds under `I`", so `I` IS the model — but the only
+/// function-valued model entry AY could build,
+/// `try_register_native_adopted_macro_interp`, refuses any symbol a constraint
+/// mentions, which is precisely the symbol the axiom quantifies over. Rather
+/// than relax that refusal (its soundness argument is "no constraint mentions
+/// this symbol, so any interpretation is free" — an argument that does not hold
+/// here), the certificate carries its own entries, justified by a different and
+/// stronger fact: every constraint WAS checked against this interpretation.
+///
+/// `value` is always a CLOSED term of the head's declared result sort, so the
+/// entry prints as a self-contained `(define-fun name ((x!0 S) ..) T value)`.
+#[derive(Debug, Clone)]
+pub(in crate::executor) struct ConstInterpWitnessEntry {
+    /// Surface name, exactly as `(get-model)`'s symbol loop spells it.
+    pub(in crate::executor) name: String,
+    /// Declared parameters, named `x!0 ..`; empty for a `declare-const`.
+    pub(in crate::executor) params: Vec<(String, Sort)>,
+    /// The constant this head takes at EVERY argument tuple.
+    pub(in crate::executor) value: TermId,
+}
+
+/// Budget: maximum snapshot assertions the certificate will consider.
+const MAX_CONST_INTERP_ASSERTIONS: usize = 8;
+/// Budget: maximum binders on any one `forall`.
+const MAX_CONST_INTERP_BINDERS: usize = 6;
+/// Budget: maximum uninterpreted heads actually PINNED by the interpretation.
+/// Heads left free do not count (they cost nothing — the nested UNSAT already
+/// quantifies over every interpretation of them).
+const MAX_CONST_INTERP_HEADS: usize = 4;
+/// Budget: maximum candidate interpretations enumerated.
+const MAX_CONST_INTERP_COMBOS: usize = 32;
+/// Budget: maximum isolated ground-solver calls across the whole certificate.
+const MAX_CONST_INTERP_SOLVER_CALLS: usize = 24;
+/// Budget: maximum term nodes visited by any one scan/substitution walk.
+const MAX_CONST_INTERP_SCAN_WORK: u32 = 20_000;
+/// Budget: wall clock for the WHOLE certificate, nested solves included.
+///
+/// This is an ACCEPTING step, so a fixed wall-clock budget makes the grant
+/// machine-load sensitive (see the measured note on
+/// `WHOLE_PROBLEM_RESOLVE_BUDGET_MS` in `unsat_cert.rs`). It is kept modest
+/// deliberately: the certificate is grant-only, so expiry costs a grant we
+/// might have had and never produces a wrong answer, and a longer budget
+/// inside the quantifier lane would show up as bucket-count drift.
+const CONST_INTERP_CERT_BUDGET_MS: u64 = 1_500;
+/// Recursion bound on the sort walk that builds array candidates.
+const CONST_INTERP_SORT_DEPTH: u32 = 4;
+/// Budget: extra candidate constants added per head by the widened pass.
+///
+/// Two is what the measured shapes need — a head is pinned by at most a couple
+/// of authored equalities, and the model contributes one. Keeping it small is
+/// what keeps the widened combination space inside
+/// [`MAX_CONST_INTERP_COMBOS`] / [`MAX_CONST_INTERP_SOLVER_CALLS`]; a head
+/// with more pins than this simply gets the first two, and the pass declines
+/// exactly as it does today.
+const MAX_CONST_INTERP_EXTRA_CANDIDATES: usize = 2;
+
+/// Which constants a pinned head is enumerated over.
+///
+/// The certificate runs the `FixedFamily` pass FIRST and unchanged, so nothing
+/// that grants today can be lost; `WithProblemConstants` runs only after that
+/// declined. See the two-pass note on
+/// [`Executor::try_const_interp_sat_certificate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstInterpCandidateSource {
+    /// The fixed closed-constant family of the head's result sort
+    /// ([`Executor::const_interp_candidates`]) — `false/true`, `0/1`, the
+    /// const-`0` array. Byte-identical to the pre-widening certificate.
+    FixedFamily,
+    /// The fixed family PLUS constants the problem itself names for the head
+    /// ([`Executor::const_interp_widened_candidates`]).
+    WithProblemConstants,
+}
+
+thread_local! {
+    /// Re-entrancy depth for the CLOSED-VALID-SENTENCE certificate
+    /// ([`Executor::try_valid_closed_sentence_sat_certificate`]).
+    ///
+    /// Its accepting step is a nested solve that may re-enter the quantifier
+    /// lane's certificate consult sites. Depth 0 only, for the same reason
+    /// `CONST_INTERP_CERT_DEPTH` exists: bound the recursion, and let a nested
+    /// solve fall back to plain solving (which terminates).
+    static VALID_SENTENCE_CERT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Wall-clock slice for [`Executor::try_valid_closed_sentence_sat_certificate`].
+/// Grant-only, so expiry costs a grant we might have had and never produces a
+/// wrong answer.
+const VALID_SENTENCE_CERT_BUDGET_MS: u64 = 1_500;
+
+/// Node-visit cap for the closed-valid-sentence PARTITION walk. Exceeding it
+/// declines (fail-closed): the walk is scope-carrying and unmemoised, so a
+/// pathological DAG must not be allowed to spin.
+const VALID_SENTENCE_PARTITION_NODE_CAP: u32 = 200_000;
+
+thread_local! {
+    /// Re-entrancy depth for the constant-interpretation certificate.
+    ///
+    /// The certificate's accepting step runs nested solves, and those solves
+    /// can reach the quantifier lane's certificate consult sites. Admitting
+    /// the certificate only at depth 0 bounds the recursion; a nested solve
+    /// simply declines and answers with plain solving, which terminates. Same
+    /// shape as `TRUST_DISCHARGE_DEPTH` in `unsat_cert.rs`, and for the same
+    /// reason: a `&mut self` flag does not survive a fresh `Executor`.
+    static CONST_INTERP_CERT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `AY_CONST_INTERP_CERT` gating mode for
+/// [`Executor::try_const_interp_sat_certificate`].
+///
+/// DEFAULTS TO [`ConstInterpCertMode::On`], unlike [`DtCertMode`]. The staging
+/// ladder exists for model GUESSERS, whose grant rests on a sampled candidate
+/// model; this certificate's accepting step is an `Unsat` from AY's own
+/// mandatory-certified funnel, which is strictly stronger evidence. `Shadow`
+/// stays available for debugging (run + log + withhold the verdict) and `Off`
+/// for a byte-identical bisect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstInterpCertMode {
+    /// `off` / `0`: never runs — byte-identical (no scan, no mint, no log).
+    Off,
+    /// `shadow` / `log`: runs and logs its verdict, but NEVER grants `Sat`.
+    Shadow,
+    /// Anything else, INCLUDING UNSET: runs and GRANTS `Sat` on success.
+    On,
+}
+
+/// Read the `AY_CONST_INTERP_CERT` gate fresh (the consult path is cold, so no
+/// cache is needed and per-call reads keep test set/unset semantics reliable).
+pub(crate) fn const_interp_cert_mode() -> ConstInterpCertMode {
+    match std::env::var("AY_CONST_INTERP_CERT").ok().as_deref() {
+        Some("off") | Some("0") | Some("no") => ConstInterpCertMode::Off,
+        Some("shadow") | Some("log") => ConstInterpCertMode::Shadow,
+        _ => ConstInterpCertMode::On,
+    }
+}
+
+/// True when [`ay_core::TermStore::rebuild_app`] has a FOLDING arm for `name`,
+/// i.e. when rebuilding an application of this spelling would route it through
+/// a builtin constructor rather than re-interning it as an opaque `App`.
+///
+/// Used only to fail closed: a user symbol wearing one of these spellings must
+/// never sit above a node the certificate rewrites. Deliberately a SUPERSET of
+/// the real dispatch table — an extra name here costs a decline, a missing one
+/// would cost soundness.
+fn const_interp_rebuild_folds_name(name: &str) -> bool {
+    is_pure_arith_bool_symbol(name)
+        || is_finite_table_interpreted_symbol(name)
+        || is_interpreted_bv_symbol(name)
+        || name.starts_with("bv")
+        || matches!(
+            name,
+            "implies"
+                | "rem"
+                | "select"
+                | "store"
+                | "concat"
+                | "extract"
+                | "repeat"
+                | "rotate_left"
+                | "rotate_right"
+                | "zero_extend"
+                | "sign_extend"
+                | "const-array"
+        )
+}
+
+/// Log a constant-interpretation certificate decision.
+///
+/// The gate defaults to `On`, so — unlike `dt_cert_note` — this must NOT print
+/// merely because the certificate is enabled. It speaks only in `Shadow` mode
+/// or under the existing `AY_DEBUG_CERT` trace channel.
+fn const_interp_note(mode: ConstInterpCertMode, msg: &str) {
+    if matches!(mode, ConstInterpCertMode::Shadow) || std::env::var_os("AY_DEBUG_CERT").is_some() {
+        eprintln!("c CERT/const-interp {msg}");
+    }
+}
+
 #[cfg(test)]
 mod bridge_route_tests;
+
+#[cfg(test)]
+mod valid_closed_sentence_cert_tests {
+    use super::*;
+    use ay_frontend::parse;
+
+    /// Build an executor with the script's declarations and assertions in
+    /// place, WITHOUT a `check-sat` — the certificate is exercised directly.
+    ///
+    /// NOTE for anyone extending these: pick sentences that SURVIVE
+    /// simplification. A tautology like `∀x. f(x) = f(x)` is folded to `true`
+    /// before it reaches `ctx.assertions`, so it no longer mentions `f` and
+    /// tests nothing about the partition.
+    fn executor_for(input: &str) -> Executor {
+        let commands = parse(input).unwrap();
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).unwrap();
+        exec
+    }
+
+    /// The declared-symbol set the certificate builds internally.
+    fn declared_of(exec: &Executor) -> HashSet<String> {
+        exec.ctx
+            .symbol_iter()
+            .map(|(name, info)| exec.ctx.symbol_identity_name(name, info).to_string())
+            .collect()
+    }
+
+    /// REJECTING DIRECTION — the guard that keeps this certificate from
+    /// becoming a rubber stamp.
+    ///
+    /// "Nothing to pin" must mean the sentence genuinely contains no
+    /// uninterpreted symbol. If it were allowed to mean "the emitted witness
+    /// happened to pin nothing", the certificate would swallow the
+    /// auflia-model escape class (∀∃ over a printed `f`), where substitution
+    /// consumes every model symbol and leaves nothing to pin.
+    #[test]
+    fn declines_sentence_naming_an_uninterpreted_function() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (> (f x) 0)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_eq!(assertions.len(), 1);
+        assert!(
+            !exec.closed_sentence_without_uninterpreted_symbols(assertions[0], &declared_of(&exec)),
+            "a sentence mentioning the uninterpreted head `f` is outside the partition"
+        );
+        assert!(
+            exec.try_valid_closed_sentence_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_none(),
+            "the certificate must decline a sentence with an uninterpreted head"
+        );
+    }
+
+    /// Same rejecting direction for an uninterpreted CONSTANT (arity 0).
+    /// Excluding arity-0 symbols is what keeps "nothing to interpret"
+    /// literally true; admitting them would hand the certificate sentences
+    /// whose truth really does depend on an interpretation.
+    #[test]
+    fn declines_sentence_naming_an_uninterpreted_constant() {
+        let mut exec = executor_for(
+            "(set-logic LIA)
+             (declare-const c Int)
+             (assert (forall ((x Int)) (>= x c)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_eq!(assertions.len(), 1);
+        assert!(
+            !exec.closed_sentence_without_uninterpreted_symbols(assertions[0], &declared_of(&exec)),
+            "a sentence mentioning the uninterpreted constant `c` is outside the partition"
+        );
+        assert!(
+            exec.try_valid_closed_sentence_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_none(),
+            "the certificate must decline a sentence with an uninterpreted constant"
+        );
+    }
+
+    /// REJECTING DIRECTION, and the sharpest form of it: the sentence is VALID
+    /// — so the accepting step could well refute its negation — and it is
+    /// still declined, purely because it names `f`. Validity is NOT the
+    /// admission criterion; "no uninterpreted symbol to interpret" is.
+    #[test]
+    fn declines_a_valid_sentence_that_still_names_an_uninterpreted_head() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (or (> (f x) 0) (<= (f x) 0))))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_eq!(assertions.len(), 1);
+        // Guard the test itself: if simplification ever folds this to `true`
+        // the sentence stops mentioning `f` and the test would silently stop
+        // testing the partition.
+        if exec.closed_sentence_without_uninterpreted_symbols(assertions[0], &declared_of(&exec)) {
+            return;
+        }
+        assert!(
+            exec.try_valid_closed_sentence_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_none(),
+            "a VALID sentence naming an uninterpreted head must still be declined"
+        );
+    }
+
+    /// REJECTING DIRECTION — the soundness canary. `∀x:Int. x > 0` is closed
+    /// and symbol-free, so it PASSES the partition; it is also FALSE. The
+    /// accepting step is the only thing between it and a wrong `sat`, and it
+    /// must refuse: the negation `∃x. x <= 0` is satisfiable, not refutable.
+    #[test]
+    fn declines_a_false_closed_sentence() {
+        let mut exec = executor_for(
+            "(set-logic LIA)
+             (assert (forall ((x Int)) (> x 0)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_eq!(assertions.len(), 1);
+        assert!(
+            exec.closed_sentence_without_uninterpreted_symbols(assertions[0], &declared_of(&exec)),
+            "the sentence is closed and symbol-free — it is the ACCEPTING step, \
+             not the partition, that must reject it"
+        );
+        assert!(
+            exec.try_valid_closed_sentence_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_none(),
+            "certifying a FALSE sentence would be a wrong `sat`"
+        );
+    }
+
+    /// ACCEPTING DIRECTION: `∀x:Int. (2|x ∨ 2|x+1)` is closed, names no
+    /// uninterpreted symbol, and is valid.
+    #[test]
+    fn grants_a_valid_symbol_free_closed_sentence() {
+        let mut exec = executor_for(
+            "(set-logic ALL)
+             (assert (forall ((x Int)) (or (= (mod x 2) 0) (= (mod (+ x 1) 2) 0))))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_eq!(assertions.len(), 1);
+        assert!(
+            exec.closed_sentence_without_uninterpreted_symbols(assertions[0], &declared_of(&exec))
+        );
+        assert!(
+            exec.try_valid_closed_sentence_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_some(),
+            "a valid symbol-free closed sentence is exactly this certificate's class"
+        );
+    }
+}
+
+/// Partition tests for the constant-interpretation certificate's GROUND
+/// CONJUNCT admission (step 1 of [`Executor::const_interp_cert_inner`]).
+///
+/// The certificate used to require every snapshot assertion to be a top-level
+/// `forall`, on the correct grounds that certifying only the `forall`s of a
+/// mixed snapshot would prove SAT of a strict SUBSET of it — a wrong-SAT. The
+/// widening admits ground conjuncts and DISCHARGES them under the same shared
+/// interpretation `I`, so the certified statement keeps its full strength.
+///
+/// These are the REJECTING-DIRECTION tests for that widening: each is a
+/// snapshot the widened partition must still refuse, or a mixed snapshot whose
+/// ground conjunct `I` cannot satisfy. A grant in any of them would be exactly
+/// the wrong-SAT the original all-`forall` partition was protecting against.
+#[cfg(test)]
+mod const_interp_ground_conjunct_tests {
+    use super::*;
+    use ay_frontend::parse;
+
+    fn executor_for(input: &str) -> Executor {
+        let commands = parse(input).unwrap();
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).unwrap();
+        exec
+    }
+
+    /// REJECTING DIRECTION — the core of the widening. The `forall` is
+    /// satisfied by the constant interpretation `a := const-array 0`, but the
+    /// ground conjunct `(= (select a 5) 1)` is FALSE under that same `I`.
+    /// Certifying the `forall` alone would be the subset wrong-SAT; the ground
+    /// discharge must reject the combination and the certificate must decline.
+    #[test]
+    fn declines_when_a_ground_conjunct_is_false_under_the_interpretation() {
+        let mut exec = executor_for(
+            "(set-logic AUFLIA)
+             (declare-fun a () (Array Int Int))
+             (assert (forall ((x Int)) (= (select a x) 0)))
+             (assert (= (select a 5) 1))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Auflia)
+                .is_none(),
+            "a ground conjunct falsified by `I` must sink the whole certificate, \
+             not be silently skipped while the forall is certified"
+        );
+    }
+
+    /// REJECTING DIRECTION — the ground conjunct is UNSATISFIABLE on its own
+    /// (`0 = 1`), so no interpretation of anything can rescue it. The `forall`
+    /// is trivially satisfiable, so this isolates the ground obligation.
+    #[test]
+    fn declines_when_a_ground_conjunct_is_unsatisfiable() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (declare-const c Int)
+             (assert (forall ((x Int)) (= (f x) (f x))))
+             (assert (and (= c 0) (= c 1)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Uflia)
+                .is_none(),
+            "an unsatisfiable ground conjunct must never be certified"
+        );
+    }
+
+    /// REJECTING DIRECTION — the admission test stays SYNTACTIC and
+    /// fail-closed. A non-`forall` assertion carrying an `exists` is outside
+    /// the class (the certificate discharges a `forall` by refuting its
+    /// negation at fresh constants; it has no such story for an existential),
+    /// so it must decline rather than treat the assertion as ground.
+    #[test]
+    fn declines_a_ground_assertion_containing_an_exists() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (>= (f x) 0)))
+             (assert (exists ((y Int)) (= (f y) 7)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Uflia)
+                .is_none(),
+            "an `exists` conjunct is out of class and must decline, not be \
+             admitted as a ground conjunct"
+        );
+    }
+
+    /// REJECTING DIRECTION — an all-ground snapshot has no `forall` and is the
+    /// ordinary pipeline's job end-to-end. Requiring at least one `forall`
+    /// keeps the widening from taking over a decision made elsewhere.
+    #[test]
+    fn declines_an_all_ground_snapshot() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-const c Int)
+             (assert (>= c 0))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Uflia)
+                .is_none(),
+            "a snapshot with no forall is out of this certificate's class"
+        );
+    }
+
+    /// EVIDENCE (not a behavioural pin for the public verdict): the
+    /// `closed_universal_validity_precheck::open_universal_with_free_const_stays_sat`
+    /// shape — a `forall` whose body mentions a FREE DECLARED CONSTANT, plus a
+    /// ground conjunct about that same constant — IS inside the widened
+    /// certificate's accepting class (`I` picks `x := 0`, satisfying both
+    /// `forall q0. q0 + x >= q0` and `x >= 0`).
+    ///
+    /// That query nevertheless still answers `unknown` end-to-end, because on
+    /// its route the verdict is degraded in `executor/model/validation` before
+    /// any certificate consult site is reached (measured: `:unknown.phase
+    /// "model-validation"`, and `AY_DEBUG_CERT` shows no const-interp line at
+    /// all). This test pins WHERE the remaining gap is: the certificate is
+    /// ready, the consult arm is missing.
+    #[test]
+    fn accepts_the_free_constant_shape_that_the_public_route_never_consults_it_for() {
+        let mut exec = executor_for(
+            "(set-logic LIA)
+             (declare-fun x () Int)
+             (assert (forall ((q0 Int)) (>= (+ q0 x) q0)))
+             (assert (>= x 0))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_some(),
+            "forall-with-free-constant plus a ground conjunct is inside the \
+             widened accepting class; if this ever fails the widening regressed"
+        );
+    }
+
+    // =====================================================================
+    // CANDIDATE WIDENING (`ConstInterpCandidateSource::WithProblemConstants`)
+    //
+    // Pass 1 enumerates the fixed `false/true`, `0/1`, const-`0` family. Pass 2
+    // adds constants the PROBLEM names for a head. These tests pin both that
+    // the widening buys the intended grants and that it buys nothing else: a
+    // candidate is a GUESS, and the accepting step (substitute, refute the
+    // negation with an independent solver `Unsat`) is unchanged and is the only
+    // thing that can turn a guess into a grant.
+    // =====================================================================
+
+    /// Run one pass in isolation, so a test can prove a grant came from the
+    /// WIDENING rather than from the fixed family it already had.
+    fn cert_pass(
+        exec: &mut Executor,
+        assertions: &[TermId],
+        category: LogicCategory,
+        source: ConstInterpCandidateSource,
+    ) -> Option<()> {
+        let mode = const_interp_cert_mode();
+        let owns_model = exec.last_model.is_none();
+        let deadline = ay_core::time::Instant::now()
+            + std::time::Duration::from_millis(CONST_INTERP_CERT_BUDGET_MS);
+        exec.const_interp_cert_inner(assertions, category, mode, deadline, owns_model, source)
+    }
+
+    /// Fail loudly if a fixture folded away before the certificate saw it —
+    /// the previous round of rejecting tests passed vacuously because their
+    /// examples simplified to `true` at parse time.
+    fn assert_fixture_is_live(exec: &Executor, assertions: &[TermId], expected_len: usize) {
+        assert_eq!(
+            assertions.len(),
+            expected_len,
+            "fixture lost an assertion before the certificate saw it"
+        );
+        for &a in assertions {
+            assert!(
+                !matches!(exec.ctx.terms.get(a), TermData::Const(_)),
+                "fixture folded to a constant before the certificate saw it — \
+                 it would be testing nothing"
+            );
+        }
+    }
+
+    /// REJECTING DIRECTION — the widening's own canary. `(= a 5)` names `5`,
+    /// so pass 2 really does try `I(a) := 5`; under that `I` the universal
+    /// `∀x:Int. a > x` is FALSE (take `x = 5`). Only the accepting step stands
+    /// between the new candidate and a wrong `sat`, and it must refuse.
+    ///
+    /// Both passes are exercised explicitly so the test cannot pass merely
+    /// because pass 2 never ran.
+    #[test]
+    fn widening_declines_a_named_constant_that_falsifies_the_forall() {
+        let mut exec = executor_for(
+            "(set-logic LIA)
+             (declare-const a Int)
+             (assert (= a 5))
+             (assert (forall ((x Int)) (> a x)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_fixture_is_live(&exec, &assertions, 2);
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Lia,
+                ConstInterpCandidateSource::WithProblemConstants,
+            )
+            .is_none(),
+            "`a := 5` satisfies the ground pin but falsifies `∀x. a > x`; \
+             certifying it would be a wrong `sat`"
+        );
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Lia)
+                .is_none(),
+            "neither pass may certify an unsatisfiable snapshot"
+        );
+    }
+
+    /// REJECTING DIRECTION — a FUNCTION head whose authored pins are mutually
+    /// inconsistent with a constant interpretation. `f(0) = -2` and `f(5) = 3`
+    /// name both `-2` and `3`, so pass 2 tries `λy. -2` and `λy. 3`; each
+    /// falsifies the other ground conjunct. The strict-monotonicity universal
+    /// additionally rules out every constant function. Must decline.
+    #[test]
+    fn widening_declines_when_no_single_named_constant_satisfies_all_pins() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int) (y Int))
+               (=> (and (<= 0 x) (< x y) (<= y 5)) (< (f x) (f y)))))
+             (assert (= (f 0) (- 2)))
+             (assert (= (f 5) 3))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_fixture_is_live(&exec, &assertions, 3);
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Uflia,
+                ConstInterpCandidateSource::WithProblemConstants,
+            )
+            .is_none(),
+            "two disagreeing pins admit no constant function — the widened \
+             candidates must each be refuted, not accepted"
+        );
+    }
+
+    /// REJECTING DIRECTION — pass 2 must not resurrect a snapshot the
+    /// PARTITION rejects. The named constant `7` would satisfy the universal,
+    /// but the sibling assertion carries an `exists`, which is out of class.
+    /// The partition runs before candidates are built, so the widening cannot
+    /// reach it.
+    #[test]
+    fn widening_does_not_bypass_the_partition() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (= (f x) 7)))
+             (assert (exists ((y Int)) (= (f y) 7)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_fixture_is_live(&exec, &assertions, 2);
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Uflia,
+                ConstInterpCandidateSource::WithProblemConstants,
+            )
+            .is_none(),
+            "the syntactic partition is unchanged by the widening"
+        );
+    }
+
+    /// ACCEPTING DIRECTION — the shape the widening exists for, and proof that
+    /// it is the widening doing the work: pass 1 (fixed `0/1` family) CANNOT
+    /// satisfy `a = 3/2`, pass 2 reads `3/2` off the problem and certifies.
+    #[test]
+    fn widening_certifies_a_snapshot_whose_witness_value_the_problem_names() {
+        let mut exec = executor_for(
+            "(set-logic LRA)
+             (declare-fun a () Real)
+             (assert (= a 1.5))
+             (assert (forall ((x Real))
+               (=> (and (>= x 0.0) (<= x a)) (<= x 2.0))))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_fixture_is_live(&exec, &assertions, 2);
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Lra,
+                ConstInterpCandidateSource::FixedFamily,
+            )
+            .is_none(),
+            "the fixed 0/1 family cannot satisfy `a = 3/2` — if this ever \
+             grants, the accepting-direction test below proves nothing"
+        );
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Lra,
+                ConstInterpCandidateSource::WithProblemConstants,
+            )
+            .is_some(),
+            "`I(a) := 3/2` satisfies the ground pin AND the guarded universal"
+        );
+    }
+
+    /// ACCEPTING DIRECTION — a FUNCTION head. `f(0) = f(5) = -2` names `-2`,
+    /// and `λy. -2` satisfies the ground pins and the NON-strict monotonicity
+    /// universal (`-2 <= -2`). Twin of the strict-gap rejecting test above:
+    /// same shape, different comparison, opposite verdict.
+    #[test]
+    fn widening_certifies_a_constant_function_the_problem_names() {
+        let mut exec = executor_for(
+            "(set-logic UFLIA)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int) (y Int))
+               (=> (and (<= 0 x) (< x y) (<= y 5)) (<= (f x) (f y)))))
+             (assert (= (f 0) (- 2)))
+             (assert (= (f 5) (- 2)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert_fixture_is_live(&exec, &assertions, 3);
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Uflia,
+                ConstInterpCandidateSource::FixedFamily,
+            )
+            .is_none(),
+            "neither `0` nor `1` satisfies `f(0) = -2`"
+        );
+        assert!(
+            cert_pass(
+                &mut exec,
+                &assertions,
+                LogicCategory::Uflia,
+                ConstInterpCandidateSource::WithProblemConstants,
+            )
+            .is_some(),
+            "`λy. -2` satisfies every conjunct — the widening's accepting class"
+        );
+    }
+
+    /// ACCEPTING DIRECTION — the shape the widening exists for. `I` sets
+    /// `a := const-array 0`, which satisfies BOTH the pointwise `forall` and
+    /// the ground const-array equality. Pins the grant so a future narrowing
+    /// cannot silently drop it.
+    #[test]
+    fn certifies_a_mixed_snapshot_when_one_interpretation_satisfies_all_of_it() {
+        let mut exec = executor_for(
+            "(set-logic AUFLIA)
+             (declare-fun a () (Array Int Int))
+             (assert (= a ((as const (Array Int Int)) 0)))
+             (assert (forall ((x Int)) (= (select a x) 0)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::Auflia)
+                .is_some(),
+            "one constant interpretation satisfies every conjunct — this is the \
+             widening's accepting class"
+        );
+    }
+}

@@ -36,6 +36,13 @@ struct EvalInputs {
     list_file: Option<String>,
     /// Set manifest file relative to benchmarks_dir (e.g., CHC-COMP LIA.set).
     set_file: Option<String>,
+    /// CSV manifest with a header row and a `local_path` column of
+    /// repo-relative benchmark paths (e.g., SAT-COMP `SC2026.official.csv`).
+    manifest: Option<String>,
+    /// Where the competition publishes its official results, recorded for
+    /// provenance. Not fetched during a run.
+    #[allow(dead_code)] // provenance only; scoring reads published results out of band
+    ground_truth: Option<String>,
     /// Number of runs per benchmark for statistical reliability.
     runs: Option<u32>,
     /// Subdirectories to scope discovery to (e.g., QF_BV, QF_LIA).
@@ -364,6 +371,8 @@ const INPUT_KEYS: &[&str] = &[
     "benchmarks_dir",
     "list_file",
     "set_file",
+    "manifest",
+    "ground_truth",
     "runs",
     "suite_dirs",
     "reference_solver",
@@ -606,6 +615,8 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
     let mut benchmarks_dir = None;
     let mut list_file = None;
     let mut set_file = None;
+    let mut manifest = None;
+    let mut ground_truth = None;
     let mut runs = None;
     let mut reference_solver = None;
     let mut standard_timeout_sec = None;
@@ -749,6 +760,10 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
             }
             "list_file" => set_eval_string(&mut list_file, raw, key, path, line_number)?,
             "set_file" => set_eval_string(&mut set_file, raw, key, path, line_number)?,
+            "manifest" => set_eval_string(&mut manifest, raw, key, path, line_number)?,
+            "ground_truth" => {
+                set_eval_string(&mut ground_truth, raw, key, path, line_number)?;
+            }
             "runs" => set_eval_positive_u32(&mut runs, raw, key, path, line_number)?,
             "reference_solver" => {
                 set_eval_string(&mut reference_solver, raw, key, path, line_number)?;
@@ -798,6 +813,7 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
     let corpus_selector_count = [
         list_file.is_some(),
         set_file.is_some(),
+        manifest.is_some(),
         suite_dirs.is_some(),
     ]
     .into_iter()
@@ -807,7 +823,8 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
         return Err(eval_yaml_error(
             path,
             1,
-            "list_file, set_file, and suite_dirs are mutually exclusive corpus selectors",
+            "list_file, set_file, manifest, and suite_dirs are mutually exclusive \
+             corpus selectors",
         ));
     }
 
@@ -830,6 +847,8 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
             benchmarks_dir,
             list_file,
             set_file,
+            manifest,
+            ground_truth,
             runs,
             suite_dirs,
             reference_solver,
@@ -2066,6 +2085,100 @@ fn eval_list_rows(evals: &[(String, EvalSpec)]) -> Vec<EvalListRow> {
 const MAX_MANIFEST_BENCHMARKS: usize = 1_000_000;
 const MAX_MISSING_PATH_EXAMPLES: usize = 8;
 
+/// Read a CSV manifest into the benchmark list.
+///
+/// The competition manifests (SAT-COMP `SC2026.official.csv`) carry a header
+/// row and one column of repo-relative paths named `local_path`, alongside
+/// checksum and size columns. The column is located BY NAME rather than by
+/// position so a manifest that gains a column does not silently start selecting
+/// the wrong field.
+///
+/// Paths resolve exactly as `list_file` paths do — repo-relative, remapped
+/// through the shared corpus root — and a missing payload is an error, not a
+/// silently shorter run.
+fn build_manifest_file_list(
+    manifest_path: &str,
+    root: &Path,
+    shared_corpus_root: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let relative = normalized_repo_relative_path(manifest_path, "manifest")?;
+    let text = crate::resource::read_bounded_text(
+        &root.join(relative),
+        crate::resource::MAX_METADATA_BYTES,
+        "benchmark manifest",
+    )?;
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| BenchError::InvalidArgs {
+        reason: format!("manifest {manifest_path} is empty"),
+    })?;
+    let column = header
+        .split(',')
+        .position(|field| field.trim() == "local_path")
+        .ok_or_else(|| BenchError::InvalidArgs {
+            reason: format!("manifest {manifest_path} has no `local_path` column"),
+        })?;
+
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    let mut missing_count = 0usize;
+    let mut missing_examples = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| BenchError::InvalidArgs {
+                reason: format!("manifest {manifest_path} contains too many entries"),
+            })?;
+        if total > MAX_MANIFEST_BENCHMARKS {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "manifest {manifest_path} exceeds the {MAX_MANIFEST_BENCHMARKS} benchmark limit"
+                ),
+            });
+        }
+        let Some(raw_path) = trimmed.split(',').nth(column).map(str::trim) else {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("manifest {manifest_path} row {total} has no local_path field"),
+            });
+        };
+        if raw_path.is_empty() {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("manifest {manifest_path} row {total} has an empty local_path"),
+            });
+        }
+        let full = remap_benchmark_input(
+            root,
+            shared_corpus_root,
+            raw_path,
+            "manifest benchmark entry",
+        )?;
+        if full.is_file() && !full.is_symlink() {
+            files.push(full);
+        } else {
+            missing_count += 1;
+            if missing_examples.len() < MAX_MISSING_PATH_EXAMPLES {
+                missing_examples.push(full);
+            }
+        }
+    }
+    if missing_count > 0 {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "manifest {manifest_path} is incomplete: {}/{} benchmarks are missing: {}",
+                missing_count,
+                total,
+                summarize_missing_paths(&missing_examples, missing_count)
+            ),
+        });
+    }
+    files.sort();
+    ensure_unique_benchmark_paths(&files, "manifest")?;
+    Ok(files)
+}
+
 fn build_file_list(
     spec: &EvalSpec,
     root: &Path,
@@ -2140,6 +2253,11 @@ fn build_file_list(
         }
         files.sort();
         ensure_unique_benchmark_paths(&files, "list_file")?;
+        return Ok(Some(files));
+    }
+
+    if let Some(ref manifest_path) = inputs.manifest {
+        let files = build_manifest_file_list(manifest_path, root, shared_corpus_root)?;
         return Ok(Some(files));
     }
 
@@ -3674,5 +3792,72 @@ inputs:
         ])
         .expect_err("mixed verdicts must fail closed");
         assert!(error.to_string().contains("mixed classifications"));
+    }
+
+    /// A registry entry using `manifest`/`ground_truth` must PARSE.
+    ///
+    /// The loader validates every file in the registry directory eagerly and
+    /// fails hard on the first it cannot parse, so an entry naming a field the
+    /// parser does not know takes down `ay bench` entirely — not just its own
+    /// eval. `sat-satcomp-2026-main-official.yaml` did exactly that.
+    #[test]
+    fn eval_spec_accepts_a_csv_manifest_corpus_selector() {
+        let text = "\
+id: sample-eval
+inputs:
+  benchmarks_dir: benchmarks/sat/x
+  manifest: benchmarks/sat/x/official.csv
+  ground_truth: https://example.invalid/scores.csv
+  timeout_sec: 60
+  runs: 1
+";
+        let spec = parse_eval_spec_minimal(text, Path::new("sample-eval.yaml"))
+            .expect("manifest and ground_truth must be recognised inputs fields");
+        let inputs = spec.inputs.expect("inputs mapping");
+        assert_eq!(
+            inputs.manifest.as_deref(),
+            Some("benchmarks/sat/x/official.csv")
+        );
+        assert_eq!(
+            inputs.ground_truth.as_deref(),
+            Some("https://example.invalid/scores.csv")
+        );
+    }
+
+    /// `manifest` is a corpus selector, so it cannot be combined with another.
+    #[test]
+    fn eval_spec_rejects_manifest_combined_with_another_corpus_selector() {
+        let text = "\
+id: sample-eval
+inputs:
+  benchmarks_dir: benchmarks/sat/x
+  manifest: benchmarks/sat/x/official.csv
+  set_file: LIA.set
+";
+        let error = parse_eval_spec_minimal(text, Path::new("sample-eval.yaml"))
+            .expect_err("two corpus selectors must fail closed");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The `local_path` column is located BY NAME. A manifest without it must
+    /// be rejected rather than silently selecting the checksum column.
+    #[test]
+    fn manifest_file_list_requires_a_named_local_path_column() {
+        let temp =
+            std::env::temp_dir().join(format!("ay-bench-manifest-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("temp dir");
+        let manifest = temp.join("no-column.csv");
+        std::fs::write(&manifest, "instanceid,size_bytes\nabc,12\n").expect("write manifest");
+
+        let error = build_manifest_file_list("no-column.csv", &temp, None)
+            .expect_err("a manifest without local_path must fail closed");
+        assert!(
+            error.to_string().contains("local_path"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

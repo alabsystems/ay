@@ -237,6 +237,22 @@ pub trait SolverContext {
     /// Get all currently assigned literals (the trail)
     fn trail(&self) -> &[Literal];
 
+    /// Number of variables the solver currently has allocated.
+    ///
+    /// An extension that needs to MINT a fresh SAT variable mid-search (to name
+    /// a theory term that was never encoded) must know where the solver's
+    /// variable space currently ends, or it would alias its new term onto an
+    /// existing variable. `add_theory_lemma` already grows the solver for
+    /// out-of-range literals, so an extension may hand back a clause over ids
+    /// `>= num_vars()`.
+    ///
+    /// The default of 0 means "unknown"; a minting extension must treat that as
+    /// "cannot mint safely" and fall back to its previous behaviour rather than
+    /// guess an id. Only the real solver overrides this.
+    fn num_vars(&self) -> usize {
+        0
+    }
+
     /// Get the VSIDS activity score for a variable.
     ///
     /// Returns the current activity score used by the SAT solver's decision

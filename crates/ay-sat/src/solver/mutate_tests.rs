@@ -512,6 +512,48 @@ fn test_delete_clause_checked_lrat_clearlevel0_skips_when_unit_antecedent_missin
 }
 
 #[test]
+fn expired_deadline_preserves_lrat_delete_for_incremental_retry() {
+    let proof = ProofOutput::lrat_text(Vec::new(), 2);
+    let mut solver = Solver::with_proof_output(2, proof);
+    let support = Literal::positive(Variable(0));
+    let target = Literal::positive(Variable(1));
+
+    let support_idx = solver.add_clause_db(&[support], false);
+    let support_ref = ClauseRef(support_idx as u32);
+    let support_id = solver.clause_id(support_ref);
+    let reason_idx = solver.add_clause_db(&[target, support.negated()], false);
+    let reason_ref = ClauseRef(reason_idx as u32);
+    assign_level0_test_lit(&mut solver, support);
+    assign_level0_test_lit(&mut solver, target);
+    solver.var_data[support.variable().index()].reason = support_ref.0;
+    solver.var_data[target.variable().index()].reason = reason_ref.0;
+    solver.record_unit_proof_id_for_lit(support, support_id);
+    solver.refresh_reason_clause_marks();
+
+    solver.set_solve_deadline(Some(ay_core::time::Instant::now()));
+    let started = std::time::Instant::now();
+    let interrupted = solver.delete_clause_checked(reason_idx, ReasonPolicy::ClearLevel0);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    assert_eq!(interrupted, DeleteResult::Skipped);
+    assert!(solver.arena.is_active(reason_idx));
+    assert_eq!(
+        solver.var_reason(target.variable().index()),
+        Some(reason_ref),
+        "deadline truncation must not detach the live reason before retry"
+    );
+
+    solver.set_solve_deadline(None);
+    let retried = solver.delete_clause_checked(reason_idx, ReasonPolicy::ClearLevel0);
+    assert_eq!(retried, DeleteResult::Deleted);
+    assert!(!solver.arena.is_active(reason_idx));
+    assert_eq!(solver.var_reason(target.variable().index()), None);
+    assert!(
+        solver.visible_unit_proof_id_for_lit(target).is_some(),
+        "retry must materialize a checker-visible standalone unit before deletion"
+    );
+}
+
+#[test]
 fn test_delete_clause_checked_lrat_clearlevel0_skips_when_unit_antecedent_hidden() {
     let proof = ProofOutput::lrat_text(Vec::new(), 1);
     let mut solver = Solver::with_proof_output(2, proof);

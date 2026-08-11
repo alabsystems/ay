@@ -672,30 +672,628 @@ fn subset_of_var_rooted_alias_into_empty_is_fail_closed_unknown() {
 }
 
 // ---------------------------------------------------------------------------
+// Cardinality/membership coupling (#set-card-membership-lower-bound).
+// ---------------------------------------------------------------------------
+
+/// A concrete member makes cardinality zero impossible.  Until the set/LIA
+/// refutation has a strict proof lane the mandatory publication gate may
+/// return `unknown`; it must never publish the old, self-contradicting `sat`.
+#[test]
+fn concrete_member_with_zero_cardinality_is_never_sat() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member 1 s))
+(assert (= 0 (set.card s)))
+(check-sat)
+"#;
+    let out = solve(smt);
+    assert!(
+        matches!(verdict(&out), Some("unsat" | "unknown")),
+        "membership/cardinality contradiction was published as SAT:\n{out}"
+    );
+}
+
+/// Two known-distinct members cannot inhabit a singleton set.  This pins the
+/// distinct-value lower bound rather than merely the one-member special case.
+#[test]
+fn two_distinct_members_with_cardinality_one_are_never_sat() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member 1 s))
+(assert (set.member 2 s))
+(assert (= 1 (set.card s)))
+(check-sat)
+"#;
+    let out = solve(smt);
+    assert!(
+        matches!(verdict(&out), Some("unsat" | "unknown")),
+        "distinct-member lower bound was not enforced:\n{out}"
+    );
+}
+
+/// The lower bound counts values, not syntactic membership probes: the model
+/// may set `x = y`, so two symbolic probes with cardinality one remain SAT.
+#[test]
+fn two_symbolic_members_may_alias_in_a_singleton_set() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(declare-const x Int)
+(declare-const y Int)
+(assert (set.member x s))
+(assert (set.member y s))
+(assert (= 1 (set.card s)))
+(check-sat)
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
 // Fail-closed: out-of-fragment obligations return unknown, never guessed.
 // ---------------------------------------------------------------------------
 
-/// `set.union` has no sound ground membership semantics yet → unknown.
+/// Ground `set.union` membership is decided, not guessed.
+///
+/// This asserted `unknown` when union had no sound ground membership
+/// semantics. It does now: `1 ∈ s ∪ t` is plainly satisfiable (`s = {1}`), and
+/// AY returns a model for it. The fail-closed guarantee this section exists to
+/// protect is "never GUESSED", so the contradictory companion is asserted
+/// alongside -- answering `sat` to both would be the actual regression.
 #[test]
-fn union_is_fail_closed_unknown() {
-    let smt = r#"
+fn union_membership_is_decided_both_ways() {
+    let sat = r#"
 (set-logic QF_SET)
 (declare-const s (Set Int))
 (declare-const t (Set Int))
 (assert (set.member 1 (set.union s t)))
 (check-sat)
 "#;
-    assert_eq!(verdict(&solve(smt)), Some("unknown"));
+    assert_eq!(verdict(&solve(sat)), Some("sat"));
+
+    // `1 ∈ s ∪ t` while 1 is in neither operand is unsatisfiable.
+    let unsat = r#"
+(set-logic QF_SET)
+(declare-const s (Set Int))
+(declare-const t (Set Int))
+(assert (set.member 1 (set.union s t)))
+(assert (not (set.member 1 s)))
+(assert (not (set.member 1 t)))
+(check-sat)
+"#;
+    assert_eq!(verdict(&solve(unsat)), Some("unsat"));
 }
 
-/// `set.complement` over an unbounded domain → unknown (fail-closed).
+/// Ground `set.complement` membership over an unbounded domain, likewise.
+///
+/// `0 ∈ complement(s)` is satisfiable by `s = {}`; AY returns exactly that
+/// model. Paired with the contradiction so a blanket `sat` cannot pass.
 #[test]
-fn complement_is_fail_closed_unknown() {
-    let smt = r#"
+fn complement_membership_is_decided_both_ways() {
+    let sat = r#"
 (set-logic QF_SET)
 (declare-const s (Set Int))
 (assert (set.member 0 (set.complement s)))
 (check-sat)
 "#;
+    assert_eq!(verdict(&solve(sat)), Some("sat"));
+
+    // Nothing is in both a set and its complement.
+    let unsat = r#"
+(set-logic QF_SET)
+(declare-const s (Set Int))
+(assert (set.member 0 (set.complement s)))
+(assert (set.member 0 s))
+(check-sat)
+"#;
+    assert_eq!(verdict(&solve(unsat)), Some("unsat"));
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality model witnesses (#set-card-model-witness).
+//
+// A `sat` verdict must come with a model that SATISFIES the assertion. A free
+// `(Set Int)` constrained only by `(= 1 (set.card s))` used to answer `sat`
+// with `((as const (Array Int Bool)) false)` — the EMPTY set — while
+// `(get-value ((set.card s)))` answered `1`. The verdict was right and the
+// model self-contradicting. genuine z3 5.0.0 exhibits a real witness for the
+// native form (`(= 1 (set.size s))` -> `((as set.unique (FiniteSet Int)) 1 1)`).
+// ---------------------------------------------------------------------------
+
+/// Members of the printed `(Array _ Bool)` carrier: the number of store writes
+/// of `true` on top of a `false` default. Panics if the carrier is printed with
+/// the universal (`true`) default — a set of ANY finite cardinality must not be
+/// printed co-finite.
+fn printed_set_size(output: &str) -> usize {
+    assert!(
+        !output.contains(") true)\n") && !output.contains("Bool)) true)"),
+        "set carrier printed with the universal default:\n{output}"
+    );
+    output.matches(" true)").count()
+}
+
+/// The value `get-value` reports for the single requested term.
+fn get_value_int(output: &str) -> i64 {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("(((set.card"))
+        .unwrap_or_else(|| panic!("no get-value line in:\n{output}"));
+    let digits: String = line
+        .rsplit(')')
+        .find(|chunk| chunk.chars().any(|c| c.is_ascii_digit()))
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("bad get-value line: {line}"))
+}
+
+/// `(= 1 (set.card s))` over a free set: `sat` with a ONE-element model, and
+/// `get-value` agrees with the model that was printed.
+#[test]
+fn card_one_model_exhibits_one_element() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (= 1 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+}
+
+/// `(= 3 (set.card s))` yields a model with exactly three distinct elements.
+#[test]
+fn card_three_model_exhibits_three_elements() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (= 3 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 3, "{out}");
+    assert_eq!(get_value_int(&out), 3, "{out}");
+}
+
+/// `(= 0 (set.card s))` yields the empty set — and `get-value` says 0.
+#[test]
+fn card_zero_model_is_the_empty_set() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (= 0 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 0, "{out}");
+    assert_eq!(get_value_int(&out), 0, "{out}");
+}
+
+/// `1 ∈ s ∧ |s| = 2`: the model contains 1 plus exactly one other element.
+/// Before the fix the carrier printed as the UNIVERSAL set (`(store ((as const
+/// ..) true) 1 true)`), whose cardinality is not 2 by any reading.
+#[test]
+fn member_plus_card_two_model_has_the_member_and_one_more() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member 1 s))
+(assert (= 2 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 2, "{out}");
+    assert_eq!(get_value_int(&out), 2, "{out}");
+    assert!(
+        out.contains(" 1 true)"),
+        "member 1 missing from model:\n{out}"
+    );
+}
+
+/// `1 ∈ s ∧ |s| = 1`: the single element IS 1 — no invented extra, and the
+/// carrier is not the universal set.
+#[test]
+fn member_plus_card_one_model_is_exactly_that_member() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member 1 s))
+(assert (= 1 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+    assert!(
+        out.contains(" 1 true)"),
+        "member 1 missing from model:\n{out}"
+    );
+}
+
+/// A non-member is respected: `0 ∉ s ∧ |s| = 1` picks some element other than 0.
+#[test]
+fn card_witness_avoids_forced_non_members() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (not (set.member 0 s)))
+(assert (= 1 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+    assert!(
+        out.contains(" 0 false)"),
+        "non-member 0 lost from model:\n{out}"
+    );
+}
+
+/// Equated carriers get the SAME witness: `(= s t) ∧ |s| = 1` must not print
+/// `s = {0}` next to `t = ∅`.
+#[test]
+fn card_witness_is_shared_across_equated_carriers() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(declare-const t (Set Int))
+(assert (= s t))
+(assert (= 1 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    // Two carriers, one element each, printed identically.
+    assert_eq!(printed_set_size(&out), 2, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+    let carriers: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            l.trim_start().starts_with("(store") || l.trim_start().starts_with("((as const")
+        })
+        .collect();
+    assert_eq!(carriers.len(), 2, "{out}");
+    assert_eq!(carriers[0].trim(), carriers[1].trim(), "{out}");
+}
+
+/// The balanced value term the model prints for the carrier named `name`.
+fn printed_carrier_body(output: &str, name: &str) -> String {
+    let head = format!("(define-fun {name} () (Array");
+    let start = output
+        .find(&head)
+        .unwrap_or_else(|| panic!("no carrier `{name}` in:\n{output}"));
+    let after = &output[start..];
+    let nl = after
+        .find('\n')
+        .unwrap_or_else(|| panic!("carrier `{name}` has no value line:\n{output}"));
+    let rest = after[nl + 1..].trim_start();
+    let mut depth = 0usize;
+    for (i, byte) in rest.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[..=i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced carrier value for `{name}`:\n{output}")
+}
+
+/// The printed carrier as `(default membership, (index, member) cells)`, read
+/// straight out of the `(store …)` chain — the same reading a re-parsing model
+/// validator performs.
+fn printed_carrier(output: &str, name: &str) -> (bool, Vec<(String, bool)>) {
+    let mut cells: Vec<(String, bool)> = Vec::new();
+    let mut cur = printed_carrier_body(output, name);
+    loop {
+        let Some(rest) = cur.strip_prefix("(store ") else {
+            // `((as const (Array …)) D)` base.
+            cells.reverse();
+            return (cur.trim_end().ends_with("true)"), cells);
+        };
+        let mut depth = 0usize;
+        let mut end = 0usize;
+        for (i, byte) in rest.bytes().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let base = rest[..end].to_string();
+        let tail = rest[end..]
+            .trim()
+            .strip_suffix(')')
+            .expect("store term closes")
+            .trim()
+            .to_string();
+        // The index is a numeral or `(- n)`; the value is the final token.
+        let (idx, val) = tail.rsplit_once(' ').expect("store index and value");
+        cells.push((idx.trim().to_string(), val.trim() == "true"));
+        cur = base;
+    }
+}
+
+/// The members (true cells) of the printed carrier named `name`.
+fn printed_carrier_members(output: &str, name: &str) -> Vec<String> {
+    printed_carrier(output, name)
+        .1
+        .into_iter()
+        .filter(|(_, member)| *member)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// A cardinality witness must not break an asserted `set.subset`: shrinking the
+/// superset to its exact size must keep the subset atom TRUE in the model that
+/// is actually printed, not merely keep both carriers small.
+#[test]
+fn card_witness_keeps_asserted_subset_true() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(declare-const t (Set Int))
+(assert (set.subset t s))
+(assert (= 1 (set.card s)))
+(check-sat)
+(get-model)
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    // `t ⊆ s` with `|s| = 1`: neither carrier may print as the universal set.
+    assert!(printed_set_size(&out) <= 2, "{out}");
+    // …and `t ⊆ s` must actually HOLD of the printed carriers: every element
+    // `t` holds is an element `s` holds. Both defaults are `false`, which
+    // `printed_set_size` already asserted.
+    let s_members = printed_carrier_members(&out, "s");
+    for (key, member) in printed_carrier(&out, "t").1 {
+        assert!(
+            !member || s_members.contains(&key),
+            "printed model falsifies (set.subset t s): {key} in t but not in s\n{out}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repairs of the first cardinality-witness landing (#set-card-neg-double-count,
+// #set-card-equality-polarity, #set-card-witness-constraints).
+// ---------------------------------------------------------------------------
+
+/// NEGATIVE elements must count ONCE. `format_eval_value` spells the integer
+/// −5 as the bare numeral `-5` while the array-witness path spells the same
+/// value `(- 5)`; both landed in `ArrayInterpretation::stores`, and every
+/// consumer compared keys as strings — so the one member {−5} was counted as
+/// two. The carrier printed a ONE-element set while `get-value` reported 2.
+#[test]
+fn negative_member_is_not_double_counted() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member (- 5) s))
+(assert (= (set.card s) 2))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 2, "{out}");
+    assert_eq!(get_value_int(&out), 2, "{out}");
+    let members = printed_carrier_members(&out, "s");
+    assert_eq!(members.len(), 2, "duplicate cell for one index:\n{out}");
+    assert!(
+        members.iter().any(|k| k == "(- 5)"),
+        "member -5 lost:\n{out}"
+    );
+}
+
+/// The other side of the same double-count: a satisfiable query answered
+/// `unknown` because the doubled member count could not reach the target.
+#[test]
+fn single_negative_member_with_card_one_is_sat() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member (- 1) s))
+(assert (= (set.card s) 1))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+}
+
+/// Two negative members plus one invented one.
+#[test]
+fn two_negative_members_with_card_three_is_sat() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.member (- 5) s))
+(assert (set.member (- 7) s))
+(assert (= (set.card s) 3))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 3, "{out}");
+    assert_eq!(get_value_int(&out), 3, "{out}");
+}
+
+/// A DISEQUALITY is not a defining equality. The witness guard used to match
+/// `(= var expr)` anywhere in the assertion DAG, so `(not (= s (set.singleton
+/// 2)))` blocked padding and a trivially satisfiable query failed closed.
+#[test]
+fn set_disequality_does_not_block_the_card_witness() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (= (set.card s) 1))
+(assert (not (= s (set.singleton 2))))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+    let members = printed_carrier_members(&out, "s");
+    assert_eq!(members.len(), 1, "{out}");
+    assert_ne!(
+        members[0], "2",
+        "witness equals the excluded singleton:\n{out}"
+    );
+}
+
+/// A set DISEQUALITY must not merge two carriers into one witness class —
+/// they would then print the SAME set and falsify the disequality.
+#[test]
+fn disequal_carriers_are_not_merged_into_one_witness() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(declare-const t (Set Int))
+(assert (set.member 2 s))
+(assert (>= (set.card s) 0))
+(assert (not (= s t)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    let s_carrier = printed_carrier(&out, "s");
+    let t_carrier = printed_carrier(&out, "t");
+    assert_ne!(
+        s_carrier, t_carrier,
+        "disequal carriers printed equal:\n{out}"
+    );
+}
+
+/// A positively asserted `set.subset` bounds the witness from ABOVE: the only
+/// element `s` may hold is 1, so `|s| = 1` must land on exactly `{1}`.
+#[test]
+fn card_witness_respects_a_subset_upper_bound() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (set.subset s (set.singleton 1)))
+(assert (= (set.card s) 1))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 1, "{out}");
+    assert_eq!(get_value_int(&out), 1, "{out}");
+    assert_eq!(
+        printed_carrier_members(&out, "s"),
+        vec!["1".to_string()],
+        "{out}"
+    );
+}
+
+/// A positively asserted `set.subset` also bounds the witness from BELOW: the
+/// superset's witness has to contain every member of the subset.
+#[test]
+fn card_witness_respects_a_subset_lower_bound() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(declare-const t (Set Int))
+(assert (set.member 2 s))
+(assert (not (set.member 1 s)))
+(assert (set.subset s t))
+(assert (>= (set.card t) 2))
+(check-sat)
+(get-model)
+(get-value ((set.card t)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    let t_members = printed_carrier_members(&out, "t");
+    for (key, member) in printed_carrier(&out, "s").1 {
+        assert!(
+            !member || t_members.contains(&key),
+            "printed model falsifies (set.subset s t): {key} in s but not in t\n{out}"
+        );
+    }
+    assert!(t_members.len() >= 2, "{out}");
+    assert_eq!(get_value_int(&out), t_members.len() as i64, "{out}");
+}
+
+/// Fail-closed: an uninterpreted element sort has no enumerable universe to
+/// draw distinct witness elements from, so a positive cardinality over it is
+/// `unknown` — never a `sat` whose model shows the empty set.
+#[test]
+fn card_over_uninterpreted_element_sort_is_fail_closed_unknown() {
+    let smt = r#"
+(set-logic ALL)
+(declare-sort U 0)
+(declare-const s (Set U))
+(assert (= 2 (set.card s)))
+(check-sat)
+"#;
     assert_eq!(verdict(&solve(smt)), Some("unknown"));
+}
+
+/// A bitvector element sort IS enumerable, so the witness is built there.
+#[test]
+fn card_over_bitvector_element_sort_exhibits_a_witness() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set (_ BitVec 4)))
+(assert (= 2 (set.card s)))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 2, "{out}");
+    assert_eq!(get_value_int(&out), 2, "{out}");
 }

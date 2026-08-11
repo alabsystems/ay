@@ -54,11 +54,11 @@ impl SmtContext {
                         Some(format!("(/ {} {})", value.numer(), value.denom()))
                     }
                 }
-                TermData::Const(Constant::BitVec { value, width }) => Some(format!(
-                    "#x{:0>hex_width$}",
-                    value.to_str_radix(16),
-                    hex_width = (*width as usize).div_ceil(4)
-                )),
+                // Canonical BV printer: hex is only well-formed at multiple-of-4
+                // widths, otherwise the literal reparses at the wrong width.
+                TermData::Const(Constant::BitVec { value, width }) => {
+                    Some(ay_dpll::format_bitvec(value, *width))
+                }
                 _ => None,
             };
             if let Some(value) = value {
@@ -102,14 +102,7 @@ impl SmtContext {
                     value += BigInt::from(1u8) << index;
                 }
             }
-            term_values.insert(
-                tid,
-                format!(
-                    "#x{:0>hex_width$}",
-                    value.to_str_radix(16),
-                    hex_width = (bvs.width as usize).div_ceil(4)
-                ),
-            );
+            term_values.insert(tid, ay_dpll::format_bitvec(&value, bvs.width));
         }
 
         term_values

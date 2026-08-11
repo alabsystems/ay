@@ -25,12 +25,10 @@ fn test_quote_symbol_needs_quoting() {
     assert_eq!(quote_symbol("x y"), "|x y|");
     // Contains colon (common in Rust names)
     assert_eq!(quote_symbol("foo::bar"), "|foo::bar|");
-    // Contains pipe - sanitized to underscore (#1841)
-    assert_eq!(quote_symbol("a|b"), "|a_b|");
-    // Contains backslash - sanitized to underscore (#1841)
-    assert_eq!(quote_symbol(r"a\b"), "|a_b|");
-    // Multiple invalid chars
-    assert_eq!(quote_symbol(r"a|b\c|d"), "|a_b_c_d|");
+    // Z3 5.0.0 quoted-symbol escapes preserve both characters losslessly.
+    assert_eq!(quote_symbol("a|b"), r"|a\|b|");
+    assert_eq!(quote_symbol(r"a\b"), r"|a\\b|");
+    assert_eq!(quote_symbol(r"a|b\c|d"), r"|a\|b\\c\|d|");
 }
 
 #[test]

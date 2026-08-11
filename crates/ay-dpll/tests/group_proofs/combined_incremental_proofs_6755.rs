@@ -150,8 +150,8 @@ fn test_auflia_check_sat_assuming_retains_lia_generic_6755() {
         "AUFLIA assumption proof should not contain hole steps: {quality:?}"
     );
     assert!(
-        quality.th_resolution_count > 0,
-        "AUFLIA assumption proof should contain at least one th_resolution step: {quality:?}"
+        quality.th_resolution_count > 0 || quality.resolution_count > 0,
+        "AUFLIA assumption proof should close through checked resolution: {quality:?}"
     );
     // Accept either LIA-generic or LRA-Farkas: both are structured arithmetic
     // lemmas for this integer conflict, and the latter exports as `la_generic`
@@ -165,15 +165,11 @@ fn test_auflia_check_sat_assuming_retains_lia_generic_6755() {
         proof_text.contains(":rule lia_generic") || proof_text.contains(":rule la_generic"),
         "AUFLIA assumption proof should contain an arithmetic proof rule (#6757):\n{proof_text}"
     );
-    // The combined theory lemma must use a structured arithmetic rule, not
-    // trust. Unit trust steps for check-sat-assuming input literals are
-    // acceptable (#6757).
-    let multi_lit_trust = proof_text.lines().any(|line| {
-        line.contains(":rule trust") && line.contains("(cl ") && line.matches("(not ").count() >= 2
-    });
+    // The public UNSAT boundary is strict: neither a combined conflict nor an
+    // assumption input may survive as an unverified trust step.
     assert!(
-        !multi_lit_trust,
-        "AUFLIA assumption proof should not contain multi-literal :rule trust (#6757):\n{proof_text}"
+        !proof_text.contains(":rule trust") && quality.trust_count == 0,
+        "AUFLIA assumption proof should be trust-free (#6757):\n{proof_text}"
     );
 }
 

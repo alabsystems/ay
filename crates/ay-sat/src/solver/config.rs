@@ -21,6 +21,15 @@ impl Solver {
         self.cold.interrupt = Some(handle);
     }
 
+    /// Replace the cooperative-cancellation handle, including clearing it.
+    ///
+    /// Persistent SMT pipelines reuse one SAT solver across public queries, so
+    /// they must rebind the exact current executor handle rather than retaining
+    /// a flag owned by an earlier query.
+    pub fn set_interrupt_handle(&mut self, handle: Option<Arc<AtomicBool>>) {
+        self.cold.interrupt = handle;
+    }
+
     /// Check whether an external interrupt has been requested.
     ///
     /// Returns true if `set_interrupt()` was called and the flag was set.
@@ -444,6 +453,30 @@ impl Solver {
     /// the conflict-analysis path. This is intentionally narrower than the
     /// inprocessing profile: proof-producing non-official runs keep their
     /// historical instrumentation unless this flag is explicitly set.
+    /// Stop maintaining the arena-offset-indexed clause-ID table.
+    ///
+    /// Only safe when NOTHING will read it: no proof of any format, no clause
+    /// or decision trace, no ER definition log, no `bcp_learned_1963` identity
+    /// profile. The DIMACS no-proof route is the one caller today. Worth
+    /// 760 MB on an 18 M-clause instance, because the table is indexed by arena
+    /// WORD and is therefore twice the size of the clause arena.
+    pub fn set_clause_ids_disabled(&mut self, disabled: bool) {
+        self.cold.clause_ids_disabled = disabled;
+    }
+
+    /// Declare this solver a ONE-SHOT SAT solve, enabling structural symmetry
+    /// breaking (orbitopal fixing, the aux-free PHP refutation).
+    ///
+    /// Only call this when the solver will be used for a single non-incremental
+    /// solve with no assumptions. Those routes remove models, which is
+    /// satisfiability-preserving for the formula but NOT valid under
+    /// assumptions: an assumption satisfiable only in a removed model would flip
+    /// to UNSAT, and an unsat core could name assumptions that are not
+    /// responsible.
+    pub fn set_symmetry_oneshot(&mut self, oneshot: bool) {
+        self.cold.symmetry_oneshot = oneshot;
+    }
+
     pub fn set_sat_comp_main_conflict_pruning(&mut self, enabled: bool) {
         self.cold.sat_comp_main_conflict_pruning = enabled;
     }
@@ -468,9 +501,30 @@ impl Solver {
     }
 
     /// Hot-path predicate for optional conflict-analysis experiments/hooks.
+    ///
+    /// Normally driven by the route profile: only the official SAT-COMP
+    /// Main/default/LRAT route prunes the per-conflict experiments (DIP-ERCL,
+    /// IBCL, and friends). `AY_SAT_PRUNE_CONFLICT_EXPERIMENTS=1|0` overrides it
+    /// so the experiments can be A/B'd on any route.
+    ///
+    /// This exists because of a measurement, not a preference: profiling AY on
+    /// the official 2026 set showed conflict analysis taking 41.6 % of active
+    /// time against BCP's 36.7 % — inverted versus a Kissat-class solver — and
+    /// those runs used `--competition --no-proof`, a route where none of the
+    /// experiments are pruned. Whether they pay for themselves is therefore an
+    /// open, measurable question rather than an assumption.
     #[inline(always)]
     pub(super) fn should_prune_conflict_analysis_experiments(&self) -> bool {
-        self.cold.sat_comp_main_conflict_pruning
+        use std::sync::OnceLock;
+        static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+        match *OVERRIDE.get_or_init(|| {
+            std::env::var("AY_SAT_PRUNE_CONFLICT_EXPERIMENTS")
+                .ok()
+                .map(|v| v != "0")
+        }) {
+            Some(forced) => forced,
+            None => self.cold.sat_comp_main_conflict_pruning,
+        }
     }
 
     /// Register a programmatic progress observer (#8155).
@@ -1396,6 +1450,23 @@ impl Solver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_solver_interrupt_handle_is_rebound_and_cleared() {
+        let mut solver = Solver::new(0);
+        let stale = Arc::new(AtomicBool::new(true));
+        solver.set_interrupt_handle(Some(stale));
+        assert!(solver.is_interrupted());
+
+        let current = Arc::new(AtomicBool::new(false));
+        solver.set_interrupt_handle(Some(Arc::clone(&current)));
+        assert!(!solver.is_interrupted());
+        current.store(true, Ordering::Relaxed);
+        assert!(solver.is_interrupted());
+
+        solver.set_interrupt_handle(None);
+        assert!(!solver.is_interrupted());
+    }
 
     #[test]
     fn test_apply_feature_profile_lrat_clamps_destructive_transforms() {

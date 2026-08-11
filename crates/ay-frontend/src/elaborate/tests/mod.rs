@@ -38,6 +38,7 @@ mod arrays;
 mod bitvectors;
 mod core;
 mod datatypes;
+mod finite_sets_z3_500;
 mod floating_point;
 mod numerics;
 mod pseudo_boolean;

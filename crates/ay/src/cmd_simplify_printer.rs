@@ -55,6 +55,7 @@ fn annotation_value_to_sexp(key: &str, value: &SExpr) -> SExpr {
 fn index_to_sexp(index: &Index) -> SExpr {
     match index {
         Index::Numeral(value) => SExpr::Numeral(value.clone()),
+        Index::Decimal(value) => SExpr::Decimal(value.clone()),
         Index::Symbol(value) => identifier_to_sexp(value),
         Index::Hexadecimal(value) => SExpr::Hexadecimal(value.clone()),
         Index::Binary(value) => SExpr::Binary(value.clone()),
@@ -254,15 +255,27 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
             SExpr::Keyword(keyword.clone()),
             opaque_value_to_sexp(value),
         ]),
+        Command::SetOptionAttribute(keyword) => SExpr::List(vec![
+            SExpr::Symbol("set-option".to_string()),
+            SExpr::Keyword(keyword.clone()),
+        ]),
         Command::SetInfo(keyword, value) => SExpr::List(vec![
             SExpr::Symbol("set-info".to_string()),
             SExpr::Keyword(keyword.clone()),
             opaque_value_to_sexp(value),
         ]),
+        Command::SetInfoAttribute(keyword) => SExpr::List(vec![
+            SExpr::Symbol("set-info".to_string()),
+            SExpr::Keyword(keyword.clone()),
+        ]),
         Command::DeclareSort(name, arity) => SExpr::List(vec![
             SExpr::Symbol("declare-sort".to_string()),
             identifier_to_sexp(name),
             SExpr::Numeral(arity.to_string()),
+        ]),
+        Command::DeclareSortParameter(name) => SExpr::List(vec![
+            SExpr::Symbol("declare-sort-parameter".to_string()),
+            identifier_to_sexp(name),
         ]),
         Command::DefineSort(name, params, sort) => SExpr::List(vec![
             SExpr::Symbol("define-sort".to_string()),
@@ -383,10 +396,15 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
         Command::ResetAssertions => {
             SExpr::List(vec![SExpr::Symbol("reset-assertions".to_string())])
         }
+        Command::Labels => SExpr::List(vec![SExpr::Symbol("labels".to_string())]),
         Command::Exit => SExpr::List(vec![SExpr::Symbol("exit".to_string())]),
         Command::Echo(message) => SExpr::List(vec![
             SExpr::Symbol("echo".to_string()),
             SExpr::String(message.clone()),
+        ]),
+        Command::Display(term, _) => SExpr::List(vec![
+            SExpr::Symbol("display".to_string()),
+            term_to_sexp(term),
         ]),
         Command::Simplify(term) => SExpr::List(vec![
             SExpr::Symbol("simplify".to_string()),
@@ -479,6 +497,15 @@ mod tests {
         let character = Term::from_sexp(&parse_sexp("(_ char #x41)").expect("valid char literal"))
             .expect("valid term");
         assert_eq!(term_to_sexp(&character).to_raw_string(), "(_ char #x41)");
+
+        let pseudo_boolean = Term::from_sexp(
+            &parse_sexp("((_ pble 0.5 0.25) true)").expect("valid pseudo-Boolean term"),
+        )
+        .expect("valid term");
+        assert_eq!(
+            term_to_sexp(&pseudo_boolean).to_raw_string(),
+            "((_ pble 0.5 0.25) true)"
+        );
 
         for input in ["(as f Int)", "(as (_ f 1) Int)"] {
             let qualified = Term::from_sexp(&parse_sexp(input).expect("valid qualified term"))

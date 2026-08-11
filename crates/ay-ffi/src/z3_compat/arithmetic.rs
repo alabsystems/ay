@@ -13,9 +13,10 @@ use std::ffi::c_uint;
 use ay_dpll::api::Sort;
 
 use super::{
-    alloc_sort, ffi_count_within_limit, ffi_guard_ast, ffi_guard_ptr, lookup_ast_sort,
-    record_ast_sort, require_term_ast_or_return, require_term_asts_or_return, term_to_ast, Z3_ast,
-    Z3_context, Z3_sort,
+    alloc_sort, ffi_count_within_limit, ffi_guard_ast, ffi_guard_ptr,
+    finite_set_engine_public_sort, has_unsupported_finite_set_datatype_embedding, lookup_ast_sort,
+    public_ast_sort, record_ast_sort, require_term_ast_or_return, require_term_asts_or_return,
+    term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_SORT_ERROR,
 };
 
 // ---- Arithmetic operations ----
@@ -387,11 +388,25 @@ pub unsafe extern "C" fn Z3_mk_select(c: Z3_context, a: Z3_ast, i: Z3_ast) -> Z3
         ffi_guard_ast(c, |ctx| {
             let array = require_term_ast_or_return!(ctx, a, "Z3_mk_select", "array", 0);
             let index = require_term_ast_or_return!(ctx, i, "Z3_mk_select", "index", 0);
+            let public_array = public_ast_sort(ctx, a, array);
+            let Sort::Array(public_array) = public_array else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_select: public operand sort is not an Array".to_string());
+                return 0;
+            };
+            let public_index = public_ast_sort(ctx, i, index);
+            if public_index != public_array.index_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_select: public index sort {public_index} differs from array domain {}",
+                    public_array.index_sort
+                ));
+                return 0;
+            }
             let t = ctx.solver.select(array, index);
             let r = term_to_ast(ctx, t);
-            if let Some(Sort::Array(arr)) = lookup_ast_sort(ctx, a) {
-                record_ast_sort(ctx, r, arr.element_sort.clone());
-            }
+            record_ast_sort(ctx, r, public_array.element_sort);
             r
         })
     }
@@ -412,11 +427,28 @@ pub unsafe extern "C" fn Z3_mk_store(c: Z3_context, a: Z3_ast, i: Z3_ast, v: Z3_
             let array = require_term_ast_or_return!(ctx, a, "Z3_mk_store", "array", 0);
             let index = require_term_ast_or_return!(ctx, i, "Z3_mk_store", "index", 0);
             let value = require_term_ast_or_return!(ctx, v, "Z3_mk_store", "value", 0);
+            let public_array = public_ast_sort(ctx, a, array);
+            let Sort::Array(public_array_info) = &public_array else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_store: public operand sort is not an Array".to_string());
+                return 0;
+            };
+            let public_index = public_ast_sort(ctx, i, index);
+            let public_value = public_ast_sort(ctx, v, value);
+            if public_index != public_array_info.index_sort
+                || public_value != public_array_info.element_sort
+            {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_store: expected public index/value sorts {}/{}; got {public_index}/{public_value}",
+                    public_array_info.index_sort, public_array_info.element_sort
+                ));
+                return 0;
+            }
             let t = ctx.solver.store(array, index, value);
             let r = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, a).cloned() {
-                record_ast_sort(ctx, r, sort);
-            }
+            record_ast_sort(ctx, r, public_array);
             r
         })
     }
@@ -444,11 +476,19 @@ pub unsafe extern "C" fn Z3_mk_const_array(c: Z3_context, domain: Z3_sort, v: Z3
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let value = require_term_ast_or_return!(ctx, v, "Z3_mk_const_array", "value", 0);
-            let t = ctx.solver.const_array(domain_sort.clone(), value);
-            let r = term_to_ast(ctx, t);
-            if let Some(elem_sort) = lookup_ast_sort(ctx, v).cloned() {
-                record_ast_sort(ctx, r, Sort::array(domain_sort, elem_sort));
+            if has_unsupported_finite_set_datatype_embedding(ctx, &domain_sort) {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_const_array: a datatype containing FiniteSet fields cannot be lowered"
+                        .to_string(),
+                );
+                return 0;
             }
+            let element_sort = public_ast_sort(ctx, v, value);
+            let engine_domain = finite_set_engine_public_sort(ctx, &domain_sort);
+            let t = ctx.solver.const_array(engine_domain, value);
+            let r = term_to_ast(ctx, t);
+            record_ast_sort(ctx, r, Sort::array(domain_sort, element_sort));
             r
         })
     }

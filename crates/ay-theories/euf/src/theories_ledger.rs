@@ -1,0 +1,351 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+//! THE ay-theories ENV LEDGER — P6 rollout, first crate group.
+//!
+//! # Why ay-theories is first, and not ay-dpll
+//!
+//! ay-dpll has 134 names to ay-theories' 47, and the rollout still starts here.
+//! **All four instances of the size-gate antipattern were found in ay-theories**
+//! (the development design notes), one of them
+//! costing a *correct answer* rather than time. Order by where the defects are, not
+//! by where the names are.
+//!
+//! It also holds a duplication the antipattern doc flags directly:
+//! `PHASE_EPOCH_MIN_ATOMS = 8192` is declared TWICE with no shared definition, once
+//! here in `lia` and once in `ay-dpll`'s combiner. Both are instrumented separately
+//! in `ay_core::forgone` so the census keeps them apart — if the two copies ever
+//! diverge, the report says so before a reader has to notice.
+//!
+//! # What this buys, stated exactly
+//!
+//! The same three things `ay-milp`'s ledger buys, and no more:
+//!
+//! * a name added at a fresh `env::var` site fails a test rather than appearing
+//!   silently;
+//! * the unknown-name audit becomes trustworthy for these crates, because it is
+//!   only as good as the ledger is exhaustive;
+//! * `read_sites` is DERIVED here from the first commit — `ay-milp` learned that the
+//!   hand-typed version was wrong on 23 of 353 entries and was still being quoted as
+//!   evidence.
+//!
+//! It does NOT give these knobs a typed surface, a soundness class, or a per-solve
+//! carrier. That is the `ay-param` migration, and it is ordered after this.
+
+/// What a knob is for. Mirrors `ay_milp::Bucket` deliberately: two vocabularies for
+/// the same concept is how a kill switch and its typed setter come to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    /// `*_NO_*` / `*_OFF`: the A/B arm for a shipped default. NEVER delete.
+    KillSwitch,
+    /// Numeric measurement scaffolding: caps, budgets, thresholds, rounds.
+    Tuning,
+    /// Trace / stats / census output. No behaviour.
+    Diagnostic,
+    /// Experiment arm selector.
+    Arm,
+    /// Named in source but never read.
+    Dead,
+}
+
+/// One environment knob in the ay-theories crate group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knob {
+    /// The environment variable name.
+    pub name: &'static str,
+    /// Which theory crate(s) read it. A name read by two theories is a coupling
+    /// worth seeing: `PHASE_EPOCH_MIN_ATOMS` is the reason this column exists.
+    pub crate_name: &'static str,
+    /// What it is for.
+    pub bucket: Bucket,
+    /// Literal `env::var`/`env::var_os` call sites. DERIVED, never hand-typed —
+    /// see the module note.
+    pub read_sites: u32,
+}
+
+/// Every `AY_*` name the ay-theories crates read.
+pub const KNOBS: &[Knob] = &[
+    Knob {
+        name: "AY_A5_CORE",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 3,
+    },
+    Knob {
+        name: "AY_ALGEBRAIC_STATS",
+        crate_name: "lia",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_BENCH_LOOP_B_ITERS",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_BENCH_LOOP_B_PERF_GATE",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_CERTORA_TRACE",
+        crate_name: "lia",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_DEBUG_ARR_EXTRACT",
+        crate_name: "arrays",
+        bucket: Bucket::Diagnostic,
+        read_sites: 2,
+    },
+    Knob {
+        name: "AY_DEBUG_EUF_INIT",
+        crate_name: "euf",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_DEBUG_FIXED_EQS",
+        crate_name: "lia",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_DT_D1_TRANSFER",
+        crate_name: "dt",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_CONG_NEG",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_CONG_NEG_ADAPTIVE",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_CONG_UNDO_DEBUG",
+        crate_name: "euf",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_CONG_UNDO_MIN",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_DISEQ_UNDO_DEBUG",
+        crate_name: "euf",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_DISEQ_UNDO_MIN",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_EXPLAIN_MEMO",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_GAP_STATS",
+        crate_name: "euf",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_INC_CONG_UNDO",
+        crate_name: "euf",
+        bucket: Bucket::Arm,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_INC_DISEQ_UNDO",
+        crate_name: "euf",
+        bucket: Bucket::Arm,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_LAZY_EXPLAIN",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_LAZY_NOPROP",
+        crate_name: "euf",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LIA_HOT_LOOP_ITERS",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LIA_INSTRUMENT",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LIA_INSTRUMENT_SECS",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LIA_PROBE_QX",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LIA_PROBE_SCAN",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_CHECK_PIVOT_BUDGET",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_FAST_DECISION",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_FLOAT_LAYER",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_FLOAT_LAYER_MIN_ROWS",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_NO_GUARD_MEMO",
+        crate_name: "lra",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_NO_IB_GATE",
+        crate_name: "lra",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_NO_IMPLIED",
+        crate_name: "lra",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_SHORTEST_POLY",
+        crate_name: "lra",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_LRA_WARM_SIMPLEX_STATE",
+        crate_name: "lra",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_NO_ALGEBRAIC_DETECT_CACHE",
+        crate_name: "lia",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_NO_PROBE_INCREMENTAL",
+        crate_name: "lia",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_PRESCREEN_RESCUE",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_PROBE_PRESCREEN",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_PROBE_STATS",
+        crate_name: "lia",
+        bucket: Bucket::Diagnostic,
+        read_sites: 5,
+    },
+    Knob {
+        name: "AY_PROBE_STATS_EVERY",
+        crate_name: "lia",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_PROBE_SUBSET_CACHE",
+        crate_name: "lia",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_STR_NF",
+        crate_name: "strings",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_STR_NF_CLOSURES",
+        crate_name: "strings",
+        bucket: Bucket::Tuning,
+        read_sites: 2,
+    },
+    Knob {
+        name: "AY_WEQ5_SHADOW_DUMP",
+        crate_name: "arrays",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_WE_S1",
+        crate_name: "strings",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_WE_WITNESS_MAX_LEN",
+        crate_name: "strings",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+];

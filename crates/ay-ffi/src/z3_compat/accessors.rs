@@ -19,10 +19,11 @@ use ay_dpll::api::{Term, TermKind};
 
 use super::{
     alloc_sort, cache_func_decl_with_params, cache_func_decl_with_symbol, cache_symbol_key,
-    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, parse_indexed_name,
-    require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context, Z3_func_decl, Z3_sort, Z3_symbol,
-    Z3_APP_AST, Z3_IOB, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_NUMERAL_AST, Z3_PARAMETER_INT,
-    Z3_QUANTIFIER_AST, Z3_UNKNOWN_AST, Z3_VAR_AST,
+    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, finite_set_app_for_ast,
+    finite_set_decl_for_ast, finite_set_empty_decl_parameter, lookup_ast_sort, parse_indexed_name,
+    public_ast_sort, require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context, Z3_func_decl,
+    Z3_sort, Z3_symbol, Z3_APP_AST, Z3_IOB, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_NUMERAL_AST,
+    Z3_PARAMETER_INT, Z3_PARAMETER_SORT, Z3_QUANTIFIER_AST, Z3_UNKNOWN_AST, Z3_VAR_AST,
 };
 
 // ============================================================================
@@ -53,6 +54,12 @@ fn declared_const_name(ctx: &super::Z3Context, term: Term) -> Option<String> {
         TermKind::Var { name } if !is_debruijn_bound_var_name(&name) => Some(name),
         _ => None,
     }
+}
+
+fn lookup_public_term_sort(ctx: &super::Z3Context, ast: Z3_ast, term: Term) -> ay_dpll::api::Sort {
+    lookup_ast_sort(ctx, ast)
+        .cloned()
+        .unwrap_or_else(|| ctx.solver.term_sort(term))
 }
 
 /// Get the kind of an AST node.
@@ -129,6 +136,9 @@ pub unsafe extern "C" fn Z3_get_ast_kind(c: Z3_context, a: Z3_ast) -> c_uint {
                     return Z3_UNKNOWN_AST;
                 }
             }
+            if finite_set_app_for_ast(ctx, a).is_some() {
+                return Z3_APP_AST;
+            }
             let term =
                 require_term_ast_or_return!(ctx, a, "Z3_get_ast_kind", "AST", Z3_UNKNOWN_AST);
             match ctx.solver.term_kind(term) {
@@ -188,7 +198,8 @@ pub unsafe extern "C" fn Z3_is_app(c: Z3_context, a: Z3_ast) -> bool {
             // A declared constant is a nullary application; the core stores it as
             // a `Var`, so `solver.is_app` alone would miss it (breaking z3py's
             // `is_app`/`to_app`). A numeral is also an application in z3.
-            let is_app = ctx.solver.is_app(term)
+            let is_app = finite_set_app_for_ast(ctx, a).is_some()
+                || ctx.solver.is_app(term)
                 || ctx.solver.is_numeral(term)
                 || declared_const_name(ctx, term).is_some();
             i32::from(is_app)
@@ -224,7 +235,8 @@ pub unsafe extern "C" fn Z3_to_app(c: Z3_context, a: Z3_ast) -> Z3_ast {
                 return 0;
             }
             let term = require_term_ast_or_return!(ctx, a, "Z3_to_app", "AST", 0);
-            if ctx.solver.is_app(term)
+            if finite_set_app_for_ast(ctx, a).is_some()
+                || ctx.solver.is_app(term)
                 || ctx.solver.is_numeral(term)
                 // A declared constant is a nullary application: z3's `Z3_to_app`
                 // is a type-checked identity cast that succeeds on it, and stock
@@ -258,6 +270,9 @@ pub unsafe extern "C" fn Z3_get_app_num_args(c: Z3_context, a: Z3_ast) -> c_uint
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
+            if let Some(app) = finite_set_app_for_ast(ctx, a) {
+                return app.args.len() as c_uint;
+            }
             let term = require_term_ast_or_return!(ctx, a, "Z3_get_app_num_args", "application", 0);
             ctx.solver.app_num_args(term) as c_uint
         })
@@ -281,6 +296,9 @@ pub unsafe extern "C" fn Z3_get_app_arg(c: Z3_context, a: Z3_ast, i: c_uint) -> 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            if let Some(app) = finite_set_app_for_ast(ctx, a) {
+                return app.args.get(i as usize).copied().unwrap_or(0);
+            }
             let term = require_term_ast_or_return!(ctx, a, "Z3_get_app_arg", "application", 0);
             match ctx.solver.app_arg(term, i as usize) {
                 Some(t) => term_to_ast(ctx, t),
@@ -310,6 +328,9 @@ pub unsafe extern "C" fn Z3_get_app_decl(c: Z3_context, a: Z3_ast) -> Z3_func_de
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            if let Some(decl) = finite_set_decl_for_ast(ctx, a) {
+                return decl;
+            }
             let term = require_term_ast_or_return!(
                 ctx,
                 a,
@@ -321,7 +342,7 @@ pub unsafe extern "C" fn Z3_get_app_decl(c: Z3_context, a: Z3_ast) -> Z3_func_de
             // function named after the constant, ranging over its sort. z3py's
             // `x.decl()` returns exactly this, so it must not be NULL.
             if let Some(const_name) = declared_const_name(ctx, term) {
-                let range = ctx.solver.term_sort(term);
+                let range = lookup_public_term_sort(ctx, a, term);
                 if let Some((identity, symbol)) = ctx.ffi_const_metadata.get(&term).cloned() {
                     return cache_func_decl_with_symbol(
                         ctx,
@@ -358,14 +379,19 @@ pub unsafe extern "C" fn Z3_get_app_decl(c: Z3_context, a: Z3_ast) -> Z3_func_de
                 .map(|i| {
                     ctx.solver
                         .app_arg(term, i)
-                        .map(|arg| ctx.solver.term_sort(arg))
+                        .map(|arg| public_ast_sort(ctx, term_to_ast(ctx, arg), arg))
                 })
                 .collect();
             let domain = match domain {
                 Some(d) => d,
                 None => return ptr::null_mut(),
             };
-            let range = ctx.solver.term_sort(term);
+            let (domain, range) =
+                if let Some((domain, range)) = ctx.finite_set_decl_signatures.get(&name).cloned() {
+                    (domain, range)
+                } else {
+                    (domain, lookup_public_term_sort(ctx, a, term))
+                };
             cache_func_decl_with_params(
                 ctx,
                 ay_dpll::api::FuncDecl::new(base_name, domain, range),
@@ -460,7 +486,15 @@ pub unsafe extern "C" fn Z3_get_domain(c: Z3_context, d: Z3_func_decl, i: c_uint
     // `.decl` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
     let decl = unsafe { &(*d).decl };
-    let sort = match decl.domain().get(i as usize) {
+    let public_signature = unsafe {
+        c.as_ref()
+            .and_then(|ctx| ctx.finite_set_decl_signatures.get(decl.name()))
+    };
+    let sort = match public_signature
+        .map(|(domain, _)| domain.as_slice())
+        .unwrap_or_else(|| decl.domain())
+        .get(i as usize)
+    {
         Some(s) => s.clone(),
         None => return ptr::null_mut(),
     };
@@ -485,7 +519,11 @@ pub unsafe extern "C" fn Z3_get_range(c: Z3_context, d: Z3_func_decl) -> Z3_sort
     // `.decl` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
     let decl = unsafe { &(*d).decl };
-    let sort = decl.range().clone();
+    let sort = unsafe {
+        c.as_ref()
+            .and_then(|ctx| ctx.finite_set_decl_signatures.get(decl.name()))
+            .map_or_else(|| decl.range().clone(), |(_, range)| range.clone())
+    };
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_ptr` handles the null case internally and catches any unwinding panic so it
@@ -666,11 +704,17 @@ pub unsafe extern "C" fn Z3_get_decl_num_parameters(_c: Z3_context, d: Z3_func_d
     if d.is_null() {
         return 0;
     }
-    // SAFETY: `d` was null-checked above and originates from a prior AY FFI allocation whose
-    // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
-    // `.params` is a shared-read with no concurrent mutation because the Z3 C API is
-    // single-threaded per context.
-    unsafe { (*d).params.len() as c_uint }
+    // SAFETY: the context guard catches panics and `d` is a context-owned,
+    // null-checked declaration handle under the C API contract.
+    unsafe {
+        ffi_guard_uint(_c, 0, |ctx| {
+            if finite_set_empty_decl_parameter(ctx, &(*d).decl).is_some() {
+                1
+            } else {
+                (*d).params.len() as c_uint
+            }
+        })
+    }
 }
 
 /// Get an integer parameter from a function declaration.
@@ -703,10 +747,9 @@ pub unsafe extern "C" fn Z3_get_decl_int_parameter(
 /// Get the `Z3_parameter_kind` of a function declaration's `idx`-th parameter.
 ///
 /// AY's indexed operators — `(_ extract h l)`, `(_ sign_extend n)`,
-/// `(_ zero_extend n)`, `(_ repeat n)`, `(_ rotate_left n)`, … — carry only
-/// INTEGER parameters, so every in-range parameter reports `Z3_PARAMETER_INT`
-/// (matching libz3, which reports `Z3_PARAMETER_INT` for these too). Read the
-/// value itself with `Z3_get_decl_int_parameter`.
+/// `(_ zero_extend n)`, `(_ repeat n)`, `(_ rotate_left n)`, … — report
+/// `Z3_PARAMETER_INT`; Z3 5.0.0 finite-set `set.empty` reports one
+/// `Z3_PARAMETER_SORT`. Read values through the corresponding typed getter.
 ///
 /// For `idx >= Z3_get_decl_num_parameters(c, d)` this sets `Z3_IOB` (index out of
 /// bounds) and returns `Z3_PARAMETER_INT` (`0`) as a benign default — the caller
@@ -727,6 +770,16 @@ pub unsafe extern "C" fn Z3_get_decl_parameter_kind(
     // func_decl handle owned by the context (single-threaded read of `.params`).
     unsafe {
         ffi_guard_uint(c, Z3_PARAMETER_INT, |ctx| {
+            if finite_set_empty_decl_parameter(ctx, &(*d).decl).is_some() {
+                if idx == 0 {
+                    return Z3_PARAMETER_SORT;
+                }
+                ctx.last_error = Z3_IOB;
+                ctx.error_msg = Some(format!(
+                    "Z3_get_decl_parameter_kind: index {idx} out of bounds (1 parameter)"
+                ));
+                return Z3_PARAMETER_INT;
+            }
             let params = &(*d).params;
             if (idx as usize) < params.len() {
                 // AY's only decl parameters are integers (indexed BV operators).

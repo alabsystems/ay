@@ -123,7 +123,9 @@ impl Solver {
         if clause_id == 0 {
             return true;
         }
-        self.materialize_level0_unit_proofs();
+        if !self.materialize_level0_unit_proofs_interruptible() {
+            return false;
+        }
         let clause_len = self.arena.len_of(clause_idx);
         for k in 0..clause_len {
             let lit = self.arena.literal(clause_idx, k);
@@ -163,11 +165,13 @@ impl Solver {
         &mut self,
         clause_idx: usize,
         clause_id: u64,
-    ) {
+    ) -> bool {
         if !self.cold.lrat_enabled || clause_id == 0 {
-            return;
+            return true;
         }
-        self.materialize_level0_unit_proofs();
+        if !self.materialize_level0_unit_proofs_interruptible() {
+            return false;
+        }
         let clause_len = self.arena.len_of(clause_idx);
         for k in 0..clause_len {
             let lit = self.arena.literal(clause_idx, k);
@@ -188,6 +192,7 @@ impl Solver {
                 }
             }
         }
+        true
     }
 
     #[inline]
@@ -195,13 +200,15 @@ impl Solver {
         &mut self,
         clause_idx: usize,
         reason_policy: ReasonPolicy,
-    ) {
-        self.drain_pending_garbage_mark(clause_idx);
-        self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
+    ) -> bool {
         let clause_id = self.clause_id(ClauseRef(clause_idx as u32));
         // Fix #6270: re-derive unit proofs that reference this clause's ID
         // before the delete is emitted (see helper doc).
-        self.lrat_rederive_units_referencing_clause(clause_idx, clause_id);
+        if !self.lrat_rederive_units_referencing_clause(clause_idx, clause_id) {
+            return false;
+        }
+        self.drain_pending_garbage_mark(clause_idx);
+        self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
         // Forward DRUP check + proof deletion via unified wrapper (#4564).
         // Uses arena-direct variant to avoid .to_vec() allocation (#5075).
         if self.cold.forward_checker.is_some() || self.proof_manager.is_some() {
@@ -276,6 +283,7 @@ impl Solver {
         }
         self.arena.delete(clause_idx);
         self.cold.clause_db_changes += 1; // BVE dual-signal fixpoint guard (#3416)
+        true
     }
 
     /// Delete a clause with uniform watch removal, reason protection, and proof logging.
@@ -332,7 +340,9 @@ impl Solver {
 
                 if self.is_reason_clause_marked(clause_idx) {
                     if self.cold.lrat_enabled {
-                        self.materialize_level0_unit_proofs();
+                        if !self.materialize_level0_unit_proofs_interruptible() {
+                            return DeleteResult::Skipped;
+                        }
                         let cid = self.clause_id(cref);
                         for i in 0..clause_len {
                             let lit = self.arena.literal(clause_idx, i);
@@ -441,8 +451,11 @@ impl Solver {
             }
         }
 
-        self.delete_clause_observed(clause_idx, reason_policy);
-        DeleteResult::Deleted
+        if self.delete_clause_observed(clause_idx, reason_policy) {
+            DeleteResult::Deleted
+        } else {
+            DeleteResult::Skipped
+        }
     }
 
     /// Delete after external reason checks while preserving observed side effects.
@@ -475,8 +488,11 @@ impl Solver {
             "BUG: delete_clause_unchecked called on reason clause {clause_idx} with Skip policy",
         );
 
-        self.delete_clause_observed(clause_idx, reason_policy);
-        DeleteResult::Deleted
+        if self.delete_clause_observed(clause_idx, reason_policy) {
+            DeleteResult::Deleted
+        } else {
+            DeleteResult::Skipped
+        }
     }
 
     /// Apply a precomputed decompose rewrite mutation without proof side effects.

@@ -38,6 +38,17 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::model::{exact, exact_small, Col, Model, Row};
 
+pub(crate) mod binary_complement;
+pub(crate) use binary_complement::{
+    substitute_binary_complements, BinaryComplementPostsolve, BinaryComplementRowOrigin,
+    BinaryComplementSide,
+};
+pub(crate) mod objective_singleton;
+pub(crate) use objective_singleton::{
+    substitute_objective_singletons, substitute_objective_singletons_with_deadline,
+    ObjectiveSingletonPostsolve, ObjectiveSingletonRecovery, ObjectiveSingletonSide,
+};
+
 /// How many sweeps of propagation to run. Each sweep is one pass over the non-zeros; the
 /// bounds tighten monotonically, so this converges. Past a handful of rounds the gains are
 /// nil on every instance measured, and the cost is a pass over the whole matrix.
@@ -85,6 +96,23 @@ pub(crate) fn tighten_bounds_opt(
     // stay pristine, and the search runs without presolve. Exact-coeff models
     // are unaffected.
     if model.has_inexact_coeffs() {
+        // FORGONE COST. The comment above is a soundness argument and then asserts the
+        // exclusion is free ("the search runs without presolve"). It never says what
+        // that costs. Charge the quantity this module exists for: the OPEN bound sides
+        // (presolve.rs, "The -inf in the box-minimum ... comes only from an OPEN
+        // bound"). Cheaper than the `model.clone()` on the next line, and no rational
+        // arithmetic runs on this branch by construction. A fully boxed inexact model
+        // charges 0 while still being excluded wholesale — hits, not cost, is the
+        // count of refused models.
+        crate::sepstat::gate_charge(
+            crate::sepstat::GATE_PRESOLVE_INEXACT,
+            (0..model.num_cols())
+                .map(|j| {
+                    let (l, u) = model.col_bounds(Col(j as u32));
+                    u64::from(!l.is_finite()) + u64::from(!u.is_finite())
+                })
+                .sum::<u64>(),
+        );
         return Presolved::Tightened(Box::new(model.clone()));
     }
     // The arithmetic runs on the small-int-fast [`Rational`] (inline `i64/i64`,
@@ -258,7 +286,34 @@ pub(crate) fn tighten_bounds_opt(
         //
         // `AY_MILP_NO_COND_TIGHTEN` restores the pre-2026-07-26 behaviour byte-identically;
         // `AY_MILP_COND_TIGHTEN` is kept as the explicit-on A/B arm.
-        if std::env::var_os("AY_MILP_NO_COND_TIGHTEN").is_none() {
+        //
+        // REVERTED TO OPT-IN (2026-07-29). The default-on justification above was measured and
+        // was true when written: strict improvement where it fires, provably inert elsewhere.
+        // It has since INVERTED. Thirty-four ay-milp commits landed afterwards, several of them
+        // correctness fixes that legitimately move node counts ("the tree's claim was not
+        // floored by the root's", "budget strong branching off THIS solve's work"), and under
+        // their interaction the pass now COSTS the one instance it touches:
+        //
+        //   corpus A/B at 60s/1T, node counts, ON (was default) vs OFF
+        //     dcmulti  2878  vs  917    <- 3.1x WORSE with it on, 1.184s vs 0.636s
+        //     blend2, flugpl, gen, gt2, khb05250, misc07, mod010, p0201, pk1, qnet1
+        //                              byte-identical, objectives preserved everywhere
+        //
+        // So it now helps nothing and harms one instance. The rewrite is still exactly sound --
+        // it lowers only the relaxed level's right-hand side and leaves the other level
+        // algebraically identical, so the feasible sets are EQUAL -- and the machinery, its
+        // brute-force guard and its A/B arms all stay. Only the default moves back.
+        //
+        // THE TRANSFERABLE LESSON: a default justified as "inert everywhere except where it
+        // wins" is only as durable as the interactions it was measured against. This one was
+        // re-checked three days later and had flipped sign. Shipped defaults on this codebase
+        // need periodic re-measurement, not just verification at merge time.
+        // Both arms stay live: `AY_MILP_COND_TIGHTEN` opts in, `AY_MILP_NO_COND_TIGHTEN`
+        // force-disables even if the opt-in is set, so a campaign script that sets the
+        // kill switch keeps working exactly as it did while this was a default.
+        if std::env::var_os("AY_MILP_COND_TIGHTEN").is_some()
+            && std::env::var_os("AY_MILP_NO_COND_TIGHTEN").is_none()
+        {
             let _t_cond = std::time::Instant::now();
             let rewritten = tighten_coefficients_conditional(&mut out, deadline);
             if trace {
@@ -287,7 +342,12 @@ pub(crate) fn tighten_bounds_opt(
 ///
 /// `plan` restricts the sweep to a row subset (the float scout's advice); propagation over a
 /// subset of the rows is still propagation, so a restriction costs tightness, never validity.
-fn propagate(
+///
+/// A THIRD caller, `crate::dualfix`, interleaves this with lock counting. It is the crate's
+/// audited exact propagator and is reused rather than reimplemented deliberately: the outward
+/// rounding, the integer floor/ceil and the at-most-one-infinite-contributor bookkeeping are
+/// each a place a fresh implementation gets it subtly and silently wrong.
+pub(crate) fn propagate(
     model: &Model,
     deadline: Option<std::time::Instant>,
     plan: Option<&[u32]>,
@@ -1859,6 +1919,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
     // (exact f64), the ORIGINAL offset (the eliminated constant rides
     // `const_delta`, applied at expansion).
     let mut out = Model::new();
+    out.inherit_ft_adoption_solve_latch(model);
     let mut map: Vec<Option<Col>> = vec![None; n];
     for j in 0..n {
         if eliminated[j] {
@@ -2164,26 +2225,18 @@ mod tests {
                 .map(|&(_, a)| a)
                 .expect("D is in the VUB row")
         };
-        // The conditional pass became a DEFAULT on 2026-07-26, so the shipped pipeline now
-        // performs BOTH stages: `tighten_bounds` already lands on Gurobi's -170 rather than
-        // stopping at the unconditional rule's -350. Assert the shipped endpoint, then assert
-        // the pass is IDEMPOTENT — re-running it rewrites nothing, which is what makes it safe
-        // to have in the pipeline unconditionally.
-        assert_eq!(
-            big_m(&out),
-            -170.0,
-            "the default pipeline reaches Gurobi's 170"
-        );
+        // The conditional pass was default-on briefly (2026-07-26) and REVERTED to opt-in on
+        // 2026-07-29 after it measured 3.1x WORSE on dcmulti under later changes. So the
+        // pipeline again stops at the unconditional rule, and the staged progression is the
+        // thing to pin: the unconditional rule reaches -350, and the conditional pass -- which
+        // is still exactly sound, just no longer a default -- takes it to Gurobi's -170.
+        assert_eq!(big_m(&out), -350.0, "unconditional rule reaches 350");
         assert_eq!(
             tighten_coefficients_conditional(&mut out, None),
-            0,
-            "already applied by the default pipeline; re-running must be a no-op"
+            1,
+            "the conditional pass rewrites exactly the one VUB row"
         );
-        assert_eq!(
-            big_m(&out),
-            -170.0,
-            "and the coefficient does not move again"
-        );
+        assert_eq!(big_m(&out), -170.0, "conditional rule reaches Gurobi's 170");
 
         // And it cut nothing off: every point the ORIGINAL admits, on a grid dense enough to
         // straddle both big-Ms, survives.

@@ -62,10 +62,19 @@ fn exports_quoted_binders_for_quantifier_and_let_terms() {
         output.contains("(assume t0 (forall ((|x y| Int) (z Int)) (= |x y| z)))"),
         "Missing assume step: {output}"
     );
+    // The rule prints as `hole`, NOT `all_simplify`. Verified against the
+    // installed carcara 1.1.0:
+    //   [ERROR] checking failed on step 't1' with rule 'all_simplify': unknown rule
+    //   invalid
+    // An unknown rule makes the whole document `invalid` — i.e. not a proof at
+    // all. Demoting to `hole` costs nothing that was ever checked and moves the
+    // document up the ladder to `holey` (an honest unproved step). This
+    // assertion previously required the uncheckable spelling.
+    //
+    // What must NOT change is the term rendering: the quoted binder `|x y|` and
+    // the quoted let-binding `|tmp value|` still have to survive into the args.
     assert!(
-        output.contains(
-            "(step t1 (cl) :rule all_simplify :args ((let ((|tmp value| |x y|)) |x y|)))"
-        ),
+        output.contains("(step t1 (cl) :rule hole :args ((let ((|tmp value| |x y|)) |x y|)))"),
         "Missing step: {output}"
     );
 }

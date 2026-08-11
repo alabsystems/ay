@@ -6,7 +6,7 @@
 
 //! SMT-LIB parser
 //!
-//! Parses SMT-LIB 2.6 input into commands.
+//! Parses SMT-LIB 2.7 input into commands.
 
 use crate::command::Command;
 use crate::sexp::{ParseError, SExpr, SExprParser};

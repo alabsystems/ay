@@ -87,6 +87,7 @@ pub(crate) const SUPPORTED_LOGICS: &[&str] = &[
     "QF_BV",
     "QF_BVFP",
     "QF_DT",
+    "QF_EIA",
     "QF_FP",
     "QF_LIA",
     "QF_LIRA",

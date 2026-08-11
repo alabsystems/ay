@@ -666,7 +666,10 @@ impl TermStore {
                         self.substitute_var_inner(body, var_term, replacement, var_name, cache);
                     if new_body != body {
                         let sort = self.sort(term).clone();
-                        self.intern(TermData::Forall(bindings, new_body, triggers), sort)
+                        let rebuilt =
+                            self.intern(TermData::Forall(bindings, new_body, triggers), sort);
+                        self.copy_quantifier_metadata(term, rebuilt);
+                        rebuilt
                     } else {
                         term
                     }
@@ -680,7 +683,10 @@ impl TermStore {
                         self.substitute_var_inner(body, var_term, replacement, var_name, cache);
                     if new_body != body {
                         let sort = self.sort(term).clone();
-                        self.intern(TermData::Exists(bindings, new_body, triggers), sort)
+                        let rebuilt =
+                            self.intern(TermData::Exists(bindings, new_body, triggers), sort);
+                        self.copy_quantifier_metadata(term, rebuilt);
+                        rebuilt
                     } else {
                         term
                     }
@@ -786,7 +792,9 @@ impl TermStore {
                 let nb = self.substitute_terms_inner(body, map, cache);
                 if nb != body {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Forall(bindings, nb, triggers), sort)
+                    let rebuilt = self.intern(TermData::Forall(bindings, nb, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 } else {
                     term
                 }
@@ -795,7 +803,9 @@ impl TermStore {
                 let nb = self.substitute_terms_inner(body, map, cache);
                 if nb != body {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Exists(bindings, nb, triggers), sort)
+                    let rebuilt = self.intern(TermData::Exists(bindings, nb, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 } else {
                     term
                 }
@@ -844,28 +854,56 @@ impl TermStore {
     /// Returns the default (else-case) value of an array.
     /// Key axioms:
     /// - `default(const(v)) = v`
-    /// - `default(store(a, i, v)) = default(a)`
-    /// - `default(as-array(f)) = f(epsilon)` (for some arbitrary epsilon)
+    /// - `default(map[f](a1, ..., an)) = f(default(a1), ..., default(an))`
+    /// - a binder-independent lambda has its constant body as default
+    ///
+    /// Z3 5.0.0 leaves dependent-lambda and `as-array` defaults opaque on its
+    /// observable SMT-LIB path; those forms therefore remain explicit terms.
     pub fn mk_array_default(&mut self, array: TermId) -> TermId {
         // Simplification: default(const-array(v)) = v
         if let Some(default_value) = self.get_const_array(array) {
             return default_value;
         }
 
-        // Simplification: default(lambda-array(x, body)) = body
-        // The default of a lambda array is the body with an unspecified index
-        // (epsilon). Since the bound variable is free in the body, this returns
-        // the body as-is (the variable acts as the epsilon witness).
-        // Z3 ref: theory_array_full.cpp:572 (instantiate_default_lambda_def_axiom)
-        if let Some((_var_term, body)) = self.get_lambda_array(array) {
-            return body;
+        // Z3 5.0.0 eagerly instantiates the exact map/default axiom:
+        //   default(map[f](a1, ..., an)) = f(default(a1), ..., default(an)).
+        // Clone the borrowed map metadata before recursively interning the
+        // argument defaults.
+        if let Some((func_name, arrays)) = self.get_array_map(array) {
+            let func_name = func_name.to_string();
+            let arrays = arrays.to_vec();
+            let elem_sort = match self.sort(array) {
+                Sort::Array(arr) => arr.element_sort.clone(),
+                _ => unreachable!("get_array_map returned a non-array term"),
+            };
+            let defaults = arrays
+                .into_iter()
+                .map(|arg| self.mk_array_default(arg))
+                .collect::<Vec<_>>();
+            return self.mk_app(Symbol::named(func_name), defaults, elem_sort);
         }
 
-        // Simplification: default(store(a, i, v)) = default(a)
-        if let TermData::App(Symbol::Named(name), args) = self.get(array) {
-            if name == "store" && args.len() == 3 {
-                let base_array = args[0];
-                return self.mk_array_default(base_array);
+        // Z3 5.0.0 folds a binder-INDEPENDENT lambda to its constant body, but
+        // leaves the default of a binder-dependent lambda as an opaque scalar.
+        // Returning a dependent body as-is is not an epsilon substitution: it
+        // exposes AY's syntactic binder as an ordinary free variable and
+        // over-constrains the result (for example an `ite` body to one of its
+        // two branches), while Z3 permits a different default value.
+        if let Some((var_term, body)) = self.get_lambda_array(array) {
+            let mut stack = vec![body];
+            let mut seen = crate::kani_compat::det_hash_set_new();
+            let mut dependent = false;
+            while let Some(term) = stack.pop() {
+                if term == var_term {
+                    dependent = true;
+                    break;
+                }
+                if seen.insert(term) {
+                    stack.extend(self.children(term));
+                }
+            }
+            if !dependent {
+                return body;
             }
         }
 
@@ -879,6 +917,42 @@ impl TermStore {
                 );
             }
         };
+
+        // ALPHA-NORMALIZE a dependent lambda before it becomes the interning key.
+        //
+        // WRONG SAT this fixes. `mk_lambda_array` interns, but the frontend hands
+        // it a FRESH bound variable per occurrence, so two structurally identical
+        // lambdas are two different `TermId`s. `mk_eq` folds them (it compares
+        // arrays structurally), which is why `(not (= a a))` is correctly `unsat`
+        // — but `default` interns by `TermId`, so the two occurrences produced
+        // two UNRELATED opaque scalars. Then:
+        //
+        //   (define-fun a () (Array Int Int) (lambda ((x Int)) (+ x 1)))
+        //   (assert (= (default a) 0))
+        //   (assert (distinct (default a) 0))
+        //
+        // answered `sat` (z3: `unsat`), and so did the reflexivity form
+        // `(not (= (default a) (default a)))` — a term differing from itself.
+        // Measured: `(= (default a) (default a))` emitted 1 clause for a lambda
+        // and 0 (folded) for a declared array, which is exactly this divergence.
+        //
+        // Rebuilding the lambda over a RESERVED canonical binder makes
+        // alpha-equivalent lambdas share one `default` term, so the two
+        // occurrences hash-cons together and the contradiction is seen. The
+        // canonical name carries the `__ay_` prefix, which `is_reserved_symbol`
+        // forbids to users, so it cannot capture a user variable.
+        if let Some((var_term, body)) = self.get_lambda_array(array) {
+            let index_sort = self.sort(var_term).clone();
+            let canon_name = format!("__ay_lambda_default_canon!{index_sort}");
+            let canon_var = self.mk_var(canon_name, index_sort);
+            if canon_var != var_term {
+                let canon_body = self.substitute_var(body, var_term, canon_var);
+                let canon_lambda = self.mk_lambda_array(canon_var, canon_body);
+                if canon_lambda != array {
+                    return self.mk_array_default(canon_lambda);
+                }
+            }
+        }
 
         self.intern(
             TermData::App(Symbol::named("default"), vec![array]),

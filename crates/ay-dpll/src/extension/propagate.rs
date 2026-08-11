@@ -1950,6 +1950,109 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 // a strict subclause), attach a Farkas cert for a 2-literal arithmetic
                 // bound implication, else Generic. Sound: recording a genuine derived
                 // clause for RUP cannot mint a false proof; a missing term skips it.
+                // #rup-fallback-census, level 4. MEASURED 2026-08-04 over one
+                // `ay-dpll --lib` run: of 2044 theory propagations reaching this
+                // point, only 163 (~8%) are at decision level 0. The rest are at
+                // levels 1-10+ (417 at level 8, 384 at level 9, 245 at level 7).
+                //
+                // So this gate excludes ~92% of theory propagations, which is why
+                // `derive_empty_via_level0_rup`'s replay database arrives holding
+                // only 1-3 clauses, why it declines with `RupNoConflict` (3042 of
+                // 3051 declines), and ultimately why the whole refutation is
+                // closed with one uncertified trust lemma -- the largest single
+                // source of strict-certification rejections in the tree.
+                //
+                // Widening the gate is the obvious fix and may well be correct:
+                // the recorded clause is `(prop_lit ∨ ¬reason…)`, the full
+                // implication including its antecedents, which reads as an
+                // unconditional theory entailment valid at any level. But this is
+                // soundness-critical, and that argument is NOT verified -- there
+                // may be a reason for the level-0 restriction not visible here
+                // (e.g. reason falsification established only against the current
+                // trail). Establish why the gate is at level 0 before widening it.
+                //
+                // See the development design notes.
+                if std::env::var("AY_RUP_FALLBACK_TRACE").is_ok_and(|v| v == "1") {
+                    safe_eprintln!(
+                        "[level0-recorder] level={} lazy={} reason_len={}",
+                        ctx.decision_level(),
+                        prop.reason_data.is_some(),
+                        prop.reason.len()
+                    );
+                }
+                // DO NOT WIDEN THIS GATE. Tried and measured 2026-08-04.
+                //
+                // The restriction excludes ~92% of theory propagations (163 of
+                // 2044 are at level 0), which starves
+                // `derive_empty_via_level0_rup`'s replay database and is the
+                // root of the largest strict-certification reject bucket. So
+                // widening it looks like the fix, and the one mechanism that
+                // would obviously forbid it -- lazy justification, where
+                // `reason` is empty and the clause degenerates to a bare unit --
+                // is ruled OUT by measurement here: 2039/2039 propagations
+                // reaching this point carry `reason_data: None` and a non-empty
+                // materialized reason.
+                //
+                // Replacing this condition with `true` anyway was measured on
+                // BOTH the suite it targets and the side-effects:
+                //
+                //   ay-dpll --lib          91 -> 91   ZERO benefit where aimed
+                //   ay-dpll group_auflia   30 -> 31   REGRESSION
+                //
+                // So it is not a trade -- it is no gain and one loss. The gate is
+                // load-bearing for a reason that is NOT the lazy-justification
+                // shape and is not yet identified, AND widening it would not
+                // have paid even if it were free. Find the real constraint before
+                // touching this again.
+                //
+                // AND THE REASON IT PAYS NOTHING IS NOW LOCALIZED. With the gate
+                // widened, the replay database size is UNCHANGED:
+                //
+                //                    hint_count<=3   hint_count>3   declines
+                //   level-0 only          2305            726          3031
+                //   widened (all)         2306            723          3029
+                //
+                // Recording ~12x more theory propagations moves the database not
+                // at all, and the gate width was never the binding constraint.
+                //
+                // THE REASON IS TWO LINES BELOW, and it is deliberate, not a bug:
+                // this recorder only fires for `prop.reason.len() == 1` AND only
+                // when `infer_bound_axiom_arith_kind` certifies the pair as an
+                // arithmetic bound implication. Measured over the same 2039
+                // propagations, `reason_len == 1` holds for just 226 (~11%):
+                //
+                //   reason_len=2  528    reason_len=1  226
+                //   reason_len=4  275    reason_len=3  258
+                //   reason_len=5  250    …
+                //
+                // Level-0 (~8%) AND single-reason (~11%) AND arithmetic-certified
+                // is what produces the census's flat `mapped=2`. Widening only the
+                // decision-level gate cannot help, because the other two
+                // conditions still reject nearly everything.
+                //
+                // And the narrowness is INTENTIONAL — see the comment on `kind`
+                // below: recording a `Generic` (uncertified) lemma would emit an
+                // opaque trust step, defeating the honest-closure purpose. So the
+                // residual trust closures are not a broken link. They are the
+                // shapes this recorder deliberately does not cover.
+                //
+                // DO NOT LIFT `reason.len() == 1` EITHER. Tried and measured:
+                // `verify_farkas_conflict_lits_full` is already N-ary, so an
+                // N-ary `infer_bound_axiom_arith_kind_n` (stricter than its
+                // 2-literal sibling — `None` unless the unit-Farkas check
+                // actually certifies) is a small, sound-looking change. It
+                // REGRESSED badly:
+                //
+                //   ay-dpll --lib          91 -> 100   (+9)
+                //   ay-dpll group_auflia   30 ->  31   (+1)
+                //   ay-dpll group_lia      11 ->  10   (-1)
+                //
+                // Recording MORE certified lemmas makes things worse, not better.
+                // The `kind` comment below already warns that extra lemmas perturb
+                // the EUF/array/datatype proof firewall; that evidently applies to
+                // certified arithmetic ones too, not just `Generic`. Whatever
+                // closes these rejections, it is not "record more here".
+                // See the development design notes.
                 if ctx.decision_level() == 0 {
                     let terms_opt = self.terms;
                     if let Some(proof_ctx) = self.proof.as_mut() {

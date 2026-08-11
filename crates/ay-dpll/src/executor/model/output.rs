@@ -7,6 +7,7 @@
 //! Formatting helpers (function tables, array values, eval-value rendering)
 //! live in sibling `output_format.rs`.
 
+use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::term::TermData;
 use ay_core::{quote_symbol, string_literal, Sort, TermId};
 
@@ -297,6 +298,13 @@ impl Executor {
         // and reproduces the internal model's committed value on every
         // constrained wrong-constructor case.
         let mut definitions = self.total_selector_definitions(model);
+        // Every fail-closed omission below drops a symbol from an otherwise
+        // well-formed model. The result still prints `sat`, so the run scores
+        // ZERO in Model-Validation while the scoreboard reads `errors: 0` — the
+        // omission is invisible to every downstream consumer. Record what was
+        // dropped so it can be surfaced on stderr; stdout is piped verbatim
+        // into Dolmen and must stay a pure get-model response.
+        let mut omitted: Vec<String> = Vec::new();
 
         // Entailed reconstruction of datatype/array-sorted constants, shared with
         // the independent gate (`gate_emit_reconstructions`): the printer's own
@@ -309,9 +317,56 @@ impl Executor {
         // the existing renderer (fail-closed, no fabrication).
         let gate_emit = self.gate_emit_reconstructions(model);
 
+        // Ground UF applications, collected once on first need and shared by
+        // every symbol that reaches the fallback below. Lazy because the sweep
+        // walks every assertion and the EUF lanes never need it.
+        let mut ground_uf_apps: Option<DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>>> =
+            None;
+
         for (name, info) in self.ctx.symbol_iter() {
             // Skip DT-internal symbols (constructors, testers, selectors) (#5412).
             if self.is_dt_internal_symbol(name) {
+                continue;
+            }
+
+            // CONSTANT-INTERPRETATION CERTIFICATE WITNESS. The certificate's
+            // proof object is an interpretation `I` under which every axiom was
+            // machine-checked, so `I` is the model and this is how it prints:
+            // `I(f) = λ ȳ. c_f` renders as
+            // `(define-fun f ((x!0 S) ..) T c_f)`, matching z3's output for the
+            // same query.
+            //
+            // Emitted through a channel of its own rather than through
+            // `adopted_macro_interp` above. That mechanism refuses any symbol a
+            // constraint mentions, and its soundness rests on exactly that
+            // refusal ("nothing constrains this symbol, so any interpretation
+            // will do"); the symbols here are the opposite case — they occur in
+            // the quantified constraint, and are publishable only because the
+            // certificate checked every constraint AGAINST this interpretation.
+            // Relaxing the frontend's refusal would have widened it for every
+            // caller on the strength of an argument only this one can make.
+            //
+            // Non-empty only after a grant on the route where the certificate
+            // supplied the entire model, so it can never displace a theory
+            // model built by a real solve.
+            if let Some(entry) = self
+                .const_interp_cert_witness_entries()
+                .iter()
+                .find(|e| e.name == *name)
+            {
+                let params_str = entry
+                    .params
+                    .iter()
+                    .map(|(n, s)| format!("({} {})", quote_symbol(n), format_sort(s)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                definitions.push(format!(
+                    "  (define-fun {} ({}) {}\n    {})",
+                    quote_symbol(name),
+                    params_str,
+                    format_sort(&info.sort),
+                    self.format_term(entry.value)
+                ));
                 continue;
             }
 
@@ -361,16 +416,39 @@ impl Executor {
 
             // Handle functions with arguments (generate function tables).
             if !info.arg_sorts.is_empty() {
+                // Did the EUF route publish an interpretation for this symbol?
+                // When it does not, the ground-application fallback below is the
+                // only thing standing between a UF-bearing `sat` and an
+                // INCOMPLETE witness (#uf-interp-bv-lane).
+                let mut euf_published = false;
                 // Check if we have EUF model with function tables.
                 if let Some(ref euf_model) = model.euf_model {
                     let identity = self.ctx.symbol_identity_name(name, info);
                     if let Some(table) = euf_model.function_tables.get(identity) {
+                        let table = match self.sequence_table_provenance_placeholders(
+                            identity,
+                            &info.arg_sorts,
+                            &info.sort,
+                            table,
+                            euf_model
+                                .function_table_terms
+                                .get(identity)
+                                .map(Vec::as_slice),
+                        ) {
+                            Ok(table) => table,
+                            Err(e) => {
+                                return format!(
+                                    "(error \"model value for function {} is not available: {e}\")",
+                                    quote_symbol(name)
+                                )
+                            }
+                        };
                         // Resolve @?N placeholders in function table values (#5452).
                         // The EUF model builds tables before theory values are merged,
                         // so Int/Real/BV-returning functions have @?N placeholders
                         // instead of concrete values. Resolve them now using the
                         // full model which has all theory values available.
-                        let resolved = self.resolve_function_table(model, table);
+                        let resolved = self.resolve_function_table(model, &table);
                         // Single-source datatype branch keys/values (stage-4
                         // review F3, #mv-dt-single-source): a table over
                         // selector-bearing datatype sorts must key its branches
@@ -389,7 +467,10 @@ impl Executor {
                         ) {
                             super::dt_egraph_values::DtUfTableRewrite::NotApplicable => resolved,
                             super::dt_egraph_values::DtUfTableRewrite::Rewritten(t) => t,
-                            super::dt_egraph_values::DtUfTableRewrite::Drop => continue,
+                            super::dt_egraph_values::DtUfTableRewrite::Drop => {
+                                omitted.push(name.to_string());
+                                continue;
+                            }
                         };
                         match self.format_function_table(
                             name,
@@ -398,7 +479,10 @@ impl Executor {
                             &resolved,
                             model,
                         ) {
-                            Ok(def) => definitions.push(def),
+                            Ok(def) => {
+                                definitions.push(def);
+                                euf_published = true;
+                            }
                             // A table value with no model value cannot be
                             // printed honestly — surface the gap as an error
                             // instead of a fabricated default
@@ -409,6 +493,98 @@ impl Executor {
                                     quote_symbol(name)
                                 )
                             }
+                        }
+                    }
+                }
+
+                // GROUND-APPLICATION FALLBACK (#uf-interp-bv-lane).
+                //
+                // Not every lane routes uninterpreted functions through EUF. The
+                // BV lanes (QF_UFBV / QF_AUFBV / UFBV) Ackermannize instead:
+                // `f(a)` is bit-blasted to a fresh BV term constrained by
+                // congruence clauses (`bv_axioms_euf.rs`), and no `EufModel` is
+                // ever built — `model.euf_model` is `None`. The old code then
+                // fell straight through to `continue`, silently dropping the
+                // symbol, so every UF-bearing `sat` in those lanes published a
+                // model with NO entry for `f` while z3 printed one.
+                //
+                // Note what this is NOT: the independent gate reads the internal
+                // `Model`, not this printout, and it already returned
+                // `confirmed-sat` on these queries. So the gap was never a gate
+                // refusal — it was the narrower and quieter failure of a
+                // CONFIRMED model being published incomplete, leaving the user
+                // (and any external validator) unable to check the `sat` that
+                // AY had in fact justified internally.
+                //
+                // The values are not missing, only unrouted: `(get-value ((f
+                // x)))` already answers on exactly these queries, because the
+                // application term carries a committed value in the bit-blasted
+                // assignment. So publish the table the solver ACTUALLY decided —
+                // one row per ground application of `f` occurring in the
+                // assertions, keyed by the model values of its arguments and
+                // valued at the model value of the application. Nothing is
+                // invented: every key and every value is read back through the
+                // same `term_value_string` path `(get-value)` uses, and
+                // `format_function_body` reuses the last row's real value as the
+                // else-branch rather than a fabricated default.
+                //
+                // Fail-closed throughout: a symbol whose applications cannot ALL
+                // be read back is OMITTED (partial model, non-voiding) rather
+                // than published with a hole, and a table that is not a function
+                // is omitted too — see `uf_table_from_ground_applications`.
+                //
+                // SCOPE LIMIT — ground applications only determine the function
+                // when nothing else constrains it. A QUANTIFIED assertion does:
+                // `(forall ((y S)) (=> (bvult y #x10) (= (f y) #x00)))` pins `f`
+                // at points no ground application mentions, and the printed
+                // `define-fun` is TOTAL, so its else-branch would answer #x07 at
+                // those points and FALSIFY the very query AY answered `sat`
+                // (measured: z3 replays the published model as `unsat`). The
+                // table is genuinely undetermined there, so — per the
+                // fail-closed rule — omit the symbol rather than invent the
+                // missing part.
+                if !euf_published && self.symbol_occurs_under_quantifier(name) {
+                    omitted.push(name.to_string());
+                    continue;
+                }
+                if !euf_published {
+                    let arity = info.arg_sorts.len();
+                    let apps = ground_uf_apps.get_or_insert_with(|| {
+                        let mut collected: DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>> =
+                            DetHashMap::default();
+                        let mut visited = DetHashSet::default();
+                        for &assertion in &self.ctx.assertions {
+                            self.collect_uf_applications(assertion, &mut collected, &mut visited);
+                        }
+                        collected
+                    });
+                    if let Some(applications) = apps.get(&(name.to_string(), arity)) {
+                        match self.uf_table_from_ground_applications(model, applications) {
+                            Some(table) => {
+                                match self.format_function_table(
+                                    name,
+                                    &info.arg_sorts,
+                                    &info.sort,
+                                    &table,
+                                    model,
+                                ) {
+                                    Ok(def) => definitions.push(def),
+                                    // The reconstructed table is not a function
+                                    // (two applications with equal argument
+                                    // values disagree on the result). That is a
+                                    // congruence violation, not something to
+                                    // paper over: omit the symbol and let the
+                                    // stderr omission notice surface it rather
+                                    // than print a falsifying interpretation.
+                                    Err(_) => omitted.push(name.to_string()),
+                                }
+                            }
+                            // At least one application has no readable model
+                            // value. Publishing a partial table would commit a
+                            // WRONG value at the unread point via the else
+                            // branch, so omit instead
+                            // (#no-fabricated-model-values).
+                            None => omitted.push(name.to_string()),
                         }
                     }
                 }
@@ -510,7 +686,16 @@ impl Executor {
                 // Real fall through to the LIA/LRA branches and the `evaluate_term`
                 // renderer below, which share `evaluate_var`'s canonical order, so
                 // emit stays faithful to what the gate checked.
-                if !matches!(info.sort, Sort::Int | Sort::Real) {
+                // A Seq-sorted EUF entry is only an INTERNAL equality-class
+                // label, not an SMT-LIB sequence value. Sequence constants are
+                // rendered below through `term_value_string`, which reads the
+                // concrete `EvalValue::Seq` witness installed by completion.
+                // Consulting EUF first leaked bare `@ay-seq!N` identifiers and
+                // made get-model disagree with get-value.
+                if !matches!(
+                    info.sort,
+                    Sort::Int | Sort::Real | Sort::Seq(_) | Sort::BitVec(_)
+                ) {
                     if let Some(ref euf_model) = model.euf_model {
                         if let Some(elem) = euf_model.term_values.get(&term_id) {
                             let elem = format_model_atom(&info.sort, elem);
@@ -822,6 +1007,18 @@ impl Executor {
         // evaluates these natively (and rejects attempts to re-define them
         // with E:id-def-conflict). This is the same declaration-free form
         // cvc5 emits for uninterpreted-sort models.
+        if !omitted.is_empty() {
+            // stderr ONLY — stdout is the get-model response. The harness
+            // already captures `stderr_tail`, so this makes a partial model
+            // greppable in the run record instead of silently scoring zero.
+            omitted.sort();
+            omitted.dedup();
+            eprintln!(
+                "c ay.model.partial omitted={} symbols=[{}]",
+                omitted.len(),
+                omitted.join(" ")
+            );
+        }
         if definitions.is_empty() {
             "(model\n)".to_string()
         } else {
@@ -973,7 +1170,24 @@ impl Executor {
             }
         }
         let result_sort = self.ctx.terms.sort(term_id);
-        let resolved = self.resolve_function_table(model, table);
+        let arg_sorts: Vec<Sort> = args
+            .iter()
+            .map(|&arg| self.ctx.terms.sort(arg).clone())
+            .collect();
+        let table = match self.sequence_table_provenance_placeholders(
+            sym.name(),
+            &arg_sorts,
+            result_sort,
+            table,
+            euf_model
+                .function_table_terms
+                .get(sym.name())
+                .map(Vec::as_slice),
+        ) {
+            Ok(table) => table,
+            Err(e) => return Some(Err(e)),
+        };
+        let resolved = self.resolve_function_table(model, &table);
         Some(match resolved.last() {
             // Same else value `format_function_table` prints.
             Some((_, else_value)) => self.resolve_table_value(else_value, result_sort, model),
@@ -1033,6 +1247,91 @@ impl Executor {
         format!("({})", pairs.join(" "))
     }
 
+    /// Reconstruct a UF interpretation table from the ground applications of a
+    /// symbol, for lanes that never build an `EufModel` (#uf-interp-bv-lane).
+    ///
+    /// Each row is `(argument values, application value)` read back through the
+    /// same `term_value_string` path `(get-value ...)` uses, so every entry is a
+    /// value the solver committed to — this publishes the table it HAS, it does
+    /// not invent one.
+    ///
+    /// Returns `None` when any application or argument has no readable value
+    /// under the model. That is deliberate: a partial table still prints a TOTAL
+    /// `define-fun`, whose else-branch would then commit some other row's value
+    /// at the unread point — a fabricated value in all but name
+    /// (#no-fabricated-model-values). The caller omits the symbol instead.
+    /// True when `name` occurs anywhere beneath a quantifier in the assertions.
+    ///
+    /// Such a symbol is NOT determined by its ground applications: a
+    /// `(forall ((y S)) ... (f y) ...)` constrains `f` at points no ground
+    /// application mentions. See
+    /// [`Self::uf_table_from_ground_applications`] for why that makes the
+    /// ground-application table unpublishable.
+    fn symbol_occurs_under_quantifier(&self, name: &str) -> bool {
+        fn walk(
+            exec: &Executor,
+            term: TermId,
+            name: &str,
+            under_quant: bool,
+            seen: &mut DetHashSet<(TermId, bool)>,
+        ) -> bool {
+            if !seen.insert((term, under_quant)) {
+                return false;
+            }
+            match exec.ctx.terms.get(term) {
+                TermData::App(sym, args) => {
+                    if under_quant && sym.name() == name {
+                        return true;
+                    }
+                    args.iter().any(|&a| walk(exec, a, name, under_quant, seen))
+                }
+                TermData::Not(inner) => walk(exec, *inner, name, under_quant, seen),
+                TermData::Ite(c, t, e) => {
+                    walk(exec, *c, name, under_quant, seen)
+                        || walk(exec, *t, name, under_quant, seen)
+                        || walk(exec, *e, name, under_quant, seen)
+                }
+                TermData::Let(bindings, body) => {
+                    bindings
+                        .iter()
+                        .any(|(_, b)| walk(exec, *b, name, under_quant, seen))
+                        || walk(exec, *body, name, under_quant, seen)
+                }
+                TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                    walk(exec, *body, name, true, seen)
+                        || triggers
+                            .iter()
+                            .flatten()
+                            .any(|&t| walk(exec, t, name, true, seen))
+                }
+                _ => false,
+            }
+        }
+
+        let mut seen = DetHashSet::default();
+        self.ctx
+            .assertions
+            .iter()
+            .any(|&a| walk(self, a, name, false, &mut seen))
+    }
+
+    fn uf_table_from_ground_applications(
+        &self,
+        model: &Model,
+        applications: &[(TermId, Vec<TermId>)],
+    ) -> Option<Vec<(Vec<String>, String)>> {
+        let mut table = Vec::with_capacity(applications.len());
+        for (app, args) in applications {
+            let value = self.term_value_string(model, *app).ok()?;
+            let mut key = Vec::with_capacity(args.len());
+            for &arg in args {
+                key.push(self.term_value_string(model, arg).ok()?);
+            }
+            table.push((key, value));
+        }
+        Some(table)
+    }
+
     /// Generate output for the Z3 `(eval <term>)` command.
     ///
     /// Evaluates a single term in the current model and prints just its value
@@ -1048,5 +1347,148 @@ impl Executor {
             Ok(value_str) => value_str,
             Err(e) => format!("(error \"value is not available: {e}\")"),
         }
+    }
+}
+
+/// A `sat` from a lane that Ackermannizes uninterpreted functions (the BV
+/// lanes) must still PUBLISH an interpretation for every declared UF, and the
+/// interpretation it publishes must agree with `(get-value ...)` on the same
+/// applications (#uf-interp-bv-lane).
+///
+/// Before the ground-application fallback these lanes built no `EufModel`, so
+/// `(get-model)` silently dropped every function symbol: the answer was `sat`,
+/// the internal gate said `confirmed-sat`, and the published witness was
+/// nonetheless missing the one interpretation a checker needs.
+#[cfg(test)]
+mod uf_interp_bv_lane_tests {
+    use super::Executor;
+    use ay_frontend::parse;
+
+    fn model_of(script: &str) -> String {
+        let commands = parse(script).expect("script parses");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("script executes");
+        exec.model()
+    }
+
+    #[test]
+    fn qf_ufbv_sat_publishes_a_bv_function_interpretation() {
+        let out = model_of(
+            "(set-logic QF_UFBV)
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (declare-const x (_ BitVec 8))
+             (assert (= (f x) #x07))
+             (check-sat)",
+        );
+        assert!(
+            out.contains("(define-fun f ((x0 (_ BitVec 8))) (_ BitVec 8)"),
+            "QF_UFBV sat must publish an interpretation for `f`, not drop it: {out}"
+        );
+        assert!(
+            out.contains("#x07"),
+            "the published interpretation must carry the constrained value: {out}"
+        );
+    }
+
+    /// The drop was never about the BV *argument* sort — a UF is dropped when
+    /// BV appears anywhere in its signature, so a BV-RETURNING function over an
+    /// Int domain was missing too.
+    #[test]
+    fn bv_returning_uf_over_int_domain_is_published() {
+        let out = model_of(
+            "(set-logic ALL)
+             (declare-fun f (Int) (_ BitVec 8))
+             (declare-const y Int)
+             (assert (= (f y) #x07))
+             (check-sat)",
+        );
+        assert!(
+            out.contains("(define-fun f ((x0 Int)) (_ BitVec 8)"),
+            "a BV-returning UF must be published: {out}"
+        );
+    }
+
+    /// Two applications at distinct argument points must both survive into the
+    /// table, so the published function is not a constant that contradicts one
+    /// of them.
+    #[test]
+    fn distinct_application_points_both_reach_the_table() {
+        let out = model_of(
+            "(set-logic QF_UFBV)
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (declare-const x (_ BitVec 8))
+             (assert (= (f x) #x07))
+             (assert (= (f #x01) #x09))
+             (check-sat)",
+        );
+        assert!(
+            out.contains("(define-fun f "),
+            "interpretation is published: {out}"
+        );
+        assert!(
+            out.contains("#x07") && out.contains("#x09"),
+            "both constrained application values must appear in the table: {out}"
+        );
+    }
+
+    /// A multi-argument UF keys its rows on the full argument tuple.
+    #[test]
+    fn multi_argument_uf_is_published_with_all_parameters() {
+        let out = model_of(
+            "(set-logic QF_UFBV)
+             (declare-fun g ((_ BitVec 4) (_ BitVec 4)) (_ BitVec 4))
+             (declare-const a (_ BitVec 4))
+             (declare-const b (_ BitVec 4))
+             (assert (= (g a b) #x3))
+             (assert (= (g b a) #x5))
+             (check-sat)",
+        );
+        assert!(
+            out.contains("(define-fun g ((x0 (_ BitVec 4)) (x1 (_ BitVec 4))) (_ BitVec 4)"),
+            "a 2-ary UF must be published with both parameters: {out}"
+        );
+    }
+
+    /// SOUNDNESS GUARD. Ground applications do not determine a function that a
+    /// QUANTIFIER also constrains, and the printed `define-fun` is total — so a
+    /// table built only from ground rows would answer the last row's value at
+    /// every quantified point and falsify the query.
+    ///
+    /// Here `(forall ((y ..)) (=> (bvult y #x10) (= (f y) #x00)))` forces
+    /// `f(#x00) = #x00`, while the only ground application is `f(#xff) = #x07`.
+    /// Publishing `f = λ. #x07` made z3 replay the model as `unsat`. The
+    /// fallback must decline instead: an omission is a partial witness, a
+    /// falsifying interpretation is a wrong one.
+    #[test]
+    fn quantified_symbol_is_omitted_not_published_from_ground_rows() {
+        let out = model_of(
+            "(set-logic UFBV)
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (assert (forall ((y (_ BitVec 8))) (=> (bvult y #x10) (= (f y) #x00))))
+             (assert (= (f #xff) #x07))
+             (check-sat)",
+        );
+        assert!(
+            !out.contains("(define-fun f ((x0 (_ BitVec 8))) (_ BitVec 8)\n    #x07)"),
+            "a quantifier-constrained UF must NOT be published as the constant \
+             taken from its single ground row — that model falsifies the forall: {out}"
+        );
+    }
+
+    /// A DEFINED symbol keeps its problem-text interpretation: the fallback must
+    /// not re-emit one (a definition conflict for any validator).
+    #[test]
+    fn defined_functions_are_still_not_re_emitted() {
+        let out = model_of(
+            "(set-logic QF_UFBV)
+             (define-fun d ((v (_ BitVec 8))) (_ BitVec 8) (bvadd v #x01))
+             (declare-const x (_ BitVec 8))
+             (assert (= (d x) #x07))
+             (check-sat)",
+        );
+        assert!(
+            !out.contains("(define-fun d "),
+            "a define-fun symbol must not be re-emitted by the fallback: {out}"
+        );
     }
 }

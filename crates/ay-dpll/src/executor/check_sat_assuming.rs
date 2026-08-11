@@ -12,11 +12,14 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Sort, TermId};
 use ay_frontend::OptionValue;
 
+use super::check_sat::contains_symbolic_integer_power;
 use super::dt_axioms::DtSolverDispatch;
 use super::theories::bv_cnf_dump;
 use super::Executor;
 use crate::ematching::contains_quantifier;
-use crate::executor_types::{ExecutorError, Result, SolveResult, Statistics, UnknownReason};
+use crate::executor_types::{
+    ExecutorError, Result, SolveResult, Statistics, UnknownOrigin, UnknownReason,
+};
 use crate::logic_detection::{LogicCategory, TheoryKind};
 
 impl Executor {
@@ -29,6 +32,17 @@ impl Executor {
     /// which returns `VerifiedSolveResult`. Part of #5787 (Phase 6).
     pub(crate) fn check_sat_assuming(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
         self.last_sat_certificate = None;
+        let mut symbolic_power_roots = self.ctx.assertions.clone();
+        symbolic_power_roots.extend_from_slice(assumptions);
+        if contains_symbolic_integer_power(&self.ctx.terms, &symbolic_power_roots) {
+            self.last_model = None;
+            self.record_unknown_from_origin(UnknownOrigin::UnsupportedArithmeticFragment);
+            self.record_unknown_diagnostic(
+                UnknownReason::UnsupportedArithmetic,
+                "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
+            );
+            return Ok(SolveResult::Unknown);
+        }
         // Keep the original assertion+assumption roots for the shared
         // nested-array UNSAT authorization boundary. The inner solver may
         // rewrite either collection while deriving its raw result.
@@ -53,7 +67,11 @@ impl Executor {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
         })?;
-        Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, result))
+        // `None`: the residue rescue is deliberately unavailable here. An
+        // assumption literal is not a hard constraint, so the hard assertions
+        // alone are NOT the problem that was refuted — a residue drawn from
+        // them could not license this verdict. Fail closed exactly as before.
+        Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, None, result))
     }
 
     /// `check-sat-assuming` entry for USER-FACING queries (the SMT-LIB
@@ -259,7 +277,24 @@ impl Executor {
             // certificate.
             return result;
         }
+        // The re-solves below run on THIS executor and reach the same public
+        // publication funnel. Its unknown path (`finalize_unknown_publication`
+        // -> `publish_unknown_from_origin` -> `invalidate_last_check_result`)
+        // CLEARS `proof_problem_assertion_provenance`, which is the authored
+        // authority `begin_public_solve` installed for the outer query. A
+        // preprocessing lane inside the re-solve then rebuilds provenance with
+        // `preserving_authority_from(None)` and so promotes its own transformed
+        // working set to "authored"; because the arithmetic lanes deliberately
+        // keep their window installed on UNSAT, that forged authority survives
+        // back out to `mint_unsat_certificate`, which rejects the (correct)
+        // refutation with `AssertionEpochMismatch`.
+        //
+        // Re-rooting cannot widen authority: `preserving_authority_from` copies
+        // the outer roots and keeps an inner premise/source path only when it
+        // is already expressed in those roots.
+        let authored_authority = self.proof_problem_assertion_provenance.clone();
         let recheck = self.check_sat_assuming(&core);
+        self.reroot_proof_authority(authored_authority.as_ref());
         if matches!(recheck, Ok(SolveResult::Unsat(_))) {
             self.last_assumption_core = Some(core);
             return recheck;
@@ -268,8 +303,33 @@ impl Executor {
         // for. Restore the original solve state (deterministic re-solve),
         // then discard the harvest so the padded superset prints.
         let restored = self.check_sat_assuming(combined);
+        self.reroot_proof_authority(authored_authority.as_ref());
         self.last_assumption_core = None;
         restored
+    }
+
+    /// Rebase whatever provenance a nested same-executor re-solve left behind
+    /// onto the outer query's authored authority.
+    ///
+    /// Soundness: this only ever NARROWS the authored set. When the nested
+    /// solve left a provenance, `preserving_authority_from` replaces its roots
+    /// with the outer roots and admits an inner premise or source path only if
+    /// it is already expressed entirely in those outer roots. When the nested
+    /// solve cleared provenance outright, the outer authority is reinstated
+    /// verbatim. Either way no solver-generated term becomes an authored
+    /// `assume`.
+    fn reroot_proof_authority(
+        &mut self,
+        outer: Option<&super::theories::solve_harness::ProofProblemAssertionProvenance>,
+    ) {
+        let Some(outer) = outer else {
+            return;
+        };
+        self.proof_problem_assertion_provenance =
+            Some(match self.proof_problem_assertion_provenance.take() {
+                Some(inner) => inner.preserving_authority_from(Some(outer)),
+                None => outer.clone(),
+            });
     }
 
     /// Completeness rescue for the named→assumption core redirect
@@ -383,6 +443,7 @@ impl Executor {
         // boundary. Core minimization and scoped subset re-solves must not
         // promote their temporary assertion windows to authored premises.
         self.quant_expansion_records.clear();
+        self.ematching_proof_records.clear();
         self.last_proof_rebuild_originals.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
@@ -398,6 +459,7 @@ impl Executor {
         // reset and must earn both authorizations independently.
         self.sat_validated_by_mod_div_or_branch = false;
         self.nested_array_row_reduction_unsat = false;
+        self.ho_seq_unfold_array_free_unsat = false;
         self.array_axiom_scope = None;
         self.row_seeded_terms.clear();
         self.proof_check_result = None;
@@ -460,7 +522,7 @@ impl Executor {
         // assertions and the passed assumptions.
         if self.terms_contain_set_has_size(&solve_roots) {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            self.last_result = Some(SolveResult::Unknown);
+            let _ = self.finalize_unknown_publication(SolveResult::Unknown);
             return Ok(SolveResult::Unknown);
         }
 
@@ -495,7 +557,7 @@ impl Executor {
             }
             crate::executor::rm_domain::RmDomainAxioms::FailClose => {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                self.last_result = Some(SolveResult::Unknown);
+                let _ = self.finalize_unknown_publication(SolveResult::Unknown);
                 return Ok(SolveResult::Unknown);
             }
         }
@@ -634,7 +696,7 @@ impl Executor {
                 }
                 self.solve_lia_with_assumptions(&base_assertions, assumptions)
             }
-            LogicCategory::QfNia => {
+            LogicCategory::QfNia | LogicCategory::QfEia => {
                 // The direct theory-assumption route runs a bare
                 // `DpllT::solve_with_assumptions`, which returns Unknown as
                 // soon as the theory requests a split (branch-and-bound
@@ -665,11 +727,37 @@ impl Executor {
                     Ok(direct)
                 }
             }
-            LogicCategory::QfNra => self.solve_with_assumptions_for_theory(
-                &base_assertions,
-                assumptions,
-                TheoryKind::Nra,
-            ),
+            LogicCategory::QfNra => {
+                // Mirrors the QfNia arm above (and QfLra below): the direct
+                // theory-assumption route runs a bare
+                // `DpllT::solve_with_assumptions`, which returns Unknown as soon
+                // as the theory requests work only the full pipeline's
+                // solve_step loop performs — for NRA that is the ICP / lifting /
+                // model-repair escalation, none of which runs under a bare
+                // assumption solve. The arm previously returned that Unknown
+                // directly, so a QF_NRA `check-sat-assuming` could answer
+                // unknown on a query the plain check-sat pipeline decides, while
+                // its QfNia sibling retried and decided. Keep the fast direct
+                // route, but on Unknown retry through the scoped-assumption
+                // fallback (`check-sat-assuming A` ≡ `check-sat (base ∧ A)`:
+                // verdict-identical, SAT models re-validated by the strict gate,
+                // conservative all-assumptions core). Retrying an Unknown can
+                // only improve completeness, never flip a decided verdict.
+                let direct = self.solve_with_assumptions_for_theory(
+                    &base_assertions,
+                    assumptions,
+                    TheoryKind::Nra,
+                )?;
+                if matches!(direct, SolveResult::Unknown) {
+                    self.solve_scoped_assumptions(
+                        &base_assertions,
+                        assumptions,
+                        Self::solve_current_assertions_with_quantifier_support,
+                    )
+                } else {
+                    Ok(direct)
+                }
+            }
             LogicCategory::QfNira => {
                 if features.has_real {
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
@@ -1316,11 +1404,47 @@ impl Executor {
             && self.lra_roots_contain_disequality(assumptions)
         {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            self.last_result = Some(SolveResult::Unknown);
+            let _ = self.finalize_unknown_publication(SolveResult::Unknown);
             self.finalize_unknown_diagnostics();
             return SolveResult::Unknown;
         }
 
+        // PROOF NET (mirrors the plain path's `check_sat.rs:2388` / `:3608`).
+        //
+        // The mandatory UNSAT funnel refuses to publish `unsat` without a
+        // certificate, and `begin_public_solve` (lifecycle.rs:302) turns proof
+        // tracking on for EVERY public decision precisely so that guarantee
+        // cannot be switched off. The plain path backs that up with two
+        // `last_proof.is_none()` nets plus UNSAT-implies-proof debug_asserts.
+        //
+        // This path had neither. Most assumption routes do build a proof —
+        // `solve_with_assumptions_for_theory`'s `AssumeResult::Unsat` arm goes
+        // through `solve_and_store_model_full` (theories/model_helpers.rs:318),
+        // which is why QF_LIA and QF_UF assumption refutations were already
+        // fine — but any lane that returns a bare `Ok(SolveResult::unsat())`
+        // (e.g. the strings/LIA lane) reached the funnel with
+        // `last_proof == None`, and a CORRECT refutation was published as
+        // `unknown` ("the provisional UNSAT verdict has no proof"). Measured:
+        // `(assert (= (str.len s) 3))` + `(check-sat-assuming ((= s "ab")))`
+        // returned `unknown`, while the same conjunction under plain
+        // `check-sat` returned `unsat` with a full Alethe proof.
+        //
+        // `last_proof.is_none()` is load-bearing, not defensive:
+        // `build_unsat_proof` is NOT idempotent — it `take_proof()`s the
+        // tracker and `take()`s `last_clause_trace` / `last_var_to_term` /
+        // `last_negations`, so calling it twice silently degrades the second
+        // proof to a trust-closed, assertion-only one.
+        //
+        // This runs AFTER the LRA fail-closed gate above, so a verdict that
+        // gate downgrades never pays for a proof it will not use. It cannot
+        // manufacture an UNSAT: it only supplies the certificate for a verdict
+        // the solver already reached, and the funnel still validates it
+        // independently and still fails closed if it does not check out.
+        if result.is_unsat() && self.produce_proofs_enabled() && self.last_proof.is_none() {
+            self.build_unsat_proof();
+        }
+
+        let result = self.finalize_unknown_publication(result);
         self.last_result = Some(result);
         // Output completion is part of emit_sat_verdict and therefore precedes
         // certificate minting. Keep this post-emission path model-immutable.
@@ -1344,5 +1468,179 @@ mod solve_session_reset_tests {
 
         assert!(!exec.sat_validated_by_mod_div_or_branch);
         assert!(!exec.nested_array_row_reduction_unsat);
+    }
+}
+
+#[cfg(test)]
+mod nested_recheck_authority_tests {
+    use super::super::theories::solve_harness::ProofProblemAssertionProvenance;
+    use super::*;
+
+    fn provenance_of(roots: &[TermId], window: &[TermId]) -> ProofProblemAssertionProvenance {
+        ProofProblemAssertionProvenance::passthrough(roots, window)
+    }
+
+    /// The assumption-core recheck runs on the SAME executor and reaches the
+    /// public publication funnel, whose unknown path calls
+    /// `invalidate_last_check_result` and CLEARS the authored proof
+    /// provenance. Re-rooting must reinstate the outer authority, or a later
+    /// preprocessing lane rebuilds provenance from its own transformed working
+    /// set and mandatory UNSAT certification rejects a correct refutation with
+    /// `AssertionEpochMismatch`.
+    #[test]
+    fn cleared_provenance_is_restored_to_the_outer_authored_roots() {
+        let mut exec = Executor::new();
+        let a = exec.ctx.terms.mk_var("a", Sort::Bool);
+        let b = exec.ctx.terms.mk_var("b", Sort::Bool);
+        let authored = vec![a, b];
+        let outer = provenance_of(&authored, &authored);
+
+        exec.proof_problem_assertion_provenance = None;
+        exec.reroot_proof_authority(Some(&outer));
+
+        assert_eq!(exec.proof_original_problem_assertions(), authored);
+    }
+
+    /// Re-rooting NARROWS: a nested lane's transformed working set must never
+    /// survive as authored authority, which is exactly the promotion that
+    /// forged the 60-term "authored" set behind the certification rejection.
+    #[test]
+    fn nested_working_set_cannot_keep_its_own_authority() {
+        let mut exec = Executor::new();
+        let a = exec.ctx.terms.mk_var("a", Sort::Bool);
+        let b = exec.ctx.terms.mk_var("b", Sort::Bool);
+        let generated = exec.ctx.terms.mk_var("solver_generated", Sort::Bool);
+        let authored = vec![a, b];
+        let outer = provenance_of(&authored, &authored);
+
+        // What a preprocessing lane installs after the clear: it treats its own
+        // window (authored MINUS a folded premise, PLUS a generated axiom) as
+        // the authored roots.
+        let nested_window = vec![b, generated];
+        exec.proof_problem_assertion_provenance =
+            Some(provenance_of(&nested_window, &nested_window));
+
+        exec.reroot_proof_authority(Some(&outer));
+
+        let rooted = exec
+            .proof_problem_assertion_provenance
+            .as_ref()
+            .expect("re-rooting installs provenance");
+        assert_eq!(rooted.original_problem_assertions, authored);
+        assert!(
+            !rooted.problem_assertions.contains(&generated),
+            "a solver-generated term must not become an authored premise"
+        );
+    }
+
+    /// With no outer authority to rebase onto there is nothing to restore, and
+    /// inventing one would be the widening this gate exists to prevent.
+    #[test]
+    fn absent_outer_authority_is_left_alone() {
+        let mut exec = Executor::new();
+        exec.proof_problem_assertion_provenance = None;
+        exec.reroot_proof_authority(None);
+        assert!(exec.proof_problem_assertion_provenance.is_none());
+    }
+}
+
+#[cfg(test)]
+mod nested_recheck_certification_tests {
+    use super::*;
+
+    /// END-TO-END pin for the forged-authority defect, run through the REAL
+    /// mandatory certification gate (`certify_unsat_for_publication` ->
+    /// `mint_unsat_certificate`) and then through the strict Alethe checker
+    /// that gate calls.
+    ///
+    /// Shape (a minimal model of the deductive-checks `*_push_appends_entailed`
+    /// obligations that surfaced this): a public assumption query whose
+    /// SAT-level failed-assumption harvest is a MISATTRIBUTED proper subset --
+    /// the "wrong-but-AUTHENTIC" input `certify_assumption_core` exists to
+    /// reject. Its re-solve of that subset is Unknown, and the Unknown
+    /// publication funnel clears `proof_problem_assertion_provenance`; the
+    /// deterministic restore-solve that follows then rebuilds provenance from
+    /// its own transformed working set (`preserving_authority_from(None)` is
+    /// an identity), promoting solver-generated terms to authored authority.
+    /// `mint_unsat_certificate` correctly refuses that with
+    /// `AssertionEpochMismatch`, and a CORRECT refutation is published as
+    /// `unknown` / `SelfCheckRejected`.
+    ///
+    /// A shape-only assertion would not have caught this: the emitted steps
+    /// were always well-formed. Only running the emitter's own artifact
+    /// through the gate -- verdict AND `check_proof_strict` -- pins it.
+    #[test]
+    fn misattributed_harvest_recheck_keeps_the_authored_proof_authority() {
+        // Base assertion is deliberately INDEPENDENT of the quantified pair so
+        // the injected subset is satisfiable-but-undecided (Unknown) while the
+        // full assumption set is refuted propositionally by `p and not p`.
+        let script = r#"
+            (set-option :produce-proofs true)
+            (set-logic UFLIA)
+            (declare-fun f (Int) Int)
+            (declare-fun g (Int) Int)
+            (declare-fun h (Int) Int)
+            (declare-const p Bool)
+            (assert (>= (h 0) 0))
+            (assert (forall ((x Int)) (exists ((y Int)) (> (f y) (g x)))))
+            (assert (forall ((x Int)) (< (f x) 0)))
+            (assert p)
+            (assert (not p))
+        "#;
+        let commands = ay_frontend::parse(script).expect("script parses");
+        let mut exec = Executor::new();
+        exec.execute_all(commands.as_slice())
+            .expect("setup commands execute");
+
+        // Reproduce the named-core redirect's split: the base stays asserted,
+        // everything else is assumption-tracked.
+        let all = exec.ctx.assertions.clone();
+        assert_eq!(all.len(), 5, "setup asserted an unexpected number of roots");
+        let base = vec![all[0]];
+        let assumed: Vec<TermId> = all[1..].to_vec();
+        exec.ctx.assertions = base.clone();
+
+        exec.begin_public_solve(false);
+        exec.bind_unsat_query_assumptions(&assumed);
+        let first = exec.check_sat_assuming(&assumed);
+        assert!(
+            matches!(first, Ok(SolveResult::Unsat(_))),
+            "setup solve must refute the full assumption set: {first:?}"
+        );
+
+        // The misattributed harvest: a proper subset that does NOT re-prove
+        // UNSAT (here: undecided). This is the documented defect class the
+        // certificate gate exists for, injected rather than waited for.
+        exec.last_assumption_core = Some(vec![assumed[0], assumed[1]]);
+        let certified = exec
+            .certify_assumption_core(&assumed, first)
+            .expect("core certification does not error");
+
+        // 1. The authored authority survived the nested re-solves.
+        let provenance = exec
+            .proof_problem_assertion_provenance
+            .as_ref()
+            .expect("authored proof authority must not be lost");
+        assert_eq!(
+            provenance.original_problem_assertions, base,
+            "a nested re-solve promoted its own working set to authored authority"
+        );
+
+        // 2. The mandatory gate accepts -- this is the exact call the SMT-LIB
+        //    dispatcher makes, and the one that returned Unknown downstream.
+        let published = exec.certify_unsat_for_publication(certified, &assumed);
+        assert!(
+            !published.is_unknown(),
+            "mandatory certification rejected a correct refutation: {:?}",
+            exec.unknown_reason()
+        );
+
+        // 3. The emitter's OWN proof passes the strict Alethe checker.
+        let proof = exec
+            .last_proof
+            .clone()
+            .expect("a certified UNSAT publishes its proof");
+        ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+            .expect("the emitted proof must pass strict Alethe checking");
     }
 }

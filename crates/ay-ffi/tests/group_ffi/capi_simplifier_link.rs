@@ -31,24 +31,13 @@ fn find_static_lib() -> Option<PathBuf> {
     let target_dir = env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root.join("target"));
-    let lib_path = target_dir.join(profile).join("libay_ffi.a");
-    lib_path.exists().then_some(lib_path)
-}
-
-/// Compile the consumer to an object file only (header compatibility check).
-fn compile_only(header_dir: &Path, c_source: &Path, obj_file: &Path) {
-    let status = Command::new("cc")
-        .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-c", "-I"])
-        .arg(header_dir.as_os_str())
-        .arg(c_source.as_os_str())
-        .arg("-o")
-        .arg(obj_file.as_os_str())
-        .status()
-        .expect("failed to invoke cc");
-    assert!(
-        status.success(),
-        "simplifier consumer failed to compile against ay_z3_compat.h"
-    );
+    let profile_dir = target_dir.join(profile);
+    [
+        profile_dir.join("deps").join("libay_ffi.a"),
+        profile_dir.join("libay_ffi.a"),
+    ]
+    .into_iter()
+    .find(|library| library.exists())
 }
 
 /// Compile and link the consumer against libay_ffi.a.
@@ -94,12 +83,8 @@ fn test_capi_simplifier_consumer_compiles_links_runs() {
     let tmpdir = env::temp_dir().join("ay_capi_simplifier_test");
     let _ = std::fs::create_dir_all(&tmpdir);
 
-    let Some(static_lib) = find_static_lib() else {
-        eprintln!("SKIP link: libay_ffi.a not found, compile-only check");
-        compile_only(&header_dir, &c_source, &tmpdir.join("capi_simplifier.o"));
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        return;
-    };
+    let static_lib = find_static_lib()
+        .expect("libay_ffi.a is required for the simplifier C compile/link/run compatibility gate");
 
     let binary = tmpdir.join("capi_simplifier_consumer");
     compile_and_link(&header_dir, &c_source, &static_lib, &binary);

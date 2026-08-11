@@ -16,10 +16,13 @@ use ay_dpll::api::{Sort, Term};
 use num_bigint::BigInt;
 
 use super::{
-    cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
-    ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, lookup_ast_sort,
-    record_ast_sort, require_term_ast, require_term_asts, term_to_ast, DatatypeOp, SymbolKey,
-    Z3_ast, Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    activate_finite_set_sat_gate, cache_func_decl_with_symbol, ffi_count_within_limit,
+    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, ffi_read_bounded_text,
+    ffi_try_declare_function, finite_set_engine_public_sort,
+    has_unsupported_finite_set_datatype_embedding, public_ast_sort, record_ast_sort,
+    require_term_ast, require_term_asts, sort_mentions_finite_set, term_to_ast, DatatypeOp,
+    SymbolKey, Z3_ast, Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG,
+    Z3_SORT_ERROR,
 };
 
 // ---- Function declarations and constants ----
@@ -148,13 +151,27 @@ pub unsafe extern "C" fn Z3_mk_const(c: Z3_context, s: Z3_symbol, ty: Z3_sort) -
                 record_ast_sort(ctx, ast, sort.clone());
                 return ast;
             }
+            if has_unsupported_finite_set_datatype_embedding(ctx, &sort) {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_const: a datatype containing FiniteSet fields cannot be lowered \
+                     without changing the datatype identity"
+                        .to_string(),
+                );
+                return 0;
+            }
             let identity = format!("!ay.z3-const!{}", ctx.next_ffi_fresh_id);
             ctx.next_ffi_fresh_id += 1;
-            let term = ctx.solver.declare_const_with_fresh_identity(
-                &display_name,
-                &identity,
-                sort.clone(),
-            );
+            let needs_finite_set_gate = sort_mentions_finite_set(ctx, &sort);
+            let engine_sort = finite_set_engine_public_sort(ctx, &sort);
+            let term =
+                ctx.solver
+                    .declare_const_with_fresh_identity(&display_name, &identity, engine_sort);
+            if needs_finite_set_gate {
+                activate_finite_set_sat_gate(ctx, term, "Z3_mk_const");
+                ctx.finite_set_decl_signatures
+                    .insert(identity.clone(), (Vec::new(), sort.clone()));
+            }
             ctx.ffi_const_cache.insert(cache_key, term);
             ctx.ffi_const_metadata
                 .insert(term, (identity.clone(), symbol.clone()));
@@ -225,9 +242,25 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
                 }
             };
             let identity = format!("!ay.z3-fresh-const!{fresh_id}");
+            if has_unsupported_finite_set_datatype_embedding(ctx, &sort) {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_fresh_const: a datatype containing FiniteSet fields cannot be \
+                     lowered without changing the datatype identity"
+                        .to_string(),
+                );
+                return 0;
+            }
+            let needs_finite_set_gate = sort_mentions_finite_set(ctx, &sort);
+            let engine_sort = finite_set_engine_public_sort(ctx, &sort);
             let term =
                 ctx.solver
-                    .declare_const_with_fresh_identity(&fresh_name, &identity, sort.clone());
+                    .declare_const_with_fresh_identity(&fresh_name, &identity, engine_sort);
+            if needs_finite_set_gate {
+                activate_finite_set_sat_gate(ctx, term, "Z3_mk_fresh_const");
+                ctx.finite_set_decl_signatures
+                    .insert(identity.clone(), (Vec::new(), sort.clone()));
+            }
             let symbol = SymbolKey::String(fresh_name.clone());
             ctx.ffi_const_metadata
                 .insert(term, (identity.clone(), symbol));
@@ -285,6 +318,45 @@ pub unsafe extern "C" fn Z3_mk_app(
             let Some(term_args) = require_term_asts(ctx, &arg_asts, "Z3_mk_app") else {
                 return 0;
             };
+            let (public_domain, public_range) = ctx
+                .finite_set_decl_signatures
+                .get(decl.name())
+                .cloned()
+                .unwrap_or_else(|| (decl.domain().to_vec(), decl.range().clone()));
+            if term_args.len() != public_domain.len() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_app: declaration expects {} argument(s), got {}",
+                    public_domain.len(),
+                    term_args.len()
+                ));
+                return 0;
+            }
+            // A POLYMORPHIC declaration's domain is a signature SCHEMA, not a
+            // concrete sort list: `f : α → α` legitimately accepts an Int
+            // argument. Equality against the schema would reject every
+            // instantiation, so the per-argument check below is skipped for
+            // such decls and `instantiate_poly_decl` (which unifies, and keeps
+            // one variable bound to ONE sort) reports the sort error instead
+            // (#poly-inst).
+            let polymorphic = decl_mentions_type_var(&decl);
+            if !polymorphic {
+                for (index, ((&arg_ast, &arg_term), expected)) in arg_asts
+                    .iter()
+                    .zip(&term_args)
+                    .zip(&public_domain)
+                    .enumerate()
+                {
+                    let actual = public_ast_sort(ctx, arg_ast, arg_term);
+                    if actual != *expected {
+                        ctx.last_error = Z3_SORT_ERROR;
+                        ctx.error_msg = Some(format!(
+                            "Z3_mk_app: argument {index} has public sort {actual}, expected {expected}"
+                        ));
+                        return 0;
+                    }
+                }
+            }
             // Datatype constructor/recognizer/accessor applications route through
             // AY's verified datatype builders so the resulting term matches the
             // SMT-LIB elaborator exactly (e.g. nullary constructors resolve to the
@@ -337,7 +409,7 @@ pub unsafe extern "C" fn Z3_mk_app(
                     // instance (libz3 parity: `f : α → α` at an Int argument
                     // yields an Int-sorted application). Mismatched unification
                     // stays an honest sort error.
-                    if decl_mentions_type_var(&decl) {
+                    if polymorphic {
                         match instantiate_poly_decl(ctx, &decl, &term_args) {
                             Ok(inst) => {
                                 let range = inst.range().clone();
@@ -365,7 +437,10 @@ pub unsafe extern "C" fn Z3_mk_app(
                 }
             };
             let ast = term_to_ast(ctx, result);
-            record_ast_sort(ctx, ast, decl.range().clone());
+            if sort_mentions_finite_set(ctx, &public_range) {
+                activate_finite_set_sat_gate(ctx, result, "Z3_mk_app result");
+            }
+            record_ast_sort(ctx, ast, public_range);
             ast
         })
     }
@@ -531,12 +606,23 @@ pub unsafe extern "C" fn Z3_mk_eq(c: Z3_context, l: Z3_ast, r: Z3_ast) -> Z3_ast
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let Some(l) = require_term_ast(ctx, l, "Z3_mk_eq", "left operand") else {
+            let l_ast = l;
+            let r_ast = r;
+            let Some(l) = require_term_ast(ctx, l_ast, "Z3_mk_eq", "left operand") else {
                 return 0;
             };
-            let Some(r) = require_term_ast(ctx, r, "Z3_mk_eq", "right operand") else {
+            let Some(r) = require_term_ast(ctx, r_ast, "Z3_mk_eq", "right operand") else {
                 return 0;
             };
+            let left_sort = public_ast_sort(ctx, l_ast, l);
+            let right_sort = public_ast_sort(ctx, r_ast, r);
+            if left_sort != right_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_eq: public operand sorts differ ({left_sort} vs {right_sort})"
+                ));
+                return 0;
+            }
             let t = ctx.solver.eq(l, r);
             let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
@@ -579,6 +665,20 @@ pub unsafe extern "C" fn Z3_mk_distinct(
             let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_distinct") else {
                 return 0;
             };
+            let Some((&first_ast, &first_term)) = arg_asts.first().zip(terms.first()) else {
+                return 0;
+            };
+            let expected = public_ast_sort(ctx, first_ast, first_term);
+            for (&arg_ast, &term) in arg_asts.iter().zip(&terms).skip(1) {
+                let actual = public_ast_sort(ctx, arg_ast, term);
+                if actual != expected {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some(format!(
+                        "Z3_mk_distinct: public operand sorts differ ({expected} vs {actual})"
+                    ));
+                    return 0;
+                }
+            }
             let t = ctx.solver.distinct(&terms);
             let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
@@ -622,20 +722,35 @@ pub unsafe extern "C" fn Z3_mk_ite(c: Z3_context, t1: Z3_ast, t2: Z3_ast, t3: Z3
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_ite", "condition") else {
+            let condition_ast = t1;
+            let then_ast = t2;
+            let else_ast = t3;
+            let Some(t1) = require_term_ast(ctx, condition_ast, "Z3_mk_ite", "condition") else {
                 return 0;
             };
-            let Some(t2_term) = require_term_ast(ctx, t2, "Z3_mk_ite", "then operand") else {
+            let Some(t2_term) = require_term_ast(ctx, then_ast, "Z3_mk_ite", "then operand") else {
                 return 0;
             };
-            let Some(t3) = require_term_ast(ctx, t3, "Z3_mk_ite", "else operand") else {
+            let Some(t3) = require_term_ast(ctx, else_ast, "Z3_mk_ite", "else operand") else {
                 return 0;
             };
+            if public_ast_sort(ctx, condition_ast, t1) != Sort::Bool {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some("Z3_mk_ite: condition must have public Bool sort".to_string());
+                return 0;
+            }
+            let then_sort = public_ast_sort(ctx, then_ast, t2_term);
+            let else_sort = public_ast_sort(ctx, else_ast, t3);
+            if then_sort != else_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_ite: branch public sorts differ ({then_sort} vs {else_sort})"
+                ));
+                return 0;
+            }
             let t = ctx.solver.ite(t1, t2_term, t3);
             let r = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t2).cloned() {
-                record_ast_sort(ctx, r, sort);
-            }
+            record_ast_sort(ctx, r, then_sort);
             r
         })
     }

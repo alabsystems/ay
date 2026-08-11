@@ -62,32 +62,108 @@ impl Executor {
         model: &Model,
         default_term: TermId,
     ) -> EvalValue {
+        if let Some(value) = model.completed_values.get(&default_term) {
+            return value.clone();
+        }
+        // A `(default a)` of arithmetic/BV/Bool sort participates directly in
+        // that theory.  Its theory assignment is authoritative; an EUF class
+        // constant is only a fallback for a term the scalar theory omitted.
+        // Consulting the EUF alias first can resurrect a stale representative
+        // (for example `0`) after arithmetic satisfied `(distinct (default a)
+        // 0 1)` with another value.
+        let scalar = self.evaluate_var(model, default_term, self.ctx.terms.sort(default_term));
+        if !matches!(scalar, EvalValue::Unknown) {
+            return scalar;
+        }
         if let Some(euf) = model.euf_model.as_ref() {
             if let Some(&constant) = euf.func_app_const_terms.get(&default_term) {
                 return self.evaluate_term(model, constant);
             }
         }
-        self.evaluate_var(model, default_term, self.ctx.terms.sort(default_term))
+        EvalValue::Unknown
     }
 
     /// Evaluate the scalar else-value of an array interpretation.
     ///
-    /// Syntactic const/store forms are reduced structurally. Symbolic arrays
-    /// read the committed default materialized in `ArrayModel`; a scalar model
-    /// entry for the `default` term is a final compatibility fallback for
-    /// solver paths whose array extraction has not yet mirrored that value.
+    /// Constant arrays and stores over infinite/large index carriers are reduced
+    /// structurally.  A store over a small finite carrier is different: Z3 5.0.0
+    /// defines its default through a shared choice index, so the store may change
+    /// the default.  In that case the scalar assignment constrained by the
+    /// default-store axioms is authoritative and must be consulted before any
+    /// base-array fallback.
     pub(in crate::executor) fn evaluate_array_default(
         &self,
         model: &Model,
         default_term: TermId,
         array: TermId,
     ) -> EvalValue {
+        // `mk_array_default` folds a binder-independent lambda to its body, so
+        // reaching this evaluator with a lambda means the body depends on the
+        // binder and the default is an opaque, independently constrained
+        // scalar.  Do not let an extractor/completion fallback for the lambda
+        // array replace that scalar with one of the body's point values.
+        // `as-array` defaults have the same opaque SMT-LIB semantics.
+        if self.ctx.terms.get_lambda_array(array).is_some()
+            || self.ctx.terms.get_as_array_func(array).is_some()
+        {
+            return self.evaluate_symbolic_array_default_scalar(model, default_term);
+        }
+
         let mut current = array;
         let mut visited = HashSet::default();
         while visited.insert(current) {
             match self.ctx.terms.get(current) {
                 TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
-                    current = args[0];
+                    let index_cardinality = match self.ctx.terms.sort(current) {
+                        Sort::Array(array_sort) => {
+                            self.sort_finite_cardinality(&array_sort.index_sort)
+                        }
+                        _ => None,
+                    };
+                    match index_cardinality {
+                        Some(1) => return self.evaluate_term(model, args[2]),
+                        Some(size) if size < (1 << 14) => {
+                            let scalar =
+                                self.evaluate_symbolic_array_default_scalar(model, default_term);
+                            if !matches!(scalar, EvalValue::Unknown) {
+                                return scalar;
+                            }
+
+                            // A model extractor may already have mirrored the
+                            // constrained scalar onto this exact store term.
+                            if let Some(default) = model
+                                .array_model
+                                .as_ref()
+                                .and_then(|arrays| arrays.array_values.get(&current))
+                                .and_then(|interp| interp.default.as_deref())
+                            {
+                                let element_sort = match self.ctx.terms.sort(current) {
+                                    Sort::Array(array_sort) => {
+                                        Some(array_sort.element_sort.clone())
+                                    }
+                                    _ => None,
+                                };
+                                let value = self.parse_model_value_string(default, &element_sort);
+                                if !matches!(value, EvalValue::Unknown) {
+                                    return value;
+                                }
+                            }
+
+                            // Last exact fallback: evaluate the select used by
+                            // the generated finite-store axiom itself.
+                            if let Some(&epsilon) = self
+                                .array_default_epsilon_by_sort
+                                .get(self.ctx.terms.sort(args[1]))
+                            {
+                                let value = self.evaluate_select(model, current, epsilon);
+                                if !matches!(value, EvalValue::Unknown) {
+                                    return value;
+                                }
+                            }
+                            return EvalValue::Unknown;
+                        }
+                        _ => current = args[0],
+                    }
                 }
                 TermData::App(sym, args) if sym.name() == "const-array" && args.len() == 1 => {
                     return self.evaluate_term(model, args[0]);
@@ -162,6 +238,9 @@ impl Executor {
         model: &mut Model,
         relevant: Option<&HashSet<TermId>>,
     ) -> bool {
+        // Runs first, and unconditionally: an array can carry duplicate-encoding
+        // index cells whether or not it also has a `(default a)` term to mirror.
+        let mut changed = self.canonicalize_enum_indexed_cells(model, relevant);
         let mut pending = Vec::new();
         for default_term in self.ctx.terms.term_ids() {
             let Some(array) = self.ctx.terms.get_array_default(default_term) else {
@@ -191,21 +270,32 @@ impl Executor {
             let Sort::Array(array_sort) = self.ctx.terms.sort(array) else {
                 continue;
             };
+            let observed_cells = self.observed_read_cells(model, array);
             pending.push((
                 array,
                 rendered,
                 array_sort.index_sort.clone(),
                 array_sort.element_sort.clone(),
+                observed_cells,
             ));
         }
         if pending.is_empty() {
-            return false;
+            return changed;
         }
 
         let arrays = model.array_model.get_or_insert_with(Default::default);
-        let mut changed = false;
-        for (array, value, index_sort, element_sort) in pending {
+        for (array, value, index_sort, element_sort, observed_cells) in pending {
             let interp = arrays.array_values.entry(array).or_default();
+            // Publish the reads the search actually committed BEFORE the scalar
+            // else-value, so the else-value cannot answer them.  See
+            // `observed_read_cells` for why a bare array needs this.
+            for (index, cell) in observed_cells {
+                if interp.stores.iter().any(|(existing, _)| *existing == index) {
+                    continue;
+                }
+                interp.stores.push((index, cell));
+                changed = true;
+            }
             if interp.default.as_ref() != Some(&value)
                 || interp.index_sort.as_ref() != Some(&index_sort)
                 || interp.element_sort.as_ref() != Some(&element_sort)
@@ -217,6 +307,208 @@ impl Executor {
             }
         }
         changed
+    }
+
+    /// Constructor names of an ALL-NULLARY (enum) datatype `sort` — its exact,
+    /// finite inhabitant set — resolving both the inline `Sort::Datatype` form
+    /// and a bare `Sort::Uninterpreted(name)` against the declared-datatype
+    /// registry. `None` for any other sort. Name-level companion to
+    /// [`Self::enum_datatype_constructor_count`].
+    fn enum_datatype_constructor_names(&self, sort: &Sort) -> Option<Vec<String>> {
+        let names: Vec<String> = match sort {
+            Sort::Datatype(dt) => {
+                if dt.constructors.is_empty()
+                    || !dt.constructors.iter().all(|c| c.fields.is_empty())
+                {
+                    return None;
+                }
+                dt.constructors.iter().map(|c| c.name.clone()).collect()
+            }
+            Sort::Uninterpreted(name) => {
+                let ctors: Vec<String> = self
+                    .ctx
+                    .datatype_iter()
+                    .find(|(dt_name, _)| dt_name == name)
+                    .map(|(_, cs)| cs.to_vec())
+                    .unwrap_or_default();
+                if ctors.is_empty() {
+                    return None;
+                }
+                let all_nullary = ctors.iter().all(|c| {
+                    self.ctx
+                        .constructor_selector_info(c)
+                        .map_or(true, |f| f.is_empty())
+                });
+                if !all_nullary {
+                    return None;
+                }
+                ctors
+            }
+            _ => return None,
+        };
+        (!names.is_empty()).then_some(names)
+    }
+
+    /// Drop enum-index cells written in a FOREIGN encoding once the constructor
+    /// encoding already covers the whole carrier. Returns whether anything
+    /// changed.
+    ///
+    /// An enum-datatype-indexed array can end up carrying every cell TWICE: once
+    /// keyed by an internal carrier token minted by uninterpreted-sort completion
+    /// (`@Color!0`), and once keyed by the real constructor (`red`). Both name the
+    /// same element, but only one is a value anything downstream can interpret.
+    /// z3 rejects `@Color!0` as an unknown constant, and the independent gate —
+    /// which is RIGHT to refuse to equate two unrelated encodings — reports
+    /// `equality between incomparable model values (Uninterpreted vs Datatype)`
+    /// and cannot confirm a `sat` that is otherwise perfectly good:
+    ///
+    /// ```smtlib
+    /// (declare-datatypes ((Color 0)) (((red) (green) (blue))))
+    /// (declare-const a (Array Color Int))
+    /// (assert (= (select a red) 1))
+    /// (assert (= (select a blue) 3))
+    /// ```
+    ///
+    /// The interpretation held `[@Color!1↦0, @Color!2↦3, @Color!0↦1, green↦0,
+    /// blue↦3, red↦1]` — three cells, each duplicated. Because the gate scans the
+    /// authoritative end first, it met `@Color!1` before ever reaching `red`.
+    ///
+    /// This is the PRODUCER-side normalization the incomparable-values arm of
+    /// `ay_model_check::value_eq` asks for. Teaching that comparison to equate the
+    /// two encodings instead would blunt exactly the check the gate depends on —
+    /// and could not even be done correctly here, since `@Color!1` and `blue` are
+    /// only the same element by virtue of a carrier mapping `value_eq` cannot see.
+    ///
+    /// SOUNDNESS: foreign-encoded cells are dropped ONLY when the retained
+    /// constructor-keyed cells cover EVERY constructor of the carrier. The
+    /// interpretation is then TOTAL in the constructor encoding, so every index
+    /// value already resolves to a concrete cell and no read can reach a dropped
+    /// one — the array denotes exactly the same function before and after. When
+    /// coverage is incomplete nothing is dropped and the prior behaviour stands.
+    fn canonicalize_enum_indexed_cells(
+        &self,
+        model: &mut Model,
+        relevant: Option<&HashSet<TermId>>,
+    ) -> bool {
+        let Some(arrays) = model.array_model.as_ref() else {
+            return false;
+        };
+        // Collect first: resolving the datatype registry needs `&self` while the
+        // rewrite needs `&mut model`.
+        let mut rewrites: Vec<(TermId, Vec<(String, String)>)> = Vec::new();
+        for (&array, interp) in &arrays.array_values {
+            if relevant.is_some_and(|terms| !terms.contains(&array)) {
+                continue;
+            }
+            let Sort::Array(array_sort) = self.ctx.terms.sort(array) else {
+                continue;
+            };
+            let Some(constructors) = self.enum_datatype_constructor_names(&array_sort.index_sort)
+            else {
+                continue;
+            };
+            let covered = constructors
+                .iter()
+                .all(|c| interp.stores.iter().any(|(index, _)| index == c));
+            if !covered {
+                continue;
+            }
+            let kept: Vec<(String, String)> = interp
+                .stores
+                .iter()
+                .filter(|(index, _)| constructors.iter().any(|c| c == index))
+                .cloned()
+                .collect();
+            if kept.len() != interp.stores.len() {
+                rewrites.push((array, kept));
+            }
+        }
+        if rewrites.is_empty() {
+            return false;
+        }
+        let arrays = model.array_model.get_or_insert_with(Default::default);
+        for (array, kept) in rewrites {
+            if let Some(interp) = arrays.array_values.get_mut(&array) {
+                interp.stores = kept;
+            }
+        }
+        true
+    }
+
+    /// Cells for the reads of `array` that the search itself committed a value
+    /// to, as `(rendered index, rendered value)` pairs.
+    ///
+    /// Publishing a scalar `(default a)` as an array's else-value silently makes
+    /// the interpretation TOTAL.  For a BARE array — a declared array variable,
+    /// with no store/const/lambda structure to extract cells from — nothing else
+    /// puts the observed cells into the interpretation, so every asserted read
+    /// falls through to that else-value.  A model the search had right is then
+    /// refuted by our own gate: for
+    ///
+    /// ```smtlib
+    /// (declare-const a (Array Bool Int))
+    /// (assert (distinct (default a) (select a false)))
+    /// (assert (distinct (default a) (select a true)))
+    /// ```
+    ///
+    /// the search commits `default(a) = 0`, `(select a false) = 1`,
+    /// `(select a true) = 2` — all distinct, a correct model — but the published
+    /// interpretation was `else 0` with NO cells, so both reads evaluated to `0`
+    /// and the strict oracle fail-closed the whole query to `unknown`.
+    ///
+    /// Only BARE (`Var`) arrays are handled. A store/const/lambda/map array gets
+    /// its cells from its own structure, and second-guessing that from committed
+    /// read values could contradict the structural extraction.
+    ///
+    /// Fail-closed: a read whose index or whose own value the model does not pin
+    /// is skipped rather than guessed, and if two reads land on the SAME index
+    /// value with DIFFERENT values the model is internally inconsistent at that
+    /// cell — no cells at all are published then, exactly as the `read_conflicted`
+    /// guard does for a dropped conflicting read.
+    ///
+    /// SOUNDNESS: this only makes a candidate model MORE specific, and every cell
+    /// it adds is re-checked downstream by model validation and the independent
+    /// gate. A cell that is wrong can therefore only cost a `Sat` (degrading it to
+    /// `unknown`) — it can never mint one.
+    fn observed_read_cells(&self, model: &Model, array: TermId) -> Vec<(String, String)> {
+        if !matches!(self.ctx.terms.get(array), TermData::Var(_, _)) {
+            return Vec::new();
+        }
+        let mut cells: Vec<(String, String)> = Vec::new();
+        for read in self.ctx.terms.term_ids() {
+            let TermData::App(sym, args) = self.ctx.terms.get(read) else {
+                continue;
+            };
+            if sym.name() != "select" || args.len() != 2 || args[0] != array {
+                continue;
+            }
+            let index = args[1];
+            let index_value = self.evaluate_term(model, index);
+            if matches!(index_value, EvalValue::Unknown) {
+                continue;
+            }
+            // The read's OWN committed value, not `evaluate_term`: evaluating the
+            // select would route through the array interpretation we are in the
+            // middle of publishing and just hand back the else-value.
+            let read_value = self.evaluate_var(model, read, self.ctx.terms.sort(read));
+            if matches!(read_value, EvalValue::Unknown) {
+                continue;
+            }
+            let (Ok(rendered_index), Ok(rendered_value)) = (
+                self.try_format_eval_value(&index_value, index),
+                self.try_format_eval_value(&read_value, read),
+            ) else {
+                continue;
+            };
+            if let Some((_, existing)) = cells.iter().find(|(i, _)| *i == rendered_index) {
+                if *existing != rendered_value {
+                    return Vec::new();
+                }
+                continue;
+            }
+            cells.push((rendered_index, rendered_value));
+        }
+        cells
     }
 
     /// Evaluate select(array, index) using array axioms (ROW1/ROW2).
@@ -640,7 +932,6 @@ impl Executor {
         let Some(interp) = array_model.array_values.get(&array) else {
             return EvalValue::Unknown;
         };
-
         let mut has_unparseable_index = false;
         for (stored_idx, stored_val) in &interp.stores {
             let parsed_idx = self.parse_model_value_string(stored_idx, &interp.index_sort);
@@ -2185,7 +2476,7 @@ impl Executor {
     /// Whether `term` is a shape `normalize_array_with_definitions` can reduce
     /// to a normalized array: an array constructor (`const-array`/`store`), an
     /// array variable, or `let`/`ite` wrapping one.
-    fn is_array_definition_shape(&self, term: TermId) -> bool {
+    pub(super) fn is_array_definition_shape(&self, term: TermId) -> bool {
         match self.ctx.terms.get(term) {
             TermData::Var(_, _) => matches!(self.ctx.terms.sort(term), Sort::Array(_)),
             TermData::App(sym, args) => {

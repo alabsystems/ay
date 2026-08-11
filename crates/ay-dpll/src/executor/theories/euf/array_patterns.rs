@@ -99,6 +99,7 @@ impl Executor {
 
     fn sort_cardinality_is_one_inner(&self, sort: &Sort, in_progress: &mut Vec<String>) -> bool {
         match sort {
+            Sort::FiniteDomain(_, size) => *size == 1,
             Sort::Array(arr) => self.sort_cardinality_is_one_inner(&arr.element_sort, in_progress),
             Sort::Datatype(dt) => self.datatype_constructors_card_one(
                 &dt.name,
@@ -229,6 +230,10 @@ impl Executor {
     ) -> Option<usize> {
         match sort {
             Sort::Bool => Some(2),
+            Sort::FiniteDomain(_, size) => {
+                let size = usize::try_from(*size).ok()?;
+                (size < Self::FINITE_CARDINALITY_CAP).then_some(size)
+            }
             Sort::BitVec(bv) => {
                 // 2^w, capped. Widths past the cap are "effectively unbounded".
                 if (bv.width as usize) >= (Self::FINITE_CARDINALITY_CAP.trailing_zeros() as usize) {
@@ -237,9 +242,40 @@ impl Executor {
                 Some(1usize << bv.width)
             }
             Sort::Array(arr) => {
-                let idx = self.sort_finite_cardinality_inner(&arr.index_sort, in_progress)?;
+                // |Array I E| = |E| ^ |I|, so the ELEMENT sort must be resolved
+                // first. A one-element element sort collapses the whole array
+                // sort to a single inhabitant no matter what the index sort is --
+                // INCLUDING an infinite one.
+                //
+                // Resolving the index first and bailing on it (the previous
+                // order) therefore reported `None` for a carrier that is not just
+                // finite but a singleton. `(Array Int E)` with `|E| = 1` has
+                // exactly one inhabitant, yet `Int` made the index lookup return
+                // `None`, the caller fell through to the "large or unknown
+                // carrier" arm, and AY ASSERTED `default(store(a,i,v)) =
+                // default(a)` -- which is false on a singleton carrier, where the
+                // store replaces the array's only element. Z3 5.0.0 refutes that
+                // axiom standalone:
+                //
+                //   (declare-datatypes ((E 0)) (((C))))
+                //   (declare-const i (Array Int E))
+                //   (define-fun a () (Array (Array Int E) Int)
+                //     ((as const (Array (Array Int E) Int)) 5))
+                //   (assert (= (default (store a i 9)) (default a)))   => unsat
+                //   (assert (= (default (store a i 9)) 9))
+                //   (assert (= (default a) 5))                         => sat
+                //
+                // Reachable in QF_AUFDT with no quantifiers.
                 let elem = self.sort_finite_cardinality_inner(&arr.element_sort, in_progress)?;
-                // |Array I E| = |E| ^ |I|. Bail (None) on any overflow / cap breach.
+                if elem <= 1 {
+                    // |E| = 1 => exactly one total function I -> E for any I.
+                    // (|E| = 0 cannot occur: SMT-LIB sorts are non-empty.)
+                    return Some(1);
+                }
+                // |E| >= 2 with an unknown-or-infinite index is unbounded, so the
+                // `?` below is the correct bail.
+                let idx = self.sort_finite_cardinality_inner(&arr.index_sort, in_progress)?;
+                // Bail (None) on any overflow / cap breach.
                 let mut acc: usize = 1;
                 for _ in 0..idx {
                     acc = acc.checked_mul(elem)?;
@@ -2929,11 +2965,10 @@ impl Executor {
     ///
     ///   `¬(= a b) ∨ (= default(a) default(b))`
     ///
-    /// i.e. equal arrays have equal defaults. `default` is the "value at almost
-    /// all indices" function with the standard array-theory simplifications
-    /// (already implemented in `TermStore::mk_array_default`):
-    ///   - `default((as const C) c) = c`
-    ///   - `default(store(b, i, v)) = default(b)`
+    /// i.e. equal arrays have equal defaults. `default` is the array model's
+    /// else-value operation. Constant arrays simplify directly; store terms are
+    /// handled by [`Self::add_array_default_store_axioms`], because their rule is
+    /// carrier-sensitive in Z3 5.0.0.
     ///
     /// This is the principled completion of array extensionality for *positive*
     /// equalities between arrays whose defaults are structurally determined.
@@ -2946,13 +2981,10 @@ impl Executor {
     /// arrays disagree at the infinitely many others), yet the witness-only
     /// machinery returned a spurious SAT.
     ///
-    /// The default axiom captures the disagreement WITHOUT a witness index:
-    /// `default(store(const 0, k, v))` simplifies to `default(const 0) = 0`,
-    /// `default(const 1) = 1`, so the consequent `(= 0 1)` folds to `false`
-    /// and the clause becomes `¬(= a b)` — refuting the equality. This mirrors
-    /// Z3's `theory_array` default/extensionality axioms, which it instantiates
-    /// on array terms unconditionally (regardless of whether a disequality is
-    /// asserted), making the const-default mismatch a theorem.
+    /// On an infinite/large carrier the store-default axiom reduces the store
+    /// default to the base default, recovering the same const-default mismatch.
+    /// On a small finite carrier it instead links both defaults to selects at a
+    /// shared choice point; unconditional store peeling would be unsound there.
     ///
     /// This is independent of (and complementary to) the `select`-over-`ite`
     /// Shannon-lift on the array-EUF route (`lift_arithmetic_ite_all` in
@@ -2970,6 +3002,20 @@ impl Executor {
     /// false, so the implication is vacuously satisfied.
     pub(in crate::executor) fn add_array_default_congruence_axioms(&mut self) {
         let should_stop = self.make_should_stop();
+        // Record defaults that already occur in the scoped formula before this
+        // pass creates any terms.  A dead `default(x)` manufactured while
+        // inspecting an unrelated equality must not make that equality relevant
+        // on the next fixpoint round.
+        let mut arrays_with_default: HashSet<TermId> = HashSet::default();
+        for idx in 0..self.ctx.terms.len() {
+            let term_id = TermId(idx as u32);
+            if self.term_in_array_scope(term_id) {
+                if let Some(array) = self.ctx.terms.get_array_default(term_id) {
+                    arrays_with_default.insert(array);
+                }
+            }
+        }
+
         // Collect array-equality atoms once, then materialize axioms, so we do
         // not iterate over the terms we are appending.
         let mut eq_atoms: Vec<(TermId, TermId, TermId)> = Vec::new();
@@ -2989,7 +3035,15 @@ impl Executor {
             if lhs == rhs {
                 continue;
             }
-            if !matches!(self.ctx.terms.sort(lhs), Sort::Array(_)) {
+            // This pass scans the append-only term history, which can contain
+            // malformed/internal equality applications left by a scoped proof
+            // replay. Array-default congruence is defined only for two arrays
+            // of the SAME sort. Checking just the lhs let `Array = Bool`
+            // reach `mk_array_default(rhs)` (a Bool fallback) and then panic
+            // while constructing `Int = Bool`. Such a node is not an array
+            // theory atom and must contribute no axiom.
+            let lhs_sort = self.ctx.terms.sort(lhs);
+            if !matches!(lhs_sort, Sort::Array(_)) || self.ctx.terms.sort(rhs) != lhs_sort {
                 continue;
             }
             if seen.insert(term_id) {
@@ -3001,20 +3055,25 @@ impl Executor {
             if should_stop() {
                 return;
             }
-            let default_lhs = self.ctx.terms.mk_array_default(lhs);
-            let default_rhs = self.ctx.terms.mk_array_default(rhs);
-            // `mk_array_default` only simplifies through const / store / lambda
-            // structure; for two opaque array variables the defaults are fresh
-            // uninterpreted terms and the axiom is a no-op constraint. Skip those
-            // to avoid littering the search with inert `default(x)` atoms and the
-            // LIA oscillation they can induce (#4304). Only emit when at least one
-            // side's default is structurally determined (a non-`default` term),
-            // which is exactly when the axiom can do useful refutation.
-            let lhs_resolved = self.ctx.terms.get_array_default(default_lhs).is_none();
-            let rhs_resolved = self.ctx.terms.get_array_default(default_rhs).is_none();
-            if !lhs_resolved && !rhs_resolved {
+            // Preserve the old useful structural case (const/lambda on either
+            // side), and additionally propagate an explicitly relevant default
+            // through an array equality class.  Z3's add_parent_default does the
+            // latter when an array enode class is merged; without it,
+            // `(default a)` plus `a = store(b,i,v)` never reaches the store axiom.
+            let lhs_resolved = self.ctx.terms.get_const_array(lhs).is_some()
+                || self.ctx.terms.get_lambda_array(lhs).is_some();
+            let rhs_resolved = self.ctx.terms.get_const_array(rhs).is_some()
+                || self.ctx.terms.get_lambda_array(rhs).is_some();
+            if !lhs_resolved
+                && !rhs_resolved
+                && !arrays_with_default.contains(&lhs)
+                && !arrays_with_default.contains(&rhs)
+            {
                 continue;
             }
+
+            let default_lhs = self.ctx.terms.mk_array_default(lhs);
+            let default_rhs = self.ctx.terms.mk_array_default(rhs);
             let default_eq = self.ctx.terms.mk_eq(default_lhs, default_rhs);
             // If the consequent already folded to `true`, the implication is a
             // tautology — adding it is pointless. If it folded to `false`, the
@@ -3027,6 +3086,295 @@ impl Executor {
             let clause = self.ctx.terms.mk_or(vec![not_eq, default_eq]);
             self.push_array_axiom_assertion_site(clause, "array_default_congruence");
         }
+    }
+
+    /// Z3 5.0.0 array-default axioms for a store whose default is relevant.
+    ///
+    /// For `A = store(B, i, v)`, Z3's `theory_array_full.cpp` distinguishes:
+    ///
+    /// - a unit index carrier: `default(A) = v`;
+    /// - a finite carrier smaller than 2^14:
+    ///   `default(A) = select(A, epsilon)`,
+    ///   `default(B) = select(B, epsilon)`, and
+    ///   `select(A, diag(i)) = select(B, diag(i))`;
+    /// - every infinite, unknown, very large, or >= 2^14 carrier:
+    ///   `default(A) = default(B)`.
+    ///
+    /// `epsilon` and unary `diag` are shared by INDEX SORT, including across
+    /// arrays with different element sorts.  Per-store witnesses are weaker and
+    /// observably disagree with Z3 (two Bool-indexed stores can force mutually
+    /// incompatible choices).
+    /// The array-default choice index for `index_sort`, minting it on first use.
+    ///
+    /// Z3 shares ONE epsilon per INDEX SORT across every array whose default it
+    /// resolves that way — stores and lambdas alike, and across arrays with
+    /// different element sorts. Measured against z3 4.15.4: with
+    /// `a = (lambda ((x Bool)) (ite x 1 0))` and
+    /// `b = (store ((as const (Array Bool Int)) 0) false 5)`, asserting
+    /// `(= (default a) 1)` (needs epsilon = true) together with
+    /// `(= (default b) 5)` (needs epsilon = false) is UNSAT, while moving the
+    /// store to index `true` makes it SAT. A per-array witness would call both
+    /// SAT and observably disagree.
+    pub(in crate::executor) fn array_default_epsilon_for(&mut self, index_sort: &Sort) -> TermId {
+        if let Some(&epsilon) = self.array_default_epsilon_by_sort.get(index_sort) {
+            return epsilon;
+        }
+        let name = self.ctx.terms.mk_internal_symbol("array_default_epsilon");
+        let epsilon = self.ctx.terms.mk_var(name, index_sort.clone());
+        self.array_default_epsilon_by_sort
+            .insert(index_sort.clone(), epsilon);
+        epsilon
+    }
+
+    pub(in crate::executor) fn add_array_default_store_axioms(&mut self) {
+        const Z3_LARGE_ARRAY_DOMAIN_SIZE: usize = 1 << 14;
+
+        let should_stop = self.make_should_stop();
+        let mut stores = Vec::new();
+        let mut seen = HashSet::default();
+        let scan_len = self.ctx.terms.len();
+        for idx in 0..scan_len {
+            let default_term = TermId(idx as u32);
+            if !self.term_in_array_scope(default_term) {
+                continue;
+            }
+            let Some(array) = self.ctx.terms.get_array_default(default_term) else {
+                continue;
+            };
+            let TermData::App(sym, args) = self.ctx.terms.get(array).clone() else {
+                continue;
+            };
+            if sym.name() != "store" || args.len() != 3 || !seen.insert(array) {
+                continue;
+            }
+            let Sort::Array(array_sort) = self.ctx.terms.sort(array).clone() else {
+                continue;
+            };
+            stores.push((
+                default_term,
+                array,
+                args[0],
+                args[1],
+                args[2],
+                array_sort.index_sort.clone(),
+            ));
+        }
+
+        for (default_store, store, base, index, value, index_sort) in stores {
+            if should_stop() {
+                return;
+            }
+            match self.sort_finite_cardinality(&index_sort) {
+                Some(1) => {
+                    let axiom = self.ctx.terms.mk_eq(default_store, value);
+                    self.push_array_axiom_assertion_site(axiom, "array_default_store_unit");
+                }
+                Some(size) if size < Z3_LARGE_ARRAY_DOMAIN_SIZE => {
+                    let epsilon = self.array_default_epsilon_for(&index_sort);
+                    let diag_name =
+                        if let Some(name) = self.array_default_diag_by_sort.get(&index_sort) {
+                            name.clone()
+                        } else {
+                            let name = self.ctx.terms.mk_internal_symbol("array_default_diag");
+                            self.array_default_diag_by_sort
+                                .insert(index_sort.clone(), name.clone());
+                            name
+                        };
+
+                    let default_base = self.ctx.terms.mk_array_default(base);
+                    let store_at_epsilon = self.ctx.terms.mk_select(store, epsilon);
+                    let base_at_epsilon = self.ctx.terms.mk_select(base, epsilon);
+                    let default_store_axiom = self.ctx.terms.mk_eq(default_store, store_at_epsilon);
+                    let default_base_axiom = self.ctx.terms.mk_eq(default_base, base_at_epsilon);
+                    self.push_array_axiom_assertion_site(
+                        default_store_axiom,
+                        "array_default_store_epsilon",
+                    );
+                    self.push_array_axiom_assertion_site(
+                        default_base_axiom,
+                        "array_default_base_epsilon",
+                    );
+
+                    // Both axioms above are THEORY-INERT on their own. `epsilon`
+                    // is a fresh VARIABLE, so `select(A, epsilon)` is an opaque
+                    // EUF application: nothing case-splits epsilon over the
+                    // carrier, and — because `mk_select` folds a read at a
+                    // CONCRETE index through the store chain by ROW — the terms
+                    // `select(A, e)` that congruence would need to merge with do
+                    // not even exist in the term store. The candidate model
+                    // therefore leaves `default(A)` unconstrained, falsifies the
+                    // assertion it was meant to decide, and the strict oracle
+                    // fail-closes the whole query to `unknown`.
+                    //
+                    // Materialize the case split for a SMALL, EXACTLY-ENUMERABLE
+                    // carrier: `select_case_split_axioms` emits, per inhabitant
+                    // `e`, the congruence instance
+                    //     (or (not (= epsilon e)) (= (select A epsilon) (select A e)))
+                    // where the right-hand `select(A, e)` folds to a real array
+                    // value. See that helper for the soundness argument.
+                    self.push_finite_epsilon_case_split(
+                        store,
+                        store_at_epsilon,
+                        epsilon,
+                        &index_sort,
+                    );
+                    self.push_finite_epsilon_case_split(
+                        base,
+                        base_at_epsilon,
+                        epsilon,
+                        &index_sort,
+                    );
+
+                    let diag_index = self.ctx.terms.mk_app(
+                        Symbol::named(diag_name),
+                        vec![index],
+                        index_sort.clone(),
+                    );
+                    let store_at_diag = self.ctx.terms.mk_select(store, diag_index);
+                    let base_at_diag = self.ctx.terms.mk_select(base, diag_index);
+                    let diag_axiom = self.ctx.terms.mk_eq(store_at_diag, base_at_diag);
+                    self.push_array_axiom_assertion_site(diag_axiom, "array_default_store_diag");
+                }
+                _ => {
+                    let default_base = self.ctx.terms.mk_array_default(base);
+                    let axiom = self.ctx.terms.mk_eq(default_store, default_base);
+                    self.push_array_axiom_assertion_site(axiom, "array_default_store_large");
+                }
+            }
+        }
+    }
+
+    /// Largest index carrier whose inhabitants are enumerated one-by-one for the
+    /// array-default epsilon case split.
+    ///
+    /// Z3's own epsilon rule applies up to 2^14 inhabitants, but ENUMERATING that
+    /// many would add ~16k equality atoms per store. The cap keeps the pass cheap;
+    /// exceeding it merely leaves the previous behaviour (the epsilon axioms stay
+    /// inert and the query can fail closed to `unknown`) — never a wrong answer.
+    /// It is deliberately generous enough for the shapes that actually occur:
+    /// `Bool` and small enum datatypes.
+    const ARRAY_DEFAULT_EPSILON_CASE_SPLIT_MAX: usize = 16;
+
+    /// Exact inhabitant list of a small finite INDEX `sort`, or `None` when the
+    /// sort is not one this pass enumerates.
+    ///
+    /// Returning `Some` is a claim that the returned terms are the WHOLE carrier,
+    /// which the caller relies on to assert a domain-coverage disjunction. Only
+    /// sorts with a closed, syntactically-known inhabitant set qualify:
+    ///
+    /// - `Bool` — exactly `{false, true}`;
+    /// - an all-nullary (enum) datatype — exactly its constructor constants, per
+    ///   the same argument `add_finite_enum_domain_coverage` documents.
+    ///
+    /// Everything else returns `None`, on one of two grounds.
+    ///
+    /// NOT ENUMERABLE (soundness): a sort whose CARDINALITY is known while its
+    /// inhabitants are not nameable — `FiniteDomain` — must never be enumerated
+    /// here, because a coverage disjunction over a guessed inhabitant set would
+    /// not be valid and could fabricate an UNSAT. Likewise `Int`/`Real`,
+    /// uninterpreted sorts, arrays, and field-bearing or recursive datatypes.
+    ///
+    /// NOT NEEDED (measured): `BitVec` is deliberately excluded even though its
+    /// `2^w` constants are perfectly enumerable. The bare epsilon axioms already
+    /// decide the BV-indexed cases on their own — a BV index equality is an atom
+    /// the bit-blaster settles, so `select(A, epsilon)` is already pinned — and
+    /// the extra clauses are pure redundancy. Measured on
+    /// `(Array (_ BitVec 1) Bool)` and `(Array (_ BitVec 2) Bool)` full-carrier
+    /// stores, both of which AY refutes WITHOUT this pass and, with BV
+    /// enumeration switched on, degraded to `unknown` (the redundant index
+    /// equalities steer the search into a conflict whose Alethe lemma is
+    /// mis-attributed as `EufCongruentPred`, and mandatory strict certification
+    /// then — correctly, fail-closed — rejects the refutation).
+    fn small_finite_sort_inhabitants(&mut self, sort: &Sort) -> Option<Vec<TermId>> {
+        match sort {
+            Sort::Bool => Some(vec![
+                self.ctx.terms.false_term(),
+                self.ctx.terms.true_term(),
+            ]),
+            Sort::BitVec(_) => None,
+            _ => {
+                let ctors = self.finite_enum_datatype_ctors(sort)?;
+                if ctors.is_empty() || ctors.len() > Self::ARRAY_DEFAULT_EPSILON_CASE_SPLIT_MAX {
+                    return None;
+                }
+                Some(
+                    ctors
+                        .iter()
+                        // A nullary constructor constant elaborates to
+                        // `mk_var(name, sort)`; building it any other way would
+                        // make a term EUF never merges with the real constructor,
+                        // leaving the case split theory-inert (see the identical
+                        // note in `add_finite_enum_domain_coverage`).
+                        .map(|c| self.ctx.terms.mk_var(c.clone(), sort.clone()))
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Make the array-default `epsilon` read decidable by case-splitting it over
+    /// a small, exactly-enumerable index carrier.
+    ///
+    /// For every inhabitant `e` of `index_sort` this asserts the CONGRUENCE
+    /// instance
+    ///
+    /// ```text
+    ///   (or (not (= epsilon e)) (= (select array epsilon) (select array e)))
+    /// ```
+    ///
+    /// together with the domain-coverage disjunction
+    /// `(or (= epsilon e_1) … (= epsilon e_n))`.
+    ///
+    /// `array_at_epsilon` is the already-interned `select(array, epsilon)`; the
+    /// per-element `select(array, e)` is built here and, because `e` is concrete,
+    /// `mk_select` folds it through the store chain by ROW down to an actual
+    /// element value. That is what gives the SAT/EUF layers something to merge
+    /// `select(array, epsilon)` with.
+    ///
+    /// SOUNDNESS: both clause families are VALID in every interpretation.
+    ///
+    /// - Each implication is a plain instance of functional congruence — if
+    ///   `epsilon` and `e` denote the same index then the two reads of the SAME
+    ///   array denote the same element. This holds whatever `epsilon` is and does
+    ///   not depend on the enumeration being complete.
+    /// - The coverage disjunction is valid because `small_finite_sort_inhabitants`
+    ///   returns `Some` only for sorts whose domain is EXACTLY the returned terms
+    ///   (`Bool`, a fully-enumerated `BitVec`, an all-nullary datatype), so every
+    ///   value of that sort equals one of them.
+    ///
+    /// Adding logically valid clauses removes no models, so this can never turn a
+    /// SAT query into UNSAT; it only stops the search from satisfying the epsilon
+    /// axiom with an out-of-carrier read. A sort we cannot enumerate is skipped
+    /// (incompleteness, never unsoundness).
+    fn push_finite_epsilon_case_split(
+        &mut self,
+        array: TermId,
+        array_at_epsilon: TermId,
+        epsilon: TermId,
+        index_sort: &Sort,
+    ) {
+        let Some(inhabitants) = self.small_finite_sort_inhabitants(index_sort) else {
+            return;
+        };
+        let mut coverage = Vec::with_capacity(inhabitants.len());
+        for element in inhabitants {
+            let epsilon_is_element = self.ctx.terms.mk_eq(epsilon, element);
+            coverage.push(epsilon_is_element);
+
+            let array_at_element = self.ctx.terms.mk_select(array, element);
+            let reads_agree = self.ctx.terms.mk_eq(array_at_epsilon, array_at_element);
+            let not_epsilon_is_element = self.ctx.terms.mk_not(epsilon_is_element);
+            let instance = self
+                .ctx
+                .terms
+                .mk_or(vec![not_epsilon_is_element, reads_agree]);
+            self.push_array_axiom_assertion_site(instance, "array_default_epsilon_case_split");
+        }
+        if coverage.is_empty() {
+            return;
+        }
+        let cover = self.ctx.terms.mk_or(coverage);
+        self.push_array_axiom_assertion_site(cover, "array_default_epsilon_coverage");
     }
 
     /// Add eager extensionality axioms for array equality atoms.

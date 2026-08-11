@@ -71,8 +71,8 @@ pub use ay_dpll::api::SolverConfig;
 
 pub use ay_dpll::api::{
     raw_smt_solve_profile_summary_from_process, raw_smt_solve_profile_summary_from_typed_details,
-    raw_smt_solve_profile_summary_from_typed_summary, validate_raw_smt_solve_profile_summary,
-    validate_raw_smt_solve_profile_summary_key_value_rows,
+    raw_smt_solve_profile_summary_from_typed_summary, split_leading_set_logic,
+    validate_raw_smt_solve_profile_summary, validate_raw_smt_solve_profile_summary_key_value_rows,
     validate_raw_smt_solve_profile_summary_text_lines, AssumptionSolveDetails,
     ConsumerAcceptanceError, FpSpecialKind, FuncDecl, Logic, Model, ModelBlockingAssignment,
     ModelBlockingClause, ModelBlockingClauseEvidence, ModelValue, NativeReplayArtifact,
@@ -359,7 +359,8 @@ pub mod api {
     pub use crate::{
         raw_smt_solve_profile_summary_from_process,
         raw_smt_solve_profile_summary_from_typed_details,
-        raw_smt_solve_profile_summary_from_typed_summary, validate_raw_smt_solve_profile_summary,
+        raw_smt_solve_profile_summary_from_typed_summary, split_leading_set_logic,
+        validate_raw_smt_solve_profile_summary,
         validate_raw_smt_solve_profile_summary_key_value_rows,
         validate_raw_smt_solve_profile_summary_text_lines, AssumptionSolveDetails,
         ConsumerAcceptanceError, CounterexampleStyle, FpSpecialKind, FuncDecl, Logic, Model,

@@ -7,8 +7,8 @@
 //!
 //! After `check-sat` produces `Sat` with a model, the gate re-evaluates every
 //! assertion under that model with a *separate*, solver-independent evaluator.
-//! The two non-confirming verdicts are treated differently, unconditionally
-//! (no environment variable changes this):
+//! Both non-confirming verdicts fail closed unconditionally (no environment
+//! variable or caller mode can weaken this):
 //!
 //! * [`GateVerdict::ModelViolates`] — the gate ground-evaluated an assertion
 //!   under the emitted model to `false`. That is a CONCRETE REFUTATION of the
@@ -17,8 +17,9 @@
 //!   as `sat`.
 //! * [`GateVerdict::CannotConfirm`] — the gate could not ground-evaluate some
 //!   fragment (FP, quantifiers, infinite-domain UF, ...). That is evaluator
-//!   INCOMPLETENESS, not a refutation; the verdict is kept and the gap is
-//!   recorded in the statistics (monitored).
+//!   INCOMPLETENESS rather than a refutation, but it is not evidence for a
+//!   public SAT claim, so `Sat` is downgraded to `Unknown` and result artifacts
+//!   are revoked.
 //!
 //! This module reuses the model's existing per-leaf value lookups
 //! ([`Executor::evaluate_var`] and [`Executor::parse_model_value_string`]) ONLY
@@ -36,6 +37,7 @@ use ay_core::kani_compat::DetHashMap;
 use ay_core::term::TermData;
 use ay_core::time::Instant;
 use ay_core::{Sort, TermId, TermStore};
+use ay_fp::FpModelValue;
 use ay_model_check::{ArrayValue, EvalOutcome, Evaluator, GateVerdict, ModelValue, ModelView};
 
 use super::{EvalValue, Model};
@@ -43,6 +45,27 @@ use crate::ematching::contains_quantifier;
 use crate::executor::Executor;
 use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
+
+/// Exact roots of the public query being certified: the provenance-captured
+/// pre-solve assertion snapshot when available, otherwise the current base
+/// stack, plus every temporary `check-sat-assuming` literal. Solver-injected
+/// axioms in a mutated context must not replace captured source roots, and
+/// assumptions are semantically part of the query rather than optional model
+/// hints.
+fn independent_gate_query_roots(exec: &Executor) -> Vec<TermId> {
+    let mut roots = exec
+        .self_check_authored_assertions
+        .as_ref()
+        .map_or_else(|| exec.ctx.assertions.clone(), Clone::clone);
+    if let Some(assumptions) = exec.last_assumptions.as_ref() {
+        for &assumption in assumptions {
+            if !roots.contains(&assumption) {
+                roots.push(assumption);
+            }
+        }
+    }
+    roots
+}
 
 /// Which sort kind a leaf-defining equality must produce.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,6 +189,22 @@ impl ModelView for IndependentModelView<'_> {
             // equality (evaluated by the gate itself) over the theory-internal
             // array model, which can be polluted by model completion.
             Sort::Array(arr) => self.array_leaf(t, &arr.index_sort, &arr.element_sort),
+            // A symbolic sequence may have no concrete `SeqModel` payload even
+            // though EUF assigned the term an exact equivalence-class element.
+            // Preserve that MODEL-PROVIDED identity as an opaque, sort-tagged
+            // gate value.  This is sufficient for equality-only / declared-UF
+            // uses, while every `seq.*` consumer still requires a concrete
+            // `ModelValue::Seq` and therefore remains fail-closed.
+            Sort::Seq(_) => {
+                let ev = self.exec.evaluate_var(self.model, t, &sort);
+                eval_value_to_model_value(&ev, &sort).or_else(|| {
+                    self.model
+                        .euf_model
+                        .as_ref()
+                        .and_then(|euf| euf.term_values.get(&t))
+                        .map(|class| sequence_euf_class_value(&sort, class))
+                })
+            }
             // Datatype leaves (native or UF-abstracted): prefer the leaf's
             // asserted definitional equality to a constructor expression,
             // evaluated by the gate itself, so a tester/selector over the leaf
@@ -260,11 +299,30 @@ impl ModelView for IndependentModelView<'_> {
                         }
                     }
                 }
+                // #dt-element-canon: the theory leaf lookup hands back an
+                // OPAQUE element token for a datatype-sorted leaf; re-encode a
+                // nullary-constructor token into the canonical `Datatype`
+                // value so it is comparable with the identical value arriving
+                // through `nullary_constructor_leaf` above.
                 let ev = self.exec.evaluate_var(self.model, t, &sort);
-                eval_value_to_model_value(&ev, &sort)
+                self.model_value_for(&ev, &sort)
             }
             // Every scalar / seq / uninterpreted leaf is resolved by the model's
             // existing leaf lookup, then converted into a gate value.
+            // A Real leaf whose value is IRRATIONAL. `ModelValue::Real` holds a
+            // `BigRational` and cannot express `sqrt(2)`, so such a leaf reached
+            // the gate UNPINNED ("model does not pin this leaf") and a correct
+            // `sat` failed closed. Publish the root object instead.
+            //
+            // The checker RE-DERIVES rather than trusts: `Algebraic::root_of`
+            // re-counts the roots in the claimed interval with its OWN Sturm
+            // chain and rejects an interval that does not isolate exactly one.
+            // A wrong isolation claim from the solver is caught here, not
+            // adopted — which is the whole point of an independent gate.
+            Sort::Real => self.algebraic_leaf(t).or_else(|| {
+                let ev = self.exec.evaluate_var(self.model, t, &sort);
+                eval_value_to_model_value(&ev, &sort)
+            }),
             _ => {
                 let ev = self.exec.evaluate_var(self.model, t, &sort);
                 eval_value_to_model_value(&ev, &sort)
@@ -337,9 +395,96 @@ impl ModelView for IndependentModelView<'_> {
                     return Some(v);
                 }
             }
+            // A datatype-returning UF application can be pinned only by an
+            // authored ground equality (for example `(= (bridge x) (tail
+            // x))`) while the extracted EUF payload remains an opaque
+            // `Element`.  Resolve that application through the same
+            // unconditional definitional-equality index used for datatype
+            // leaves before converting the opaque payload.  This is model
+            // completion, not an assertion skip: UF applications are still
+            // keyed by independently evaluated argument values below, and the
+            // gate still checks every authored ground sibling, so conflicting
+            // definitions or non-functional rows are rejected.
+            if let Some(v) = self.datatype_leaf(t) {
+                return Some(v);
+            }
+            // #dt-app-element-encoding — the SAME enum value must not reach the
+            // gate in two encodings. A datatype-sorted application with no
+            // e-graph value and no defining equality falls through to
+            // `evaluate_term`, which yields `EvalValue::Element("v1")`, and
+            // `eval_value_to_model_value` maps every `Element` to
+            // `ModelValue::Uninterpreted` regardless of sort — while the same
+            // value reached as a LEAF is normalized to `ModelValue::Datatype`
+            // by `nullary_constructor_leaf`. Comparing the two then observes
+            // "incomparable" and the gate cannot confirm a correct model.
+            //
+            // Normalize here through the leaf path's OWN parser, which returns
+            // `Datatype { ctor, args: [] }` only for a real nullary constructor
+            // name and `None` for anything else (abstract `@Unit!0` tokens,
+            // wrong arity). Fail-closed: a non-constructor token leaves the
+            // application exactly as unpinned as before, no value is
+            // fabricated, and congruence is still enforced by `uf_graph`.
+            if let EvalValue::Element(token) = self.exec.evaluate_term(self.model, t) {
+                if let Some(v) = self.exec.parse_rendered_dt_value(&token, &sort) {
+                    return Some(v);
+                }
+            }
+        }
+        // An ARRAY-sorted UF application is the mirror of the datatype case
+        // just above, and needs the same treatment (#seq-array-uf-def):
+        // verification-consumer's Seq encoding carries a sequence's backing array through a
+        // plain `seq_array : Seq -> (Array Int Int)`, and the array solver
+        // materializes no entry for an application no `select` constrains — so
+        // `evaluate_term` below yields nothing and the gate could not confirm
+        // `(= (const-array 0) (seq_array v))` even as a `check-sat-assuming`
+        // premise. `array_leaf` resolves it through its asserted definitional
+        // equality exactly as it already does for a bare array VARIABLE,
+        // carrying the same cycle guard and the same "evaluate the defining
+        // expression with the gate's own evaluator" discipline.
+        //
+        // Congruence is still enforced, not bypassed: `uf_app_value` results
+        // are keyed by evaluated ARGUMENT VALUES in the gate's `uf_graph`, so
+        // two congruent applications resolving to different arrays are
+        // surfaced as a violation rather than honoured (#uflia-uf-collapse).
+        if let Sort::Array(arr) = &sort {
+            if let Some(value) = self.array_leaf(t, &arr.index_sort, &arr.element_sort) {
+                return Some(value);
+            }
         }
         let ev = self.exec.evaluate_term(self.model, t);
-        eval_value_to_model_value(&ev, &sort)
+        let structural = if matches!((&sort, &ev), (Sort::Seq(_), EvalValue::Element(_))) {
+            // An `Element` is not, by itself, a sequence value.  Accept opaque
+            // sequence identities only through the exact EUF `term_values`
+            // lookup below, which supplies their model provenance.
+            None
+        } else {
+            // #dt-element-canon: the enum-SAT lane's `decode_enum_model`
+            // publishes a datatype-sorted UF application (`(u p1)`) as the
+            // constructor NAME, which arrives here as `EvalValue::Element`.
+            // Re-encode it canonically so it is comparable with the same value
+            // reaching the gate as a `Datatype` through a nullary-constructor
+            // leaf — see `canonical_dt_element` for the 66538b006f account.
+            self.model_value_for(&ev, &sort)
+        };
+        structural
+            .or_else(|| {
+                matches!(sort, Sort::Seq(_))
+                    .then(|| {
+                        self.model
+                            .euf_model
+                            .as_ref()
+                            .and_then(|euf| euf.term_values.get(&t))
+                            .map(|class| sequence_euf_class_value(&sort, class))
+                    })
+                    .flatten()
+            })
+            // LAST RESORT (#gate-scalar-uf-def): nothing in the model pins this
+            // application, but an asserted equality may DEFINE it — `(= v (f
+            // i))`, or the `(= (fp.to_real x) 5.0)` that is the sole constraint
+            // on a result SMT-LIB deliberately leaves unspecified. Placed after
+            // every model read above, so a committed value always wins and this
+            // only ever fills a hole where the gate would otherwise fail closed.
+            .or_else(|| self.uf_app_definition_value(t))
     }
 
     /// The model's committed value for an array-`select` read `t` = `(select A
@@ -375,7 +520,9 @@ impl ModelView for IndependentModelView<'_> {
         let (array, index) = (args[0], args[1]);
         let sort = self.exec.ctx.terms.sort(t).clone();
         let ev = self.exec.evaluate_select(self.model, array, index);
-        eval_value_to_model_value(&ev, &sort)
+        // #dt-element-canon: an array over a datatype element sort reads back an
+        // opaque element token for the same reason a UF application does.
+        self.model_value_for(&ev, &sort)
     }
 }
 
@@ -416,6 +563,30 @@ impl IndependentModelView<'_> {
     /// A cycle guard breaks mutual/self definitions: on re-entry for the same
     /// array term we return `None` (so that sub-expression is unevaluable and
     /// the resolution falls through soundly).
+    /// The root object for a Real leaf the NRA lane assigned an algebraic
+    /// value, re-validated by the independent checker.
+    ///
+    /// Only the algebraic POINT is published. A non-identity residue is a
+    /// derived expression rather than a variable's assignment, and the gate
+    /// computes derived values itself from the term — so declining here keeps
+    /// the checker's arithmetic independent of the solver's.
+    fn algebraic_leaf(&self, t: TermId) -> Option<ModelValue> {
+        let value = self.exec.nra_algebraic_model.get(&t)?;
+        if !value.is_identity() {
+            return None;
+        }
+        let alpha = value.alpha();
+        let coefficients = alpha
+            .poly_coeffs()
+            .into_iter()
+            .map(num_rational::BigRational::from)
+            .collect();
+        let (lo, hi) = alpha.interval();
+        ay_model_check::algebraic::Algebraic::root_of(coefficients, lo.clone(), hi.clone())
+            .ok()
+            .map(|a| ModelValue::Algebraic(Box::new(a)))
+    }
+
     fn array_leaf(&self, t: TermId, index_sort: &Sort, element_sort: &Sort) -> Option<ModelValue> {
         if let Some(cached) = self.resolved.borrow().get(&t) {
             return Some(cached.clone());
@@ -451,14 +622,6 @@ impl IndependentModelView<'_> {
         index_sort: &Sort,
         element_sort: &Sort,
     ) -> Option<ModelValue> {
-        if self
-            .model
-            .array_model
-            .as_ref()
-            .is_some_and(|arrays| arrays.read_conflicted.contains(&t))
-        {
-            return None;
-        }
         // 1. Definitional equality `(= t <array-expr>)`: evaluate the defining
         //    expression compositionally with the gate's own evaluator. A leaf can
         //    carry SEVERAL asserted definitions (e.g. a fresh `(= d (const-array
@@ -476,6 +639,39 @@ impl IndependentModelView<'_> {
             }
             // else: try the next definition / fall through to the reconstructed
             // model (branch 2 below).
+        }
+
+        // 1b. A preprocessing-recorded variable substitution is also an exact
+        // definition, even though the defining equality has been consumed and
+        // therefore cannot appear in `array_definitions`. Resolve only the
+        // recorded forward edge, require the replacement to have the identical
+        // array sort, and evaluate it compositionally through this independent
+        // view. This is stronger evidence than the poisoned theory model below:
+        // the preprocessor may replace `a24 -> a9`, while `a9` itself resolves
+        // through an authored equality to a concrete store chain.
+        //
+        // The outer `array_leaf` cycle guard is already active for `t`, so a
+        // malformed/cyclic substitution chain (`a -> b -> a`) fails closed.
+        if let Some(&replacement) = self.exec.recorded_var_substitutions.get(&t) {
+            if self.exec.ctx.terms.sort(replacement) == self.exec.ctx.terms.sort(t) {
+                let ev = Evaluator::new(&self.exec.ctx.terms, self);
+                if let EvalOutcome::Value(v @ ModelValue::Array(_)) = ev.evaluate(replacement) {
+                    return Some(v);
+                }
+            }
+        }
+
+        // A read-conflicted theory interpretation is not evidence for the
+        // array value, but an independently evaluated authored definition
+        // above is.  Keep the conflict fail-closed for every fallback below;
+        // this ordering permits only the stronger, assertion-derived value.
+        if self
+            .model
+            .array_model
+            .as_ref()
+            .is_some_and(|arrays| arrays.read_conflicted.contains(&t))
+        {
+            return None;
         }
 
         // 2. Fallback: the array theory's reconstructed model entry.
@@ -960,8 +1156,7 @@ impl IndependentModelView<'_> {
         }
         self.building_index.set(true);
         let mut map: HashMap<TermId, Vec<TermId>> = HashMap::new();
-        let assertions = self.exec.ctx.assertions.clone();
-        for assertion in assertions {
+        for assertion in independent_gate_query_roots(self.exec) {
             self.index_walk(assertion, 32, &mut map);
         }
         self.building_index.set(false);
@@ -984,13 +1179,48 @@ impl IndependentModelView<'_> {
         if depth == 0 {
             return;
         }
-        // Record a `(= l r)` where the operands are array/datatype sorted.
+        // Record a `(= l r)` where the operands are array/datatype sorted, or
+        // where either side is an APPLICATION of any other sort.
+        //
+        // #gate-scalar-uf-def: the second case is what lets a SCALAR-sorted
+        // uninterpreted application be resolved from its asserted definition.
+        // `(assert (= v (f i)))` pins `f` at `i` exactly as `(assert (= a
+        // (store b i x)))` pins the array `a`, but only the array/datatype
+        // sorts were indexed — so `(f i)` reached `uf_app_value` with nothing
+        // behind it, the model committed no per-application value, and the gate
+        // could not confirm a witness the solver had correctly found ("model
+        // commits no value for this application of `f`"). The same gap hid an
+        // FP result SMT-LIB deliberately leaves unconstrained: `(assert (=
+        // (fp.to_real x) 5.0))` with `x` NaN is satisfiable precisely BECAUSE
+        // that assertion is what fixes the value, and it was the one thing the
+        // gate would not read.
+        //
+        // Restricted to equalities with an APPLICATION side: a leaf-to-leaf
+        // scalar alias is already served by `leaf_value`, and only
+        // `uf_app_value` consults this new class of entry, so the index grows
+        // only where it is used.
+        //
+        // SOUND — the same argument as the array/datatype entries, reused
+        // wholesale: `index_walk` records a partner ONLY along an
+        // unconditionally-asserted path, so `l = r` holds in every model of the
+        // assertions; the value is produced by the gate's OWN evaluator under
+        // the fixed model, never taken on trust; single-valuedness is still
+        // enforced by `uf_graph`, which keys applications by evaluated ARGUMENT
+        // values, so two definitions that disagree at coincident arguments
+        // collapse to one value and surface the conflict; and every assertion —
+        // including each definition not chosen — is still re-checked, so a
+        // wrong resolution can only produce `ModelViolates`, never a
+        // confirmation.
         if let TermData::App(sym, args) = self.exec.ctx.terms.get(cand) {
             if sym.name() == "=" && args.len() == 2 {
                 let (l, r) = (args[0], args[1]);
                 if l != r {
                     let ls = self.exec.ctx.terms.sort(l).clone();
-                    if matches!(ls, Sort::Array(_)) || self.exec.datatype_sort_name(&ls).is_some() {
+                    let structural =
+                        matches!(ls, Sort::Array(_)) || self.exec.datatype_sort_name(&ls).is_some();
+                    let app_sided = matches!(self.exec.ctx.terms.get(l), TermData::App(_, _))
+                        || matches!(self.exec.ctx.terms.get(r), TermData::App(_, _));
+                    if structural || app_sided {
                         map.entry(l).or_default().push(r);
                         map.entry(r).or_default().push(l);
                     }
@@ -1101,6 +1331,121 @@ impl IndependentModelView<'_> {
         }
     }
 
+    /// Resolve an uninterpreted APPLICATION `t` through an asserted definitional
+    /// equality `(= t <expr>)` — the scalar analogue of [`Self::array_leaf`]
+    /// branch 1 and [`Self::datatype_leaf`] (#gate-scalar-uf-def).
+    ///
+    /// Consulted only after the solver's own evaluator has declined to pin the
+    /// application, so a model that DOES commit a value keeps it, and a
+    /// definition contradicting that value still surfaces as `ModelViolates` on
+    /// the defining assertion. See [`Self::index_walk`] for why every partner
+    /// read here is unconditionally entailed by the assertions.
+    ///
+    /// Partners are filtered to `t`'s own sort (an `=` is homogeneous, so this
+    /// only screens out a malformed index entry) and evaluated with the gate's
+    /// OWN evaluator; the first that yields a concrete value wins — they are all
+    /// asserted equal, and each losing definition is itself a top-level
+    /// assertion the gate ground-checks, so a disagreement is reported there
+    /// rather than hidden here. Cycles (`(= (f i) (g (f i)))`) are cut by the
+    /// shared `resolving` stack, which fails the resolution closed.
+    ///
+    /// A CONFLICT CHECK over the partners (evaluate them all; adopt nothing if
+    /// two disagree) was written here and deliberately dropped. It is not the
+    /// stricter option, it is the blunter one: partners are recorded only from
+    /// [`independent_gate_query_roots`] — exactly the assertions this gate
+    /// re-checks — so two partners that evaluate to different values under the
+    /// fixed model mean the model itself falsifies one of those two asserted
+    /// equalities, and adopting the first makes the gate report that as
+    /// `ModelViolates` (an exact refutation). Refusing here instead erases the
+    /// refutation and downgrades it to a `CannotConfirm` coverage gap. It also
+    /// costs the early exit, turning each nested resolution's branching factor
+    /// from 1 into the partner count.
+    fn uf_app_definition_value(&self, t: TermId) -> Option<ModelValue> {
+        // DECLARED UNINTERPRETED FUNCTIONS ONLY — never a theory operator.
+        //
+        // This is the guard that keeps the fallback from papering over a bug in
+        // the gate's OWN theory evaluators. For a genuinely uninterpreted `f`,
+        // "the model pins nothing" means the value is free, and an asserted
+        // equality is the only thing that can fix it — reading it is exactly
+        // right. For a THEORY operation the gate is itself responsible for
+        // computing the value, and it cannot distinguish "SMT-LIB leaves this
+        // free" (`fp.to_real` at NaN/±Inf) from "my evaluator failed to compute
+        // a value that IS determined". Adopting the assertion's own claim in
+        // the second case would turn an evaluator bug into a confirmed wrong
+        // `sat` — the precise hazard
+        // `independent_gate_rejects_unspecified_fp_to_real_witness` pins. So
+        // theory heads stay fail-closed here; widening `fp.to_real` at its
+        // unspecified points belongs in the FP evaluator, which can tell the
+        // two cases apart.
+        let TermData::App(sym, _) = self.exec.ctx.terms.get(t) else {
+            return None;
+        };
+        let name = sym.name().to_string();
+        // SECOND GATE, by NAME, over the operators SMT-LIB leaves
+        // unspecified-but-total. The declared-symbol test below already keeps
+        // every theory head out, because a theory operator is not in the
+        // front-end's symbol table — this list is what still holds if that ever
+        // stops being true (a front-end that registers a signature for a
+        // built-in, a logic in which one of these names is BOTH declarable and
+        // interpreted). Inventing a value here would confirm the witness under
+        // an interpretation the model does not hold and the printer would not
+        // emit: `(= (fp.to_real +oo) 0)` is satisfiable in the abstract, but it
+        // is not evidence about THIS model. The only cost of the redundancy is
+        // a refusal on a user function that took one of these names verbatim,
+        // and a refusal is the direction this gate is allowed to be wrong in.
+        if matches!(
+            name.as_str(),
+            "fp.to_real"
+                | "fp.min"
+                | "fp.max"
+                | "fp.to_ieee_bv"
+                | "fp.to_ubv"
+                | "fp.to_sbv"
+                | "div"
+                | "mod"
+                | "/"
+        ) {
+            return None;
+        }
+        let declared = self
+            .exec
+            .ctx
+            .symbol_info_by_identity(&name)
+            .or_else(|| self.exec.ctx.symbol_info(&name))
+            .is_some_and(|info| !info.arg_sorts.is_empty());
+        if !declared {
+            return None;
+        }
+        let sort = self.exec.ctx.terms.sort(t).clone();
+        self.ensure_def_index();
+        let partners: Vec<TermId> = {
+            let idx = self.def_index.borrow();
+            idx.as_ref()?
+                .get(&t)?
+                .iter()
+                .copied()
+                .filter(|&p| *self.exec.ctx.terms.sort(p) == sort)
+                .collect()
+        };
+        if partners.is_empty() {
+            return None;
+        }
+        if !self.resolving.borrow_mut().insert(t) {
+            self.cycle_hits.set(self.cycle_hits.get() + 1);
+            return None; // cycle ⇒ fail closed
+        }
+        let mut result = None;
+        for def in partners {
+            let ev = Evaluator::new(&self.exec.ctx.terms, self);
+            if let EvalOutcome::Value(v) = ev.evaluate(def) {
+                result = Some(v);
+                break;
+            }
+        }
+        self.resolving.borrow_mut().remove(&t);
+        result
+    }
+
     /// Resolve a DATATYPE-sorted leaf `t` through its definitional equality
     /// `(= t <ctor-expr>)` — the analogue of [`array_leaf`](Self::array_leaf).
     ///
@@ -1143,6 +1488,103 @@ impl IndependentModelView<'_> {
         } else {
             None
         }
+    }
+
+    /// Re-encode a model-published OPAQUE element token into the gate's
+    /// CANONICAL encoding for a datatype-sorted term (#dt-element-canon).
+    ///
+    /// WHY THIS EXISTS. [`EvalValue`] cannot carry datatype structure: the model
+    /// side renders a `ModelValue::Datatype` back DOWN to
+    /// `EvalValue::Element(<canonical string>)` (`dt_construct.rs`), and the
+    /// enum-SAT lane's producer `decode_enum_model` (`enum_sat.rs`) builds its
+    /// `EufModel` with the constructor NAMES as the sort's elements. So the SAME
+    /// value reaches this gate in TWO encodings: a bare nullary-constructor leaf
+    /// via [`Self::nullary_constructor_leaf`] as `Datatype { ctor: "u0", args: [] }`,
+    /// and the UF application `(u p1)` as `Uninterpreted("u0")` (through
+    /// `eval_value_to_model_value`). `value_eq` then refuses the comparison —
+    ///
+    /// ```text
+    /// c probe value_eq incomparable: a=Datatype { ctor: "u0", args: [] } b=Uninterpreted("u0")
+    /// ```
+    ///
+    /// — 891 times on `QF_UFDT/20210312-Bouvier/vlsat3_k13.smt2`, so the gate
+    /// reports `CannotConfirm`. Before `66538b006f` that gap was recorded and the
+    /// verdict kept; `66538b006f` made it downgrade `Sat` to `Unknown`, which is
+    /// what cost the whole `QF_UFDT/Bouvier` sat stratum (100/100) of the banked
+    /// SQ QF_Datatypes score.
+    ///
+    /// THE FIX IS IN THE PRODUCER, exactly as `ay-model-check/src/lib.rs:254-260`
+    /// prescribes ("the fix for that is to normalize the PRODUCER; teaching
+    /// `value_eq` to equate encodings would loosen the comparison this gate
+    /// depends on"). `value_eq` is untouched and the gate is not opened: an
+    /// element token that is NOT a nullary constructor of the term's own datatype
+    /// still fails closed exactly as today.
+    ///
+    /// WHY `Datatype { ctor, args: [] }` IS THE CANONICAL ENCODING, not
+    /// `Uninterpreted(name)`:
+    ///  * it is what the model PRINTER publishes. `(get-model)` on `vlsat3_k13`
+    ///    emits `(define-fun u ((x0 Place)) Unit (ite (= x0 p1) u0 ...))` — the
+    ///    bare constructor symbol — and `Datatype { ctor: "u0", args: [] }` is
+    ///    that same value, while `Uninterpreted("u0")` is a token of a sort the
+    ///    problem does not declare. Reading the canonical form keeps the gate
+    ///    checking the witness it actually ships (#mv-gate-reads-printed-dt).
+    ///  * it is strictly MORE checkable: over a `Datatype` value the evaluator
+    ///    decides testers and projects selectors; over an `Uninterpreted` token
+    ///    it can only compare identity. Equal tokens still compare equal, so no
+    ///    comparison that succeeds today changes its answer.
+    ///
+    /// FAITHFULNESS. The token is adopted only when it is, verbatim, a NULLARY
+    /// constructor of the datatype named by `sort` — resolved through the SAME
+    /// two lookups [`Self::nullary_constructor_leaf`] uses, so the two sides of
+    /// an equality agree by construction. Anything else (an EUF class
+    /// representative such as `@Unit!0`, a non-nullary constructor, a
+    /// non-datatype sort) returns `None` and the existing conversion runs
+    /// unchanged.
+    ///
+    /// `AY_DT_ELEMENT_CANON=0` opts out (A/B measurement only); opting out can
+    /// only restore today's fail-closed `CannotConfirm`, never widen a verdict.
+    fn canonical_dt_element(&self, ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
+        let EvalValue::Element(token) = ev else {
+            return None;
+        };
+        // Read the opt-out ONCE: this runs on every datatype-sorted leaf and UF
+        // application (~9k atoms x 2 on `vlsat3_k13`), and this division is
+        // already time-sensitive.
+        static CANON_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*CANON_ON.get_or_init(|| std::env::var("AY_DT_ELEMENT_CANON").as_deref() != Ok("0")) {
+            return None;
+        }
+        let dt_name = self.exec.datatype_sort_name(sort)?;
+        let (_, ctor_names) = self
+            .exec
+            .ctx
+            .datatype_iter()
+            .find(|(dt, _)| *dt == dt_name)?;
+        if !ctor_names.iter().any(|c| c == token) {
+            return None;
+        }
+        // A constructor NAME of this datatype; require it to be NULLARY — a
+        // token for a constructor with fields carries no field values, and
+        // fabricating them here would be exactly the model invention the gate
+        // exists to prevent.
+        if !self.exec.ctx.constructor_selector_info(token)?.is_empty() {
+            return None;
+        }
+        Some(ModelValue::Datatype {
+            ctor: token.clone(),
+            args: Vec::new(),
+        })
+    }
+
+    /// [`eval_value_to_model_value`] in the gate's canonical encoding: a
+    /// datatype-sorted opaque element token is re-encoded by
+    /// [`Self::canonical_dt_element`] first (#dt-element-canon); everything else
+    /// converts exactly as before.
+    fn model_value_for(&self, ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
+        if let Some(v) = self.canonical_dt_element(ev, sort) {
+            return Some(v);
+        }
+        eval_value_to_model_value(ev, sort)
     }
 
     /// Reconstruct a [`ModelValue::Datatype`] for a datatype-sorted term `t` from
@@ -1247,9 +1689,177 @@ impl IndependentModelView<'_> {
     /// Parse a model-emitted value string for the given sort into a gate value,
     /// reusing the solver's own parser (a pure leaf-value helper).
     fn parse_leaf(&self, s: &str, sort: &Sort) -> Option<ModelValue> {
-        let ev = self.exec.parse_model_value_string(s, &Some(sort.clone()));
-        eval_value_to_model_value(&ev, sort)
+        self.parse_leaf_at_depth(s, sort, 0)
     }
+
+    /// [`Self::parse_leaf`] carrying the nesting budget the array-text reader
+    /// needs to recurse through an array-of-array cell.
+    ///
+    /// #gate-nested-array-encoding — an ARRAY-sorted CELL (the default or a
+    /// store value of a NESTED array) reaches the gate as the printer's SMT-LIB
+    /// text, and [`Executor::parse_model_value_string`] hands every
+    /// array-sorted string straight back as an opaque `EvalValue::Element`.
+    /// The same array value then exists in the gate in TWO encodings: a
+    /// structured `ModelValue::Array` when it arrives as a plain array LEAF,
+    /// and this unparsed text when it arrives as a nested cell. Comparing them
+    /// lands in `value_eq`'s incomparable arm ("Array vs Uninterpreted") and
+    /// the gate cannot confirm a witness that is in fact correct — the
+    /// deductive-checks ground-seed shape `(= seed (select m #x0..0))`, where `seed`
+    /// resolves to `Array{default: #x0..0}` while `m`'s cell is the string
+    /// `"((as const (Array (_ BitVec 64) (_ BitVec 64))) #x0000000000000000)"`.
+    ///
+    /// The fix is the one `value_eq`'s incomparable arm prescribes: normalize
+    /// the PRODUCER, never teach `value_eq` to equate encodings. Parsing the
+    /// printed array back into the SAME structured value the leaf path builds
+    /// makes the two encodings one.
+    ///
+    /// FAIL-SOFT, not fail-closed: an array text this reader cannot parse falls
+    /// through to exactly today's opaque-token behaviour, so no leaf that
+    /// resolves today stops resolving. FAITHFUL: the text IS the emitted
+    /// witness, and the gate still re-checks every assertion against the parsed
+    /// value — a misparse can only surface as `ModelViolates`, never confirm a
+    /// wider model.
+    fn parse_leaf_at_depth(&self, s: &str, sort: &Sort, depth: u32) -> Option<ModelValue> {
+        if depth > 32 {
+            return None;
+        }
+        if let Sort::Array(arr) = sort {
+            if let Some(v) = self.parse_array_text(s, &arr.index_sort, &arr.element_sort, depth + 1)
+            {
+                return Some(v);
+            }
+        }
+        let ev = self.exec.parse_model_value_string(s, &Some(sort.clone()));
+        // Array interpretations store values as strings.  A nullary datatype
+        // constructor therefore parses through the scalar layer as an
+        // `Element`, just like a datatype-sorted UF result.  Normalize it at
+        // this producer boundary so an array key `red` and the authored
+        // constructor term `red` reach the independent evaluator in the same
+        // canonical Datatype encoding.
+        self.model_value_for(&ev, sort)
+    }
+
+    /// Read the printer's SMT-LIB rendering of an ARRAY value back into a
+    /// structured [`ModelValue::Array`]. Handles the two forms the model
+    /// printer emits — the const-array base `((as const <sort>) <default>)` and
+    /// a `(store <array> <index> <value>)` chain over it — and returns `None`
+    /// for anything else (a `lambda`, an abstract `@`-atom, a partial
+    /// rendering), which keeps the caller on its existing path.
+    ///
+    /// STORE ORDER: SMT-LIB nests oldest-innermost and the OUTERMOST `store`
+    /// wins at a repeated index; [`ArrayValue`] is oldest-first and
+    /// `array_select` scans it in REVERSE. Recursing into the base BEFORE
+    /// pushing this level's entry therefore reproduces the emitted witness's
+    /// winner exactly.
+    fn parse_array_text(
+        &self,
+        s: &str,
+        index_sort: &Sort,
+        element_sort: &Sort,
+        depth: u32,
+    ) -> Option<ModelValue> {
+        if depth > 32 {
+            return None;
+        }
+        let items = sexpr_items(s)?;
+        match items.first()?.as_str() {
+            // `(store <array> <index> <value>)`
+            "store" if items.len() == 4 => {
+                let base = self.parse_array_text(&items[1], index_sort, element_sort, depth + 1)?;
+                let ModelValue::Array(mut arr) = base else {
+                    return None;
+                };
+                let key = self.parse_leaf_at_depth(&items[2], index_sort, depth + 1)?;
+                let val = self.parse_leaf_at_depth(&items[3], element_sort, depth + 1)?;
+                arr.store.push((key, val));
+                Some(ModelValue::Array(arr))
+            }
+            // `((as const <sort>) <default>)` — the head is itself the
+            // parenthesised `(as const <sort>)` qualifier.
+            head if items.len() == 2 && head.starts_with('(') => {
+                let qual = sexpr_items(head)?;
+                if qual.len() != 3 || qual[0] != "as" || qual[1] != "const" {
+                    return None;
+                }
+                let default = self.parse_leaf_at_depth(&items[1], element_sort, depth + 1)?;
+                Some(ModelValue::Array(Box::new(ArrayValue {
+                    default,
+                    store: Vec::new(),
+                })))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Split the BODY of a parenthesised s-expression into its top-level items,
+/// respecting nesting, `"…"` string literals (with the SMT-LIB `""` escape) and
+/// `|…|` quoted symbols. `None` when `s` is not ONE balanced parenthesised form
+/// — so a bare atom, a truncated rendering, or `(a)(b)` all decline rather than
+/// parse into something the caller would mistake for a value.
+fn sexpr_items(s: &str) -> Option<Vec<String>> {
+    let body = s.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut items: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut in_sym = false;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            cur.push(c);
+            if c == '"' {
+                // `""` is an escaped quote inside an SMT-LIB string literal.
+                if chars.peek() == Some(&'"') {
+                    cur.push(chars.next()?);
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        if in_sym {
+            cur.push(c);
+            if c == '|' {
+                in_sym = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                cur.push(c);
+            }
+            '|' => {
+                in_sym = true;
+                cur.push(c);
+            }
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None; // the leading `(` did not match the trailing one
+                }
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    items.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if depth != 0 || in_str || in_sym {
+        return None;
+    }
+    if !cur.is_empty() {
+        items.push(cur);
+    }
+    Some(items)
 }
 
 /// Conservative structural equality of two gate [`ModelValue`]s, used only to
@@ -1273,6 +1883,28 @@ fn values_equal(a: &ModelValue, b: &ModelValue) -> bool {
                 value: v2,
             },
         ) => w1 == w2 && v1 == v2,
+        (
+            V::FloatingPoint {
+                sign: sign1,
+                exponent: exponent1,
+                significand: significand1,
+                exponent_bits: exponent_bits1,
+                significand_bits: significand_bits1,
+            },
+            V::FloatingPoint {
+                sign: sign2,
+                exponent: exponent2,
+                significand: significand2,
+                exponent_bits: exponent_bits2,
+                significand_bits: significand_bits2,
+            },
+        ) => {
+            sign1 == sign2
+                && exponent1 == exponent2
+                && significand1 == significand2
+                && exponent_bits1 == exponent_bits2
+                && significand_bits1 == significand_bits2
+        }
         (V::Str(x), V::Str(y)) => x == y,
         (V::Uninterpreted(x), V::Uninterpreted(y)) => x == y,
         (V::Array(x), V::Array(y)) => {
@@ -1296,8 +1928,9 @@ fn values_equal(a: &ModelValue, b: &ModelValue) -> bool {
 ///
 /// `sort` disambiguates a numeric `Rational` between `Int` and `Real` and gives
 /// the element sort for sequences. Anything the gate cannot faithfully
-/// represent (floating point, unknown, a non-integer in an Int context) becomes
-/// `None`, which makes the leaf unpinned and the gate fail closed.
+/// represent (unknown, an FP format wider than AY's exact u64 carrier, or a
+/// non-integer in an Int context) becomes `None`, which makes the leaf unpinned
+/// and the gate fail closed.
 fn eval_value_to_model_value(ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
     match ev {
         EvalValue::Bool(b) => Some(ModelValue::Bool(*b)),
@@ -1327,10 +1960,66 @@ fn eval_value_to_model_value(ev: &EvalValue, sort: &Sort) -> Option<ModelValue> 
         // ModelValue is rational-only, so the leaf is unpinned and the gate
         // fails closed (CannotConfirm) — never a wrong confirmation.
         EvalValue::Algebraic(_) => None,
-        // Floating point is intentionally not modelled by the gate; Unknown is
-        // an unpinned leaf. Both fail closed.
-        EvalValue::Fp(_) | EvalValue::Unknown => None,
+        EvalValue::Fp(fp) => fp_value_to_independent_model(fp, sort),
+        EvalValue::Unknown => None,
     }
+}
+
+/// Copy AY's concrete FP witness into the independent gate's raw IEEE carrier.
+///
+/// The copy is deliberately field-level instead of calling the solver's
+/// `to_rational`: the independent evaluator must reconstruct `fp.to_real`
+/// itself.  Special values receive their canonical AY encodings; that retains
+/// structural SMT equality while `fp.to_real` rejects their all-ones exponent.
+fn fp_value_to_independent_model(fp: &FpModelValue, sort: &Sort) -> Option<ModelValue> {
+    let Sort::FloatingPoint(sort_eb, sort_sb) = sort else {
+        return None;
+    };
+    let eb = fp.eb();
+    let sb = fp.sb();
+    if eb != *sort_eb || sb != *sort_sb || !(2..64).contains(&eb) || !(2..=64).contains(&sb) {
+        return None;
+    }
+    let max_exponent = (1u64 << eb) - 1;
+    let significand_limit = 1u64 << (sb - 1);
+    let (sign, exponent, significand) = match fp {
+        FpModelValue::PosZero { .. } => (false, 0, 0),
+        FpModelValue::NegZero { .. } => (true, 0, 0),
+        FpModelValue::PosInf { .. } => (false, max_exponent, 0),
+        FpModelValue::NegInf { .. } => (true, max_exponent, 0),
+        FpModelValue::NaN { .. } => (false, max_exponent, 1u64 << (sb - 2)),
+        FpModelValue::Fp {
+            sign,
+            exponent,
+            significand,
+            ..
+        } => {
+            if *exponent > max_exponent || *significand >= significand_limit {
+                return None;
+            }
+            (*sign, *exponent, *significand)
+        }
+    };
+    Some(ModelValue::FloatingPoint {
+        sign,
+        exponent,
+        significand,
+        exponent_bits: eb,
+        significand_bits: sb,
+    })
+}
+
+/// Reify one EUF-provided class identity for a sequence-sorted term.
+///
+/// The sort tag is part of the token: EUF is permitted to reuse a printable
+/// class name such as `e0` in two different carriers, but those elements are
+/// not interchangeable.  The raw class identity is never inferred from term
+/// syntax or a `TermId`; absence of the model entry therefore remains `None`.
+fn sequence_euf_class_value(sort: &Sort, class: &str) -> ModelValue {
+    ModelValue::Uninterpreted(format!(
+        "@ay-seq-euf-class:{sort:?}:{}:{class}",
+        class.len()
+    ))
 }
 
 /// A parsed S-expression: an atom (a whitespace/paren-delimited token, or a
@@ -1436,9 +2125,9 @@ fn parse_atom(cur: &mut &str) -> String {
 ///
 /// DIRECTIONAL SOUNDNESS: the gate keeps a `Sat` verdict (`true`) EXACTLY when the
 /// incoming verdict was `Sat` AND the model was independently `confirmed`, OR
-/// enforcement is deliberately not engaged (`!enforce` — statically the case only
-/// for the monitored `CannotConfirm` coverage-gap arm; the `ModelViolates`
-/// refutation arm passes `enforce = true` unconditionally, see
+/// the generic proof model supplies `enforce = false`. Every live unconfirmed
+/// publication call site supplies `enforce = true`; `CannotConfirm` bypasses
+/// this helper only to downgrade directly (see
 /// [`Executor::apply_independent_model_gate`]). Consequences, both
 /// machine-checkable: it can NEVER manufacture `Sat` from a non-`Sat` verdict
 /// (`result ==> was_sat`), and once enforcement is on it NEVER keeps an
@@ -1630,28 +2319,100 @@ impl Executor {
         if std::env::var_os("AY_G3_GATE_DUMP").is_some() {
             self.dump_gate_diagnostics(&view);
         }
-        // A DT certificate validates the whole snapshot against its completed
-        // model M', while the retained emission candidate M intentionally did
-        // not witness the universals.  Independently check every ground
-        // assertion in M, but leave the already-certified universals to the
-        // quantified gate's deterministic certificate deferral below.  Without
-        // an active grant, the full assertion set is checked exactly as before.
-        let ground_assertions: Vec<TermId> = if self.dt_cert_grant_active {
-            self.ctx
-                .assertions
-                .iter()
-                .copied()
-                .filter(|&assertion| !contains_quantifier(&self.ctx.terms, assertion))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let assertions = if self.dt_cert_grant_active {
-            ground_assertions.as_slice()
+        // A specialized quantified certificate is allowed to discharge only
+        // the quantified LEAF conjuncts it checked. The compositional evaluator
+        // still checks every ground sibling. This is an evidence composition,
+        // not a skip: the quantified gate runs first and sets one of these
+        // markers only after its own fail-closed validation succeeds.
+        let quantified_certified = self.dt_cert_grant_active
+            || self.finite_table_cert_grant_active
+            || self.bv_quantifier_full_domain_proof
+            // Read as a RAW BOOL, like its two siblings. The stat string
+            // `deferred-certified-const-interp` written at the fail-closed
+            // handoff below is NOT in the `matches!` list, so adding only the
+            // string there would never reach this consumer.
+            || self.const_interp_cert_grant_active
+            || self.mbqi_sat_cert_grant_active
+            || matches!(
+                self.last_statistics
+                    .get_string("model_check_gate.quantified"),
+                Some("confirmed" | "deferred-certified-dt")
+            );
+        let mut independently_checkable = Vec::new();
+        if quantified_certified {
+            for &assertion in &self.ctx.assertions {
+                let mut conjuncts = Vec::new();
+                crate::executor::quantifier_loop::collect_and_conjuncts(
+                    &self.ctx.terms,
+                    assertion,
+                    &mut conjuncts,
+                );
+                if conjuncts.is_empty() {
+                    conjuncts.push(assertion);
+                }
+                independently_checkable.extend(
+                    conjuncts
+                        .into_iter()
+                        .filter(|term| !contains_quantifier(&self.ctx.terms, *term)),
+                );
+            }
+        }
+        let assertions = if quantified_certified {
+            independently_checkable.as_slice()
         } else {
             self.ctx.assertions.as_slice()
         };
         ay_model_check::confirm_model(&self.ctx.terms, &view, assertions)
+    }
+
+    /// Authority-grade independent confirmation for a strict-gate coverage
+    /// exception.
+    ///
+    /// Unlike [`Self::confirm_sat_with_independent_gate`], this deliberately
+    /// admits neither model-independent tautology recovery nor a residual
+    /// satisfiability extension.  Every exact authored assertion must evaluate
+    /// compositionally to `Bool(true)` under one fresh independent evaluator;
+    /// an unsupported atom, unpinned leaf, non-Boolean result, or explicit
+    /// `false` fails closed.  This stronger predicate is used only for the
+    /// `arrays-read-conflict-uneval` completeness lane, where AY's primary
+    /// array witness is poisoned but the separate model view can sometimes
+    /// reconstruct and check the complete witness from authored definitions.
+    pub(in crate::executor) fn confirm_sat_with_fully_evaluated_independent_gate(
+        &self,
+    ) -> GateVerdict {
+        let Some(model) = self.last_model.as_ref() else {
+            return GateVerdict::CannotConfirm {
+                reason: "no model was produced".to_string(),
+            };
+        };
+        let assertions = independent_gate_query_roots(self);
+        if assertions.is_empty() {
+            return GateVerdict::CannotConfirm {
+                reason: "no authored assertions were available".to_string(),
+            };
+        }
+
+        let view = IndependentModelView::new(self, model);
+        view.ensure_def_index();
+        let evaluator = Evaluator::new(&self.ctx.terms, &view);
+        for assertion in assertions {
+            let outcome = evaluator.evaluate(assertion);
+            match outcome {
+                EvalOutcome::Value(ModelValue::Bool(true)) => {}
+                EvalOutcome::Value(ModelValue::Bool(false)) => {
+                    return GateVerdict::ModelViolates { assertion };
+                }
+                EvalOutcome::Value(_) => {
+                    return GateVerdict::CannotConfirm {
+                        reason: "authored assertion did not evaluate to a boolean".to_string(),
+                    };
+                }
+                EvalOutcome::Unevaluable(reason) => {
+                    return GateVerdict::CannotConfirm { reason };
+                }
+            }
+        }
+        GateVerdict::ConfirmedSat
     }
 
     /// Emission-side entailed reconstruction, shared with the model PRINTER.
@@ -1802,8 +2563,8 @@ impl Executor {
     /// Apply the independent, fail-closed model-check gate to a `check-sat`
     /// result. Only `Sat` is gated; every other verdict is returned untouched.
     ///
-    /// ENFORCEMENT IS UNCONDITIONAL for a refutation, monitoring for a coverage
-    /// gap — no environment variable changes either posture:
+    /// ENFORCEMENT IS UNCONDITIONAL for both a refutation and a coverage gap;
+    /// no environment variable or API call can weaken this posture:
     ///
     /// * [`GateVerdict::ModelViolates`] — the emitted model ground-falsifies an
     ///   assertion: a concrete, independently-derived refutation of the witness.
@@ -1811,11 +2572,10 @@ impl Executor {
     ///   (`unknown` is never a wrong answer), so the downgrade is enforced
     ///   unconditionally. This is the permanent guarantee that no wrong-model
     ///   class — present or future — ships as `sat`.
-    /// * [`GateVerdict::CannotConfirm`] — the gate could not ground-evaluate
-    ///   some fragment. That is evaluator INCOMPLETENESS, not a refutation;
-    ///   enforcing it would permanently degrade fragments that can never be
-    ///   ground-model-checked (FP, quantifiers, infinite-domain UF) for zero
-    ///   soundness gain, so this arm records the gap and keeps the verdict.
+    /// * [`GateVerdict::CannotConfirm`] — the independent evaluator could not
+    ///   establish that every authored assertion and query-local assumption is
+    ///   true in the published witness. The solver may be right, but the public
+    ///   SAT claim is not independently certified, so it degrades to `Unknown`.
     ///
     /// The gate never alters a verdict toward unsoundness — at most
     /// `Sat` → `Unknown`.
@@ -1824,13 +2584,6 @@ impl Executor {
         result: SolveResult,
     ) -> SolveResult {
         if result != SolveResult::Sat {
-            return result;
-        }
-        // The only way to disable the gate is the programmatic
-        // `set_independent_model_gate(false)` API (debugging/tests); the former
-        // `AY_NO_MODEL_CHECK_GATE` env-var bypass is removed — no environment
-        // variable may turn off a soundness gate.
-        if !self.independent_model_gate_enabled() {
             return result;
         }
         // Nothing to independently re-check without a model (trivially-SAT /
@@ -1930,26 +2683,15 @@ impl Executor {
                     .set_string("model_check_gate.result", "cannot-confirm");
                 self.last_statistics
                     .set_string("model_check_gate.cannot_confirm_reason", reason.clone());
-                // MONITORED, deliberately — and this is a DIFFERENT KIND of
-                // verdict from `ModelViolates`, not a weaker copy of it. A
-                // `CannotConfirm` is a COVERAGE gap: the gate's evaluator could
-                // not ground-evaluate some fragment (FP, quantifiers,
-                // uninterpreted functions, UF-elaborated datatypes). Nothing
-                // was refuted; the solver's own (stricter, theory-aware)
-                // validation already passed. Some of these fragments can NEVER
-                // be ground-model-checked (FP, quantifiers, infinite-domain
-                // UF), so enforcing a downgrade here would be a permanent
-                // completeness loss for zero soundness gain — evaluator
-                // incompleteness must not masquerade as a refutation. The
-                // gate's soundness value is the unconditionally-enforced
-                // `ModelViolates` path above, which is unaffected: record the
-                // gap and keep the verdict.
-                tracing::debug!(
-                    reason = %reason,
-                    "independent model-check gate could not confirm SAT \
-                     (evaluator coverage gap, not a refutation); keeping verdict"
-                );
-                result
+                // `CannotConfirm` is distinct from `ModelViolates`: it is a
+                // coverage gap, not evidence that the candidate is false. It is
+                // nevertheless insufficient evidence for an authoritative SAT
+                // publication. Correctness wins over completeness at this
+                // boundary, so every unconfirmed witness fails closed.
+                self.downgrade_sat_after_gate(&format!(
+                    "independent model checker could not confirm the model: {reason}"
+                ));
+                SolveResult::Unknown
             }
         }
     }
@@ -2115,27 +2857,21 @@ impl Executor {
         }
     }
 
-    /// AUTHORITATIVE-GROUND FAIL-CLOSED gate (soundness kernel, #sat-chokepoint).
+    /// AUTHORITATIVE-GROUND FAIL-CLOSED gate (defense in depth, #sat-chokepoint).
     ///
-    /// Inverts the independent gate's [`GateVerdict::CannotConfirm`] fail-OPEN
-    /// default to fail-CLOSED for theories whose GROUND evaluation is
-    /// authoritative. [`apply_independent_model_gate`](Self::apply_independent_model_gate)
-    /// KEEPS a `Sat` on `CannotConfirm` because, for genuinely-incomplete
-    /// fragments (FP, quantifiers, infinite-domain UF, incomplete strings), an
-    /// unevaluable assertion is evaluator INCOMPLETENESS, not a refutation. But
-    /// over a model that pins EVERY scalar leaf an assertion reads, in an
-    /// authoritative theory (arrays/LIA/LRA/BV/UF), a well-formed ground
-    /// evaluator MUST reduce that assertion to a boolean; a `CannotConfirm` there
-    /// means the independent evaluator UNDER-COMPUTED — the model was never
-    /// actually confirmed. Keeping the `Sat` is the exact fail-open that shipped
-    /// the QF_AX free-base-read / QF_SLIA wrong-SATs.
+    /// The independent gate now rejects every [`GateVerdict::CannotConfirm`]
+    /// before this pass can observe a public `Sat`. This narrower historical
+    /// classifier remains in the funnel and in direct regression tests as a
+    /// second fail-closed boundary: if ordering changes, an authoritatively
+    /// ground assertion that the evaluator under-computed still cannot escape.
     ///
     /// This gate re-asks per-assertion: if any assertion the independent
     /// evaluator left unevaluated is authoritatively GROUND
     /// ([`assertion_is_authoritatively_ground`](Self::assertion_is_authoritatively_ground)),
     /// the `Sat` fails CLOSED — downgraded to `Unknown` through the same
     /// contract-carrying [`gate_keeps_sat`] core as the `ModelViolates` arm.
-    /// Non-authoritative coverage gaps KEEP the verdict (completeness preserved).
+    /// Non-authoritative coverage gaps are handled by the universal independent
+    /// gate, not accepted here.
     /// Runs LAST in the [`emit_sat_verdict`](crate::executor::model::sat_emit)
     /// funnel, after the strict and independent gates.
     pub(in crate::executor) fn apply_authoritative_failclosed_gate(
@@ -2148,9 +2884,8 @@ impl Executor {
         if !self.independent_model_gate_enabled() {
             return result;
         }
-        // Only the fail-open `CannotConfirm` arm needs this second look: a
-        // `ConfirmedSat` needs no further scrutiny and a `ModelViolates` already
-        // downgraded upstream. The independent gate records which arm fired.
+        // This branch is reachable only in direct regression use or if a future
+        // funnel reordering presents the recorded CannotConfirm state as Sat.
         if self.last_statistics.get_string("model_check_gate.result") != Some("cannot-confirm") {
             return result;
         }
@@ -2189,7 +2924,7 @@ impl Executor {
     /// authoritatively GROUND — the under-computed-refutation signal the
     /// [`apply_authoritative_failclosed_gate`](Self::apply_authoritative_failclosed_gate)
     /// fails closed on. Returns the offending assertion, or `None` when every
-    /// coverage gap is a genuine incompleteness (kept as `Sat`).
+    /// coverage gap is outside this narrower defense-in-depth classifier.
     fn authoritative_ground_unevaluated_assertion(&self) -> Option<TermId> {
         if !self.logic_is_authoritative_when_ground() {
             return None;
@@ -2211,7 +2946,7 @@ impl Executor {
                 // already accounts for; do not double-handle it here.
                 EvalOutcome::Value(ModelValue::Bool(false)) => continue,
                 // Non-boolean top value or genuinely unevaluable: the
-                // coverage-gap signature the fail-open arm keeps as `Sat`.
+                // coverage-gap signature recorded by the independent evaluator.
                 EvalOutcome::Value(_) | EvalOutcome::Unevaluable(_) => {}
             }
             // A model-independent datatype/Boolean tautology holds in EVERY
@@ -2244,7 +2979,7 @@ impl Executor {
             // (element diseq only, no array diseq — not matched); a bare
             // `(= a b)` over free arrays has no `store` operand; an
             // extensionality class with a satisfiable ground read pin is
-            // `ConfirmedSat` upstream and never reaches this fail-open arm. The
+            // `ConfirmedSat` upstream and never reaches this fallback arm. The
             // downgrade is to Unknown — always sound, and the sibling storeinv
             // sizes already answer Unknown, bounding the completeness cost.
             if self.is_positive_store_chain_array_equality(assertion)
@@ -2298,10 +3033,11 @@ impl Executor {
     /// indexof/replace and their cross-theory element views) can return `sat` for
     /// an UNSATISFIABLE formula, and the emitted "model" either cannot be produced
     /// (`get-value` errors) or FALSIFIES the very assertions it claims to satisfy.
-    /// The independent gate leaves these as a `CannotConfirm` coverage gap
+    /// The independent gate reports these as a `CannotConfirm` coverage gap
     /// (sequence ground evaluation is deliberately incomplete — see
-    /// [`authoritative_sort_class`](Self::authoritative_sort_class)), and the
-    /// fail-OPEN `CannotConfirm` arm then KEEPS the wrong `sat`.
+    /// [`authoritative_sort_class`](Self::authoritative_sort_class)) and now
+    /// rejects them universally. This pass remains a theory-specific second
+    /// boundary and preserves its regression diagnostics.
     ///
     /// This gate closes that hole SYSTEMICALLY rather than per-axiom: over a `Sat`
     /// the independent gate could not confirm, if ANY asserted constraint
@@ -2316,7 +3052,7 @@ impl Executor {
     /// verdicts, and a pure-string problem never contains a `Sort::Seq(_)` subterm
     /// — so this gate never fires on it. A genuine non-string-seq `Sat` whose model
     /// the independent evaluator CAN confirm true is `ConfirmedSat` upstream and
-    /// never reaches this fail-open arm, so it stays `sat`.
+    /// never reaches this fallback arm, so it stays `sat`.
     ///
     /// Runs LAST in the [`emit_sat_verdict`](crate::executor::model::sat_emit)
     /// funnel, after the authoritative-failclosed gate.
@@ -2330,11 +3066,8 @@ impl Executor {
         if !self.independent_model_gate_enabled() {
             return result;
         }
-        // Only the fail-open `CannotConfirm` arm can ship a wrong non-string-seq
-        // `sat`: a `ConfirmedSat` re-evaluated every assertion to `true` (so the
-        // model genuinely satisfies the seq constraints), and a `ModelViolates`
-        // already downgraded upstream. The independent gate records which arm
-        // fired.
+        // Defense in depth for a recorded CannotConfirm state. In the public
+        // funnel the universal independent gate already downgraded that state.
         if self.last_statistics.get_string("model_check_gate.result") != Some("cannot-confirm") {
             return result;
         }
@@ -2380,8 +3113,8 @@ impl Executor {
         let model = self.last_model.as_ref()?;
         // SCOPE — QUANTIFIER-FREE ONLY. The systemic non-string-seq wrong verdicts
         // are all quantifier-free (both audits). In a QUANTIFIED problem, an
-        // unconfirmable leaf is the independent gate's DELIBERATE fail-open
-        // posture for quantifier/UF incompleteness (E-matching / MBQI /
+        // unconfirmable leaf is ordinary quantifier/UF evaluator incompleteness
+        // (E-matching / MBQI /
         // infinite-domain UF — see the `CannotConfirm` docs), NOT a seq-theory
         // wrong sat: e.g. a UF+datatype weakest-precondition query over a
         // `(Seq Int)` argument is DECIDED sat by E-matching, and its seq leaf is
@@ -2744,7 +3477,7 @@ impl Executor {
     /// incompleteness. Restricted to quantifier-free array / LIA / LRA / BV / UF
     /// combinations; FP, strings, sequences/sets/maps, and nonlinear arithmetic
     /// are DELIBERATELY excluded (their ground evaluators are legitimately
-    /// incomplete, so a `CannotConfirm` there must keep the verdict).
+    /// incomplete; the universal independent gate handles that as `unknown`).
     fn logic_is_authoritative_when_ground(&self) -> bool {
         let Some(logic) = self.logic() else {
             return false;
@@ -2911,13 +3644,99 @@ impl Executor {
         )
     }
 
+    /// DEEP-QE RESTORE CERTIFICATE (#qe-prepass-restore-cert).
+    ///
+    /// Evidence that the emitted model satisfies every QUANTIFIED assertion of
+    /// the restored (authored) window, for the one class the deep-QE pre-pass
+    /// decides: assertions it can eliminate ENTIRELY into a quantifier-free
+    /// equivalent.
+    ///
+    /// WHY IT IS NEEDED. `qe_prepass::deep_qe` runs before the quantifier loop
+    /// and replaces such an assertion, in the SOLVED window, by its
+    /// quantifier-free equivalent — so the ground lane decides the problem
+    /// exactly. `restore_assertions` then puts the AUTHORED quantified form
+    /// back for model validation, which skips quantified assertions
+    /// (`skipped_quantifier`), and the skipped-quantifier evidence gate finds
+    /// no certificate covering them. MBQI cannot supply one (the binders range
+    /// over an infinite Int domain), so a correctly-decided `sat` was published
+    /// as `unknown` whenever a GROUND sibling was present:
+    /// `(> a 5) ∧ ∀x∃y.(y > x ∧ y > a)` measured `unknown` against z3's `sat`.
+    ///
+    /// WHY IT IS SOUND. Two independent obligations, both fail-closed:
+    ///
+    /// 1. **Equivalence.** The quantifier-free `A'` is re-derived HERE by the
+    ///    canonical pass (`deep_qe`), whose every per-variable elimination is
+    ///    gated by Cooper's / Loos-Weispfenning's own equivalence self-check
+    ///    and whose adoption is all-or-nothing — capability is not evidence, so
+    ///    a residual quantifier (or a refused/unchanged assertion) declines.
+    /// 2. **Model evidence.** `A'` must evaluate to a DEFINITE `Bool(true)`
+    ///    under the emitted model with the INDEPENDENT evaluator
+    ///    (`ay_model_check`) — the same evaluator every ground gate anchors on.
+    ///    Unevaluable, non-Boolean, or `false` all decline.
+    ///
+    /// `A ≡ A'` and `M ⊨ A'` give `M ⊨ A`. Nothing here is vacuous: an empty
+    /// quantified set declines (this certificate has no business firing when
+    /// there is nothing to certify), and clause 2 genuinely reads the model —
+    /// `∀x.(0 ≤ x ≤ 3 ⇒ x < a)` eliminates to `a > 3`, which this REJECTS at
+    /// `a = 0` and accepts at `a = 10`
+    /// (`qe_prepass_restore_cert_rejects_falsifying_model`).
+    ///
+    /// The `Sat` this admits is not published on this certificate alone: it
+    /// still passes the emission funnel's quantified gate and independent gate
+    /// over the same restored window.
+    pub(crate) fn qe_prepass_certifies_restored_quantifiers(&mut self) -> bool {
+        if self.last_model.is_none() {
+            return false;
+        }
+        // The restored (authored) assertions that still carry a quantifier.
+        let quantified: Vec<TermId> = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .filter(|&a| contains_quantifier(&self.ctx.terms, a))
+            .collect();
+        // NON-VACUITY: with nothing quantified to certify this certificate
+        // must not vote. The caller's other arms own that case.
+        if quantified.is_empty() {
+            return false;
+        }
+        // (1) Re-derive the quantifier-free equivalent with the canonical pass.
+        let mut rewritten = quantified.clone();
+        crate::executor::qe_prepass::deep_qe(
+            &mut self.ctx.terms,
+            &mut rewritten,
+            self.solve_interrupt.as_deref(),
+        );
+        for (original, qf) in quantified.iter().zip(rewritten.iter()) {
+            if qf == original || contains_quantifier(&self.ctx.terms, *qf) {
+                return false;
+            }
+        }
+        // (2) Every equivalent must be DEFINITELY true under the emitted model.
+        let Some(model) = self.last_model.as_ref() else {
+            return false;
+        };
+        let view = IndependentModelView::new(self, model);
+        view.ensure_def_index();
+        for &qf in &rewritten {
+            if !matches!(
+                ay_model_check::evaluate_term(&self.ctx.terms, &view, qf),
+                EvalOutcome::Value(ModelValue::Bool(true))
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// QUANTIFIED-ASSERTION fail-closed model gate (#quantified-model-gate).
     ///
     /// The independent evaluator cannot evaluate a quantifier
-    /// (`ay_model_check` fails closed on `Forall`/`Exists`), the
-    /// `CannotConfirm` arm fails OPEN, the authoritative gate skips quantified
-    /// assertions, and the strict all-ground gate disables itself when any
-    /// quantifier is present — so historically NO gate ever checked a
+    /// (`ay_model_check` reports `CannotConfirm` on `Forall`/`Exists`) and now
+    /// fails closed universally. This additional quantified-model checker can
+    /// retain SAT completeness when it independently proves the emitted model's
+    /// quantified obligations. Historically no gate checked a
     /// universally quantified assertion against the concrete emitted model,
     /// and a `sat` whose model FALSIFIES its own `forall` could ship
     /// (AUFLIA `(forall i. (= (select a i) (f i)))` emitted `f := λ.1` against
@@ -2940,8 +3759,10 @@ impl Executor {
     ///   answer; an unvalidatable quantified `sat` witness must not ship.
     ///
     /// Runs in the [`emit_sat_verdict`](crate::executor::model::sat_emit)
-    /// funnel after the non-string-seq gate, over the funnel's scoped combined
-    /// assertion set (so `check-sat-assuming` roots are covered). Zero cost on
+    /// funnel before the compositional independent evaluator, over the funnel's
+    /// scoped combined assertion set (so `check-sat-assuming` roots are covered).
+    /// A successful certificate lets that evaluator skip only the quantified
+    /// leaf conjuncts while it still checks every ground sibling. Zero cost on
     /// quantifier-free problems (keyed on `contains_quantifier`).
     pub(in crate::executor) fn apply_quantified_model_failclosed_gate(
         &mut self,
@@ -2972,6 +3793,60 @@ impl Executor {
         if self.dt_cert_grant_active {
             self.last_statistics
                 .set_string("model_check_gate.quantified", "deferred-certified-dt");
+            return result;
+        }
+        // Exact parallel of the DT handoff above, for the finite-table SAT
+        // certificate on the CEGQI-classified-`Sat` route. That certificate has
+        // likewise already checked EVERY snapshot universal, under an explicitly
+        // constructed interpretation; the retained emission candidate carries
+        // only the ground core, which the strict gate has checked and the
+        // independent gate still checks. Without this handoff a `forall` over an
+        // infinite domain is unevaluable against the ground-core model, this gate
+        // fails closed, and a certified `Sat` is published as `unknown`.
+        if self.finite_table_cert_grant_active {
+            self.last_statistics.set_string(
+                "model_check_gate.quantified",
+                "deferred-certified-finite-table",
+            );
+            return result;
+        }
+        // A BV quantifier full-domain proof is equally authoritative: every
+        // binder value was covered either by exact finite-domain expansion,
+        // exhaustive BV-MBQI enumeration, or a symbolic entailment refutation.
+        // The independent evaluator still checks every ground sibling; only
+        // the already-proved quantified leaves are discharged here.
+        if self.bv_quantifier_full_domain_proof {
+            self.last_statistics.set_string(
+                "model_check_gate.quantified",
+                "deferred-certified-bv-full-domain",
+            );
+            return result;
+        }
+        // Exact parallel again, for the CONSTANT-INTERPRETATION certificate.
+        // Its evidence is the strongest of the three: every snapshot `forall`
+        // was discharged by an independent ground-solver `Unsat` on the
+        // negated body, substituted under the certified interpretation and
+        // Skolemized with fresh constants. Same reason for the handoff — the
+        // emission candidate cannot ground-evaluate those universals.
+        //
+        // Placed AFTER the two siblings, so a solve carrying more than one
+        // marker records the older certificate's provenance and this one's
+        // string is dropped. That ordering is deliberate and matches the
+        // existing dt-before-finite-table precedence.
+        if self.const_interp_cert_grant_active {
+            self.last_statistics.set_string(
+                "model_check_gate.quantified",
+                "deferred-certified-const-interp",
+            );
+            return result;
+        }
+        // MBQI SAT certification likewise discharges every restored universal
+        // through a complete finite-domain check or an explicitly constructed
+        // total interpretation. Preserve that authority through the public
+        // funnel while leaving every ground sibling to the independent gate.
+        if self.mbqi_sat_cert_grant_active {
+            self.last_statistics
+                .set_string("model_check_gate.quantified", "deferred-certified-mbqi-sat");
             return result;
         }
         // `ConfirmedSat` means the independent evaluator pinned EVERY
@@ -3063,47 +3938,23 @@ impl Executor {
             None
             | Some((_, QuantifiedModelCheck::Confirmed))
             | Some((_, QuantifiedModelCheck::Deferred)) => {
-                if deferred_any && self.self_check {
-                    // FAIL-CLOSED under --self-check (#quantified-deferred-selfcheck).
-                    // The self-check contract emits `sat` ONLY when the evaluator
-                    // CONFIRMS every authored assertion; anything unverifiable is
-                    // `unknown`. A DEFERRED quantified conjunct was NOT confirmed —
-                    // the emitted witness pins no interpretation for its functions,
-                    // so the `sat` rests on the solving machinery alone, which is
-                    // exactly the unsound component on quantified fragments (found
-                    // 2026-07-23: 20 UFBV + 1 UFNIRA wintersteiger `fixpoint`
-                    // wrong-SATs passing --self-check, while z3, cvc5, and each
-                    // file's own `(set-info :status unsat)` all say UNSAT). An
-                    // unverified quantifier must degrade to `unknown` here. Default
-                    // mode is unchanged: it keeps the completeness-favoring
-                    // deferred-`sat` (documented not-sound trade), so this can only
-                    // ADD unknowns to the fail-closed mode, never a wrong answer.
-                    self.last_statistics.set_string(
-                        "model_check_gate.quantified",
-                        "deferred-selfcheck-failclosed",
-                    );
+                if deferred_any {
+                    // A DEFERRED quantified conjunct is not model evidence. The
+                    // public SAT boundary is universally fail-closed, independent
+                    // of --self-check, so solver confidence alone cannot replace a
+                    // complete certificate.
+                    self.last_statistics
+                        .set_string("model_check_gate.quantified", "deferred-failclosed");
                     self.downgrade_sat_after_gate(
-                        "self-check: a quantified assertion could not be confirmed \
+                        "a quantified assertion could not be confirmed \
                          against the emitted model (deferred: the witness pins no \
                          interpretation for its functions) — failing closed rather \
                          than trusting the solver's unchecked `sat`",
                     );
                     SolveResult::Unknown
                 } else {
-                    self.last_statistics.set_string(
-                        "model_check_gate.quantified",
-                        if deferred_any {
-                            // Every checked conjunct passed, but at least one was
-                            // DEFERRED: the emitted witness cannot falsify it (no
-                            // printed function interpretation, or a closed
-                            // model-independent sentence) — the `sat` rests on
-                            // the machinery that minted it exactly as before this
-                            // gate (refutation paths still ran and found nothing).
-                            "deferred"
-                        } else {
-                            "confirmed"
-                        },
-                    );
+                    self.last_statistics
+                        .set_string("model_check_gate.quantified", "confirmed");
                     result
                 }
             }
@@ -3156,6 +4007,82 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Positively certify every quantified leaf in the CURRENT assertion set
+    /// against the retained model, using the same checker as the mandatory
+    /// publication gate.
+    ///
+    /// Quantifier-result restoration invokes this only after ordinary model
+    /// validation has checked the ground siblings but skipped a quantifier.
+    /// The bridge is deliberately limited to the regression class that needs
+    /// it: at least one leaf must contain a provably vacuous binder that the
+    /// mandatory checker removes. It must not turn that checker into a general
+    /// post-hoc SAT authority for live quantifiers (in particular, enumerating
+    /// only the datatype values present in a model does not cover a recursive
+    /// datatype's full carrier). Every retained leaf must then return
+    /// [`QuantifiedModelCheck::Confirmed`]. A refutation, deferral,
+    /// indeterminate result, missing model, recursion, or exhausted deadline
+    /// returns `false` and preserves the existing fail-closed `Unknown` path.
+    pub(in crate::executor) fn quantified_model_gate_confirms_current_assertions(
+        &mut self,
+    ) -> bool {
+        if self.last_model.is_none() || self.in_quantified_model_gate {
+            return false;
+        }
+
+        let assertions = self.ctx.assertions.clone();
+        let mut candidates = Vec::new();
+        for assertion in assertions {
+            if !contains_quantifier(&self.ctx.terms, assertion) {
+                continue;
+            }
+            let mut conjuncts = Vec::new();
+            crate::executor::quantifier_loop::collect_and_conjuncts(
+                &self.ctx.terms,
+                assertion,
+                &mut conjuncts,
+            );
+            if conjuncts.is_empty() {
+                conjuncts.push(assertion);
+            }
+            for conjunct in conjuncts {
+                let is_and_node = matches!(
+                    self.ctx.terms.get(conjunct),
+                    TermData::App(sym, _) if sym.name() == "and"
+                );
+                if !is_and_node
+                    && contains_quantifier(&self.ctx.terms, conjunct)
+                    && self.quantified_gate_drop_vacuous_binders(conjunct) != conjunct
+                    && !candidates.contains(&conjunct)
+                {
+                    candidates.push(conjunct);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let saved_deadline = self.solve_deadline.get();
+        let budget = Instant::now() + Duration::from_secs(2);
+        self.set_deadline(match saved_deadline {
+            Some(deadline) if deadline < budget => Some(deadline),
+            _ => Some(budget),
+        });
+        let saved_statistics = self.last_statistics.clone();
+        self.in_quantified_model_gate = true;
+        let confirmed = candidates.into_iter().all(|conjunct| {
+            !self.solve_deadline.expired()
+                && matches!(
+                    self.check_quantified_conjunct_against_model(conjunct),
+                    QuantifiedModelCheck::Confirmed
+                )
+        });
+        self.in_quantified_model_gate = false;
+        self.set_deadline(saved_deadline);
+        self.last_statistics = saved_statistics;
+        confirmed
     }
 
     /// Validate ONE quantified leaf conjunct against the emitted model.
@@ -3242,6 +4169,58 @@ impl Executor {
         // disjunction of the instances (capped; past the cap the binder is
         // kept). This decides alternations like `∃x:BV2. ∀y:BV2. …` exactly.
         let conjunct = self.quantified_gate_expand_finite_binders(conjunct);
+
+        // (1c2) Drop VACUOUS binders (#satgate-vacuous-binder). Over the
+        // non-empty sorts SMT-LIB mandates, `∀v.φ ≡ φ ≡ ∃v.φ` whenever `v` does
+        // not occur free in `φ` — an unconditional equivalence, so this cannot
+        // change the conjunct's truth value in ANY structure, the emitted model
+        // included. It is purely enabling: the routes below can only decide a
+        // conjunct whose quantifier prefix they recognise, and a vacuous binder
+        // buried in the matrix defeats both of them (the prefix route requires
+        // `!contains_quantifier(matrix)`; the general route's `deep_qe` refuses
+        // a vacuous binder outright — `find_bound_var → None` does not PROVE
+        // non-occurrence there, see `qe_prepass`'s module header — and then
+        // fails closed on the residual quantifier at
+        // `quantified_gate_general_check`).
+        //
+        // WHY THIS EXISTS (bisected): `66538b006f` made gate (2)'s deferral
+        // fail closed for every solve, not just under `--self-check`
+        // (`if deferred_any && self.self_check` -> `if deferred_any`). That
+        // turned "the gate could not decide this conjunct" into a published
+        // `unknown`, which is how `benchmarks/smt/regression/
+        // false_unsat_cegqi_entailed_inner_forall_witness.smt2` (measured `sat`
+        // before that commit, `unknown` 5/5 after) regressed. The conjunct
+        // reaching the gate there is
+        //   (forall ((x Int)) (or (forall ((y Int)) (not (= 1 x))) (not (= 0 x))))
+        // — `y` is vacuous (the `(select ((as const …) 1) y)` folded to `1`),
+        // and dropping it leaves a plain universal prefix over a
+        // quantifier-free matrix whose negation the gate's own nested solve
+        // refutes. So the fix MINTS the certificate that was missing rather
+        // than relaxing the funnel: the answer becomes `Confirmed`, not
+        // `Deferred`. The fail-closed gate itself is untouched — every
+        // conjunct the gate still cannot decide still degrades to `unknown`
+        // (verified: `crates/ay-dpll/tests/fixtures/
+        // ufbv_uf_completion_strict_leg_wrong_sat.smt2`, a declared-`unsat`
+        // instance that a blanket disable of the site turns into a WRONG `sat`,
+        // stays `unknown`).
+        //
+        // The non-occurrence test is a POSITIVE proof that fails safe on any
+        // unrecognised node kind (`TermData` is `#[non_exhaustive]`), so a
+        // binder is only ever dropped when its variable provably cannot appear
+        // — never the dangling-binder UNSAT→SAT hazard.
+        let devacuoused = self.quantified_gate_drop_vacuous_binders(conjunct);
+        if devacuoused != conjunct && std::env::var("AY_DEBUG_QMG").is_ok() {
+            // Observability, and the build MARKER this change is verified by
+            // (`strings -a target/release/ay | grep 'QMG dropped vacuous
+            // binders'`). A `last_statistics` key would be pointless here: the
+            // gate snapshots and restores the statistics around the whole
+            // conjunct loop, so anything written inside it is discarded.
+            safe_eprintln!(
+                "QMG dropped vacuous binders: {}",
+                self.format_term(devacuoused)
+            );
+        }
+        let conjunct = devacuoused;
 
         // (1d) Folding/expansion can leave the conjunct directly evaluable
         // (e.g. every quantifier expanded away over literals).
@@ -3499,6 +4478,36 @@ impl Executor {
                     }
                 }
             }
+            // FORALL-EXISTS alternation: a universal prefix over a matrix
+            // that is itself existential. The general route runs FIRST and
+            // unchanged — when its `deep_qe` eliminates the alternation
+            // (Presburger/LRA) it decides the conjunct outright and this arm
+            // is byte-identical to HEAD. Only when it comes back NON-DECISIVE
+            // (a residual quantifier — the NIA alternations) does the witness
+            // route spend gate budget trying to synthesise the existential
+            // witness term. Confirm-only, so a failed synthesis leaves the
+            // general route's own fail-closed outcome exactly as it was.
+            Some(true) => {
+                let general = self.quantified_gate_general_check(
+                    conjunct,
+                    &interps,
+                    &mut elems,
+                    model_independent,
+                );
+                if matches!(
+                    &general,
+                    QuantifiedModelCheck::Deferred | QuantifiedModelCheck::Indeterminate(_)
+                ) {
+                    match self.quantified_gate_forall_exists_witness_check(
+                        &binders, matrix, &interps, &mut elems,
+                    ) {
+                        Some(confirmed) => confirmed,
+                        None => general,
+                    }
+                } else {
+                    general
+                }
+            }
             _ => self.quantified_gate_general_check(
                 conjunct,
                 &interps,
@@ -3518,6 +4527,293 @@ impl Executor {
             }
         }
         outcome
+    }
+
+    /// FORALL-EXISTS route (#quantified-model-gate alternation): confirm
+    /// `∀x⃗. ∃y⃗. body` in the emitted model by SYNTHESISING a witness TERM for
+    /// the existential block and discharging the resulting purely UNIVERSAL
+    /// obligation with the gate's own quantifier-FREE nested solver.
+    ///
+    /// The caller has already normalized the conjunct's polarity to
+    /// `∀ uni_binders. matrix`; this route requires `matrix` itself to
+    /// normalize to `∃ ex_binders. body` with `body` quantifier-free.
+    ///
+    /// ## Why the existing routes cannot
+    ///
+    /// The prefix route only fires when the matrix under the FIRST quantifier
+    /// block is quantifier-free — an alternation breaks its parse loop on the
+    /// polarity switch. The general route hands `pins ∧ conjunct` to
+    /// `deep_qe`, which is a Presburger/LRA elimination: it leaves an
+    /// NIA alternation exactly as it found it, and
+    /// [`Self::quantified_gate_general_check`] then refuses the residual
+    /// quantifier. `quantified_gate_isolated_solve` likewise refuses any
+    /// quantified assertion outright. So a ∀∃ conjunct has NO ground instance
+    /// for the gate to evaluate and every lane ends in `Deferred` /
+    /// `Indeterminate`, i.e. a published `unknown`.
+    ///
+    /// ## The certificate
+    ///
+    /// For a term tuple `t⃗` over the universal variables,
+    ///
+    /// ```text
+    ///   pins ∧ distinct ∧ ¬body[y⃗ := t⃗][x⃗ := sk⃗]   UNSAT      (ground solve)
+    ///     ⟹ pins ∧ distinct ⊨ ∀x⃗. body[y⃗ := t⃗]              (sk⃗ fresh)
+    ///     ⟹ M ⊨ ∀x⃗. body[y⃗ := t⃗]              (M ⊨ pins ∧ distinct, by construction)
+    ///     ⟹ M ⊨ ∀x⃗ ∃y⃗. body                    (t⃗ IS a witness function)
+    /// ```
+    ///
+    /// so the accepting evidence is a GROUND `Unsat` — exactly the evidence
+    /// class the universal prefix route already accepts — never a nested
+    /// QUANTIFIED verdict. `¬body` is built after the same
+    /// [`Self::apply_quantified_gate_uf_interps`] substitution and under the
+    /// same [`Self::quantified_gate_model_pins`] the other routes use, so the
+    /// emitted model's own values are what the ground solve reasons about: a
+    /// model that falsifies the alternation makes the negation SATISFIABLE and
+    /// this route declines (the NON-VACUITY bar — see
+    /// `forall_exists_witness_route_confirm_is_model_sensitive`, which holds
+    /// the formula fixed and flips only the emitted value of a constant).
+    ///
+    /// ## Fail-closed perimeter
+    ///
+    /// CONFIRM-ONLY, and grant-only. Substituting a term for an existential
+    /// binder is an UNDER-approximation (`∀x⃗. φ[y:=t] ⟹ ∀x⃗∃y. φ`, never the
+    /// converse), so a candidate that fails to discharge proves nothing about
+    /// the model and returns `None`; the caller then runs the unchanged
+    /// general route and its unchanged fail-closed outcomes. This route never
+    /// returns `Refuted` and never converts an `Indeterminate` into a
+    /// `Deferred`. Partial pins only make the ground obligation HARDER (an
+    /// unpinned leaf is universally quantified over by the `Unsat`), so the
+    /// implication above survives `pins.total == false`; the same holds for an
+    /// unsubstituted uninterpreted function, which stays free.
+    fn quantified_gate_forall_exists_witness_check(
+        &mut self,
+        uni_binders: &[(String, Sort)],
+        matrix: TermId,
+        interps: &DetHashMap<String, QuantifiedGateUfInterp>,
+        elems: &mut QuantifiedGateElements,
+    ) -> Option<QuantifiedModelCheck> {
+        let debug = std::env::var("AY_DEBUG_QMG").is_ok();
+        if uni_binders.is_empty() || uni_binders.len() > QUANTIFIED_GATE_MAX_WITNESS_BINDERS {
+            return None;
+        }
+        // Fixed-interpretation binder sorts only. An uninterpreted-sort
+        // universal's truth depends on the model's carrier, which the prefix
+        // route handles by expanding over the printed universe; this route
+        // deliberately does not duplicate that machinery.
+        if !uni_binders
+            .iter()
+            .all(|(_, sort)| quantified_gate_witness_sort(sort))
+        {
+            return None;
+        }
+
+        // Second polarity-normalized block: `matrix ≡ ∃ ex_binders. body`.
+        let mut ex_binders: Vec<(String, Sort)> = Vec::new();
+        let mut universal: Option<bool> = None;
+        let mut cur = matrix;
+        let mut positive = true;
+        loop {
+            match self.ctx.terms.get(cur).clone() {
+                TermData::Not(inner) => {
+                    positive = !positive;
+                    cur = inner;
+                }
+                TermData::Forall(vars, body, _) => {
+                    if *universal.get_or_insert(positive) != positive {
+                        break;
+                    }
+                    ex_binders.extend(vars);
+                    cur = body;
+                }
+                TermData::Exists(vars, body, _) => {
+                    if *universal.get_or_insert(!positive) == positive {
+                        break;
+                    }
+                    ex_binders.extend(vars);
+                    cur = body;
+                }
+                _ => break,
+            }
+        }
+        if universal != Some(false) {
+            return None;
+        }
+        let body = if positive {
+            cur
+        } else {
+            self.ctx.terms.mk_not(cur)
+        };
+        if contains_quantifier(&self.ctx.terms, body) {
+            return None;
+        }
+        if ex_binders.is_empty() || ex_binders.len() > QUANTIFIED_GATE_MAX_WITNESS_BINDERS {
+            return None;
+        }
+        if !ex_binders
+            .iter()
+            .all(|(_, sort)| quantified_gate_witness_sort(sort))
+        {
+            return None;
+        }
+        // A name shared between the two blocks (or repeated inside one) makes
+        // "substitute the universal variable for the existential binder" an
+        // ill-defined capture question. Refuse rather than reason about it.
+        let mut names: Vec<&String> = uni_binders
+            .iter()
+            .chain(ex_binders.iter())
+            .map(|(n, _)| n)
+            .collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        if names.len() != before {
+            return None;
+        }
+
+        // Candidate witness terms per existential binder, strongest first.
+        let mut per_binder: Vec<Vec<TermId>> = Vec::with_capacity(ex_binders.len());
+        for ex in &ex_binders {
+            let candidates = self.quantified_gate_witness_candidates(body, ex, uni_binders);
+            if candidates.is_empty() {
+                return None;
+            }
+            per_binder.push(candidates);
+        }
+
+        for tuple in quantified_gate_witness_tuples(&per_binder) {
+            if self.solve_deadline.expired() {
+                break;
+            }
+            let mut subst: DetHashMap<String, TermId> = DetHashMap::default();
+            for ((name, _), &witness) in ex_binders.iter().zip(tuple.iter()) {
+                subst.insert(name.clone(), witness);
+            }
+            let instantiated = crate::ematching::subst_vars(&mut self.ctx.terms, body, &subst);
+
+            // Skolemize the universal prefix with fresh constants.
+            let mut universals: DetHashMap<String, TermId> = DetHashMap::default();
+            let mut skolems: HashSet<TermId> = HashSet::default();
+            for (name, sort) in uni_binders {
+                let fresh = self
+                    .ctx
+                    .terms
+                    .mk_fresh_var(&format!("qmg!fe!{name}"), sort.clone());
+                skolems.insert(fresh);
+                universals.insert(name.clone(), fresh);
+            }
+            let instance =
+                crate::ematching::subst_vars(&mut self.ctx.terms, instantiated, &universals);
+            let (instance, _) = self.apply_quantified_gate_uf_interps(instance, interps, elems);
+            let mut exclude = skolems;
+            exclude.extend(elems.all_terms());
+            let pins = self.quantified_gate_model_pins(instance, elems, &exclude);
+            let mut nested = pins.equalities.clone();
+            nested.extend(elems.distinct_assertions(&mut self.ctx.terms));
+            let target = self.ctx.terms.mk_not(instance);
+            nested.push(target);
+            let result = self.quantified_gate_isolated_solve(nested);
+            if debug {
+                safe_eprintln!(
+                    "QMG forall-exists witness obligation: not {} -> {result:?}",
+                    self.format_term(instance)
+                );
+            }
+            if matches!(result, SolveResult::Unsat(_)) {
+                return Some(QuantifiedModelCheck::Confirmed);
+            }
+        }
+        None
+    }
+
+    /// Witness-term candidates for ONE existential binder of
+    /// [`Self::quantified_gate_forall_exists_witness_check`], strongest first:
+    ///
+    /// 1. EQUALITY-DETERMINED — a top-level conjunct `(= y e)` / `(= e y)` of
+    ///    the matrix whose other side names no existential binder. Such an
+    ///    equality is a NECESSARY condition of the matrix, so if a witness
+    ///    exists at all it is this term.
+    /// 2. IDENTITY on each universal binder of the same sort (`y := x`), the
+    ///    witness for the monotone shapes (`∀x∃y. y·y ≥ x`).
+    /// 3. The sort's zero/false constant.
+    ///
+    /// Purely heuristic: every candidate is CHECKED by a ground `Unsat`
+    /// obligation before it can confirm anything, so a bad candidate costs a
+    /// nested solve and nothing else.
+    fn quantified_gate_witness_candidates(
+        &mut self,
+        body: TermId,
+        ex: &(String, Sort),
+        uni_binders: &[(String, Sort)],
+    ) -> Vec<TermId> {
+        let (ex_name, ex_sort) = ex;
+        let mut out: Vec<TermId> = Vec::new();
+
+        let mut conjuncts = Vec::new();
+        crate::executor::quantifier_loop::collect_and_conjuncts(
+            &self.ctx.terms,
+            body,
+            &mut conjuncts,
+        );
+        if conjuncts.is_empty() {
+            conjuncts.push(body);
+        }
+        for conjunct in conjuncts {
+            let TermData::App(sym, args) = self.ctx.terms.get(conjunct).clone() else {
+                continue;
+            };
+            if sym.name() != "=" || args.len() != 2 {
+                continue;
+            }
+            for (side, other) in [(args[0], args[1]), (args[1], args[0])] {
+                let is_binder = matches!(
+                    self.ctx.terms.get(side),
+                    TermData::Var(name, _) if name == ex_name
+                );
+                if !is_binder || self.ctx.terms.sort(other) != ex_sort {
+                    continue;
+                }
+                // The other side must be a term over the UNIVERSAL variables
+                // and model symbols only: a witness may not mention the
+                // existential binders it is supposed to eliminate.
+                if quantified_gate_mentions_var(&self.ctx.terms, other, ex_name) {
+                    continue;
+                }
+                if !out.contains(&other) {
+                    out.push(other);
+                }
+            }
+        }
+
+        for (name, sort) in uni_binders {
+            if sort != ex_sort {
+                continue;
+            }
+            let var = self.ctx.terms.mk_var(name.clone(), sort.clone());
+            if !out.contains(&var) {
+                out.push(var);
+            }
+        }
+
+        let zero = match ex_sort {
+            Sort::Int => Some(self.ctx.terms.mk_int(num_bigint::BigInt::from(0))),
+            Sort::Real => Some(self.ctx.terms.mk_rational(
+                num_rational::BigRational::from_integer(num_bigint::BigInt::from(0)),
+            )),
+            Sort::Bool => Some(self.ctx.terms.mk_bool(false)),
+            Sort::BitVec(bv) => {
+                let width = bv.width;
+                Some(self.ctx.terms.mk_bitvec(num_bigint::BigInt::from(0), width))
+            }
+            _ => None,
+        };
+        if let Some(zero) = zero {
+            if !out.contains(&zero) {
+                out.push(zero);
+            }
+        }
+
+        out.truncate(QUANTIFIED_GATE_MAX_WITNESS_CANDIDATES);
+        out
     }
 
     /// General/alternation route: decide `pins ∧ distinct ∧ conjunct` after
@@ -4050,6 +5346,176 @@ impl Executor {
         }
         let defer_ok = !heads.is_empty() && deferable_heads == heads.len();
         (interps, defer_ok)
+    }
+
+    /// Drop VACUOUS binders from `term` (#satgate-vacuous-binder), innermost
+    /// first, collapsing a fully-vacuous quantifier to its body.
+    ///
+    /// Every SMT-LIB sort is non-empty, so `∀v:S.φ ≡ φ` and `∃v:S.φ ≡ φ`
+    /// whenever `v` does not occur free in `φ`. The rewrite is therefore an
+    /// unconditional EQUIVALENCE at any polarity and any binder depth: it
+    /// cannot change the conjunct's truth value in the emitted model, so it can
+    /// neither manufacture a `Confirmed` nor suppress a `Refuted`. It only
+    /// removes prefix noise that stops the routes in
+    /// [`check_quantified_conjunct_against_model`] from DECIDING a conjunct
+    /// they are otherwise perfectly able to decide (see the call site for the
+    /// bisected `66538b006f` regression this recovers).
+    ///
+    /// SOUNDNESS: a binder is dropped only on a POSITIVE non-occurrence proof
+    /// from [`Self::quantified_gate_binder_may_occur`], which answers "may
+    /// occur" for every node kind it does not recognise. Dropping a binder
+    /// whose variable still occurs would free it — the dangling-binder
+    /// UNSAT→SAT hazard `qe_prepass`/`qe_light` document — so the conservative
+    /// direction here is to KEEP, which merely leaves the gate where it is
+    /// today (a fail-closed `unknown`). `Let` bodies are not rewritten
+    /// (a let-bound name could shadow a binder), only traversed by the
+    /// occurrence test.
+    fn quantified_gate_drop_vacuous_binders(&mut self, term: TermId) -> TermId {
+        let mut cache: DetHashMap<TermId, TermId> = DetHashMap::default();
+        self.quantified_gate_drop_vacuous_binders_memo(term, &mut cache)
+    }
+
+    /// Memoized worker for [`Self::quantified_gate_drop_vacuous_binders`]. The
+    /// cache is sound over the hash-consed DAG because a node's rewrite depends
+    /// only on that node's own subtree (each drop is an equivalence for ALL
+    /// valuations of the term's free variables, outer-bound ones included), and
+    /// it keeps a shared subterm from being rewritten once per path.
+    fn quantified_gate_drop_vacuous_binders_memo(
+        &mut self,
+        term: TermId,
+        cache: &mut DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&hit) = cache.get(&term) {
+            return hit;
+        }
+        let rewritten = match self.ctx.terms.get(term).clone() {
+            TermData::Const(_) | TermData::Var(..) => term,
+            TermData::App(sym, args) => {
+                let new_args: Vec<TermId> = args
+                    .iter()
+                    .map(|&a| self.quantified_gate_drop_vacuous_binders_memo(a, cache))
+                    .collect();
+                if new_args == args {
+                    term
+                } else {
+                    let sort = self.ctx.terms.sort(term).clone();
+                    self.ctx.terms.mk_app(sym, new_args, sort)
+                }
+            }
+            TermData::Not(inner) => {
+                let ni = self.quantified_gate_drop_vacuous_binders_memo(inner, cache);
+                if ni == inner {
+                    term
+                } else {
+                    self.ctx.terms.mk_not(ni)
+                }
+            }
+            TermData::Ite(c, t, e) => {
+                let nc = self.quantified_gate_drop_vacuous_binders_memo(c, cache);
+                let nt = self.quantified_gate_drop_vacuous_binders_memo(t, cache);
+                let ne = self.quantified_gate_drop_vacuous_binders_memo(e, cache);
+                if nc == c && nt == t && ne == e {
+                    term
+                } else {
+                    self.ctx.terms.mk_ite(nc, nt, ne)
+                }
+            }
+            TermData::Forall(vars, body, triggers) => {
+                let nb = self.quantified_gate_drop_vacuous_binders_memo(body, cache);
+                let kept: Vec<(String, Sort)> = vars
+                    .iter()
+                    .filter(|(n, _)| self.quantified_gate_binder_may_occur(nb, n))
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    nb
+                } else if kept.len() == vars.len() && nb == body {
+                    term
+                } else {
+                    // A trigger group mentioning a dropped binder is invalid;
+                    // drop the group (triggers are E-matching hints, never
+                    // semantics).
+                    let new_triggers =
+                        quantified_gate_retain_triggers(&self.ctx.terms, &triggers, &vars, &kept);
+                    self.ctx
+                        .terms
+                        .mk_forall_with_triggers(kept, nb, new_triggers)
+                }
+            }
+            TermData::Exists(vars, body, triggers) => {
+                let nb = self.quantified_gate_drop_vacuous_binders_memo(body, cache);
+                let kept: Vec<(String, Sort)> = vars
+                    .iter()
+                    .filter(|(n, _)| self.quantified_gate_binder_may_occur(nb, n))
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    nb
+                } else if kept.len() == vars.len() && nb == body {
+                    term
+                } else {
+                    let new_triggers =
+                        quantified_gate_retain_triggers(&self.ctx.terms, &triggers, &vars, &kept);
+                    self.ctx
+                        .terms
+                        .mk_exists_with_triggers(kept, nb, new_triggers)
+                }
+            }
+            // `Let` (a let-bound name may shadow the binder) and any node kind
+            // this gate does not model are left verbatim.
+            _ => term,
+        };
+        cache.insert(term, rewritten);
+        rewritten
+    }
+
+    /// Whether a binder named `name` MAY occur anywhere in `term`.
+    ///
+    /// `false` is a PROOF of non-occurrence: every node kind that can hold a
+    /// subterm is traversed, and any unrecognised kind (`TermData` is
+    /// `#[non_exhaustive]`) answers `true`. Shadowing inner binders are not
+    /// stopped at, which can only over-report occurrence — and over-reporting
+    /// merely CONSERVES a binder, never drops a live one. This is the
+    /// difference from `result_mapping`'s `term_mentions_name`, whose
+    /// unrecognised-node fallback is `false`; the SAT-publication gate must not
+    /// mint a certificate on an unverified assumption.
+    fn quantified_gate_binder_may_occur(&self, term: TermId, name: &str) -> bool {
+        let mut stack = vec![term];
+        let mut seen: HashSet<TermId> = HashSet::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t) {
+                TermData::Const(_) => {}
+                TermData::Var(n, _) => {
+                    if n == name {
+                        return true;
+                    }
+                }
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::Forall(_, b, triggers) | TermData::Exists(_, b, triggers) => {
+                    stack.push(*b);
+                    for grp in triggers {
+                        stack.extend(grp.iter().copied());
+                    }
+                }
+                TermData::Let(bindings, b) => {
+                    stack.extend(bindings.iter().map(|(_, v)| *v));
+                    stack.push(*b);
+                }
+                // Unrecognised node kind: NOT traversed, so non-occurrence is
+                // unproven — answer "may occur" and keep the binder.
+                _ => return true,
+            }
+        }
+        false
     }
 
     /// Finite-domain binder expansion (#quantified-model-gate): rewrite every
@@ -4808,6 +6274,71 @@ const QUANTIFIED_GATE_MAX_UF_ROWS: usize = 512;
 /// over the model's finite universes (#quantified-model-gate).
 const QUANTIFIED_GATE_MAX_USORT_INSTANCES: usize = 64;
 
+/// Cap on binders per quantifier block in the ∀∃ witness route
+/// (#quantified-model-gate alternation). Confirm-only, so a cap can only cost
+/// a confirm, never soundness.
+const QUANTIFIED_GATE_MAX_WITNESS_BINDERS: usize = 3;
+
+/// Cap on candidate witness terms per existential binder.
+const QUANTIFIED_GATE_MAX_WITNESS_CANDIDATES: usize = 4;
+
+/// Cap on candidate TUPLES actually discharged. Each costs one nested ground
+/// solve out of the gate's shared per-check-sat budget.
+const QUANTIFIED_GATE_MAX_WITNESS_TUPLES: usize = 6;
+
+/// Binder sorts the ∀∃ witness route accepts: fixed-interpretation domains
+/// only, so a witness TERM means the same thing in every structure satisfying
+/// the pins. `Sort::Uninterpreted` is excluded on purpose — its carrier is
+/// model-dependent and the prefix route's universe expansion owns it.
+fn quantified_gate_witness_sort(sort: &Sort) -> bool {
+    matches!(sort, Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_))
+}
+
+/// Does `term` contain a `Var` named `name`? Used to reject a witness
+/// candidate that mentions the existential binder it must eliminate.
+/// Conservative: an over-budget walk answers `true` (candidate rejected).
+fn quantified_gate_mentions_var(terms: &TermStore, term: TermId, name: &str) -> bool {
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut stack = vec![term];
+    let mut budget = 20_000usize;
+    while let Some(t) = stack.pop() {
+        if budget == 0 {
+            return true;
+        }
+        budget -= 1;
+        if !seen.insert(t) {
+            continue;
+        }
+        if let TermData::Var(var, _) = terms.get(t) {
+            if var == name {
+                return true;
+            }
+        }
+        stack.extend(terms.children(t));
+    }
+    false
+}
+
+/// Candidate witness TUPLES in "strongest first" order: the cartesian product
+/// of the per-binder candidate lists, ordered so the first candidate of every
+/// binder is tried first, capped at [`QUANTIFIED_GATE_MAX_WITNESS_TUPLES`].
+fn quantified_gate_witness_tuples(per_binder: &[Vec<TermId>]) -> Vec<Vec<TermId>> {
+    let mut tuples: Vec<Vec<TermId>> = vec![Vec::new()];
+    for candidates in per_binder {
+        let mut next = Vec::new();
+        for prefix in &tuples {
+            for &candidate in candidates {
+                let mut extended = prefix.clone();
+                extended.push(candidate);
+                next.push(extended);
+            }
+        }
+        tuples = next;
+    }
+    tuples.truncate(QUANTIFIED_GATE_MAX_WITNESS_TUPLES);
+    tuples
+}
+
 /// One reconstructed printer-visible function interpretation
 /// (#quantified-model-gate): the resolved table rows IN ORDER minus the last
 /// (whose result is `else_value`), exactly `format_function_table`'s
@@ -5017,6 +6548,71 @@ fn quantified_gate_guard_bounded_bv_domain(
         };
         conjuncts.into_iter().find_map(bound_of)
     }
+}
+
+/// Keep only the trigger groups that mention NO dropped binder name
+/// (#satgate-vacuous-binder): a trigger referencing an eliminated binder is
+/// ill-formed. Sound in either direction — triggers are E-matching hints, never
+/// semantics — so the cheap syntactic name test is enough here.
+fn quantified_gate_retain_triggers(
+    terms: &TermStore,
+    triggers: &[Vec<TermId>],
+    all_vars: &[(String, Sort)],
+    kept: &[(String, Sort)],
+) -> Vec<Vec<TermId>> {
+    let dropped: Vec<&str> = all_vars
+        .iter()
+        .filter(|(n, _)| !kept.iter().any(|(k, _)| k == n))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if dropped.is_empty() {
+        return triggers.to_vec();
+    }
+    triggers
+        .iter()
+        .filter(|grp| {
+            grp.iter().all(|&t| {
+                !dropped
+                    .iter()
+                    .any(|d| term_mentions_binder_name(terms, t, d))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Syntactic "does a `Var` named `name` occur in `term`" for trigger hygiene
+/// only. Over-reporting is harmless (the group is merely dropped).
+fn term_mentions_binder_name(terms: &TermStore, term: TermId, name: &str) -> bool {
+    let mut stack = vec![term];
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        match terms.get(t) {
+            TermData::Var(n, _) => {
+                if n == name {
+                    return true;
+                }
+            }
+            TermData::Const(_) => {}
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, a, b) => {
+                stack.push(*c);
+                stack.push(*a);
+                stack.push(*b);
+            }
+            TermData::Forall(_, b, _) | TermData::Exists(_, b, _) => stack.push(*b),
+            TermData::Let(bindings, b) => {
+                stack.extend(bindings.iter().map(|(_, v)| *v));
+                stack.push(*b);
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// STRICT model-independence for the quantified gate's CLOSED-sentence
@@ -5268,9 +6864,11 @@ enum SortClass {
 #[cfg(test)]
 mod tests {
     use ay_core::kani_compat::DetHashMap;
+    use ay_core::term::Symbol;
     use ay_frontend::parse;
     use ay_lia::LiaModel;
     use num_bigint::BigInt;
+    use num_rational::BigRational;
 
     use super::*;
 
@@ -5305,6 +6903,268 @@ mod tests {
             dt_ground: DetHashMap::default(),
             dt_pins: DetHashMap::default(),
         }
+    }
+
+    /// A model carrying only exact EUF equivalence-class identities.
+    fn synthetic_euf_model(values: &[(TermId, &str)]) -> Model {
+        let mut model = synthetic_lia_model(&[]);
+        model.lia_model = None;
+        let mut euf = ay_euf::EufModel::default();
+        for &(term, class) in values {
+            euf.term_values.insert(term, class.to_string());
+        }
+        model.euf_model = Some(euf);
+        model
+    }
+
+    /// A model carrying one exact floating-point leaf assignment.
+    fn synthetic_fp_model(term: TermId, value: FpModelValue) -> Model {
+        let mut model = synthetic_lia_model(&[]);
+        model.lia_model = None;
+        let mut values = DetHashMap::default();
+        values.insert(term, value);
+        model.fp_model = Some(ay_fp::FpModel { values });
+        model
+    }
+
+    #[test]
+    fn independent_gate_confirms_exact_finite_fp_to_real_witness() {
+        let mut exec = Executor::new();
+        let fp16 = Sort::FloatingPoint(5, 11);
+        let x = exec.ctx.terms.mk_var("fp-to-real-x", fp16);
+        let r = exec.ctx.terms.mk_var("fp-to-real-r", Sort::Real);
+        let to_real = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("fp.to_real"), vec![x], Sort::Real);
+        let definition = exec.ctx.terms.mk_eq(r, to_real);
+        let one = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(1)));
+        let greater_than_one = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named(">"), vec![r, one], Sort::Bool);
+        exec.self_check_authored_assertions = Some(vec![definition, greater_than_one]);
+        let mut model = synthetic_fp_model(
+            x,
+            FpModelValue::Fp {
+                sign: false,
+                exponent: 16,
+                significand: 256,
+                eb: 5,
+                sb: 11,
+            },
+        );
+        let mut real_values = DetHashMap::default();
+        real_values.insert(r, BigRational::new(BigInt::from(5), BigInt::from(2)));
+        model.lra_model = Some(ay_lra::LraModel {
+            values: real_values,
+        });
+        exec.last_model = Some(model);
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ));
+    }
+
+    #[test]
+    fn independent_gate_rejects_unspecified_fp_to_real_witness() {
+        let mut exec = Executor::new();
+        let fp16 = Sort::FloatingPoint(5, 11);
+        let x = exec.ctx.terms.mk_var("fp-to-real-inf", fp16);
+        let to_real = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("fp.to_real"), vec![x], Sort::Real);
+        let zero = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(0)));
+        let assertion = exec.ctx.terms.mk_eq(to_real, zero);
+        exec.self_check_authored_assertions = Some(vec![assertion]);
+        exec.last_model = Some(synthetic_fp_model(
+            x,
+            FpModelValue::PosInf { eb: 5, sb: 11 },
+        ));
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::CannotConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn fully_evaluated_gate_checks_false_temporary_assumption() {
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("assuming-x", Sort::Int);
+        let five = exec.ctx.terms.mk_int(BigInt::from(5));
+        let four = exec.ctx.terms.mk_int(BigInt::from(4));
+        let base = exec.ctx.terms.mk_eq(x, five);
+        let assumption = exec.ctx.terms.mk_eq(x, four);
+        exec.self_check_authored_assertions = Some(vec![base]);
+        exec.last_assumptions = Some(vec![assumption]);
+        exec.last_model = Some(synthetic_lia_model(&[(x, 5)]));
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ModelViolates { assertion } if assertion == assumption
+        ));
+    }
+
+    #[test]
+    fn fully_evaluated_gate_accepts_true_temporary_assumption() {
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("assuming-positive-x", Sort::Int);
+        let five = exec.ctx.terms.mk_int(BigInt::from(5));
+        let base = exec.ctx.terms.mk_eq(x, five);
+        exec.self_check_authored_assertions = Some(vec![base]);
+        exec.last_assumptions = Some(vec![base]);
+        exec.last_model = Some(synthetic_lia_model(&[(x, 5)]));
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ));
+    }
+
+    #[test]
+    fn fully_evaluated_gate_fails_closed_on_unevaluable_assumption() {
+        let mut exec = Executor::new();
+        let true_term = exec.ctx.terms.true_term();
+        let unpinned = exec.ctx.terms.mk_var("assuming-unpinned", Sort::Bool);
+        exec.self_check_authored_assertions = Some(vec![true_term]);
+        exec.last_assumptions = Some(vec![unpinned]);
+        exec.last_model = Some(synthetic_lia_model(&[]));
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::CannotConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn assumption_definition_is_visible_to_read_conflicted_array_gate() {
+        let mut exec = Executor::new();
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let constant = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+        let target = exec
+            .ctx
+            .terms
+            .mk_var("assuming-array-target", Sort::array(Sort::Int, Sort::Int));
+        let definition = exec.ctx.terms.mk_eq(target, constant);
+        let read = exec.ctx.terms.mk_select(target, zero);
+        let read_is_zero = exec.ctx.terms.mk_eq(read, zero);
+        let true_term = exec.ctx.terms.true_term();
+        exec.self_check_authored_assertions = Some(vec![true_term]);
+        exec.last_assumptions = Some(vec![definition, read_is_zero]);
+
+        let mut model = synthetic_lia_model(&[]);
+        let mut arrays = ay_arrays::ArrayModel::default();
+        arrays.read_conflicted.insert(target);
+        model.array_model = Some(arrays);
+        exec.last_model = Some(model);
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ));
+
+        // Without the exact defining assumption, the poisoned leaf must not
+        // be reconstructed from unrelated/transient state.
+        exec.last_assumptions = Some(vec![read_is_zero]);
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::CannotConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn sequence_euf_same_and_distinct_classes_are_exact() {
+        let mut exec = Executor::new();
+        let seq_int = Sort::Seq(Box::new(Sort::Int));
+        let x = exec.ctx.terms.mk_var("seq-euf-x", seq_int.clone());
+        let y = exec.ctx.terms.mk_var("seq-euf-y", seq_int.clone());
+        let z = exec.ctx.terms.mk_var("seq-euf-z", seq_int);
+        let equal = exec.ctx.terms.mk_eq(x, y);
+        let distinct = exec.ctx.terms.mk_distinct(vec![x, z]);
+        let model = synthetic_euf_model(&[(x, "e0"), (y, "e0"), (z, "e1")]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(matches!(
+            ay_model_check::evaluate_term(&exec.ctx.terms, &view, equal),
+            EvalOutcome::Value(ModelValue::Bool(true))
+        ));
+        assert!(matches!(
+            ay_model_check::evaluate_term(&exec.ctx.terms, &view, distinct),
+            EvalOutcome::Value(ModelValue::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn sequence_euf_declared_function_still_enforces_congruence() {
+        let mut exec = Executor::new();
+        let seq_int = Sort::Seq(Box::new(Sort::Int));
+        let x = exec.ctx.terms.mk_var("seq-euf-arg-x", seq_int.clone());
+        let y = exec.ctx.terms.mk_var("seq-euf-arg-y", seq_int.clone());
+        let f = Symbol::Named("seq_euf_f".to_string());
+        let fx = exec.ctx.terms.mk_app(f.clone(), vec![x], seq_int.clone());
+        let fy = exec.ctx.terms.mk_app(f, vec![y], seq_int);
+        let outputs_differ = exec.ctx.terms.mk_distinct(vec![fx, fy]);
+        let model =
+            synthetic_euf_model(&[(x, "arg"), (y, "arg"), (fx, "out-left"), (fy, "out-right")]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(matches!(
+            ay_model_check::evaluate_term(&exec.ctx.terms, &view, outputs_differ),
+            EvalOutcome::Value(ModelValue::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn sequence_euf_identity_is_sort_tagged_and_model_backed_only() {
+        let mut exec = Executor::new();
+        let seq_int = Sort::Seq(Box::new(Sort::Int));
+        let seq_bool = Sort::Seq(Box::new(Sort::Bool));
+        let int_seq = exec.ctx.terms.mk_var("seq-euf-int", seq_int.clone());
+        let bool_seq = exec.ctx.terms.mk_var("seq-euf-bool", seq_bool);
+        let unpinned = exec.ctx.terms.mk_var("seq-euf-unpinned", seq_int.clone());
+        let syntactic_equality = exec.ctx.terms.mk_eq(int_seq, unpinned);
+        exec.ctx.assertions.push(syntactic_equality);
+        let model = synthetic_euf_model(&[(int_seq, "e0"), (bool_seq, "e0")]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        let int_value = view.leaf_value(int_seq).expect("Seq Int class value");
+        let bool_value = view.leaf_value(bool_seq).expect("Seq Bool class value");
+        assert!(
+            !values_equal(&int_value, &bool_value),
+            "the same printable EUF class in different sequence carriers must not alias"
+        );
+        assert!(view.leaf_value(unpinned).is_none());
+        assert!(matches!(
+            ay_model_check::evaluate_term(&exec.ctx.terms, &view, syntactic_equality),
+            EvalOutcome::Unevaluable(_)
+        ));
+    }
+
+    #[test]
+    fn sequence_euf_opaque_value_cannot_feed_sequence_builtins() {
+        let mut exec = Executor::new();
+        let seq_int = Sort::Seq(Box::new(Sort::Int));
+        let x = exec.ctx.terms.mk_var("seq-euf-built-in", seq_int);
+        let len = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::Named("seq.len".to_string()), vec![x], Sort::Int);
+        let model = synthetic_euf_model(&[(x, "e0")]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(matches!(
+            ay_model_check::evaluate_term(&exec.ctx.terms, &view, len),
+            EvalOutcome::Unevaluable(_)
+        ));
     }
 
     /// The post-UF-substitution obligation produced by the mid-range Bool-UF
@@ -5397,7 +7257,7 @@ mod tests {
         let two = exec
             .ctx
             .terms
-            .mk_rational(num_rational::BigRational::from_integer(BigInt::from(2)));
+            .mk_rational(BigRational::from_integer(BigInt::from(2)));
         let nonlinear_real = exec.ctx.terms.mk_eq(x_squared, two);
         let zero = exec.ctx.terms.mk_int(BigInt::from(0));
         let integer_bound = exec.ctx.terms.mk_ge(y, zero);
@@ -5503,6 +7363,102 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn read_conflicted_array_resolves_through_recorded_substitution_chain() {
+        let mut exec = Executor::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let thirty = exec.ctx.terms.mk_int(BigInt::from(30));
+        let base = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+        let stored = exec.ctx.terms.mk_store(base, zero, thirty);
+        let source = exec
+            .ctx
+            .terms
+            .mk_var("seq_array_proxy_source", array_sort.clone());
+        let target = exec.ctx.terms.mk_var("seq_array_proxy_target", array_sort);
+        let source_definition = exec.ctx.terms.mk_eq(source, stored);
+        exec.ctx.assertions.push(source_definition);
+        exec.recorded_var_substitutions.insert(target, source);
+
+        let mut model = Model::empty();
+        let mut arrays = ay_arrays::ArrayModel::default();
+        arrays.read_conflicted.extend([target, source]);
+        model.array_model = Some(arrays);
+        let view = IndependentModelView::new(&exec, &model);
+
+        let Some(ModelValue::Array(value)) = view.leaf_value(target) else {
+            panic!("recorded substitution chain must reconstruct the array");
+        };
+        assert!(values_equal(
+            &value.default,
+            &ModelValue::Int(BigInt::from(0))
+        ));
+        assert_eq!(value.store.len(), 1);
+        assert!(values_equal(
+            &value.store[0].0,
+            &ModelValue::Int(BigInt::from(0))
+        ));
+        assert!(values_equal(
+            &value.store[0].1,
+            &ModelValue::Int(BigInt::from(30))
+        ));
+    }
+
+    #[test]
+    fn cyclic_recorded_array_substitutions_fail_closed() {
+        let mut exec = Executor::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a = exec.ctx.terms.mk_var("array-cycle-a", array_sort.clone());
+        let b = exec.ctx.terms.mk_var("array-cycle-b", array_sort);
+        exec.recorded_var_substitutions.insert(a, b);
+        exec.recorded_var_substitutions.insert(b, a);
+
+        let mut model = Model::empty();
+        let mut arrays = ay_arrays::ArrayModel::default();
+        arrays.read_conflicted.extend([a, b]);
+        model.array_model = Some(arrays);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(view.leaf_value(a).is_none());
+        assert!(view.leaf_value(b).is_none());
+    }
+
+    #[test]
+    fn read_conflicted_array_needs_an_exact_same_sort_recorded_edge() {
+        let mut exec = Executor::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let target = exec
+            .ctx
+            .terms
+            .mk_var("array-nonrecorded-target", array_sort.clone());
+        let unrelated = exec
+            .ctx
+            .terms
+            .mk_var("array-nonrecorded-source", array_sort);
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let base = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+        let unrelated_definition = exec.ctx.terms.mk_eq(unrelated, base);
+        exec.ctx.assertions.push(unrelated_definition);
+
+        let mut model = Model::empty();
+        let mut arrays = ay_arrays::ArrayModel::default();
+        arrays.read_conflicted.insert(target);
+        model.array_model = Some(arrays);
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            view.leaf_value(target).is_none(),
+            "an unrelated definition must not authorize the poisoned target"
+        );
+
+        drop(view);
+        exec.recorded_var_substitutions.insert(target, zero);
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            view.leaf_value(target).is_none(),
+            "an ill-sorted recorded edge must not authorize array reconstruction"
+        );
+    }
+
     const XEQ5: &str = "(set-logic QF_LIA)(declare-fun x () Int)(assert (= x 5))(check-sat)";
 
     /// SOUNDNESS REGRESSION — a `Sat` whose emitted witness is GROUND-REFUTED
@@ -5565,7 +7521,6 @@ mod tests {
     /// Each `EvalValue` variant renders to a compact debug string for the alarm.
     #[test]
     fn gate_alarm_eval_value_display_renders_variants() {
-        use num_rational::BigRational;
         assert_eq!(eval_value_display(&EvalValue::Bool(false)), "false");
         assert_eq!(
             eval_value_display(&EvalValue::Rational(BigRational::from_integer(
@@ -5593,12 +7548,10 @@ mod tests {
         );
     }
 
-    /// The `CannotConfirm` arm is EVALUATOR INCOMPLETENESS (a leaf the gate
-    /// cannot pin), not a refutation: the verdict is kept and the gap is
-    /// recorded. This pins the deliberate ModelViolates/CannotConfirm
-    /// asymmetry: enforcement fires on concrete refutations only.
+    /// Evaluator incompleteness is not a refutation, but it is also not an
+    /// independent SAT certificate. The public boundary must fail closed.
     #[test]
-    fn coverage_gap_keeps_sat_and_is_recorded() {
+    fn coverage_gap_fails_closed_and_is_recorded() {
         let (mut exec, outputs) = solved(XEQ5);
         assert_eq!(outputs[0], "sat");
 
@@ -5609,13 +7562,55 @@ mod tests {
         let gated = exec.apply_independent_model_gate(SolveResult::Sat);
         assert_eq!(
             gated,
-            SolveResult::Sat,
-            "evaluator incompleteness must not masquerade as a refutation"
+            SolveResult::Unknown,
+            "an independently unconfirmed witness must not retain SAT authority"
+        );
+        assert!(exec.last_model.is_none());
+        // The GATE's own field, not the `unknown_reason()` accessor. That
+        // accessor returns `None` unless `last_result == Some(Unknown)`, and
+        // setting `last_result` is the CALLER's job (`emit_sat_verdict`), not
+        // the gate's -- so driving the gate in isolation and then querying the
+        // whole-path accessor was asserting something this unit can never
+        // establish. The production path is unaffected and does report it:
+        // a gate-declined query prints `(:reason-unknown incomplete)`.
+        assert_eq!(
+            exec.last_unknown_reason,
+            Some(UnknownReason::Incomplete),
+            "the gate must record WHY it could not confirm"
         );
         assert_eq!(
             exec.last_statistics.get_string("model_check_gate.result"),
             Some("cannot-confirm"),
             "the coverage gap must be recorded in the gate telemetry"
+        );
+    }
+
+    /// `--self-check` observes the same mandatory public policy.
+    #[test]
+    fn self_check_coverage_gap_fails_closed_to_unknown() {
+        let (mut exec, outputs) = solved(XEQ5);
+        assert_eq!(outputs[0], "sat");
+        exec.last_model = Some(synthetic_lia_model(&[]));
+        exec.set_self_check(true);
+
+        let gated = exec.apply_independent_model_gate(SolveResult::Sat);
+        assert_eq!(gated, SolveResult::Unknown);
+        assert!(exec.last_model.is_none());
+        // The GATE's own field, not the `unknown_reason()` accessor. That
+        // accessor returns `None` unless `last_result == Some(Unknown)`, and
+        // setting `last_result` is the CALLER's job (`emit_sat_verdict`), not
+        // the gate's -- so driving the gate in isolation and then querying the
+        // whole-path accessor was asserting something this unit can never
+        // establish. The production path is unaffected and does report it:
+        // a gate-declined query prints `(:reason-unknown incomplete)`.
+        assert_eq!(
+            exec.last_unknown_reason,
+            Some(UnknownReason::Incomplete),
+            "the gate must record WHY it could not confirm"
+        );
+        assert_eq!(
+            exec.last_statistics.get_string("model_check_gate.result"),
+            Some("cannot-confirm")
         );
     }
 
@@ -5666,7 +7661,7 @@ mod tests {
     /// DISTINCT index values (or distinct array leaves) are indeterminate,
     /// never a refutation — a valid witness with unpinned reads keeps `sat`.
     #[test]
-    fn read_congruence_distinct_index_values_keep_sat() {
+    fn read_congruence_distinct_index_values_are_indeterminate_not_refuted() {
         let (mut exec, outputs) = solved(
             "(set-logic QF_ALIA)\
              (declare-const x Int)\
@@ -5685,11 +7680,25 @@ mod tests {
 
         let gated = exec.apply_independent_model_gate(SolveResult::Sat);
         let gated = exec.apply_authoritative_failclosed_gate(gated);
+
+        // The property is CONSERVATISM: the congruent-read pass must not treat
+        // reads at distinct indices as a REFUTATION. It is not that the gate
+        // returns `Sat` -- this witness deliberately pins only `x` and `z`, so
+        // `arr1` is an unpinned leaf and the gate cannot confirm it. Refusing
+        // to confirm a partial model is correct, and it lands on `Unknown` by
+        // the same route a refutation does, so the verdict alone cannot tell
+        // the two apart. The telemetry can, and that is what is asserted.
         assert_eq!(
-            gated,
-            SolveResult::Sat,
-            "an indeterminate congruent-read verdict must keep the sat"
+            exec.last_statistics.get_string("model_check_gate.result"),
+            Some("cannot-confirm"),
+            "distinct-index reads are INDETERMINATE, never a refutation"
         );
+        assert_ne!(
+            exec.last_statistics.get_string("model_check_gate.result"),
+            Some("model-violates"),
+            "the congruent-read pass must not refute a valid witness"
+        );
+        assert_eq!(gated, SolveResult::Unknown);
     }
 
     /// EXTENSIONALITY-CLASS COMPLETENESS REGRESSION (#ext-class-adopt-emitted,
@@ -5805,5 +7814,222 @@ mod tests {
             !model_str.contains("(- 2)"),
             "get-model must NOT emit the stale merged-EUF value -2; got: {model_str}"
         );
+    }
+
+    /// A ∀∃ alternation whose truth depends on the EMITTED VALUE of a model
+    /// constant. `∀x:Int. ∃y:Int. (y = 1 ∧ x·y ≥ x + c)` forces `y := 1`, so
+    /// the alternation says exactly `c ≤ 0` (z3 5.0.0 differential, measured:
+    /// `sat` with `(= c 0)`, `unsat` with `(= c 5)`).
+    ///
+    /// It is deliberately NONLINEAR (`x·y`) so `deep_qe` cannot eliminate the
+    /// alternation and the general route stays non-decisive — the ∀∃ witness
+    /// route is the only lane that can decide it.
+    const FORALL_EXISTS_MODEL_SENSITIVE: &str = "(set-logic NIA)\
+         (declare-fun c () Int)\
+         (assert (forall ((x Int)) (exists ((y Int)) (and (= y 1) (>= (* x y) (+ x c))))))";
+
+    /// Load [`FORALL_EXISTS_MODEL_SENSITIVE`] and publish `c := value` as the
+    /// emitted witness, with NO `check-sat` — the gate is exercised on a model
+    /// this test chose, so the two legs below differ in the MODEL alone.
+    fn forall_exists_gate_with_c(value: i64) -> Executor {
+        let commands = parse(FORALL_EXISTS_MODEL_SENSITIVE).expect("valid SMT-LIB input");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("execute succeeds");
+        let c = exec.ctx.terms.mk_var("c", Sort::Int);
+        exec.last_model = Some(synthetic_lia_model(&[(c, value)]));
+        exec
+    }
+
+    /// THE NON-VACUITY BAR for the ∀∃ witness route.
+    ///
+    /// A confirm that did not actually evaluate the quantified body under the
+    /// emitted model would pass the first leg and the second one too. This
+    /// test holds the FORMULA and the CODE PATH fixed and varies only the
+    /// model:
+    ///
+    /// * `c = 0` — the synthesised witness `y := 1` reduces the conjunct to
+    ///   the ground obligation `¬(sk·1 ≥ sk + 0)`, which is UNSAT, so the gate
+    ///   CONFIRMS and the `Sat` survives with the quantified-gate marker;
+    /// * `c = 5` — the same witness yields `¬(sk·1 ≥ sk + 5)`, which is
+    ///   SATISFIABLE, no other candidate discharges, and the gate fails closed
+    ///   to `Unknown`.
+    ///
+    /// The second leg is a MUTANT MODEL the gate must reject, and does.
+    #[test]
+    fn forall_exists_witness_route_confirm_is_model_sensitive() {
+        let mut honest = forall_exists_gate_with_c(0);
+        assert_eq!(
+            honest.apply_quantified_model_failclosed_gate(SolveResult::Sat),
+            SolveResult::Sat,
+            "the ∀∃ witness route must confirm the alternation under c = 0"
+        );
+        assert_eq!(
+            honest
+                .last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("confirmed"),
+            "the Sat must survive because the QUANTIFIED gate confirmed the \
+             alternation — not because some lane bypassed it"
+        );
+
+        let mut mutant = forall_exists_gate_with_c(5);
+        assert_eq!(
+            mutant.apply_quantified_model_failclosed_gate(SolveResult::Sat),
+            SolveResult::Unknown,
+            "a model that FALSIFIES the alternation must never be confirmed"
+        );
+        assert_ne!(
+            mutant
+                .last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("confirmed"),
+            "the mutant model must not be recorded as a quantified-gate confirm"
+        );
+    }
+
+    /// The witness route is CONFIRM-ONLY over a genuinely quantifier-free
+    /// obligation: it must decline when no candidate term witnesses the
+    /// existential. `∀x:Int. ∃y:Int. (y ≤ x ∧ y ≥ x+1)` is FALSE for every
+    /// `x`, so every candidate leaves the negated obligation satisfiable and
+    /// the gate must fail closed even though the sentence is closed and
+    /// alternating — the same shape the route confirms above.
+    #[test]
+    fn forall_exists_witness_route_declines_when_no_witness_exists() {
+        let commands = parse(
+            "(set-logic NIA)\
+             (assert (forall ((x Int)) (exists ((y Int)) \
+                (and (<= y x) (>= y (+ x 1)) (>= (* x x) 0)))))",
+        )
+        .expect("valid SMT-LIB input");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("execute succeeds");
+        exec.last_model = Some(synthetic_lia_model(&[]));
+        assert_eq!(
+            exec.apply_quantified_model_failclosed_gate(SolveResult::Sat),
+            SolveResult::Unknown,
+            "an unwitnessable ∀∃ must never be confirmed by the witness route"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sexpr_items_tests {
+    use super::sexpr_items;
+
+    #[test]
+    fn splits_top_level_items_and_keeps_nested_forms_whole() {
+        assert_eq!(
+            sexpr_items("((as const (Array (_ BitVec 64) (_ BitVec 64))) #x0000000000000000)"),
+            Some(vec![
+                "(as const (Array (_ BitVec 64) (_ BitVec 64)))".to_string(),
+                "#x0000000000000000".to_string(),
+            ]),
+            "the `as const` head is ONE item, not four"
+        );
+        // The head splits in turn into exactly the three tokens
+        // `parse_array_text` matches on before it will read a const-array.
+        assert_eq!(
+            sexpr_items("(as const (Array Int Int))"),
+            Some(vec![
+                "as".to_string(),
+                "const".to_string(),
+                "(Array Int Int)".to_string(),
+            ])
+        );
+        assert_eq!(
+            sexpr_items("(store a #x01 #x02)"),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                "#x01".to_string(),
+                "#x02".to_string()
+            ])
+        );
+        // Nested stores stay whole at the top level, so the store chain is
+        // consumed one level per recursion (outermost store wins).
+        assert_eq!(
+            sexpr_items("(store (store a 0 1) 2 3)").unwrap()[1],
+            "(store a 0 1)"
+        );
+        // A nested array cell comes back whole, for the caller to parse in turn.
+        assert_eq!(
+            sexpr_items("((as const (Array Int (Array Int Int))) ((as const (Array Int Int)) 0))")
+                .unwrap()[1],
+            "((as const (Array Int Int)) 0)"
+        );
+        // Leading/trailing whitespace and runs of spaces.
+        assert_eq!(
+            sexpr_items("  (  store   a  0 1 )  "),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                "0".to_string(),
+                "1".to_string()
+            ])
+        );
+    }
+
+    /// Parens inside a STRING literal are not structure, and `""` is the
+    /// SMT-LIB escape for one quote INSIDE a literal rather than its end.
+    #[test]
+    fn string_literals_are_opaque() {
+        assert_eq!(
+            sexpr_items(r#"(store a "a (b" "c)d")"#),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                r#""a (b""#.to_string(),
+                r#""c)d""#.to_string(),
+            ])
+        );
+        assert_eq!(
+            sexpr_items(r#"(store a "he said ""hi"" )" 0)"#),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                r#""he said ""hi"" )""#.to_string(),
+                "0".to_string(),
+            ]),
+            "an escaped quote does not end the literal, so the `)` stays inside it"
+        );
+    }
+
+    /// A `|…|` quoted symbol is one atom, whatever it contains.
+    #[test]
+    fn quoted_symbols_are_opaque() {
+        assert_eq!(
+            sexpr_items("(store a |weird (name)| 0)"),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                "|weird (name)|".to_string(),
+                "0".to_string(),
+            ])
+        );
+        assert_eq!(sexpr_items("(store a |unterminated 0)"), None);
+    }
+
+    /// Anything not a single balanced parenthesized form is refused, so an
+    /// unrecognized rendering stays opaque rather than becoming a wrong value.
+    /// A wrong array here would be confirmed as readily as a right one, whereas
+    /// `None` only costs a refusal.
+    #[test]
+    fn malformed_input_is_refused() {
+        assert_eq!(sexpr_items("not-parenthesized"), None);
+        assert_eq!(sexpr_items("(unbalanced"), None);
+        assert_eq!(sexpr_items("unbalanced)"), None);
+        assert_eq!(sexpr_items("(a))("), None, "balanced count, wrong nesting");
+        assert_eq!(sexpr_items(r#"("unterminated)"#), None);
+        assert_eq!(sexpr_items("(a (b)"), None);
+        assert_eq!(sexpr_items("((as const (Array Int Int)) 0"), None);
+        assert_eq!(
+            sexpr_items("@Array!0"),
+            None,
+            "an abstract atom is not a form"
+        );
+        assert_eq!(sexpr_items(""), None);
+        // An empty form parses, with NO items — `parse_array_text`'s
+        // `items.first()?` is what refuses it, so it never reads as an array.
+        assert_eq!(sexpr_items("()"), Some(Vec::new()));
     }
 }

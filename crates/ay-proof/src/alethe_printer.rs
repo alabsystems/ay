@@ -93,15 +93,19 @@ pub enum AlethePrintError {
         /// 0-based index of the offending step in the proof.
         step: u32,
     },
-    /// AY's internal array-extensionality certificate has no sound stock
-    /// Alethe/Carcara rendering yet.
+    /// This array-extensionality certificate is outside the subset that can be
+    /// lowered to Carcara's `arrays_ext`.
     ///
-    /// Carcara's `arrays_ext` rule requires a disequality premise and a unit
-    /// conclusion whose index is the rule's exact choice term. AY instead
-    /// stores a two-literal conservative-extension clause over a separately
-    /// declared fresh witness; the internal `array_ext_diff_intro` provenance
-    /// is only a comment in Alethe output. Emitting `:rule extensionality` (or
-    /// merely renaming it to `arrays_ext`) would therefore be unverifiable.
+    /// `arrays_ext` requires a disequality premise and a unit conclusion whose
+    /// index is the rule's exact `choice` term. AY stores a two-literal
+    /// conservative-extension clause over a separately declared fresh witness,
+    /// which the printer rewrites into that `choice` term at every occurrence —
+    /// but only for the exactly-recognized ONE-LEVEL shape whose witness could
+    /// be substituted consistently. Multi-level Skolem chains, the datatype
+    /// lane's folded reads, a witness bound to two different array pairs, and
+    /// an array mentioning a symbol the `choice` binder would capture all land
+    /// here. Emitting `:rule extensionality` (or merely renaming it to
+    /// `arrays_ext`) would be unverifiable, so the export refuses instead.
     #[error(
         "array extensionality lemma {id} has no verifiable Alethe/Carcara translation; \
          refusing to emit the unsupported `extensionality` rule"
@@ -162,6 +166,38 @@ pub enum AlethePrintError {
         /// Conflicting sort of a later occurrence.
         second: Sort,
     },
+    /// The proof is free in symbols the problem does not declare, and an
+    /// Alethe PROOF document has no command that can introduce them.
+    ///
+    /// AY used to open such a document with a `(declare-fun <name> () <sort>)`
+    /// preamble. MEASURED against carcara 1.1.0: its Alethe proof parser
+    /// accepts **no** declaration command at any position — at line 0 and
+    /// mid-file alike, both abort with
+    /// `parser error: unexpected token: 'declare-fun'` before a single rule is
+    /// checked. So every document AY emitted with a non-empty preamble was
+    /// uncheckable by construction.
+    ///
+    /// The one binder carcara does accept in a proof file is `define-fun`, and
+    /// it is not a general substitute: it is a MACRO whose body is expanded
+    /// inline, so it can only introduce a symbol whose DEFINING TERM AY
+    /// actually knows. For a Skolem constant that term is the Hilbert choice
+    /// `εx. B`, recorded at the mint site
+    /// ([`ay_core::SkolemChoice`]) and emitted by
+    /// [`AlethePrinter::skolem_choice_definitions`]. A symbol with no such
+    /// provenance has no correct rendering at all, and the exporter DECLINES:
+    /// the caller keeps its verdict and writes no file, because a document no
+    /// checker can parse is strictly worse than no document.
+    #[error(
+        "proof is free in {count} symbol(s) that the problem does not declare and an Alethe \
+         proof document cannot introduce ({names}); refusing to emit a document no checker \
+         can parse — Carcara rejects every declaration command in a proof file"
+    )]
+    UndeclarableProofSymbols {
+        /// How many undeclarable free symbols the proof references.
+        count: usize,
+        /// Comma-separated symbol names (truncated for very wide preambles).
+        names: String,
+    },
 }
 
 impl AlethePrintError {
@@ -218,6 +254,18 @@ pub(crate) struct AlethePrinter<'a> {
     /// Used to resugar decomposition steps whose premise assume PRINTS as a
     /// De Morgan surface form (`(not (and ...))` for an internal or-term).
     assume_terms: std::cell::RefCell<HashMap<ProofId, TermId>>,
+    /// Renderings installed by the `let`-elimination bridge (see
+    /// [`Self::format_let_assume_bridge`]).
+    ///
+    /// A `let`-rooted surface override is unusable in every DOWNSTREAM step: no
+    /// Alethe tautology has a `(let ...)` gate, and carcara's `assume`/premise
+    /// matching never expands `let` (`Polyeq` recurses through `Term::Let` via
+    /// `compare_binder`, it does not eliminate it). The bridge keeps the
+    /// `assume` in the problem's surface spelling and derives the eliminated
+    /// form once; from that point on the term must print as the eliminated
+    /// form everywhere, which is what this map does. Read BEFORE
+    /// `term_overrides` so the switch is atomic for the whole document.
+    let_bridge_renderings: std::cell::RefCell<HashMap<TermId, String>>,
     /// Internal clauses by proof id, populated eagerly so a resolution step
     /// can repair surface-order complements in its already-printed premises.
     proof_clauses: std::cell::RefCell<HashMap<ProofId, Vec<TermId>>>,
@@ -253,6 +301,7 @@ impl<'a> AlethePrinter<'a> {
             skolem_witness_names: std::cell::RefCell::new(HashSet::default()),
             format_cache: std::cell::RefCell::new(HashMap::default()),
             assume_terms: std::cell::RefCell::new(HashMap::default()),
+            let_bridge_renderings: std::cell::RefCell::new(HashMap::default()),
             proof_clauses: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
             work_budget,
@@ -363,10 +412,145 @@ impl<'a> AlethePrinter<'a> {
                 .borrow_mut()
                 .insert(witness_name.clone());
         }
+        self.prepare_array_extensionality_choices(proof);
         // Preparation may have formatted source terms before their substituted
         // overrides were installed. Never retain a stale rendering.
         self.format_cache.borrow_mut().clear();
         Ok(())
+    }
+
+    /// Install the epsilon (`choice`) rendering of every array-extensionality
+    /// diff witness, so that EVERY downstream occurrence of the solver's fresh
+    /// Skolem constant prints as the exact term Carcara's `arrays_ext` rule
+    /// builds for itself.
+    ///
+    /// AY's internal certificate names the diff index with a fresh constant
+    /// `__ay_ext_diff!N`, licensed by an `array_ext_diff_intro` provenance step
+    /// plus `ExtDiffRegistry` freshness. Carcara has no such notion: its
+    /// `arrays_ext` conclusion is fixed to
+    /// `(not (= (select a K) (select b K)))` with
+    /// `K = (choice ((x <Index>)) (or (= a b) (not (= (select a x) (select b x)))))`,
+    /// and the pinned build compares that term with `assert_polyeq`, which does
+    /// NOT quotient by alpha-renaming — the binder must literally be `x` (this
+    /// was MEASURED: an otherwise-identical proof with binder `zz` is rejected).
+    ///
+    /// Rendering the constant as `K` at every occurrence is a global
+    /// substitution of a term for a constant, which preserves every rule
+    /// instance the document contains (all of `arrays_idx`, `arrays_row`,
+    /// `cong`, `trans`, `symm`, `resolution`, `or_pos`, `or_neg`, `not_not` are
+    /// schematic in their operands). It is done through the existing
+    /// `skolem_overrides` channel, so the witness also stops being emitted as a
+    /// free `(declare-fun ...)`.
+    ///
+    /// Everything here is best effort and FAIL-CLOSED: a witness that is not
+    /// installed simply keeps its constant rendering, and
+    /// [`Self::format_array_extensionality`] then refuses the lemma exactly as
+    /// before.
+    fn prepare_array_extensionality_choices(&self, proof: &Proof) {
+        let mut pending: Vec<(TermId, TermId, TermId)> = Vec::new();
+        for step in &proof.steps {
+            let ProofStep::TheoryLemma { clause, kind, .. } = step else {
+                continue;
+            };
+            if !matches!(kind, ay_core::TheoryLemmaKind::ArrayExtensionality) {
+                continue;
+            }
+            // One level only. A multi-level chain (and the datatype lane's
+            // folded shape) has no single `arrays_ext` instance, so it stays
+            // un-substituted and the lemma printer fails closed.
+            let Some((array_a, array_b, witness)) =
+                crate::checker::recognize_array_extensionality(self.terms, clause)
+            else {
+                continue;
+            };
+            pending.push((witness, array_a, array_b));
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        // One witness may only ever stand for ONE array pair: a substitution
+        // that satisfied one lemma while contradicting another would corrupt
+        // every step in between. A witness that already has a certified
+        // `sko_forall` rendering is likewise left alone.
+        let mut pairs: HashMap<TermId, Option<(TermId, TermId)>> = HashMap::default();
+        for &(witness, array_a, array_b) in &pending {
+            let entry = pairs.entry(witness).or_insert(Some((array_a, array_b)));
+            if *entry != Some((array_a, array_b)) {
+                *entry = None;
+            }
+        }
+        let mut kept: HashSet<TermId> = HashSet::default();
+        pending.retain(|&(witness, array_a, array_b)| {
+            !self.skolem_overrides.borrow().contains_key(&witness)
+                && pairs.get(&witness) == Some(&Some((array_a, array_b)))
+                && kept.insert(witness)
+        });
+        if pending.is_empty() {
+            return;
+        }
+
+        // A witness whose own arrays mention another witness must be rendered
+        // AFTER that one, or its choice body would bake in the stale constant.
+        // `ExtDiffRegistry` already forbids cycles; a cycle here simply leaves
+        // the remaining witnesses uninstalled (fail-closed).
+        let mut remaining = pending;
+        loop {
+            let uninstalled: Vec<TermId> = remaining.iter().map(|&(w, _, _)| w).collect();
+            let mut installed_any = false;
+            let mut next = Vec::new();
+            for &(witness, array_a, array_b) in &remaining {
+                let blocked = uninstalled.iter().any(|&other| {
+                    other != witness
+                        && (term_mentions(self.terms, array_a, other)
+                            || term_mentions(self.terms, array_b, other))
+                });
+                if blocked {
+                    next.push((witness, array_a, array_b));
+                    continue;
+                }
+                // Capture guard: the binder is literally `x`, so a free `x` of
+                // any sort inside either array would be captured by it.
+                if term_mentions_symbol(self.terms, array_a, EXT_CHOICE_BINDER)
+                    || term_mentions_symbol(self.terms, array_b, EXT_CHOICE_BINDER)
+                {
+                    continue;
+                }
+                let TermData::Var(witness_name, _) = self.terms.get(witness) else {
+                    continue;
+                };
+                let witness_name = witness_name.clone();
+                // Renderings computed before the previous pass's installs are
+                // stale for any term containing an inner witness.
+                self.format_cache.borrow_mut().clear();
+                let choice = self.array_ext_choice_term(array_a, array_b, witness);
+                if self
+                    .insert_skolem_override(ProofId(0), witness, choice)
+                    .is_err()
+                {
+                    continue;
+                }
+                self.skolem_witness_names.borrow_mut().insert(witness_name);
+                installed_any = true;
+            }
+            if next.is_empty() || !installed_any {
+                break;
+            }
+            remaining = next;
+        }
+        self.format_cache.borrow_mut().clear();
+    }
+
+    /// The exact epsilon term Carcara's `arrays_ext` builds for `(a, b)`.
+    fn array_ext_choice_term(&self, array_a: TermId, array_b: TermId, witness: TermId) -> String {
+        let a = self.format_term(array_a);
+        let b = self.format_term(array_b);
+        let sort = self.terms.sort(witness);
+        let binder = EXT_CHOICE_BINDER;
+        format!(
+            "(choice (({binder} {sort})) \
+             (or (= {a} {b}) (not (= (select {a} {binder}) (select {b} {binder})))))"
+        )
     }
 
     /// Select the binder token and body spelling used by every command in one
@@ -634,17 +818,6 @@ impl<'a> AlethePrinter<'a> {
         }
         let ak_str = self.format_term(ak);
         let source_str = self.format_term(source);
-        // The internal conjunct index `i` must be valid against the PRINTED
-        // and-term. A surface override can re-spell `source` (e.g. re-nest a
-        // flattened conjunction, or reorder commutative args), so the printed
-        // arity / operand-`i` may diverge from the internal conjunct vector —
-        // emitting `:args (i)` against a divergent printed shape yields a
-        // wrong-index step. Require the printed `and` to split into exactly the
-        // internal conjunct count with operand `i` equal to `Ak`.
-        let printed_ops = split_application(&source_str, "and")?;
-        if printed_ops.len() != conjuncts.len() || printed_ops.get(i) != Some(&ak_str) {
-            return None;
-        }
         let printed: [String; 2] = [self.format_term(clause[0]), self.format_term(clause[1])];
         let ak_pos = printed.iter().position(|s| *s == ak_str)?;
         let other = clause[1 - ak_pos];
@@ -656,9 +829,504 @@ impl<'a> AlethePrinter<'a> {
         {
             return None;
         }
+        // The internal conjunct index `i` must be valid against the PRINTED
+        // and-term. A surface override can re-spell `source` (e.g. re-nest a
+        // flattened conjunction, or reorder commutative args), so the printed
+        // arity / operand-`i` may diverge from the internal conjunct vector —
+        // emitting `:args (i)` against a divergent printed shape yields a
+        // wrong-index step. The fast path requires the printed `and` to split
+        // into exactly the internal conjunct count with operand `i` equal to
+        // `Ak`; anything else goes through the printed-nesting navigator, which
+        // reads the index off the PRINTED node it actually emits.
+        if let Some(printed_ops) = split_application(&source_str, "and") {
+            if printed_ops.len() == conjuncts.len() && printed_ops.get(i) == Some(&ak_str) {
+                return Some(format!(
+                    "(step {id} (cl (not {source_str}) {ak_str}) :rule and_pos :args ({i}))"
+                ));
+            }
+        }
+        self.navigate_and_pos_gate(id, &source_str, &ak_str)
+    }
+
+    /// Rebuild an `and_pos` tautology when the authored spelling wraps the
+    /// canonical conjunction in `(or false C)`.
+    ///
+    /// Elaboration simplifies that wrapper to `C`, so the proof IR correctly
+    /// records `and_pos` over `C`; the source override must nevertheless print
+    /// the authored root so its `assume` matches the problem.  Printing the IR
+    /// step directly would claim `and_pos` over an `or`.  Compose the exact
+    /// Boolean rules instead:
+    ///
+    /// `or_pos(ROOT)`, `false`, and `and_pos(C)` resolve to `¬ROOT ∨ Ak`.
+    fn resugar_and_pos_false_or_and(
+        &self,
+        id: ProofId,
+        rule: &ay_core::AletheRule,
+        clause: &[TermId],
+        args: &[TermId],
+    ) -> Option<String> {
+        let ay_core::AletheRule::AndPos(i) = rule else {
+            return None;
+        };
+        let [source] = args else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(name), conjuncts) = self.terms.get(*source) else {
+            return None;
+        };
+        if name != "and" || clause.len() != 2 {
+            return None;
+        }
+        let ak = *conjuncts.get(*i as usize)?;
+        let ak_str = self.format_term(ak);
+        let printed: [String; 2] = [self.format_term(clause[0]), self.format_term(clause[1])];
+        let ak_pos = printed.iter().position(|literal| *literal == ak_str)?;
+        let gate = clause[1 - ak_pos];
+        if matches!(self.terms.get(gate), TermData::Not(inner) if *inner == *source)
+            || !self.is_demorgan_negation(gate, *source)
+        {
+            return None;
+        }
+
+        let root = self.format_term(*source);
+        let root_operands = split_application(&root, "or")?;
+        if root_operands.len() != 2 {
+            return None;
+        }
+        let (false_operand, inner) = if root_operands[0] == "false" {
+            (&root_operands[0], &root_operands[1])
+        } else if root_operands[1] == "false" {
+            (&root_operands[1], &root_operands[0])
+        } else {
+            return None;
+        };
+        let inner_operands = split_application(inner, "and")?;
+        let inner_index = inner_operands
+            .iter()
+            .position(|operand| operand == &ak_str)?;
+        // Require an exact one-to-one printed conjunction. A nested/reordered
+        // spelling needs a navigation proof; declining here is safer than
+        // guessing an `and_pos` index.
+        if inner_operands.len() != conjuncts.len()
+            || inner_operands
+                .iter()
+                .filter(|operand| *operand == &ak_str)
+                .count()
+                != 1
+        {
+            return None;
+        }
+
+        let or_id = format!("{id}.ow0");
+        let false_id = format!("{id}.ow1");
+        let and_id = format!("{id}.ow2");
+        let drop_id = format!("{id}.ow3");
         Some(format!(
-            "(step {id} (cl (not {source_str}) {ak_str}) :rule and_pos :args ({i}))"
+            "(step {or_id} (cl (not {root}) {false_operand} {inner}) :rule or_pos)\n\
+             (step {false_id} (cl (not {false_operand})) :rule false)\n\
+             (step {and_id} (cl (not {inner}) {ak_str}) :rule and_pos :args ({inner_index}))\n\
+             (step {drop_id} (cl (not {root}) {inner}) :rule resolution :premises ({or_id} {false_id}))\n\
+             (step {id} (cl (not {root}) {ak_str}) :rule resolution :premises ({drop_id} {and_id}))"
         ))
+    }
+
+    /// Derive `(cl (not ROOT) Ak)` by walking the PRINTED `and` nesting.
+    ///
+    /// The printed root stays byte-identical to `format_term(source)`, so the
+    /// resolution step that consumes this gate against the assertion's unit
+    /// clause is unaffected — only the step DECOMPOSITION changes:
+    ///
+    /// ```text
+    /// (step tK.g0 (cl (not (and (and p q) r)) (and p q)) :rule and_pos :args (0))
+    /// (step tK.g1 (cl (not (and p q)) p)                 :rule and_pos :args (0))
+    /// (step tK    (cl (not (and (and p q) r)) p) :rule resolution :premises (tK.g0 tK.g1))
+    /// ```
+    ///
+    /// Returns `None` (fail loud at the caller) when `Ak` is not a printed
+    /// operand anywhere in the nesting — emitting `:args (i)` against a shape
+    /// that does not hold it is exactly the wrong-index step this guards.
+    fn navigate_and_pos_gate(&self, id: ProofId, root: &str, ak_str: &str) -> Option<String> {
+        let nesting = PrintedNesting::build(root, "and", PRINTED_NESTING_NODE_BUDGET)?;
+        if nesting.is_flat() {
+            // Flat print with a mismatching index: there is no other shape to
+            // try, so do not guess.
+            return None;
+        }
+        self.charge(root.len() as u64);
+        if self.work_budget_exhausted() {
+            return None;
+        }
+        let (node, index) = nesting.find_operand(ak_str)?;
+        let path = nesting.path_to(node);
+        if path.is_empty() {
+            return Some(format!(
+                "(step {id} (cl (not {root}) {ak_str}) :rule and_pos :args ({index}))"
+            ));
+        }
+        let mut out = String::new();
+        let mut premises = Vec::with_capacity(path.len() + 1);
+        for (hop, (parent, operand_index)) in path.iter().enumerate() {
+            let gate_id = format!("{id}.g{hop}");
+            let parent_str = &nesting.nodes[*parent];
+            let child_str = &nesting.operands[*parent][*operand_index];
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "(step {gate_id} (cl (not {parent_str}) {child_str}) \
+                     :rule and_pos :args ({operand_index}))\n"
+                ),
+            );
+            premises.push(gate_id);
+        }
+        let leaf_id = format!("{id}.g{}", path.len());
+        let leaf_str = &nesting.nodes[node];
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "(step {leaf_id} (cl (not {leaf_str}) {ak_str}) :rule and_pos :args ({index}))\n"
+            ),
+        );
+        premises.push(leaf_id);
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "(step {id} (cl (not {root}) {ak_str}) :rule resolution :premises ({}))",
+                premises.join(" ")
+            ),
+        );
+        Some(out)
+    }
+
+    /// Re-derive an `or_pos` tautology whose printed gate is a NESTED binary
+    /// `or` (the mirror image of the `and_pos` defect above).
+    ///
+    /// carcara's `or_pos` requires the gate's TOP-LEVEL arity to equal the
+    /// clause tail length; a surface override that re-nests AY's flattened
+    /// n-ary `or` gives "expected 6 terms in 'or' term, got 2". Unlike
+    /// `and_pos` this had NO guard at all, so a broken step shipped silently.
+    ///
+    /// The repair is the same shared printed-nesting walk, one `or_pos` per
+    /// printed node, resolved into the traced clause:
+    ///
+    /// ```text
+    /// (step tK.g0 (cl (not (or (or a b) c)) (or a b) c) :rule or_pos)
+    /// (step tK.g1 (cl (not (or a b)) a b)               :rule or_pos)
+    /// (step tK    (cl (not (or (or a b) c)) a b c) :rule resolution :premises (tK.g0 tK.g1))
+    /// ```
+    ///
+    /// Returns `None` unless the printed leaves are exactly the traced clause
+    /// tail (as a multiset of printed literals) — the guard that keeps a
+    /// mis-decomposed gate off the wire.
+    fn resugar_or_pos_nested(
+        &self,
+        id: ProofId,
+        rule: &ay_core::AletheRule,
+        clause: &[TermId],
+        args: &[TermId],
+    ) -> Option<String> {
+        if !matches!(rule, ay_core::AletheRule::OrPos(_)) {
+            return None;
+        }
+        let [source] = args else {
+            return None;
+        };
+        let source = *source;
+        let TermData::App(Symbol::Named(name), _) = self.terms.get(source) else {
+            return None;
+        };
+        if name != "or" || clause.len() < 2 {
+            return None;
+        }
+        let source_str = self.format_term(source);
+        // Cheap pre-check: a printed gate that is already flat AND already the
+        // spec shape needs no repair, and this runs on every traced `or_pos`.
+        let top = split_application(&source_str, "or")?;
+        let already_flat = !top.iter().any(|o| split_application(o, "or").is_some());
+        if already_flat
+            && top.len() == clause.len() - 1
+            && matches!(self.terms.get(clause[0]), TermData::Not(inner) if *inner == source)
+        {
+            return None;
+        }
+        let printed: Vec<String> = clause.iter().map(|&lit| self.format_term(lit)).collect();
+        // The gate literal is whichever traced literal negates `source` —
+        // either the raw `(not source)` or AY's De Morgan normal form.
+        let gate_pos = clause.iter().position(|&lit| {
+            matches!(self.terms.get(lit), TermData::Not(inner) if *inner == source)
+                || self.is_demorgan_negation(lit, source)
+        })?;
+        let mut tail: Vec<String> = Vec::with_capacity(printed.len() - 1);
+        for (index, literal) in printed.iter().enumerate() {
+            if index != gate_pos {
+                tail.push(literal.clone());
+            }
+        }
+        let nesting = PrintedNesting::build(&source_str, "or", PRINTED_NESTING_NODE_BUDGET)?;
+        self.charge(source_str.len() as u64);
+        if self.work_budget_exhausted() {
+            return None;
+        }
+        // GUARD: the printed decomposition must reproduce exactly the traced
+        // clause tail, or the emitted chain would not resolve to it.
+        let mut sorted_leaves = nesting.leaves.clone();
+        let mut sorted_tail = tail.clone();
+        sorted_leaves.sort();
+        sorted_tail.sort();
+        if sorted_leaves != sorted_tail {
+            return None;
+        }
+        let mut out = String::new();
+        let mut premises = Vec::with_capacity(nesting.nodes.len());
+        for (node, operands) in nesting.operands.iter().enumerate() {
+            let gate_id = format!("{id}.g{node}");
+            let node_str = &nesting.nodes[node];
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "(step {gate_id} (cl (not {node_str}) {}) :rule or_pos)\n",
+                    operands.join(" ")
+                ),
+            );
+            premises.push(gate_id);
+        }
+        if premises.len() == 1 {
+            // Single node: the chain degenerates to the spec step itself, so
+            // emit it under the traced id instead of a resolution.
+            return Some(format!(
+                "(step {id} (cl (not {source_str}) {}) :rule or_pos)",
+                nesting.leaves.join(" ")
+            ));
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "(step {id} (cl (not {source_str}) {}) :rule resolution :premises ({}))",
+                nesting.leaves.join(" "),
+                premises.join(" ")
+            ),
+        );
+        Some(out)
+    }
+
+    /// Why the DEFAULT rendering of this `and_pos` / `or_pos` step would not
+    /// check, or `None` when it is fine (or is not one of these two rules).
+    ///
+    /// This is the guard the `or_pos` path never had. It is deliberately
+    /// evaluated only after every certified bridge has declined, and it is
+    /// deliberately narrow: it fires ONLY on the two shapes measured to be
+    /// rejected, so a step whose default rendering is correct is never turned
+    /// into a missing proof.
+    fn unrepairable_gate_reason(
+        &self,
+        rule: &ay_core::AletheRule,
+        clause: &[TermId],
+        args: &[TermId],
+    ) -> Option<String> {
+        let [source] = args else {
+            return None;
+        };
+        let source = *source;
+        let TermData::App(Symbol::Named(name), _) = self.terms.get(source) else {
+            return None;
+        };
+        match rule {
+            ay_core::AletheRule::AndPos(_) if name == "and" => {
+                // Correct by default exactly when the gate literal IS the raw
+                // `(not source)`; otherwise it is the De Morgan or-form and
+                // carcara rejects it as "the wrong form".
+                let gate_is_raw = clause.iter().any(
+                    |&lit| matches!(self.terms.get(lit), TermData::Not(inner) if *inner == source),
+                );
+                if gate_is_raw {
+                    return None;
+                }
+                Some(
+                    "and_pos gate literal is the De Morgan or-form and no certified \
+                     printed-shape bridge applies"
+                        .to_string(),
+                )
+            }
+            ay_core::AletheRule::OrPos(_) if name == "or" => {
+                let gate_is_raw = clause.iter().any(
+                    |&lit| matches!(self.terms.get(lit), TermData::Not(inner) if *inner == source),
+                );
+                let printed_arity = split_application(&self.format_term(source), "or")?.len();
+                if gate_is_raw && printed_arity == clause.len() - 1 {
+                    return None;
+                }
+                Some(format!(
+                    "or_pos printed gate arity {printed_arity} does not match the clause tail \
+                     length {} and no certified printed-shape bridge applies",
+                    clause.len() - 1
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `let`-elimination bridge for an `assume` whose surface override is a
+    /// `(let ...)` term.
+    ///
+    /// WHY. A census of 167 non-datatype `:status unsat` instances found 36
+    /// INVALID proofs; the largest class (23 instances over QF_UFLIA, QF_ALIA,
+    /// QF_IDL, QF_LIA, QF_UFIDL and ALIA) is an `and_pos` step whose gate
+    /// literal is printed as its De Morgan surface form. The repair for that —
+    /// [`Self::resugar_and_pos_not_and`] — is blocked at its printed-shape
+    /// guard whenever the assertion was authored with `let`: `source_str` is
+    /// then `(let ...)`, `split_application(s, "and")` fails at its
+    /// `strip_prefix("and")`, and the guard returns `None`, so the broken De
+    /// Morgan step ships. Every measured instance of the class is a SINGLE
+    /// `let`-rooted assertion (DTP_k2_n35_c210_s12: 2 nested lets, 40 + 16
+    /// bindings; mathsat medium5/13/18/19 and piVC_f5059f likewise).
+    ///
+    /// The `let` cannot simply be expanded in the `assume`: carcara matches an
+    /// `assume` against the problem premises with
+    /// `Polyeq::new().mod_reordering(true).mod_nary(true)`, which recurses
+    /// THROUGH `Term::Let` but never eliminates it — an expanded `assume`
+    /// against a `let` problem is rejected outright ("could not match term to
+    /// any of the original problem premises", measured).
+    ///
+    /// So keep the `assume` surface-exact under a derived id and hand the
+    /// ORIGINAL step id to the eliminated form:
+    ///
+    /// ```text
+    /// (assume tK.a  (let ((?v_0 e0) ..) BODY))
+    /// (anchor :step tK.l :args ((:= ?v_0 e0) ..))          ; certified arm
+    /// (step tK.l.t1 (cl (= BODY SUB)) :rule refl)          ;
+    /// (step tK.l    (cl (= (let ..) SUB)) :rule let)       ; NO :premises
+    /// (step tK.e    (cl (not (= (let ..) SUB)) (not (let ..)) SUB) :rule equiv_pos2)
+    /// (step tK      (cl SUB) :rule resolution :premises (tK.e tK.l tK.a))
+    /// ```
+    ///
+    /// The id swap is what makes this a purely local repair: every downstream
+    /// step already cites `tK`, and `tK` still concludes the unit clause of the
+    /// assertion — no premise reference anywhere in the document moves.
+    /// `:rule let` must carry NO `:premises` (carcara drops binding pairs whose
+    /// two sides are equal and then asserts the premise count, so a premise on
+    /// an already-normal binding is "expected 0 premises, got 1").
+    ///
+    /// TARGET FORM. `SUB` is AY's own rendering of the assertion term — the
+    /// form every other step in the document already prints. The alternative,
+    /// substituting the surface text, was rejected by measurement: AY's
+    /// internal terms are arithmetically normalized (`(<= 26 (+ x10 (- x31)))`
+    /// for the authored `(>= (- x10 x31) 26)`), so a surface-substituted body
+    /// would collide with every other step's spelling. When the two DO
+    /// coincide the substitution is emitted as a genuine `refl`/`let`
+    /// derivation (certified arm, measured `valid` end to end); otherwise the
+    /// single equivalence is marked `:rule hole` (fallback arm).
+    ///
+    /// BE HONEST ABOUT THE COST. On the measured instances the fallback arm is
+    /// what fires, and it is the FIRST hole in five of the six (only DTP
+    /// already carried one), so this trades `invalid` for `holey` rather than
+    /// for `valid`. That is still strictly better — an invalid proof is not a
+    /// proof, a hole is a visible, countable obligation — and the hole is
+    /// confined to ONE step whose obligation is exactly "this `let` eliminates
+    /// to this term". Closing it needs the arithmetic/commutative
+    /// normalization equalities, not more printing work.
+    fn format_let_assume_bridge(&self, id: ProofId, term: TermId, surface: &str) -> Option<String> {
+        if !surface.starts_with("(let") {
+            return None;
+        }
+        // A blown emission budget renders terms as a placeholder; bridging that
+        // would bake the placeholder into the document (which is discarded
+        // anyway).
+        if self.work_budget_exhausted() {
+            return None;
+        }
+        let (levels, innermost_body) = peel_printed_lets(surface)?;
+        // The eliminated form: AY's structural rendering of the assertion,
+        // bypassing this term's own `(let ...)` override but still honouring
+        // every SUBTERM override, so the result is byte-identical to how the
+        // rest of the document spells this term.
+        let eliminated = self.format_term_data(self.terms.get(term));
+        self.charge(eliminated.len() as u64 * 4);
+        if self.work_budget_exhausted() {
+            return None;
+        }
+        // Nothing is gained if the internal form is itself a binder: the gate
+        // rules still have no shape to work with.
+        if eliminated.starts_with("(let") || eliminated == surface {
+            return None;
+        }
+        // The certified arm's textual substitution assumes every bound name is
+        // bound exactly once and that SMT-LIB's PARALLEL `let` semantics never
+        // bite (no level references a name it binds itself). Shadowing or a
+        // self-reference would make the substitution disagree with the context
+        // carcara composes, so fall back to the hole arm rather than emit a
+        // `refl` the checker rejects.
+        let substituted = if printed_let_bindings_are_simple(&levels) {
+            expand_printed_lets(&levels, &innermost_body)
+        } else {
+            String::new()
+        };
+
+        let mut out = String::new();
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("(assume {id}.a {surface})\n"));
+        if substituted == eliminated {
+            // Certified arm: the authored spelling survives elimination
+            // unchanged, so the equivalence is a real `refl` under the `let`
+            // context. Anchors nest outermost-first and only the INNERMOST
+            // subproof carries the `refl`; carcara composes the contexts, so a
+            // binding value mentioning an outer variable is discharged by the
+            // same single step.
+            let mut anchor_ids = Vec::with_capacity(levels.len());
+            let mut anchor_id = format!("{id}.l");
+            for (index, (bindings, _)) in levels.iter().enumerate() {
+                if index > 0 {
+                    anchor_id.push_str(".t1");
+                }
+                let args: Vec<String> = bindings
+                    .iter()
+                    .map(|(name, value)| format!("(:= {name} {value})"))
+                    .collect();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("(anchor :step {anchor_id} :args ({}))\n", args.join(" ")),
+                );
+                anchor_ids.push(anchor_id.clone());
+            }
+            let refl_id = format!("{anchor_id}.t1");
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "(step {refl_id} (cl (= {innermost_body} {substituted})) :rule refl)\n"
+                ),
+            );
+            // Close the subproofs innermost-first. Each `let` step concludes
+            // the equivalence for the `let` term AS WRITTEN AT ITS LEVEL.
+            for (index, level_id) in anchor_ids.iter().enumerate().rev() {
+                let level_surface = if index == 0 {
+                    surface
+                } else {
+                    levels[index - 1].1.as_str()
+                };
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "(step {level_id} (cl (= {level_surface} {substituted})) :rule let)\n"
+                    ),
+                );
+            }
+        } else {
+            // Fallback arm: one visible, countable trust hole for the
+            // let-elimination equivalence itself.
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("(step {id}.l (cl (= {surface} {eliminated})) :rule hole)\n"),
+            );
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "(step {id}.e (cl (not (= {surface} {eliminated})) (not {surface}) {eliminated}) \
+                 :rule equiv_pos2)\n\
+                 (step {id} (cl {eliminated}) :rule resolution :premises ({id}.e {id}.l {id}.a))"
+            ),
+        );
+        self.let_bridge_renderings
+            .borrow_mut()
+            .insert(term, eliminated);
+        Some(out)
     }
 
     fn surface_complement_matches(&self, disjunct: TermId, expected: &str) -> bool {
@@ -824,6 +1492,176 @@ impl<'a> AlethePrinter<'a> {
         self.skolem_witness_names.borrow().contains(name)
     }
 
+    /// Alethe `define-fun` lines for the Skolem CONSTANTS among `wanted`, in
+    /// mint order, paired with the names they cover.
+    ///
+    /// ## Why a definition and not a declaration
+    ///
+    /// A Skolem constant is not a fresh opaque symbol the proof may assume
+    /// things about — it denotes `εx. B`, and `∃x. B ⟺ B[x := εx. B]` is an
+    /// equivalence. Declaring it instead states something strictly stronger
+    /// than the problem: nothing licenses a FRESH constant satisfying `B`.
+    ///
+    /// It also has to be a definition for a blunter reason, MEASURED on carcara
+    /// 1.1.0: its proof grammar (`Parser::parse_proof`) admits only `assume`,
+    /// `step`, `anchor` and `define-fun`. A `(declare-fun ...)` anywhere in the
+    /// document — first line or not — is `parser error: unexpected token:
+    /// 'declare-fun'`, so every proof AY has ever emitted with a non-empty
+    /// declaration preamble was rejected before a single rule was checked.
+    /// `(define-fun c () S (choice ...))` parses, and carcara expands it, so
+    /// the checked document is exactly the one with the choice term inlined at
+    /// every occurrence — without paying that term's size per occurrence.
+    ///
+    /// ## Fail-closed
+    ///
+    /// A definition is emitted ONLY when every free variable of the choice body
+    /// is resolvable in the document: declared by the problem, or defined by an
+    /// EARLIER line here. A witness that fails the test is simply not covered,
+    /// and the caller then DECLINES the whole export — there is no declaration
+    /// fallback, because `(declare-fun ...)` is exactly what makes a document
+    /// unparseable (see [`AlethePrintError::UndeclarableProofSymbols`]).
+    ///
+    /// Free APPLICATION symbols are not checked here: AY's declaration
+    /// collector does not see those either, so a proof-only function symbol is
+    /// a pre-existing defect of a different class, and this guard neither fixes
+    /// nor worsens it.
+    ///
+    /// ## No two witnesses may share a body (the COLLAPSE guard)
+    ///
+    /// `define-fun` is a MACRO: carcara expands each body inline, so two
+    /// symbols defined by the same body become the SAME term. MEASURED on
+    /// carcara 1.1.0 with `(define-fun sk1 () U (choice ((x U)) true))` and
+    /// `(define-fun sk2 () U (choice ((x U)) true))`, the step
+    /// `(step t2 (cl (= sk1 sk2)) :rule refl)` checks and the document is
+    /// `valid` — two DISTINCT Skolem constants proved equal. With distinct
+    /// bodies the same step is rejected (`reflexivity failed`), so the
+    /// identification is caused by the shared body and nothing else.
+    ///
+    /// Equality is judged up to renaming of the choice BINDER, because carcara
+    /// compares terms modulo alpha: MEASURED, `(choice ((x U)) true)` and
+    /// `(choice ((y U)) true)` also collapse. Any body text that repeats after
+    /// that normalization disqualifies EVERY witness sharing it — the export
+    /// then declines rather than shipping an identification AY cannot justify.
+    ///
+    /// Residual, measured and deliberately left open: carcara also identifies
+    /// bodies that differ only in an INNER binder's name
+    /// (`(choice ((x U)) (forall ((z U)) (q x z)))` vs the same with `w` for
+    /// `z` checks `valid`). Normalizing only the outer binder does not catch
+    /// that shape. It needs alpha-normalization of the whole term, which the
+    /// printer cannot do against an immutable [`TermStore`]; the bodies here
+    /// are quantifier bodies taken verbatim from the problem, so two witnesses
+    /// reaching it would have to come from source existentials identical but
+    /// for an inner bound name.
+    pub(crate) fn skolem_choice_definitions(
+        &self,
+        wanted: &HashSet<String>,
+        problem_symbols: &HashSet<String>,
+    ) -> (Vec<String>, HashSet<String>) {
+        // Phase 1 — render every candidate body ONCE, in mint order. The
+        // rendering is needed twice (to detect a shared body and to emit the
+        // line) and `format_term` is the expensive part of this method.
+        let mut candidates: Vec<(&String, &ay_core::SkolemChoice, String)> = Vec::new();
+        // Bodies that occur in the document but are NOT emission candidates.
+        // They still collapse against an emitted definition, so the census in
+        // phase 2 must see them (see `census_only` below).
+        let mut census_only: Vec<(&ay_core::SkolemChoice, String)> = Vec::new();
+        for (witness, choice) in self.terms.skolem_choices() {
+            let TermData::Var(name, _) = self.terms.get(witness) else {
+                continue;
+            };
+            if !wanted.contains(name) {
+                continue;
+            }
+            // A witness the printer already resugared to an inline `choice`
+            // must not ALSO be defined here: it never reaches the preamble.
+            //
+            // But it MUST still be counted by the collapse guard. `define-fun`
+            // is a macro, so an emitted definition whose body is textually the
+            // inline term identifies the two. MEASURED on carcara 1.1.0: with
+            // `(define-fun sk!i_other () Int (choice ((i Int)) (not (P i))))`
+            // alongside a step spelling that same choice term inline,
+            // `(step t9 (cl (= (choice ((i Int)) (not (P i))) sk!i_other))
+            //  :rule refl)` PASSES the rule check -- a distinct witness proved
+            // equal to an inline occurrence. Skipping these before the census
+            // (which is what this `continue` used to do) made the guard blind
+            // to exactly that shape.
+            if self.is_skolem_witness_name(name) {
+                census_only.push((choice, self.format_term(choice.body)));
+                continue;
+            }
+            // Capture guard: the binder is printed by NAME, so a document
+            // symbol spelled the same way would be captured by it. AY's binder
+            // renaming makes this vanishingly rare; withholding the definition
+            // costs nothing that was working.
+            if problem_symbols.contains(&choice.binder) {
+                continue;
+            }
+            candidates.push((name, choice, self.format_term(choice.body)));
+        }
+
+        // Phase 2 — the COLLAPSE guard. Normalize the binder away so that
+        // alpha-variants share a key, then disqualify every key seen twice.
+        let mut key_counts: HashMap<String, usize> = HashMap::default();
+        let census = candidates
+            .iter()
+            .map(|(_, choice, body)| (*choice, body))
+            .chain(census_only.iter().map(|(choice, body)| (*choice, body)));
+        for (choice, body) in census {
+            let key = format!(
+                "{}|{}",
+                choice.sort,
+                substitute_smt_symbol(body, &choice.binder, CHOICE_BINDER_NORMAL_FORM)
+            );
+            *key_counts.entry(key).or_insert(0) += 1;
+        }
+
+        // Phase 3 — emit, in mint order, so a body may name an earlier witness.
+        let mut lines = Vec::new();
+        let mut covered: HashSet<String> = HashSet::default();
+        for (name, choice, body) in &candidates {
+            if covered.contains(*name) {
+                continue;
+            }
+            let key = format!(
+                "{}|{}",
+                choice.sort,
+                substitute_smt_symbol(body, &choice.binder, CHOICE_BINDER_NORMAL_FORM)
+            );
+            if key_counts.get(&key).is_some_and(|count| *count > 1) {
+                continue;
+            }
+            // A binder spelled like an EARLIER definition would capture it.
+            if covered.contains(&choice.binder) {
+                continue;
+            }
+            let body_symbols = crate::variables::free_var_names(self.terms, [choice.body]);
+            let resolvable = body_symbols.iter().all(|symbol| {
+                symbol == &choice.binder
+                    || symbol != *name
+                        && (problem_symbols.contains(symbol) || covered.contains(symbol))
+            });
+            if !resolvable {
+                continue;
+            }
+            lines.push(format!(
+                "(define-fun {} () {} (choice (({} {})) {body}))",
+                quote_symbol(name),
+                choice.sort,
+                quote_symbol(&choice.binder),
+                choice.sort,
+            ));
+            covered.insert((*name).clone());
+        }
+        // Rendering the preamble is the FIRST formatting the document does, so
+        // it would otherwise seed `format_cache` with entries computed before
+        // `format_step` installs its `let`-bridge renderings. Drop them: the
+        // preamble must be invisible to step rendering, exactly as
+        // `prepare_proof` ends by dropping its own. (The cache is empty on
+        // entry, so this discards only what this method just added.)
+        self.format_cache.borrow_mut().clear();
+        (lines, covered)
+    }
+
     /// Record `amount` units of rendering work (saturating).
     fn charge(&self, amount: u64) {
         self.work.set(self.work.get().saturating_add(amount));
@@ -862,6 +1700,9 @@ impl<'a> AlethePrinter<'a> {
             ProofStep::Assume(term_id) => {
                 self.assume_terms.borrow_mut().insert(id, *term_id);
                 let term_str = self.format_term(*term_id);
+                if let Some(bridge) = self.format_let_assume_bridge(id, *term_id, &term_str) {
+                    return Ok(bridge);
+                }
                 Ok(format!("(assume {id} {term_str})"))
             }
             ProofStep::Resolution {
@@ -888,8 +1729,18 @@ impl<'a> AlethePrinter<'a> {
             // extensionality clause); it is not an Alethe inference and has no
             // conclusion, so it renders as a COMMENT. Emitting `(step tN (cl)
             // ...)` here would hand an external checker a bogus derivation of
-            // the empty clause. The witness symbol itself is still declared in
-            // the `(declare-fun ...)` preamble, so the document stays complete.
+            // the empty clause.
+            //
+            // NOTE (corrected 2026-08-04): this used to say the witness symbol
+            // "is still declared in the `(declare-fun ...)` preamble, so the
+            // document stays complete". That is now FALSE in both halves. No
+            // declaration command is emitted anywhere -- carcara's proof
+            // grammar rejects one outright -- and `__ay_ext_diff!NN` has no
+            // choice-term provenance, so it cannot be rendered as a
+            // `define-fun` either. It is precisely what makes the two
+            // `QF_ALIA/ios` instances DECLINE. The document does not stay
+            // complete; the export refuses instead, which is the intended
+            // fail-closed behaviour.
             ProofStep::Step {
                 rule: ay_core::AletheRule::ArrayExtDiffIntro,
                 clause,
@@ -1254,14 +2105,13 @@ impl<'a> AlethePrinter<'a> {
         farkas: Option<&ay_core::FarkasAnnotation>,
         kind: &ay_core::TheoryLemmaKind,
     ) -> Result<String, AlethePrintError> {
-        // Fail closed until the internal conservative-extension certificate is
-        // translated to Carcara's actual `arrays_ext` proof shape. The current
-        // `array_ext_diff_intro` renders only as a comment, while
-        // `TheoryLemmaKind::ArrayExtensionality.alethe_rule()` is the unknown
-        // rule name `extensionality`; neither conveys the fresh-witness choice
-        // obligation to an external checker.
+        // Lower the internal conservative-extension certificate to Carcara's
+        // `arrays_ext` shape (fresh witness rendered as the exact epsilon
+        // term). Anything outside that exactly-reconstructible subset still
+        // fails closed: `TheoryLemmaKind::ArrayExtensionality.alethe_rule()` is
+        // the unknown rule name `extensionality`, which must never be emitted.
         if matches!(kind, ay_core::TheoryLemmaKind::ArrayExtensionality) {
-            return Err(AlethePrintError::UnsupportedArrayExtensionality { id });
+            return self.format_array_extensionality(id, clause);
         }
         if let ay_core::TheoryLemmaKind::ArraySelectStore { index_eq } = kind {
             return self.format_array_select_store(id, clause, *index_eq);
@@ -1276,6 +2126,13 @@ impl<'a> AlethePrinter<'a> {
                 return Ok(text);
             }
         }
+        if matches!(kind, ay_core::TheoryLemmaKind::ArrayDefaultConst) {
+            return Err(AlethePrintError::InvalidArrayStep {
+                id,
+                reason: "the pinned Alethe checker has no sound rule for the non-standard array `default` operator; the exact schema is certified only by AY's native strict checker"
+                    .to_string(),
+            });
+        }
         if kind.alethe_rule() == "eq_congruent" {
             match self.surface_eq_congruent_bridge(id, clause, &[], &[]) {
                 Ok(Some(text)) => return Ok(text),
@@ -1288,7 +2145,12 @@ impl<'a> AlethePrinter<'a> {
 
         let clause_str = self.format_clause(clause);
         if let Some(farkas) = farkas {
-            let rule = kind.alethe_rule();
+            // WIRE name, not the internal one: a kind the checker does not
+            // implement must print as `hole`, never as an unknown rule name
+            // (which makes the whole document `invalid`). The arithmetic kinds
+            // that actually reach here (`LraFarkas`, `LiaGeneric`) are
+            // checkable and pass through unchanged.
+            let rule = kind.alethe_wire_rule();
             // Alethe `la_generic` coefficients are SIGNED: an equality literal
             // used in the `rhs - lhs` orientation must print a negative
             // coefficient, while the internal certificate keeps non-negative
@@ -1380,14 +2242,193 @@ impl<'a> AlethePrinter<'a> {
             }
         }
 
-        // Non-arithmetic kinds fall through to their own rule name. Any
-        // theory lemma whose rule is the literal `"trust"` (i.e.,
-        // TheoryLemmaKind::Generic) is emitted faithfully so the #8759
-        // detector sees the trust step via `kind.is_trust()`.
-        Ok(format!(
-            "(step {id} {clause_str} :rule {})",
-            kind.alethe_rule()
-        ))
+        // Non-arithmetic kinds fall through to their own rule name, mapped to
+        // the WIRE name. Every lowering above this point that found a real
+        // Alethe inference has already returned; what is left is a theory
+        // lemma AY can state but not justify in the checker's calculus —
+        // `TheoryLemmaKind::Generic` (internally `"trust"`), `dt_project`, the
+        // array/string/FP kinds with no Alethe counterpart. Those print as
+        // `hole`: the checker accepts the document as *holey* and the step is
+        // machine-readable as unproved, where an unknown rule name would make
+        // the whole proof `invalid`. The one datatype kind that DOES have a
+        // checker rule, `dt_distinct`, is aliased by `wire_rule_name` to the
+        // checker's spelling `dt_clash` and is genuinely checked.
+        //
+        // The #8759 terminal-trust detector is unaffected — it walks the proof
+        // IR and reads `kind.is_trust()` / `AletheRule::Hole`, both of which
+        // still flag this step, not the printed text.
+        //
+        // Last chance before the hole: a handful of these clauses ARE a real
+        // Alethe axiom, just filed under a coarse AY kind. Recover the real
+        // rule from the clause shape so the step is genuinely checked.
+        // Theory-lemma steps are printed without premises, so promotion to a
+        // real boolean-constant axiom is available here.
+        let wire = Self::wire_rule_for_printed_step(kind.alethe_wire_rule(), &clause_str, true);
+        Ok(format!("(step {id} {clause_str} :rule {wire})"))
+    }
+
+    /// Alethe's `true` rule proves exactly this clause and nothing else.
+    const TRUE_AXIOM_CLAUSE: &'static str = "(cl true)";
+    /// Alethe's `false` rule proves exactly this clause and nothing else.
+    const FALSE_AXIOM_CLAUSE: &'static str = "(cl (not false))";
+
+    /// Final wire-name decision for one printed step.
+    ///
+    /// Passing [`ay_core::is_checkable_alethe_rule`] is necessary but not
+    /// sufficient: a name can be real *and* misapplied, which the checker
+    /// rejects just as hard as an invented one. Two Alethe rules have a FIXED
+    /// conclusion — `true` proves exactly `(cl true)`, `false` proves exactly
+    /// `(cl (not false))` — while AY's `AletheRule::True`/`False` are Tseitin
+    /// bool-constant units admitted by the wider internal bool-tautology
+    /// validator (`checker/mod.rs`). Measured divergence: on
+    /// `QF_DT/20172804-Barrett/.../v1l20005.cvc.smt2` AY prints
+    /// `(step t1 (cl (not (and …))) :rule false)` and carcara answers
+    /// `expected term 'false' to be boolean constant '(and …)'` => `invalid`
+    /// for the whole document. So:
+    ///
+    /// * `true`/`false` whose printed conclusion is NOT the axiom is demoted
+    ///   to an honest `hole`;
+    /// * a `hole` whose printed conclusion IS the axiom (it arrived under a
+    ///   coarse kind such as `TheoryLemmaKind::BoolTautology`) is promoted to
+    ///   the real, checked rule.
+    ///
+    /// The gate reads the PRINTED clause, not the term IR, and that is
+    /// load-bearing: a problem-scope surface override can print an internally
+    /// bool-constant literal in the source problem's own spelling, so an
+    /// IR-driven gate promotes steps carcara then rejects (that is exactly how
+    /// v1l20005 was found). The checker only ever sees the printed text.
+    ///
+    /// `allow_promote` is false for steps carrying premises: the two axioms
+    /// are premise-free, so promotion is only offered where it is meaningful.
+    fn wire_rule_for_printed_step<'r>(
+        wire: &'r str,
+        clause_str: &str,
+        allow_promote: bool,
+    ) -> &'r str {
+        match wire {
+            "true" if clause_str != Self::TRUE_AXIOM_CLAUSE => ay_core::UNPROVED_STEP_RULE,
+            "false" if clause_str != Self::FALSE_AXIOM_CLAUSE => ay_core::UNPROVED_STEP_RULE,
+            w if allow_promote && w == ay_core::UNPROVED_STEP_RULE => match clause_str {
+                Self::TRUE_AXIOM_CLAUSE => "true",
+                Self::FALSE_AXIOM_CLAUSE => "false",
+                _ => w,
+            },
+            w => w,
+        }
+    }
+
+    /// Lower AY's Skolemized array-extensionality certificate to Carcara's
+    /// `arrays_ext`.
+    ///
+    /// AY's clause is the conservative-extension disjunction
+    /// `(= a b) ∨ ¬(= (select a K) (select b K))`, where `K` is the fresh diff
+    /// witness. Carcara instead derives the UNIT `¬(= (select a K) (select b K))`
+    /// from the premise `¬(= a b)`, with `K` fixed to its own epsilon term. So:
+    ///
+    ///  * [`Self::prepare_array_extensionality_choices`] has already made every
+    ///    printed occurrence of the witness — here and in every downstream ROW,
+    ///    congruence and resolution step — spell that exact epsilon term;
+    ///  * the disjunction is recovered by discharging `¬(= a b)` through a local
+    ///    subproof (`subproof` + `not_not` + `resolution`), mirroring the ROW2
+    ///    guard handling;
+    ///  * `or_neg` + `resolution` repack the two literals into the unit `or`
+    ///    term AY's later `or_pos` steps consume, so no premise reference moves.
+    ///
+    /// Every reconstruction is checked against the ACTUALLY PRINTED clause
+    /// before it is emitted: if a surface override, an unrecognized shape, a
+    /// multi-level chain, or a missing witness installation makes the rebuilt
+    /// text differ by one byte, the lemma is refused and the caller keeps
+    /// failing closed instead of publishing a derivation of something else.
+    fn format_array_extensionality(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        let refuse = || AlethePrintError::UnsupportedArrayExtensionality { id };
+        let Some((array_a, array_b, witness)) =
+            crate::checker::recognize_array_extensionality(self.terms, clause)
+        else {
+            return Err(refuse());
+        };
+        // The witness must be rendered as the epsilon term EVERYWHERE, not just
+        // inside this step; that is what `prepare_array_extensionality_choices`
+        // installs. Without it the step would claim `arrays_ext` for a free
+        // constant Carcara has no reason to believe anything about.
+        let Some(installed) = self.skolem_overrides.borrow().get(&witness).cloned() else {
+            return Err(refuse());
+        };
+        let expected_choice = self.array_ext_choice_term(array_a, array_b, witness);
+        if installed != expected_choice {
+            return Err(refuse());
+        }
+
+        let a = self.format_term(array_a);
+        let b = self.format_term(array_b);
+        let equality = format!("(= {a} {b})");
+        let negated_select = format!("(not (= (select {a} {installed}) (select {b} {installed})))");
+        let disjunction = format!("(or {equality} {negated_select})");
+
+        // How the clause is ACTUALLY printed decides the tail of the
+        // derivation; nothing is inferred from the internal representation.
+        enum Conclusion {
+            /// `(cl (or (= a b) (not (= (select a K) (select b K)))))`
+            PackedOr,
+            /// `(cl (= a b) (not (= (select a K) (select b K))))`
+            Flat,
+            /// `(cl (not (= (select a K) (select b K))) (= a b))`
+            FlatReversed,
+        }
+        let conclusion = match clause {
+            [packed] if self.format_term(*packed) == disjunction => Conclusion::PackedOr,
+            [first, second] => match (self.format_term(*first), self.format_term(*second)) {
+                (f, s) if f == equality && s == negated_select => Conclusion::Flat,
+                (f, s) if f == negated_select && s == equality => Conclusion::FlatReversed,
+                _ => return Err(refuse()),
+            },
+            _ => return Err(refuse()),
+        };
+
+        // Discharge `¬(= a b)` so the two-literal disjunction reappears. The
+        // last step of this prefix is named `{id}` itself in the `Flat` case,
+        // so that no extra single-premise step is needed.
+        let flat_step = match conclusion {
+            Conclusion::Flat => format!("{id}"),
+            Conclusion::PackedOr | Conclusion::FlatReversed => format!("{id}.flat"),
+        };
+        let mut out = String::new();
+        out.push_str(&format!(
+            "(anchor :step {id}.sp)\n\
+             (assume {id}.h (not {equality}))\n\
+             (step {id}.ext (cl {negated_select}) :rule arrays_ext :premises ({id}.h))\n\
+             (step {id}.sp (cl (not (not {equality})) {negated_select}) \
+             :rule subproof :discharge ({id}.h))\n\
+             (step {id}.nn (cl (not (not (not {equality}))) {equality}) :rule not_not)\n\
+             (step {flat_step} (cl {equality} {negated_select}) \
+             :rule resolution :premises ({id}.sp {id}.nn))"
+        ));
+        match conclusion {
+            Conclusion::Flat => {}
+            Conclusion::FlatReversed => {
+                out.push_str(&format!(
+                    "\n(step {id} (cl {negated_select} {equality}) \
+                     :rule reordering :premises ({flat_step}))"
+                ));
+            }
+            // Repack into the unit `or` term AY's later `or_pos` steps consume,
+            // exactly as the ROW2 lowering does.
+            Conclusion::PackedOr => {
+                out.push_str(&format!(
+                    "\n(step {id}.o0 (cl {disjunction} (not {equality})) :rule or_neg :args (0))\n\
+                     (step {id}.r0 (cl {negated_select} {disjunction}) \
+                     :rule resolution :premises ({flat_step} {id}.o0))\n\
+                     (step {id}.o1 (cl {disjunction} (not {negated_select})) \
+                     :rule or_neg :args (1))\n\
+                     (step {id} (cl {disjunction}) \
+                     :rule resolution :premises ({id}.r0 {id}.o1))"
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// Lower AY's internally checked ROW1/ROW2 lemmas to the array rules
@@ -1682,23 +2723,43 @@ impl<'a> AlethePrinter<'a> {
                 let printed_guard = self.format_term(guard);
                 let guard_forward = format!("(= {store_index} {read_index})");
                 let guard_reverse = format!("(= {read_index} {store_index})");
-                let assumed_disequality = if printed_guard == guard_forward {
-                    format!("(not {guard_forward})")
+                // `arrays_row` reads the store index and the read index off its
+                // premise POSITIONALLY: the premise must literally spell
+                // `(not (= store_index read_index))`. When AY's own guard is
+                // the symmetric spelling, bridge it with `not_symm` rather than
+                // handing Carcara a premise it will reject ("expected terms to
+                // be equal: i0 and i1").
+                let (assumed_disequality, row_premise, orientation_bridge) = if printed_guard
+                    == guard_forward
+                {
+                    (format!("(not {guard_forward})"), format!("{id}.h"), None)
                 } else if printed_guard == guard_reverse {
-                    format!("(not {guard_reverse})")
+                    (
+                        format!("(not {guard_reverse})"),
+                        format!("{id}.hs"),
+                        Some(format!(
+                            "(step {id}.hs (cl (not {guard_forward})) \
+                                 :rule not_symm :premises ({id}.h))\n"
+                        )),
+                    )
                 } else {
                     return Err(invalid_surface(
                         "ROW2 guard surface override changes the certified index pair".to_string(),
                     ));
                 };
+                let orientation_bridge = orientation_bridge.unwrap_or_default();
 
                 let row_derivation = if printed_row == canonical_row {
                     format!(
-                        "(step {id}.row (cl {canonical_row}) :rule arrays_row :premises ({id}.h))"
+                        "{orientation_bridge}\
+                         (step {id}.row (cl {canonical_row}) :rule arrays_row \
+                         :premises ({row_premise}))"
                     )
                 } else {
                     format!(
-                        "(step {id}.base (cl {canonical_row}) :rule arrays_row :premises ({id}.h))\n\
+                        "{orientation_bridge}\
+                         (step {id}.base (cl {canonical_row}) :rule arrays_row \
+                         :premises ({row_premise}))\n\
                          (step {id}.row (cl {reversed_row}) :rule symm :premises ({id}.base))"
                     )
                 };
@@ -2131,6 +3192,10 @@ impl<'a> AlethePrinter<'a> {
                     return None;
                 }
             }
+            // The internal checker re-derives select(const-array(v), i) = v,
+            // but the pinned external Alethe checker has no sound primitive
+            // for that axiom.  Refuse export instead of spelling it as trust.
+            RowChainEnd::Const { .. } => return None,
         }
         match step_ids.len() {
             0 => Some(RowChainPathProof::Reflexive),
@@ -2402,6 +3467,24 @@ impl<'a> AlethePrinter<'a> {
                         .to_string(),
                 });
             }
+            // The general shape-changing case. A surface override may
+            // re-render an internal term as the SOURCE text it was simplified
+            // from — e.g. the internal `(<= a b)` prints back as the authored
+            // `(and (<= a b) (<= c c))` it was simplified out of. The internal
+            // congruence is a perfectly good same-operator inference, but the
+            // PRINTED step equates an `and` with a `<=`, and the default
+            // rendering below would ship it.
+            //
+            // There is no honest repair. Stating the surface equality as a
+            // `hole` and composing with `trans` would turn `invalid` into
+            // `holey` while proving NOTHING about the two terms — a hole
+            // proves anything, so a holey verdict bought that way hides the
+            // defect instead of reporting it, which is strictly worse than
+            // `invalid`. DECLINE, and let the caller's unverifiable-proof path
+            // fire.
+            if let Some(reason) = self.surface_cong_has_uncheckable_operands(clause) {
+                return Err(AlethePrintError::InvalidCongruenceStep { id, reason });
+            }
         }
         if matches!(rule, ay_core::AletheRule::EqCongruent) {
             match self.surface_eq_congruent_bridge(id, clause, premises, args) {
@@ -2436,10 +3519,20 @@ impl<'a> AlethePrinter<'a> {
             if let Some(text) = self.resugar_equality_split_and_pos(id, rule, clause) {
                 return Ok(text);
             }
+            if let Some(text) = self.resugar_and_pos_false_or_and(id, rule, clause, args) {
+                return Ok(text);
+            }
             // `and_pos` whose `(not (and ...))` gate literal was traced as its
             // De Morgan surface `(or (not A1) .. (not An))`: re-slot to the
             // spec-shaped `(cl (not (and ...)) Ak)` Carcara requires.
             if let Some(text) = self.resugar_and_pos_not_and(id, rule, clause, args) {
+                return Ok(text);
+            }
+            // `or_pos` whose printed gate is a NESTED binary `or` while the
+            // internal or-term is n-ary: carcara compares the gate's TOP-LEVEL
+            // arity against the clause tail length, so a re-nested surface
+            // spelling is rejected ("expected 6 terms in 'or' term, got 2").
+            if let Some(text) = self.resugar_or_pos_nested(id, rule, clause, args) {
                 return Ok(text);
             }
             // Clausification tautologies over a source term whose PRINTED
@@ -2470,6 +3563,19 @@ impl<'a> AlethePrinter<'a> {
                         .to_string(),
                 });
             }
+            // FAIL LOUD for the two printed-shape defects this pass repairs.
+            // Reaching here means every certified bridge declined, so the
+            // DEFAULT rendering below is about to ship a step carcara rejects:
+            //   * `and_pos` whose gate literal is the De Morgan or-form — the
+            //     23-instance census class ("term '(or ..)' is of the wrong
+            //     form, expected '(not(and ...))'");
+            //   * `or_pos` whose printed gate arity differs from the clause
+            //     tail ("expected 6 terms in 'or' term, got 2").
+            // A wrong proof is worse than no proof: raise so the caller's
+            // unverifiable-proof path fires instead.
+            if let Some(reason) = self.unrepairable_gate_reason(rule, clause, args) {
+                return Err(AlethePrintError::InvalidSurfaceStep { id, reason });
+            }
         }
         // An `or` decomposition step whose premise assume PRINTS as a De
         // Morgan surface form `(not (and A1 .. An))` (elaboration
@@ -2481,8 +3587,47 @@ impl<'a> AlethePrinter<'a> {
                 return Ok(text);
             }
         }
+        // carcara's `or` rule is POSITIONAL: it zips the premise or-term's
+        // disjuncts against the conclusion's literals and requires them equal
+        // pairwise. MEASURED on carcara 1.1.0: premise `(or a b)` with
+        // conclusion `(cl b a)` is
+        // `checking failed on step 't1' with rule 'or': expected terms to be
+        // equal: 'a' and 'b'`, while `(cl a b)` is accepted. It does NOT
+        // flatten either — a nested or-term gives "expected 2 terms in clause,
+        // got 3".
+        //
+        // AY's internal clause is a SET: its `Vec<TermId>` order is whatever
+        // order the solver happened to build the clause in, i.e. a permutation
+        // of the disjuncts in general. Reordering a `cl` is sound (an Alethe
+        // clause IS a disjunction) and touches only the RENDERING: the proof
+        // object, its premises, and AY's own checker all see the same clause.
+        // Fires only when the printed literals are an exact permutation of the
+        // printed disjuncts, so every other `or` step stays byte-identical.
+        let reordered_or_clause;
+        let clause = if matches!(rule, ay_core::AletheRule::Or) && premises.len() == 1 {
+            match self.or_conclusion_in_premise_order(clause, premises[0]) {
+                Some(reordered) => {
+                    reordered_or_clause = reordered;
+                    reordered_or_clause.as_slice()
+                }
+                None => clause,
+            }
+        } else {
+            clause
+        };
         let clause_str = self.format_clause(clause);
-        let mut result = format!("(step {id} {clause_str} :rule {rule}");
+        // WIRE name, not `Display`/`AletheRule::name()`. Every surface
+        // resugaring that produces a genuine Alethe inference has already
+        // returned above; the default rendering must not put a rule name the
+        // checker does not implement on the wire, because that is not a weaker
+        // proof — it is *no* proof (carcara: `UnknownRule` => `invalid`).
+        // `AletheRule::Trust` and the theory-specific names with no Alethe
+        // counterpart become `hole` here, which checks as *holey*.
+        // ... and a name that IS real is still only allowed when this step is
+        // an instance of it (see `wire_rule_for_printed_step`).
+        let wire =
+            Self::wire_rule_for_printed_step(rule.wire_name(), &clause_str, premises.is_empty());
+        let mut result = format!("(step {id} {clause_str} :rule {wire}");
         if !premises.is_empty() {
             let premises_str: Vec<String> = premises.iter().map(ToString::to_string).collect();
             let _ = std::fmt::Write::write_fmt(
@@ -2678,6 +3823,53 @@ impl<'a> AlethePrinter<'a> {
             ),
             (Some(left_op), Some(right_op)) if left_op != right_op
         )
+    }
+
+    /// Detect a printed `cong` conclusion that no congruence rule can check,
+    /// returning the reason to DECLINE with.
+    ///
+    /// MEASURED against carcara 1.1.0 on a `(= x y)` premise, every shape below
+    /// is rejected outright, so this can never withhold a step the checker
+    /// would have accepted:
+    ///
+    /// | printed conclusion   | carcara                                        |
+    /// |----------------------|------------------------------------------------|
+    /// | `(= (g x) (f y))`    | `functions don't match: 'g' and 'f'`           |
+    /// | `(= zzz (f y))`      | `term is not an application or operation: 'zzz'`|
+    /// | `(= zzz x)`          | `term is not an application or operation: 'zzz'`|
+    ///
+    /// The bare-ATOM rows are why this does not simply compare head symbols:
+    /// a sibling guard that required BOTH sides to be applications let
+    /// `(= zzz (f y))` through to the default rendering, which shipped a step
+    /// carcara rejects. An operand that is not a printed application fails the
+    /// rule whatever the other side is, so it is reported here.
+    ///
+    /// `None` when the conclusion is not a printed binary `=`, when both heads
+    /// agree, or when the rendering is not parseable as an application — those
+    /// are left to the ordinary path rather than guessed at.
+    fn surface_cong_has_uncheckable_operands(&self, clause: &[TermId]) -> Option<String> {
+        let [conclusion] = clause else {
+            return None;
+        };
+        let [left, right] = split_application(&self.format_term(*conclusion), "=")
+            .and_then(|args| <[String; 2]>::try_from(args).ok())?;
+        match (printed_head_symbol(&left), printed_head_symbol(&right)) {
+            (Some(left_head), Some(right_head)) => {
+                if left_head == right_head {
+                    return None;
+                }
+                Some(format!(
+                    "surface rewriting gives the two congruence applications different operators \
+                     ('{left_head}' and '{right_head}')"
+                ))
+            }
+            // Exactly one side is an application, or neither is. carcara needs
+            // BOTH to be applications of the same operator.
+            (None, Some(_)) | (Some(_), None) | (None, None) => Some(format!(
+                "a congruence operand is not a printed application ('{left}' and '{right}'), \
+                 which no congruence rule can check"
+            )),
+        }
     }
 
     /// Repair the exact `eq_congruent` surface mismatch produced when an
@@ -3096,6 +4288,66 @@ impl<'a> AlethePrinter<'a> {
         ))
     }
 
+    /// Reorder an `or` step's conclusion literals into the order the premise's
+    /// printed or-term lists its disjuncts, or `None` to leave the step exactly
+    /// as it is.
+    ///
+    /// carcara checks `or` POSITIONALLY: given premise `(or D1 .. Dn)` the
+    /// conclusion must be `(cl D1 .. Dn)` in that order. AY's internal clause
+    /// is a set, so it is a permutation of the disjuncts in general and the
+    /// step is rejected with "expected terms to be equal: 'Di' and 'Dj'".
+    ///
+    /// Matching is done on the PRINTED strings, which is exactly what carcara
+    /// parses: a surface override can make two distinct internal terms render
+    /// identically, and in the emitted document those are interchangeable. It
+    /// is also what makes the check total — no internal-vs-surface skew can
+    /// make this produce a clause the checker reads differently.
+    ///
+    /// Fail-closed in the conservative direction: any shape this cannot prove
+    /// is a pure permutation (premise not a printed or-term, arity mismatch,
+    /// a literal with no partner) returns `None` and the caller renders the
+    /// step byte-unchanged. Returns `None` for an already-ordered clause too,
+    /// so only genuinely permuted steps differ from today's output.
+    ///
+    /// Only the RENDERING moves. Nothing downstream indexes a premise clause
+    /// positionally — all five `proof_clauses` consumers were checked — and
+    /// the recorded clause for this step is unchanged, so a later step that
+    /// takes this one as a premise sees exactly what it saw before.
+    fn or_conclusion_in_premise_order(
+        &self,
+        clause: &[TermId],
+        premise: ProofId,
+    ) -> Option<Vec<TermId>> {
+        let source = {
+            let clauses = self.proof_clauses.borrow();
+            let [literal] = clauses.get(&premise)?.as_slice() else {
+                return None;
+            };
+            *literal
+        };
+        let disjuncts = split_application(&self.format_term(source), "or")?;
+        if disjuncts.len() != clause.len() {
+            return None;
+        }
+        let printed: Vec<String> = clause.iter().map(|&lit| self.format_term(lit)).collect();
+        // Greedy multiset match; `used` keeps repeated disjuncts honest by
+        // consuming a distinct clause position for each occurrence.
+        let mut used = vec![false; clause.len()];
+        let mut reordered: Vec<TermId> = Vec::with_capacity(clause.len());
+        for disjunct in &disjuncts {
+            let position = printed
+                .iter()
+                .enumerate()
+                .position(|(index, lit)| !used[index] && lit == disjunct)?;
+            used[position] = true;
+            reordered.push(clause[position]);
+        }
+        if reordered == clause {
+            return None;
+        }
+        Some(reordered)
+    }
+
     fn format_anchor(end_step: ProofId, variables: &[(String, Sort)]) -> String {
         let mut result = format!("(anchor :step {end_step}");
         if !variables.is_empty() {
@@ -3161,6 +4413,15 @@ impl<'a> AlethePrinter<'a> {
             out.push_str(&term_str);
             return;
         }
+        // A `let`-bridged assertion prints as its eliminated form from the
+        // bridge step onwards; the surface `(let ...)` spelling survives only
+        // inside the bridge itself (the `assume` and the equivalence it
+        // discharges), which embeds it literally.
+        if let Some(term_str) = self.let_bridge_renderings.borrow().get(&term_id).cloned() {
+            self.charge(term_str.len() as u64);
+            out.push_str(&term_str);
+            return;
+        }
         if let Some(term_str) = self
             .term_overrides
             .and_then(|overrides| overrides.get(&term_id))
@@ -3205,6 +4466,27 @@ impl<'a> AlethePrinter<'a> {
             }
 
             TermData::App(sym, args) => {
+                // DATATYPE TESTERS (#dt-tester-printing): AY's internal spelling
+                // is the plain symbol `is-C` (see the `strip_prefix("is-")`
+                // consumers in executor/mbqi.rs, model/dt_construct.rs and
+                // ay-model-check/dt_axiom.rs). SMT-LIB has no such function —
+                // a tester is the INDEXED identifier `(_ is C)`, so printing
+                // `(is-C t)` makes every consumer reject the file with
+                // "identifier 'is-C' is not defined". Measured: a blocksworld
+                // proof carried 389 such occurrences and carcara returned
+                // `invalid` — strictly worse than a hole, since no rule can
+                // even run on an unparseable file.
+                if let Symbol::Named(n) = sym {
+                    if args.len() == 1 {
+                        if let Some(ctor) = n.strip_prefix("is-") {
+                            return format!(
+                                "((_ is {}) {})",
+                                quote_symbol(ctor),
+                                self.format_term(args[0])
+                            );
+                        }
+                    }
+                }
                 let name = Self::format_symbol(sym);
                 if args.is_empty() {
                     // Alethe's clause constructor is written as `(cl ...)`, including the
@@ -3624,6 +4906,14 @@ impl<'a> AlethePrinter<'a> {
                 }
             }
             R::AndPos(_) => {
+                // Canonicalization flattens `not (A => B)` to an `and`, so an
+                // internally valid `and_pos` can have a problem-surface source
+                // that prints as the original negated implication.  Rebuild
+                // that projection with the actual surface rules (and, for a
+                // conjunctive antecedent, one genuine `and_pos`).
+                if let Some(text) = self.format_not_implies_and_pos(id, clause, &source_str) {
+                    return Some(text);
+                }
                 if let Some(ops) = split_application(&source_str, "and") {
                     let ops_bytes: u64 = ops.iter().map(|o| o.len() as u64).sum();
                     self.charge(ops_bytes.saturating_mul(ops.len() as u64));
@@ -3845,6 +5135,84 @@ impl<'a> AlethePrinter<'a> {
         None
     }
 
+    /// Honest surface derivation for an internally checked `and_pos` whose
+    /// canonical conjunction prints as the authored `not (A => B)`.
+    ///
+    /// The traced projection is `not S or child`, with `S` the canonicalized
+    /// conjunction and surface spelling `(not (=> A B))`.  Alethe cannot apply
+    /// `and_pos` to that printed source.  Instead:
+    ///
+    /// * `not_simplify` proves `not S = (=> A B)` at the printed surface;
+    /// * `equiv_pos1` exposes the usable implication literal;
+    /// * `implies_neg1` or `implies_neg2` derives the corresponding component;
+    /// * when `child` is inside a conjunctive `A`, a real `and_pos` projects it;
+    /// * resolution restores the exact traced clause under the original id.
+    ///
+    /// Every match is against the fully printed strings.  Any reordered,
+    /// malformed, or unrelated override declines and the caller fails loud on
+    /// the unrepairable `and_pos` surface mismatch.
+    fn format_not_implies_and_pos(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        source_str: &str,
+    ) -> Option<String> {
+        if clause.len() != 2 {
+            return None;
+        }
+        let mut outer = split_application(source_str, "not")?;
+        if outer.len() != 1 {
+            return None;
+        }
+        let implication = outer.pop()?;
+        let (antecedent, consequent) = split_binary_implies(&implication)?;
+        let not_source = format!("(not {source_str})");
+        let printed: Vec<String> = clause.iter().map(|&lit| self.format_term(lit)).collect();
+        let child = printed.iter().find(|lit| **lit != not_source)?.clone();
+        let mut expected = vec![not_source.clone(), child.clone()];
+        let mut actual = printed.clone();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if actual != expected {
+            return None;
+        }
+
+        let (component_steps, component_id) = if child == antecedent {
+            (
+                format!("(step {id}.imp (cl {implication} {antecedent}) :rule implies_neg1)\n"),
+                format!("{id}.imp"),
+            )
+        } else if child == format!("(not {consequent})") {
+            (
+                format!(
+                    "(step {id}.imp (cl {implication} (not {consequent})) :rule implies_neg2)\n"
+                ),
+                format!("{id}.imp"),
+            )
+        } else {
+            let conjuncts = split_application(&antecedent, "and")?;
+            let position = conjuncts.iter().position(|conjunct| conjunct == &child)?;
+            (
+                format!(
+                    "(step {id}.imp (cl {implication} {antecedent}) :rule implies_neg1)\n\
+                     (step {id}.part (cl (not {antecedent}) {child}) :rule and_pos :args ({position}))\n\
+                     (step {id}.component (cl {implication} {child}) :rule resolution :premises ({id}.imp {id}.part))\n"
+                ),
+                format!("{id}.component"),
+            )
+        };
+
+        let equivalence = format!("(= {not_source} {implication})");
+        Some(format!(
+            "(step {id}.ns (cl {equivalence}) :rule not_simplify)\n\
+             (step {id}.eq (cl (not {equivalence}) {not_source} (not {implication})) :rule equiv_pos1)\n\
+             {component_steps}\
+             (step {id}.surface (cl {not_source} (not {implication})) :rule resolution :premises ({id}.ns {id}.eq))\n\
+             (step {id} {} :rule resolution :premises ({id}.surface {component_id}))",
+            self.format_clause(clause)
+        ))
+    }
+
     /// Honest premise-free derivation of an `or_pos` tautology whose source
     /// term prints as the De Morgan surface `(not (and A1 .. An))`:
     ///
@@ -3888,6 +5256,84 @@ impl<'a> AlethePrinter<'a> {
     fn is_negation_of(&self, lit: TermId, term: TermId) -> bool {
         matches!(self.terms.get(lit), TermData::Not(inner) if *inner == term)
     }
+}
+
+/// The binder name Carcara's `arrays_ext` hard-codes in its `choice` witness.
+///
+/// MEASURED against the pinned array-capable build: the rule compares its own
+/// constructed term with `assert_polyeq`, which normalizes Int/Real subtyping
+/// but does NOT quotient by alpha-renaming, so an otherwise byte-identical
+/// proof using binder `zz` is rejected with "expected terms to be equal".
+const EXT_CHOICE_BINDER: &str = "x";
+
+/// Node cap for the shared printed-nesting walk. A 57-deep binary `and` (the
+/// mathsat `medium*` shape) needs 56 nodes; anything past this is a printing
+/// pathology and must fail loud instead of emitting a huge unverified chain.
+const PRINTED_NESTING_NODE_BUDGET: usize = 4096;
+
+/// Placeholder the Skolem-collapse guard substitutes for a `choice` binder
+/// before comparing two definition bodies.
+///
+/// Only ever appears inside a comparison key, never in emitted text, so it is
+/// deliberately unspellable as an SMT-LIB symbol: a body that already mentioned
+/// it could otherwise be made to collide with a different body on purpose.
+const CHOICE_BINDER_NORMAL_FORM: &str = "|ay!choice-binder|";
+
+/// Whether `needle` occurs anywhere inside `haystack` (inclusive).
+fn term_mentions(terms: &TermStore, haystack: TermId, needle: TermId) -> bool {
+    walk_subterms(terms, haystack, &mut |term, _| term == needle)
+}
+
+/// Whether any leaf variable inside `haystack` is spelled exactly `name`.
+fn term_mentions_symbol(terms: &TermStore, haystack: TermId, name: &str) -> bool {
+    walk_subterms(terms, haystack, &mut |_, data| match data {
+        TermData::Var(symbol, _) => symbol == name,
+        TermData::App(Symbol::Named(symbol), args) => args.is_empty() && symbol == name,
+        TermData::Forall(bindings, _, _) | TermData::Exists(bindings, _, _) => {
+            bindings.iter().any(|(binder, _)| binder == name)
+        }
+        TermData::Let(bindings, _) => bindings.iter().any(|(binder, _)| binder == name),
+        _ => false,
+    })
+}
+
+/// Structural walk with cycle protection; stops at the first `hit`.
+fn walk_subterms(
+    terms: &TermStore,
+    root: TermId,
+    hit: &mut dyn FnMut(TermId, &TermData) -> bool,
+) -> bool {
+    let mut stack = vec![root];
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        let data = terms.get(term);
+        if hit(term, data) {
+            return true;
+        }
+        match data {
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(cond, then_branch, else_branch) => {
+                stack.extend([*cond, *then_branch, *else_branch]);
+            }
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                stack.push(*body);
+                stack.extend(triggers.iter().flatten().copied());
+            }
+            TermData::Let(bindings, body) => {
+                stack.push(*body);
+                stack.extend(bindings.iter().map(|(_, bound)| *bound));
+            }
+            TermData::Const(_) | TermData::Var(_, _) => {}
+            // `TermData` is #[non_exhaustive]: a variant added upstream must
+            // not silently hide subterms from the capture/dependency scan.
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// Split a surface-override string of the form `(=> A B)` into (`A`, `B`)
@@ -3938,6 +5384,16 @@ fn surface_order_reversal(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The head symbol of a printed application, or `None` when `s` is not one
+/// (a bare symbol, a numeral, an unbalanced rendering).
+///
+/// Tokenized rather than split on whitespace so a quoted `|sym with spaces|`
+/// head and nested-application arguments are both handled.
+fn printed_head_symbol(s: &str) -> Option<String> {
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    split_sexpr_tokens(inner)?.into_iter().next()
 }
 
 fn surface_order_operator(s: &str) -> Option<&'static str> {
@@ -4127,6 +5583,14 @@ fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
     if !inner.starts_with(|c: char| c.is_whitespace()) {
         return None;
     }
+    split_sexpr_tokens(inner)
+}
+
+/// Split the *body* of an s-expression into its top-level tokens by balanced
+/// scanning. `inner` is everything between the outermost parentheses; unlike
+/// [`split_application`] no leading operator is stripped, so this also serves
+/// binding lists (`(?v_0 e0) (?v_1 e1)`). Returns `None` on unbalanced input.
+fn split_sexpr_tokens(inner: &str) -> Option<Vec<String>> {
     let mut tokens: Vec<String> = Vec::new();
     let mut depth = 0usize;
     let mut current = String::new();
@@ -4162,6 +5626,266 @@ fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
     }
     Some(tokens)
 }
+
+/// One `let` level of a printed surface term: its bindings and its body.
+type PrintedLetLevel = (Vec<(String, String)>, String);
+
+/// Parse a printed `(let ((v1 e1) .. (vk ek)) BODY)` into its bindings and
+/// body. Purely textual: the argument is the PROBLEM'S SURFACE SPELLING as
+/// recorded in `term_overrides`, so there is no term to consult.
+fn split_printed_let(s: &str) -> Option<PrintedLetLevel> {
+    let inner = s
+        .strip_prefix('(')?
+        .strip_prefix("let")?
+        .strip_suffix(')')?;
+    if !inner.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let mut tokens = split_sexpr_tokens(inner)?;
+    if tokens.len() != 2 {
+        return None;
+    }
+    let body = tokens.pop()?;
+    let binding_list = tokens.pop()?;
+    let binding_inner = binding_list.strip_prefix('(')?.strip_suffix(')')?;
+    let mut bindings = Vec::new();
+    for binding in split_sexpr_tokens(binding_inner)? {
+        let pair_inner = binding.strip_prefix('(')?.strip_suffix(')')?;
+        let mut pair = split_sexpr_tokens(pair_inner)?;
+        if pair.len() != 2 {
+            return None;
+        }
+        let value = pair.pop()?;
+        let name = pair.pop()?;
+        // A bound name must be an atom; `((a b) e)` is not a `let` binding.
+        if name.starts_with('(') {
+            return None;
+        }
+        bindings.push((name, value));
+    }
+    if bindings.is_empty() {
+        return None;
+    }
+    Some((bindings, body))
+}
+
+/// Peel every nested `let` level off a printed term, outermost first.
+///
+/// Returns the levels and the innermost (still `?v`-bearing) body. `None` when
+/// `s` is not a `let`.
+fn peel_printed_lets(s: &str) -> Option<(Vec<PrintedLetLevel>, String)> {
+    let mut levels = Vec::new();
+    let mut current = s.to_string();
+    while let Some((bindings, body)) = split_printed_let(&current) {
+        levels.push((bindings, body.clone()));
+        current = body;
+        // Pathological nesting is a printing bug, not a proof; bail out rather
+        // than build an unbounded anchor stack.
+        if levels.len() > 64 {
+            return None;
+        }
+    }
+    if levels.is_empty() {
+        None
+    } else {
+        Some((levels, current))
+    }
+}
+
+/// Textually replace whole-token occurrences of each bound name by its value.
+///
+/// Token boundaries are the s-expression delimiters (parens / whitespace) with
+/// `|quoted symbols|` treated as atomic, so a binding named `?v_1` never
+/// rewrites the inside of `?v_12` or of a quoted symbol.
+fn substitute_printed_tokens(text: &str, bindings: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let mut in_quote = false;
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        match bindings.iter().find(|(name, _)| name == token) {
+            Some((_, value)) => out.push_str(value),
+            None => out.push_str(token),
+        }
+        token.clear();
+    };
+    for c in text.chars() {
+        match c {
+            '|' => {
+                in_quote = !in_quote;
+                token.push(c);
+            }
+            _ if in_quote => token.push(c),
+            '(' | ')' => {
+                flush(&mut token, &mut out);
+                out.push(c);
+            }
+            c if c.is_whitespace() => {
+                flush(&mut token, &mut out);
+                out.push(c);
+            }
+            _ => token.push(c),
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// `true` when a peeled `let` chain can be expanded by plain token
+/// substitution: no name is bound at two levels (shadowing), and no level's
+/// binding VALUES mention a name that same level binds (SMT-LIB `let` binds in
+/// PARALLEL, so such an occurrence refers to an outer symbol, not the binding).
+fn printed_let_bindings_are_simple(levels: &[PrintedLetLevel]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for (bindings, _) in levels {
+        for (name, _) in bindings {
+            if seen.contains(&name.as_str()) {
+                return false;
+            }
+            seen.push(name.as_str());
+        }
+        for (_, value) in bindings {
+            let rewritten = substitute_printed_tokens(value, bindings);
+            if rewritten != *value {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Fully expand a peeled `let` chain: substitute innermost bindings first so
+/// that an inner binding value mentioning an outer variable is itself expanded
+/// by the outer pass.
+fn expand_printed_lets(levels: &[PrintedLetLevel], innermost_body: &str) -> String {
+    let mut expanded = innermost_body.to_string();
+    for (bindings, _) in levels.iter().rev() {
+        expanded = substitute_printed_tokens(&expanded, bindings);
+    }
+    expanded
+}
+
+/// Fully expanded view of a PRINTED `and`/`or` nesting.
+///
+/// THE SHARED PRINTED-SHAPE HELPER for both `and_pos` and `or_pos`. AY's
+/// `mk_and`/`mk_or` flatten (`ay-core/src/term/boolean.rs`), so the INTERNAL
+/// operand vector is n-ary; a surface override re-spells the same term with the
+/// problem file's binary nesting. Both gate rules then break, in mirror-image
+/// ways:
+///
+/// * `and_pos` compares `conclusion[1]` against `and_contents[args[0]]` with a
+///   SYNTACTIC `assert_eq`, so an internal index has no meaning against a
+///   printed shape of different arity;
+/// * `or_pos` requires the gate's TOP-LEVEL arity to equal the clause tail
+///   length — "expected 6 terms in 'or' term, got 2" for a printed
+///   `(or (or (or (or (or (= x 0) (= x 1)) (= x 2)) ..)))`.
+///
+/// Rather than re-spell the term (which would desynchronize the `assume` that
+/// still has to match the problem premise), walk the printed nesting and emit
+/// one genuine gate step per printed node. Every consecutive `(parent, child)`
+/// pair is a real `and_pos`/`or_pos` instance at the recorded operand index, so
+/// the chain is checkable without changing a single printed TERM.
+#[derive(Default)]
+struct PrintedNesting {
+    /// Printed spelling of each node; node 0 is the root.
+    nodes: Vec<String>,
+    /// Top-level printed operands of each node.
+    operands: Vec<Vec<String>>,
+    /// `(parent node, operand index within the parent)`; `None` for the root.
+    parent: Vec<Option<(usize, usize)>>,
+    /// Operands that are NOT themselves `op` applications, in printed
+    /// left-to-right order — i.e. the flattened disjunct/conjunct list.
+    leaves: Vec<String>,
+}
+
+impl PrintedNesting {
+    /// Expand the printed `op`-nesting rooted at `root`.
+    ///
+    /// `None` when `root` is not an `op` application or the walk exceeds
+    /// `node_budget` nodes / a fixed depth cap — the caller must then fail
+    /// loud rather than emit an unverifiable gate.
+    fn build(root: &str, op: &str, node_budget: usize) -> Option<Self> {
+        let mut nesting = Self::default();
+        nesting.push_node(root.to_string(), None);
+        nesting.expand(0, op, node_budget, 0)?;
+        Some(nesting)
+    }
+
+    fn push_node(&mut self, node: String, parent: Option<(usize, usize)>) -> usize {
+        self.nodes.push(node);
+        self.operands.push(Vec::new());
+        self.parent.push(parent);
+        self.nodes.len() - 1
+    }
+
+    fn expand(&mut self, node: usize, op: &str, node_budget: usize, depth: usize) -> Option<()> {
+        if depth > 1024 {
+            return None;
+        }
+        let operands = split_application(&self.nodes[node], op)?;
+        self.operands[node] = operands.clone();
+        for (index, operand) in operands.iter().enumerate() {
+            if split_application(operand, op).is_some() {
+                if self.nodes.len() >= node_budget {
+                    return None;
+                }
+                let child = self.push_node(operand.clone(), Some((node, index)));
+                self.expand(child, op, node_budget, depth + 1)?;
+            } else {
+                self.leaves.push(operand.clone());
+            }
+        }
+        Some(())
+    }
+
+    /// `true` when the printed root is already flat — nothing to navigate.
+    fn is_flat(&self) -> bool {
+        self.nodes.len() == 1
+    }
+
+    /// The chain of `(node, operand index)` hops from the root down to `node`,
+    /// outermost first.
+    fn path_to(&self, node: usize) -> Vec<(usize, usize)> {
+        let mut path = Vec::new();
+        let mut current = node;
+        while let Some((parent, index)) = self.parent[current] {
+            path.push((parent, index));
+            current = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// The shallowest node with `wanted` among its top-level operands.
+    fn find_operand(&self, wanted: &str) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for (node, operands) in self.operands.iter().enumerate() {
+            let Some(index) = operands.iter().position(|o| o == wanted) else {
+                continue;
+            };
+            let depth = self.path_to(node).len();
+            if best.is_none() || best.is_some_and(|(_, _, best_depth)| depth < best_depth) {
+                best = Some((node, index, depth));
+            }
+        }
+        best.map(|(node, index, _)| (node, index))
+    }
+}
+
+// NOTE ON THE ROAD NOT TAKEN. Instead of navigating the printed nesting, the
+// printed spine could be FLATTENED (`(and (and a b) c)` -> `(and a b c)`), which
+// carcara's `assume` matching does accept: `Polyeq::mod_nary` collapses
+// left-associated spines at any depth (`compare_assoc`, `Operator::And | Or =>
+// NaryCase::LeftAssoc`), even through a `let` binder. It was rejected because it
+// only works if the ASSUME is re-spelled too — and re-spelling a premise that
+// currently matches, for every assertion in the corpus, is a far wider blast
+// radius than emitting extra steps. It is also only sound for a LEFT spine:
+// measured, `(and p (and q r))` -> `(and p q r)` and
+// `(and (and p (and q r)) s)` -> `(and p q r s)` are both REJECTED as
+// "could not match term to any of the original problem premises". The navigator
+// above changes no printed term at all.
 
 fn format_rational64(r: &num_rational::Rational64) -> String {
     let mut numer = *r.numer();

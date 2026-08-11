@@ -7,7 +7,7 @@
 use ay_sat::proof_certificate::ProofCertificate;
 use ay_sat::SatResult;
 
-use crate::executor::SatCertificate;
+use crate::executor::{SatCertificate, UnsatCertificate};
 
 /// SMT-level proof certificate wrapping the SAT-level [`ProofCertificate`].
 ///
@@ -191,12 +191,16 @@ pub enum ConsumerAcceptanceError {
 /// (via `finalize_sat_model_validation`). Consumers must inspect
 /// [`was_model_validated()`](Self::was_model_validated) or call
 /// [`accept_for_consumer()`](Self::accept_for_consumer) before treating a SAT
-/// model as trusted. For `Unsat` results, the DPLL(T) proof was produced (when
-/// proofs are enabled).
+/// model as trusted. For `Unsat` results, a private one-shot certificate proves
+/// the strict checker accepted the refutation against the exact authored query
+/// epoch. The shared native result boundary publishes registered `Unknown` and
+/// revokes executor artifacts before wrapping any definite verdict whose exact
+/// capability is missing.
 ///
 /// The private inner fields prevent construction outside ay-dpll.
-/// Within the crate, only the validated code path in `Solver::check_sat()`
-/// can create this type.
+/// Within the crate, every native solve route crosses the same
+/// `Solver::finish_verified_result` boundary; only token-consuming constructors
+/// can create definite variants.
 ///
 /// A downstream crate cannot manufacture a validated SAT wrapper by choosing
 /// its own validation bit:
@@ -218,43 +222,45 @@ pub struct VerifiedSolveResult {
     /// crossed the private validation boundary.  The capability itself is
     /// consumed rather than retained as proof-shaped state.
     sat_emission_witness: bool,
+    /// Records that the one-shot `UnsatCertificate` was consumed at this
+    /// boundary. The capability itself is never exposed or cloned.
+    unsat_emission_witness: bool,
 }
 
 impl VerifiedSolveResult {
-    /// Wrap a validated solve result with model validation provenance (#5973)
-    /// and the SAT-emission witness (#sat-chokepoint).
-    ///
-    /// Only callable within ay-dpll. `sat_certificate` MUST be the token the
-    /// executor minted for this exact verdict (via
-    /// [`take_sat_certificate`](crate::executor::Executor::take_sat_certificate)).
-    ///
-    /// FAIL-CLOSED: a `Sat` result without a certificate never went through the
-    /// `emit_sat_verdict` soundness funnel — it is degraded to a sound `Unknown`
-    /// rather than surfaced as an unfunnelled model. Because the certificate can
-    /// only be minted inside `emit_sat_verdict`, this makes it impossible to
-    /// return `Sat` at a public boundary without the funnel.
-    pub(crate) fn from_validated(
-        result: SolveResult,
-        sat_certificate: Option<SatCertificate>,
-    ) -> Self {
-        let admitted_sat = matches!(result, SolveResult::Sat) && sat_certificate.is_some();
-        let result = if matches!(result, SolveResult::Sat) && !admitted_sat {
-            // Missing proof capability: fail closed in debug and release. Do
-            // not preserve a separately supplied validation bit — the consumed
-            // certificate is the sole authority for SAT validation provenance.
-            SolveResult::Unknown
-        } else {
-            result
-        };
-        // The capability is consumed at this boundary. Retaining a second copy
-        // in the public wrapper would be dead proof-shaped state: construction
-        // is private, and `result` has already been downgraded if it was absent.
+    /// Construct the public SAT wrapper by consuming the exact one-shot token
+    /// minted by the model-validation publication funnel.
+    pub(crate) fn certified_sat(_certificate: SatCertificate) -> Self {
         Self {
-            result,
-            // Non-SAT results never carry model-validation provenance, even if
-            // a stale certificate were accidentally supplied.
-            model_validated: admitted_sat,
-            sat_emission_witness: admitted_sat,
+            result: SolveResult::Sat,
+            model_validated: true,
+            sat_emission_witness: true,
+            unsat_emission_witness: false,
+        }
+    }
+
+    /// Construct the public UNSAT wrapper by consuming the exact one-shot token
+    /// minted after strict proof validation for the authored query epoch.
+    pub(crate) fn certified_unsat(
+        result: SmtProofCertificate,
+        _certificate: UnsatCertificate,
+    ) -> Self {
+        Self {
+            result: SolveResult::Unsat(result),
+            model_validated: false,
+            sat_emission_witness: false,
+            unsat_emission_witness: true,
+        }
+    }
+
+    /// Construct a public Unknown wrapper. Definite verdicts deliberately have
+    /// no token-free constructor.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            result: SolveResult::Unknown,
+            model_validated: false,
+            sat_emission_witness: false,
+            unsat_emission_witness: false,
         }
     }
 
@@ -277,6 +283,7 @@ impl VerifiedSolveResult {
             result,
             model_validated,
             sat_emission_witness: false,
+            unsat_emission_witness: false,
         }
     }
 
@@ -302,6 +309,14 @@ impl VerifiedSolveResult {
     #[must_use]
     pub fn has_sat_emission_witness(&self) -> bool {
         self.sat_emission_witness
+    }
+
+    /// Whether this UNSAT result crossed the mandatory strict-proof
+    /// certification boundary with its exact-query one-shot capability.
+    #[inline]
+    #[must_use]
+    pub fn has_unsat_emission_witness(&self) -> bool {
+        self.unsat_emission_witness
     }
 
     /// Get the underlying solve result.
@@ -399,10 +414,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_sat_certificate_cannot_leave_validation_provenance_true() {
-        let result = VerifiedSolveResult::from_validated(SolveResult::Sat, None);
+    fn token_free_constructor_can_only_build_unknown() {
+        let result = VerifiedSolveResult::unknown();
         assert!(result.is_unknown());
         assert!(!result.was_model_validated());
+        assert!(!result.has_unsat_emission_witness());
         assert_eq!(result.accept_for_consumer(), Ok(&SolveResult::Unknown));
     }
 }

@@ -1475,3 +1475,83 @@ fn test_rescale_for_reorder_denormal_collapse_rebuilds_heap() {
         vsids.debug_assert_heap_pos_consistent();
     }
 }
+
+/// `decay_all_scores` must re-heapify after scaling, for the same reason
+/// `rescale` and `rescale_for_reorder` do: multiplication by the decay factor
+/// is monotone but NOT strictly monotone. Distinct tiny activities can round
+/// to the SAME value without ever reaching exactly 0.0, and the heap's
+/// tie-break is by variable index (`var_less`), so the collapse inverts the
+/// relative order of a parent/child pair that was strictly ordered before the
+/// decay. The old guard here rebuilt only when a previously-nonzero activity
+/// underflowed to exactly 0.0, so it left this stale arrangement in place
+/// (debug builds then panic with "BUG: heap property violated" in
+/// `debug_assert_heap_property` on the next validated heap op).
+#[test]
+fn test_decay_all_scores_denormal_collapse_rebuilds_heap() {
+    let mut vsids = VSIDS::new(5);
+
+    // Smallest positive denormal: every denormal is an integer multiple of it.
+    let d = f64::from_bits(1);
+
+    // Build a heap where a HIGHER-index variable is the parent of a
+    // LOWER-index one, ordered strictly by activity:
+    //   var4 (act 1.0) at the root, var3 (act 5*d) above var1 (act 4*d).
+    // `set_activity` sifts, so the heap stays valid while we plant them.
+    vsids.set_activity(Variable(4), 1.0);
+    vsids.set_activity(Variable(3), 5.0 * d);
+    vsids.set_activity(Variable(1), 4.0 * d);
+    assert_heap_property_holds(&vsids);
+    assert!(
+        vsids.activity(Variable(3)) > vsids.activity(Variable(1)),
+        "precondition: strictly ordered before decay"
+    );
+    let pos3 = vsids.heap_pos[3] as usize;
+    let pos1 = vsids.heap_pos[1] as usize;
+    assert_eq!(
+        (pos1 - 1) / 2,
+        pos3,
+        "precondition: var3 must be the parent of var1 (higher index above \
+         lower index), so the tie-break inverts the edge on collapse"
+    );
+
+    // Factor 0.5: 5*d*0.5 == 2.5*d rounds (ties-to-even) to 2*d, and
+    // 4*d*0.5 == 2*d exactly — a collapse to a shared NONZERO value.
+    vsids.decay_all_scores(0.5);
+
+    assert_eq!(
+        vsids.activity(Variable(3)),
+        vsids.activity(Variable(1)),
+        "precondition: activities must collapse to the same denormal \
+         (got {} vs {})",
+        vsids.activity(Variable(3)),
+        vsids.activity(Variable(1)),
+    );
+    assert!(
+        vsids.activity(Variable(1)) > 0.0,
+        "precondition: collapse must NOT reach exactly 0.0 (the old code \
+         only rebuilt on underflow-to-zero)"
+    );
+
+    // The old code left the heap stale here.
+    assert_heap_property_holds(&vsids);
+    #[cfg(debug_assertions)]
+    {
+        vsids.debug_assert_heap_property();
+        vsids.debug_assert_heap_pos_consistent();
+    }
+
+    // And the decision order must still be a valid non-increasing pop order.
+    let vals = make_vals(&[None; 5]);
+    let mut prev: Option<usize> = None;
+    while let Some(top) = vsids.pick_branching_variable(&vals) {
+        let cur = top.index();
+        if let Some(p) = prev {
+            assert!(
+                !vsids.var_less(cur, p),
+                "pop order not non-increasing after decay collapse: var {cur} after var {p}"
+            );
+        }
+        prev = Some(cur);
+        vsids.remove_from_heap(top);
+    }
+}

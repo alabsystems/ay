@@ -375,7 +375,14 @@ fn proof_solve_and_extract(
         return Vec::new();
     }
 
-    let Ok(mut solver) = Solver::try_new(Logic::QfLia) else {
+    // Build with the script's OWN `(set-logic …)` when it declares one, and
+    // strip that command. `Solver::try_new` dispatches a `set-logic` itself, so
+    // leaving one in the script makes it the SECOND — which the elaborator
+    // rejects (z3 parity, `118630ef6`). `parse_smtlib2` would then fail and
+    // this function would silently return no interpolants at all.
+    let (logic, script) =
+        crate::smt::executor_adapter::split_leading_set_logic(script, Logic::QfLia);
+    let Ok(mut solver) = Solver::try_new(logic) else {
         return Vec::new();
     };
     // Proof mode is scoped to THIS solver instance / THIS query only.
@@ -387,7 +394,7 @@ fn proof_solve_and_extract(
     solver.set_timeout(Some(remaining));
 
     let stats = proof_itp_stats_enabled();
-    let Ok(asserts) = solver.parse_smtlib2(script) else {
+    let Ok(asserts) = solver.parse_smtlib2(&script) else {
         if stats {
             safe_eprintln!("[PROOF-ITP] solve: script parse failed");
         }

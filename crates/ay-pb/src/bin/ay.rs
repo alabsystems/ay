@@ -407,6 +407,11 @@ fn render_emergency_flush() -> (Vec<u8>, PbStatus) {
 }
 
 fn main() {
+    // FIRST statement of main: arm() re-execs this process under a kernel-held
+    // memory bound, so anything above it is discarded work, and it sets an env
+    // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+
     let status = match std::panic::catch_unwind(run_main) {
         Ok(Ok(status)) => {
             mark_final_result_emitted();

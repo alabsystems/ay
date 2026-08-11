@@ -51,6 +51,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::super::super::Executor;
+use crate::features::StaticFeatures;
 
 /// Largest concrete unfolding length (elements per combinator). Beyond this
 /// the pass leaves the term intact (honest `unknown`) instead of exploding
@@ -73,15 +74,52 @@ impl Executor {
         if !self.assertions_contain_ho_seq_ops() {
             return;
         }
+        let mut rewrote = false;
         for _ in 0..MAX_HO_SEQ_UNFOLD_ROUNDS {
             let subst = self.collect_ho_seq_unfoldings();
             if subst.is_empty() {
                 break;
             }
+            rewrote = true;
             for i in 0..self.ctx.assertions.len() {
                 let assertion = self.ctx.assertions[i];
                 self.ctx.assertions[i] = self.ctx.terms.substitute_terms(assertion, &subst);
             }
+        }
+        if rewrote {
+            self.note_ho_seq_unfold_left_no_nested_arrays();
+        }
+    }
+
+    /// Record whether this unfolding left the LIVE assertions free of nested
+    /// arrays, authorizing the nested-array UNSAT quarantine to accept a
+    /// refutation of what remains (#ho-seq-array-free).
+    ///
+    /// Every `seq.foldl`/`seq.foldli` takes a CURRIED function-as-array
+    /// (`(Array A (Array E A))`), so the declared-sort test that opens
+    /// `quarantine_unverified_nested_array_unsat` sees a nested array in the
+    /// root DAG of every fold goal and withholds the verdict — which made every
+    /// fold refutation unreachable, `(seq.foldl f a (as seq.empty …))` included.
+    ///
+    /// The exemption is decided HERE, before any solving, and that is what
+    /// makes it sound: the claim is not the post-hoc "the residue looks
+    /// array-free" (preprocessing can erase array terms that array reasoning
+    /// already used) but the far stronger "the solver is never handed a nested
+    /// array at all". Unfolding is an equivalence, not merely an entailment —
+    /// a function-as-array application IS `select` — so refuting what remains
+    /// refutes the original. When a fold's sequence is empty the chain collapses
+    /// to the accumulator and the array vanishes entirely; when it is non-empty
+    /// the rewrite yields real `select` chains over that same nested array, the
+    /// check below fails, and the quarantine still applies. Compare
+    /// `nested_array_row_reduction_unsat`, which carries the same "no array
+    /// combination was used" claim for the store-flat ROW reduction.
+    fn note_ho_seq_unfold_left_no_nested_arrays(&mut self) {
+        if self.assertions_contain_ho_seq_ops() {
+            return;
+        }
+        let assertions = self.ctx.assertions.clone();
+        if !StaticFeatures::collect(&self.ctx.terms, &assertions).has_nested_arrays {
+            self.ho_seq_unfold_array_free_unsat = true;
         }
     }
 

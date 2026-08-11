@@ -216,7 +216,69 @@ impl<'a> Evaluator<'a> {
             TermData::App(sym, args) => match sym {
                 Symbol::Named(name) => self.eval_named(term, name, args, depth),
                 Symbol::Indexed(name, indices) => {
+                    // `(_ NaN eb sb)`, `(_ +zero eb sb)`, … are FP VALUES, not
+                    // bitvector operators. Routing every indexed symbol to
+                    // `bitvec::eval_indexed` made the gate report "unsupported
+                    // indexed bitvector operator NaN" and refuse to confirm the
+                    // model, so a correct `sat` was published as `unknown`.
+                    if args.is_empty() {
+                        if let Some(value) = fp_special_constant(name, indices) {
+                            return Ok(value);
+                        }
+                    }
+                    // The ROUNDING conversions take a leading rounding mode,
+                    // which is a nullary symbol no model pins — so their first
+                    // operand must be resolved syntactically, BEFORE the
+                    // blanket `eval_all` below would try to look it up as a
+                    // leaf and fail. Each reduces to one correctly rounded
+                    // conversion of an exact rational (`crate::fp`).
+                    if args.len() == 2 {
+                        if let Some(unsigned) = match name.as_str() {
+                            "to_fp" => Some(false),
+                            "to_fp_unsigned" => Some(true),
+                            _ => None,
+                        } {
+                            let [eb, sb] = <[u32; 2]>::try_from(indices.as_slice())
+                                .map_err(|_| "to_fp expects two indices".to_string())?;
+                            let rm = self.eval_rounding_mode(args[0], depth)?;
+                            let value = self.eval(args[1], depth + 1)?;
+                            return crate::fp::to_fp_rounded(unsigned, eb, sb, rm, &value);
+                        }
+                        if let Some(unsigned) = match name.as_str() {
+                            "fp.to_sbv" => Some(false),
+                            "fp.to_ubv" => Some(true),
+                            _ => None,
+                        } {
+                            let [width] = <[u32; 1]>::try_from(indices.as_slice())
+                                .map_err(|_| "fp.to_sbv/to_ubv expects one index".to_string())?;
+                            let rm = self.eval_rounding_mode(args[0], depth)?;
+                            let value = self.eval(args[1], depth + 1)?;
+                            return crate::fp::to_bv(unsigned, width, rm, &value);
+                        }
+                    }
                     let vals = self.eval_all(args, depth)?;
+                    // `((_ to_fp eb sb) <bv>)` is a BIT REINTERPRET, not a
+                    // bitvector operator: it reads an `eb + sb`-wide word as the
+                    // IEEE fields of an FP value. No rounding is involved, so
+                    // the gate can do it exactly and INDEPENDENTLY — it is pure
+                    // bit-splitting, sharing no code with the solver.
+                    //
+                    // The two-operand ROUNDING forms (`(_ to_fp eb sb) <rm>
+                    // <real|bv|fp>` and `to_fp_unsigned`) are handled ABOVE, by
+                    // `crate::fp::to_fp_rounded`. They used to decline here on
+                    // the grounds that "an independent gate must not confirm a
+                    // model using the same rounding routine that produced it,
+                    // and an approximate reimplementation could confirm a WRONG
+                    // model". The first half is the real constraint and is
+                    // honoured — nothing in this crate calls into the solver's
+                    // FP code. The second half does not apply, because
+                    // `crate::fp` rounds by comparing exact `BigRational`s
+                    // against exact half-way points; see that module's header.
+                    if name == "to_fp" && vals.len() == 1 {
+                        if let Some(value) = fp_from_ieee_bits(indices, &vals[0]) {
+                            return Ok(value);
+                        }
+                    }
                     bitvec::eval_indexed(name, indices, &vals)
                 }
                 _ => Err("unsupported symbol kind".to_string()),
@@ -291,16 +353,102 @@ impl<'a> Evaluator<'a> {
             "distinct" => self.eval_distinct(args, depth),
 
             // Arithmetic (Int/Real).
+            //
+            // `(/ x 0)`, `(div x 0)` and `(mod x 0)` are UNCONSTRAINED in
+            // SMT-LIB — the Ints/Reals theories leave division by zero to an
+            // uninterpreted function — so `eval_arith` routes exactly those
+            // three sites through [`Self::division_by_zero`], which adopts the
+            // model's own choice and then checks the one residue the theory
+            // does fix (the result is still a number of the right sort). The
+            // adoption is deliberately NOT applied to the whole arithmetic
+            // dispatch: a narrower window cannot mistake an unrelated failure
+            // for an under-specified one.
             "+" | "-" | "*" | "/" | "div" | "mod" | "abs" | "to_real" | "to_int" | "is_int"
             | "<" | "<=" | ">" | ">=" => self.eval_arith(term, name, args, depth),
+
+            // Floating-point to exact Real.  This deliberately lives outside
+            // `eval_arith`: its operand is an IEEE bit-pattern value, not an
+            // Int/Real numeric value.  NaN and the infinities have no real
+            // value SMT-LIB fixes, so those adopt the model's choice (checked
+            // to still be a number) rather than being computed.
+            "fp.to_real" => self.eval_fp_to_real(term, args, depth),
+
+            // Floating-point to its IEEE-754 interchange encoding. Pure
+            // bit-reinterpretation, so the gate computes it exactly and
+            // independently on every value SMT-LIB determines.
+            //
+            // NaN is the sole exception, and it takes the underspecified path
+            // rather than the generic one because adopting the model's value
+            // there is only sound WITH A CHECK: the standard frees the sign bit
+            // and the payload, it does not free the result from being a NaN
+            // encoding at all. `crate::fp::check_ieee_nan_encoding` enforces
+            // exactly that residue, so an adopted `#x00000000` — which z3 also
+            // refutes — still fails closed instead of confirming a `sat`.
+            "fp.to_ieee_bv" => {
+                let [arg] = exactly(args)?;
+                let operand = self.eval(arg, depth + 1)?;
+                match crate::fp::to_ieee_bv(&operand) {
+                    Err(reason) if reason == crate::fp::UNDERSPECIFIED => self
+                        .adopt_underspecified(term, name, args, depth, reason, |adopted| {
+                            crate::fp::check_ieee_nan_encoding(&operand, adopted)
+                        }),
+                    other => other,
+                }
+            }
+
+            // The `(fp <sign-bv> <exp-bv> <sig-bv>)` literal: three bitvector
+            // fields assembled into a value. Assembling it here rather than
+            // adopting the solver's reading of it is the difference between
+            // CHECKING an FP assertion and restating one — the literal is the
+            // operand of nearly every one of them. The arity guard keeps a
+            // user-declared symbol that merely happens to be spelled `fp` on
+            // the uninterpreted-application path.
+            "fp" if args.len() == 3 => {
+                crate::fp::from_field_bitvectors(&self.eval_all(args, depth)?)
+            }
+
+            // The rest of the floating-point fragment, computed exactly on
+            // `BigInt`/`BigRational` in `crate::fp` — see that module for why
+            // an exact reimplementation of IEEE rounding keeps the gate
+            // independent.
+            //
+            // This is a PREFIX arm on purpose. With one match arm per operator,
+            // an `fp.` operator nobody had implemented yet fell through to
+            // `eval_uninterpreted_app`, which ADOPTS the solver's committed
+            // value — silently confirming an interpreted operator the gate
+            // never computed. Claiming the whole namespace turns that class of
+            // hole into an explicit `Err` and a `CannotConfirm`.
+            _ if name.starts_with("fp.") => self.eval_fp(term, name, args, depth),
 
             // Arrays.
             "select" | "store" | "const-array" | "lambda-array" | "default" => {
                 self.eval_array(term, name, args, depth)
             }
 
-            // Strings (minimal: ++, len, at; `=` handled above generically).
-            "str.++" | "str.len" | "str.at" => self.eval_string(name, args, depth),
+            // Strings. Regex structure is interpreted by the separate,
+            // proof-checker-parity interval matcher; only String-sorted leaves
+            // flow through this evaluator/model view.
+            "str.++" | "str.len" | "str.at" | "str.in_re" | "str.in.re" | "str.replace_re"
+            | "str.replace_re_all" => self.eval_string(name, args, depth),
+
+            // The rest of the string theory, computed from the operand VALUES.
+            // These were reaching the uninterpreted-function path, so the gate
+            // adopted the solver's answer for `(str.contains s t)` rather than
+            // looking at `s` and `t`.
+            _ if crate::strings::handles(name, args.len()) => {
+                let vals = self.eval_all(args, depth)?;
+                crate::strings::eval(name, &vals)
+            }
+
+            // Finite sets, computed from the `(Array T Bool)` membership
+            // carrier they are modelled on. Also previously adopted.
+            _ if crate::sets::handles(name, args.len()) => {
+                let domain = args.first().map_or(crate::sets::DomainSize::Unknown, |&a| {
+                    element_domain_size(self.terms.sort(a))
+                });
+                let vals = self.eval_all(args, depth)?;
+                crate::sets::eval(name, &vals, &domain)
+            }
 
             _ if is_bv_named(name) => {
                 let vals = self.eval_all(args, depth)?;
@@ -316,9 +464,305 @@ impl<'a> Evaluator<'a> {
             // interpretation (fail closed if it cannot be built).
             _ => match self.eval_datatype(term, name, args, depth) {
                 Ok(v) => Ok(v),
-                Err(dt_err) => self.eval_uninterpreted_app(term, name, args, depth, dt_err),
+                Err(dt_err) => self.eval_uninterpreted_app(term, name, args, depth, dt_err, false),
             },
         }
+    }
+
+    /// Adopt the model's committed value for an application whose result
+    /// SMT-LIB leaves UNCONSTRAINED on these particular inputs, then CHECK the
+    /// residue the standard does constrain.
+    ///
+    /// SMT-LIB fixes no value for `fp.min`/`fp.max` of `+0` and `-0`, for
+    /// `fp.to_real` of a NaN or an infinity, for the NaN encoding
+    /// `fp.to_ieee_bv` returns, nor for `/`, `div` and `mod` by zero. On those
+    /// inputs the operator IS an uninterpreted function and is treated as one:
+    /// the gate adopts the model's value and its `uf_graph` still forces equal
+    /// arguments to the same result. Failing closed here instead would refuse
+    /// to confirm a witness the standard plainly admits — `(assert (< 0 (div 1
+    /// 0)))` is `sat` — while adopting UNCHECKED would let a broken solver
+    /// answer through.
+    ///
+    /// `residue` is what is left to check once the free part is granted: an
+    /// adopted `fp.min` of the two zeros must still be a ZERO of that format,
+    /// an adopted `fp.to_ieee_bv` of NaN must still be a NaN ENCODING, an
+    /// adopted `(div a 0)` must still be an INTEGER. That is what keeps this
+    /// path from laundering an evaluator bug into a confirmed `sat`. A residue
+    /// failure is an `Err`, i.e. `CannotConfirm` — fail closed, as everywhere
+    /// else here.
+    fn adopt_underspecified(
+        &self,
+        term: TermId,
+        name: &str,
+        args: &[TermId],
+        depth: usize,
+        reason: String,
+        residue: impl FnOnce(&ModelValue) -> Result<(), String>,
+    ) -> Result<ModelValue, String> {
+        // `false`, NOT `unconstrained`: this helper exists for results the
+        // standard RESTRICTS rather than frees (a NaN keeps a required
+        // encoding even though its sign and payload are unspecified), so only
+        // the model's own committed value is admissible and `residue` audits
+        // it below.
+        let adopted = self.eval_uninterpreted_app(term, name, args, depth, reason, false)?;
+        residue(&adopted)?;
+        Ok(adopted)
+    }
+
+    /// `(/ a 0)`, `(div a 0)` and `(mod a 0)`: unspecified but TOTAL.
+    ///
+    /// SMT-LIB constrains integer division and remainder only for a nonzero
+    /// divisor. At zero they are arbitrary-but-FIXED functions of their
+    /// arguments — every value is a legal interpretation, so there is nothing
+    /// to compute, and refusing turned a legitimate `sat` into `unknown`
+    /// (`(assert (< 0 (div 1 0)))` is sat in z3).
+    ///
+    /// So adopt the model's own choice, exactly as `fp.to_real` at NaN does.
+    /// The adoption is keyed by the argument VALUES, which is what makes it an
+    /// interpretation rather than a wish: `(div 1 0)` gets ONE value across
+    /// every occurrence, so a model claiming it is both 0 and 1 is still
+    /// refuted. The sort check is the rest of what can be verified — the
+    /// theory says nothing else about these values.
+    fn division_by_zero(
+        &self,
+        term: TermId,
+        name: &str,
+        args: &[TermId],
+        depth: usize,
+    ) -> Result<ModelValue, String> {
+        self.adopt_underspecified(
+            term,
+            name,
+            args,
+            depth,
+            format!("SMT-LIB leaves {name} by zero unconstrained"),
+            |adopted| {
+                let well_sorted = match name {
+                    "div" | "mod" => matches!(adopted, ModelValue::Int(_)),
+                    "/" => matches!(adopted, ModelValue::Real(_) | ModelValue::Int(_)),
+                    _ => false,
+                };
+                if well_sorted {
+                    Ok(())
+                } else {
+                    Err(format!("{name} by zero must still be a number"))
+                }
+            },
+        )
+    }
+
+    /// Resolve a `RoundingMode`-sorted operand to one of the five modes.
+    ///
+    /// A literal (`RNE`, `roundTowardZero`, …) is a nullary symbol that no
+    /// model pins, so it is read SYNTACTICALLY; a declared `RoundingMode`
+    /// constant is a leaf the model does pin, and arrives as an uninterpreted
+    /// token naming its mode. Anything else fails closed.
+    fn eval_rounding_mode(
+        &self,
+        term: TermId,
+        depth: usize,
+    ) -> Result<crate::fp::RoundingMode, String> {
+        let syntactic = match self.terms.get(term) {
+            TermData::App(sym, args) if args.is_empty() => {
+                crate::fp::RoundingMode::from_name(sym.name())
+            }
+            TermData::Var(name, _) => crate::fp::RoundingMode::from_name(name),
+            _ => None,
+        };
+        if let Some(rm) = syntactic {
+            return Ok(rm);
+        }
+        match self.eval(term, depth + 1)? {
+            ModelValue::Uninterpreted(token) => crate::fp::RoundingMode::from_name(&token)
+                .ok_or_else(|| format!("`{token}` does not name a rounding mode")),
+            _ => Err("operand is not a rounding mode".to_string()),
+        }
+    }
+
+    /// The `fp.`-prefixed floating-point operators.
+    ///
+    /// Split by whether the operator takes a leading rounding mode, because
+    /// that decides where the value operands start. Anything not listed falls
+    /// through to an `Err` and the gate keeps failing closed on it — which is
+    /// the point of routing the whole `fp.` namespace here rather than letting
+    /// an unimplemented operator reach the adopt-the-solver's-answer path.
+    fn eval_fp(
+        &self,
+        term: TermId,
+        name: &str,
+        args: &[TermId],
+        depth: usize,
+    ) -> Result<ModelValue, String> {
+        // Rounding-mode-taking operators: `rm` first, values after.
+        if matches!(
+            name,
+            "fp.add" | "fp.sub" | "fp.mul" | "fp.div" | "fp.fma" | "fp.sqrt" | "fp.roundToIntegral"
+        ) {
+            let (rm_arg, rest) = args
+                .split_first()
+                .ok_or_else(|| format!("{name} expects a rounding mode"))?;
+            let rm = self.eval_rounding_mode(*rm_arg, depth)?;
+            let vals = self.eval_all(rest, depth)?;
+            return match name {
+                "fp.fma" => crate::fp::fma(rm, &vals),
+                "fp.roundToIntegral" | "fp.sqrt" => {
+                    let [v] = <&[ModelValue; 1]>::try_from(vals.as_slice())
+                        .map_err(|_| format!("{name} expects one argument"))?;
+                    if name == "fp.sqrt" {
+                        crate::fp::sqrt(rm, v)
+                    } else {
+                        crate::fp::round_to_integral(rm, v)
+                    }
+                }
+                _ => crate::fp::arith(name, rm, &vals)?
+                    .ok_or_else(|| format!("unsupported floating-point operator {name}")),
+            };
+        }
+
+        let vals = self.eval_all(args, depth)?;
+        if let [only] = vals.as_slice() {
+            if let Some(verdict) = crate::fp::classify(name, only)? {
+                return Ok(ModelValue::Bool(verdict));
+            }
+            if let Some(value) = crate::fp::unary_sign(name, only)? {
+                return Ok(value);
+            }
+        }
+        if let Some(verdict) = crate::fp::compare(name, &vals)? {
+            return Ok(ModelValue::Bool(verdict));
+        }
+        match crate::fp::min_max(name, &vals) {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) => {}
+            // `fp.min`/`fp.max` of `+0` and `-0`: SMT-LIB allows EITHER zero,
+            // so there is nothing to compute and nothing to refuse. Adopt the
+            // model's own choice — the treatment `fp.to_real` gets at NaN —
+            // and then check that what came back is one of the two answers the
+            // standard actually allows, so an adopted value is still a checked
+            // one. (`min_max` only reports this for two operands of one
+            // format, so `vals[0]` is the format to check against.)
+            Err(reason) if reason == crate::fp::UNDERSPECIFIED => {
+                let like = vals
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| format!("{name} expects two floating-point arguments"))?;
+                return self.adopt_underspecified(term, name, args, depth, reason, |adopted| {
+                    if is_zero_of_format(adopted, &like) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{name} of +0 and -0 must be a zero of the operands' format"
+                        ))
+                    }
+                });
+            }
+            Err(reason) => return Err(reason),
+        }
+        if name == "fp.rem" {
+            return crate::fp::rem(&vals);
+        }
+        Err(format!("unsupported floating-point operator {name}"))
+    }
+
+    /// Evaluate SMT-LIB `fp.to_real` from the model's exact IEEE fields.
+    ///
+    /// No host float participates in this conversion.  Finite values are
+    /// reconstructed as `significand * 2^exponent` using `BigInt` /
+    /// `BigRational`; malformed payloads, unsupported field widths, NaN,
+    /// infinity, and impractically large exact shifts are rejected rather than
+    /// guessed.  The shift bound is only a resource guard: crossing it changes
+    /// a possible confirmation into `CannotConfirm`, never the reverse.
+    ///
+    /// The decoding is kept here, rather than delegated to [`crate::fp`],
+    /// because it accepts a WIDER format envelope than the arithmetic there
+    /// needs (`fp.to_real` never rounds, so it does not have to bound the
+    /// intermediates the way rounding does) — declining a format the gate can
+    /// read exactly would be a pure completeness loss.
+    fn eval_fp_to_real(
+        &self,
+        term: TermId,
+        args: &[TermId],
+        depth: usize,
+    ) -> Result<ModelValue, String> {
+        let [arg] = exactly(args)?;
+        let ModelValue::FloatingPoint {
+            sign,
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+        } = self.eval(arg, depth + 1)?
+        else {
+            return Err("fp.to_real expects a floating-point value".to_string());
+        };
+
+        // AY's concrete FP model uses u64 fields.  Keep the independent gate's
+        // accepted envelope identical to that representation and validate the
+        // raw payload before shifting.
+        if !(2..64).contains(&exponent_bits) || !(2..=64).contains(&significand_bits) {
+            return Err("unsupported floating-point field width".to_string());
+        }
+        let stored_bits = significand_bits - 1;
+        let max_exponent = (1u64 << exponent_bits) - 1;
+        let significand_limit = 1u64 << stored_bits;
+        if exponent > max_exponent || significand >= significand_limit {
+            return Err("malformed floating-point model payload".to_string());
+        }
+        if exponent == max_exponent {
+            // Unconstrained by SMT-LIB rather than uncomputable: `fp.to_real`
+            // of a NaN or an infinity may be ANY real, so this adopts the
+            // model's own choice instead of refusing (see
+            // [`Self::adopt_underspecified`] and `crate::fp::UNDERSPECIFIED`).
+            // The only residue the theory leaves to check is that the adopted
+            // value is a number at all.
+            return self.adopt_underspecified(
+                term,
+                "fp.to_real",
+                args,
+                depth,
+                crate::fp::UNDERSPECIFIED.to_string(),
+                |adopted| {
+                    if matches!(
+                        adopted,
+                        ModelValue::Real(_) | ModelValue::Int(_) | ModelValue::Algebraic(_)
+                    ) {
+                        Ok(())
+                    } else {
+                        Err("fp.to_real of NaN or infinity must still be a real".to_string())
+                    }
+                },
+            );
+        }
+
+        let bias = (1u64 << (exponent_bits - 1)) - 1;
+        let mut exact_significand = BigInt::from(significand);
+        if exponent != 0 {
+            exact_significand += BigInt::from(1u8) << stored_bits as usize;
+        }
+        if exact_significand.is_zero() {
+            // Both IEEE zeros map to mathematical Real zero.
+            return Ok(ModelValue::Real(BigRational::from_integer(BigInt::zero())));
+        }
+
+        let effective_exponent = if exponent == 0 {
+            1i64 - bias as i64 - i64::from(stored_bits)
+        } else {
+            exponent as i64 - bias as i64 - i64::from(stored_bits)
+        };
+        const MAX_EXACT_FP_SHIFT: i64 = 1 << 20;
+        if effective_exponent.unsigned_abs() > MAX_EXACT_FP_SHIFT as u64 {
+            return Err("fp.to_real exact exponent exceeds resource bound".to_string());
+        }
+
+        let magnitude = if effective_exponent >= 0 {
+            BigRational::from_integer(exact_significand << effective_exponent as usize)
+        } else {
+            BigRational::new(
+                exact_significand,
+                BigInt::from(1u8) << (-effective_exponent) as usize,
+            )
+        };
+        Ok(ModelValue::Real(if sign { -magnitude } else { magnitude }))
     }
 
     /// Evaluate an uninterpreted-function application `(name arg0 ...)` against
@@ -342,6 +786,13 @@ impl<'a> Evaluator<'a> {
     ///
     /// If the model does not pin the application, the result is `Unevaluable`
     /// (`dt_err` is surfaced) — fail closed, never assumed.
+    ///
+    /// `unconstrained` says the CALLER has established that SMT-LIB fixes no
+    /// value whatsoever for this application, so an asserted definition is the
+    /// only thing that can pin it and reading one is legitimate
+    /// ([`ModelView::unconstrained_app_value`]). It is `false` everywhere the
+    /// gate is itself responsible for computing the value; see that method for
+    /// why the difference is a soundness boundary rather than a preference.
     fn eval_uninterpreted_app(
         &self,
         term: TermId,
@@ -349,6 +800,7 @@ impl<'a> Evaluator<'a> {
         args: &[TermId],
         depth: usize,
         dt_err: String,
+        unconstrained: bool,
     ) -> Result<ModelValue, String> {
         // Evaluate the arguments ourselves. If any argument is unevaluable, the
         // application is unevaluable (fail closed).
@@ -381,7 +833,24 @@ impl<'a> Evaluator<'a> {
         // First time this key is seen: adopt the model's committed
         // per-application value as the representative. A model that does not pin
         // the application leaves the gate unable to confirm (fail closed).
-        let val = self.model.uf_app_value(term).ok_or(dt_err)?;
+        //
+        // Report the MISS, not `dt_err`. `dt_err` is the datatype-dispatch
+        // failure that routed us here, and for a plain uninterpreted symbol it
+        // reads "uninterpreted / unsupported function application: f" — which
+        // states that the EVALUATOR does not support `f`. That is not what
+        // happened: the evaluator supports `f` fine (this function is exactly
+        // that support), and the real reason is that the MODEL committed no
+        // value for this application. The two call for opposite fixes — extend
+        // the evaluator vs. complete the model — and the misattribution sends a
+        // reader to the wrong one. Keep `dt_err` in the text so the datatype
+        // path is still diagnosable when that is genuinely the cause.
+        let val = self.model.uf_app_value(term).ok_or_else(|| {
+            format!(
+                "model commits no value for this application of `{name}` \
+                 (gate cannot confirm without one; datatype dispatch also \
+                 declined: {dt_err})"
+            )
+        })?;
         self.uf_graph
             .borrow_mut()
             .push((name.to_string(), arg_vals, val.clone()));
@@ -539,6 +1008,13 @@ impl<'a> Evaluator<'a> {
         let vals = self.eval_all(args, depth)?;
         let sort = self.terms.sort(term);
         match name {
+            // An ALGEBRAIC operand cannot be folded into a `BigRational` --
+            // that is the lossy step that loses `sqrt(2)` -- so the sum/product
+            // is carried in the extension instead. Rational operands are lifted
+            // into it; a mix of two DIFFERENT extensions declines (resultants),
+            // and declining is a coverage gap, never a wrong answer.
+            "+" if vals.iter().any(is_algebraic) => fold_algebraic(&vals, AlgebraicFold::Sum),
+            "*" if vals.iter().any(is_algebraic) => fold_algebraic(&vals, AlgebraicFold::Product),
             "+" => {
                 let mut acc = BigRational::zero();
                 for v in &vals {
@@ -575,7 +1051,10 @@ impl<'a> Evaluator<'a> {
                 for v in &vals[1..] {
                     let d = as_rational(v)?;
                     if d.is_zero() {
-                        return Err("real division by zero (under-specified)".to_string());
+                        // SMT-LIB leaves `(/ x 0)` unconstrained — it is an
+                        // uninterpreted function on that input, not something
+                        // to compute. Adopt the model's choice, checked.
+                        return self.division_by_zero(term, name, args, depth);
                     }
                     acc /= d;
                 }
@@ -584,14 +1063,16 @@ impl<'a> Evaluator<'a> {
             }
             "div" => {
                 let (a, b) = (as_integer(&vals[0])?, as_integer(arg_v(&vals, 1)?)?);
-                let (q, _) = euclid(&a, &b)
-                    .ok_or_else(|| "integer div by zero (under-specified)".to_string())?;
+                let Some((q, _)) = euclid(&a, &b) else {
+                    return self.division_by_zero(term, name, args, depth);
+                };
                 Ok(ModelValue::Int(q))
             }
             "mod" => {
                 let (a, b) = (as_integer(&vals[0])?, as_integer(arg_v(&vals, 1)?)?);
-                let (_, r) = euclid(&a, &b)
-                    .ok_or_else(|| "integer mod by zero (under-specified)".to_string())?;
+                let Some((_, r)) = euclid(&a, &b) else {
+                    return self.division_by_zero(term, name, args, depth);
+                };
                 Ok(ModelValue::Int(r))
             }
             "abs" => {
@@ -610,6 +1091,14 @@ impl<'a> Evaluator<'a> {
             "<" | "<=" | ">" | ">=" => {
                 if vals.len() < 2 {
                     return Err("comparison needs at least two arguments".to_string());
+                }
+                // An algebraic operand is ORDERED by refining its isolating
+                // interval, not by collapsing it to a rational. `sqrt(2) > 0`
+                // is exactly the constraint reduction alone cannot settle --
+                // both roots of `x^2 - 2` satisfy the same equalities and
+                // differ only in sign.
+                if vals.iter().any(is_algebraic) {
+                    return compare_with_algebraic(name, &vals).map(ModelValue::Bool);
                 }
                 let rats: Vec<BigRational> =
                     vals.iter().map(as_rational).collect::<Result<_, _>>()?;
@@ -723,11 +1212,94 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Exact cardinality when it is provably finite and below `cap`.
+    ///
+    /// This is intentionally the same conservative classification used by the
+    /// solver's Z3-compatible array-default pass. `None` means infinite,
+    /// recursive/unknown, or at least `cap`; all three take Z3's large-domain
+    /// store-default branch.
+    fn finite_sort_cardinality_below(
+        &self,
+        sort: &Sort,
+        cap: usize,
+        in_progress: &mut Vec<String>,
+    ) -> Option<usize> {
+        match sort {
+            Sort::Bool => (2 < cap).then_some(2),
+            Sort::BitVec(bitvec) => {
+                if bitvec.width as usize >= cap.trailing_zeros() as usize {
+                    None
+                } else {
+                    Some(1usize << bitvec.width)
+                }
+            }
+            Sort::FiniteDomain(_, size) => {
+                let size = usize::try_from(*size).ok()?;
+                (size < cap).then_some(size)
+            }
+            Sort::Array(array) => {
+                let index =
+                    self.finite_sort_cardinality_below(&array.index_sort, cap, in_progress)?;
+                let element =
+                    self.finite_sort_cardinality_below(&array.element_sort, cap, in_progress)?;
+                let mut total = 1usize;
+                for _ in 0..index {
+                    total = total.checked_mul(element)?;
+                    if total >= cap {
+                        return None;
+                    }
+                }
+                Some(total)
+            }
+            Sort::Datatype(datatype) => self.datatype_cardinality_below(datatype, cap, in_progress),
+            Sort::Uninterpreted(name) => {
+                let datatype = self.model.datatype_def(name)?;
+                self.datatype_cardinality_below(&datatype, cap, in_progress)
+            }
+            _ => None,
+        }
+    }
+
+    fn datatype_cardinality_below(
+        &self,
+        datatype: &ay_core::DatatypeSort,
+        cap: usize,
+        in_progress: &mut Vec<String>,
+    ) -> Option<usize> {
+        if datatype.constructors.is_empty() || in_progress.iter().any(|name| name == &datatype.name)
+        {
+            return None;
+        }
+        in_progress.push(datatype.name.clone());
+        let result = (|| {
+            let mut total = 0usize;
+            for constructor in &datatype.constructors {
+                let mut variants = 1usize;
+                for field in &constructor.fields {
+                    let count =
+                        self.finite_sort_cardinality_below(&field.sort, cap, in_progress)?;
+                    variants = variants.checked_mul(count)?;
+                    if variants >= cap {
+                        return None;
+                    }
+                }
+                total = total.checked_add(variants)?;
+                if total >= cap {
+                    return None;
+                }
+            }
+            Some(total)
+        })();
+        in_progress.pop();
+        result
+    }
+
     /// Evaluate an array else-value without touching irrelevant store writes.
     ///
-    /// SMT array semantics gives `default(store(a, i, v)) = default(a)`, so
-    /// evaluating `i` or `v` would turn an exact structural result into a
-    /// spurious coverage failure when either term is unpinned.
+    /// Z3 5.0.0 preserves the base default for infinite/large carriers, but a
+    /// small finite carrier uses a shared-epsilon select and a unit carrier uses
+    /// the stored value. The finite case therefore reads the solver's committed
+    /// scalar application value instead of unsoundly peeling the store.
     fn eval_array_default(
         &self,
         term: TermId,
@@ -741,6 +1313,26 @@ impl<'a> Evaluator<'a> {
             return Err("default result sort does not match array element sort".to_string());
         }
 
+        // A binder-dependent lambda has no finite `(else, stores)`
+        // representation, but SMT-LIB still exposes `(default lambda)` as an
+        // opaque scalar application.  Re-check the model's committed scalar
+        // value directly instead of trying (and failing) to reconstruct the
+        // whole lambda array.  The value is not invented here: an unpinned
+        // default remains unevaluable, and the gate still compares the pin
+        // against every authored assertion.
+        if let TermData::App(sym, args) = self.terms.get(array) {
+            let dependent_lambda = sym.name() == "lambda-array"
+                && args.len() == 2
+                && self.term_contains(args[1], args[0]);
+            let as_array = sym.name().starts_with("as-array[");
+            if dependent_lambda || as_array {
+                return self
+                    .model
+                    .uf_app_value(term)
+                    .ok_or_else(|| "model does not pin opaque array default".to_string());
+            }
+        }
+
         let mut current = array;
         let mut seen = HashSet::new();
         while seen.insert(current) {
@@ -749,12 +1341,45 @@ impl<'a> Evaluator<'a> {
             }
             match self.terms.get(current) {
                 TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
-                    current = args[0];
+                    let Sort::Array(array_sort) = self.terms.sort(current) else {
+                        return Err("store result is not an array sort".to_string());
+                    };
+                    match self.finite_sort_cardinality_below(
+                        &array_sort.index_sort,
+                        1 << 14,
+                        &mut Vec::new(),
+                    ) {
+                        Some(1) => return self.eval(args[2], depth + seen.len()),
+                        Some(_) => {
+                            return self.model.uf_app_value(term).ok_or_else(|| {
+                                "model does not pin finite array default".to_string()
+                            });
+                        }
+                        None => current = args[0],
+                    }
                 }
                 TermData::App(sym, args) if sym.name() == "const-array" && args.len() == 1 => {
                     return self.eval(args[0], depth + seen.len());
                 }
-                _ => return Ok(self.eval_array_value(current, depth + seen.len())?.default),
+                _ => {
+                    return match self.eval_array_value(current, depth + seen.len()) {
+                        Ok(array) => Ok(array.default),
+                        // A named/defined array can hide the lambda syntax from
+                        // the fast path above. If resolving that alias proves
+                        // that its value is a binder-dependent lambda, its
+                        // `default` is still the same opaque scalar operation;
+                        // use only the model's committed value for this exact
+                        // application. Other reconstruction failures remain
+                        // fail-closed and never gain this fallback.
+                        Err(reason)
+                            if reason
+                                == "binder-dependent lambda-array has no finite array representation" =>
+                        {
+                            self.model.uf_app_value(term).ok_or(reason)
+                        }
+                        Err(reason) => Err(reason),
+                    };
+                }
             }
         }
         Err("cyclic array store chain".to_string())
@@ -993,6 +1618,44 @@ impl<'a> Evaluator<'a> {
                     None => Ok(ModelValue::Str(String::new())),
                 }
             }
+            // `str.replace_re` / `str.replace_re_all`.
+            //
+            // RegLan has no `ModelValue`, so a regex argument cannot be
+            // evaluated as a value; like `str.in_re` two arms below, these pass
+            // the regex term STRUCTURALLY to this crate's own interval matcher.
+            // The SMT-LIB clause (leftmost, then shortest, match) and the one
+            // shape that is deliberately left failing closed (a regex accepting
+            // the empty word) are documented on [`crate::regex::replace`].
+            //
+            // This previously accepted only `(str.to_re <non-empty literal>)`
+            // and reported `Unevaluable` for every other regex, so the gate
+            // refused to confirm any model mentioning one and published a
+            // computed `sat` as `unknown`.
+            "str.replace_re" | "str.replace_re_all" => {
+                let [subject, regex, replacement] = exactly(args)?;
+                let subject = self.eval_str(subject, depth + 1)?;
+                let replacement = self.eval_str(replacement, depth + 1)?;
+                let out = crate::regex::replace(
+                    self.terms,
+                    name,
+                    &subject,
+                    regex,
+                    &replacement,
+                    name == "str.replace_re_all",
+                    depth + 1,
+                    |term| self.eval_str(term, depth + 2),
+                )?;
+                Ok(ModelValue::Str(out))
+            }
+            "str.in_re" | "str.in.re" => {
+                let [subject, regex] = exactly(args)?;
+                let subject = self.eval_str(subject, depth + 1)?;
+                let member =
+                    crate::regex::matches(self.terms, &subject, regex, depth + 1, |term| {
+                        self.eval_str(term, depth + 2)
+                    })?;
+                Ok(ModelValue::Bool(member))
+            }
             _ => Err(format!("unsupported string operator {name}")),
         }
     }
@@ -1201,6 +1864,148 @@ impl<'a> Evaluator<'a> {
 // free helpers
 // ===========================================================================
 
+/// The exact value of an indexed FP special constant, if `name` is one.
+///
+/// `(_ NaN eb sb)`, `(_ +zero eb sb)`, `(_ -zero eb sb)`, `(_ +oo eb sb)` and
+/// `(_ -oo eb sb)` are the SMT-LIB spellings of the FP special values. They are
+/// nullary CONSTANTS, but they are `Symbol::Indexed`, and the gate routed every
+/// indexed symbol to the bitvector operator table — where they are, correctly,
+/// unrecognized. The gate then could not confirm any model mentioning one and
+/// degraded the verdict, so `(assert (fp.isNaN (_ NaN 11 53)))` was published
+/// as `unknown` even though AY refutes its negation as `unsat`.
+///
+/// SMT-LIB counts the hidden bit in `sb`, so the stored fraction field is
+/// `sb - 1` bits. NaN is a single value in the FP sort (payloads are not
+/// observable), so the canonical quiet NaN is an exact representative.
+///
+/// Returns `None` for any other indexed symbol, which keeps the bitvector path
+/// and the gate's fail-closed discipline untouched: an out-of-range width
+/// declines here rather than producing a truncated value.
+fn fp_special_constant(name: &str, indices: &[u32]) -> Option<ModelValue> {
+    let [eb, sb] = <[u32; 2]>::try_from(indices).ok()?;
+    // `exponent` and `significand` are `u64`: an all-ones exponent needs
+    // `eb <= 64`, and the stored fraction field is `sb - 1` bits wide. A quiet
+    // NaN additionally needs a fraction bit to set, hence `sb >= 2`.
+    if eb == 0 || eb > 64 || sb < 2 || sb > 65 {
+        return None;
+    }
+    let all_ones = if eb == 64 { u64::MAX } else { (1u64 << eb) - 1 };
+    let (sign, exponent, significand) = match name {
+        "+zero" => (false, 0, 0),
+        "-zero" => (true, 0, 0),
+        "+oo" => (false, all_ones, 0),
+        "-oo" => (true, all_ones, 0),
+        "NaN" => (false, all_ones, 1u64 << (sb - 2)),
+        _ => return None,
+    };
+    Some(ModelValue::FloatingPoint {
+        sign,
+        exponent,
+        significand,
+        exponent_bits: eb,
+        significand_bits: sb,
+    })
+}
+
+/// Reinterpret an `eb + sb`-wide bitvector as the IEEE fields of an FP value.
+///
+/// This is SMT-LIB `((_ to_fp eb sb) <bv>)`: a pure re-reading of the same
+/// bits, with no rounding and no value change. Splitting them out here keeps
+/// the gate independent of the solver's FP code.
+///
+/// Declines (returns `None`) unless the operand is a bitvector of EXACTLY the
+/// width the indices call for, and unless both fields fit the `u64` slots of
+/// [`ModelValue::FloatingPoint`]. A width mismatch is a malformed term rather
+/// than something to coerce, so it falls through and fails closed.
+fn fp_from_ieee_bits(indices: &[u32], value: &ModelValue) -> Option<ModelValue> {
+    let [eb, sb] = <[u32; 2]>::try_from(indices).ok()?;
+    if eb == 0 || eb > 64 || sb < 2 || sb > 65 {
+        return None;
+    }
+    let ModelValue::BitVec { width, value } = value else {
+        return None;
+    };
+    if *width != eb + sb {
+        return None;
+    }
+    let fraction_bits = sb - 1;
+    let exponent_mask = if eb == 64 { u64::MAX } else { (1u64 << eb) - 1 };
+    let fraction_mask = if fraction_bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << fraction_bits) - 1
+    };
+    // `value` is normalized to `0 <= value < 2^width` by construction, so these
+    // shifts stay in range and both fields are guaranteed to fit their masks.
+    let sign = ((value >> (eb + sb - 1) as usize) & BigInt::from(1u8)) == BigInt::from(1u8);
+    let exponent =
+        u64::try_from((value >> fraction_bits as usize) & BigInt::from(exponent_mask)).ok()?;
+    let significand = u64::try_from(value & BigInt::from(fraction_mask)).ok()?;
+    Some(ModelValue::FloatingPoint {
+        sign,
+        exponent,
+        significand,
+        exponent_bits: eb,
+        significand_bits: sb,
+    })
+}
+
+/// Whether `value` is a floating-point ZERO in the same format as `like`.
+///
+/// The residue [`Evaluator::eval_fp`] checks after adopting the model's choice
+/// for `fp.min`/`fp.max` of `+0` and `-0`. SMT-LIB frees WHICH zero comes back;
+/// it does not free the result from being a zero of that format at all, so a
+/// model answering `1.0` there is still refuted. Deliberately written from the
+/// raw fields rather than routed through [`crate::fp`]: the check must hold
+/// even for a format that module's arithmetic envelope declines.
+fn is_zero_of_format(value: &ModelValue, like: &ModelValue) -> bool {
+    let (
+        &ModelValue::FloatingPoint {
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+            ..
+        },
+        &ModelValue::FloatingPoint {
+            exponent_bits: like_eb,
+            significand_bits: like_sb,
+            ..
+        },
+    ) = (value, like)
+    else {
+        return false;
+    };
+    exponent == 0 && significand == 0 && exponent_bits == like_eb && significand_bits == like_sb
+}
+
+/// How many values the ELEMENT sort of a set carrier has.
+///
+/// A set is modelled as `(Array T Bool)`, so this is the cardinality of `T`.
+/// `crate::sets` needs it to decide whether an index exists that neither
+/// operand's store overrides — a fact about the sort, which the VALUE cannot
+/// carry.
+///
+/// Unknown beats a guess: an uninterpreted sort has whatever cardinality the
+/// model gives it, and claiming it is infinite would decide `set.subset` on an
+/// assumption rather than on the model.
+fn element_domain_size(sort: &Sort) -> crate::sets::DomainSize {
+    use crate::sets::DomainSize;
+    let Sort::Array(array) = sort else {
+        return DomainSize::Unknown;
+    };
+    match &array.index_sort {
+        Sort::Bool => DomainSize::Finite(BigInt::from(2u8)),
+        Sort::BitVec(bv) => DomainSize::Finite(BigInt::from(1u8) << bv.width as usize),
+        // A floating-point sort is finite, but its distinct VALUES are fewer
+        // than its bit patterns (all the NaN encodings are one value), so its
+        // exact cardinality is not `2^(eb+sb)`. Unknown rather than wrong.
+        Sort::FloatingPoint(_, _) => DomainSize::Unknown,
+        Sort::Int | Sort::Real | Sort::String => DomainSize::Infinite,
+        _ => DomainSize::Unknown,
+    }
+}
+
 /// Destructure exactly `N` arguments, or fail closed.
 fn exactly<const N: usize>(args: &[TermId]) -> Result<[TermId; N], String> {
     <[TermId; N]>::try_from(args).map_err(|_| format!("expected {N} arguments, got {}", args.len()))
@@ -1208,6 +2013,103 @@ fn exactly<const N: usize>(args: &[TermId]) -> Result<[TermId; N], String> {
 
 fn arg_v(vals: &[ModelValue], i: usize) -> Result<&ModelValue, String> {
     vals.get(i).ok_or_else(|| "missing argument".to_string())
+}
+
+/// Evaluate a comparison chain where at least one operand is algebraic.
+///
+/// Each adjacent pair is decided by the SIGN of `a - b`, computed by interval
+/// refinement. An undecided sign (the refinement budget ran out, or the pair
+/// spans two different extensions) is an error the gate fails closed on --
+/// never a `false`, which would be an unearned refutation.
+fn compare_with_algebraic(name: &str, vals: &[ModelValue]) -> Result<bool, String> {
+    use core::cmp::Ordering;
+
+    let carrier = vals
+        .iter()
+        .find_map(|v| match v {
+            ModelValue::Algebraic(a) => Some(a.as_ref().clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "no algebraic operand".to_string())?;
+
+    let lift = |v: &ModelValue| -> Result<crate::algebraic::Algebraic, String> {
+        match v {
+            ModelValue::Algebraic(a) => Ok(a.as_ref().clone()),
+            other => Ok(carrier.with_rational(as_rational(other)?)),
+        }
+    };
+
+    for pair in vals.windows(2) {
+        let difference = lift(&pair[0])?
+            .add(&lift(&pair[1])?.neg())
+            .map_err(|e| format!("algebraic comparison declined: {e:?}"))?;
+        let ordering = difference
+            .sign()
+            .map(|s| match s {
+                0 => Ordering::Equal,
+                n if n < 0 => Ordering::Less,
+                _ => Ordering::Greater,
+            })
+            .ok_or_else(|| "algebraic sign undecided within the refinement budget".to_string())?;
+        let holds = match name {
+            "<" => ordering == Ordering::Less,
+            "<=" => ordering != Ordering::Greater,
+            ">" => ordering == Ordering::Greater,
+            ">=" => ordering != Ordering::Less,
+            _ => return Err(format!("unsupported comparison {name}")),
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a value carries an algebraic number.
+fn is_algebraic(v: &ModelValue) -> bool {
+    matches!(v, ModelValue::Algebraic(_))
+}
+
+/// Which fold `fold_algebraic` performs.
+enum AlgebraicFold {
+    Sum,
+    Product,
+}
+
+/// Fold a mixed list of algebraic and rational operands inside one extension.
+///
+/// Every rational is lifted into the algebraic operand's extension, so exact
+/// arithmetic applies throughout. The result collapses back to `Real` when it
+/// reduces to a rational -- `sqrt(2) * sqrt(2)` IS 2 -- so downstream
+/// comparisons see the simplest exact form.
+fn fold_algebraic(vals: &[ModelValue], fold: AlgebraicFold) -> Result<ModelValue, String> {
+    let first = vals
+        .iter()
+        .find_map(|v| match v {
+            ModelValue::Algebraic(a) => Some(a.as_ref().clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "no algebraic operand".to_string())?;
+
+    let mut acc = match fold {
+        AlgebraicFold::Sum => first.with_rational(BigRational::zero()),
+        AlgebraicFold::Product => first.with_rational(BigRational::from(BigInt::from(1))),
+    };
+    for v in vals {
+        let operand = match v {
+            ModelValue::Algebraic(a) => a.as_ref().clone(),
+            other => first.with_rational(as_rational(other)?),
+        };
+        acc = match fold {
+            AlgebraicFold::Sum => acc.add(&operand),
+            AlgebraicFold::Product => acc.mul(&operand),
+        }
+        .map_err(|e| format!("algebraic arithmetic declined: {e:?}"))?;
+    }
+    Ok(match acc.as_rational() {
+        Some(q) => ModelValue::Real(q),
+        None => ModelValue::Algebraic(Box::new(acc)),
+    })
 }
 
 fn as_rational(v: &ModelValue) -> Result<BigRational, String> {

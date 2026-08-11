@@ -4,8 +4,6 @@
 
 //! Display formatting for `ModelValue` and array store chains.
 
-use num_bigint::BigInt;
-
 use super::{FpSpecialKind, ModelValue};
 
 impl std::fmt::Display for ModelValue {
@@ -14,16 +12,15 @@ impl std::fmt::Display for ModelValue {
             Self::Bool(b) => write!(f, "{b}"),
             Self::Int(n) => write!(f, "{}", crate::executor_format::format_bigint(n)),
             Self::Real(r) => write!(f, "{}", crate::executor_format::format_rational(r)),
+            // Delegate to the canonical BV-numeral printer: `#x` is well-formed
+            // only at widths that are a multiple of 4, otherwise `#b` is
+            // required, or the printed value silently reparses at the wrong
+            // width (e.g. `(_ BitVec 5)` value 17 as `#x11`, i.e. 8 bits).
             Self::BitVec { value, width } => {
-                // Convert to unsigned representation for hex display
-                let hex_digits = (*width as usize).div_ceil(4);
-                let modulus = BigInt::from(1) << *width;
-                let unsigned_val = ((value % &modulus) + &modulus) % &modulus;
                 write!(
                     f,
-                    "#x{:0>width$}",
-                    format!("{:x}", unsigned_val),
-                    width = hex_digits
+                    "{}",
+                    crate::executor_format::format_bitvec(value, *width)
                 )
             }
             Self::String(s) => {

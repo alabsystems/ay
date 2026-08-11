@@ -731,28 +731,35 @@ impl VSIDS {
     /// increment too, the relative influence of old vs new bumps would be
     /// unchanged, defeating the purpose.
     ///
-    /// Preserves relative variable ordering (no heap restructure needed).
+    /// Preserves the *mathematical* order of the scores, but the heap is
+    /// re-heapified afterwards (see the body: scaling is not strictly
+    /// monotone in IEEE-754).
     pub(crate) fn decay_all_scores(&mut self, factor: f64) {
         debug_assert!(factor > 0.0 && factor <= 1.0 && factor.is_finite());
-        // As in `rescale`, scaling by a positive factor < 1 preserves ordering
-        // EXCEPT when tiny positive activities underflow to exactly 0.0, after
-        // which `var_less`'s index tie-break can disagree with the heap order.
-        // Rebuild only if such an underflow occurred (rare; this path is itself
-        // infrequent — split-loop iteration boundaries).
-        let mut underflowed_to_zero = false;
         for act in &mut self.activities {
-            let was_nonzero = *act != 0.0;
             *act *= factor;
-            if was_nonzero && *act == 0.0 {
-                underflowed_to_zero = true;
-            }
         }
         // Note: increment is NOT scaled. After decay, the next bump adds
         // `increment` to a halved score, effectively 2x the relative boost.
         // This is intentional: new conflicts should dominate stale scores.
-        if underflowed_to_zero {
-            self.rebuild_heap();
-        }
+
+        // Scaling is monotone but NOT strictly monotone: distinct tiny
+        // activities can round to the SAME value without ever reaching
+        // exactly 0.0 (e.g. with factor 0.5, both 5*d and 4*d collapse to
+        // 2*d, where d = 2^-1074 is the smallest positive denormal). The heap
+        // breaks ties by variable index (`var_less`), so a collapse can
+        // invert the relative order of a parent/child pair that was strictly
+        // ordered before scaling, leaving a stale arrangement the heap never
+        // repairs (debug builds then panic in `debug_assert_heap_property`).
+        // The old guard here rebuilt only on underflow to exactly 0.0, which
+        // misses the collapse-to-a-shared-nonzero case entirely. `rescale`
+        // (the 1e-100 overflow path) and `rescale_for_reorder` already
+        // re-heapify unconditionally for exactly this reason — mirror them.
+        // This path is rare (split-loop iteration boundaries) and the scan
+        // above is already O(n), so the Floyd rebuild is free at this
+        // frequency. Heuristic-only: it restores the decision-order structure
+        // and can never change a SAT/UNSAT result.
+        self.rebuild_heap();
     }
 
     /// Get the bump order for a variable (for trail reuse comparison)

@@ -104,6 +104,9 @@ impl Solver {
         if self.collect_level0_garbage() {
             return true;
         }
+        if self.is_interrupted() || self.solve_deadline_expired() {
+            return false;
+        }
         if self.propagate_check_unsat() {
             return true;
         }

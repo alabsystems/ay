@@ -68,9 +68,18 @@ fn test_from_bigint() {
 #[test]
 fn test_from_bigrational() {
     let br = BigRational::new(BigInt::from(7), BigInt::from(3));
+    let borrowed = Rational::from(&br);
+    assert_eq!(borrowed, Rational::new(7, 3));
+    assert!(borrowed.is_small());
+
     let r = Rational::from(br);
     assert_eq!(r, Rational::new(7, 3));
     assert!(r.is_small());
+
+    let large = BigRational::from_integer(BigInt::from(i64::MAX) + BigInt::one());
+    let borrowed_large = Rational::from(&large);
+    assert!(!borrowed_large.is_small());
+    assert_eq!(borrowed_large.to_big(), large);
 }
 
 #[test]

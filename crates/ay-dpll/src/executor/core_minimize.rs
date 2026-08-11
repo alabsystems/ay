@@ -239,9 +239,54 @@ impl Executor {
     ) -> Result<SolveResult> {
         let saved_result = self.last_result.clone();
         let saved_unknown_reason = self.last_unknown_reason;
+        // #uc-minimize-proof-gate: park the entry UNSAT certificate across the
+        // subset solves. Each subset solve is a full public decision that mints
+        // its own one-shot certificate for a REDUCED problem; leaving that in
+        // place would publish this verdict against a certificate for a
+        // different formula. The entry certificate stays valid throughout —
+        // minimization never changes the verdict on the original problem, it
+        // only shrinks the printed core — so putting it back is the correct
+        // envelope, and it is what lets the gate above run on the internal
+        // tracker without weakening the publish path.
+        let saved_unsat_certificate = self.last_unsat_certificate.take();
+        // ...and with it the PUBLICATION AUTHORITY the certificate is minted
+        // from. `mint_unsat_certificate` does not re-verify a proof; it checks
+        // that `unsat_query_epoch`'s bound assumptions equal the ones being
+        // published and that `proof_problem_assertion_provenance` still matches
+        // the epoch's assertion set. Every subset solve is itself a public query
+        // that installs its OWN epoch over both. Parking only the certificate
+        // (as this first did) left the outer publish to re-mint against a
+        // subset's epoch, fail `AssumptionEpochMismatch`, and fail-closed to
+        // `unknown` — measured as 4 UC tests flipping unsat -> unknown.
+        //
+        // Restoring is not borrowing authority: the ORIGINAL query genuinely
+        // established this epoch before minimization ran, and minimization
+        // cannot change the verdict on the original problem — it only shrinks
+        // the printed core. What is restored is exactly the authority the
+        // entry verdict already earned; what is discarded is the subset solves'
+        // authority, which must never publish.
+        let saved_epoch = self.unsat_query_epoch.take();
+        let saved_provenance = self.proof_problem_assertion_provenance.take();
+        // ...and the REFUTATION ITSELF. `mint_unsat_certificate` reads
+        // `last_proof` and fails `MissingProof` without it, and
+        // `build_unsat_proof` is explicitly NOT idempotent — it `take_proof()`s
+        // the tracker and `take()`s the clause trace (see the PROOF NET comment
+        // in check_sat_assuming.rs). Each subset solve therefore CONSUMES the
+        // entry refutation and leaves a proof of a reduced problem in its place,
+        // so the outer publish found no usable proof and fail-closed to
+        // `unknown` — "the provisional UNSAT verdict has no proof", measured on
+        // 4 UC tests. Parking the entry proof restores the refutation the
+        // published verdict actually rests on.
+        let saved_proof = self.last_proof.take();
         let out = self.minimize_assumption_core_inner(combined, result, rescue_elapsed);
-        // Only restore when the pass was entered on an UNSAT verdict (the inner
-        // function is a no-op otherwise, so nothing was clobbered).
+        // Unconditional: the take()s above must never be observable, whether or
+        // not the inner pass did any work.
+        self.last_unsat_certificate = saved_unsat_certificate;
+        self.unsat_query_epoch = saved_epoch;
+        self.proof_problem_assertion_provenance = saved_provenance;
+        self.last_proof = saved_proof;
+        // Only restore the verdict when the pass was entered on an UNSAT (the
+        // inner function is a no-op otherwise, so nothing was clobbered).
         if matches!(saved_result, Some(SolveResult::Unsat(_))) {
             self.last_result = saved_result;
             self.last_unknown_reason = saved_unknown_reason;
@@ -256,20 +301,53 @@ impl Executor {
         rescue_elapsed: Option<Duration>,
     ) -> Result<SolveResult> {
         let rescued = rescue_elapsed.is_some();
+        // Gate telemetry (#uc-minimize-gate-trace): this pass has several
+        // independent early returns and its only trace line sits AFTER all of
+        // them, so "no `uc-minimize` output" was indistinguishable between
+        // "never called" and "declined at gate N". That ambiguity cost a wrong
+        // root cause on 2026-08-08. Name the declining gate instead.
+        let gate_trace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        macro_rules! decline {
+            ($why:expr) => {{
+                if gate_trace {
+                    eprintln!("c phase-trace uc-minimize skip={}", $why);
+                }
+                return result;
+            }};
+        }
         if !matches!(result, Ok(SolveResult::Unsat(_))) {
-            return result;
+            decline!("not-unsat");
         }
         // Proof-envelope coherence: subset solves overwrite clause traces /
-        // proof state with refutations of REDUCED problems. Under
-        // produce-proofs (incl. --self-check, which forces it) the boundary
-        // would materialize a wrong proof — skip entirely.
-        if self.produce_proofs_enabled() {
-            return result;
+        // proof state with refutations of REDUCED problems. When the session
+        // will EXPORT a proof, the boundary would materialize a wrong one —
+        // skip entirely.
+        //
+        // #uc-minimize-proof-gate: this must test user-requested proof OUTPUT,
+        // not `produce_proofs_enabled()`. That predicate ORs in
+        // `proof_tracker.is_enabled()`, and `begin_public_solve` enables the
+        // tracker UNCONDITIONALLY on every public decision ("proof output is
+        // optional; proof-backed UNSAT correctness is not"). So the old test
+        // was `true` on every real invocation and this pass returned here every
+        // time — measured 2026-08-08 as ZERO `uc-minimize` trace lines across
+        // seven probes spanning QF_UF, QF_BV, QF_LRA, QF_FP and BV, QF_UF being
+        // the pass's own original target. The whole minimizer, including the
+        // #uc-minimize-general widening below, was dead code.
+        //
+        // `is_producing_proofs()` is the user-facing half of exactly the
+        // distinction `begin_public_solve` draws: `--no-proof` /
+        // `:produce-proofs false` suppress the artifact while the internal
+        // soundness certificate keeps running. The certificate is preserved
+        // across the subset solves by the save/restore in the caller
+        // (`minimize_assumption_core`), so nothing that gates publishing
+        // `unsat` can be clobbered by a reduced-problem refutation.
+        if self.is_producing_proofs() {
+            decline!("proofs");
         }
         // A/B knob (NOT a soundness guard — the pass only shrinks a valid
         // core; disabling it restores the padded-superset behavior).
         if std::env::var_os("AY_NO_UC_MINIMIZE").is_some() {
-            return result;
+            decline!("env-kill");
         }
 
         // Category gate: EUF / ArrayEuf content only for now
@@ -344,7 +422,7 @@ impl Executor {
             && std::env::var_os("AY_NO_UC_MINIMIZE_GENERAL").is_none()
             && combined.len() <= GENERAL_MINIMIZE_CAP;
         if !euf_like && !general_ok {
-            return result;
+            decline!(format!("category={category:?} len={}", combined.len()));
         }
         // Array containment rule (see ARRAY_SCOPED_RESCUE_CAP): scoped subset
         // re-solves on array content only when the rescue was affordable.

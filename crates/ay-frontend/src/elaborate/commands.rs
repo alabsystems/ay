@@ -13,12 +13,20 @@ use super::{
     OptionValue, Result, ScopeFrame, SoftAssertion, SymbolInfo,
 };
 
-/// Builtin simple sort names supplied by the SMT-LIB FloatingPoint theory.
-/// User aliases/declarations with these names would either shadow
-/// `RoundingMode`'s fixed five-element semantics or be silently ignored by the
-/// FP abbreviation match in `sorts.rs`.
-const BUILTIN_FP_SIMPLE_SORT_NAMES: &[&str] =
-    &["RoundingMode", "Float16", "Float32", "Float64", "Float128"];
+/// Builtin sort names supplied by enabled SMT theories.
+///
+/// User aliases/declarations with these names would either shadow a theory
+/// carrier or be silently ignored by the builtin match in `sorts.rs`.
+const BUILTIN_THEORY_SORT_NAMES: &[&str] = &[
+    "Bool",
+    "RoundingMode",
+    "Float16",
+    "Float32",
+    "Float64",
+    "Float128",
+    // Z3 5.0.0's one-parameter finite-set sort constructor.
+    "FiniteSet",
+];
 
 /// A compact `(push N)` command must not amplify a few input bytes into an
 /// effectively unbounded loop and allocation.  This still permits far deeper
@@ -26,8 +34,8 @@ const BUILTIN_FP_SIMPLE_SORT_NAMES: &[&str] =
 /// context's empty-frame storage.
 const MAX_INCREMENTAL_SCOPE_DEPTH: usize = 1 << 16;
 
-fn is_builtin_fp_simple_sort(name: &str) -> bool {
-    BUILTIN_FP_SIMPLE_SORT_NAMES.contains(&name)
+pub(super) fn is_builtin_theory_sort(name: &str) -> bool {
+    BUILTIN_THEORY_SORT_NAMES.contains(&name)
 }
 
 impl Context {
@@ -36,13 +44,20 @@ impl Context {
     /// namespace even though their implementation metadata lives in four
     /// maps.
     fn ensure_sort_name_available(&self, name: &str) -> Result<()> {
-        if is_builtin_fp_simple_sort(name) {
+        // Z3 5.0.0's no-logic signature includes the legacy lowercase `bool`
+        // alias and its proof-object carrier. Selecting any logic removes
+        // both, at which point the names may be declared as ordinary user
+        // sorts.
+        if is_builtin_theory_sort(name)
+            || (self.logic.is_none() && matches!(name, "bool" | "Proof"))
+        {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         if self.sort_defs.contains_key(name)
             || self.parametric_sort_defs.contains_key(name)
             || self.datatypes.contains_key(name)
             || self.parametric_datatypes.contains_key(name)
+            || self.sort_parameters.contains(name)
         {
             return Err(ElaborateError::SortRedeclaration(name.to_string()));
         }
@@ -56,7 +71,11 @@ impl Context {
         // method). On adoption the elaboration below expands every
         // `f`-application, turning this assertion into the reflexive
         // tautology while `(get-model)` gains the definitional entry.
-        let adopted = self.try_adopt_definitional_forall(term);
+        let adopted = if self.elaborating_polymorphic_instance {
+            None
+        } else {
+            self.try_adopt_definitional_forall(term)
+        };
         #[cfg(test)]
         if adopted.is_some() && std::mem::take(&mut self.fail_next_assert_after_macro_adoption) {
             if let Some(name) = adopted.as_deref() {
@@ -94,12 +113,22 @@ impl Context {
                 actual: format!("{sort:?}"),
             });
         }
+        let public_metadata = match self.validate_public_assertion(term, id) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if let Some(name) = adopted.as_deref() {
+                    self.rollback_adopted_macro(name);
+                }
+                return Err(error);
+            }
+        };
         // Retain the original parsed AST only under the retention policy and
         // while the parallel assertion stacks remain prefix-aligned.
         if self.retain_parsed_assertions && self.assertions_parsed.len() == self.assertions.len() {
             self.assertions_parsed.push(term.clone());
         }
         self.assertions.push(id);
+        self.assertion_finite_set_metadata.push(public_metadata);
         Ok(())
     }
 
@@ -116,6 +145,9 @@ impl Context {
             sort_defs: Vec::new(),
             fun_defs: Vec::new(),
             parametric_datatypes: Vec::new(),
+            polymorphic_assertion_count: self.polymorphic_assertions.len(),
+            authored_assertion_count: self.authored_assertions.len(),
+            polymorphic_declarations: Vec::new(),
         });
     }
 
@@ -145,11 +177,17 @@ impl Context {
             }
             // Remove assertions from this scope
             self.assertions.truncate(frame.assertion_count);
+            self.assertion_finite_set_metadata
+                .truncate(frame.assertion_count);
             self.assertions_parsed.truncate(frame.assertion_count);
             // Remove objectives from this scope
             self.objectives.truncate(frame.objective_count);
+            self.objective_finite_set_metadata
+                .truncate(frame.objective_count);
             // Remove soft constraints from this scope
             self.soft_constraints.truncate(frame.soft_constraint_count);
+            self.soft_finite_set_metadata
+                .truncate(frame.soft_constraint_count);
             // Remove named terms defined in this scope
             for name in frame.named_terms {
                 self.named_terms.remove(&name);
@@ -173,6 +211,7 @@ impl Context {
             // absent key from either map is a harmless no-op).
             for name in frame.sort_defs {
                 self.sort_defs.remove(&name);
+                self.public_sort_defs.remove(&name);
                 self.parametric_sort_defs.remove(&name);
             }
             // Remove function definitions defined in this scope (#8621)
@@ -183,6 +222,18 @@ impl Context {
             // Remove parametric datatype templates defined in this scope.
             for name in frame.parametric_datatypes {
                 self.parametric_datatypes.remove(&name);
+            }
+            self.polymorphic_assertions
+                .truncate(frame.polymorphic_assertion_count);
+            self.authored_assertions
+                .truncate(frame.authored_assertion_count);
+            if !frame.polymorphic_declarations.is_empty() {
+                self.polymorphic_declarations.retain(|declaration| {
+                    !frame
+                        .polymorphic_declarations
+                        .iter()
+                        .any(|name| name == &declaration.name)
+                });
             }
             true
         } else {
@@ -197,6 +248,7 @@ impl Context {
     /// clauses it appended at the current scope level once the solve completes.
     pub fn truncate_assertions(&mut self, len: usize) {
         self.assertions.truncate(len);
+        self.assertion_finite_set_metadata.truncate(len);
         self.assertions_parsed.truncate(len);
     }
 
@@ -287,12 +339,26 @@ impl Context {
     /// It repeats the context-side soundness checks: the declaration must be a
     /// single, ordinary user function with the exact signature; no earlier
     /// constraint may mention it; and the body must be non-recursive.
+    ///
+    /// `existing_uses_are_pinned` is the ONE narrow exemption from the
+    /// "no earlier constraint may mention it" check, and only the native API
+    /// may pass `true`.  That guard is there because an earlier raw
+    /// application would otherwise stay a disconnected uninterpreted symbol
+    /// once the defining `forall` is discharged.  The native adopter can
+    /// instead enumerate EVERY raw application in its term arena and replace
+    /// the `forall` with those applications' own definitional instances; when
+    /// it has done so, each earlier use is fixed at exactly the value this
+    /// interpretation gives it, so the interpretation is consistent with every
+    /// remaining occurrence and nothing is disconnected.  The parsed-SMT path
+    /// has no such enumeration and always passes `false`.  Every other check
+    /// below applies unchanged in both modes.
     #[doc(hidden)]
     pub fn try_register_native_adopted_macro_interp(
         &mut self,
         name: &str,
         params: &[(String, Sort)],
         body: TermId,
+        existing_uses_are_pinned: bool,
     ) -> bool {
         if !self.scopes.is_empty()
             || self.fun_defs.contains_key(name)
@@ -300,7 +366,7 @@ impl Context {
             || self.is_datatype_member_name(name)
             || self.overloaded_symbols.contains_key(name)
             || self.adopted_macro_interps.contains_key(name)
-            || self.constraints_mention_symbol(name)
+            || (!existing_uses_are_pinned && self.constraints_mention_symbol(name))
             || self.term_mentions_symbol(body, name)
         {
             return false;
@@ -433,10 +499,25 @@ impl Context {
         }
         // The `f`-application side at the parsed level: `(f x1 … xk)` with
         // the binders in order.
+        //
+        // Head candidacy is restricted to USER-DECLARED symbols.  A theory
+        // builtin (`+`, `bvadd`, `select`, …) is already totally interpreted,
+        // so it can never be the symbol a definition defines; without this
+        // restriction `forall a b. (= (add a b) (+ a b))` — the RHS being the
+        // binders applied exactly, in order — made BOTH sides look like heads
+        // and the disambiguation below refused a definition that is in fact
+        // unambiguous.  This can only NARROW candidacy, so it removes no
+        // adoption: an undeclared head was already rejected below by
+        // `self.symbols.get(&fname)?`.  Two user-declared heads
+        // (`f(a,b) = g(a,b)`) stay genuinely ambiguous and keep refusing.
+        let declared = &self.symbols;
         let side_f = |t: &PT| -> Option<String> {
             let PT::App(f, args) = t else {
                 return None;
             };
+            if !declared.contains_key(f) {
+                return None;
+            }
             if args.len() != pvars.len() {
                 return None;
             }
@@ -574,10 +655,13 @@ impl Context {
     /// This is used by the native Rust API to register constants created
     /// via `mk_var` so they appear in models.
     pub fn register_symbol(&mut self, name: String, term: TermId, sort: Sort) {
+        let public_sort = super::PublicSort::from_engine(&sort);
         let info = SymbolInfo {
             term: Some(term),
             sort,
             arg_sorts: vec![],
+            public_sort,
+            public_arg_sorts: vec![],
             internal_name: None,
         };
         if self.global_declarations_enabled() {
@@ -611,8 +695,74 @@ impl Context {
         arg_sorts: Vec<Sort>,
         ret_sort: Sort,
     ) -> Result<bool> {
-        let is_same_alias = |info: &SymbolInfo| {
-            self.symbol_identity_name(&surface_name, info) == internal_name
+        let public_arg_sorts = arg_sorts
+            .iter()
+            .map(super::PublicSort::from_engine)
+            .collect();
+        let public_sort = super::PublicSort::from_engine(&ret_sort);
+        self.register_native_function_alias_inner(
+            surface_name,
+            internal_name,
+            arg_sorts,
+            ret_sort,
+            public_arg_sorts,
+            public_sort,
+            false,
+        )
+    }
+
+    /// Register a trusted native function alias with an exact public signature.
+    ///
+    /// Z3 5.0.0 API adapters use this when a declaration mentions
+    /// [`super::PublicSort::FiniteSet`]. Its engine signature is derived by
+    /// lowering that public signature, while the distinct public identity is
+    /// retained for subsequent textual parsing.
+    pub fn register_native_public_function_alias(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        public_arg_sorts: Vec<super::PublicSort>,
+        public_sort: super::PublicSort,
+    ) -> Result<bool> {
+        let arg_sorts = public_arg_sorts
+            .iter()
+            .map(|sort| {
+                sort.engine_sort().ok_or_else(|| {
+                    ElaborateError::Unsupported(format!(
+                        "native alias '{surface_name}' has an unresolved public argument sort"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ret_sort = public_sort.engine_sort().ok_or_else(|| {
+            ElaborateError::Unsupported(format!(
+                "native alias '{surface_name}' has an unresolved public result sort"
+            ))
+        })?;
+        self.register_native_function_alias_inner(
+            surface_name,
+            internal_name,
+            arg_sorts,
+            ret_sort,
+            public_arg_sorts,
+            public_sort,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_native_function_alias_inner(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        arg_sorts: Vec<Sort>,
+        ret_sort: Sort,
+        public_arg_sorts: Vec<super::PublicSort>,
+        public_sort: super::PublicSort,
+        replace_public_identity: bool,
+    ) -> Result<bool> {
+        let is_same_engine_alias = |info: &SymbolInfo| {
+            info.internal_name.as_deref().unwrap_or(&surface_name) == internal_name
                 && info.arg_sorts == arg_sorts
                 && info.sort == ret_sort
         };
@@ -620,13 +770,61 @@ impl Context {
         // trusted alias of a datatype member. Check it before the collision
         // gates: after first registration, metadata intentionally classifies a
         // custom recognizer alias as a datatype-member surface name.
-        if self.symbols.get(&surface_name).is_some_and(is_same_alias)
-            || self
-                .overloaded_symbols
-                .get(&surface_name)
-                .is_some_and(|aliases| aliases.iter().any(is_same_alias))
+        if let Some(info) = self
+            .overloaded_symbols
+            .get_mut(&surface_name)
+            .and_then(|aliases| aliases.iter_mut().find(|info| is_same_engine_alias(info)))
         {
+            if replace_public_identity {
+                let changed =
+                    info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort;
+                info.public_arg_sorts = public_arg_sorts.clone();
+                info.public_sort = public_sort.clone();
+                if let Some(primary) = self
+                    .symbols
+                    .get_mut(&surface_name)
+                    .filter(|primary| is_same_engine_alias(primary))
+                {
+                    primary.public_arg_sorts = public_arg_sorts;
+                    primary.public_sort = public_sort;
+                }
+                return Ok(changed);
+            }
             return Ok(false);
+        }
+        if let Some(info) = self
+            .symbols
+            .get_mut(&surface_name)
+            .filter(|info| is_same_engine_alias(info))
+        {
+            if replace_public_identity {
+                let changed =
+                    info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort;
+                info.public_arg_sorts = public_arg_sorts;
+                info.public_sort = public_sort;
+                return Ok(changed);
+            }
+            return Ok(false);
+        }
+        if replace_public_identity {
+            let lowered_signature_collides = self
+                .symbols
+                .get(&surface_name)
+                .is_some_and(|info| info.arg_sorts == arg_sorts && info.sort == ret_sort)
+                || self
+                    .overloaded_symbols
+                    .get(&surface_name)
+                    .is_some_and(|aliases| {
+                        aliases
+                            .iter()
+                            .any(|info| info.arg_sorts == arg_sorts && info.sort == ret_sort)
+                    });
+            if lowered_signature_collides {
+                // The engine cannot select two declarations distinguished only
+                // by FiniteSet-vs-Array public identity. Reject instead of
+                // silently routing an application to an arbitrary alias.
+                return Err(ElaborateError::UnrepresentableOverload(surface_name));
+            }
         }
         // Reserved structural operators are safe only through their dedicated
         // builders. A textual alias could be intercepted by a specialized
@@ -644,6 +842,8 @@ impl Context {
                 term: None,
                 sort: ret_sort,
                 arg_sorts,
+                public_sort,
+                public_arg_sorts,
                 internal_name: Some(internal_name),
             },
         );
@@ -662,6 +862,26 @@ impl Context {
     ) -> Result<bool> {
         self.with_native_global_declaration_tracking(|ctx| {
             ctx.register_native_function_alias(surface_name, internal_name, arg_sorts, ret_sort)
+        })
+    }
+
+    /// Register a native alias with an exact public signature independently of
+    /// the current SMT-LIB assertion scope.
+    #[doc(hidden)]
+    pub fn register_native_global_public_function_alias(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        public_arg_sorts: Vec<super::PublicSort>,
+        public_sort: super::PublicSort,
+    ) -> Result<bool> {
+        self.with_native_global_declaration_tracking(|ctx| {
+            ctx.register_native_public_function_alias(
+                surface_name,
+                internal_name,
+                public_arg_sorts,
+                public_sort,
+            )
         })
     }
 
@@ -825,7 +1045,7 @@ impl Context {
 
         let mut matches = candidates
             .iter()
-            .filter(|info| signature_matches(info, true));
+            .filter(|info| signature_matches(info, self.int_real_coercions()));
         let Some(first) = matches.next().cloned() else {
             return Ok(None);
         };
@@ -965,7 +1185,7 @@ impl Context {
 
         let mut coercive = candidates
             .iter()
-            .filter(|info| signature_matches(info, true));
+            .filter(|info| signature_matches(info, self.int_real_coercions()));
         let Some(first) = coercive.next().cloned() else {
             return Ok(None);
         };
@@ -979,31 +1199,103 @@ impl Context {
 
     /// Process a command
     pub fn process_command(&mut self, cmd: &Command) -> Result<Option<CommandResult>> {
+        self.validate_command_execution_mode(cmd)?;
+        self.validate_command_against_declared_logic(cmd)?;
+        if matches!(
+            cmd,
+            Command::SetLogic(_)
+                | Command::DeclareSort(..)
+                | Command::DeclareSortParameter(..)
+                | Command::DefineSort(..)
+                | Command::DeclareDatatype(..)
+                | Command::DeclareDatatypes(..)
+                | Command::DeclareFun(..)
+                | Command::DeclareConst(..)
+                | Command::DefineFun(..)
+                | Command::DefineFunRec(..)
+                | Command::DefineFunsRec(..)
+                | Command::Assert(..)
+                | Command::AssertSoft { .. }
+                | Command::Push(..)
+                | Command::Pop(..)
+                | Command::Reset
+                | Command::ResetAssertions
+                | Command::CheckSat
+                | Command::CheckSatAssuming(..)
+                | Command::Maximize(..)
+                | Command::Minimize(..)
+        ) {
+            self.clear_materialized_polymorphic_assertions();
+        }
         match cmd {
             Command::SetLogic(logic) => {
+                self.validate_logic_sort_parameter_conflicts(logic)?;
                 self.logic = Some(logic.clone());
+                // This one came from the command stream, so a LATER one in the
+                // same stream is z3's "already been set" error.
+                self.logic_set_by_command = true;
+                self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             Command::DeclareConst(name, sort) => {
-                self.declare_const(name, sort)?;
+                if self.rank_sort_parameters(&[], sort).is_empty() {
+                    self.declare_const(name, sort)?;
+                    self.refresh_polymorphic_declarations()?;
+                } else {
+                    self.declare_polymorphic_fun(name, &[], sort)?;
+                }
                 Ok(None)
             }
             Command::DeclareFun(name, arg_sorts, ret_sort) => {
-                self.declare_fun(name, arg_sorts, ret_sort)?;
+                if self.rank_sort_parameters(arg_sorts, ret_sort).is_empty() {
+                    self.declare_fun(name, arg_sorts, ret_sort)?;
+                    self.refresh_polymorphic_declarations()?;
+                } else {
+                    self.declare_polymorphic_fun(name, arg_sorts, ret_sort)?;
+                }
                 Ok(None)
             }
             Command::DefineFun(name, params, ret_sort, body) => {
-                self.define_fun(name, params, ret_sort, body)?;
+                if self
+                    .function_definition_sort_parameters(params, ret_sort, body)
+                    .is_empty()
+                {
+                    self.define_fun(name, params, ret_sort, body)?;
+                } else {
+                    self.define_function_with_sort_parameters(name, params, ret_sort, body)?;
+                }
                 Ok(None)
             }
             Command::DefineFunRec(name, params, ret_sort, body) => {
-                // For recursive functions, register the symbol first so the body can reference it
-                self.define_fun_rec(name, params, ret_sort, body)?;
+                if self
+                    .function_definition_sort_parameters(params, ret_sort, body)
+                    .is_empty()
+                {
+                    // Register the symbol first so the body can reference it.
+                    self.define_fun_rec(name, params, ret_sort, body)?;
+                } else {
+                    self.define_recursive_function_with_sort_parameters(
+                        name, params, ret_sort, body,
+                    )?;
+                }
                 Ok(None)
             }
             Command::DefineFunsRec(declarations, bodies) => {
-                // For mutually recursive functions, register all symbols first
-                self.define_funs_rec(declarations, bodies)?;
+                let polymorphic =
+                    declarations
+                        .iter()
+                        .zip(bodies)
+                        .any(|((_name, params, ret_sort), body)| {
+                            !self
+                                .function_definition_sort_parameters(params, ret_sort, body)
+                                .is_empty()
+                        });
+                if polymorphic {
+                    self.define_recursive_functions_with_sort_parameters(declarations, bodies)?;
+                } else {
+                    // Register all symbols first so the bodies can reference peers.
+                    self.define_funs_rec(declarations, bodies)?;
+                }
                 Ok(None)
             }
             Command::DeclareVar(_, _)
@@ -1027,7 +1319,7 @@ impl Context {
                 ))
             }
             Command::Assert(term) => {
-                self.assert(term)?;
+                self.assert_authored(term)?;
                 Ok(None)
             }
             Command::AssertSoft {
@@ -1047,27 +1339,35 @@ impl Context {
                         actual: format!("{sort:?}"),
                     });
                 }
+                let public_metadata = self.validate_public_assertion(term, term_id)?;
                 self.add_soft_constraint(SoftAssertion {
                     term: term_id,
                     weight: *weight,
                     id: group.clone(),
                 });
+                if let Some(metadata) = self.soft_finite_set_metadata.last_mut() {
+                    *metadata = public_metadata;
+                }
                 Ok(None)
             }
             Command::Maximize(term) => {
                 let id = self.elaborate_term(term, &HashMap::default())?;
+                let public_metadata = self.validate_public_assertion(term, id)?;
                 self.objectives.push(Objective {
                     direction: ObjectiveDirection::Maximize,
                     term: id,
                 });
+                self.objective_finite_set_metadata.push(public_metadata);
                 Ok(None)
             }
             Command::Minimize(term) => {
                 let id = self.elaborate_term(term, &HashMap::default())?;
+                let public_metadata = self.validate_public_assertion(term, id)?;
                 self.objectives.push(Objective {
                     direction: ObjectiveDirection::Minimize,
                     term: id,
                 });
+                self.objective_finite_set_metadata.push(public_metadata);
                 Ok(None)
             }
             Command::Push(n) => {
@@ -1116,6 +1416,7 @@ impl Context {
                 Ok(None)
             }
             Command::CheckSat => {
+                self.materialize_polymorphic_assertions()?;
                 self.check_sat_commands = self.check_sat_commands.saturating_add(1);
                 Ok(Some(CommandResult::CheckSat))
             }
@@ -1125,10 +1426,22 @@ impl Context {
                 // exactly like a scope command: not a single-shot query.
                 self.check_sat_commands = self.check_sat_commands.saturating_add(1);
                 self.scope_commands_used = true;
+                self.materialize_polymorphic_assertions()?;
+                if terms
+                    .iter()
+                    .any(|term| !self.term_sort_parameters(term).is_empty())
+                {
+                    self.polymorphic_instantiation_complete = false;
+                    return Ok(Some(CommandResult::CheckSatAssuming(Vec::new())));
+                }
                 // Elaborate each assumption term to get its TermId
                 let term_ids: Vec<TermId> = terms
                     .iter()
-                    .map(|t| self.elaborate_term(t, &HashMap::default()))
+                    .map(|term| {
+                        let id = self.elaborate_term(term, &HashMap::default())?;
+                        self.validate_public_term(term)?;
+                        Ok(id)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Some(CommandResult::CheckSatAssuming(term_ids)))
             }
@@ -1141,8 +1454,9 @@ impl Context {
                 let pairs: Vec<(String, TermId)> = terms
                     .iter()
                     .map(|(text, t)| {
-                        self.elaborate_term(t, &HashMap::default())
-                            .map(|id| (text.clone(), id))
+                        let id = self.elaborate_term(t, &HashMap::default())?;
+                        self.validate_public_term(t)?;
+                        Ok((text.clone(), id))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Some(CommandResult::GetValue(pairs)))
@@ -1151,16 +1465,25 @@ impl Context {
                 // (eval t) is Z3 shorthand for get-value of one term: elaborate
                 // the term and let the executor print just its model value.
                 let term_id = self.elaborate_term(term, &HashMap::default())?;
+                self.validate_public_term(term)?;
                 Ok(Some(CommandResult::Eval(term_id)))
             }
             Command::GetConsequences(assumptions, variables) => {
                 let assumption_ids: Vec<TermId> = assumptions
                     .iter()
-                    .map(|t| self.elaborate_term(t, &HashMap::default()))
+                    .map(|term| {
+                        let id = self.elaborate_term(term, &HashMap::default())?;
+                        self.validate_public_term(term)?;
+                        Ok(id)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let variable_ids: Vec<TermId> = variables
                     .iter()
-                    .map(|t| self.elaborate_term(t, &HashMap::default()))
+                    .map(|term| {
+                        let id = self.elaborate_term(term, &HashMap::default())?;
+                        self.validate_public_term(term)?;
+                        Ok(id)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Some(CommandResult::GetConsequences(
                     assumption_ids,
@@ -1169,31 +1492,57 @@ impl Context {
             }
             Command::GetAbduct(name, goal) => {
                 let goal_id = self.elaborate_term(goal, &HashMap::default())?;
+                self.validate_public_term(goal)?;
                 Ok(Some(CommandResult::GetAbduct(name.clone(), goal_id)))
             }
             Command::GetInfo(keyword) => Ok(Some(CommandResult::GetInfo(keyword.clone()))),
             Command::GetOption(keyword) => Ok(Some(CommandResult::GetOption(keyword.clone()))),
+            Command::Labels => Ok(Some(CommandResult::Labels)),
             Command::GetAssertions => Ok(Some(CommandResult::GetAssertions)),
             Command::SetOption(keyword, value) => {
                 self.set_option(keyword, value);
                 Ok(None)
             }
+            Command::SetOptionAttribute(keyword) => Err(ElaborateError::Unsupported(format!(
+                "valueless solver option {keyword}"
+            ))),
             Command::Exit => Ok(Some(CommandResult::Exit)),
             Command::Reset => {
                 // Preserve the host-configured parsed-assertion retention
                 // policy across `(reset)` — it reflects the session's proof
                 // configuration (e.g. `--no-proof`), not per-script state.
                 let retain_parsed = self.retain_parsed_assertions;
+                let finite_set_typing_mode = self.finite_set_typing_mode;
+                let strict_logic_compliance = self.strict_logic_compliance;
                 *self = Self::new();
                 self.retain_parsed_assertions = retain_parsed;
+                self.finite_set_typing_mode = finite_set_typing_mode;
+                self.strict_logic_compliance = strict_logic_compliance;
                 Ok(None)
             }
             Command::ResetAssertions => {
+                if self.strict_logic_compliance {
+                    // SMT-LIB 2.7 removes every assertion level beyond the
+                    // first. Popping the frames (instead of merely clearing
+                    // the vector) also retires declarations and definitions
+                    // introduced in those levels when
+                    // :global-declarations is false.
+                    while self.pop() {}
+                } else {
+                    // Z3 5.0.0 keeps its public assertion-stack level across
+                    // reset-assertions. Preserve the historical executor
+                    // behavior used by --z3-mode: discard the materialized
+                    // frames while the CLI retains the public level and
+                    // simulates later pops.
+                    self.scopes.clear();
+                }
                 self.assertions.clear();
+                self.assertion_finite_set_metadata.clear();
                 self.assertions_parsed.clear();
                 self.objectives.clear();
+                self.objective_finite_set_metadata.clear();
                 self.soft_constraints.clear();
-                self.scopes.clear();
+                self.soft_finite_set_metadata.clear();
                 // Named formulas are assertion provenance. Keeping them after
                 // their assertions and scope frames are gone can make a later
                 // syntactically identical assertion inherit a stale core label.
@@ -1206,6 +1555,11 @@ impl Context {
                     self.fun_defs.remove(name.as_str());
                 }
                 self.adopted_macro_interps.clear();
+                self.polymorphic_assertions
+                    .retain(|assertion| assertion.persistent_definition);
+                self.authored_assertions.clear();
+                self.materialized_polymorphic_assertions = 0;
+                self.polymorphic_instantiation_complete = true;
                 Ok(None)
             }
             // Declare/define sort are stored but don't produce output
@@ -1229,9 +1583,16 @@ impl Context {
                     )));
                 }
                 // Store as uninterpreted sort
-                self.sort_defs
-                    .insert(name.clone(), Sort::Uninterpreted(name.clone()));
+                let sort = Sort::Uninterpreted(name.clone());
+                self.sort_defs.insert(name.clone(), sort.clone());
+                self.public_sort_defs
+                    .insert(name.clone(), super::PublicSort::Core(sort));
                 self.track_scoped_sort_def(name.clone());
+                self.refresh_polymorphic_declarations()?;
+                Ok(None)
+            }
+            Command::DeclareSortParameter(name) => {
+                self.declare_sort_parameter(name)?;
                 Ok(None)
             }
             Command::DefineSort(name, params, sort) => {
@@ -1245,10 +1606,13 @@ impl Context {
                         "duplicate define-sort parameter: {duplicate}"
                     )));
                 }
+                self.validate_define_sort_parameters(params, sort)?;
                 if params.is_empty() {
                     // Monomorphic synonym: eagerly elaborate and store the sort.
+                    let public_sort = self.elaborate_public_sort(sort)?;
                     let elaborated = self.elaborate_sort(sort)?;
                     self.sort_defs.insert(name.clone(), elaborated);
+                    self.public_sort_defs.insert(name.clone(), public_sort);
                 } else {
                     // Parameterized synonym: keep the body as a template so each
                     // ground use `(Name A1 .. An)` substitutes the type parameters
@@ -1258,27 +1622,30 @@ impl Context {
                         .insert(name.clone(), (params.clone(), sort.clone()));
                 }
                 self.track_scoped_sort_def(name.clone());
+                self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             Command::DeclareDatatype(name, datatype_dec) => {
-                if is_builtin_fp_simple_sort(name) {
+                if is_builtin_theory_sort(name) {
                     return Err(ElaborateError::ReservedSymbol(name.clone()));
                 }
                 self.declare_datatype(name, datatype_dec)?;
+                self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             Command::DeclareDatatypes(sort_decs, datatype_decs) => {
                 if let Some(sort_dec) = sort_decs
                     .iter()
-                    .find(|sort_dec| is_builtin_fp_simple_sort(&sort_dec.name))
+                    .find(|sort_dec| is_builtin_theory_sort(&sort_dec.name))
                 {
                     return Err(ElaborateError::ReservedSymbol(sort_dec.name.clone()));
                 }
                 self.declare_datatypes(sort_decs, datatype_decs)?;
+                self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             // SetInfo is acknowledged but not required to produce output
-            Command::SetInfo(_, _) => Ok(None),
+            Command::SetInfo(_, _) | Command::SetInfoAttribute(_) => Ok(None),
             // Echo returns the message to be printed (handled by executor)
             Command::Echo(msg) => Ok(Some(CommandResult::Echo(msg.clone()))),
             Command::GetAssignment => Ok(Some(CommandResult::GetAssignment)),
@@ -1286,8 +1653,26 @@ impl Context {
             Command::GetUnsatCoreWithFarkas => Ok(Some(CommandResult::GetUnsatCoreWithFarkas)),
             Command::GetUnsatAssumptions => Ok(Some(CommandResult::GetUnsatAssumptions)),
             Command::GetProof => Ok(Some(CommandResult::GetProof)),
+            Command::Display(term, source) => {
+                let _ = self.elaborate_term(term, &HashMap::default())?;
+                self.validate_public_term(term)?;
+                Ok(Some(CommandResult::Display(source.clone())))
+            }
+            Command::DebugSet(name, term, source) => {
+                let _ = self.elaborate_term(term, &HashMap::default())?;
+                self.validate_public_term(term)?;
+                self.z3_debug_exprs.insert(name.clone(), source.clone());
+                Ok(None)
+            }
+            Command::DebugPpVar(name) => {
+                let source = self.z3_debug_exprs.get(name).cloned().ok_or_else(|| {
+                    ElaborateError::Unsupported(format!("unknown global variable {name}"))
+                })?;
+                Ok(Some(CommandResult::Display(source)))
+            }
             Command::Simplify(term) => {
                 let term_id = self.elaborate_term(term, &HashMap::default())?;
+                self.validate_public_term(term)?;
                 Ok(Some(CommandResult::Simplify(term_id)))
             }
             // `(apply <tactic>)`: no term elaboration is needed — the tactic
@@ -1321,6 +1706,7 @@ impl Context {
         if !matches!(
             cmd,
             Command::DeclareSort(..)
+                | Command::DeclareSortParameter(..)
                 | Command::DefineSort(..)
                 | Command::DeclareDatatype(..)
                 | Command::DeclareDatatypes(..)
@@ -1357,6 +1743,16 @@ impl Context {
         if key == "produce-proofs" && matches!(opt_value, OptionValue::Bool(true)) {
             self.retain_parsed_assertions = true;
         }
+        if key == "numeral-as-real" {
+            if let OptionValue::Bool(enabled) = &opt_value {
+                self.numeral_as_real = *enabled;
+            }
+        }
+        if key == "int-real-coercions" {
+            if let OptionValue::Bool(enabled) = &opt_value {
+                self.int_real_coercions = *enabled;
+            }
+        }
         if key == "global-declarations" || key == "global-decls" {
             self.options
                 .insert("global-declarations".to_string(), opt_value.clone());
@@ -1370,6 +1766,14 @@ impl Context {
     pub fn get_option(&self, keyword: &str) -> Option<&OptionValue> {
         let key = keyword.trim_start_matches(':');
         self.options.get(key)
+    }
+
+    pub(super) fn numeral_as_real(&self) -> bool {
+        self.numeral_as_real
+    }
+
+    pub(super) fn int_real_coercions(&self) -> bool {
+        self.int_real_coercions
     }
 
     /// Iterate over named terms (for get-assignment)

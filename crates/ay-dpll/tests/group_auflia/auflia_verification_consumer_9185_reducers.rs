@@ -22,6 +22,20 @@ fn expect_not_sat(input: &str, label: &str) {
     assert_ne!(result, SolverOutcome::Sat, "{label}: must not return SAT");
 }
 
+/// The counterpart of [`expect_not_sat`], and the one whose absence hid a wrong
+/// answer: a ONE-SIDED assertion cannot catch a wrong verdict on the side it
+/// permits. `expect_not_sat` accepts `unsat`, so a WRONG UNSAT passed as green.
+/// Use this whenever the formula is satisfiable but AY is not yet expected to
+/// prove it — it forbids the unsound direction while tolerating incompleteness.
+fn expect_not_unsat(input: &str, label: &str) {
+    let result = run_executor_smt_with_timeout(input, 30).expect("execution should succeed");
+    assert_ne!(
+        result,
+        SolverOutcome::Unsat,
+        "{label}: must not return UNSAT (the formula is satisfiable)"
+    );
+}
+
 fn expect_unsat(input: &str, label: &str) {
     let result = run_executor_smt_with_timeout(input, 30).expect("execution should succeed");
     assert_eq!(result, SolverOutcome::Unsat, "{label}: expected UNSAT");
@@ -280,10 +294,23 @@ fn symbolic_mod_range_disjunction_reducer_is_sat() {
 #[test]
 #[timeout(30_000)]
 fn symbolic_mod_zero_divisor_branch_with_restore_equality_is_soundly_unknown() {
-    // Built-in non-string sequences do not yet have a complete model witness.
-    // Keep this satisfiable reducer behind the deliberate fail-closed gate:
-    // UNKNOWN is sound, whereas bypassing validation to recover SAT is not.
-    expect_unknown(
+    // STALE PIN REFRESHED. The premise below is obsolete:
+    //
+    //   "Built-in non-string sequences do not yet have a complete model witness.
+    //    Keep this satisfiable reducer behind the deliberate fail-closed gate:
+    //    UNKNOWN is sound, whereas bypassing validation to recover SAT is not."
+    //
+    // Non-string sequences DO have a complete model witness now. The test's own
+    // wording concedes the reducer is SATISFIABLE, and AY answers `sat` with a
+    // complete model; z3 4.15.4 answers `sat` directly; and AY's published model
+    // REPLAYS through z3 as `sat` against the original assertions. So this is
+    // AY having closed a capability gap, not a gate being bypassed.
+    //
+    // Note this pin was `expect_unknown`, which — like the `expect_not_sat` on
+    // its sibling above — is ONE-SIDED. That one hid a wrong `unsat` for as long
+    // as it stood. This one only hid an improvement, but the shape is the same:
+    // prefer an assertion that names the correct verdict.
+    expect_sat(
         r#"
 (set-logic ALL)
 (declare-datatype List ((nil) (cons (hd Int) (tl List))))
@@ -311,7 +338,44 @@ fn symbolic_mod_zero_divisor_branch_with_restore_equality_is_soundly_unknown() {
 #[test]
 #[timeout(30_000)]
 fn symbolic_mod_zero_divisor_branch_with_restore_contradiction_is_not_sat() {
-    expect_not_sat(
+    // KNOWN-RED, PINNING A WRONG ANSWER. AY returns `unsat`; the formula is
+    // SATISFIABLE and z3 4.15.4 produces an explicit witness:
+    //
+    //   dividend = -1, divisor = 0, mod0(-1, 0) = 0, arg0_view = (seq.unit 2),
+    //   list_current = nil,
+    //   __seq_index_restore_List = \v i. ite(v = (seq.unit 2) and i = -1,
+    //                                        cons 5 nil, nil)
+    //
+    // Checked by hand against all three assertions:
+    //   1. nil != (cons 5 nil)                       -> true
+    //   2. nil  = restore(view, mod(-1,0)) = nil     -> true
+    //   3. first disjunct `(= 0 seq_len_proxy_48)`   -> true
+    //
+    // SMT-LIB leaves `(mod a 0)` UNCONSTRAINED, so `mod dividend divisor` may
+    // take the value 0 here. AY refutes a branch the problem explicitly allows.
+    //
+    // This assertion USED to be `expect_not_sat`, which accepts `unsat` — so a
+    // WRONG UNSAT passed as green and the defect was invisible. That is the
+    // failure mode recorded as "`disagree: 0` is not zero wrong answers": a
+    // one-sided assertion cannot see a wrong answer on the side it permits.
+    //
+    // Isolated by controlled variant: dropping assertion 3 yields a sound
+    // `unknown`, and adding a disjunction cannot make a formula unsat — so
+    // assertion 3 is triggering a different code path (its extra `mod` atoms
+    // bring in `mod_div_elim`), not narrowing the model space. Root cause is in
+    // `executor/mod_div_elim/`; `mk_mod` itself is correct and already guards
+    // div-by-zero (#div0-soundness).
+    //
+    // FIXED in `theories/combined/mod.rs`: `zero_mod_dividend` asserted the
+    // identity `(mod a 0) == a`, which SMT-LIB does not grant, and
+    // `assertions_have_quantifier_consumer_restore_zero_divisor_contradiction` turned that
+    // into an outright `SolveResult::unsat()`. AY now answers `unknown` here —
+    // sound but incomplete; `sat` remains the completeness goal.
+    //
+    // Asserted as NOT-UNSAT, deliberately. That is the SOUNDNESS property, and
+    // it is the assertion that would have caught this from the start: the old
+    // `expect_not_sat` permitted exactly the wrong answer AY was giving.
+    expect_not_unsat(
         r#"
 (set-logic ALL)
 (declare-datatype List ((nil) (cons (hd Int) (tl List))))
@@ -1316,13 +1380,26 @@ fn verification_consumer_datatype_tester_branch_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn arbitrary_seq_quantifier_still_fails_closed() {
-    // Body must be NON-vacuous (mention the bound `s`) to exercise the opaque-Seq
-    // fail-closed guard: a constant body like `false` is now soundly collapsed by
-    // simplify_vacuous_quantifiers — `(forall s. false) === false` over the
-    // non-empty Seq sort — and AY then correctly decides it UNSAT (matching z3),
-    // which is a sound improvement, not a guard bypass. `(p s)` stays opaque.
-    expect_unknown(
+fn arbitrary_seq_quantifier_is_sat_by_constant_interpretation() {
+    // HISTORY: this was `arbitrary_seq_quantifier_still_fails_closed`, pinning
+    // `unknown` for an opaque `(p s)` body. The pin recorded a LIMITATION, not
+    // a soundness boundary — and the comment it carried already set the
+    // precedent that a sound improvement here "is a sound improvement, not a
+    // guard bypass".
+    //
+    // The CONSTANT-INTERPRETATION certificate now decides it. The answer is
+    // `sat`, and the certificate's own witness is `p := λs. true`:
+    // substituting that interpretation turns the body into `true`, so the
+    // negated body is refuted outright.
+    //
+    // Cross-checked against z3 4.15.4 (the `(Seq Int)` sort needs `ALL`;
+    // `QF_AUFLIA` makes z3 reject the sort and answer `sat` for an empty
+    // problem, so the check below was run under `(set-logic ALL)`):
+    //     $ z3 canary.smt2
+    //     sat
+    //     ( (define-fun p ((x!0 (Seq Int))) Bool true) )
+    // z3 reports exactly the interpretation AY's certificate constructs.
+    expect_sat(
         r#"
 (set-logic QF_AUFLIA)
 (declare-fun p ((Seq Int)) Bool)

@@ -89,6 +89,7 @@ pub const OP_SUBSET: &str = "set.subset";
 pub const OUT_OF_FRAGMENT_OPS: &[&str] = &[
     "set.map",
     "set.filter",
+    "set.range",
     "set.fold",
     "set.comprehension",
     "set.choose",
@@ -96,7 +97,9 @@ pub const OUT_OF_FRAGMENT_OPS: &[&str] = &[
     "set.complement",
     "set.union",
     "set.inter",
+    "set.intersect",
     "set.minus",
+    "set.difference",
 ];
 
 /// Classification of a set-related application term.

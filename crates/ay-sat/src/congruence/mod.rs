@@ -72,6 +72,11 @@ pub struct CongruenceStats {
     pub clauses_modified: u64,
     /// Number of rounds of congruence closure
     pub rounds: u64,
+    /// Congruence-closure fixpoints abandoned because the process memory limit
+    /// was already exceeded. Non-zero means the pass stopped early and returned
+    /// a PARTIAL closure — sound, just less simplification. Before this bound
+    /// existed the same situation grew a 33 MB instance to 82.75 GB.
+    pub memory_abandoned_closures: u64,
     /// ITE gates morphed to AND (CaDiCaL rewrite_ite_gate)
     pub ite_to_and: u64,
     /// ITE gates morphed to XOR (CaDiCaL rewrite_ite_gate)

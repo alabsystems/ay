@@ -33,6 +33,25 @@ use crate::VarId;
 /// fresh auxiliary variables for wide rows instead of skipping.
 const MAX_XOR_PROOF_ROW_VARS: usize = 24;
 
+/// Total helper clauses the XOR proof encoder may emit across ALL rows of one
+/// elimination trace.
+///
+/// `encode_xor_row_to_cnf` emits `2^(k-1)` clauses for a width-`k` row, so the
+/// per-row cap alone bounds nothing useful once Gaussian fill-in produces many
+/// wide rows: at the cap, `k = 24` is 8.4 M clauses — roughly 1 GB of
+/// `Vec<Literal>` — for a SINGLE row, and the trace has one row per pivot.
+///
+/// Measured on `lightsout_sat_23_unbounded_direct_random50_2_unsat` from the
+/// SAT-COMP 2026 Main set — **529 variables, 7744 clauses, a 180 KB file**,
+/// detected as one XOR component of 529 constraints: AY reached **71.7 GB**,
+/// and 11.3 GB within six seconds against a `--memory 2000` limit that never
+/// took effect. 26 of the 31 official solvers solve that instance.
+///
+/// Skipping emission is sound — it only means fewer helper clauses for the
+/// external checker, which fails closed — so the aggregate budget is a pure
+/// safety bound. Sized so the whole trace stays around 100 MB of clause data.
+const MAX_XOR_PROOF_TOTAL_CLAUSES: usize = 1 << 20;
+
 /// Result of a Gaussian elimination step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GaussResult {
@@ -619,6 +638,13 @@ impl GaussianSolver {
     /// For k variables, generates 2^(k-1) clauses that forbid all assignments
     /// violating the XOR parity constraint.
     fn encode_xor_row_to_cnf(row: &PackedRow, col_to_var: &[VarId], out: &mut Vec<Vec<Literal>>) {
+        // Aggregate budget across the whole elimination trace. Without it the
+        // per-row width cap bounds one row and nothing else, and a 180 KB
+        // instance can drive this to tens of gigabytes (see
+        // `MAX_XOR_PROOF_TOTAL_CLAUSES`).
+        if out.len() >= MAX_XOR_PROOF_TOTAL_CLAUSES {
+            return;
+        }
         let vars: Vec<(VarId, usize)> = row
             .iter_set_bits()
             .map(|col| (col_to_var[col], col))

@@ -122,7 +122,33 @@ pub(in crate::executor) fn self_cert_armed() -> bool {
     SELF_CERT_ARMED.with(Cell::get)
 }
 
-fn validate_regular_artifact_metadata(metadata: &Metadata) -> io::Result<()> {
+/// How a checked artifact can be reached for platform identity queries.
+///
+/// Windows exposes neither the file identity nor the hard-link count through
+/// `Metadata` on stable (the accessors sit behind the perpetually unstable
+/// `windows_by_handle` feature, rust-lang/rust#63010), so the source is threaded
+/// through to `GetFileInformationByHandle` instead of read off the metadata.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ArtifactFileRef<'a> {
+    Handle(&'a File),
+    Path(&'a Path),
+}
+
+#[cfg(windows)]
+impl ArtifactFileRef<'_> {
+    fn windows_info(self) -> io::Result<ay_sys::windows_fs::WindowsFileInfo> {
+        match self {
+            Self::Handle(file) => ay_sys::windows_fs::file_info(file),
+            Self::Path(path) => ay_sys::windows_fs::file_info_no_follow(path),
+        }
+    }
+}
+
+fn validate_regular_artifact_metadata(
+    metadata: &Metadata,
+    source: ArtifactFileRef<'_>,
+) -> io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -131,6 +157,7 @@ fn validate_regular_artifact_metadata(metadata: &Metadata) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
+        let _ = source;
         use std::os::unix::fs::MetadataExt;
         if metadata.nlink() != 1 {
             return Err(io::Error::new(
@@ -141,25 +168,29 @@ fn validate_regular_artifact_metadata(metadata: &Metadata) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
         if metadata.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "artifact path is a symbolic link",
             ));
         }
-        if metadata.number_of_links().is_some_and(|links| links != 1) {
+        if source.windows_info()?.number_of_links != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "artifact file has multiple hard links",
             ));
         }
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = source;
+    }
     Ok(())
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &Metadata) -> io::Result<FileIdentity> {
+fn file_identity(metadata: &Metadata, source: ArtifactFileRef<'_>) -> io::Result<FileIdentity> {
+    let _ = source;
     use std::os::unix::fs::MetadataExt;
     Ok(FileIdentity {
         device: metadata.dev(),
@@ -168,20 +199,17 @@ fn file_identity(metadata: &Metadata) -> io::Result<FileIdentity> {
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &Metadata) -> io::Result<FileIdentity> {
-    use std::os::windows::fs::MetadataExt;
+fn file_identity(metadata: &Metadata, source: ArtifactFileRef<'_>) -> io::Result<FileIdentity> {
+    let _ = metadata;
+    let info = source.windows_info()?;
     Ok(FileIdentity {
-        volume: metadata.volume_serial_number().ok_or_else(|| {
-            io::Error::other("artifact filesystem did not expose a volume identity")
-        })?,
-        index: metadata.file_index().ok_or_else(|| {
-            io::Error::other("artifact filesystem did not expose a file identity")
-        })?,
+        volume: info.volume_serial_number,
+        index: info.file_index,
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_metadata: &Metadata) -> io::Result<FileIdentity> {
+fn file_identity(_metadata: &Metadata, _source: ArtifactFileRef<'_>) -> io::Result<FileIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "artifact identity checks are unsupported on this platform",
@@ -212,7 +240,7 @@ fn reject_unsafe_artifact_leaf(path: &Path, allow_missing: bool) -> io::Result<(
             io::ErrorKind::InvalidInput,
             "artifact path is not a regular file",
         )),
-        Ok(metadata) => validate_regular_artifact_metadata(&metadata),
+        Ok(metadata) => validate_regular_artifact_metadata(&metadata, ArtifactFileRef::Path(path)),
         Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -225,8 +253,8 @@ fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, FileIdentity)> 
     configure_no_follow(&mut options);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    validate_regular_artifact_metadata(&metadata)?;
-    let identity = file_identity(&metadata)?;
+    validate_regular_artifact_metadata(&metadata, ArtifactFileRef::Handle(&file))?;
+    let identity = file_identity(&metadata, ArtifactFileRef::Handle(&file))?;
     Ok((file, identity))
 }
 
@@ -237,8 +265,8 @@ fn create_new_regular_file_no_follow(path: &Path) -> io::Result<(File, FileIdent
     configure_no_follow(&mut options);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    validate_regular_artifact_metadata(&metadata)?;
-    let identity = file_identity(&metadata)?;
+    validate_regular_artifact_metadata(&metadata, ArtifactFileRef::Handle(&file))?;
+    let identity = file_identity(&metadata, ArtifactFileRef::Handle(&file))?;
     Ok((file, identity))
 }
 
@@ -282,7 +310,7 @@ fn path_has_identity_allow_multiple_links(path: &Path, expected: FileIdentity) -
             "opened artifact cleanup path is not a regular file",
         ));
     }
-    Ok(file_identity(&metadata)? == expected)
+    Ok(file_identity(&metadata, ArtifactFileRef::Handle(&file))? == expected)
 }
 
 fn remove_file_link_if_owned(path: &Path, expected: FileIdentity) -> io::Result<bool> {
@@ -1056,8 +1084,8 @@ pub(in crate::executor) fn prepare_for_check() -> Result<CheckTransaction> {
 
 fn seal_open_file(file: &mut File, expected_len: Option<u64>) -> io::Result<ArtifactSeal> {
     let before = file.metadata()?;
-    validate_regular_artifact_metadata(&before)?;
-    let identity = file_identity(&before)?;
+    validate_regular_artifact_metadata(&before, ArtifactFileRef::Handle(file))?;
+    let identity = file_identity(&before, ArtifactFileRef::Handle(file))?;
     let len = before.len();
     if let Some(expected) = expected_len {
         if expected != len {
@@ -1100,8 +1128,8 @@ fn seal_open_file(file: &mut File, expected_len: Option<u64>) -> io::Result<Arti
         ));
     }
     let after = file.metadata()?;
-    validate_regular_artifact_metadata(&after)?;
-    if file_identity(&after)? != identity || after.len() != len {
+    validate_regular_artifact_metadata(&after, ArtifactFileRef::Handle(file))?;
+    if file_identity(&after, ArtifactFileRef::Handle(file))? != identity || after.len() != len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact identity or length changed while sealing",

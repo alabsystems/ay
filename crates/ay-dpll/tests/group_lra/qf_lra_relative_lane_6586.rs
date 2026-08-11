@@ -14,6 +14,8 @@
 
 use crate::common::{check_z3_or_skip, run_z3_file, workspace_path, SolverOutcome};
 use anyhow::{anyhow, Context, Result};
+use ay_dpll::Executor;
+use ay_frontend::parse;
 use ntest::timeout;
 use std::fs;
 use std::path::Path;
@@ -22,8 +24,6 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use ay_dpll::Executor;
-use ay_frontend::parse;
 
 // Integration tests run the debug `ay-dpll` stack, which is materially slower
 // than the release CLI measurements used in the design packet. Use a wider
@@ -97,7 +97,17 @@ fn run_executor_file_with_timeout_and_stats(
 #[timeout(90_000)]
 fn test_constraints_tempo_width_10_reports_bound_refinement_handoffs_issue_6586() -> Result<()> {
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/constraints-tempo-width-10.smt2");
-    assert!(path.exists(), "benchmark not found: {}", path.display());
+    // `benchmarks/smtcomp/` is gitignored, so a clean checkout has no corpus.
+    // Skip when the fixture is absent instead of hard-failing; the Sat assertion
+    // below is unchanged and still runs wherever the corpus is installed.
+    if !path.exists() {
+        eprintln!(
+            "SKIP test_constraints_tempo_width_10_reports_bound_refinement_handoffs_issue_6586: \
+             corpus benchmark not found: {}",
+            path.display()
+        );
+        return Ok(());
+    }
 
     let run = run_executor_file_with_timeout_and_stats(&path, BENCHMARK_TIMEOUT_SECS)?;
     eprintln!(
@@ -127,12 +137,14 @@ fn test_red_relative_family_reports_bound_refinement_handoffs_issue_6586() -> Re
     let simple_startup =
         workspace_path("benchmarks/smtcomp/QF_LRA/simple_startup_10nodes.bug.induct.smt2");
     let uart = workspace_path("benchmarks/smtcomp/QF_LRA/uart-23.induction.cvc.smt2");
+    // simple_startup_10nodes is whitelisted in .gitignore and always present, so
+    // it stays a hard requirement. uart-23 is part of the gitignored smtcomp
+    // corpus, so it is checked only when installed.
     assert!(
         simple_startup.exists(),
         "benchmark not found: {}",
         simple_startup.display()
     );
-    assert!(uart.exists(), "benchmark not found: {}", uart.display());
 
     if check_z3_or_skip() {
         assert_eq!(
@@ -144,15 +156,10 @@ fn test_red_relative_family_reports_bound_refinement_handoffs_issue_6586() -> Re
 
     let simple_run =
         run_executor_file_with_timeout_and_stats(&simple_startup, BENCHMARK_TIMEOUT_SECS)?;
-    let uart_run = run_executor_file_with_timeout_and_stats(&uart, BENCHMARK_TIMEOUT_SECS)?;
 
     eprintln!(
         "[#6586 trace] simple_startup_10nodes: outcome={:?}, timed_out={}, handoffs={}",
         simple_run.outcome, simple_run.timed_out, simple_run.bound_refinement_handoffs
-    );
-    eprintln!(
-        "[#6586 trace] uart-23: outcome={:?}, timed_out={}, handoffs={}",
-        uart_run.outcome, uart_run.timed_out, uart_run.bound_refinement_handoffs
     );
 
     assert!(
@@ -163,20 +170,34 @@ fn test_red_relative_family_reports_bound_refinement_handoffs_issue_6586() -> Re
         "unexpected simple_startup_10nodes result: {:?}",
         simple_run.outcome
     );
-    assert!(
-        matches!(
-            uart_run.outcome,
-            SolverOutcome::Sat | SolverOutcome::Unknown | SolverOutcome::Timeout
-        ),
-        "unexpected uart-23 result: {:?}",
-        uart_run.outcome
-    );
     // Note: handoff counts may be 0 with geometric restarts. The correctness
     // assertions are the outcome checks above; handoff count is telemetry.
     eprintln!(
-        "[#6586 trace] handoffs: simple_startup={}, uart-23={} (informational)",
-        simple_run.bound_refinement_handoffs, uart_run.bound_refinement_handoffs
+        "[#6586 trace] handoffs: simple_startup={} (informational)",
+        simple_run.bound_refinement_handoffs
     );
+
+    if uart.exists() {
+        let uart_run = run_executor_file_with_timeout_and_stats(&uart, BENCHMARK_TIMEOUT_SECS)?;
+        eprintln!(
+            "[#6586 trace] uart-23: outcome={:?}, timed_out={}, handoffs={} (informational)",
+            uart_run.outcome, uart_run.timed_out, uart_run.bound_refinement_handoffs
+        );
+        assert!(
+            matches!(
+                uart_run.outcome,
+                SolverOutcome::Sat | SolverOutcome::Unknown | SolverOutcome::Timeout
+            ),
+            "unexpected uart-23 result: {:?}",
+            uart_run.outcome
+        );
+    } else {
+        eprintln!(
+            "SKIP uart-23 leg of test_red_relative_family_reports_bound_refinement_handoffs_issue_6586: \
+             corpus benchmark not found: {}",
+            uart.display()
+        );
+    }
 
     Ok(())
 }

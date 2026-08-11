@@ -465,6 +465,10 @@ fn test_deep_negative_exists_becomes_forall() {
     let five = terms.mk_int(BigInt::from(5));
     let eq = terms.mk_eq(x, five);
     let exists = terms.mk_exists(vec![("x".to_string(), Sort::Int)], eq);
+    terms.set_quantifier_id(exists, "qid-negative-exists".to_string());
+    terms.set_skolem_id(exists, "skid-negative-exists".to_string());
+    terms.set_quantifier_weight(exists, 9);
+    terms.set_quantifier_no_patterns(exists, vec![eq]);
     let not_exists = terms.mk_not(exists);
 
     let result = skolemize_deep(&mut terms, not_exists, true);
@@ -474,6 +478,10 @@ fn test_deep_negative_exists_becomes_forall() {
         "negative Exists should be converted to Forall via NNF"
     );
     let rewritten = result.unwrap();
+    assert_eq!(terms.quantifier_id(rewritten), Some("qid-negative-exists"));
+    assert_eq!(terms.skolem_id(rewritten), Some("skid-negative-exists"));
+    assert_eq!(terms.quantifier_weight(rewritten), 9);
+    assert_eq!(terms.quantifier_no_patterns(rewritten), &[eq]);
     match terms.get(rewritten) {
         TermData::Forall(vars, body, _) => {
             assert_eq!(vars.len(), 1);
@@ -1049,4 +1057,129 @@ fn test_finite_domain_bounded_bv_forall_empty_range_vacuous_true() {
         TermData::Const(ay_core::Constant::Bool(true)) => {}
         other => panic!("expected vacuous true, got {other:?}"),
     }
+}
+
+// --- Hilbert-choice provenance of a Skolem CONSTANT
+// --- (`register_skolem_choice_provenance`).
+//
+// The proof exporter needs to spell `sk!x` as the term it DENOTES. Only the
+// mint site knows that term, so it is recorded here and nowhere else. Scope is
+// deliberately narrow — see the function's own docs — and an unregistered
+// witness costs a printable proof, never a verdict.
+
+/// The witness of `∃x. B` denotes `εx. B`, so its recorded body is `B` itself.
+#[test]
+fn positive_exists_records_the_choice_body_verbatim() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let five = terms.mk_int(BigInt::from(5));
+    let eq = terms.mk_eq(x, five);
+    let exists = terms.mk_exists(vec![("x".to_string(), Sort::Int)], eq);
+
+    let body = skolemize(&mut terms, exists, false).expect("positive Exists Skolemizes");
+    let TermData::App(_, args) = terms.get(body).clone() else {
+        panic!("expected the substituted equality")
+    };
+    let witness = args
+        .iter()
+        .copied()
+        .find(|&id| matches!(terms.get(id), TermData::Var(name, _) if name.starts_with("sk!x_")))
+        .expect("a Skolem witness");
+
+    let choice = terms
+        .skolem_choice(witness)
+        .expect("the mint site must record what the witness denotes");
+    assert_eq!(choice.binder, "x");
+    assert_eq!(choice.sort, Sort::Int);
+    assert_eq!(
+        choice.body, eq,
+        "the choice body is the SOURCE body, still mentioning the binder — not \
+         the substituted instance"
+    );
+}
+
+/// `¬∀x. B ≡ ∃x. ¬B`, so the witness denotes `εx. ¬B` — the NEGATED body.
+/// Recording `B` here would state the opposite of what the proof uses.
+#[test]
+fn negative_forall_records_the_negated_choice_body() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let px = terms.mk_app(Symbol::named("P"), vec![x], Sort::Bool);
+    let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], px);
+
+    let body = skolemize(&mut terms, forall, true).expect("negated Forall Skolemizes");
+    let TermData::Not(inner) = terms.get(body).clone() else {
+        panic!("expected a negated instance")
+    };
+    let TermData::App(_, args) = terms.get(inner).clone() else {
+        panic!("expected the substituted application")
+    };
+    let witness = args[0];
+
+    let choice = terms
+        .skolem_choice(witness)
+        .expect("the mint site must record what the witness denotes");
+    assert_eq!(choice.binder, "x");
+    let TermData::Not(negated_of) = terms.get(choice.body).clone() else {
+        panic!(
+            "the recorded choice body must be a negation, got {:?}",
+            terms.get(choice.body)
+        )
+    };
+    assert_eq!(negated_of, px);
+}
+
+/// A MULTI-binder quantifier's correct witnesses are nested choices
+/// (`sk₁ = εx₁. ∃x₂. B`, `sk₂ = (εx₂. B)[x₁ := sk₁]`), which this site does not
+/// build. Registering the one-binder form would state something false, so
+/// nothing is registered and the Alethe export DECLINES rather than spelling a
+/// witness it cannot justify.
+#[test]
+fn multi_binder_exists_registers_no_choice() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let body = terms.mk_app(Symbol::named("R"), vec![x, y], Sort::Bool);
+    let exists = terms.mk_exists(
+        vec![("x".to_string(), Sort::Int), ("y".to_string(), Sort::Int)],
+        body,
+    );
+
+    let instance = skolemize(&mut terms, exists, false).expect("Skolemizes");
+    let TermData::App(_, args) = terms.get(instance).clone() else {
+        panic!("expected the substituted application")
+    };
+    for witness in args {
+        assert!(
+            terms.skolem_choice(witness).is_none(),
+            "a multi-binder witness has no single-binder choice term"
+        );
+    }
+}
+
+/// A witness that DEPENDS on enclosing universals is a Skolem FUNCTION
+/// application, not a constant, and denotes no single choice term.
+#[test]
+fn dependent_skolem_function_registers_no_choice() {
+    let mut terms = TermStore::new();
+    let y = terms.mk_var("y", Sort::Int);
+    let x = terms.mk_var("x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("R"), vec![x, y], Sort::Bool);
+    let inner = terms.mk_exists(vec![("x".to_string(), Sort::Int)], body);
+    let outer = terms.mk_forall(vec![("y".to_string(), Sort::Int)], inner);
+
+    let (rewritten, _) = skolemize_deep_with_provenance(&mut terms, outer, true);
+    let rewritten = rewritten.expect("the nested existential Skolemizes");
+    let TermData::Forall(_, forall_body, _) = terms.get(rewritten).clone() else {
+        panic!("the universal must survive")
+    };
+    let TermData::App(_, args) = terms.get(forall_body).clone() else {
+        panic!("expected the substituted application")
+    };
+    let witness = args[0];
+    assert!(
+        matches!(terms.get(witness), TermData::App(..)),
+        "a dependent witness is a Skolem function application"
+    );
+    assert!(terms.skolem_choice(witness).is_none());
 }

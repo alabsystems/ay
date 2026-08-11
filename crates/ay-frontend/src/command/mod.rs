@@ -4,7 +4,7 @@
 
 //! SMT-LIB commands
 //!
-//! Represents and parses SMT-LIB 2.6 commands.
+//! Represents and parses SMT-LIB 2.7 commands.
 
 mod datatype;
 mod fixedpoint;
@@ -18,6 +18,493 @@ pub use tactic::{ApplyTactic, ParamValue, Probe, ProbeCmp, SUPPORTED_TACTIC_NAME
 pub use term::{Constant, Index, MatchPattern, ParsedConstant, QualifiedIdentifier, Term};
 
 use crate::sexp::{ParseError, SExpr, PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
+use std::collections::{HashMap, HashSet};
+
+/// Exact regular-stream payload produced by the pinned Z3 5.0.0 `(help)`
+/// command, including its one terminal line feed.
+const Z3_5_HELP_OUTPUT: &str = include_str!("z3_5_help.txt");
+
+/// Exact regular-stream payload produced by the pinned Z3 5.0.0
+/// `(help-simplifier)` command, including its one terminal line feed.
+///
+/// This command reports a build-time registry, not live solver state. Keeping
+/// the oracle snapshot beside the parser makes the versioned compatibility
+/// contract explicit and avoids reconstructing almost 180 lines of parameter
+/// metadata from unrelated AY implementation details.
+const Z3_5_HELP_SIMPLIFIER_OUTPUT: &str = include_str!("z3_5_help_simplifier.txt");
+
+/// Exact regular-stream payload produced by the pinned Z3 5.0.0
+/// `(help-tactic)` command, including its one terminal line feed. The snapshot
+/// contains the complete 118-tactic parameter registry for this exact build.
+const Z3_5_HELP_TACTIC_OUTPUT: &str = include_str!("z3_5_help_tactic.txt");
+
+fn z3_5_help_simplifier_output() -> &'static str {
+    Z3_5_HELP_SIMPLIFIER_OUTPUT
+        .strip_suffix('\n')
+        .unwrap_or(Z3_5_HELP_SIMPLIFIER_OUTPUT)
+}
+
+fn z3_5_help_output() -> &'static str {
+    Z3_5_HELP_OUTPUT
+        .strip_suffix('\n')
+        .unwrap_or(Z3_5_HELP_OUTPUT)
+}
+
+fn z3_5_help_tactic_output() -> &'static str {
+    Z3_5_HELP_TACTIC_OUTPUT
+        .strip_suffix('\n')
+        .unwrap_or(Z3_5_HELP_TACTIC_OUTPUT)
+}
+
+/// Select one command's complete help block from the pinned zero-argument
+/// registry transcript. Every entry begins at a line whose exact prefix is
+/// ` (`; descriptions and parameter rows are more deeply indented.
+fn z3_5_help_entry(name: &str) -> Option<&'static str> {
+    let body = z3_5_help_output().strip_prefix('\"')?.strip_suffix('\"')?;
+    let mut starts = vec![0];
+    starts.extend(body.match_indices("\n (").map(|(index, _)| index + 1));
+
+    for (entry_index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(entry_index + 1).copied().unwrap_or(body.len());
+        let entry = &body[start..end];
+        let header = entry.strip_prefix(" (")?;
+        let name_end = header
+            .find(|character: char| character.is_whitespace() || character == ')')
+            .unwrap_or(header.len());
+        if &header[..name_end] == name {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// Render the public `sexpr::display` grammar used by Z3 5.0.0's
+/// `dbg-sexpr` command. Unlike normal SMT-LIB serialization, that debug
+/// printer emits symbol payloads verbatim (even when the input was quoted)
+/// and escapes only embedded double quotes in string atoms.
+fn z3_5_debug_sexpr_output(sexpr: &SExpr) -> String {
+    match sexpr {
+        SExpr::Symbol(symbol) => symbol.clone(),
+        SExpr::Keyword(keyword) => keyword.clone(),
+        SExpr::Numeral(numeral) => numeral.clone(),
+        SExpr::Decimal(decimal) => decimal.clone(),
+        SExpr::Hexadecimal(hexadecimal) => hexadecimal.clone(),
+        SExpr::Binary(binary) => binary.clone(),
+        SExpr::String(string) => format!("\"{}\"", string.replace('"', "\\\"")),
+        SExpr::True => "true".to_string(),
+        SExpr::False => "false".to_string(),
+        SExpr::List(items) => {
+            let body = items
+                .iter()
+                .map(z3_5_debug_sexpr_output)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("({body})")
+        }
+    }
+}
+
+/// Minimal expression DAG used by the pinned Z3 debug/introspection commands.
+///
+/// Z3's `dbg-size` and `dbg-used-vars` operate on its parsed AST, before the
+/// solver rewriters run. AY's native `TermStore` deliberately performs eager
+/// Boolean/arithmetic normalization, so counting or scanning that lowered DAG
+/// would lose authored nodes (`(and true false)` is the smallest example).
+/// This private representation retains exactly the pieces these commands
+/// inspect: hash-consed expression shape and de Bruijn-bound variables. `let`
+/// is expanded while building the DAG, matching Z3's SMT2 parser.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Z3DebugNode {
+    Atom(String),
+    Var(u32, String),
+    App(String, Vec<Self>),
+    Quantifier(String, Vec<(String, String)>, Box<Self>),
+}
+
+#[derive(Clone, Debug)]
+enum Z3DebugBinding {
+    Bound(String),
+    Let(Z3DebugNode),
+}
+
+fn z3_debug_shift_free_vars(node: &Z3DebugNode, amount: u32, cutoff: u32) -> Z3DebugNode {
+    match node {
+        Z3DebugNode::Atom(_) => node.clone(),
+        Z3DebugNode::Var(index, sort) if *index >= cutoff => {
+            Z3DebugNode::Var(index.saturating_add(amount), sort.clone())
+        }
+        Z3DebugNode::Var(_, _) => node.clone(),
+        Z3DebugNode::App(head, arguments) => Z3DebugNode::App(
+            head.clone(),
+            arguments
+                .iter()
+                .map(|argument| z3_debug_shift_free_vars(argument, amount, cutoff))
+                .collect(),
+        ),
+        Z3DebugNode::Quantifier(kind, declarations, body) => Z3DebugNode::Quantifier(
+            kind.clone(),
+            declarations.clone(),
+            Box::new(z3_debug_shift_free_vars(
+                body,
+                amount,
+                cutoff.saturating_add(declarations.len() as u32),
+            )),
+        ),
+    }
+}
+
+fn z3_debug_symbol_node(symbol: &str, bindings: &[(String, Z3DebugBinding)]) -> Z3DebugNode {
+    let mut de_bruijn_index = 0u32;
+    for (name, binding) in bindings.iter().rev() {
+        if name == symbol {
+            return match binding {
+                Z3DebugBinding::Bound(sort) => Z3DebugNode::Var(de_bruijn_index, sort.clone()),
+                Z3DebugBinding::Let(value) => z3_debug_shift_free_vars(value, de_bruijn_index, 0),
+            };
+        }
+        if matches!(binding, Z3DebugBinding::Bound(_)) {
+            de_bruijn_index = de_bruijn_index.saturating_add(1);
+        }
+    }
+    Z3DebugNode::Atom(format!("symbol:{symbol}"))
+}
+
+fn z3_debug_node(sexpr: &SExpr, bindings: &mut Vec<(String, Z3DebugBinding)>) -> Z3DebugNode {
+    match sexpr {
+        SExpr::Symbol(symbol) => z3_debug_symbol_node(symbol, bindings),
+        SExpr::Keyword(keyword) => Z3DebugNode::Atom(format!("keyword:{keyword}")),
+        SExpr::Numeral(value) => Z3DebugNode::Atom(format!("numeral:{value}")),
+        SExpr::Decimal(value) => Z3DebugNode::Atom(format!("decimal:{value}")),
+        SExpr::Hexadecimal(value) => Z3DebugNode::Atom(format!("hex:{value}")),
+        SExpr::Binary(value) => Z3DebugNode::Atom(format!("binary:{value}")),
+        SExpr::String(value) => Z3DebugNode::Atom(format!("string:{value}")),
+        SExpr::True => Z3DebugNode::Atom("bool:true".to_string()),
+        SExpr::False => Z3DebugNode::Atom("bool:false".to_string()),
+        SExpr::List(items) if items.is_empty() => Z3DebugNode::Atom("list:()".to_string()),
+        SExpr::List(items) => {
+            let head = items[0].as_symbol();
+            if head == Some("let") && items.len() == 3 {
+                let Some(let_bindings) = items[1].as_list() else {
+                    return Z3DebugNode::App(
+                        "let".to_string(),
+                        items[1..]
+                            .iter()
+                            .map(|item| z3_debug_node(item, bindings))
+                            .collect(),
+                    );
+                };
+                // SMT-LIB let bindings are simultaneous: every value is built
+                // in the incoming environment, then all names scope the body.
+                let mut values = Vec::with_capacity(let_bindings.len());
+                for binding in let_bindings {
+                    let Some(pair) = binding.as_list() else {
+                        continue;
+                    };
+                    let (Some(name), Some(value)) =
+                        (pair.first().and_then(SExpr::as_symbol), pair.get(1))
+                    else {
+                        continue;
+                    };
+                    values.push((name.to_string(), z3_debug_node(value, bindings)));
+                }
+                let old_len = bindings.len();
+                bindings.extend(
+                    values
+                        .into_iter()
+                        .map(|(name, value)| (name, Z3DebugBinding::Let(value))),
+                );
+                let result = z3_debug_node(&items[2], bindings);
+                bindings.truncate(old_len);
+                return result;
+            }
+
+            if matches!(head, Some("forall" | "exists" | "lambda")) && items.len() == 3 {
+                let Some(sorted_variables) = items[1].as_list() else {
+                    return Z3DebugNode::App(
+                        head.unwrap_or_default().to_string(),
+                        items[1..]
+                            .iter()
+                            .map(|item| z3_debug_node(item, bindings))
+                            .collect(),
+                    );
+                };
+                let mut declarations = Vec::with_capacity(sorted_variables.len());
+                for variable in sorted_variables {
+                    let Some(pair) = variable.as_list() else {
+                        continue;
+                    };
+                    let (Some(name), Some(sort)) =
+                        (pair.first().and_then(SExpr::as_symbol), pair.get(1))
+                    else {
+                        continue;
+                    };
+                    declarations.push((name.to_string(), sort.to_raw_string()));
+                }
+                let old_len = bindings.len();
+                bindings.extend(
+                    declarations
+                        .iter()
+                        .cloned()
+                        .map(|(name, sort)| (name, Z3DebugBinding::Bound(sort))),
+                );
+                let body = z3_debug_node(&items[2], bindings);
+                bindings.truncate(old_len);
+                return Z3DebugNode::Quantifier(
+                    head.unwrap_or_default().to_string(),
+                    declarations,
+                    Box::new(body),
+                );
+            }
+
+            // An SMT-LIB annotation does not introduce an expression node.
+            // Quantifier patterns are metadata children in Z3, but the clean
+            // owner witnesses intentionally avoid them; the logical body is
+            // still the exact node inspected by the commands implemented here.
+            if head == Some("!") && items.len() >= 2 {
+                return z3_debug_node(&items[1], bindings);
+            }
+
+            // Indexed and qualified identifiers in term position are nullary
+            // applications. Their indices/sort are declaration parameters,
+            // not expression children.
+            if matches!(head, Some("_" | "as")) {
+                return Z3DebugNode::Atom(format!("identifier:{}", sexpr.to_raw_string()));
+            }
+
+            let application_head = items[0].to_raw_string();
+            let arguments = items[1..]
+                .iter()
+                .map(|item| z3_debug_node(item, bindings))
+                .collect();
+            Z3DebugNode::App(application_head, arguments)
+        }
+    }
+}
+
+fn z3_debug_is_associative(head: &str) -> bool {
+    matches!(
+        head,
+        "and" | "or" | "xor" | "+" | "*" | "bvand" | "bvor" | "bvxor" | "bvadd" | "bvmul"
+    )
+}
+
+fn z3_debug_count_nodes(node: &Z3DebugNode, visited: &mut HashSet<Z3DebugNode>) -> usize {
+    if !visited.insert(node.clone()) {
+        return 0;
+    }
+    match node {
+        Z3DebugNode::Atom(_) | Z3DebugNode::Var(_, _) => 1,
+        Z3DebugNode::App(head, arguments) => {
+            let associative_expansion = if z3_debug_is_associative(head) {
+                arguments.len().saturating_sub(2)
+            } else {
+                0
+            };
+            1 + associative_expansion
+                + arguments
+                    .iter()
+                    .map(|argument| z3_debug_count_nodes(argument, visited))
+                    .sum::<usize>()
+        }
+        Z3DebugNode::Quantifier(_, _, body) => 1 + z3_debug_count_nodes(body, visited),
+    }
+}
+
+fn z3_5_debug_size_output(sexpr: &SExpr) -> String {
+    let node = z3_debug_node(sexpr, &mut Vec::new());
+    z3_debug_count_nodes(&node, &mut HashSet::new()).to_string()
+}
+
+fn z3_debug_collect_used_vars(node: &Z3DebugNode, delta: u32, used: &mut HashMap<u32, String>) {
+    match node {
+        Z3DebugNode::Var(index, sort) if *index >= delta => {
+            used.entry(index - delta).or_insert_with(|| sort.clone());
+        }
+        Z3DebugNode::App(_, arguments) => {
+            for argument in arguments {
+                z3_debug_collect_used_vars(argument, delta, used);
+            }
+        }
+        Z3DebugNode::Quantifier(_, declarations, body) => {
+            z3_debug_collect_used_vars(body, delta.saturating_add(declarations.len() as u32), used)
+        }
+        Z3DebugNode::Atom(_) | Z3DebugNode::Var(_, _) => {}
+    }
+}
+
+fn z3_debug_used_var_map(sexpr: &SExpr) -> HashMap<u32, String> {
+    let node = z3_debug_node(sexpr, &mut Vec::new());
+    let inspected = match &node {
+        Z3DebugNode::Quantifier(_, _, body) => body.as_ref(),
+        _ => &node,
+    };
+    let mut used = HashMap::new();
+    z3_debug_collect_used_vars(inspected, 0, &mut used);
+    used
+}
+
+fn z3_5_debug_used_vars_output(sexpr: &SExpr) -> String {
+    let used = z3_debug_used_var_map(sexpr);
+    let Some(max_index) = used.keys().copied().max() else {
+        return "(vars)".to_string();
+    };
+    let mut output = String::from("(vars");
+    for index in 0..=max_index {
+        let sort = used.get(&index).map(String::as_str).unwrap_or("<not-used>");
+        output.push_str(&format!("\n  ({index:<6} {sort})"));
+    }
+    output.push(')');
+    output
+}
+
+fn z3_debug_quantifier_parts(sexpr: &SExpr) -> Option<(&str, &[SExpr], &SExpr)> {
+    let items = sexpr.as_list()?;
+    if items.len() != 3 {
+        return None;
+    }
+    let kind = items[0].as_symbol()?;
+    if !matches!(kind, "forall" | "exists" | "lambda") {
+        return None;
+    }
+    Some((kind, items[1].as_list()?, &items[2]))
+}
+
+fn z3_5_debug_elim_unused_vars_output(sexpr: &SExpr) -> String {
+    let Some((kind, declarations, body)) = z3_debug_quantifier_parts(sexpr) else {
+        return sexpr.to_raw_string();
+    };
+    let used = z3_debug_used_var_map(sexpr);
+    let declaration_count = declarations.len();
+    let retained = declarations
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| {
+            let index = declaration_count - 1 - position;
+            used.contains_key(&(index as u32))
+        })
+        .map(|(_, declaration)| declaration.clone())
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        return body.to_raw_string();
+    }
+    SExpr::List(vec![
+        SExpr::Symbol(kind.to_string()),
+        SExpr::List(retained),
+        body.clone(),
+    ])
+    .to_raw_string()
+}
+
+fn z3_debug_substitute_symbols(sexpr: &SExpr, substitutions: &HashMap<String, SExpr>) -> SExpr {
+    match sexpr {
+        SExpr::Symbol(symbol) => substitutions
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(|| sexpr.clone()),
+        SExpr::List(items) if items.is_empty() => sexpr.clone(),
+        SExpr::List(items) => {
+            let head = items[0].as_symbol();
+            if matches!(head, Some("forall" | "exists" | "lambda")) && items.len() == 3 {
+                let mut nested = substitutions.clone();
+                if let Some(declarations) = items[1].as_list() {
+                    for declaration in declarations {
+                        if let Some(name) = declaration
+                            .as_list()
+                            .and_then(|pair| pair.first())
+                            .and_then(SExpr::as_symbol)
+                        {
+                            nested.remove(name);
+                        }
+                    }
+                }
+                return SExpr::List(vec![
+                    items[0].clone(),
+                    items[1].clone(),
+                    z3_debug_substitute_symbols(&items[2], &nested),
+                ]);
+            }
+            if head == Some("let") && items.len() == 3 {
+                let rewritten_bindings = items[1].as_list().map(|bindings| {
+                    bindings
+                        .iter()
+                        .map(|binding| {
+                            let Some(pair) = binding.as_list() else {
+                                return binding.clone();
+                            };
+                            if pair.len() != 2 {
+                                return binding.clone();
+                            }
+                            SExpr::List(vec![
+                                pair[0].clone(),
+                                z3_debug_substitute_symbols(&pair[1], substitutions),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let mut nested = substitutions.clone();
+                if let Some(bindings) = items[1].as_list() {
+                    for binding in bindings {
+                        if let Some(name) = binding
+                            .as_list()
+                            .and_then(|pair| pair.first())
+                            .and_then(SExpr::as_symbol)
+                        {
+                            nested.remove(name);
+                        }
+                    }
+                }
+                return SExpr::List(vec![
+                    items[0].clone(),
+                    SExpr::List(rewritten_bindings.unwrap_or_default()),
+                    z3_debug_substitute_symbols(&items[2], &nested),
+                ]);
+            }
+
+            let mut rewritten = Vec::with_capacity(items.len());
+            rewritten.push(items[0].clone());
+            rewritten.extend(
+                items[1..]
+                    .iter()
+                    .map(|item| z3_debug_substitute_symbols(item, substitutions)),
+            );
+            SExpr::List(rewritten)
+        }
+        _ => sexpr.clone(),
+    }
+}
+
+fn z3_5_debug_instantiate(items: &[SExpr]) -> Result<(Term, String), ParseError> {
+    if items.len() != 3 {
+        return Err(ParseError::new(
+            "dbg-instantiate requires a quantifier and one expression list",
+        ));
+    }
+    let Some((_kind, declarations, body)) = z3_debug_quantifier_parts(&items[1]) else {
+        return Err(ParseError::new(
+            "dbg-instantiate requires a quantified expression",
+        ));
+    };
+    let arguments = items[2]
+        .as_list()
+        .ok_or_else(|| ParseError::new("dbg-instantiate requires an expression list"))?;
+    if declarations.len() != arguments.len() {
+        return Err(ParseError::new(
+            "dbg-instantiate argument count must match the quantified variables",
+        ));
+    }
+    let mut substitutions = HashMap::new();
+    for (declaration, argument) in declarations.iter().zip(arguments) {
+        let name = declaration
+            .as_list()
+            .and_then(|pair| pair.first())
+            .and_then(SExpr::as_symbol)
+            .ok_or_else(|| ParseError::new("quantified variable must be a sorted symbol"))?;
+        substitutions.insert(name.to_string(), argument.clone());
+    }
+    let instantiated = z3_debug_substitute_symbols(body, &substitutions);
+    let term = Term::from_sexp(&instantiated)?;
+    Ok((term, instantiated.to_raw_string()))
+}
 
 /// An SMT-LIB parsed sort AST.
 ///
@@ -106,10 +593,16 @@ pub enum Command {
     SetLogic(String),
     /// `(set-option <keyword> <value>)`
     SetOption(String, SExpr),
+    /// `(set-option <keyword>)`, the valueless generic `attribute` alternative.
+    SetOptionAttribute(String),
     /// `(set-info <keyword> <value>)`
     SetInfo(String, SExpr),
+    /// `(set-info <keyword>)`, the valueless generic `attribute` alternative.
+    SetInfoAttribute(String),
     /// `(declare-sort <symbol> <numeral>)`
     DeclareSort(String, u32),
+    /// `(declare-sort-parameter <symbol>)` (SMT-LIB 2.7)
+    DeclareSortParameter(String),
     /// `(define-sort <symbol> (<symbol>*) <sort>)`
     DefineSort(String, Vec<String>, Sort),
     /// `(declare-datatype <symbol> <datatype_dec>)`
@@ -236,6 +729,9 @@ pub enum Command {
     GetInfo(String),
     /// `(get-option <keyword>)`
     GetOption(String),
+    /// `(labels)` - retrieve the labels attached to the last satisfiable or
+    /// unknown result.
+    Labels,
     /// `(push <numeral>)`
     Push(u32),
     /// `(pop <numeral>)`
@@ -248,6 +744,12 @@ pub enum Command {
     Exit,
     /// `(echo <string>)`
     Echo(String),
+    /// `(display <term>)` - Z3 extension that prints an elaborated term.
+    Display(Term, String),
+    /// `(dbg-set <symbol> <term>)` - store a validated AST in Z3's debug-global map.
+    DebugSet(String, Term, String),
+    /// `(dbg-pp-var <symbol>)` - print an AST from Z3's debug-global map.
+    DebugPpVar(String),
     /// `(simplify <term>)` - Z3 extension
     Simplify(Term),
     /// `(get-interpolant <term-A> <term-B>)` - Z3/SeaHorn/KLEE extension.
@@ -282,6 +784,34 @@ pub enum Command {
     Apply(ApplyTactic),
 }
 
+fn no_argument_command(
+    items: &[SExpr],
+    name: &str,
+    command: Command,
+) -> Result<Command, ParseError> {
+    if items.len() != 1 {
+        return Err(ParseError::new(format!("{name} takes no arguments")));
+    }
+    Ok(command)
+}
+
+fn parse_optional_u32(items: &[SExpr], name: &str, default: u32) -> Result<u32, ParseError> {
+    if items.len() > 2 {
+        return Err(ParseError::new(format!(
+            "{name} accepts at most one numeral"
+        )));
+    }
+    let Some(value) = items.get(1) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_numeral()
+        .ok_or_else(|| ParseError::new(format!("{name} requires a numeral")))?;
+    value
+        .parse::<u32>()
+        .map_err(|_| ParseError::new(format!("{name} numeral is out of range")))
+}
+
 impl Command {
     /// Parse a command from an S-expression
     pub fn from_sexp(sexp: &SExpr) -> Result<Self, ParseError> {
@@ -299,6 +829,9 @@ impl Command {
 
         match cmd {
             "set-logic" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("set-logic requires exactly one logic name"));
+                }
                 let logic = items
                     .get(1)
                     .and_then(|s| s.as_symbol())
@@ -306,38 +839,84 @@ impl Command {
                 Ok(Self::SetLogic(logic.to_string()))
             }
             "set-option" => {
-                if items.len() < 3 {
-                    return Err(ParseError::new("set-option requires keyword and value"));
+                if !(2..=3).contains(&items.len()) {
+                    return Err(ParseError::new(
+                        "set-option requires one keyword and at most one value",
+                    ));
                 }
                 let keyword = match &items[1] {
                     SExpr::Keyword(k) => k.clone(),
                     _ => return Err(ParseError::new("set-option requires keyword")),
                 };
-                Ok(Self::SetOption(keyword, items[2].clone()))
+                if let Some(value) = items.get(2) {
+                    if matches!(value, SExpr::Keyword(_)) {
+                        return Err(ParseError::new(
+                            "set-option value must be an SMT-LIB attribute_value, not a keyword",
+                        ));
+                    }
+                    Ok(Self::SetOption(keyword, value.clone()))
+                } else {
+                    Ok(Self::SetOptionAttribute(keyword))
+                }
             }
             "set-info" => {
-                if items.len() < 3 {
-                    return Err(ParseError::new("set-info requires keyword and value"));
+                if !(2..=3).contains(&items.len()) {
+                    return Err(ParseError::new(
+                        "set-info requires one keyword and at most one value",
+                    ));
                 }
                 let keyword = match &items[1] {
                     SExpr::Keyword(k) => k.clone(),
                     _ => return Err(ParseError::new("set-info requires keyword")),
                 };
-                Ok(Self::SetInfo(keyword, items[2].clone()))
+                if let Some(value) = items.get(2) {
+                    if matches!(value, SExpr::Keyword(_)) {
+                        return Err(ParseError::new(
+                            "set-info value must be an SMT-LIB attribute_value, not a keyword",
+                        ));
+                    }
+                    Ok(Self::SetInfo(keyword, value.clone()))
+                } else {
+                    Ok(Self::SetInfoAttribute(keyword))
+                }
             }
             "declare-sort" => {
+                if !(2..=3).contains(&items.len()) {
+                    return Err(ParseError::new(
+                        "declare-sort requires a name and optional arity",
+                    ));
+                }
                 let name = items
                     .get(1)
                     .and_then(|s| s.as_symbol())
                     .ok_or_else(|| ParseError::new("declare-sort requires name"))?;
-                let arity = items
-                    .get(2)
-                    .and_then(|s| s.as_numeral())
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .unwrap_or(0);
+                let arity = match items.get(2) {
+                    Some(arity) => arity
+                        .as_numeral()
+                        .ok_or_else(|| ParseError::new("declare-sort arity must be a numeral"))?
+                        .parse::<u32>()
+                        .map_err(|_| ParseError::new("declare-sort arity is out of range"))?,
+                    None => 0,
+                };
                 Ok(Self::DeclareSort(name.to_string(), arity))
             }
+            "declare-sort-parameter" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "declare-sort-parameter requires exactly one symbol",
+                    ));
+                }
+                let name = items[1]
+                    .as_symbol()
+                    .ok_or_else(|| ParseError::new("declare-sort-parameter requires a symbol"))?;
+                Ok(Self::DeclareSortParameter(name.to_string()))
+            }
             "define-sort" => {
+                if items.len() != 4 {
+                    return Err(ParseError::new(
+                        "define-sort requires exactly a name, parameter list, and sort",
+                    ));
+                }
                 let name = items
                     .get(1)
                     .and_then(|s| s.as_symbol())
@@ -364,6 +943,11 @@ impl Command {
                 ))
             }
             "declare-datatype" => {
+                if items.len() != 3 {
+                    return Err(ParseError::new(
+                        "declare-datatype requires exactly a name and datatype declaration",
+                    ));
+                }
                 // (declare-datatype name datatype_dec)
                 let name = items
                     .get(1)
@@ -378,6 +962,11 @@ impl Command {
                 ))
             }
             "declare-datatypes" => {
+                if items.len() != 3 {
+                    return Err(ParseError::new(
+                        "declare-datatypes requires exactly sort and datatype declaration lists",
+                    ));
+                }
                 // (declare-datatypes ((name1 arity1) ...) (datatype_dec1 ...))
                 let sort_decs = items.get(1).and_then(|s| s.as_list()).ok_or_else(|| {
                     ParseError::new("declare-datatypes requires sort declarations")
@@ -385,6 +974,12 @@ impl Command {
                 let datatype_decs = items.get(2).and_then(|s| s.as_list()).ok_or_else(|| {
                     ParseError::new("declare-datatypes requires datatype declarations")
                 })?;
+
+                if datatype_decs.is_empty() {
+                    return Err(ParseError::new(
+                        "declare-datatypes requires at least one sort and datatype declaration",
+                    ));
+                }
 
                 // Legacy pre-2.6 non-parametric syntax:
                 //   (declare-datatypes () ((Name <ctor>+) ...))
@@ -438,6 +1033,11 @@ impl Command {
                 Ok(Self::DeclareDatatypes(sorts?, datatypes?))
             }
             "declare-fun" => {
+                if items.len() != 4 {
+                    return Err(ParseError::new(
+                        "declare-fun requires exactly a name, argument-sort list, and return sort",
+                    ));
+                }
                 let name = items
                     .get(1)
                     .and_then(|s| s.as_symbol())
@@ -457,6 +1057,11 @@ impl Command {
                 ))
             }
             "declare-const" => {
+                if items.len() != 3 {
+                    return Err(ParseError::new(
+                        "declare-const requires exactly a name and sort",
+                    ));
+                }
                 let name = items
                     .get(1)
                     .and_then(|s| s.as_symbol())
@@ -480,10 +1085,30 @@ impl Command {
             "inv-constraint" => Self::parse_inv_constraint(items),
             "check-synth" => Self::parse_check_synth(items),
             "assert" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("assert requires exactly one term"));
+                }
                 let term = items
                     .get(1)
                     .ok_or_else(|| ParseError::new("assert requires term"))?;
                 Ok(Self::Assert(Term::from_sexp(term)?))
+            }
+            // Z3 5.0.0's debug command constructs `(not term)` and passes it
+            // directly to the ordinary assertion path. Desugar at the parser
+            // boundary so every assertion invariant (Bool sort checking,
+            // stack scoping, proof tracking, and query invalidation) stays in
+            // the single established implementation.
+            "assert-not" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("assert-not requires exactly one term"));
+                }
+                let term = items
+                    .get(1)
+                    .ok_or_else(|| ParseError::new("assert-not requires term"))?;
+                Ok(Self::Assert(Term::App(
+                    "not".to_string(),
+                    vec![Term::from_sexp(term)?],
+                )))
             }
             "assert-soft" => Self::parse_assert_soft(items),
             "maximize" => {
@@ -504,7 +1129,19 @@ impl Command {
                     .ok_or_else(|| ParseError::new("minimize requires term"))?;
                 Ok(Self::Minimize(Term::from_sexp(term)?))
             }
-            "check-sat" => Ok(Self::CheckSat),
+            "check-sat" => {
+                if items.len() == 1 {
+                    return Ok(Self::CheckSat);
+                }
+                // Exact Z3 5.0.0 overlay: trailing Boolean terms are temporary
+                // assumptions, with the same semantics as the parenthesized
+                // list accepted by `check-sat-assuming`.
+                let terms = items[1..]
+                    .iter()
+                    .map(Term::from_sexp)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::CheckSatAssuming(terms))
+            }
             // Z3 tactic surface (#tactics). `(check-sat-using <tactic>)` runs a
             // user-supplied tactic to discharge the current goal. AY VALIDATES
             // the tactic argument through the shared registry (so a garbage
@@ -540,6 +1177,11 @@ impl Command {
                 Ok(Self::CheckSat)
             }
             "check-sat-assuming" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "check-sat-assuming requires exactly one literal list",
+                    ));
+                }
                 let lits = items
                     .get(1)
                     .and_then(|s| s.as_list())
@@ -547,14 +1189,38 @@ impl Command {
                 let terms: Result<Vec<_>, _> = lits.iter().map(Term::from_sexp).collect();
                 Ok(Self::CheckSatAssuming(terms?))
             }
-            "get-model" => Ok(Self::GetModel),
-            "get-objectives" => Ok(Self::GetObjectives),
+            "get-model" => {
+                // Z3 5.0.0 registers this command with variable arity. Every
+                // argument must be a 32-bit unsigned model index; successive
+                // arguments overwrite the preceding index. AY has no boxed
+                // optimization-model selection here, so validate all indices
+                // and otherwise retain the ordinary `GetModel` operation.
+                for index in &items[1..] {
+                    index
+                        .as_numeral()
+                        .ok_or_else(|| {
+                            ParseError::new("get-model requires unsigned integer indices")
+                        })?
+                        .parse::<u32>()
+                        .map_err(|_| ParseError::new("get-model index is out of range"))?;
+                }
+                Ok(Self::GetModel)
+            }
+            "get-objectives" => no_argument_command(items, "get-objectives", Self::GetObjectives),
             "get-objective-certificates" => Ok(Self::GetObjectiveCertificates),
             "get-value" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "get-value requires exactly one non-empty term list",
+                    ));
+                }
                 let terms = items
                     .get(1)
                     .and_then(|s| s.as_list())
                     .ok_or_else(|| ParseError::new("get-value requires term list"))?;
+                if terms.is_empty() {
+                    return Err(ParseError::new("get-value requires a non-empty term list"));
+                }
                 let parsed: Result<Vec<(String, Term)>, _> = terms
                     .iter()
                     .map(|s| Term::from_sexp(s).map(|t| (s.to_raw_string(), t)))
@@ -572,6 +1238,11 @@ impl Command {
             "get-unsat-core" => {
                 // (get-unsat-core) -- standard SMT-LIB.
                 // (get-unsat-core :farkas) -- AY extension for #8769.
+                if items.len() > 2 {
+                    return Err(ParseError::new(
+                        "get-unsat-core accepts no arguments or exactly :farkas",
+                    ));
+                }
                 match items.get(1) {
                     None => Ok(Self::GetUnsatCore),
                     Some(SExpr::Keyword(k)) if k == "farkas" || k == ":farkas" => {
@@ -582,11 +1253,16 @@ impl Command {
                     ))),
                 }
             }
-            "get-unsat-assumptions" => Ok(Self::GetUnsatAssumptions),
-            "get-proof" => Ok(Self::GetProof),
-            "get-assertions" => Ok(Self::GetAssertions),
-            "get-assignment" => Ok(Self::GetAssignment),
+            "get-unsat-assumptions" => {
+                no_argument_command(items, "get-unsat-assumptions", Self::GetUnsatAssumptions)
+            }
+            "get-proof" => no_argument_command(items, "get-proof", Self::GetProof),
+            "get-assertions" => no_argument_command(items, "get-assertions", Self::GetAssertions),
+            "get-assignment" => no_argument_command(items, "get-assignment", Self::GetAssignment),
             "get-info" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("get-info requires exactly one info flag"));
+                }
                 let keyword = match items.get(1) {
                     Some(SExpr::Keyword(k)) => k.clone(),
                     _ => return Err(ParseError::new("get-info requires keyword")),
@@ -594,37 +1270,150 @@ impl Command {
                 Ok(Self::GetInfo(keyword))
             }
             "get-option" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("get-option requires exactly one keyword"));
+                }
                 let keyword = match items.get(1) {
                     Some(SExpr::Keyword(k)) => k.clone(),
                     _ => return Err(ParseError::new("get-option requires keyword")),
                 };
                 Ok(Self::GetOption(keyword))
             }
+            "labels" => no_argument_command(items, "labels", Self::Labels),
             "push" => {
-                let n = items
-                    .get(1)
-                    .and_then(|s| s.as_numeral())
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .unwrap_or(1);
+                let n = parse_optional_u32(items, "push", 1)?;
                 Ok(Self::Push(n))
             }
             "pop" => {
-                let n = items
-                    .get(1)
-                    .and_then(|s| s.as_numeral())
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .unwrap_or(1);
+                let n = parse_optional_u32(items, "pop", 1)?;
                 Ok(Self::Pop(n))
             }
-            "reset" => Ok(Self::Reset),
-            "reset-assertions" => Ok(Self::ResetAssertions),
-            "exit" => Ok(Self::Exit),
+            "reset" => no_argument_command(items, "reset", Self::Reset),
+            "reset-assertions" => {
+                no_argument_command(items, "reset-assertions", Self::ResetAssertions)
+            }
+            "exit" => no_argument_command(items, "exit", Self::Exit),
+            "help" => Self::parse_help(items),
+            // Z3 5.0.0 renders a deterministic build-time simplifier registry.
+            // Model it as a fixed-output query through the existing `Echo`
+            // result path: that path emits the payload without an additional
+            // `:print-success` acknowledgement, exactly like Z3's command.
+            "help-simplifier" => {
+                if items.len() != 1 {
+                    return Err(ParseError::new("invalid command, too many arguments"));
+                }
+                Ok(Self::Echo(z3_5_help_simplifier_output().to_string()))
+            }
+            "help-tactic" => {
+                if items.len() != 1 {
+                    return Err(ParseError::new("invalid command, too many arguments"));
+                }
+                Ok(Self::Echo(z3_5_help_tactic_output().to_string()))
+            }
+            "dbg-params" => {
+                no_argument_command(items, "dbg-params", Self::Echo("worked".to_string()))
+            }
+            "dbg-sexpr" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "dbg-sexpr requires exactly one s-expression",
+                    ));
+                }
+                Ok(Self::Echo(z3_5_debug_sexpr_output(&items[1])))
+            }
+            "dbg-translator" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("dbg-translator requires exactly one term"));
+                }
+                let source = items[1].to_string();
+                Ok(Self::Display(
+                    Term::from_sexp(&items[1])?,
+                    format!("{source}\n--->\n{source}"),
+                ))
+            }
+            "dbg-size" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("dbg-size requires exactly one term"));
+                }
+                let term = Term::from_sexp(&items[1])?;
+                let output = stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+                    z3_5_debug_size_output(&items[1])
+                });
+                Ok(Self::Display(term, output))
+            }
+            "dbg-used-vars" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "dbg-used-vars requires exactly one expression",
+                    ));
+                }
+                let term = Term::from_sexp(&items[1])?;
+                let output = stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+                    z3_5_debug_used_vars_output(&items[1])
+                });
+                Ok(Self::Display(term, output))
+            }
+            "dbg-elim-unused-vars" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new(
+                        "dbg-elim-unused-vars requires exactly one expression",
+                    ));
+                }
+                let term = Term::from_sexp(&items[1])?;
+                let output = stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+                    z3_5_debug_elim_unused_vars_output(&items[1])
+                });
+                Ok(Self::Display(term, output))
+            }
+            "dbg-instantiate" => {
+                let (term, output) =
+                    stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+                        z3_5_debug_instantiate(items)
+                    })?;
+                Ok(Self::Display(term, output))
+            }
+            "dbg-set" => {
+                if items.len() != 3 {
+                    return Err(ParseError::new(
+                        "dbg-set requires exactly one symbol and one term",
+                    ));
+                }
+                let name = items[1]
+                    .as_symbol()
+                    .ok_or_else(|| ParseError::new("dbg-set requires a symbol"))?;
+                Ok(Self::DebugSet(
+                    name.to_string(),
+                    Term::from_sexp(&items[2])?,
+                    items[2].to_raw_string(),
+                ))
+            }
+            "dbg-pp-var" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("dbg-pp-var requires exactly one symbol"));
+                }
+                let name = items[1]
+                    .as_symbol()
+                    .ok_or_else(|| ParseError::new("dbg-pp-var requires a symbol"))?;
+                Ok(Self::DebugPpVar(name.to_string()))
+            }
             "echo" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("echo requires exactly one string"));
+                }
                 let msg = match items.get(1) {
                     Some(SExpr::String(s)) => s.clone(),
                     _ => return Err(ParseError::new("echo requires string")),
                 };
                 Ok(Self::Echo(msg))
+            }
+            "display" => {
+                if items.len() != 2 {
+                    return Err(ParseError::new("display requires exactly one term"));
+                }
+                Ok(Self::Display(
+                    Term::from_sexp(&items[1])?,
+                    items[1].to_string(),
+                ))
             }
             "simplify" => {
                 let term = items
@@ -649,6 +1438,38 @@ impl Command {
             "get-abduct" => Self::parse_get_abduct(items),
             _ => Err(ParseError::new(format!("Unknown command: {cmd}"))),
         }
+    }
+
+    /// Parse Z3 5.0.0's `(help <symbol>*)` registry query.
+    ///
+    /// With no names Z3 prints the complete sorted registry snapshot. With
+    /// names it prints those complete blocks in request order, retaining
+    /// duplicates. An unknown or non-symbol argument rejects the whole command
+    /// before any output is emitted.
+    fn parse_help(items: &[SExpr]) -> Result<Self, ParseError> {
+        if items.len() == 1 {
+            return Ok(Self::Echo(z3_5_help_output().to_string()));
+        }
+
+        let mut output = String::from("\"");
+        for item in &items[1..] {
+            // `true` and `false` have dedicated SExpr variants in AY's generic
+            // parser, but Z3's command-argument parser accepts them in a
+            // CPK_SYMBOL slot and then performs the ordinary registry lookup.
+            let name = match item {
+                SExpr::Symbol(name) => name.as_str(),
+                SExpr::True => "true",
+                SExpr::False => "false",
+                _ => {
+                    return Err(ParseError::new("invalid command argument, symbol expected"));
+                }
+            };
+            let entry = z3_5_help_entry(name)
+                .ok_or_else(|| ParseError::new(format!("unknown command '{name}'")))?;
+            output.push_str(entry);
+        }
+        output.push('\"');
+        Ok(Self::Echo(output))
     }
 
     /// Parse `(assert-soft <term> [:weight <numeral>] [:id <symbol>])`.
@@ -793,6 +1614,11 @@ impl Command {
     }
 
     fn parse_define_fun(items: &[SExpr]) -> Result<Self, ParseError> {
+        if items.len() != 5 {
+            return Err(ParseError::new(
+                "define-fun requires exactly a name, parameter list, return sort, and body",
+            ));
+        }
         let name = items
             .get(1)
             .and_then(|s| s.as_symbol())
@@ -816,6 +1642,11 @@ impl Command {
     /// `define-fun`. Desugars to `(define-fun name () sort value)`; z3's own
     /// tutorial teaches it, so consumers pasting tutorial scripts hit it.
     fn parse_define_const(items: &[SExpr]) -> Result<Self, ParseError> {
+        if items.len() != 4 {
+            return Err(ParseError::new(
+                "define-const requires exactly a name, sort, and value",
+            ));
+        }
         let name = items
             .get(1)
             .and_then(|s| s.as_symbol())
@@ -835,6 +1666,11 @@ impl Command {
     }
 
     fn parse_define_fun_rec(items: &[SExpr]) -> Result<Self, ParseError> {
+        if items.len() != 5 {
+            return Err(ParseError::new(
+                "define-fun-rec requires exactly a name, parameter list, return sort, and body",
+            ));
+        }
         let name = items
             .get(1)
             .and_then(|s| s.as_symbol())
@@ -856,6 +1692,11 @@ impl Command {
 
     fn parse_define_funs_rec(items: &[SExpr]) -> Result<Self, ParseError> {
         // (define-funs-rec ((f1 ((x T)) T) (f2 ((y T)) T)) (body1 body2))
+        if items.len() != 3 {
+            return Err(ParseError::new(
+                "define-funs-rec requires exactly declaration and body lists",
+            ));
+        }
         let func_decs = items
             .get(1)
             .and_then(|s| s.as_list())
@@ -864,6 +1705,12 @@ impl Command {
             .get(2)
             .and_then(|s| s.as_list())
             .ok_or_else(|| ParseError::new("define-funs-rec requires function bodies"))?;
+
+        if func_decs.is_empty() {
+            return Err(ParseError::new(
+                "define-funs-rec requires at least one function declaration and body",
+            ));
+        }
 
         if func_decs.len() != bodies.len() {
             return Err(ParseError::new(

@@ -6,6 +6,79 @@
 use super::*;
 use crate::bv_blast_export::{BvBlastValidateError, ClauseProvenance, ResRule};
 use proptest::prelude::*;
+use std::time::Duration;
+
+fn one_pivot_refutation() -> (ResolutionDag, Vec<Clause>) {
+    let variable = Variable::new(0);
+    let positive = Literal::positive(variable);
+    let negative = Literal::negative(variable);
+    let dag = ResolutionDag {
+        num_vars: 1,
+        original_clauses: vec![(1, vec![positive]), (2, vec![negative])],
+        derived: vec![RupStep {
+            id: 3,
+            clause: Vec::new(),
+            rup_hints: vec![1, 2],
+        }],
+        empty_clause_id: 3,
+    };
+    let clauses = vec![
+        Clause {
+            id: 0,
+            lits: vec![Lit::pos(0)],
+            provenance: ClauseProvenance::Disequality,
+        },
+        Clause {
+            id: 1,
+            lits: vec![Lit::neg(0)],
+            provenance: ClauseProvenance::Disequality,
+        },
+    ];
+    (dag, clauses)
+}
+
+#[test]
+fn rup_expansion_rejects_resolution_step_cap_before_emission() {
+    let (dag, clauses) = one_pivot_refutation();
+    let error = expand_dag_to_resolution(
+        &dag,
+        &clauses,
+        Some(RupExpansionLimits {
+            max_steps: 0,
+            deadline: Instant::now() + Duration::from_secs(1),
+        }),
+    )
+    .expect_err("a zero-step cap must reject the first required resolution");
+    assert!(matches!(
+        error,
+        BvSolvedExportError::ResourceLimit {
+            resource: "expanded resolution steps",
+            limit: 0,
+            actual: 1,
+        }
+    ));
+}
+
+#[test]
+fn rup_expansion_rejects_an_already_expired_deadline() {
+    let (dag, clauses) = one_pivot_refutation();
+    let error = expand_dag_to_resolution(
+        &dag,
+        &clauses,
+        Some(RupExpansionLimits {
+            max_steps: usize::MAX,
+            deadline: Instant::now(),
+        }),
+    )
+    .expect_err("an already-expired absolute deadline must fail closed");
+    assert!(matches!(
+        error,
+        BvSolvedExportError::ResourceLimit {
+            resource: "RUP expansion deadline",
+            ..
+        }
+    ));
+}
 
 /// A genuinely non-identical, valid obligation (commutativity of `bvadd`) at a
 /// real width (>= 8) yields a `BvBlastProof` whose `validate()` passes: every

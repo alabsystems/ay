@@ -128,6 +128,10 @@ mod dpll_tracing;
 pub(crate) mod ematching;
 pub mod executor;
 mod executor_format;
+/// The canonical SMT-LIB bit-vector numeral printer, re-exported so that every
+/// crate that renders BV values (the Z3-compatible FFI, CHC model dumps) shares
+/// one implementation instead of open-coding a second, sort-changing one.
+pub use executor_format::format_bitvec;
 pub(crate) mod executor_types;
 pub(crate) mod extension;
 pub(crate) mod features;
@@ -329,7 +333,7 @@ pub use ay_core::Proof;
 pub use dpll_error::DpllError;
 pub use executor::Executor;
 pub use executor_types::{
-    ExecutorError, Result as ExecutorResult, StatValue, Statistics, UnknownReason,
+    ExecutorError, Result as ExecutorResult, StatValue, Statistics, UnknownOrigin, UnknownReason,
 };
 pub use minimize::CounterexampleStyle;
 pub use solve_step_result::SolveStepResult;

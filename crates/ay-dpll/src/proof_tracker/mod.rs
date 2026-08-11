@@ -202,6 +202,40 @@ impl ProofTracker {
         Some(id)
     }
 
+    /// Record a decomposed combined-theory conflict (#combined-theory-decompose).
+    ///
+    /// `core` is a single-theory sub-lemma with a strict-checkable `kind`, and
+    /// `full` is the complete blocking clause with `core` as a PREFIX. Emits the
+    /// core under its real kind and then a `weakening` step up to `full`, so the
+    /// caller's downstream consumers still see the clause they expect while the
+    /// justification is checkable instead of `Generic`/trust.
+    ///
+    /// Both halves are validated by the strict checker: the core by its kind's
+    /// own validator, and the weakening by `validate_weakening`, which requires
+    /// exactly the prefix relationship the caller must establish.
+    pub(crate) fn add_theory_lemma_weakened(
+        &mut self,
+        core: Vec<TermId>,
+        kind: TheoryLemmaKind,
+        full: Vec<TermId>,
+    ) -> Option<ProofId> {
+        if !self.enabled {
+            return None;
+        }
+        debug_assert!(
+            full.len() >= core.len() && full[..core.len()] == core[..],
+            "BUG: weakened theory lemma requires the core to be a prefix of the full clause"
+        );
+        if full.len() < core.len() || full[..core.len()] != core[..] {
+            return self.add_theory_lemma(full);
+        }
+        let core_id = self.add_theory_lemma_with_kind(core, kind)?;
+        Some(
+            self.proof
+                .add_rule_step(AletheRule::Weakening, full, vec![core_id], Vec::new()),
+        )
+    }
+
     /// Record a theory lemma (conflict clause) with a specified Alethe rule kind.
     pub(crate) fn add_theory_lemma_with_kind(
         &mut self,

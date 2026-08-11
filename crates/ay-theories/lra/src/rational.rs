@@ -672,7 +672,11 @@ impl From<BigRational> for Rational {
 impl From<&BigRational> for Rational {
     #[inline]
     fn from(br: &BigRational) -> Self {
-        Self::from_big(br.clone())
+        // Inspect the borrowed limbs before cloning: exact solver witnesses are
+        // stored as `BigRational` even when almost every value fits inline.
+        // Cloning first paid two BigInt allocations merely to discard them
+        // while shrinking to `Small`.
+        try_shrink_num(br).unwrap_or_else(|| Self::Big(Box::new(br.clone())))
     }
 }
 

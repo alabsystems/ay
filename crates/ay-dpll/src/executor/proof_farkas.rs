@@ -279,6 +279,7 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
                 | TheoryLemmaKind::StringGroundEval
                 | TheoryLemmaKind::RegexIntersectEmpty
                 | TheoryLemmaKind::EufTransitive
+                | TheoryLemmaKind::EufReflexive
                 | TheoryLemmaKind::EufCongruent
                 | TheoryLemmaKind::EufCongruentPred
         ) {
@@ -384,25 +385,84 @@ pub(crate) fn try_lra_farkas_reconstruction(
         };
         ay_core::TheorySolver::assert_literal(&mut lra, atom, value);
     }
-    if let ay_core::TheoryResult::UnsatWithFarkas(conflict) = ay_core::TheorySolver::check(&mut lra)
+    let ay_core::TheoryResult::UnsatWithFarkas(conflict) = ay_core::TheorySolver::check(&mut lra)
+    else {
+        return false;
+    };
+    let Some(source_farkas) = conflict.farkas.as_ref() else {
+        return false;
+    };
+    if source_farkas.coefficients.len() != conflict.literals.len() {
+        return false;
+    }
+
+    // LraSolver returns coefficients in `conflict.literals` order, which is
+    // free to differ from registration/assertion order. Recover the exact
+    // blocking-clause identity of each row, then rebind by TermId. Attaching
+    // this vector directly to `clause` is unsound after a solver permutation.
+    let zero = num_rational::Rational64::from(0);
+    let mut source_clause = Vec::with_capacity(conflict.literals.len());
+    let mut source_coefficients = Vec::with_capacity(conflict.literals.len());
+    for (&literal, coefficient) in conflict
+        .literals
+        .iter()
+        .zip(source_farkas.coefficients.iter())
     {
-        if let Some(farkas_proof) = conflict.farkas {
-            if farkas_proof.coefficients.len() == clause.len() {
-                let inferred_kind =
-                    crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
-                        terms,
-                        clause,
-                        Some(&farkas_proof),
-                    );
-                *farkas = Some(farkas_proof);
-                *kind = if inferred_kind.is_trust() {
-                    TheoryLemmaKind::LraFarkas
-                } else {
-                    inferred_kind
-                };
-                return true;
+        let blocker = clause.iter().copied().find(|&candidate| {
+            if literal.value {
+                matches!(terms.get(candidate), TermData::Not(inner) if *inner == literal.term)
+            } else {
+                candidate == literal.term
             }
+        });
+        match blocker {
+            Some(blocker) => {
+                source_clause.push(blocker);
+                source_coefficients.push(*coefficient);
+            }
+            None if *coefficient == zero => {}
+            None => return false,
         }
     }
-    false
+    let source_farkas = ay_core::FarkasAnnotation::new(source_coefficients);
+    let Some(rebound) = source_farkas.rebind_by_literal(&source_clause, clause) else {
+        return false;
+    };
+    if !rebound.is_valid() {
+        return false;
+    }
+
+    // Re-check the rebound certificate against the exact target clause before
+    // it can become proof authority. This is independent of the producing LRA
+    // solver and catches every remaining polarity/order mismatch fail-closed.
+    let target_conflict: Vec<ay_core::TheoryLit> = clause
+        .iter()
+        .map(|&literal| match terms.get(literal) {
+            TermData::Not(inner) => ay_core::TheoryLit::new(*inner, true),
+            _ => ay_core::TheoryLit::new(literal, false),
+        })
+        .collect();
+    if ay_core::proof_validation::verify_farkas_conflict_lits_full(
+        terms,
+        &target_conflict,
+        &rebound,
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    let inferred_kind =
+        crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+            terms,
+            clause,
+            Some(&rebound),
+        );
+    *farkas = Some(rebound);
+    *kind = if inferred_kind.is_trust() {
+        TheoryLemmaKind::LraFarkas
+    } else {
+        inferred_kind
+    };
+    true
 }

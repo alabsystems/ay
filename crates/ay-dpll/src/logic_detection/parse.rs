@@ -25,12 +25,14 @@ pub(crate) const FAIL_CLOSED_COMBINED: [&str; 4] =
 /// same content detection as the unset case, so no verdict depends on this
 /// predicate diverging from z3 on an unmeasured token.
 pub(crate) fn is_z3_recognized_logic(s: &str) -> bool {
-    const EXACT: [&str; 6] = ["ALL", "HORN", "QF_FD", "FP", "QF_FP", "QF_S"];
+    const EXACT: [&str; 8] = [
+        "ALL", "HO_ALL", "HORN", "QF_FD", "FP", "QF_FP", "QF_S", "SMTFD",
+    ];
     if EXACT.contains(&s) {
         return true;
     }
-    const SUBSTR: [&str; 12] = [
-        "UF", "BV", "DT", "FP", "LIA", "LRA", "LIRA", "NIA", "NRA", "NIRA", "IDL", "RDL",
+    const SUBSTR: [&str; 13] = [
+        "UF", "BV", "DT", "FP", "FS", "LIA", "LRA", "LIRA", "NIA", "NRA", "NIRA", "IDL", "RDL",
     ];
     if SUBSTR.iter().any(|needle| s.contains(needle)) {
         return true;
@@ -64,6 +66,9 @@ impl LogicCategory {
             "QF_LIA" | "QF_IDL" => Self::QfLia,
             // Non-linear arithmetic logics
             "QF_NIA" => Self::QfNia,
+            // QF_EIA terms reach this route only after the frontend has
+            // eliminated a supported `**` application exactly.
+            "QF_EIA" => Self::QfEia,
             "QF_NRA" => Self::QfNra,
             "QF_NIRA" => Self::QfNira,
             // Combined UF + LIA (very common in verification; also accepts QF_UFIDL)
@@ -163,6 +168,20 @@ impl LogicCategory {
             "ABV" => Self::QfAbv,
             "UFBV" => Self::QfUfbv,
             "AUFBV" => Self::QfAufbv,
+            // Quantified floating-point: same treatment as quantified bitvectors
+            // above — route to the QF solver and let the quantifier loop handle
+            // the binders. These were MISSING, so a declared `FP`/`BVFP`/... fell
+            // through to content-based detection, which does not recognise FP
+            // content and classified them as `QfUf`: the FP theory never ran.
+            // Measured on the SQ FPArith selection (2.7% solved, 86% fast-bails):
+            // 7 of 10 sampled bails were categorised QfUf while declaring FP,
+            // BVFP, FPLRA or BVFPLRA. Each arm mirrors its QF_ counterpart above
+            // (QF_FP -> QfFp, QF_BVFP -> QfBvfp, QF_ABVFP -> QfAbvfp,
+            // QF_FPLRA -> QfFp with LRA via the combined path).
+            "FP" => Self::QfFp,
+            "BVFP" => Self::QfBvfp,
+            "ABVFP" | "AFPBV" => Self::QfAbvfp,
+            "FPLRA" => Self::QfFp,
             // Quantified datatype logics (#7150: ~9 SMT-COMP tracks)
             // Quantifier preprocessing strips quantifiers before theory dispatch,
             // so these route to the same DT-combined solvers as QF_ variants.

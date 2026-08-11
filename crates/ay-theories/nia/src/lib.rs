@@ -42,6 +42,7 @@ mod check_loop;
 mod factor_split;
 pub(crate) mod feasible_set;
 mod interval_contract;
+mod local_search;
 mod monomial;
 mod nlsat;
 mod patch;
@@ -300,6 +301,34 @@ pub struct NiaSolver<'a> {
     /// checkpoints observe the same wall. `None` (the default) preserves the
     /// old un-budgeted behavior.
     deadline: Option<ay_core::time::Instant>,
+
+    /// Original (post-preprocessing) assertion FORMULAS for this solve, with
+    /// their Boolean structure intact (#nia-clausal-sls).
+    ///
+    /// `asserted` only ever holds theory ATOMS under the SAT solver's current
+    /// trail, which is enough for the box-shaped fallbacks but destroys exactly
+    /// the clause structure the clausal local search needs. The executor
+    /// installs the roots via [`NiaSolver::set_root_assertions`]; empty (the
+    /// default) disables the lane.
+    root_assertions: Vec<TermId>,
+
+    /// The clausal local search is a whole-formula search whose result does not
+    /// depend on the SAT trail, so it is attempted at most once per solver
+    /// instance (#nia-clausal-sls).
+    local_search_done: bool,
+
+    /// Absolute wall cutoff for the clausal local-search lane
+    /// (#nia-clausal-sls), shared by every theory instance the split loop
+    /// creates during one solve.
+    ///
+    /// The executor recreates `NiaSolver` on every split iteration, so a
+    /// per-instance budget compounds: each new instance would claim a fresh
+    /// slice of the REMAINING wall and, between them, the whole deadline. That
+    /// starves work that would still have finished — measured: one QF_NIA
+    /// `unsat` that needed 12.3s of a 15s budget degraded to `unknown`. One
+    /// absolute cutoff installed before the split loop caps the lane's TOTAL
+    /// share of the solve and leaves the remainder to the rest of the pipeline.
+    local_search_deadline: Option<ay_core::time::Instant>,
 }
 
 impl<'a> NiaSolver<'a> {
@@ -346,7 +375,31 @@ impl<'a> NiaSolver<'a> {
             box_bound_emitted: HashSet::default(),
             last_unsat_certificate: None,
             deadline: None,
+            root_assertions: Vec::new(),
+            local_search_done: false,
+            local_search_deadline: None,
         }
+    }
+
+    /// Install the solve's original assertion formulas (#nia-clausal-sls).
+    ///
+    /// Only the clausal local-search lane reads these, and only to build its
+    /// own clause set and to exactly re-verify a candidate witness. Nothing on
+    /// the UNSAT side consults them, so an inaccurate or empty list can cost
+    /// completeness but never soundness.
+    pub fn set_root_assertions(&mut self, roots: Vec<TermId>) {
+        self.root_assertions = roots;
+        self.local_search_done = false;
+    }
+
+    /// Install the shared absolute wall cutoff for the clausal local-search
+    /// lane (#nia-clausal-sls); see the `local_search_deadline` field.
+    ///
+    /// Callers must compute this ONCE per solve, before the split loop, so
+    /// every theory instance the loop creates shares one budget. Completeness
+    /// only: a cutoff in the past simply disables the lane.
+    pub fn set_local_search_deadline(&mut self, cutoff: ay_core::time::Instant) {
+        self.local_search_deadline = Some(cutoff);
     }
 
     /// Install a hard wall-clock deadline on the NIA solver (#nia-deadline).

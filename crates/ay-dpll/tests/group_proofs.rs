@@ -7,8 +7,17 @@
 
 #![allow(clippy::panic)]
 
+// Shared SMT-LIB script helpers (`common::solve`). The module is
+// `#![allow(dead_code)]` because each integration-test binary uses a different
+// subset of it.
+mod common;
+
+#[path = "group_proofs/array_collapse_promotion.rs"]
+mod array_collapse_promotion;
 #[path = "group_proofs/carcara_external_check.rs"]
 mod carcara_external_check;
+#[path = "group_proofs/check_sat_assuming_proof_net.rs"]
+mod check_sat_assuming_proof_net;
 #[path = "group_proofs/class4_generic_trust_shapes.rs"]
 mod class4_generic_trust_shapes;
 #[path = "group_proofs/combined_direct_proof_quality_6756.rs"]
@@ -21,6 +30,8 @@ mod combined_proof_provenance_6759;
 mod complementary_literal_rebuild;
 #[path = "group_proofs/congruence_collapse_rebuild.rs"]
 mod congruence_collapse_rebuild;
+#[path = "group_proofs/ematching_forall_farkas_rebuild.rs"]
+mod ematching_forall_farkas_rebuild;
 #[path = "group_proofs/incremental_clausification_proofs.rs"]
 mod incremental_clausification_proofs;
 #[path = "group_proofs/incremental_proof_quality_8154.rs"]
@@ -29,6 +40,8 @@ mod incremental_proof_quality_8154;
 mod linear_and_collapse_rebuild;
 #[path = "group_proofs/multi_equality_farkas_rebuild.rs"]
 mod multi_equality_farkas_rebuild;
+#[path = "group_proofs/premise_binding_nary_rebuild.rs"]
+mod premise_binding_nary_rebuild;
 #[path = "group_proofs/proof_boundary_unsat_9037.rs"]
 mod proof_boundary_unsat_9037;
 #[path = "group_proofs/proof_ring_repro.rs"]

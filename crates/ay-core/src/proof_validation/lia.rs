@@ -133,6 +133,73 @@ fn validate_linear_identity(
     }
 }
 
+/// Recognize a strict-checkable SMT-LIB Euclidean-remainder range theorem.
+///
+/// This is the exact inverse of [`validate_lia_mod_range`], so proof producers
+/// can only classify clauses that the strict checker independently accepts.
+#[must_use]
+pub fn recognize_lia_mod_range(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_lia_mod_range(terms, clause).is_ok()
+}
+
+/// Validate a unit theorem saying a symbolic Euclidean remainder cannot equal
+/// an out-of-range integer constant.
+///
+/// SMT-LIB integer `mod` satisfies `0 <= (mod x d) < |d|` for every non-zero
+/// integer divisor `d`.  Consequently
+/// `(not (= (mod x d) r))` is valid for every `x` exactly when the constant
+/// `r` is negative or at least `|d|`.  The checker accepts only that closed
+/// schema; importantly, divisor zero and non-constant divisors are rejected.
+pub fn validate_lia_mod_range(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Result<(), LiaValidationError> {
+    use crate::term::{Constant, Symbol, TermData};
+    use crate::Sort;
+    use num_traits::{Signed, Zero};
+
+    let fail = || LiaValidationError::IntegerReasoningUnverified { shape: "ModRange" };
+    let [literal] = clause else {
+        return Err(fail());
+    };
+    let TermData::Not(equality) = terms.get(*literal) else {
+        return Err(fail());
+    };
+    let (lhs, rhs) = decode_eq(terms, *equality).ok_or_else(fail)?;
+
+    let int_constant = |term: TermId| match terms.get(term) {
+        TermData::Const(Constant::Int(value)) => Some(value),
+        _ => None,
+    };
+    let decode = |mod_term: TermId, remainder_term: TermId| {
+        let TermData::App(Symbol::Named(name), args) = terms.get(mod_term) else {
+            return None;
+        };
+        if name != "mod"
+            || args.len() != 2
+            || !matches!(terms.sort(mod_term), Sort::Int)
+            || !matches!(terms.sort(args[0]), Sort::Int)
+            || !matches!(terms.sort(args[1]), Sort::Int)
+            || !matches!(terms.sort(remainder_term), Sort::Int)
+        {
+            return None;
+        }
+        Some((int_constant(args[1])?, int_constant(remainder_term)?))
+    };
+    let (divisor, remainder) = decode(lhs, rhs)
+        .or_else(|| decode(rhs, lhs))
+        .ok_or_else(fail)?;
+    if divisor.is_zero() {
+        return Err(fail());
+    }
+    let modulus = divisor.abs();
+    if remainder.is_negative() || remainder >= &modulus {
+        Ok(())
+    } else {
+        Err(fail())
+    }
+}
+
 /// Decode a POSITIVE equality `(= A B)` into `(A, B)`.
 fn decode_eq(terms: &TermStore, lit: TermId) -> Option<(TermId, TermId)> {
     use crate::term::{Symbol, TermData};

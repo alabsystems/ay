@@ -83,13 +83,17 @@
 //! # Proof story
 //!
 //! A refutation returned here surfaces as a direct UNSAT from the FP theory
-//! path. The Alethe proof for it is closed by the executor's existing audited
-//! fallback (`derive_empty_via_trust_lemma`), i.e. the gamma/half-ulp lemma is
-//! recorded as a `:rule trust` hole and counted by `terminal_trust_report` —
-//! exactly like other theory conflicts detected outside the SAT loop. A
-//! kernel-checked gamma lemma (validating `r(M)` and the accumulation steps
-//! from the input-bound assumptions) is the follow-up that would discharge
-//! this hole; see the development design notes.
+//! path. The Alethe proof for it is closed by the executor's
+//! `derive_empty_via_trust_lemma` fallback (one theory lemma negating the
+//! resolvable assumptions + genuine `th_resolution` to the empty clause), and
+//! the finalize-time `promote_fp_forward_error_lemmas` pass then re-tags that
+//! lemma to `TheoryLemmaKind::FpForwardError` iff the strict checker's own
+//! recognizer (`ay_proof::recognize_fp_forward_error` — an INDEPENDENT,
+//! fail-closed re-implementation of this analysis in `ay-proof`) accepts the
+//! clause. The promoted lemma is not a trust step: `terminal_trust_report`
+//! reports the proof trust-free, `check_proof_strict` re-validates the lemma
+//! analytically, and the UNSAT survives `--strict-proofs`/`--self-check`.
+//! See the development design notes.
 
 use std::collections::BTreeMap;
 

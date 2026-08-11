@@ -1,10 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Char theory: `(_ Char n)` / `(_ char #xNN)` literals and `char.to_int`,
-//! `char.<=`, `char.is_digit`. SMT-LIB models a Char as a Unicode code point,
+//! Z3 5.0.0 Char ground fragment: `(_ Char n)`, `char.to_int`, `char.<=`,
+//! `char.is_digit`, `char.to_bv`, and `char.from_bv`.
+//! SMT-LIB models a Char as a Unicode code point,
 //! which AY represents as that bounded Int, so each operator desugars to Int
-//! arithmetic. Every expected verdict below matches z3 4.15.4.
+//! arithmetic or an exact 18-bit conversion. Every expected verdict below
+//! matches Z3 5.0.0.
 
 fn solve(smt: &str) -> String {
     crate::common::solve(smt)
@@ -49,6 +51,26 @@ fn char_is_digit_checks_the_ascii_digit_range() {
     // 'a' (97) is not a digit.
     assert_eq!(
         solve("(set-logic ALL)\n(assert (char.is_digit (_ Char 97)))\n(check-sat)"),
+        "unsat"
+    );
+}
+
+#[test]
+fn char_bitvector_conversions_use_the_exact_18_bit_code_point() {
+    assert_eq!(
+        solve("(set-logic ALL)\n(assert (= (char.to_bv (_ Char 65)) (_ bv65 18)))\n(check-sat)"),
+        "sat"
+    );
+    assert_eq!(
+        solve("(set-logic ALL)\n(assert (distinct (char.to_bv (_ Char 65)) (_ bv65 18)))\n(check-sat)"),
+        "unsat"
+    );
+    assert_eq!(
+        solve("(set-logic ALL)\n(assert (= (char.from_bv (_ bv65 18)) (_ Char 65)))\n(check-sat)"),
+        "sat"
+    );
+    assert_eq!(
+        solve("(set-logic ALL)\n(assert (distinct (char.from_bv (_ bv65 18)) (_ Char 65)))\n(check-sat)"),
         "unsat"
     );
 }

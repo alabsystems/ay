@@ -631,18 +631,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         );
                                     match kind {
                                         ay_core::TheoryLemmaKind::Generic => {
-                                            let _ = $self.proof_tracker.add_theory_lemma(terms);
+                                            let _ =
+                                                $self.proof_tracker.add_theory_lemma(terms.clone());
                                         }
                                         _ => {
                                             let _ = $self
                                                 .proof_tracker
-                                                .add_theory_lemma_with_kind(terms, kind);
+                                                .add_theory_lemma_with_kind(terms.clone(), kind);
                                         }
                                     }
                                     if *recorded_in_trace {
                                         state.clausification_proofs.push(None);
                                         state.original_clause_theory_proofs.push(Some(
                                             ay_core::TheoryLemmaProof {
+                                                clause: terms,
                                                 kind,
                                                 farkas: None,
                                                 lia: None,
@@ -782,6 +784,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // Finalize proof after loop exits (borrows on state/solver are released) (#6705)
         if let Some((_itp_ct, _itp_vtm, _itp_neg, _itp_cp, _itp_tp)) = _itp_proof_stash {
             $self.last_clause_trace = _itp_ct;
+            $crate::pipeline_fns::record_var_map_provenance_trace(
+                "incremental", _itp_vtm.len(), $self.last_clause_trace.as_ref());
             $self.last_var_to_term = Some(_itp_vtm);
             $self.last_negations = Some(_itp_neg);
             $self.last_clausification_proofs = Some(_itp_cp);
@@ -1295,16 +1299,21 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     );
                                     match kind {
                                         ay_core::TheoryLemmaKind::Generic => {
-                                            let _ = $self.proof_tracker.add_theory_lemma(terms);
+                                            let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
                                         }
                                         _ => {
-                                            let _ = $self.proof_tracker.add_theory_lemma_with_kind(terms, kind);
+                                            let _ = $self.proof_tracker.add_theory_lemma_with_kind(terms.clone(), kind);
                                         }
                                     }
                                     if *recorded_in_trace {
                                         state.clausification_proofs.push(None);
                                         state.original_clause_theory_proofs.push(Some(
-                                            ay_core::TheoryLemmaProof { kind, farkas: None, lia: None },
+                                            ay_core::TheoryLemmaProof {
+                                                clause: terms,
+                                                kind,
+                                                farkas: None,
+                                                lia: None,
+                                            },
                                         ));
                                     }
                                 }
@@ -1440,6 +1449,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
         if let Some((_itp_ct, _itp_vtm, _itp_neg, _itp_cp, _itp_tp)) = _itp_proof_stash {
             $self.last_clause_trace = _itp_ct;
+            $crate::pipeline_fns::record_var_map_provenance_trace(
+                "incremental", _itp_vtm.len(), $self.last_clause_trace.as_ref());
             $self.last_var_to_term = Some(_itp_vtm);
             $self.last_negations = Some(_itp_neg);
             $self.last_clausification_proofs = Some(_itp_cp);

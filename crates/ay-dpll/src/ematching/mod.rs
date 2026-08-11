@@ -126,6 +126,16 @@ impl Default for EMatchingConfig {
     }
 }
 
+fn effective_quantifier_weight(
+    terms: &TermStore,
+    quantifier: TermId,
+    config: &EMatchingConfig,
+) -> f64 {
+    terms
+        .explicit_quantifier_weight(quantifier)
+        .map_or(config.default_weight, f64::from)
+}
+
 /// Tracks generation (age) of terms for cost-based instantiation filtering.
 ///
 /// Generation tracking prevents infinite instantiation loops more intelligently
@@ -331,6 +341,15 @@ pub(crate) struct ForallInstantiationProvenance {
 pub(crate) struct EMatchingResult {
     /// Ground instantiations derived from quantified formulas.
     pub instantiations: Vec<TermId>,
+    /// Exact quantifier roots for which at least one binding passed the
+    /// instantiation cost gate in this round.
+    ///
+    /// This is provenance, not a completeness claim: callers use it to tell
+    /// whether an existential was actually processed by E-matching.  Deriving
+    /// that fact by comparing a separately recollected quantifier list against
+    /// `uninstantiated_quantifiers` is unsound because NNF recollection can
+    /// mint an equivalent quantifier with a different `TermId`.
+    pub instantiated_quantifiers: HashSet<TermId>,
     /// True if any quantifier had no matching ground terms.
     /// When true and solver returns Sat, we must return Unknown instead.
     pub has_uninstantiated: bool,
@@ -532,6 +551,7 @@ pub(crate) fn perform_ematching_with_generations(
     if quantifiers.is_empty() {
         return EMatchingResult {
             instantiations: vec![],
+            instantiated_quantifiers: HashSet::default(),
             has_uninstantiated: false,
             uninstantiated_quantifiers: HashSet::default(),
             reached_limit: false,
@@ -554,6 +574,16 @@ pub(crate) fn perform_ematching_with_generations(
         collect_unconditional_foralls(terms, assertion, &mut unconditional_foralls);
     }
     let mut unconditional_forall_roots: HashSet<TermId> = HashSet::default();
+
+    // (#auflia-disjunct-forall-false-unsat) SOUNDNESS GATE for instantiation
+    // itself. Every instance this function returns is appended to `ctx.assertions`
+    // as a TOP-LEVEL CONJUNCT by every caller (`add_ematching_instances`,
+    // `dispatch.rs`, `run_post_cegqi_ematching`, the demand-lane flush), so the
+    // instance must be a CONSEQUENCE OF THE PROBLEM, not merely of its source
+    // quantifier. `collect_entailed_foralls` is the polarity-aware predicate for
+    // that; `quantifiers` above is NOT (it flattens through `or`/`ite`/`=>`
+    // without polarity and deliberately also surfaces `Exists`).
+    let entailed_foralls: HashSet<TermId> = entailed_forall_set(terms, assertions);
 
     tracker.next_round();
 
@@ -646,6 +676,36 @@ pub(crate) fn perform_ematching_with_generations(
             TermData::Exists(..) => continue,
             _ => continue,
         };
+        // (#auflia-disjunct-forall-false-unsat) NEVER instantiate a Forall that
+        // the assertion set does not ENTAIL. Universal instantiation is sound as
+        // an IMPLICATION (`∀x.body ⇒ body[t/x]`), but every caller conjoins the
+        // returned instance as a top-level assertion, which asserts the
+        // CONSEQUENT unconditionally. That is only licensed when `∀x.body` is
+        // itself entailed — a top-level conjunct, a conjunct under `and`, a
+        // negated `exists`, … A Forall reachable only under a positive `or`/`=>`
+        // or an `ite` is a mere DISJUNCT: the problem does not entail it, so its
+        // "instance" is a fabricated constraint that can refute a satisfiable
+        // problem. Measured doing exactly that on six AUFLIA/20170829-Rodin
+        // files (declared `sat`, confirmed `sat` by z3 and cvc5) whose
+        // Skolemizer output `(forall x. (or (not (mAckn x)) (forall y. (not (dap
+        // y x)))))` puts the INNER universal under a disjunction.
+        //
+        // Skipping is FAIL-CLOSED IN BOTH DIRECTIONS, exactly like the `Exists`
+        // refusal above: the quantifier gets no ground match, so it lands in
+        // `uninstantiated_quantifiers`, which sets `has_uninstantiated` and
+        // thereby blocks the `full_ematching_coverage` SAT certificate in
+        // `result_mapping.rs`, and routes it to the unhandled/MBQI lane. So
+        // neither an unsound UNSAT nor an unsound SAT can be built on it.
+        //
+        // The sound way to USE such a quantifier is the guarded lemma
+        // `(or (not Q) body[t/x])` — but `flatten_and_strip_quantifiers` drops
+        // every quantifier-containing assertion before the ground solve, so a
+        // guarded lemma would be discarded rather than used. Recovering these
+        // instances therefore needs a real quantifier abstraction in the ground
+        // solver; refusing to instantiate is the soundness floor until then.
+        if !entailed_foralls.contains(&quant) {
+            continue;
+        }
         // Only ground instances of an UNCONDITIONALLY-asserted Forall are sound
         // to thread as conflict-verification support (the strict `and`-only walk
         // in `collect_unconditional_foralls` populates `unconditional_foralls`).
@@ -663,6 +723,7 @@ pub(crate) fn perform_ematching_with_generations(
         let var_sorts: Vec<Sort> = quant_vars.iter().map(|(_, sort)| sort.clone()).collect();
 
         let quant_count = per_quantifier_count.entry(quant).or_insert(0);
+        let quantifier_weight = effective_quantifier_weight(terms, quant, config);
         // LI-INC-3: replay the epoch matched-binding record. When the eqclasses are
         // stable and this round skips `quant`'s OLD candidates, the per-round
         // `instantiated_quantifiers` firewall input must still reflect that a PRIOR
@@ -677,7 +738,7 @@ pub(crate) fn perform_ematching_with_generations(
         let mut quantifier_instantiated_this_round = false;
         if eqclasses_stable {
             for old_binding in state.epoch_matched_bindings_for(quant) {
-                let cost = tracker.instantiation_cost(old_binding, config.default_weight);
+                let cost = tracker.instantiation_cost(old_binding, quantifier_weight);
                 if cost <= config.lazy_threshold {
                     instantiated_quantifiers.insert(quant);
                     quantifier_instantiated_this_round = true;
@@ -815,7 +876,7 @@ pub(crate) fn perform_ematching_with_generations(
                     }
 
                     // Compute instantiation cost based on generation
-                    let cost = tracker.instantiation_cost(&binding, config.default_weight);
+                    let cost = tracker.instantiation_cost(&binding, quantifier_weight);
 
                     if cost > config.lazy_threshold {
                         // M0': blocked (skipped at the cost gate). Counted where the
@@ -1034,6 +1095,7 @@ pub(crate) fn perform_ematching_with_generations(
 
     EMatchingResult {
         instantiations,
+        instantiated_quantifiers,
         has_uninstantiated,
         uninstantiated_quantifiers,
         reached_limit,
@@ -1062,6 +1124,7 @@ fn compute_full_instantiated_quantifiers(
 ) -> HashSet<TermId> {
     let mut instantiated: HashSet<TermId> = HashSet::default();
     for &quant in quantifiers {
+        let quantifier_weight = effective_quantifier_weight(terms, quant, config);
         let trigger_groups = extract_patterns_with_fallback(terms, quant);
         let var_sorts: Vec<Sort> = match terms.get(quant) {
             TermData::Forall(v, _, _) | TermData::Exists(v, _, _) => {
@@ -1097,7 +1160,7 @@ fn compute_full_instantiated_quantifiers(
                     )
                 };
                 for binding in bindings {
-                    let cost = tracker.instantiation_cost(&binding, config.default_weight);
+                    let cost = tracker.instantiation_cost(&binding, quantifier_weight);
                     if cost > config.lazy_threshold {
                         continue;
                     }
@@ -1269,9 +1332,246 @@ pub(crate) fn quantifier_has_no_possible_trigger_match(
     all_dead
 }
 
+/// (#auflia-disjunct-forall-false-unsat) Collect, in deterministic order, the universal
+/// quantifiers ENTAILED as NNF CONJUNCTS of `term` under the given `positive`
+/// polarity. This is the CANONICAL entailment predicate for every lane that
+/// conjoins a ground instance `body[t/x]` into the assertion set as a
+/// TOP-LEVEL CONJUNCT.
+///
+/// # Why every instantiation lane must consult it
+///
+/// `∀x. body ⊨ body[t/x]` (universal instantiation) is a consequence of the
+/// QUANTIFIER, not of the PROBLEM. It licenses conjoining `body[t/x]` only when
+/// the problem entails `∀x. body` itself. When the `forall` sits in a
+/// disjunctive position — `(or c (forall x. p x))`, an `ite` branch, a positive
+/// `=>` conclusion — the problem entails only the enclosing disjunction, and
+/// conjoining an instance FABRICATES a constraint: a genuinely-SAT problem can
+/// be turned UNSAT. That is exactly the `#auflia-disjunct-forall-false-unsat`
+/// defect (six 20170829-Rodin files answered `unsat` against a declared and
+/// triply-oracle-confirmed `sat`, with `conflicts=0 decisions=0` — the whole
+/// refutation came from conjoined instances, not from search).
+///
+/// The walk descends ONLY through connectives that preserve conjunct-hood:
+///  * positive `and` (each arg is entailed),
+///  * negative `or`  (`¬(a ∨ b) ≡ ¬a ∧ ¬b`),
+///  * negative `=>`  (`¬(a₁ ⇒ … ⇒ aₙ) ≡ a₁ ∧ … ∧ aₙ₋₁ ∧ ¬aₙ`, right-assoc),
+///  * `not` (flips polarity).
+///
+/// It collects a positive `Forall` directly, and a negative `Exists` as its
+/// minted NNF-dual `forall x. ¬body` — the SAME construction (and therefore the
+/// same hash-consed `TermId`) as [`collect_quantifiers`]'s `Not(Exists)` arm, so
+/// membership tests against a `collect_quantifiers` list line up exactly.
+///
+/// It STOPS at every other position (positive `or`/`=>`, both-polarity `ite`,
+/// `xor`, `=`, quantifier bodies, `let`, uninterpreted apps): a quantifier
+/// reachable only past one of those is NOT entailed. Dropping a candidate is
+/// always FAIL-SAFE for the UNSAT direction — an instantiation lane that
+/// instantiates fewer quantifiers only weakens the conjunction, so it can lose
+/// a refutation (sound `unknown`) but never manufacture one.
+///
+/// Strictly WIDER than [`collect_unconditional_foralls`] (which is `and`-only
+/// and is the narrower provenance filter for proof/support-axiom tagging) and
+/// strictly NARROWER than [`collect_quantifiers`] (which flattens through
+/// `or`/`ite` with no polarity at all). Do not substitute one for another.
+pub(crate) fn collect_entailed_foralls(
+    terms: &mut TermStore,
+    term: TermId,
+    positive: bool,
+    out: &mut Vec<TermId>,
+) {
+    collect_entailed_foralls_with_units(terms, term, positive, &UnitFacts::default(), out);
+}
+
+/// Top-level unit facts of an assertion list: atom -> its asserted truth value.
+///
+/// A bare atom assertion is a FACT, and the entailment test has to be taken
+/// modulo those facts rather than read off the syntax tree alone. This is the
+/// same `#unit-conjunctive` refinement `forall_ids_in_conjunctive_position`
+/// already applies for the MBQI gate: `(=> ext_eq_0 (forall i. B i))` puts its
+/// `forall` in a syntactically DISJUNCTIVE position, yet with `(assert
+/// ext_eq_0)` also present the universal is an outright top-level consequence
+/// and its instances are sound ground facts. Reading that shape syntactically
+/// discarded a genuine UNSAT once already (#7956); it also loses the
+/// `∀x. q(x) ⇒ ∀x. p(x)` + `q(0)` + `¬p(1)` refutation.
+///
+/// Unit-simplifying first is sound (a unit assertion is unconditionally true)
+/// and strictly more accurate: it only ever RECOGNISES universals that really
+/// are consequences, never admits one that is not.
+#[derive(Default)]
+pub(crate) struct UnitFacts {
+    values: HashMap<TermId, bool>,
+}
+
+impl UnitFacts {
+    /// Collect the top-level unit facts of `assertions`.
+    pub(crate) fn from_assertions(terms: &TermStore, assertions: &[TermId]) -> Self {
+        let mut values: HashMap<TermId, bool> = HashMap::default();
+        for &a in assertions {
+            match terms.get(a) {
+                TermData::Not(inner) => {
+                    let inner = *inner;
+                    if is_unit_atom(terms, inner) {
+                        values.insert(inner, false);
+                    }
+                }
+                _ => {
+                    if is_unit_atom(terms, a) {
+                        values.insert(a, true);
+                    }
+                }
+            }
+        }
+        Self { values }
+    }
+
+    /// Truth of `t` under the units, if determined. Handles a negated atom by
+    /// flipping its atom's unit value.
+    fn value(&self, terms: &TermStore, t: TermId) -> Option<bool> {
+        if let Some(&v) = self.values.get(&t) {
+            return Some(v);
+        }
+        if let TermData::Not(inner) = terms.get(t) {
+            if let Some(&v) = self.values.get(inner) {
+                return Some(!v);
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// Is `t` an atom that a bare assertion of it pins as a unit fact? (Mirrors
+/// `result_mapping::is_unit_atom`.)
+fn is_unit_atom(terms: &TermStore, t: TermId) -> bool {
+    match terms.get(t) {
+        TermData::Forall(..) | TermData::Exists(..) | TermData::Not(..) => false,
+        TermData::App(ay_core::Symbol::Named(name), _) => {
+            !matches!(name.as_str(), "and" | "or" | "=>" | "not" | "ite" | "xor")
+        }
+        _ => true,
+    }
+}
+
+/// [`collect_entailed_foralls`], taken modulo the top-level unit facts in
+/// `units` (see [`UnitFacts`]). With empty units this is exactly the syntactic
+/// walk.
+pub(crate) fn collect_entailed_foralls_with_units(
+    terms: &mut TermStore,
+    term: TermId,
+    positive: bool,
+    units: &UnitFacts,
+    out: &mut Vec<TermId>,
+) {
+    stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
+        match terms.get(term).clone() {
+            TermData::Forall(..) => {
+                if positive {
+                    out.push(term);
+                }
+                // Negative forall = existential: not entailed as a universal.
+            }
+            TermData::Exists(vars, body, triggers) => {
+                if !positive {
+                    // NNF: NOT(exists x. phi) is the entailed universal
+                    // forall x. NOT(phi).
+                    let neg_body = terms.mk_not(body);
+                    let converted = terms.mk_forall_with_triggers(vars, neg_body, triggers);
+                    terms.copy_quantifier_metadata(term, converted);
+                    out.push(converted);
+                }
+            }
+            TermData::Not(inner) => {
+                collect_entailed_foralls_with_units(terms, inner, !positive, units, out);
+            }
+            TermData::App(sym, args) => {
+                let name = sym.name();
+                if (positive && name == "and") || (!positive && name == "or") {
+                    for arg in args {
+                        collect_entailed_foralls_with_units(terms, arg, positive, units, out);
+                    }
+                } else if !positive && name == "=>" && !args.is_empty() {
+                    // ¬(a₁ ⇒ … ⇒ aₙ) ≡ a₁ ∧ … ∧ aₙ₋₁ ∧ ¬aₙ (right-assoc n-ary).
+                    let last = args.len() - 1;
+                    for (i, arg) in args.into_iter().enumerate() {
+                        collect_entailed_foralls_with_units(terms, arg, i < last, units, out);
+                    }
+                } else if !units.is_empty() && positive && name == "=>" && args.len() == 2 {
+                    // (#unit-conjunctive) `(=> a b)` with `a` a unit FACT makes
+                    // `b` a top-level consequence. Sound: `a` is unconditionally
+                    // true, so the implication reduces to `b`.
+                    if units.value(terms, args[0]) == Some(true) {
+                        collect_entailed_foralls_with_units(terms, args[1], positive, units, out);
+                    }
+                } else if !units.is_empty() && positive && name == "or" {
+                    // (#unit-conjunctive) Unit propagation through a positive
+                    // `or`: when no disjunct is already TRUE and every disjunct
+                    // but one is FALSIFIED by a unit fact, the survivor is a
+                    // top-level consequence.
+                    if !args.iter().any(|&x| units.value(terms, x) == Some(true)) {
+                        let live: Vec<TermId> = args
+                            .iter()
+                            .copied()
+                            .filter(|&x| units.value(terms, x) != Some(false))
+                            .collect();
+                        if live.len() == 1 {
+                            collect_entailed_foralls_with_units(
+                                terms, live[0], positive, units, out,
+                            );
+                        }
+                    }
+                }
+                // Every other App (positive or / =>, xor, =, uninterpreted, …):
+                // STOP — nothing below is an entailed conjunct.
+            }
+            // ite (either polarity), let, atoms, leaves: STOP (fail-safe).
+            _ => {}
+        }
+    }) // stacker::maybe_grow
+}
+
+/// The entailed-universal set of a whole assertion list, as a membership index.
+/// Every assertion root is walked at positive polarity (asserted = true), taken
+/// modulo the list's own top-level unit facts.
+pub(crate) fn entailed_forall_set(terms: &mut TermStore, assertions: &[TermId]) -> HashSet<TermId> {
+    let units = UnitFacts::from_assertions(terms, assertions);
+    let mut acc: Vec<TermId> = Vec::new();
+    for &assertion in assertions {
+        collect_entailed_foralls_with_units(terms, assertion, true, &units, &mut acc);
+    }
+    acc.into_iter().collect()
+}
+
 pub(crate) fn collect_quantifiers(terms: &mut TermStore, term: TermId, out: &mut Vec<TermId>) {
     stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
         match terms.get(term).clone() {
+            // An `Exists` IS surfaced here, and that is deliberate — do not
+            // "fix" the #auflia-exists-eq-false-unsat wrong-`unsat` at this site
+            // (#auflia-exists-eq-collector-must-still-surface).
+            //
+            // Surfacing is not instantiation. The unsound step was the E-matching
+            // loop DESTRUCTURING an `Exists` as an instantiation target; that is
+            // refused at the single point where it happens, in
+            // `perform_ematching_with_generations` (`TermData::Exists(..) =>
+            // continue`). Everything downstream of THIS function needs the
+            // existential to keep flowing through:
+            //
+            //   * it lands in `uninstantiated_quantifiers`, setting
+            //     `has_uninstantiated`, which is one of the conjuncts blocking
+            //     the `full_ematching_coverage` SAT certificate;
+            //   * `quantifier_loop::mod.rs` recomputes this same list to derive
+            //     `ematching_has_exists`; and
+            //   * `setup_cegqi_for_unhandled` iterates it, so a positive-position
+            //     existential is routed to CEGQI, or else recorded as unhandled.
+            //
+            // Dropping the `Exists` arm here silences all three at once: the
+            // existential becomes invisible rather than unhandled, and the ground
+            // solve's `sat` can then be returned as authoritative with the
+            // existential never discharged. That trades a wrong `unsat` for a
+            // wrong `sat`, which is the worse direction — the wrong `unsat` was
+            // already closed at the instantiation site.
             TermData::Forall(..) | TermData::Exists(..) => {
                 out.push(term);
             }
@@ -1281,12 +1581,14 @@ pub(crate) fn collect_quantifiers(terms: &mut TermStore, term: TermId, out: &mut
                     TermData::Exists(vars, body, triggers) => {
                         let neg_body = terms.mk_not(body);
                         let converted = terms.mk_forall_with_triggers(vars, neg_body, triggers);
+                        terms.copy_quantifier_metadata(inner, converted);
                         out.push(converted);
                     }
                     // NNF: NOT(forall x. phi) → exists x. NOT(phi)
                     TermData::Forall(vars, body, triggers) => {
                         let neg_body = terms.mk_not(body);
                         let converted = terms.mk_exists_with_triggers(vars, neg_body, triggers);
+                        terms.copy_quantifier_metadata(inner, converted);
                         out.push(converted);
                     }
                     _ => collect_quantifiers(terms, inner, out),

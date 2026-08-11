@@ -79,10 +79,23 @@ impl Executor {
         } else {
             "UNCONFIRMED/published"
         };
-        ay_core::safe_eprintln!(
-            "c !! MODEL-UNCONFIRMED [{tier}] (not a refutation — see \
-             [AY SOUNDNESS GATE] for caught invalid models) {detail}"
-        );
+        // Not while corroborating someone else's verdict. The deferred-trust
+        // discharge re-solves the problem in a fresh `Executor` to confirm the
+        // OUTER refutation; that probe reaches this same funnel and, when its
+        // own proof leans on a trust step, cannot certify itself. Narrating
+        // that on the shared transcript reported a failure the user's query
+        // did not have -- measured on
+        // `(assert (=> p (< x 0))) (assert (> x 0)) (check-sat-assuming (p))`,
+        // where the outer certification SUCCEEDS (`all_discharged`) and
+        // publishes a certified `unsat`, yet this line still claimed the
+        // verdict was unconfirmed. The statistics below stay: they live on the
+        // probe's own executor and never reach the user.
+        if !crate::executor::unsat_cert::inside_trust_discharge_solve() {
+            ay_core::safe_eprintln!(
+                "c !! MODEL-UNCONFIRMED [{tier}] (not a refutation — see \
+                 [AY SOUNDNESS GATE] for caught invalid models) {detail}"
+            );
+        }
         self.last_statistics
             .set_string("unknown.phase", "model-validation");
         self.last_statistics
@@ -3996,6 +4009,22 @@ impl Executor {
         Some((atom, polarity))
     }
 
+    /// Whether the one strict array *coverage* oracle may defer to stronger,
+    /// independently checked SAT authority.
+    ///
+    /// Exact spelling is intentional: every definitive-false array oracle,
+    /// every other coverage reason, and every non-confirming independent result
+    /// remains fail-closed.  The invoked gate accepts only when each exact
+    /// authored assertion directly evaluates to `Bool(true)` with no residual,
+    /// tautology, unsupported-atom, or skipped-assertion escape.
+    fn read_conflict_coverage_gap_has_full_independent_authority(&self, oracle: &str) -> bool {
+        oracle == "arrays-read-conflict-uneval"
+            && matches!(
+                self.confirm_sat_with_fully_evaluated_independent_gate(),
+                ay_model_check::GateVerdict::ConfirmedSat
+            )
+    }
+
     /// Run the global strict definitive-false gate on the current SAT result and
     /// degrade it to `Unknown` if any [`DefinitiveEval`] oracle proves the
     /// produced model makes an asserted leaf concretely false.
@@ -4015,6 +4044,7 @@ impl Executor {
             return result;
         }
         self.repair_asserted_bool_leaf_polarities();
+        self.complete_opaque_array_defaults_gate_verified();
         // #uflia-witness-complete (1a-i): fill absent / out-of-range
         // asserted-bound Int leaves BEFORE the read-pin repair measures any
         // collision, so the range-blind diseq shift is never even reached for
@@ -4041,6 +4071,11 @@ impl Executor {
         // model-independent datatype tautology). ModelViolates / CannotConfirm
         // still degrade. Scoped to `datatype-field` on dt-carrying-array problems.
         let mut strict = match self.verify_model_strict() {
+            Some((_, oracle, _))
+                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
+            {
+                None
+            }
             Some((_, oracle, _))
                 if oracle == "datatype-field"
                     && self.problem_has_datatype_carrying_array()
@@ -4541,6 +4576,7 @@ impl Executor {
         // today-Unknown string model into a validated SAT — never a wrong SAT
         // and never a sat→unknown regression (#str-gap).
         self.complete_string_gaps_gate_verified();
+        self.complete_opaque_array_defaults_gate_verified();
 
         // Enum model repair (#enum-model-repair): map surplus EUF elements of
         // a finite all-nullary (enum) datatype sort onto constructor slots
@@ -4628,6 +4664,11 @@ impl Executor {
         // strict degrade. Scoped to `datatype-field` on dt-carrying-array
         // problems, so no other strict oracle is weakened.
         let strict_verdict = match self.verify_model_strict() {
+            Some((_, oracle, _))
+                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
+            {
+                None
+            }
             Some((_, oracle, _))
                 if oracle == "datatype-field"
                     && self.problem_has_datatype_carrying_array()
@@ -5082,6 +5123,11 @@ impl Executor {
         // re-checked true or a proven model-independent datatype tautology).
         let strict3 = match self.verify_model_strict() {
             Some((_, oracle, _))
+                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
+            {
+                None
+            }
+            Some((_, oracle, _))
                 if oracle == "datatype-field"
                     && self.problem_has_datatype_carrying_array()
                     && matches!(
@@ -5373,7 +5419,30 @@ impl Executor {
         // store chain and get-value stay in lockstep. It only augments the
         // printed interpretation (never the SAT/UNSAT verdict), and the model is
         // re-validated by the normal pipeline below.
-        self.materialize_set_witnesses();
+        //
+        // The same pass also makes the carrier exhibit the CARDINALITY the model
+        // assigns to its `set.card` term (#set-card-model-witness): a free set
+        // constrained only by `(= 1 (set.card s))` probes no membership at all,
+        // so it used to print the empty set while `(get-value ((set.card s)))`
+        // answered 1. When no valid witness can be built (an uninterpreted
+        // element sort with no enumerable universe, a cardinality larger than
+        // the domain, contradictory pinned cells) it returns false and we fail
+        // closed: `unknown` is sound, a `sat` whose model falsifies its own
+        // assertion is not.
+        if !self.materialize_set_witnesses() {
+            self.last_statistics.model_validation_failures += 1;
+            tracing::warn!(
+                "SAT degraded to Unknown: could not materialize a finite-set carrier of the \
+                 required cardinality (#set-card-model-witness)"
+            );
+            self.last_model = None;
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.last_result = Some(SolveResult::Unknown);
+            self.record_model_validation_unknown_diagnostic(
+                "could not materialize a finite-set witness of the required cardinality",
+            );
+            return Ok(SolveResult::Unknown);
+        }
 
         // (#mixed-combo-WS) String content sourced from an Array `select` is opaque
         // to the string theory; AY's array-string model defaults the select to ""

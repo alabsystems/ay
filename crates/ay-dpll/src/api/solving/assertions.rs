@@ -11,6 +11,7 @@ use ay_frontend::Command;
 
 use crate::api::types::{NativeReplayEventKind, SolverError, Term};
 use crate::api::Solver;
+use crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER;
 
 impl Solver {
     /// Assert a constraint (must be a Boolean term)
@@ -67,7 +68,7 @@ impl Solver {
         let ctx = self.executor.context_mut();
         ctx.add_assertion_with_parsed(
             asserted_term,
-            ParsedTerm::Symbol("__ay_api_assertion__".to_string()),
+            ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
         );
         self.record_native_replay_event(NativeReplayEventKind::Assert {
             term: term.0,
@@ -122,7 +123,14 @@ impl Solver {
         self.executor.note_api_assertion_mutation();
 
         let ctx = self.executor.context_mut();
-        ctx.add_assertion_with_parsed(term.0, ParsedTerm::Symbol(format!("__ay_named_{name}__")));
+        // A native assertion's optional core name is metadata, not surface
+        // syntax.  Reuse the anonymous native sentinel so strict proof
+        // reconstruction derives from the exact asserted term instead of
+        // trying to elaborate a fabricated `__ay_named_*` variable.
+        ctx.add_assertion_with_parsed(
+            term.0,
+            ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
+        );
         ctx.register_named_term(name.to_string(), term.0);
         self.record_native_replay_event(NativeReplayEventKind::Assert {
             term: term.0,
@@ -291,13 +299,19 @@ impl Solver {
     }
 
     /// Adopt a native, already-elaborated definitional forall as an exact
-    /// macro, returning the tautology that replaces its discharged assertion.
+    /// macro, returning the assertion that replaces the discharged `forall`.
     ///
-    /// This is deliberately stricter than syntactic recognition alone.  The
-    /// declared function must have no earlier constrained use and no other raw
-    /// application may already exist in the native term arena.  The latter is
-    /// essential for a handle-based API: a caller can retain any prebuilt term
-    /// and assert it after adoption, bypassing expansion in `try_apply`.
+    /// This is deliberately stricter than syntactic recognition alone.  Raw
+    /// applications of the defined symbol that were built BEFORE the definition
+    /// arrived are the hazard for a handle-based API: a caller can retain any
+    /// prebuilt term and assert it after adoption, bypassing expansion in
+    /// `try_apply`, so discharging the `forall` would strand them as a
+    /// disconnected uninterpreted symbol.  Every such application is therefore
+    /// PINNED to its own definitional instance in the returned assertion, and
+    /// any application that cannot be pinned exactly (a variable argument, a
+    /// mismatched arity/sort, a quantified definition body) REFUSES the whole
+    /// adoption.  With no earlier application the replacement is the reflexive
+    /// tautology, exactly as before.
     fn try_adopt_native_definitional_forall(&mut self, assertion: TermId) -> Option<TermId> {
         if self.scope_level != 0 {
             return None;
@@ -322,10 +336,23 @@ impl Solver {
             return None;
         }
 
+        // Head candidacy is restricted to USER-DECLARED functions.  A theory
+        // builtin (`bvadd`, `+`, `select`, …) is already totally interpreted,
+        // so it can never be the symbol a definition defines; without this
+        // restriction `forall a b. (= (add a b) (bvadd a b))` — the RHS being
+        // the binders applied exactly, in order — made BOTH sides look like
+        // heads and the disambiguation below refused a definition that is in
+        // fact unambiguous.  This can only NARROW candidacy, so it removes no
+        // adoption: an undeclared head was already rejected a few lines down
+        // by `native_fun_signatures.get(&name)?`.  Two user-declared heads
+        // (`f(a,b) = g(a,b)`) stay genuinely ambiguous and keep refusing.
         let exact_head = |solver: &Self, candidate: TermId| {
             let TermData::App(Symbol::Named(name), args) = solver.terms().get(candidate) else {
                 return None;
             };
+            if !solver.native_fun_signatures.contains_key(name) {
+                return None;
+            }
             if args.len() != vars.len()
                 || args
                     .iter()
@@ -350,7 +377,10 @@ impl Solver {
         if self.defined_funs.contains_key(&name) {
             return None;
         }
-        let (domain, range) = self.native_fun_signatures.get(&name)?.clone();
+        let Some(sig) = self.native_fun_signatures.get(&name).cloned() else {
+            return None;
+        };
+        let (domain, range) = sig;
         if domain.len() != vars.len()
             || domain
                 .iter()
@@ -361,17 +391,70 @@ impl Solver {
             return None;
         }
 
-        // Native Terms are persistent handles.  Refuse if any second raw
-        // application was built before the definition; otherwise that stale
-        // term could later constrain an uninterpreted `f` independently of the
-        // adopted macro.  Trigger references reuse `head` through hash-consing.
-        if self.terms().term_ids().any(|id| {
-            id != head
-                && matches!(
-                    self.terms().get(id),
-                    TermData::App(Symbol::Named(other), _) if other == &name
-                )
-        }) {
+        // Native Terms are persistent handles, so a raw application of `f`
+        // built BEFORE the definition arrived cannot be expanded retroactively:
+        // the caller may already have asserted it, or may assert a retained
+        // handle later, bypassing expansion in `try_apply`.  Adopting while
+        // such a term exists would strand it as a disconnected uninterpreted
+        // symbol — the definition would be discharged while those occurrences
+        // stayed unconstrained.
+        //
+        // Collect them instead of refusing outright, and PIN each to the value
+        // the definition gives it (below).  That keeps the adoption exactly as
+        // strong as the `forall` it discharges: the arena scan is COMPLETE
+        // (every raw application of `f` that exists), the set is CLOSED (after
+        // adoption `try_apply` expands, so no new raw application can be
+        // built), and each pin is read from the definition body itself, never
+        // invented.  Any occurrence that cannot be pinned keeps the original
+        // REFUSAL:
+        //
+        //   * an argument mentioning a bound variable — the enclosing
+        //     quantifier's OTHER instances would be raw applications at points
+        //     no pin covers;
+        //   * an arity or argument-sort mismatch (an overloaded second use);
+        //   * more occurrences than `RAW_APPLICATION_PIN_CAP`.
+        //   * a PREDICATE (Bool-ranged) definition: the pin is a Bool/Bool
+        //     equality that strict UNSAT certification cannot currently
+        //     reconstruct (`EufCongruentPred: predicate symbols differ`), so a
+        //     genuinely provable UNSAT would be rejected and demoted to
+        //     Unknown.  Refusing keeps the pre-pinning verdict exactly.
+        let range_is_bool = range.as_term_sort() == Sort::Bool;
+        let mut stale_applications: Vec<(TermId, Vec<TermId>)> = Vec::new();
+        for id in self.terms().term_ids() {
+            if id == head {
+                continue;
+            }
+            let TermData::App(Symbol::Named(other), args) = self.terms().get(id) else {
+                continue;
+            };
+            if other != &name {
+                continue;
+            }
+            let args = args.clone();
+            if args.len() != vars.len() {
+                return None;
+            }
+            for (arg, (_, bound)) in args.iter().zip(vars.iter()) {
+                if self.terms().sort(*arg) != bound {
+                    return None;
+                }
+                if term_mentions_var(self, *arg) {
+                    return None;
+                }
+            }
+            if range_is_bool {
+                return None;
+            }
+            stale_applications.push((id, args));
+        }
+        if stale_applications.len() > RAW_APPLICATION_PIN_CAP {
+            return None;
+        }
+        // Pinning substitutes the binder terms into the definition body by
+        // TERM IDENTITY.  A quantifier inside that body could re-bind the same
+        // identity, so the substitution would capture.  No pin, no exposure —
+        // refuse rather than reason about it.
+        if !stale_applications.is_empty() && term_contains_quantifier(self, definition_body) {
             return None;
         }
 
@@ -379,7 +462,15 @@ impl Solver {
         if !self
             .executor
             .context_mut()
-            .try_register_native_adopted_macro_interp(&name, &params, definition_body)
+            // Claim the pinned-uses exemption ONLY when there is something to
+            // exempt.  With no pre-definition application the original
+            // "no earlier constraint may mention it" check runs unchanged.
+            .try_register_native_adopted_macro_interp(
+                &name,
+                &params,
+                definition_body,
+                !stale_applications.is_empty(),
+            )
         {
             return None;
         }
@@ -388,7 +479,7 @@ impl Solver {
             super::super::DefinedFun {
                 params: params
                     .iter()
-                    .zip(param_terms)
+                    .zip(param_terms.iter().copied())
                     .map(|((name, _), term)| (name.clone(), term))
                     .collect(),
                 body: definition_body,
@@ -396,6 +487,84 @@ impl Solver {
                 assertion_derived: true,
             },
         );
-        Some(self.terms().true_term())
+
+        // Replace the discharged `forall` with the ground pins for the raw
+        // applications that predated it.  With no such application this is the
+        // reflexive tautology, byte-identical to the previous behaviour.  Each
+        // pin is the definition INSTANTIATED at that application's own
+        // arguments — an exact consequence of the assertion being replaced, so
+        // the swap can only weaken, never strengthen (no UNSAT can be created);
+        // and because the scan above is complete and closed, any model of the
+        // pins extends to a model of the original `forall` by reading `f` off
+        // the definition body everywhere else, so no SAT is created either.
+        let mut replacement = Term(self.terms().true_term());
+        for (raw, args) in stale_applications {
+            let subst: ay_core::kani_compat::DetHashMap<TermId, TermId> =
+                param_terms.iter().copied().zip(args).collect();
+            let expanded = self.substitute_defined_fun_body(definition_body, &subst);
+            let pin = self.eq(Term(raw), Term(expanded));
+            replacement = self.and(replacement, pin);
+        }
+        Some(replacement.0)
     }
+}
+
+/// The most raw pre-definition applications of one symbol that adoption will
+/// pin.  Beyond this the adoption REFUSES (status quo), bounding the extra
+/// ground equations a single assertion can introduce.
+const RAW_APPLICATION_PIN_CAP: usize = 256;
+
+/// Does `term`'s DAG contain a quantifier anywhere?  Fail-closed default: an
+/// unrecognized node counts as one.
+fn term_contains_quantifier(solver: &Solver, term: TermId) -> bool {
+    let mut seen = ay_core::kani_compat::DetHashSet::default();
+    let mut stack = vec![term];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        match solver.terms().get(current) {
+            TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => return true,
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
+            TermData::Let(bindings, body) => {
+                stack.extend(bindings.iter().map(|(_, value)| *value));
+                stack.push(*body);
+            }
+            TermData::Const(_) | TermData::Var(_, _) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Does `term`'s DAG mention a bound/free variable anywhere?  A raw application
+/// with a variable argument cannot be pinned: instantiating its enclosing
+/// quantifier yields applications at points no pin covers.
+fn term_mentions_var(solver: &Solver, term: TermId) -> bool {
+    let mut seen = ay_core::kani_compat::DetHashSet::default();
+    let mut stack = vec![term];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        match solver.terms().get(current) {
+            TermData::Var(_, _) => return true,
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
+            TermData::Let(bindings, body) => {
+                stack.extend(bindings.iter().map(|(_, value)| *value));
+                stack.push(*body);
+            }
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                stack.push(*body);
+                stack.extend(triggers.iter().flatten().copied());
+            }
+            TermData::Const(_) => {}
+            _ => return true,
+        }
+    }
+    false
 }

@@ -19,6 +19,9 @@ fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
     let scratch_quantifier = store.mk_forall(vec![("q".to_string(), Sort::Bool)], scratch);
     store.mark_no_mbqi(scratch_quantifier);
     store.set_quantifier_id(scratch_quantifier, "scratch-qid".to_string());
+    store.set_skolem_id(scratch_quantifier, "scratch-skid".to_string());
+    store.set_quantifier_weight(scratch_quantifier, 7);
+    store.set_quantifier_no_patterns(scratch_quantifier, vec![scratch_not]);
     let before_rollback = store.len();
 
     store.rollback_to(checkpoint);
@@ -30,6 +33,10 @@ fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
     assert!(!store.has_var_name("scratch"));
     assert!(!store.is_no_mbqi(scratch_quantifier));
     assert_eq!(store.quantifier_id(scratch_quantifier), None);
+    assert_eq!(store.skolem_id(scratch_quantifier), None);
+    assert_eq!(store.quantifier_weight(scratch_quantifier), 1);
+    assert_eq!(store.explicit_quantifier_weight(scratch_quantifier), None);
+    assert!(store.quantifier_no_patterns(scratch_quantifier).is_empty());
 
     let replacement = store.mk_var("replacement", Sort::Bool);
     assert_eq!(

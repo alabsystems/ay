@@ -102,10 +102,25 @@ fn format_bitvec_masks_and_pads() {
     );
     // Width 64: boundary case, divisible by 4, uses hex (#1793)
     assert_eq!(format_bitvec(&BigInt::from(1), 64), "#x0000000000000001");
-    // Width 65: > 64, not divisible by 4, uses indexed format (#1793)
-    assert_eq!(format_bitvec(&BigInt::from(1), 65), "(_ bv1 65)");
+    // Width 65: > 64 and not divisible by 4 -> still binary, zero-padded to the
+    // full width. This case previously printed the indexed form `(_ bv1 65)`;
+    // that is legal SMT-LIB but z3 5.0.0 never emits it (measured: z3 prints
+    // `#b0…01`), so the pin was corrected to match z3.
+    assert_eq!(
+        format_bitvec(&BigInt::from(1), 65),
+        "#b00000000000000000000000000000000000000000000000000000000000000001"
+    );
     // Width 68: > 64, divisible by 4, still uses hex (#1793)
     assert_eq!(format_bitvec(&BigInt::from(1), 68), "#x00000000000000001");
+    // Negative inputs print their two's-complement pattern at both a hex and a
+    // binary width (the modular reduction, not a sign-magnitude mask).
+    assert_eq!(format_bitvec(&BigInt::from(-1), 5), "#b11111");
+    assert_eq!(format_bitvec(&BigInt::from(-2), 65), {
+        let mut s = String::from("#b");
+        s.push_str(&"1".repeat(64));
+        s.push('0');
+        s
+    });
 }
 
 #[test]

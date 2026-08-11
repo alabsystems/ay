@@ -722,6 +722,16 @@ fn multi_equality_chain_zero_combination_rejected() {
 
 /// FORGED: negative λ would let a forger flip constraint directions at will;
 /// the shape check must reject it outright.
+///
+/// The negative multiplier sits on the INEQUALITY row (`n < x + y`), which is
+/// where the forgery argument actually bites — flipping an inequality's
+/// direction is unsound. It was originally placed on the EQUALITY row
+/// `x = n`, which does not test what the name claims: an equality's Farkas
+/// multiplier is sign-free, and that conflict (`x = n ∧ y = 0 ∧ n < x + y`) is
+/// genuinely UNSAT with a genuinely valid certificate at λ = [-1, 1, 1] — the
+/// flipped orientation gives `(x - n) + y + (n - x - y + 1) = 1 > 0`. The gate
+/// rejected it only because it was literal-blind; see
+/// `negative_multiplier_on_an_equality_literal_is_accepted`.
 #[test]
 fn multi_equality_chain_negative_lambda_rejected() {
     let mut terms = TermStore::new();
@@ -741,9 +751,9 @@ fn multi_equality_chain_negative_lambda_rejected() {
         TheoryLit::new(n_lt_sum, true),
     ];
     let farkas = FarkasAnnotation::new(vec![
+        num_rational::Rational64::from(1),
+        num_rational::Rational64::from(1),
         num_rational::Rational64::from(-1),
-        num_rational::Rational64::from(1),
-        num_rational::Rational64::from(1),
     ]);
     let err = verify_farkas_conflict_lits_full(&terms, &conflict, &farkas)
         .expect_err("negative coefficients must be rejected by the shape check");
@@ -878,4 +888,117 @@ fn long_equality_chain_satisfiable_set_rejected() {
         FarkasValidationError::VariablesNotEliminated { .. }
             | FarkasValidationError::NoContradiction { .. }
     ));
+}
+
+// =========================================================================
+// Sign-free equality multipliers (the QF_UFLRA congruence-envelope rejection)
+// =========================================================================
+//
+// Farkas' lemma requires λ >= 0 only for INEQUALITIES. An equality `e = 0`
+// may carry ANY real multiplier — this file already relies on that fact
+// (`equality_elimination_contradicts`: "Equality multipliers in Farkas'
+// lemma are sign-free"), and the search explores both orientations of every
+// equality literal, which makes `λ·alt0` and `λ·alt1` cover `{-λ·e, +λ·e}`
+// for either sign of λ. The blanket non-negativity precondition therefore
+// rejects certificates the semantic check would accept, with no soundness
+// benefit for the equality rows.
+//
+// Reproducer (`group_theory_misc::smt_soundness_gate::uflra::
+// test_gate_qf_uflra_unsat_proof_envelope`, minimized):
+//
+//     (set-logic QF_UFLRA)
+//     (assert (= x y)) (assert (> (f x) 0.0)) (assert (< (f y) 0.0))
+//
+// UNSAT by congruence. The combined solver emits the conflict with a
+// SIGNED multiplier on the equality row; the strict funnel rejected it with
+// "Farkas coefficients must be non-negative, but found: [(2, -1)]" and the
+// whole refutation degraded to `unknown`.
+
+#[test]
+fn negative_multiplier_on_an_equality_literal_is_accepted() {
+    // `x >= 3 ∧ x = 2` — the same conflict as
+    // `resolve_equality_signs_flips_lhs_minus_rhs_orientation`, but with the
+    // equality's multiplier already carrying the printed (negative) sign.
+    // Both orientations are searched, so -1 must verify exactly as +1 does.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let two = terms.mk_int(BigInt::from(2));
+    let three = terms.mk_int(BigInt::from(3));
+    let x_ge_3 = terms.mk_ge(x, three);
+    let x_eq_2 = terms.mk_eq(x, two);
+
+    let conflict = vec![TheoryLit::new(x_ge_3, true), TheoryLit::new(x_eq_2, true)];
+
+    let positive = FarkasAnnotation::from_ints(&[1, 1]);
+    verify_farkas_conflict_lits_full(&terms, &conflict, &positive)
+        .expect("baseline: unsigned certificate verifies");
+
+    let signed = FarkasAnnotation::new(vec![
+        num_rational::Rational64::from(1),
+        num_rational::Rational64::from(-1),
+    ]);
+    verify_farkas_conflict_lits_full(&terms, &conflict, &signed).expect(
+        "an equality row's multiplier is sign-free in Farkas' lemma — a negative \
+         coefficient on `x = 2` must verify, not be rejected by the shape gate",
+    );
+}
+
+#[test]
+fn negative_multiplier_on_an_inequality_literal_is_still_rejected() {
+    // SOUNDNESS DIRECTION. A negative multiplier on an INEQUALITY flips its
+    // direction and is never admissible. `x <= 5 ∧ x >= 10` refutes with
+    // λ = [1, 1]; negating either row must stay rejected.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let five = terms.mk_int(BigInt::from(5));
+    let ten = terms.mk_int(BigInt::from(10));
+    let x_le_5 = terms.mk_le(x, five);
+    let x_ge_10 = terms.mk_ge(x, ten);
+
+    let conflict = vec![TheoryLit::new(x_le_5, true), TheoryLit::new(x_ge_10, true)];
+    verify_farkas_conflict_lits_full(&terms, &conflict, &FarkasAnnotation::from_ints(&[1, 1]))
+        .expect("baseline: unsigned certificate verifies");
+
+    for negated in 0..2 {
+        let mut coeffs = vec![
+            num_rational::Rational64::from(1),
+            num_rational::Rational64::from(1),
+        ];
+        coeffs[negated] = num_rational::Rational64::from(-1);
+        let err =
+            verify_farkas_conflict_lits_full(&terms, &conflict, &FarkasAnnotation::new(coeffs))
+                .expect_err("a negative multiplier on an inequality row must be rejected");
+        assert!(
+            matches!(err, FarkasValidationError::NegativeCoefficients { .. }),
+            "expected NegativeCoefficients for inequality row {negated}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn negative_multiplier_on_a_disequality_literal_is_still_rejected() {
+    // A `distinct`-style row is refuted by a two-branch case split, not by a
+    // signed multiplier; its coefficient must stay non-negative so the branch
+    // magnitudes remain comparable.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let x_ge_3 = terms.mk_ge(x, three);
+    let x_eq_3 = terms.mk_eq(x, three);
+
+    // `x = 3` asserted FALSE is a disequality row.
+    let conflict = vec![TheoryLit::new(x_ge_3, true), TheoryLit::new(x_eq_3, false)];
+    let err = verify_farkas_conflict_lits_full(
+        &terms,
+        &conflict,
+        &FarkasAnnotation::new(vec![
+            num_rational::Rational64::from(1),
+            num_rational::Rational64::from(-1),
+        ]),
+    )
+    .expect_err("a negative multiplier on a disequality row must be rejected");
+    assert!(
+        matches!(err, FarkasValidationError::NegativeCoefficients { .. }),
+        "expected NegativeCoefficients for the disequality row, got {err:?}"
+    );
 }

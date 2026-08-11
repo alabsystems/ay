@@ -147,8 +147,60 @@ fn skolemize_quantifier_body(
         witnesses.push(skolem);
     }
 
+    register_skolem_choice_provenance(terms, quantifier_id, &vars, body, &witnesses);
+
     // Substitute Skolem constants into the body
     Some((subst_vars(terms, body, &subst), witnesses))
+}
+
+/// Record what a freshly minted Skolem CONSTANT denotes, so the Alethe printer
+/// can DEFINE it as the Hilbert `choice` term it stands for (see
+/// [`ay_core::SkolemChoice`]). Declaring it is not an alternative: an Alethe
+/// proof document admits no declaration command, so a witness that reaches the
+/// exporter without provenance makes the export DECLINE.
+///
+/// Scope is deliberately narrow — a registration is proof authority, and an
+/// unregistered witness costs only a printable proof:
+///
+/// * SINGLE binder only. For `∃x₁…xₙ. B` the correct witnesses are the nested
+///   choices `sk₁ = εx₁. ∃x₂…xₙ. B`, `sk₂ = (εx₂. ∃x₃…xₙ. B)[x₁ := sk₁]`, …,
+///   which is a different (and unmeasured) construction; registering the
+///   one-binder form for it would state something false.
+/// * CONSTANT witnesses only. The dependent case builds a Skolem FUNCTION
+///   `sk_x(y₁…yₖ)`, which denotes no single choice term; `register_skolem_choice`
+///   also rejects a non-`Var` witness, so this is belt and braces.
+///
+/// The `Forall` source is `¬∀x. B ≡ ∃x. ¬B`, so its choice body is the NEGATED
+/// body — matching the rendering the printer already emits for a certified
+/// `sko_forall` step.
+fn register_skolem_choice_provenance(
+    terms: &mut TermStore,
+    quantifier_id: TermId,
+    vars: &[(String, Sort)],
+    body: TermId,
+    witnesses: &[TermId],
+) {
+    let ([(binder, sort)], [witness]) = (vars, witnesses) else {
+        return;
+    };
+    if !matches!(terms.get(*witness), TermData::Var(..)) {
+        return;
+    }
+    let negate = match terms.get(quantifier_id) {
+        TermData::Exists(..) => false,
+        TermData::Forall(..) => true,
+        _ => return,
+    };
+    let (binder, sort) = (binder.clone(), sort.clone());
+    let choice_body = if negate { terms.mk_not(body) } else { body };
+    terms.register_skolem_choice(
+        *witness,
+        ay_core::SkolemChoice {
+            binder,
+            sort,
+            body: choice_body,
+        },
+    );
 }
 
 fn extend_universal_env(universal_env: &[String], vars: &[(String, Sort)]) -> Vec<String> {
@@ -275,7 +327,9 @@ fn rewrite_nnf_with_skolem(
                 let extended_env = extend_universal_env(universal_env, &vars);
                 let negated_body =
                     rewrite_nnf_with_skolem(terms, body, false, &extended_env, provenance);
-                terms.mk_forall_with_triggers(vars, negated_body, triggers)
+                let converted = terms.mk_forall_with_triggers(vars, negated_body, triggers);
+                terms.copy_quantifier_metadata(term, converted);
+                converted
             }
 
             // Positive forall keeps universal scope. Recurse so nested existentials
@@ -287,7 +341,9 @@ fn rewrite_nnf_with_skolem(
                 if new_body == body {
                     term
                 } else {
-                    terms.mk_forall_with_triggers(vars, new_body, triggers)
+                    let converted = terms.mk_forall_with_triggers(vars, new_body, triggers);
+                    terms.copy_quantifier_metadata(term, converted);
+                    converted
                 }
             }
 

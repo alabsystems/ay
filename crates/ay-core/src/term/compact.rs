@@ -246,6 +246,14 @@ impl TermStore {
             Self::for_each_child(&entry.term, |child| {
                 push_root(child, &mut stack, &mut reachable);
             });
+            // `:no-pattern` candidates live in a side map rather than in
+            // `TermData`, but their TermIds are owned by a live quantifier and
+            // must survive and be remapped with it.
+            if let Some(no_patterns) = self.quantifier_no_patterns.get(&id) {
+                for &no_pattern in no_patterns {
+                    push_root(no_pattern, &mut stack, &mut reachable);
+                }
+            }
         }
 
         // Phase 3: build the old → new mapping in topological order
@@ -311,6 +319,64 @@ impl TermStore {
             // we pinned every named TermId above — but if a caller
             // somehow violates the contract, we silently drop the
             // name rather than dangling.
+        }
+
+        let old_no_mbqi = std::mem::take(&mut self.no_mbqi);
+        for old_id in old_no_mbqi {
+            if let Some(new_id) = remap.get(old_id) {
+                self.no_mbqi.insert(new_id);
+            }
+        }
+
+        let old_quantifier_id = std::mem::take(&mut self.quantifier_id);
+        for (old_id, qid) in old_quantifier_id {
+            if let Some(new_id) = remap.get(old_id) {
+                self.quantifier_id.insert(new_id, qid);
+            }
+        }
+
+        let old_skolem_id = std::mem::take(&mut self.skolem_id);
+        for (old_id, skid) in old_skolem_id {
+            if let Some(new_id) = remap.get(old_id) {
+                self.skolem_id.insert(new_id, skid);
+            }
+        }
+
+        let old_quantifier_weight = std::mem::take(&mut self.quantifier_weight);
+        for (old_id, weight) in old_quantifier_weight {
+            if let Some(new_id) = remap.get(old_id) {
+                self.quantifier_weight.insert(new_id, weight);
+            }
+        }
+
+        let old_quantifier_no_patterns = std::mem::take(&mut self.quantifier_no_patterns);
+        for (old_id, no_patterns) in old_quantifier_no_patterns {
+            let Some(new_id) = remap.get(old_id) else {
+                continue;
+            };
+            let no_patterns = no_patterns
+                .into_iter()
+                .map(|no_pattern| remap.remap(no_pattern))
+                .collect();
+            self.quantifier_no_patterns.insert(new_id, no_patterns);
+        }
+
+        // Skolem-choice provenance is keyed by witness TermId and holds a body
+        // TermId, so both sides must move with the arena. An entry whose
+        // witness or body was reclaimed is DROPPED — the exporter then DECLINES
+        // rather than spelling a term that no longer exists. (The neighbouring
+        // `no_mbqi` / `quantifier_id` / `skolem_id`
+        // pins are not remapped here; they are instantiation hints whose loss
+        // cannot change a verdict, whereas this map is read by the certificate
+        // printer.)
+        let old_skolem_choice = std::mem::take(&mut self.skolem_choice);
+        for (witness, mut choice) in old_skolem_choice {
+            let (Some(new_witness), Some(new_body)) = (remap.get(witness), remap.get(choice.body))
+            else {
+                continue;
+            };
+            choice.body = new_body;
+            self.skolem_choice.insert(new_witness, choice);
         }
 
         // Phase 6: rebuild the hash-cons map from scratch. This is
@@ -714,6 +780,48 @@ mod tests {
             }
             other => panic!("forall corrupted: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_compact_preserves_quantifier_side_metadata() {
+        let mut store = TermStore::new();
+
+        // This unrooted constant is deliberately allocated first so every live
+        // metadata key/value below moves to a different TermId.
+        let garbage = store.mk_int(BigInt::from(999));
+        let x = mk_int_var(&mut store, "metadata_x");
+        let body = store.mk_var("metadata_body", Sort::Bool);
+        let no_pattern = store.intern(
+            TermData::App(Symbol::named("metadata_no_pattern"), vec![x]),
+            Sort::Bool,
+        );
+        let forall = store.mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        store.mark_no_mbqi(forall);
+        store.set_quantifier_id(forall, "compact-qid".to_string());
+        store.set_skolem_id(forall, "compact-skid".to_string());
+        store.set_quantifier_weight(forall, 23);
+        store.set_quantifier_no_patterns(forall, vec![no_pattern]);
+
+        let remap = store.mark_and_compact(&[forall]);
+
+        assert_eq!(remap.get(garbage), None);
+        let new_forall = remap.remap(forall);
+        let new_no_pattern = remap
+            .get(no_pattern)
+            .expect(":no-pattern metadata must pin its term");
+        assert_ne!(new_forall, forall);
+        assert_ne!(new_no_pattern, no_pattern);
+        assert!(store.is_no_mbqi(new_forall));
+        assert_eq!(store.quantifier_id(new_forall), Some("compact-qid"));
+        assert_eq!(store.skolem_id(new_forall), Some("compact-skid"));
+        assert_eq!(store.explicit_quantifier_weight(new_forall), Some(23));
+        assert_eq!(store.quantifier_no_patterns(new_forall), &[new_no_pattern]);
+        assert!(matches!(
+            store.get(new_no_pattern),
+            TermData::App(symbol, args)
+                if symbol.name() == "metadata_no_pattern"
+                    && args == &[remap.remap(x)]
+        ));
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl Executor {
     /// every witness identity and intermediate pair were recorded at the
     /// generator that minted this exact clause. A reserved-looking name alone
     /// carries no authority.
-    fn recorded_array_extensionality_chain(
+    pub(super) fn recorded_array_extensionality_chain(
         &self,
         clause: TermId,
     ) -> Option<Vec<(TermId, TermId, TermId)>> {

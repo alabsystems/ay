@@ -964,7 +964,12 @@ impl TheorySolver for LiaSolver<'_> {
         // (`None` disables the skip); on 10^4+-atom industrial files the
         // O(atoms) re-scan is the wall and the skip is decisive.
         const PHASE_EPOCH_MIN_ATOMS: usize = 8192;
-        if self.lra.registered_atom_count() < PHASE_EPOCH_MIN_ATOMS {
+        let atoms = self.lra.registered_atom_count();
+        if atoms < PHASE_EPOCH_MIN_ATOMS {
+            // FORGONE COST -- see the sibling site in ay-dpll's combiner, which
+            // declares THE SAME CONSTANT with no shared definition. Charged to its own
+            // index so the duplication is visible in the report rather than summed away.
+            ay_core::forgone::charge(ay_core::forgone::PHASE_EPOCH_LIA, atoms as u64);
             return None;
         }
         self.lra.phase_hint_epoch()

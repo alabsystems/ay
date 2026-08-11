@@ -284,6 +284,27 @@ mod tests {
     }
 
     #[test]
+    fn fp_forward_error_lemma_on_terminal_path_is_not_flagged() {
+        // `FpForwardError` is a strict-checkable kind (`is_trust() == false`):
+        // a proof closing through it must be reported trust-free, unlike the
+        // `Generic` lemma it is promoted from.
+        let terms = TermStore::new();
+        let t = terms.true_term();
+        let mut proof = Proof::new();
+        let lemma =
+            proof.add_theory_lemma_with_kind("trust", vec![t], TheoryLemmaKind::FpForwardError);
+        let _ = proof.add_resolution(vec![], t, lemma, lemma);
+        let r = terminal_trust_report(&proof);
+        assert_eq!(r.empty_clause_steps, 1);
+        assert_eq!(
+            r.trust_theory_lemma_on_path, 0,
+            "FpForwardError is internally validated, not a Generic trust lemma"
+        );
+        assert!(r.is_trust_free());
+        assert!(!r.has_terminal_trust());
+    }
+
+    #[test]
     fn trust_off_terminal_path_is_not_flagged() {
         let terms = TermStore::new();
         let t = terms.true_term();

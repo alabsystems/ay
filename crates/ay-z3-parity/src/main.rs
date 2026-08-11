@@ -1,6 +1,13 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+// The per-division scoreboard record is one flat `serde_json::json!` literal
+// with ~45 keys; `json_internal!` recurses once per key and overruns the
+// default 128-deep limit. Raising it is the fix the compiler itself suggests,
+// and it keeps the record flat — nesting the speed statistics to dodge the
+// limit would change the published JSON shape for every existing reader.
+#![recursion_limit = "256"]
+
 //! `ay-z3-parity` — a mechanistic compatibility auditor.
 //!
 //! It measures named compatibility surfaces between the AY SMT solver
@@ -23,12 +30,13 @@ mod loader;
 mod scoreboard;
 mod smtlib_conformance;
 mod symbols;
+mod z3_abi_500;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const DEFAULT_AY: &str = "target/debug/libay_ffi.dylib";
-const DEFAULT_Z3: &str = "/opt/homebrew/lib/libz3.dylib";
+const DEFAULT_Z3: &str = "/opt/homebrew/lib/python3.14/site-packages/z3/lib/libz3.dylib";
 const DEFAULT_DIFF_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_BENCH_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_BENCH_JSON: &str = "ay-z3-bench.json";
@@ -155,7 +163,7 @@ USAGE:
 DEFAULTS:
   --ay        target/debug/libay_ffi.dylib
   --ay-cli    sibling `ay` next to --ay, else target/release/ay (scoreboard)
-  --z3        /opt/homebrew/lib/libz3.dylib
+  --z3        /opt/homebrew/lib/python3.14/site-packages/z3/lib/libz3.dylib
   --timeout   10 (diff) / 20 (bench, scoreboard)  per-(file,solver) wall seconds
   --jobs      1    (bench/scoreboard; requested workers, host planner may cap)
   --json-out  ay-z3-bench.json (bench) / ay-z3-scoreboard.json (scoreboard)
@@ -337,6 +345,11 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
 }
 
 fn main() -> ExitCode {
+    // FIRST statement of main: arm() re-execs this process under a kernel-held
+    // memory bound, so anything above it is discarded work, and it sets an env
+    // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+
     let argv: Vec<String> = std::env::args().collect();
     let (cmd, rest) = match argv.split_first().and_then(|(_, tail)| tail.split_first()) {
         Some((c, r)) => (c.as_str(), r),
@@ -355,6 +368,9 @@ fn main() -> ExitCode {
     // and needs no dylibs, so it parses its own args ahead of the shared parser.
     if cmd == "fetch" {
         return ExitCode::from(fetch::run(rest) as u8);
+    }
+    if cmd == "z3-abi-probe" {
+        return ExitCode::from(z3_abi_500::run_probe_child(rest) as u8);
     }
     if matches!(cmd, "smtlib-conformance" | "smtlib") {
         return ExitCode::from(smtlib_conformance::run(rest) as u8);

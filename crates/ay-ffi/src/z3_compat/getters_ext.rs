@@ -25,8 +25,9 @@ use num_bigint::BigInt;
 use super::{
     alloc_sort, cache_dt_func_decl, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
     ffi_guard_double, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    record_ast_sort, require_term_ast_or_return, term_to_ast, DatatypeOp, Z3_ast, Z3_context,
-    Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
+    finite_set_empty_decl_parameter, record_ast_sort, require_term_ast_or_return, term_to_ast,
+    DatatypeOp, Z3_ast, Z3_context, Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol,
+    Z3_INVALID_ARG, Z3_IOB,
 };
 
 // ============================================================================
@@ -476,13 +477,14 @@ pub unsafe extern "C" fn Z3_is_well_sorted(c: Z3_context, t: Z3_ast) -> bool {
 }
 
 // ============================================================================
-// Decl parameters — DIVERGENCE (AY decls carry only integer params)
+// Decl-parameter getters not implemented by AY
 // ============================================================================
 //
-// `FuncDeclHandle.params` is `Vec<c_int>`: AY func_decls only ever carry INTEGER
-// parameters (indexed BV ops like extract/rotate). No decl carries an AST /
-// double / rational / sort / symbol / func_decl parameter, so every such query
-// is out of range. Each sets `Z3_IOB` and returns a null/zero sentinel.
+// `FuncDeclHandle.params` stores integer parameters for indexed operators.
+// Finite-set `set.empty` additionally exposes one computed SORT parameter
+// through `Z3_get_decl_sort_parameter` in `accessors.rs`. No declaration
+// currently carries an AST, double, rational, symbol, or func-decl parameter,
+// so those getters set `Z3_IOB` and return a null/zero sentinel.
 
 /// Z3's `Z3_get_decl_ast_parameter` — no AST decl parameters in AY.
 /// # Safety
@@ -562,12 +564,17 @@ pub unsafe extern "C" fn Z3_get_decl_rational_parameter(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_get_decl_sort_parameter(
     c: Z3_context,
-    _d: Z3_func_decl,
-    _idx: c_uint,
+    d: Z3_func_decl,
+    idx: c_uint,
 ) -> Z3_sort {
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            if !d.is_null() && idx == 0 {
+                if let Some(sort) = finite_set_empty_decl_parameter(ctx, &(*d).decl) {
+                    return alloc_sort(ctx, sort);
+                }
+            }
             ctx.last_error = Z3_IOB;
             ptr::null_mut()
         })
@@ -910,15 +917,15 @@ pub unsafe extern "C" fn Z3_get_pattern(c: Z3_context, p: Z3_pattern, idx: c_uin
 
 /// Z3's `Z3_get_quantifier_id` — the `:qid` (quantifier identifier).
 ///
-/// REAL for any quantifier given an EXPLICIT `:qid` (via `Z3_mk_quantifier_ex`/
-/// `_const_ex` or SMT-LIB `:qid`): the id round-trips exactly. RESIDUAL honest
-/// divergence only when NO explicit qid was set — Z3 there auto-generates a
-/// synthetic symbol AY cannot replicate, so we return null (`Z3_INVALID_ARG`)
-/// rather than fabricate one.
+/// REAL for any quantifier given an explicit `:qid` through
+/// `Z3_mk_quantifier_ex`/`_const_ex`: the id round-trips exactly. Parsed
+/// quantifier metadata is rejected until parser AST identity can retain it.
+/// When no explicit qid was set, Z3 auto-generates a synthetic symbol AY cannot
+/// replicate, so AY returns null (`Z3_INVALID_ARG`) rather than fabricating one.
 ///
-/// Benign caveat: two structurally-identical quantifiers differing only in `:qid`
-/// hash-cons to one term, so the side-map keeps the last-set qid — metadata only,
-/// never affects any sat/unsat verdict.
+/// A constructor that would hash-cons to an existing term with different qid,
+/// skolemid, weight, or no-pattern metadata is rejected with
+/// `Z3_INVALID_USAGE`; metadata never aliases between public ASTs.
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
@@ -943,8 +950,12 @@ pub unsafe extern "C" fn Z3_get_quantifier_id(c: Z3_context, a: Z3_ast) -> Z3_sy
                 "quantifier",
                 ptr::null_mut()
             );
-            match ctx.solver.quantifier_id(term) {
-                Some(name) => super::cache_symbol(ctx, name),
+            let symbol = ctx
+                .quantifier_ffi_metadata
+                .get(&term)
+                .and_then(|metadata| metadata.quantifier_id.clone());
+            match symbol {
+                Some(symbol) => super::cache_symbol_key(ctx, symbol),
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ptr::null_mut()
@@ -982,8 +993,12 @@ pub unsafe extern "C" fn Z3_get_quantifier_skolem_id(c: Z3_context, a: Z3_ast) -
                 "quantifier",
                 ptr::null_mut()
             );
-            match ctx.solver.skolem_id(term) {
-                Some(name) => super::cache_symbol(ctx, name),
+            let symbol = ctx
+                .quantifier_ffi_metadata
+                .get(&term)
+                .and_then(|metadata| metadata.skolem_id.clone());
+            match symbol {
+                Some(symbol) => super::cache_symbol_key(ctx, symbol),
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ptr::null_mut()

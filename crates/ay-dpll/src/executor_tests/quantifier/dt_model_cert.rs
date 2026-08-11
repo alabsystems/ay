@@ -18,12 +18,16 @@
 use super::*;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const SUBPROCESS_WORKER_ENV: &str = "AY_INTERNAL_DT_CERT_TEST_WORKER";
+const SUBPROCESS_BOUNDED_ENV: &str = "AY_INTERNAL_DT_CERT_TEST_BOUNDED";
 const SKIP_RESEQUENCE_ENV: &str = "AY_INTERNAL_DT_CERT_SKIP_RESEQUENCE";
 const SUBPROCESS_RESULT_PREFIX: &str = "AY_INTERNAL_DT_CERT_TEST_RESULT=";
+const SUBPROCESS_SOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 const SUBPROCESS_WORKER_TEST: &str =
     "executor_tests::quantifier::dt_model_cert::dt_cert_subprocess_worker";
 
@@ -38,7 +42,19 @@ fn solve_in_subprocess(
     skip_resequence: bool,
     input: &str,
 ) -> String {
-    solve_in_subprocess_full(cert, lazy_override, skip_resequence, None, input).0
+    solve_in_subprocess_full(cert, lazy_override, skip_resequence, None, false, input).0
+}
+
+/// Refusal-only variant: a timeout is an admissible fail-closed `unknown` for
+/// these tests, whereas positive certificate tests must retain enough time to
+/// demonstrate their required `sat` grant.
+fn solve_in_subprocess_bounded(
+    cert: Option<&str>,
+    lazy_override: Option<Option<&str>>,
+    skip_resequence: bool,
+    input: &str,
+) -> String {
+    solve_in_subprocess_full(cert, lazy_override, skip_resequence, None, true, input).0
 }
 
 /// Extended isolated-child solve: additionally sets (`Some`) or removes
@@ -50,6 +66,7 @@ fn solve_in_subprocess_full(
     lazy_override: Option<Option<&str>>,
     skip_resequence: bool,
     bridge_route: Option<&str>,
+    bounded: bool,
     input: &str,
 ) -> (String, String) {
     let mut command = Command::new(std::env::current_exe().expect("locate ay-dpll test binary"));
@@ -62,6 +79,11 @@ fn solve_in_subprocess_full(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if bounded {
+        command.env(SUBPROCESS_BOUNDED_ENV, "1");
+    } else {
+        command.env_remove(SUBPROCESS_BOUNDED_ENV);
+    }
     match cert {
         Some(value) => {
             command.env("AY_DT_CERT", value);
@@ -134,6 +156,14 @@ fn solve_with_mode(mode: Option<&str>, input: &str) -> String {
     solve_in_subprocess(mode, None, false, input)
 }
 
+/// Solve an adversarial/refusal input with a hard outer bound.  The only
+/// assertion these callers make is `result != sat`, so timeout -> Unknown is
+/// both sound and contract-preserving.
+fn solve_with_mode_bounded(mode: Option<&str>, input: &str) -> String {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    solve_in_subprocess_bounded(mode, None, false, input)
+}
+
 /// Force the post-solve certificate arm, bypassing only the test binary's
 /// bounded re-sequencing probe.  This pins parity between both grant sites.
 fn solve_with_postsolve_certificate(mode: Option<&str>, input: &str) -> String {
@@ -163,6 +193,26 @@ fn dt_cert_subprocess_worker() {
         .expect("read isolated DT-gate solver input");
     let commands = parse(&input).unwrap();
     let mut exec = Executor::new();
+    let _watchdog = if std::env::var_os(SUBPROCESS_BOUNDED_ENV).is_some() {
+        // Refusal tests assert only that adversarial inputs can never be
+        // published as SAT. Some deliberately drive incomplete solver lanes,
+        // so give those children an explicit wall-clock bound. Positive grant
+        // tests remain unbounded: turning a required `sat` into `unknown` would
+        // weaken their contract instead of merely bounding it.
+        exec.set_timeout(Some(SUBPROCESS_SOLVE_TIMEOUT));
+        // Quantified solves intentionally relax nominal deadlines into a
+        // deterministic-work backstop. Drive the independent cooperative
+        // interrupt at the same bound; persistent SAT pipelines rebind this
+        // exact handle on every query.
+        let interrupt = Arc::new(AtomicBool::new(false));
+        exec.set_interrupt(Arc::clone(&interrupt));
+        Some(std::thread::spawn(move || {
+            std::thread::sleep(SUBPROCESS_SOLVE_TIMEOUT);
+            interrupt.store(true, Ordering::Relaxed);
+        }))
+    } else {
+        None
+    };
     let outputs = exec.execute_all(&commands).unwrap();
     println!(
         "{}{}",
@@ -172,13 +222,25 @@ fn dt_cert_subprocess_worker() {
 }
 
 #[test]
+fn dt_cert_worker_preserves_definitive_unsat() {
+    // Refusal tests accept Unknown by design; keep a separate positive control
+    // proving that the bounded worker still publishes a strictly certified
+    // UNSAT result when the authored query has a complete refutation.
+    let verdict = solve_with_mode(
+        Some("on"),
+        "(set-logic QF_UF)\n(assert false)\n(check-sat)\n",
+    );
+    assert_eq!(verdict, "unsat");
+}
+
+#[test]
 fn flagged_solve_isolated_from_parallel_parent_reader() {
     let cert_before = std::env::var_os("AY_DT_CERT");
     let lazy_before = std::env::var_os("AY_DT_LAZY");
     let observer_cert = cert_before.clone();
     let observer_lazy = lazy_before.clone();
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let observer_barrier = std::sync::Arc::clone(&barrier);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let observer_barrier = Arc::clone(&barrier);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let observer = std::thread::spawn(move || {
         observer_barrier.wait();
@@ -317,7 +379,7 @@ fn dt_cert_int_control_unchanged() {
 fn dt_cert_refuses_tester_on_binder() {
     // `forall x:List. is-Cons x` is UNSAT (Nil). The tester must never be
     // treated as a free finite-piecewise UF.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -334,7 +396,7 @@ fn dt_cert_refuses_tester_on_binder() {
 #[test]
 fn dt_cert_refuses_selector_on_binder() {
     // The binder read through a selector is out of the cell-invariant class.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -356,7 +418,7 @@ fn dt_cert_refuses_all_or_nothing_unroutable() {
     // `(= (list_cons_1 y) (tl y)) ∨ ¬is-Cons y` is now the sanctioned F3 route —
     // see `dt_cert_grants_f3_bridge_default` — so the discipline is exercised here
     // with a genuinely unroutable forall instead.)
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -531,7 +593,7 @@ fn solve_with_bridge_route(
     input: &str,
 ) -> (String, String) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    solve_in_subprocess_full(cert, None, skip_resequence, bridge_route, input)
+    solve_in_subprocess_full(cert, None, skip_resequence, bridge_route, false, input)
 }
 
 /// The `inc_some_list` base shape in miniature: an F4 nonneg lemma, the W1
@@ -670,7 +732,7 @@ fn dt_cert_bridge_route_flag_off_byte_identical() {
 fn dt_cert_refuses_g_nonunique_pin() {
     // 5a: the guard's `t` side is NOT ground (mentions a binder), so the
     // equation does not pin the binders uniquely — G must decline.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -694,7 +756,7 @@ fn dt_cert_refuses_g_nonunique_pin() {
 fn dt_cert_refuses_g_false_at_pin() {
     // 5b: the consequent is FALSE at the injectivity-pinned point
     // (`hd self = 999` but `hd self = 3` is asserted) — UNSAT, never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -719,7 +781,7 @@ fn dt_cert_refuses_f3_selector_disagreement() {
     // 5c: an F3 bridge whose ground exception row DISAGREES with the selector
     // (`list_cons_1 self = Cons 9 Nil` but `tl self = Nil`) — after the uf ≡ sel
     // rewrite the ground re-verification refutes it. UNSAT, never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -744,7 +806,7 @@ fn dt_cert_refuses_adv3_g_false_after_rewrite() {
     // 5d (the adv3 composition): a G claim TRUE under the raw candidate M becomes
     // FALSE under the completed M' (list_cons_1 ≡ tl). The SINGLE-AUTHORITY
     // post-M' re-verification of the G claim must catch it. UNSAT, never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -771,7 +833,7 @@ fn dt_cert_refuses_unsat_ground_core() {
     // 5e (mini-fullsort): a mutated ground assertion makes the GROUND CORE
     // itself UNSAT (`hd self` = 5 and = 7). No candidate ⇒ the re-sequence
     // declines; the normal solve concludes UNSAT. Never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -792,7 +854,7 @@ fn dt_cert_refuses_unsat_ground_core() {
 fn dt_cert_refuses_int_binder_forall_in_snapshot() {
     // A mixed snapshot with an Int-binder forall is not all-DT-F4: the DT cert
     // declines (the Int one is the finite-table cert's job, not this one).
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -814,7 +876,7 @@ fn dt_cert_refuses_int_binder_forall_in_snapshot() {
 fn dt_cert_never_sat_distinct_collapse_twin() {
     // Two EUF-distinct classes materialize to Cons(0,Nil): injectivity ⇒ a=b,
     // but `distinct a b` is asserted. UNSAT; never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)
@@ -842,7 +904,7 @@ fn dt_cert_never_sat_distinct_collapse_twin() {
 fn dt_cert_never_sat_negative_leaf_sibling() {
     // A negative table entry logic_sum(neg) = -1 violates the nonneg atom.
     // UNSAT; never sat.
-    let verdict = solve_with_mode(
+    let verdict = solve_with_mode_bounded(
         Some("on"),
         r#"
         (set-logic ALL)

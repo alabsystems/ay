@@ -280,8 +280,132 @@ impl ArraySolver<'_> {
                     }
                 }
             }
+
+            self.fill_missing_array_defaults(&mut model);
+        }
+
+        if std::env::var_os("AY_DEBUG_ARR_EXTRACT").is_some() {
+            let mut rows: Vec<_> = model.array_values.iter().collect();
+            rows.sort_by_key(|(t, _)| t.0);
+            for (t, i) in rows {
+                eprintln!(
+                    "[arr-extract] FINAL arr={} default={:?} stores={:?}",
+                    t.0, i.default, i.stores
+                );
+            }
         }
 
         model
+    }
+
+    /// Give every array interpretation that still lacks an `else` value one the
+    /// problem already ENTAILS, instead of leaving the renderer to invent it.
+    ///
+    /// `default` is only ever set from `const_array_cache` / `default_cache`, so
+    /// an array-sorted UF APPLICATION never gets one: `(seq_array (seq_singleton
+    /// v))` collects select-derived cells and so HAS an interpretation, but with
+    /// `default: None`. The renderer then had to guess, and guessing from a
+    /// store value collapsed the array to a CONSTANT — for
+    /// `(= (seq_array (seq_singleton v)) (store ((as const ..) 0) 0 v))` with
+    /// `v = 42` it printed `((as const ..) 42)`, which differs from the asserted
+    /// `store((as const ..) 0, 0, 42)` at every index but 0. AY published a
+    /// `sat` whose own `get-value` then called those two arrays equal, and z3
+    /// replayed the published model as `unsat`.
+    ///
+    /// Two sound sources, applied to a fixpoint because each feeds the other (a
+    /// class member's default can come from a store chain whose base only got
+    /// ITS default from another class):
+    ///
+    /// * EQUIVALENCE CLASS — a class is exactly the set of arrays the solver
+    ///   asserted equal, and equal arrays have equal defaults. Only taken when
+    ///   the class agrees on a single value; a class carrying two different
+    ///   defaults is already inconsistent and must not have one picked
+    ///   arbitrarily.
+    /// * STORE CHAIN — `store(b, i, v)` has the same `else` value as `b`, which
+    ///   is the same assumption the chain walk already makes when `b` is a
+    ///   const-array.
+    ///
+    /// Neither invents a value, so this cannot manufacture a model the
+    /// assertions do not already permit.
+    fn fill_missing_array_defaults(&self, model: &mut ArrayModel) {
+        let rounds = model.array_values.len() + 1;
+        for _ in 0..rounds {
+            let mut changed = false;
+
+            for class in &self.equiv_classes {
+                let mut class_default: Option<String> = None;
+                let mut conflict = false;
+                for member in class {
+                    let Some(value) = model
+                        .array_values
+                        .get(member)
+                        .and_then(|interp| interp.default.as_ref())
+                    else {
+                        continue;
+                    };
+                    match &class_default {
+                        Some(existing) if existing != value => {
+                            conflict = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => class_default = Some(value.clone()),
+                    }
+                }
+                if conflict {
+                    continue;
+                }
+                let Some(value) = class_default else { continue };
+                for member in class {
+                    if let Some(interp) = model.array_values.get_mut(member) {
+                        if interp.default.is_none() {
+                            interp.default = Some(value.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            let pending: Vec<(TermId, TermId)> = model
+                .array_values
+                .iter()
+                .filter(|(_, interp)| interp.default.is_none())
+                .map(|(&term, _)| {
+                    let mut current = term;
+                    // `store_cache` is a base pointer per term, so the walk
+                    // terminates on any acyclic cache; bound it anyway so a
+                    // malformed cache can never spin here.
+                    for _ in 0..=self.store_cache.len() {
+                        let Some(&(base, _, _)) = self.store_cache.get(&current) else {
+                            break;
+                        };
+                        current = base;
+                    }
+                    (term, current)
+                })
+                .collect();
+            for (term, base) in pending {
+                if base == term {
+                    continue;
+                }
+                let Some(value) = model
+                    .array_values
+                    .get(&base)
+                    .and_then(|interp| interp.default.clone())
+                else {
+                    continue;
+                };
+                if let Some(interp) = model.array_values.get_mut(&term) {
+                    if interp.default.is_none() {
+                        interp.default = Some(value);
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
     }
 }

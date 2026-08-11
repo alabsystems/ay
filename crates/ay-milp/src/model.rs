@@ -160,6 +160,10 @@ pub struct Model {
     /// the margin, so the reframe never has to GUESS which row is the
     /// violation; that is what makes this opt-in shape sound and robust.
     pub(crate) margin: Option<u32>,
+    /// Measurement-only latch shared by every model/LP clone derived during
+    /// one top-level native MILP solve. `None` outside the outermost
+    /// [`crate::BabSession::check`] frame; never consulted by a solver decision.
+    ft_adoption_solve_latch: Option<crate::sepstat::FtAdoptionSolveLatch>,
 }
 
 impl Model {
@@ -167,6 +171,124 @@ impl Model {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Clone one already-validated speculative-route model with cooperative
+    /// construction checkpoints.  This is deliberately crate-private: public
+    /// sessions retain [`Clone`] plus the ordinary validation boundary.
+    pub(crate) fn clone_with_work(&self, work: &mut dyn FnMut(usize) -> bool) -> Option<Self> {
+        let mut cols = Vec::with_capacity(self.cols.len());
+        for (index, column) in self.cols.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(self.cols.len().saturating_sub(index))) {
+                return None;
+            }
+            cols.push(*column);
+        }
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            if !work(1) {
+                return None;
+            }
+            let mut coefficients = Vec::with_capacity(row.coeffs.len());
+            for (index, coefficient) in row.coeffs.iter().enumerate() {
+                if index & 0xff == 0 && !work(0x100.min(row.coeffs.len().saturating_sub(index))) {
+                    return None;
+                }
+                coefficients.push(*coefficient);
+            }
+            rows.push(RowSpec {
+                lb: row.lb,
+                ub: row.ub,
+                coeffs: coefficients,
+            });
+        }
+        let mut exact_obj = HashMap::with_capacity(self.exact_obj.len());
+        for (&column, value) in &self.exact_obj {
+            if !work(1) {
+                return None;
+            }
+            exact_obj.insert(column, value.clone());
+        }
+        let exact_obj_offset = if let Some(value) = &self.exact_obj_offset {
+            if !work(1) {
+                return None;
+            }
+            Some(value.clone())
+        } else {
+            None
+        };
+        let mut exact_rows = HashMap::with_capacity(self.exact_rows.len());
+        for (&row, truth) in &self.exact_rows {
+            if !work(1) {
+                return None;
+            }
+            let mut coefficients = HashMap::with_capacity(truth.coeffs.len());
+            for (&column, value) in &truth.coeffs {
+                if !work(1) {
+                    return None;
+                }
+                coefficients.insert(column, value.clone());
+            }
+            let lower = if let Some(value) = &truth.lb {
+                if !work(1) {
+                    return None;
+                }
+                Some(value.clone())
+            } else {
+                None
+            };
+            let upper = if let Some(value) = &truth.ub {
+                if !work(1) {
+                    return None;
+                }
+                Some(value.clone())
+            } else {
+                None
+            };
+            exact_rows.insert(
+                row,
+                ExactRow {
+                    coeffs: coefficients,
+                    lb: lower,
+                    ub: upper,
+                },
+            );
+        }
+        Some(Self {
+            cols,
+            rows,
+            sense: self.sense,
+            obj_offset: self.obj_offset,
+            has_objective: self.has_objective,
+            exact_obj,
+            exact_obj_offset,
+            exact_rows,
+            has_inexact_coeffs: self.has_inexact_coeffs,
+            margin: self.margin,
+            ft_adoption_solve_latch: self.ft_adoption_solve_latch.clone(),
+        })
+    }
+
+    /// Install the active top-level FT-adoption census frame.
+    pub(crate) fn set_ft_adoption_solve_latch(
+        &mut self,
+        latch: crate::sepstat::FtAdoptionSolveLatch,
+    ) {
+        self.ft_adoption_solve_latch = Some(latch);
+    }
+
+    /// Copy the active census frame when a transform rebuilds a model.
+    pub(crate) fn inherit_ft_adoption_solve_latch(&mut self, source: &Self) {
+        self.ft_adoption_solve_latch = source.ft_adoption_solve_latch();
+    }
+
+    /// End this model's participation in a top-level census frame.
+    pub(crate) fn clear_ft_adoption_solve_latch(&mut self) {
+        self.ft_adoption_solve_latch = None;
+    }
+
+    pub(crate) fn ft_adoption_solve_latch(&self) -> Option<crate::sepstat::FtAdoptionSolveLatch> {
+        self.ft_adoption_solve_latch.clone()
     }
 
     /// Add a continuous column with bounds `[lb, ub]` (use `±INFINITY` for
@@ -266,6 +388,92 @@ impl Model {
         Row(idx)
     }
 
+    /// Add an already canonical row without sorting and copying it again.
+    ///
+    /// Parser front-ends commonly perform exact duplicate consolidation before
+    /// rounding a row into the float advice lane.  Sending that canonical row
+    /// through [`Self::add_row`] would allocate a second vector and repeat a
+    /// sort/dedup whose result is already known.  This crate-private boundary
+    /// consumes the prepared storage after checking the same invariants.
+    pub(crate) fn add_row_sorted_unique(
+        &mut self,
+        lb: f64,
+        ub: f64,
+        coeffs: Vec<(u32, f64)>,
+    ) -> Row {
+        assert!(
+            !lb.is_nan() && !ub.is_nan(),
+            "add_row_sorted_unique: NaN bound"
+        );
+        let mut previous = None;
+        for &(column, coefficient) in &coeffs {
+            assert!(
+                coefficient.is_finite(),
+                "add_row_sorted_unique: non-finite coefficient"
+            );
+            assert_ne!(coefficient, 0.0, "add_row_sorted_unique: zero coefficient");
+            assert!(
+                (column as usize) < self.cols.len(),
+                "add_row_sorted_unique: column {column} out of range ({} columns)",
+                self.cols.len()
+            );
+            assert!(
+                previous.is_none_or(|prior| prior < column),
+                "add_row_sorted_unique: coefficients are not strictly ordered"
+            );
+            previous = Some(column);
+        }
+        let idx = u32::try_from(self.rows.len()).expect("row count exceeds u32");
+        self.rows.push(RowSpec { lb, ub, coeffs });
+        Row(idx)
+    }
+
+    /// Resource-bounded twin of [`Self::add_row_sorted_unique`] for an
+    /// internally assembled speculative model. The callback is polled while
+    /// checking the canonical row; `None` leaves the row uninstalled.
+    pub(crate) fn add_row_sorted_unique_with_work<F>(
+        &mut self,
+        lb: f64,
+        ub: f64,
+        coeffs: Vec<(u32, f64)>,
+        work: &mut F,
+    ) -> Option<Row>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        assert!(
+            !lb.is_nan() && !ub.is_nan(),
+            "add_row_sorted_unique_with_work: NaN bound"
+        );
+        let mut previous = None;
+        for (index, &(column, coefficient)) in coeffs.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(coeffs.len().saturating_sub(index))) {
+                return None;
+            }
+            assert!(
+                coefficient.is_finite(),
+                "add_row_sorted_unique_with_work: non-finite coefficient"
+            );
+            assert_ne!(
+                coefficient, 0.0,
+                "add_row_sorted_unique_with_work: zero coefficient"
+            );
+            assert!(
+                (column as usize) < self.cols.len(),
+                "add_row_sorted_unique_with_work: column {column} out of range ({} columns)",
+                self.cols.len()
+            );
+            assert!(
+                previous.is_none_or(|prior| prior < column),
+                "add_row_sorted_unique_with_work: coefficients are not strictly ordered"
+            );
+            previous = Some(column);
+        }
+        let idx = u32::try_from(self.rows.len()).expect("row count exceeds u32");
+        self.rows.push(RowSpec { lb, ub, coeffs });
+        Some(Row(idx))
+    }
+
     /// Replace an existing row's bounds and coefficients in place — the node-level
     /// CUT-SLOT primitive (`bab.rs`). The row count never changes, which is the whole
     /// point: every basis and every box stored against this model stays
@@ -321,6 +529,61 @@ impl Model {
         self.refresh_inexact_flag();
     }
 
+    /// Append the current highest-indexed column to an existing canonical row.
+    ///
+    /// Restricted masters grow one column at a time.  This narrow mutation
+    /// preserves the row's bounds and every existing coefficient, including
+    /// their exact side-store values, while avoiding a rebuild of the row.
+    ///
+    /// # Panics
+    /// Panics if the row or column is out of range, the column is not the
+    /// highest-indexed column, the coefficient is non-finite or zero, or the
+    /// append would violate the row's strict column ordering.
+    pub(crate) fn append_row_coeff(&mut self, row: Row, col: Col, coefficient: f64) {
+        assert!(
+            row.index() < self.rows.len(),
+            "append_row_coeff: row {} out of range ({} rows)",
+            row.index(),
+            self.rows.len()
+        );
+        assert!(
+            coefficient.is_finite(),
+            "append_row_coeff: non-finite coefficient"
+        );
+        assert_ne!(coefficient, 0.0, "append_row_coeff: zero coefficient");
+        assert!(
+            col.index() < self.cols.len(),
+            "append_row_coeff: column {} out of range ({} columns)",
+            col.index(),
+            self.cols.len()
+        );
+        assert_eq!(
+            col.index() + 1,
+            self.cols.len(),
+            "append_row_coeff: column {} is not the highest column ({})",
+            col.index(),
+            self.cols.len() - 1
+        );
+
+        let coefficients = &mut self.rows[row.index()].coeffs;
+        assert!(
+            coefficients
+                .last()
+                .is_none_or(|&(previous, _)| previous < col.0),
+            "append_row_coeff: coefficients are not strictly ordered"
+        );
+        coefficients.push((col.0, coefficient));
+
+        let remove_exact_row = self.exact_rows.get_mut(&row.0).is_some_and(|exact_row| {
+            exact_row.coeffs.remove(&col.0);
+            exact_row.coeffs.is_empty() && exact_row.lb.is_none() && exact_row.ub.is_none()
+        });
+        if remove_exact_row {
+            self.exact_rows.remove(&row.0);
+        }
+        self.refresh_inexact_flag();
+    }
+
     /// Set the linear objective: coefficients (unmentioned columns get 0) and
     /// direction. Replaces any previous objective.
     ///
@@ -346,6 +609,73 @@ impl Model {
             self.cols[col.index()].obj = a;
         }
         self.sense = sense;
+        self.has_objective = true;
+        self.refresh_inexact_flag();
+    }
+
+    /// Resource-bounded twin of [`Self::set_objective`] for a disposable
+    /// speculative model. A declined callback may leave the model partially
+    /// rewritten; callers must discard it, never solve it.
+    pub(crate) fn set_objective_with_work<F>(
+        &mut self,
+        coeffs: &[(Col, f64)],
+        sense: Sense,
+        work: &mut F,
+    ) -> bool
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        self.exact_obj.clear();
+        let column_count = self.cols.len();
+        for (index, spec) in self.cols.iter_mut().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(column_count.saturating_sub(index))) {
+                return false;
+            }
+            spec.obj = 0.0;
+        }
+        for (index, &(col, a)) in coeffs.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(coeffs.len().saturating_sub(index))) {
+                return false;
+            }
+            assert!(
+                a.is_finite(),
+                "set_objective_with_work: non-finite coefficient"
+            );
+            assert!(
+                col.index() < self.cols.len(),
+                "set_objective_with_work: column {} out of range ({} columns)",
+                col.index(),
+                self.cols.len()
+            );
+            self.cols[col.index()].obj = a;
+        }
+        self.sense = sense;
+        self.has_objective = true;
+        self.refresh_inexact_flag();
+        true
+    }
+
+    /// Set one objective coefficient without rebuilding the objective vector.
+    ///
+    /// The objective direction, offset, and every other coefficient (including
+    /// exact side-store overrides) are preserved.  A previous exact override
+    /// for `col` no longer describes the replacement value and is retired.
+    ///
+    /// # Panics
+    /// Panics if the coefficient is non-finite or the column is out of range.
+    pub(crate) fn set_obj_coeff(&mut self, col: Col, coefficient: f64) {
+        assert!(
+            coefficient.is_finite(),
+            "set_obj_coeff: non-finite coefficient"
+        );
+        assert!(
+            col.index() < self.cols.len(),
+            "set_obj_coeff: column {} out of range ({} columns)",
+            col.index(),
+            self.cols.len()
+        );
+        self.cols[col.index()].obj = coefficient;
+        self.exact_obj.remove(&col.0);
         self.has_objective = true;
         self.refresh_inexact_flag();
     }
@@ -480,19 +810,45 @@ impl Model {
         self.has_inexact_coeffs
     }
 
+    /// Whether any objective coefficient is represented by a rounded `f64`
+    /// proxy whose authoritative value lives in the exact side store.
+    ///
+    /// This deliberately excludes an exact objective-offset override.  The
+    /// offset does not affect search ordering or pruning, and native MILP adds
+    /// it through [`Self::obj_offset_exact`].  A coefficient override does
+    /// affect both, so a native path that only prices `f64` costs must decline
+    /// it rather than silently optimize the proxy objective.
+    #[must_use]
+    pub(crate) fn has_inexact_objective_coeffs(&self) -> bool {
+        !self.exact_obj.is_empty()
+    }
+
     /// The TRUE rational coefficient of row `row` at column `c`, given its
     /// stored `f64` `a`. Consults the side-store first; falls back to `exact(a)`
     /// (identical to the old behaviour) when there is no override. `row` is a
     /// row index (`Row::index`).
     pub(crate) fn row_coeff_exact(&self, row: usize, c: u32, a: f64) -> BigRational {
+        self.row_coeff_exact_cow(row, c, a).into_owned()
+    }
+
+    /// Borrow a side-store row coefficient when one exists, allocating only
+    /// for the ordinary exact-`f64` fallback. Resource-capped exact routes use
+    /// this to inspect a large rational before deciding whether cloning it is
+    /// within their local budget.
+    pub(crate) fn row_coeff_exact_cow(
+        &self,
+        row: usize,
+        c: u32,
+        a: f64,
+    ) -> std::borrow::Cow<'_, BigRational> {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = er.coeffs.get(&c) {
-                    return v.clone();
+                    return std::borrow::Cow::Borrowed(v);
                 }
             }
         }
-        exact(a).expect("validated row coefficient")
+        std::borrow::Cow::Owned(exact(a).expect("validated row coefficient"))
     }
 
     /// [`Self::row_coeff_exact`], landing on the inline-small exact rational
@@ -510,7 +866,7 @@ impl Model {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = er.coeffs.get(&c) {
-                    return ay_lra::rational::Rational::from_big(v.clone());
+                    return ay_lra::rational::Rational::from(v);
                 }
             }
         }
@@ -520,14 +876,25 @@ impl Model {
     /// The TRUE rational lower bound of row `row` (`None` = `-INFINITY`), given
     /// its stored `f64` `lb`. Consults the side-store first.
     pub(crate) fn row_lb_exact(&self, row: usize, lb: f64) -> Option<BigRational> {
+        self.row_lb_exact_cow(row, lb)
+            .map(|value| value.into_owned())
+    }
+
+    /// Borrow the exact lower-bound override when present; see
+    /// [`Self::row_coeff_exact_cow`].
+    pub(crate) fn row_lb_exact_cow(
+        &self,
+        row: usize,
+        lb: f64,
+    ) -> Option<std::borrow::Cow<'_, BigRational>> {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = &er.lb {
-                    return Some(v.clone());
+                    return Some(std::borrow::Cow::Borrowed(v));
                 }
             }
         }
-        exact(lb)
+        exact(lb).map(std::borrow::Cow::Owned)
     }
 
     /// [`Self::row_lb_exact`], landing on the inline-small exact rational
@@ -540,7 +907,7 @@ impl Model {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = &er.lb {
-                    return Some(ay_lra::rational::Rational::from_big(v.clone()));
+                    return Some(ay_lra::rational::Rational::from(v));
                 }
             }
         }
@@ -549,14 +916,25 @@ impl Model {
 
     /// The TRUE rational upper bound of row `row` (`None` = `+INFINITY`).
     pub(crate) fn row_ub_exact(&self, row: usize, ub: f64) -> Option<BigRational> {
+        self.row_ub_exact_cow(row, ub)
+            .map(|value| value.into_owned())
+    }
+
+    /// Borrow the exact upper-bound override when present; see
+    /// [`Self::row_coeff_exact_cow`].
+    pub(crate) fn row_ub_exact_cow(
+        &self,
+        row: usize,
+        ub: f64,
+    ) -> Option<std::borrow::Cow<'_, BigRational>> {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = &er.ub {
-                    return Some(v.clone());
+                    return Some(std::borrow::Cow::Borrowed(v));
                 }
             }
         }
-        exact(ub)
+        exact(ub).map(std::borrow::Cow::Owned)
     }
 
     /// [`Self::row_ub_exact`], landing on the inline-small exact rational
@@ -569,7 +947,7 @@ impl Model {
         if self.has_inexact_coeffs {
             if let Some(er) = self.exact_rows.get(&(row as u32)) {
                 if let Some(v) = &er.ub {
-                    return Some(ay_lra::rational::Rational::from_big(v.clone()));
+                    return Some(ay_lra::rational::Rational::from(v));
                 }
             }
         }
@@ -579,22 +957,114 @@ impl Model {
     /// The TRUE rational objective coefficient of column `c`, given its stored
     /// `f64` `a`. Consults the side-store first.
     pub(crate) fn obj_coeff_exact_at(&self, c: u32, a: f64) -> BigRational {
+        self.obj_coeff_exact_cow(c, a).into_owned()
+    }
+
+    /// Borrow the exact objective override when present; see
+    /// [`Self::row_coeff_exact_cow`].
+    pub(crate) fn obj_coeff_exact_cow(&self, c: u32, a: f64) -> std::borrow::Cow<'_, BigRational> {
         if self.has_inexact_coeffs {
             if let Some(v) = self.exact_obj.get(&c) {
-                return v.clone();
+                return std::borrow::Cow::Borrowed(v);
             }
         }
-        exact(a).expect("validated objective coefficient")
+        std::borrow::Cow::Owned(exact(a).expect("validated objective coefficient"))
     }
 
     /// The TRUE rational objective offset. Consults the side-store first.
     pub(crate) fn obj_offset_exact(&self) -> BigRational {
+        self.obj_offset_exact_cow().into_owned()
+    }
+
+    /// Borrow the exact objective-offset override when present; see
+    /// [`Self::row_coeff_exact_cow`].
+    pub(crate) fn obj_offset_exact_cow(&self) -> std::borrow::Cow<'_, BigRational> {
         if self.has_inexact_coeffs {
             if let Some(v) = &self.exact_obj_offset {
-                return v.clone();
+                return std::borrow::Cow::Borrowed(v);
             }
         }
-        exact(self.obj_offset).unwrap_or_else(BigRational::zero)
+        std::borrow::Cow::Owned(exact(self.obj_offset).unwrap_or_else(BigRational::zero))
+    }
+
+    /// Whether the objective is IDENTICALLY ZERO: every coefficient AND the
+    /// exact offset exactly `0`, so the model is a pure FEASIBILITY problem
+    /// however it was built.
+    ///
+    /// # Why this is a first-class model property and not a local helper
+    ///
+    /// It names a MODEL CLASS the engine is structurally blind to. Under a zero
+    /// objective every dual bound is the trivial `0`, so dual-bound pruning,
+    /// reduced-cost fixing, best-bound node ordering, pseudocost branching and
+    /// every "close the root gap" criterion are INERT — and the engine is
+    /// architected around exactly those. The class is not exotic: EVERY captured
+    /// ny W1 model (Big-M ReLU neural-network verification MILPs; 46 in the
+    /// capture measured here) is in it, and UNSAT is the deliverable there, so
+    /// the whole workload lands on the one regime none of the shipped levers can
+    /// see. Twelve of the 379 MIPLIB corpus instances are in it too:
+    /// `cryptanalysiskb128n5obj14/16`, `fhnw-binpack4-4/18/48`, `fhnw-sq2/3`,
+    /// `neos-3004026-krka`, `ns1116954`, `ns1952667`, `ponderthis0517-inf` and
+    /// `supportcase30`.
+    ///
+    /// # Why this is exact and not a tolerance
+    ///
+    /// Both halves of the objective are checked where the truth lives. The stored
+    /// `f64` is only a ROUNDED PROXY whenever the exact side-store holds an
+    /// override for that column, so the override alone decides that entry;
+    /// otherwise the proxy is exact and decides it. The OFFSET goes through
+    /// [`Self::obj_offset_exact`] for the same reason. The side-store is empty
+    /// on every all-`f64`-exact model, so this is one `f64` sweep in the common
+    /// case.
+    ///
+    /// # Not the same question as [`Self::has_objective`]
+    ///
+    /// `has_objective` records whether an objective was ever SET, and the MPS
+    /// reader always sets one (an all-zero `COST` row is still a `COST` row), so
+    /// it is `true` on every model in this class. The two must stay distinct:
+    /// `has_objective` decides whether the session optimizes or answers
+    /// feasibility, and collapsing them would make the LP and MILP lanes disagree
+    /// (`Optimal { value: 0 }` against `Feasible`) on the same model.
+    #[must_use]
+    pub(crate) fn objective_is_identically_zero(&self) -> bool {
+        self.exact_obj
+            .iter()
+            .all(|(&column, value)| (column as usize) < self.cols.len() && value.is_zero())
+            && self.cols.iter().enumerate().all(|(column, spec)| {
+                self.exact_obj
+                    .get(&(column as u32))
+                    .map_or(spec.obj == 0.0, BigRational::is_zero)
+            })
+            && self.obj_offset_exact().is_zero()
+    }
+
+    /// Cooperative, allocation-free twin of
+    /// [`Self::objective_is_identically_zero`] for a speculative recognizer.
+    /// `None` means the caller's cumulative envelope expired mid-census.
+    pub(crate) fn objective_is_identically_zero_with_work<F>(&self, work: &mut F) -> Option<bool>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        for (index, (&column, value)) in self.exact_obj.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(self.exact_obj.len().saturating_sub(index))) {
+                return None;
+            }
+            if (column as usize) >= self.cols.len() || !value.is_zero() {
+                return Some(false);
+            }
+        }
+        for (index, column) in self.cols.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(self.cols.len().saturating_sub(index))) {
+                return None;
+            }
+            if !self
+                .exact_obj
+                .get(&(index as u32))
+                .map_or(column.obj == 0.0, BigRational::is_zero)
+            {
+                return Some(false);
+            }
+        }
+        work(1).then(|| self.obj_offset_exact_cow().is_zero())
     }
 
     /// Record the TRUE rational coefficient of row `row` at column `c` — used by
@@ -753,13 +1223,10 @@ impl Model {
         );
         let mut acc = self.obj_offset_exact();
         for (j, (spec, v)) in self.cols.iter().zip(values).enumerate() {
-            // A rounded `f64` obj coeff can be a nonzero true rational stored in
-            // the side-store even when `spec.obj == 0.0` is impossible here (a
-            // nonzero true coeff never rounds to 0.0 for the magnitudes the
-            // reader admits), so the `!= 0.0` fast-skip stays exact: the
-            // side-store is only ever populated for columns whose `f64` obj is
-            // nonzero.
-            if spec.obj != 0.0 {
+            // Preserve the zero-proxy fast path only when there is no exact
+            // override.  The side store is semantic authority even for a
+            // transformed/adversarial model whose advice rounded to zero.
+            if spec.obj != 0.0 || self.exact_obj.contains_key(&(j as u32)) {
                 acc += self.obj_coeff_exact_at(j as u32, spec.obj) * v;
             }
         }
@@ -772,15 +1239,48 @@ impl Model {
     /// # Panics
     /// Panics if `values.len() != num_cols()`.
     pub fn check_point(&self, values: &[BigRational]) -> Result<(), PointViolation> {
+        let mut unlimited = |_| true;
+        self.check_point_counted(values, &mut unlimited)
+    }
+
+    /// Crate-private resource-bounded twin of [`Self::check_point`].  The
+    /// callback receives deterministic entry counts before each construction
+    /// chunk and returns `false` to decline without accepting the point.
+    pub(crate) fn check_point_with_work<F>(
+        &self,
+        values: &[BigRational],
+        work: &mut F,
+    ) -> Result<(), PointViolation>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        self.check_point_counted(values, work)
+    }
+
+    fn check_point_counted<F>(
+        &self,
+        values: &[BigRational],
+        work: &mut F,
+    ) -> Result<(), PointViolation>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
         use std::sync::atomic::Ordering::Relaxed;
         CHECK_CALLS.fetch_add(1, Relaxed);
         let _t = std::time::Instant::now();
-        let out = self.check_point_inner(values);
+        let out = self.check_point_inner(values, work);
         CHECK_NANOS.fetch_add(_t.elapsed().as_nanos() as u64, Relaxed);
         out
     }
 
-    fn check_point_inner(&self, values: &[BigRational]) -> Result<(), PointViolation> {
+    fn check_point_inner<F>(
+        &self,
+        values: &[BigRational],
+        work: &mut F,
+    ) -> Result<(), PointViolation>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
         // A POINT OF THE WRONG LENGTH IS NOT A FEASIBLE POINT — SAY SO, DON'T PANIC.
         //
         // `check_point` decides whether `values` is a feasible point of THIS model, and a vector
@@ -807,11 +1307,17 @@ impl Model {
         // this check ~8% of a small solve's wall at the rate heuristics ask it.
         // Same numbers, same verdicts.
         use ay_lra::rational::Rational;
-        let vals: Vec<Rational> = values
-            .iter()
-            .map(|v| Rational::from_big(v.clone()))
-            .collect();
+        let mut vals = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(values.len().saturating_sub(index))) {
+                return Err(PointViolation::ResourceLimit);
+            }
+            vals.push(Rational::from(value));
+        }
         for (i, (spec, v)) in self.cols.iter().zip(&vals).enumerate() {
+            if i & 0xff == 0 && !work(0x100.min(vals.len().saturating_sub(i))) {
+                return Err(PointViolation::ResourceLimit);
+            }
             if let Some(lb) = exact_small(spec.lb) {
                 if *v < lb {
                     return Err(PointViolation::ColBound { col: Col(i as u32) });
@@ -829,7 +1335,64 @@ impl Model {
                 return Err(PointViolation::Integrality { col: Col(i as u32) });
             }
         }
+        if !work(vals.len()) {
+            return Err(PointViolation::ResourceLimit);
+        }
+        let values_fit_small = vals.iter().all(Rational::is_small);
         for (i, r) in self.rows.iter().enumerate() {
+            if !work(1) {
+                return Err(PointViolation::ResourceLimit);
+            }
+            // Small exact witnesses and ordinary-size dyadic matrix entries are
+            // the overwhelmingly common case for routed SAT/PB models.  Keep
+            // that case in `Rational::Small` so checking a witness does not
+            // allocate a `BigInt` numerator and denominator for every row.
+            //
+            // This is only a representation fast path: `Rational` promotes to
+            // its exact big backing if an intermediate overflows i64.  Rows
+            // with a true-rational side-store entry, or with a finite f64 whose
+            // exact dyadic does not fit inline, retain the common-denominator
+            // BigInt path below.  The latter remains materially better for
+            // very large rational witnesses because it deliberately avoids
+            // reducing the accumulated sum.
+            let mut coefficients_fit_small = !self.has_inexact_coeffs && values_fit_small;
+            if coefficients_fit_small {
+                for (entry, &(_, a)) in r.coeffs.iter().enumerate() {
+                    if entry & 0xff == 0 && !work(0x100.min(r.coeffs.len().saturating_sub(entry))) {
+                        return Err(PointViolation::ResourceLimit);
+                    }
+                    if !exact_small(a).is_some_and(|coefficient| coefficient.is_small()) {
+                        coefficients_fit_small = false;
+                        break;
+                    }
+                }
+            }
+            let row_fits_small = coefficients_fit_small
+                && (!r.lb.is_finite() || exact_small(r.lb).is_some_and(|bound| bound.is_small()))
+                && (!r.ub.is_finite() || exact_small(r.ub).is_some_and(|bound| bound.is_small()));
+            if row_fits_small {
+                let mut activity = Rational::zero();
+                for (entry, &(c, a)) in r.coeffs.iter().enumerate() {
+                    if entry & 0xff == 0 && !work(0x100.min(r.coeffs.len().saturating_sub(entry))) {
+                        return Err(PointViolation::ResourceLimit);
+                    }
+                    let x = &vals[c as usize];
+                    if !x.is_zero() {
+                        activity += exact_small(a).expect("validated row coefficient") * x;
+                    }
+                }
+                if let Some(lb) = exact_small(r.lb) {
+                    if activity < lb {
+                        return Err(PointViolation::RowBound { row: Row(i as u32) });
+                    }
+                }
+                if let Some(ub) = exact_small(r.ub) {
+                    if activity > ub {
+                        return Err(PointViolation::RowBound { row: Row(i as u32) });
+                    }
+                }
+                continue;
+            }
             // The row activity, accumulated as ONE BigInt numerator over a running
             // denominator — the same technique as `solve_sparse` back-substitution.
             // The naive `act += a * x` runs up to five Stein gcds PER TERM at the
@@ -843,7 +1406,10 @@ impl Model {
             // of positive denominators), so the comparisons preserve direction.
             let mut num = num_bigint::BigInt::from(0);
             let mut den = num_bigint::BigInt::from(1);
-            for &(c, a) in &r.coeffs {
+            for (entry, &(c, a)) in r.coeffs.iter().enumerate() {
+                if entry & 0xff == 0 && !work(0x100.min(r.coeffs.len().saturating_sub(entry))) {
+                    return Err(PointViolation::ResourceLimit);
+                }
                 let x = &values[c as usize];
                 if x.is_zero() {
                     continue;
@@ -887,6 +1453,8 @@ impl Model {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PointViolation {
+    /// A crate-private resource-bounded replay declined before finishing.
+    ResourceLimit,
     /// The point does not have one entry per model column (an internal arity error —
     /// see `check_point_inner`). Treated as "not a feasible point", never accepted.
     Arity,
@@ -1080,12 +1648,161 @@ mod exact_tests {
 
 #[cfg(test)]
 mod check_point_row_tests {
-    use super::{Model, PointViolation};
+    use super::{Col, Model, PointViolation, Row, Sense};
+    use ay_lra::rational::Rational;
     use num_bigint::BigInt;
     use num_rational::BigRational;
+    use num_traits::Zero;
 
     fn rat(n: i64, d: i64) -> BigRational {
         BigRational::new(BigInt::from(n), BigInt::from(d))
+    }
+
+    #[test]
+    fn exact_small_row_accessors_shrink_borrowed_side_store_values_inline() {
+        let mut model = Model::new();
+        let column = model.add_col(0.0, 1.0);
+        let row = model.add_row(-1.0, 1.0, &[(column, 1.0)]);
+        let coefficient = rat(i64::MAX, i64::MAX - 1);
+        let lower = rat(i64::MIN, 1);
+        let upper = rat(-7, 11);
+        model.record_inexact_row_coeff(row, column.0, coefficient);
+        model.record_inexact_row_bound(row, true, lower);
+        model.record_inexact_row_bound(row, false, upper);
+
+        assert_eq!(
+            model.row_coeff_exact_small(row.index(), column.0, 1.0),
+            Rational::Small(i64::MAX, i64::MAX - 1)
+        );
+        assert_eq!(
+            model.row_lb_exact_small(row.index(), -1.0),
+            Some(Rational::Small(i64::MIN, 1))
+        );
+        assert_eq!(
+            model.row_ub_exact_small(row.index(), 1.0),
+            Some(Rational::Small(-7, 11))
+        );
+    }
+
+    #[test]
+    fn exact_small_row_accessors_clone_true_large_side_store_values_exactly() {
+        let mut model = Model::new();
+        let column = model.add_col(0.0, 1.0);
+        let row = model.add_row(-1.0, 1.0, &[(column, 1.0)]);
+        let beyond_i64 = BigInt::from(i64::MAX) + BigInt::from(1);
+        let coefficient = BigRational::new(beyond_i64.clone(), BigInt::from(3));
+        let lower = BigRational::new(-(beyond_i64.clone() + BigInt::from(1)), BigInt::from(5));
+        let upper = BigRational::new(BigInt::from(1), beyond_i64);
+        model.record_inexact_row_coeff(row, column.0, coefficient.clone());
+        model.record_inexact_row_bound(row, true, lower.clone());
+        model.record_inexact_row_bound(row, false, upper.clone());
+
+        for (actual, expected) in [
+            (
+                model.row_coeff_exact_small(row.index(), column.0, 1.0),
+                coefficient,
+            ),
+            (
+                model
+                    .row_lb_exact_small(row.index(), -1.0)
+                    .expect("finite exact lower bound"),
+                lower,
+            ),
+            (
+                model
+                    .row_ub_exact_small(row.index(), 1.0)
+                    .expect("finite exact upper bound"),
+                upper,
+            ),
+        ] {
+            assert!(
+                matches!(&actual, Rational::Big(_)),
+                "a value outside the i64 boundary must stay on the exact big path"
+            );
+            assert_eq!(actual.to_big(), expected);
+        }
+    }
+
+    #[test]
+    fn exact_objective_overrides_own_both_proxy_zero_classes() {
+        let mut model = Model::new();
+        let column = model.add_col(0.0, 2.0);
+
+        model.set_objective(&[], Sense::Minimize);
+        model.record_inexact_obj_coeff(column.0, BigRational::from_integer(7.into()));
+        assert!(!model.objective_is_identically_zero());
+        assert_eq!(
+            model.objective_is_identically_zero_with_work(&mut |_| true),
+            Some(false)
+        );
+        assert_eq!(
+            model.objective_value_at(&[BigRational::from_integer(2.into())]),
+            BigRational::from_integer(14.into())
+        );
+
+        model.set_objective(&[(column, 1.0)], Sense::Minimize);
+        model.record_inexact_obj_coeff(column.0, BigRational::zero());
+        assert!(model.objective_is_identically_zero());
+        assert_eq!(
+            model.objective_is_identically_zero_with_work(&mut |_| true),
+            Some(true)
+        );
+        assert!(model
+            .objective_value_at(&[BigRational::from_integer(2.into())])
+            .is_zero());
+
+        model.record_inexact_obj_offset(BigRational::from_integer(1.into()));
+        assert!(!model.objective_is_identically_zero());
+        assert_eq!(
+            model.objective_is_identically_zero_with_work(&mut |_| true),
+            Some(false)
+        );
+
+        model.record_inexact_obj_offset(BigRational::zero());
+        model.record_inexact_obj_coeff(17, BigRational::zero());
+        assert!(!model.objective_is_identically_zero());
+        assert_eq!(
+            model.objective_is_identically_zero_with_work(&mut |_| true),
+            Some(false),
+            "an out-of-range exact key is invalid even when its value is zero"
+        );
+    }
+
+    #[test]
+    fn exact_zero_objective_census_is_cooperatively_interruptible() {
+        let mut model = Model::new();
+        for _ in 0..300 {
+            model.add_col(0.0, 1.0);
+        }
+        model.set_objective(&[], Sense::Minimize);
+
+        let mut calls = 0usize;
+        let mut interrupt_second_chunk = |_| {
+            calls += 1;
+            calls < 2
+        };
+        assert_eq!(
+            model.objective_is_identically_zero_with_work(&mut interrupt_second_chunk),
+            None
+        );
+        assert_eq!(calls, 2, "the second column chunk declined");
+
+        let one_column = {
+            let mut model = Model::new();
+            model.add_col(0.0, 1.0);
+            model.set_objective(&[], Sense::Minimize);
+            model
+        };
+        let mut calls = 0usize;
+        let mut interrupt_offset = |_| {
+            calls += 1;
+            calls < 2
+        };
+        assert_eq!(
+            one_column.objective_is_identically_zero_with_work(&mut interrupt_offset),
+            None
+        );
+        assert_eq!(calls, 2, "the exact-offset check is cooperative too");
     }
 
     /// Exact readers deliberately represent only finite coefficients. Reject
@@ -1110,7 +1827,7 @@ mod check_point_row_tests {
             assert!(std::panic::catch_unwind(|| {
                 let mut m = Model::new();
                 let x = m.add_col(0.0, 1.0);
-                m.set_objective(&[(x, bad)], super::Sense::Minimize);
+                m.set_objective(&[(x, bad)], Sense::Minimize);
             })
             .is_err());
             assert!(std::panic::catch_unwind(|| {
@@ -1136,6 +1853,25 @@ mod check_point_row_tests {
             let x = m.add_col(0.0, 1.0);
             let row = m.add_row(0.0, 1.0, &[(x, 1.0)]);
             m.set_row(row, 0.0, 1.0, &[(x, f64::MAX), (x, f64::MAX)]);
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn prepared_row_insertion_preserves_canonical_coefficients() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let y = model.add_col(0.0, 1.0);
+        let row = model.add_row_sorted_unique(-2.0, 3.0, vec![(x.0, 0.5), (y.0, -4.0)]);
+        let (coefficients, lower, upper) = model.row(row);
+        assert_eq!(coefficients, &[(x.0, 0.5), (y.0, -4.0)]);
+        assert_eq!((lower, upper), (-2.0, 3.0));
+
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let x = model.add_col(0.0, 1.0);
+            let y = model.add_col(0.0, 1.0);
+            model.add_row_sorted_unique(0.0, 1.0, vec![(y.0, 1.0), (x.0, 1.0)]);
         })
         .is_err());
     }
@@ -1173,6 +1909,27 @@ mod check_point_row_tests {
         // cross-multiplied comparison. 0.5·2 = 1.
         let on = vec![rat(2, 1), rat(0, 1), rat(0, 1), rat(0, 1)];
         assert!(m.check_point(&on).is_ok());
+    }
+
+    /// The inline witness path must promote rather than overflow when otherwise
+    /// small operands create a large intermediate.  These two 2^70 products
+    /// cancel exactly; changing one input by one leaves 2^40 and violates the
+    /// zero upper bound.
+    #[test]
+    fn row_activity_small_path_promotes_exactly() {
+        let mut m = Model::new();
+        let upper = 2_f64.powi(31);
+        let scale = 2_f64.powi(40);
+        let x = m.add_col(0.0, upper);
+        let y = m.add_col(0.0, upper);
+        m.add_row(f64::NEG_INFINITY, 0.0, &[(x, scale), (y, -scale)]);
+
+        let base = 1_i64 << 30;
+        assert!(m.check_point(&[rat(base, 1), rat(base, 1)]).is_ok());
+        assert!(matches!(
+            m.check_point(&[rat(base, 1), rat(base - 1, 1)]),
+            Err(PointViolation::RowBound { .. })
+        ));
     }
 
     /// THE SOUNDNESS PROPERTY for inexact coverage: when a coefficient's true
@@ -1226,7 +1983,7 @@ mod check_point_row_tests {
         // Objective: minimize (2^53+1)·x. At x = 1 the TRUE objective value is
         // exactly 2^53 + 1; a rounded read would report 2^53. Assert the exact
         // value is the TRUE rational, never the rounded one.
-        m.set_objective(&[(x, rounded)], super::Sense::Minimize);
+        m.set_objective(&[(x, rounded)], Sense::Minimize);
         m.record_inexact_obj_coeff(x.0, true_coeff.clone());
         let v = m.objective_value_at(&[BigRational::from_integer(1.into())]);
         assert_eq!(
@@ -1248,7 +2005,7 @@ mod check_point_row_tests {
         let mut m = Model::new();
         let x = m.add_col(0.0, 2.0);
 
-        m.set_objective(&[(x, 1.0)], super::Sense::Minimize);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
         m.record_inexact_obj_coeff(x.0, BigRational::from_integer(7.into()));
         m.set_objective_offset(1.0);
         m.record_inexact_obj_offset(BigRational::from_integer(11.into()));
@@ -1257,7 +2014,7 @@ mod check_point_row_tests {
             BigRational::from_integer(25.into())
         );
 
-        m.set_objective(&[(x, 3.0)], super::Sense::Minimize);
+        m.set_objective(&[(x, 3.0)], Sense::Minimize);
         // The offset override is independent and remains until that value is
         // replaced; the old coefficient override is already gone.
         assert_eq!(
@@ -1279,5 +2036,124 @@ mod check_point_row_tests {
             BigRational::from_integer(2.into())
         );
         assert!(!m.has_inexact_coeffs());
+    }
+
+    #[test]
+    fn incremental_model_row_append_preserves_unrelated_exact_values() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let y = model.add_col(0.0, 1.0);
+        let row = model.add_row(-1.0, 2.0, &[(x, 1.0)]);
+
+        let exact_x = rat(7, 3);
+        let exact_lb = rat(-11, 5);
+        let exact_ub = rat(13, 7);
+        model.record_inexact_row_coeff(row, x.0, exact_x.clone());
+        model.record_inexact_row_coeff(row, y.0, rat(101, 9));
+        model.record_inexact_row_bound(row, true, exact_lb.clone());
+        model.record_inexact_row_bound(row, false, exact_ub.clone());
+
+        model.append_row_coeff(row, y, -3.5);
+
+        let (coefficients, lower, upper) = model.row(row);
+        assert_eq!(coefficients, &[(x.0, 1.0), (y.0, -3.5)]);
+        assert_eq!((lower, upper), (-1.0, 2.0));
+        assert_eq!(model.row_coeff_exact(row.index(), x.0, 1.0), exact_x);
+        assert_eq!(
+            model.row_coeff_exact(row.index(), y.0, -3.5),
+            rat(-7, 2),
+            "the stale override for only the appended coordinate must be retired"
+        );
+        assert_eq!(model.row_lb_exact(row.index(), lower), Some(exact_lb));
+        assert_eq!(model.row_ub_exact(row.index(), upper), Some(exact_ub));
+        assert!(model.has_inexact_coeffs());
+    }
+
+    #[test]
+    fn incremental_model_objective_update_preserves_unrelated_objective_state() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let y = model.add_col(0.0, 1.0);
+        model.set_objective(&[(x, 1.0), (y, 2.0)], Sense::Maximize);
+        model.set_objective_offset(4.0);
+        model.record_inexact_obj_coeff(x.0, rat(7, 3));
+        let exact_y = rat(11, 5);
+        let exact_offset = rat(13, 7);
+        model.record_inexact_obj_coeff(y.0, exact_y.clone());
+        model.record_inexact_obj_offset(exact_offset.clone());
+        let columns_ptr = model.cols.as_ptr();
+        let columns_capacity = model.cols.capacity();
+
+        model.set_obj_coeff(x, -3.5);
+
+        assert_eq!(model.cols.as_ptr(), columns_ptr);
+        assert_eq!(model.cols.capacity(), columns_capacity);
+        assert_eq!(model.obj_coeff(x), -3.5);
+        assert_eq!(model.obj_coeff(y), 2.0);
+        assert_eq!(model.obj_coeff_exact_at(x.0, -3.5), rat(-7, 2));
+        assert_eq!(model.obj_coeff_exact_at(y.0, 2.0), exact_y);
+        assert_eq!(model.sense(), Sense::Maximize);
+        assert_eq!(model.objective_offset(), 4.0);
+        assert_eq!(model.obj_offset_exact(), exact_offset);
+        assert!(model.has_objective());
+        assert!(model.has_inexact_coeffs());
+    }
+
+    #[test]
+    fn incremental_model_mutators_reject_invalid_coordinates_and_coefficients() {
+        for bad in [0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(std::panic::catch_unwind(|| {
+                let mut model = Model::new();
+                let x = model.add_col(0.0, 1.0);
+                let y = model.add_col(0.0, 1.0);
+                let row = model.add_row(0.0, 1.0, &[(x, 1.0)]);
+                model.append_row_coeff(row, y, bad);
+            })
+            .is_err());
+        }
+
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let x = model.add_col(0.0, 1.0);
+            let _highest = model.add_col(0.0, 1.0);
+            let row = model.add_row(0.0, 1.0, &[]);
+            model.append_row_coeff(row, x, 1.0);
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let highest = model.add_col(0.0, 1.0);
+            let row = model.add_row(0.0, 1.0, &[(highest, 1.0)]);
+            model.append_row_coeff(row, highest, 2.0);
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let highest = model.add_col(0.0, 1.0);
+            let row = model.add_row(0.0, 1.0, &[]);
+            model.append_row_coeff(row, Col(highest.0 + 1), 1.0);
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let highest = model.add_col(0.0, 1.0);
+            model.append_row_coeff(Row(0), highest, 1.0);
+        })
+        .is_err());
+
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(std::panic::catch_unwind(|| {
+                let mut model = Model::new();
+                let x = model.add_col(0.0, 1.0);
+                model.set_obj_coeff(x, bad);
+            })
+            .is_err());
+        }
+        assert!(std::panic::catch_unwind(|| {
+            let mut model = Model::new();
+            let x = model.add_col(0.0, 1.0);
+            model.set_obj_coeff(Col(x.0 + 1), 1.0);
+        })
+        .is_err());
     }
 }

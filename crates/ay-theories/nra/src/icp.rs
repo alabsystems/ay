@@ -115,13 +115,46 @@ const MAX_BOXES: usize = 2048;
 /// collapses the box in a handful of contractions).
 const PIN_SEARCH_MAX_BOXES: usize = 128;
 
-/// Total pinned (pin-variable, pin-value) attempts per call.
-const MAX_PIN_ATTEMPTS: usize = 12;
+/// Total pinned (pin-variable, pin-value) attempts per call. Sized so a
+/// typical pinned system exhausts its pin-variable choices against the whole
+/// [`PIN_VALUE_LADDER`] rather than truncating the ladder after the first few
+/// pin sets (12 truncated a 4-variable system to one ladder rung).
+const MAX_PIN_ATTEMPTS: usize = 96;
 
-/// Budget of boxes when variables had to be CLAMPED to the large initial box:
-/// such trees cannot prove UNSAT and only the first few boxes plausibly yield
-/// a rational candidate, so a long search is wasted work.
-const CLAMPED_MAX_BOXES: usize = 64;
+/// Budget of boxes when variables had to be CLAMPED to the large initial box.
+///
+/// Such trees cannot prove UNSAT, so this budget only ever buys a SAT witness.
+/// It was 64 on the theory that "only the first few boxes plausibly yield a
+/// rational candidate" — measured false: the clamp is `2^20`, so the widest
+/// dimension needs ~20 levels of DFS bisection before boxes reach unit width,
+/// and 64 boxes cannot get there. Raising it to 1024 converted 11 of the 69
+/// meti-tarski rational-witness misses for ~9% more wall time on that pool.
+const CLAMPED_MAX_BOXES: usize = 1024;
+
+/// Largest system [`NraSolver::dyadic_grid_search`] attempts. The grid is a
+/// PRODUCT over coordinates, so past a handful of variables a node budget buys
+/// only a prefix of the first variable's alphabet; the shape that phase is for
+/// (meti-tarski Skolem constants) is 3-5 variables.
+const GRID_MAX_VARS: usize = 6;
+
+/// Finest dyadic grid level: denominators up to `2^GRID_MAX_LEVEL`.
+const GRID_MAX_LEVEL: usize = 3;
+
+/// Magnitude cap on grid values: `|k / 2^level| <= 4`. Raising it to 8 adds no
+/// coverage on the measured witness pool (0 extra of 161) and doubles the
+/// alphabet, so it stays at 4.
+const GRID_ABS_CAP: usize = 4;
+
+/// Contracted nodes [`NraSolver::dyadic_grid_search`] may expand in ONE call,
+/// summed over all grid levels. One node costs one box clone plus one
+/// `contract_box` — the same unit as a main-tree box, so this is sized against
+/// [`MAX_BOXES`].
+const GRID_MAX_NODES: usize = 20000;
+
+/// Grid nodes available to the WHOLE solve, across every `check()`. Bounds the
+/// boolean-heavy case, where the per-call cap alone would be paid once per
+/// theory call. See [`crate::NraSolver::grid_budget`].
+pub(crate) const GRID_SOLVE_NODES: usize = 400_000;
 
 /// Contraction passes per box before bisecting.
 const MAX_CONTRACT_PASSES: usize = 10;
@@ -527,6 +560,103 @@ fn nice_point_in(iv: &Interval) -> Option<BigRational> {
     }
     let mid = interval_midpoint(iv)?;
     interval_contains(iv, &mid).then_some(mid)
+}
+
+/// A "nice" rational inside an interval that may be UNBOUNDED on one or both
+/// sides.
+///
+/// [`nice_point_in`] returns `None` the moment an endpoint is infinite, so
+/// every SAT-candidate path built on it silently does NOTHING on the shape
+/// that dominates meti-tarski: a Skolem constant with a one-sided bound
+/// (`skoT > 0`, interval `(0, +inf)`). This replaces each infinite side with a
+/// finite surrogate two units from the finite side (or `[-1, 1]` when both
+/// sides are infinite) so the simplest-rational descent yields a SMALL value
+/// -- `0`, `+/-1`, `+/-1/2` -- which is what these witnesses actually are.
+/// The result is re-checked against the ORIGINAL interval, so nothing outside
+/// it is ever proposed.
+///
+/// Sound by construction: this only proposes a candidate. Every rational
+/// candidate is re-verified by exact substitution into EVERY asserted atom
+/// (`verify_model`) before `sat` is claimed, so a bad proposal costs time and
+/// can never cost correctness.
+fn nice_point_in_open(iv: &Interval) -> Option<BigRational> {
+    if matches!(iv.lo, Endpoint::Finite(..)) && matches!(iv.hi, Endpoint::Finite(..)) {
+        return nice_point_in(iv);
+    }
+    let two = BigRational::from_integer(BigInt::from(2));
+    let one = BigRational::one();
+    let surrogate = match (&iv.lo, &iv.hi) {
+        (Endpoint::Finite(l, inc), Endpoint::PosInf) => Interval {
+            lo: Endpoint::Finite(l.clone(), *inc),
+            hi: Endpoint::Finite(l + &two, true),
+        },
+        (Endpoint::NegInf, Endpoint::Finite(h, inc)) => Interval {
+            lo: Endpoint::Finite(h - &two, true),
+            hi: Endpoint::Finite(h.clone(), *inc),
+        },
+        (Endpoint::NegInf, Endpoint::PosInf) => Interval {
+            lo: Endpoint::Finite(-(&one), true),
+            hi: Endpoint::Finite(one, true),
+        },
+        _ => return None,
+    };
+    nice_point_in(&surrogate).filter(|p| interval_contains(iv, p))
+}
+
+/// Number of distinct pin VALUES tried per pin-variable set (the ladder in
+/// [`pin_candidate`]).
+const PIN_VALUE_LADDER: usize = 8;
+
+/// The `k`-th candidate pin value inside `iv`, `None` when that rung does not
+/// land in the interval.
+///
+/// The three-rung ladder this replaces -- simplest-rational, midpoint,
+/// lower-half-simplest -- is strongly CORRELATED: all three descend to the same
+/// small-denominator neighbourhood, and on the meti-tarski shape all three
+/// collapse to the single value `0`. A Skolem constant asserted `(not (<= skoT
+/// 0))` yields the SOUND interval `[0, +inf)` (a strict bound relaxed to a
+/// closed one is a legal over-approximation), whose simplest rational is `0` --
+/// exactly the value the strict atom forbids. Every attempt then fails on the
+/// same point and the whole pinned search does no work.
+///
+/// So the ladder adds the values these witnesses are actually made of: the
+/// small integers `1`, `-1`, `2`, `1/2` and the two endpoint neighbourhoods.
+/// Sound: a pin value is only a PROPOSAL. `sat` is claimed solely through
+/// `verify_model`, which substitutes exactly into every asserted atom, so a
+/// wrong rung wastes time and can never produce a wrong verdict.
+fn pin_candidate(iv: &Interval, k: usize) -> Option<BigRational> {
+    let unit = |x: BigRational| interval_contains(iv, &x).then_some(x);
+    match k {
+        0 => nice_point_in_open(iv),
+        1 => unit(BigRational::one()),
+        2 => unit(-BigRational::one()),
+        3 => interval_midpoint(iv).filter(|m| interval_contains(iv, m)),
+        4 => lower_half_point(iv),
+        5 => unit(BigRational::from_integer(BigInt::from(2))),
+        6 => unit(BigRational::new(BigInt::one(), BigInt::from(2))),
+        // Just inside the finite lower (else upper) endpoint: the witness of a
+        // strict bound often sits against it.
+        _ => match (&iv.lo, &iv.hi) {
+            (Endpoint::Finite(l, _), _) => unit(l + BigRational::one())
+                .or_else(|| unit(l + BigRational::new(BigInt::one(), BigInt::from(1024)))),
+            (_, Endpoint::Finite(h, _)) => unit(h - BigRational::one())
+                .or_else(|| unit(h - BigRational::new(BigInt::one(), BigInt::from(1024)))),
+            _ => None,
+        },
+    }
+}
+
+/// Sweep the [`pin_candidate`] ladder as whole candidate VECTORS over `bx`,
+/// returning the first that `verify_model` accepts against every asserted atom.
+/// Used where a single cheap shot is worth taking -- the unclamped root box and
+/// the high-dimensional pure-inequality give-up -- not inside the box tree,
+/// where it would multiply the per-box cost.
+fn ladder_vector(vars: &[TermId], bx: &VarBox, k: usize) -> Option<Vec<(TermId, BigRational)>> {
+    let mut model = Vec::with_capacity(vars.len());
+    for &v in vars {
+        model.push((v, pin_candidate(bx.get(&v)?, k)?));
+    }
+    Some(model)
 }
 
 // ============================================================================
@@ -1091,7 +1221,14 @@ impl NraSolver<'_> {
         //    bisection. Honest: no verdict is claimed on the give-up. Low-
         //    dimensional pure-inequality systems still run the tree below (they
         //    CAN exhaust, and a rational witness may land in an early box).
-        const PURE_INEQ_LOW_DIM: usize = 4;
+        //
+        //    The cutoff was 4, which is BELOW the dimension of most QF_NRA
+        //    meti-tarski instances (3-5 Skolem constants), so the give-up was
+        //    firing on ordinary small systems rather than on the dense
+        //    high-dimensional pose clusters it was written for. 10 keeps the
+        //    ASME shape out of the tree while letting the small systems use it;
+        //    measured, this converted 1 of the 69 and cost no wall time.
+        const PURE_INEQ_LOW_DIM: usize = 10;
         if eq_count == 0 && vars.len() > PURE_INEQ_LOW_DIM {
             // The box tree can neither exhaust these dims within budget nor
             // Krawczyk-certify (no equality subsystem). But a full-measure
@@ -1106,6 +1243,15 @@ impl NraSolver<'_> {
             if let Some(res) = self.try_certify_box(&constraints, &vars, &root) {
                 return res;
             }
+            if all_parsed {
+                for k in 0..PIN_VALUE_LADDER {
+                    if let Some(model) = ladder_vector(&vars, &root, k) {
+                        if self.verify_model(&model) {
+                            return UniResult::Sat(model);
+                        }
+                    }
+                }
+            }
             return UniResult::Unknown;
         }
         // 6. Underdetermined systems: SAT-only pinned search first (cheap,
@@ -1116,16 +1262,36 @@ impl NraSolver<'_> {
             }
         }
         // 7. Main branch-and-prune (SAT + exhaustive-refutation UNSAT).
-        // Non-square systems get a smaller budget: their SAT side was already
-        // attempted by the pinned search (a solution MANIFOLD cannot be
-        // certified by bisection), so the tree is mostly useful for quick
-        // exhaustive refutations.
-        let budget = if eq_count == vars.len() {
-            MAX_BOXES
-        } else {
-            MAX_BOXES / 8
-        };
-        self.branch_and_prune(&constraints, &vars, root, all_parsed, false, budget)
+        //
+        // Every system gets the same budget. Non-square systems used to get
+        // `MAX_BOXES / 8`, on the argument that the pinned search above had
+        // already taken their SAT side, leaving the tree useful to them only for
+        // quick exhaustive refutations. That mis-sizes the penalty for this
+        // division: UNDERDETERMINED is the NORMAL shape of meti-tarski, so the
+        // divisor fired on the majority of QF_NRA rather than on a special case,
+        // and the pinned search it leans on returns `None` outright when there is
+        // no equality subsystem to match against.
+        //
+        // MEASURED TRADE, on the 310 MV QF_NRA misses at 300 s: removing the
+        // divisor converts 4 more (23 -> 27) and costs exactly one previously
+        // solved file, `polypaver/bench-sqrt-3d/...-chunk-0504`, which the
+        // divisor solves in 231 s and the wider tree misses even at 600 s — the
+        // budget it hands the tree is deadline the phase that actually answers
+        // that instance no longer gets. Net +3, and the loss is an `unknown`,
+        // never a wrong verdict. Restore the divisor to trade those 4 back for
+        // that 1 if robustness is preferred to score.
+        let budget = MAX_BOXES;
+        let tree =
+            self.branch_and_prune(&constraints, &vars, root.clone(), all_parsed, false, budget);
+        // 8. LAST RESORT, SAT-only: dyadic grid search. Runs ONLY on the
+        //    `Unknown` fallthrough, so it can neither change a verdict the tree
+        //    reached nor widen the surface on which `Unsat` is claimed.
+        if all_parsed && matches!(tree, UniResult::Unknown) {
+            if let Some(model) = self.dyadic_grid_search(&constraints, &vars, &root) {
+                return UniResult::Sat(model);
+            }
+        }
+        tree
     }
 
     /// Branch-and-prune over a box tree. `sat_only` (pinned/heuristic boxes)
@@ -1142,6 +1308,21 @@ impl NraSolver<'_> {
     ) -> UniResult {
         let mut sat_only = sat_only;
         let mut max_boxes = max_boxes;
+        // Sweep the small-integer ladder over the root box BEFORE the 2^20
+        // clamp below. Once `(0, +inf)` becomes `(0, 2^20]` the simplest-
+        // rational descent returns ~2^18 rather than the small integer these
+        // witnesses actually are, and no bisection budget recovers it: reaching
+        // width 1 from 2^20 costs 20 DFS levels. SAT only, gated by the same
+        // exact `verify_model` as every other candidate.
+        if all_parsed {
+            for k in 0..PIN_VALUE_LADDER {
+                if let Some(model) = ladder_vector(vars, &root, k) {
+                    if self.verify_model(&model) {
+                        return UniResult::Sat(model);
+                    }
+                }
+            }
+        }
         // Clamp still-unbounded variables to the large initial search box.
         // The clamp is a SEARCH heuristic: solutions may exist outside it, so
         // it forfeits UNSAT (see module docs) and gets a short budget.
@@ -1241,7 +1422,7 @@ impl NraSolver<'_> {
                     }
                     m
                 } else {
-                    match nice_point_in(iv) {
+                    match nice_point_in_open(iv) {
                         Some(p) => p,
                         None => continue 'cand,
                     }
@@ -1255,9 +1436,42 @@ impl NraSolver<'_> {
         }
         // (b) Krawczyk existence certificate, with an exact witness.
         if let Some(result) = self.krawczyk_certify(constraints, vars, bx) {
+            // SOUNDNESS GATE for the ALGEBRAIC certificate — see
+            // [`Self::asserted_fully_parsed`]. Rational results need no gate
+            // here: every path that builds one already ran `verify_model`,
+            // which walks `self.asserted` itself.
+            if matches!(result, UniResult::SatAlgebraic(_)) && !self.asserted_fully_parsed() {
+                return None;
+            }
             return Some(result);
         }
         None
+    }
+
+    /// SOUNDNESS GATE for ALGEBRAIC witnesses: every asserted atom must lie in
+    /// the parsed multivariate fragment.
+    ///
+    /// The `SatAlgebraic` witnesses built by [`Self::krawczyk_certify`] (and its
+    /// bivariate helpers) are re-verified by exact Sturm sign determination
+    /// against `constraints` — the PARSE of the asserted atoms, which by
+    /// construction omits every atom `atom_to_multi` rejected — and nothing
+    /// downstream re-validates them (`accept_algebraic_witnesses` in
+    /// check_loop.rs only injects them into the model). So if ANY asserted atom
+    /// failed to parse, the certificate says nothing about it and `sat` must
+    /// not be claimed. The rational paths have no such gap: their
+    /// `verify_model` iterates `self.asserted` and fails closed on any atom it
+    /// cannot evaluate exactly.
+    ///
+    /// This is checked HERE, at the single choke point through which every ICP
+    /// `SatAlgebraic` flows, rather than at each call site of
+    /// [`Self::try_certify_box`]: a caller that omits its `all_parsed` guard
+    /// then degrades to a sound `unknown` instead of an unsound `sat`. Cost is
+    /// one re-parse of the atom list, paid only on the terminal step where a
+    /// certificate is about to be returned.
+    fn asserted_fully_parsed(&self) -> bool {
+        self.asserted
+            .iter()
+            .all(|&(atom, value)| self.atom_to_multi(atom, value).is_some())
     }
 
     /// Krawczyk certification of a box: substitute exact point-intervals as
@@ -1729,9 +1943,8 @@ impl NraSolver<'_> {
             };
             let mut pin_vars: Vec<TermId> = vec![first_pin];
             pin_vars.extend(remaining.iter().copied().filter(|v| !matched.contains(v)));
-            // Up to 3 pin-value assignments: simplest rational, midpoint, and
-            // the simplest rational of the lower half of each pinned interval.
-            for attempt in 0..3usize {
+            // Pin-value assignments from the small-integer ladder.
+            for attempt in 0..PIN_VALUE_LADDER {
                 if attempts >= MAX_PIN_ATTEMPTS {
                     break;
                 }
@@ -1740,11 +1953,7 @@ impl NraSolver<'_> {
                 let mut ok = true;
                 for &v in &pin_vars {
                     let iv = root.get(&v)?;
-                    let val = match attempt {
-                        0 => nice_point_in(iv),
-                        1 => interval_midpoint(iv).filter(|m| interval_contains(iv, m)),
-                        _ => lower_half_point(iv),
-                    };
+                    let val = pin_candidate(iv, attempt);
                     match val {
                         Some(val) => {
                             bx.insert(v, Interval::point(val));
@@ -1774,6 +1983,173 @@ impl NraSolver<'_> {
         }
         None
     }
+
+    /// SAT-only DYADIC GRID SEARCH: assign each variable a SMALL DYADIC value
+    /// INDEPENDENTLY, contracting after every assignment so an infeasible
+    /// prefix is cut before its subtree is enumerated.
+    ///
+    /// WHY THIS SHAPE, MEASURED. Every candidate the ICP proposes today is
+    /// DIAGONAL: [`ladder_vector`] and [`Self::pinned_sat_search`] both evaluate
+    /// `pin_candidate(iv, k)` at ONE rung `k` for EVERY variable at once, so the
+    /// vectors they can even name are `(v, v, …, v)` — a one-dimensional curve
+    /// through the search space. On the 161 MV QF_NRA files that have a rational
+    /// witness AY's own exact gate ACCEPTS, z3's witness is MIXED across
+    /// coordinates in 158 — e.g. `(-1/2, -3/4, 1)`, `(0, 1, -1, 1)`,
+    /// `(2, 1, 1/8, 1)`. The diagonal can never name any of them. It is not a
+    /// budget problem and not a representation problem: the values are all
+    /// individually on the existing ladder, only never in combination.
+    /// Of the 85 such files small enough for this phase, 47 have EVERY witness
+    /// coordinate on the `k/4, |k| ≤ 4` grid and 55 on `k/8`.
+    ///
+    /// Cost is controlled by ITERATIVE DEEPENING over grid resolution (integers,
+    /// then halves, then quarters, then eighths) under a shared node budget, so
+    /// the coarse grid — where most of these witnesses live — is always swept
+    /// even when the fine grid cannot be afforded.
+    ///
+    /// SOUNDNESS. This only PROPOSES points. `sat` is claimed solely through
+    /// [`crate::NraSolver::verify_model`], exact substitution into every asserted
+    /// atom, and the phase returns `None` on failure. It never returns `Unsat`,
+    /// never enlarges a box budget, and runs ONLY where the tree already returned
+    /// `Unknown` — so the set of inputs on which an exhaustive refutation can be
+    /// claimed is bit-for-bit unchanged.
+    fn dyadic_grid_search(
+        &self,
+        constraints: &[MultiConstraint],
+        vars: &[TermId],
+        root: &VarBox,
+    ) -> Option<Vec<(TermId, BigRational)>> {
+        if vars.len() > GRID_MAX_VARS {
+            return None;
+        }
+        // Most-constrained-first: a narrow interval admits few grid values, so
+        // ordering it early makes the tree bushy at the bottom, not the top.
+        let mut order: Vec<TermId> = vars.to_vec();
+        order.sort_by(|a, b| {
+            let wa = root.get(a).and_then(interval_width);
+            let wb = root.get(b).and_then(interval_width);
+            match (wa, wb) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+        let mut budget = GRID_MAX_NODES.min(self.grid_budget.get());
+        let start = budget;
+        let mut out = None;
+        for level in 0..=GRID_MAX_LEVEL {
+            let grid = dyadic_grid(level);
+            out = self.grid_dfs(
+                constraints,
+                vars,
+                &order,
+                0,
+                root.clone(),
+                grid,
+                &mut budget,
+            );
+            if out.is_some() || budget == 0 {
+                break; // found, or no room for a finer grid
+            }
+        }
+        self.grid_budget
+            .set(self.grid_budget.get() - (start - budget));
+        out
+    }
+
+    /// One level of [`Self::dyadic_grid_search`]: pin `order[depth]`, contract,
+    /// recurse. `budget` is decremented per contracted node and stops the sweep.
+    fn grid_dfs(
+        &self,
+        constraints: &[MultiConstraint],
+        vars: &[TermId],
+        order: &[TermId],
+        depth: usize,
+        bx: VarBox,
+        grid: &[BigRational],
+        budget: &mut usize,
+    ) -> Option<Vec<(TermId, BigRational)>> {
+        if depth == order.len() {
+            // Every variable is a point interval; assemble and verify EXACTLY.
+            let mut model = Vec::with_capacity(vars.len());
+            for &v in vars {
+                model.push((v, bx.get(&v).and_then(interval_point)?.clone()));
+            }
+            return self.verify_model(&model).then_some(model);
+        }
+        let v = order[depth];
+        let iv = bx.get(&v)?.clone();
+        // Already collapsed by contraction: nothing to choose here.
+        if interval_point(&iv).is_some() {
+            return self.grid_dfs(constraints, vars, order, depth + 1, bx, grid, budget);
+        }
+        // Candidates: the interval's own simplest rational and midpoint first
+        // (these carry the tight numeric-constant intervals — `pi` bounded to
+        // `26353589/8388608` and friends — that no fixed grid contains), then
+        // the grid values that lie inside.
+        let mut cands: Vec<BigRational> = Vec::with_capacity(grid.len() + 2);
+        for c in [nice_point_in_open(&iv), interval_midpoint(&iv)]
+            .into_iter()
+            .flatten()
+        {
+            if interval_contains(&iv, &c) && !cands.contains(&c) {
+                cands.push(c);
+            }
+        }
+        for g in grid {
+            if interval_contains(&iv, g) && !cands.contains(g) {
+                cands.push(g.clone());
+            }
+        }
+        for c in cands {
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            let mut next = bx.clone();
+            next.insert(v, Interval::point(c));
+            if matches!(
+                contract_box(constraints, vars, &mut next),
+                Contraction::Refuted
+            ) {
+                continue; // prefix PROVABLY infeasible — cut the whole subtree
+            }
+            if let Some(m) = self.grid_dfs(constraints, vars, order, depth + 1, next, grid, budget)
+            {
+                return Some(m);
+            }
+        }
+        None
+    }
+}
+
+/// Small dyadic values `k / 2^level` with `|k / 2^level| <= 4`, ordered by
+/// magnitude (positive before negative), coarsest first and without repeats
+/// across levels — the alphabet [`NraSolver::dyadic_grid_search`] draws from.
+fn dyadic_grid(level: usize) -> &'static [BigRational] {
+    static GRIDS: std::sync::OnceLock<Vec<Vec<BigRational>>> = std::sync::OnceLock::new();
+    &GRIDS.get_or_init(|| {
+        let mut out: Vec<Vec<BigRational>> = Vec::new();
+        let mut acc: Vec<BigRational> = Vec::new();
+        for level in 0..=GRID_MAX_LEVEL {
+            let den = BigInt::one() << level;
+            let cap = (GRID_ABS_CAP as i64) << level;
+            let mut fresh: Vec<BigRational> = Vec::new();
+            for k in -cap..=cap {
+                let q = BigRational::new(BigInt::from(k), den.clone());
+                if !acc.contains(&q) && !fresh.contains(&q) {
+                    fresh.push(q);
+                }
+            }
+            fresh.sort_by(|a, b| {
+                let (aa, ba) = (a.abs(), b.abs());
+                aa.cmp(&ba).then_with(|| b.cmp(a))
+            });
+            acc.extend(fresh);
+            out.push(acc.clone());
+        }
+        out
+    })[level.min(GRID_MAX_LEVEL)]
 }
 
 /// Lower a bivariate [`MultiPoly`] over `{keep, elim}` to coefficient form in
@@ -2091,6 +2467,61 @@ mod tests {
     }
 
     #[test]
+    fn nice_point_in_open_handles_unbounded_sides() {
+        // `(0, +inf)` — the meti-tarski Skolem shape. `nice_point_in` gives up.
+        let half_open = Interval {
+            lo: Endpoint::Finite(rat(0), false),
+            hi: Endpoint::PosInf,
+        };
+        assert_eq!(nice_point_in(&half_open), None);
+        assert_eq!(nice_point_in_open(&half_open), Some(rat(1)));
+        // `[0, +inf)` — the SOUND relaxation of the same strict bound. The
+        // simplest rational IS 0 here, which is why the ladder must offer more.
+        let half_closed = Interval {
+            lo: Endpoint::Finite(rat(0), true),
+            hi: Endpoint::PosInf,
+        };
+        assert_eq!(nice_point_in_open(&half_closed), Some(rat(0)));
+        assert_eq!(pin_candidate(&half_closed, 1), Some(rat(1)));
+        assert_eq!(pin_candidate(&half_closed, 2), None); // -1 is outside
+
+        // `(-inf, hi]` mirrors, and the doubly-unbounded interval yields 0.
+        let below = Interval {
+            lo: Endpoint::NegInf,
+            hi: Endpoint::Finite(rat(-5), false),
+        };
+        assert_eq!(nice_point_in_open(&below), Some(rat(-6)));
+        let whole = Interval::whole();
+        assert_eq!(nice_point_in_open(&whole), Some(rat(0)));
+        // Every proposal lands inside the interval it was asked about.
+        for iv in [&half_open, &half_closed, &below, &whole] {
+            for k in 0..PIN_VALUE_LADDER {
+                if let Some(p) = pin_candidate(iv, k) {
+                    assert!(interval_contains(iv, &p), "rung {k} escaped its interval");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pin_ladder_is_not_degenerate_on_a_bounded_interval() {
+        // The three-rung ladder collapsed to one value on intervals like this;
+        // the replacement must offer several DISTINCT candidates.
+        let iv = Interval {
+            lo: Endpoint::Finite(rat(0), false),
+            hi: Endpoint::Finite(ratfrac(151, 50), false),
+        };
+        let vals: std::collections::BTreeSet<_> = (0..PIN_VALUE_LADDER)
+            .filter_map(|k| pin_candidate(&iv, k))
+            .collect();
+        assert!(vals.len() >= 4, "ladder collapsed to {vals:?}");
+        assert!(vals.contains(&rat(1)) && vals.contains(&rat(2)));
+        for p in &vals {
+            assert!(interval_contains(&iv, p));
+        }
+    }
+
+    #[test]
     fn invert_interval_positive_and_negative() {
         // 1/[2, 4] = [1/4, 1/2]
         let iv = Interval {
@@ -2237,6 +2668,96 @@ mod tests {
         }
     }
 
+    /// An algebraic certificate over only the parsed constraint subset must
+    /// not authorize SAT while any asserted atom lies outside that subset.
+    #[test]
+    fn icp_algebraic_certificate_refuses_unparsed_atoms() {
+        use ay_core::term::TermStore;
+        use ay_core::Sort;
+        use ay_core::TheorySolver;
+        let mut terms = TermStore::new();
+        let x2 = terms.mk_var("x2", Sort::Real);
+        let x3 = terms.mk_var("x3", Sort::Real);
+        let y3 = terms.mk_var("y3", Sort::Real);
+        let c100 = terms.mk_rational(rat(100));
+        let c64 = terms.mk_rational(rat(64));
+        let c49 = terms.mk_rational(rat(49));
+        let c0 = terms.mk_rational(rat(0));
+        let c1000 = terms.mk_rational(rat(1000));
+        let x2sq = terms.mk_mul(vec![x2, x2]);
+        let x3sq = terms.mk_mul(vec![x3, x3]);
+        let y3sq = terms.mk_mul(vec![y3, y3]);
+        let a1 = terms.mk_eq(x2sq, c100);
+        let s2 = terms.mk_add(vec![x3sq, y3sq]);
+        let a2 = terms.mk_eq(s2, c64);
+        let d = terms.mk_sub(vec![x3, x2]);
+        let dsq = terms.mk_mul(vec![d, d]);
+        let s3 = terms.mk_add(vec![dsq, y3sq]);
+        let a3 = terms.mk_eq(s3, c49);
+        let a4 = terms.mk_gt(y3, c0);
+        // This division is outside the parsed multivariate fragment and false
+        // at the triangle witness (`10 / 5.56` is nowhere near `> 1000`).
+        let quot = terms.mk_div(x2, y3);
+        let a5 = terms.mk_gt(quot, c1000);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(a1, true);
+        solver.assert_literal(a2, true);
+        solver.assert_literal(a3, true);
+        solver.assert_literal(a4, true);
+        solver.assert_literal(a5, true);
+
+        assert!(
+            solver.atom_to_multi(a5, true).is_none(),
+            "x2 / y3 > 1000 must remain outside the multivariate fragment"
+        );
+        assert!(
+            !solver.asserted_fully_parsed(),
+            "the gate must observe the unparsed asserted atom"
+        );
+
+        // Build exactly the parsed subset and deliberately emulate a caller
+        // that incorrectly claims `all_parsed = true`. The choke-point guard,
+        // not caller discipline, must keep the answer fail-closed.
+        let mut constraints: Vec<MultiConstraint> = Vec::new();
+        for &(atom, value) in &solver.asserted {
+            if let Some(MultiAtom::Constraint(c)) = solver.atom_to_multi(atom, value) {
+                constraints.push(c);
+            }
+        }
+        let mut vars: Vec<TermId> = Vec::new();
+        for c in &constraints {
+            for v in c.poly.variables() {
+                if !vars.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        vars.sort_unstable_by_key(|t| t.0);
+        let mut root: VarBox = collect_variable_bounds(&constraints);
+        for &v in &vars {
+            root.entry(v).or_insert_with(Interval::whole);
+        }
+        assert!(
+            !matches!(
+                contract_box(&constraints, &vars, &mut root),
+                Contraction::Refuted
+            ),
+            "the parsed subset alone is satisfiable"
+        );
+
+        let result = solver.branch_and_prune(&constraints, &vars, root, true, false, MAX_BOXES);
+        let got = match result {
+            UniResult::Sat(_) => "Sat",
+            UniResult::SatAlgebraic(_) => "SatAlgebraic",
+            UniResult::Unsat => "Unsat",
+            UniResult::Unknown => "Unknown",
+        };
+        assert_eq!(
+            got, "Unknown",
+            "an algebraic certificate must not ignore an unparsed asserted atom"
+        );
+    }
+
     #[test]
     fn matching_finds_pin_complement() {
         // Two equations over {a, b, c}: eq0 ~ {a, b}, eq1 ~ {b}. A maximum
@@ -2250,5 +2771,175 @@ mod tests {
         assert!(matched.contains(&a));
         assert!(matched.contains(&b));
         assert!(!matched.contains(&c));
+    }
+
+    #[test]
+    fn dyadic_grid_is_cumulative_and_capped() {
+        // Level 0 is the integers in [-4, 4], zero first, positive before its
+        // negation; each finer level ADDS only the new denominators.
+        let l0 = dyadic_grid(0);
+        assert_eq!(
+            l0.iter().map(|q| q.to_string()).collect::<Vec<_>>(),
+            ["0", "1", "-1", "2", "-2", "3", "-3", "4", "-4"]
+        );
+        for level in 0..GRID_MAX_LEVEL {
+            let (a, b) = (dyadic_grid(level), dyadic_grid(level + 1));
+            assert_eq!(
+                &b[..a.len()],
+                a,
+                "level {level} must be a prefix of the next"
+            );
+            assert!(b.len() > a.len(), "level {level} must gain values");
+        }
+        let fine = dyadic_grid(GRID_MAX_LEVEL);
+        let cap = BigRational::from_integer(BigInt::from(GRID_ABS_CAP as i64));
+        assert!(
+            fine.iter().all(|q| q.abs() <= cap),
+            "values stay within the cap"
+        );
+        assert!(
+            fine.iter().all(
+                |q| (q * BigRational::from_integer(BigInt::one() << GRID_MAX_LEVEL)).is_integer()
+            ),
+            "every value is a dyadic with denominator dividing 2^GRID_MAX_LEVEL"
+        );
+        let mut seen = fine.to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), fine.len(), "no value repeats across levels");
+    }
+
+    #[test]
+    fn dyadic_grid_search_finds_a_mixed_coordinate_witness() {
+        // `x*y = 2 ∧ x - y > 0 ∧ y > 0` has the witness (2, 1) — MIXED across
+        // coordinates, so no single rung of the diagonal `pin_candidate` ladder
+        // can name it. The grid must, and the model must verify exactly.
+        use ay_core::term::TermStore;
+        use ay_core::Sort;
+        use ay_core::TheorySolver;
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let y = terms.mk_var("y", Sort::Real);
+        let c0 = terms.mk_rational(rat(0));
+        let c2 = terms.mk_rational(rat(2));
+        let xy = terms.mk_mul(vec![x, y]);
+        let a1 = terms.mk_eq(xy, c2);
+        let diff = terms.mk_sub(vec![x, y]);
+        let a2 = terms.mk_gt(diff, c0);
+        let a3 = terms.mk_gt(y, c0);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(a1, true);
+        solver.assert_literal(a2, true);
+        solver.assert_literal(a3, true);
+
+        let mut constraints: Vec<MultiConstraint> = Vec::new();
+        for &(atom, value) in &solver.asserted {
+            if let Some(MultiAtom::Constraint(c)) = solver.atom_to_multi(atom, value) {
+                constraints.push(c);
+            }
+        }
+        let mut vars: Vec<TermId> = Vec::new();
+        for c in &constraints {
+            for v in c.poly.variables() {
+                if !vars.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        vars.sort_unstable_by_key(|t| t.0);
+        let mut root: VarBox = collect_variable_bounds(&constraints);
+        for &v in &vars {
+            root.entry(v).or_insert_with(Interval::whole);
+        }
+        assert!(!matches!(
+            contract_box(&constraints, &vars, &mut root),
+            Contraction::Refuted
+        ));
+        let model = solver
+            .dyadic_grid_search(&constraints, &vars, &root)
+            .expect("the grid must find a mixed-coordinate rational witness");
+        assert!(
+            solver.verify_model(&model),
+            "the witness must pass the exact substitution gate"
+        );
+        assert_eq!(model.len(), 2);
+    }
+
+    #[test]
+    fn dyadic_grid_search_declines_without_a_witness_and_never_refutes() {
+        // `x*x + y*y = -1` has no real solution. The grid must return `None`
+        // (it has no `Unsat` to return) and must not spend beyond its budget.
+        use ay_core::term::TermStore;
+        use ay_core::Sort;
+        use ay_core::TheorySolver;
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let y = terms.mk_var("y", Sort::Real);
+        let cm1 = terms.mk_rational(rat(-1));
+        let xx = terms.mk_mul(vec![x, x]);
+        let yy = terms.mk_mul(vec![y, y]);
+        let sum = terms.mk_add(vec![xx, yy]);
+        let a1 = terms.mk_eq(sum, cm1);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(a1, true);
+        let mut constraints: Vec<MultiConstraint> = Vec::new();
+        for &(atom, value) in &solver.asserted {
+            if let Some(MultiAtom::Constraint(c)) = solver.atom_to_multi(atom, value) {
+                constraints.push(c);
+            }
+        }
+        let vars: Vec<TermId> = vec![x, y];
+        let mut root: VarBox = VarBox::default();
+        for &v in &vars {
+            root.insert(v, Interval::whole());
+        }
+        let before = solver.grid_budget.get();
+        assert!(solver
+            .dyadic_grid_search(&constraints, &vars, &root)
+            .is_none());
+        assert!(
+            solver.grid_budget.get() < before,
+            "the sweep must charge its solve-wide budget"
+        );
+        assert!(before - solver.grid_budget.get() <= GRID_MAX_NODES);
+    }
+
+    #[test]
+    fn dyadic_grid_search_declines_above_the_variable_cap() {
+        use ay_core::term::TermStore;
+        use ay_core::Sort;
+        use ay_core::TheorySolver;
+        let mut terms = TermStore::new();
+        let vs: Vec<TermId> = (0..=GRID_MAX_VARS)
+            .map(|i| terms.mk_var(&format!("v{i}"), Sort::Real))
+            .collect();
+        let c1 = terms.mk_rational(rat(1));
+        let prod = terms.mk_mul(vs.clone());
+        let a1 = terms.mk_eq(prod, c1);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(a1, true);
+        let mut constraints: Vec<MultiConstraint> = Vec::new();
+        for &(atom, value) in &solver.asserted {
+            if let Some(MultiAtom::Constraint(c)) = solver.atom_to_multi(atom, value) {
+                constraints.push(c);
+            }
+        }
+        let mut root: VarBox = VarBox::default();
+        for &v in &vs {
+            root.insert(v, Interval::whole());
+        }
+        let before = solver.grid_budget.get();
+        assert!(
+            solver
+                .dyadic_grid_search(&constraints, &vs, &root)
+                .is_none(),
+            "{}+ variables must be declined outright",
+            GRID_MAX_VARS + 1
+        );
+        assert_eq!(
+            solver.grid_budget.get(),
+            before,
+            "a declined call must cost nothing"
+        );
     }
 }

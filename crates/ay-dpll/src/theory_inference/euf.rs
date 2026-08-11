@@ -165,6 +165,17 @@ fn infer_euf_transitive(
     let conclusion_eq = conclusion_eq?;
     let (lhs, rhs) = decode_eq(terms, conclusion_eq)?;
 
+    // Reflexive conclusion: the refuted disequality relates a term to ITSELF,
+    // so there is no chain to walk and nothing for transitivity to say. The
+    // BFS below would terminate at once, leave `chain_eqs` empty and build a
+    // ONE-literal `eq_transitive` clause — a shape the strict checker rejects
+    // outright, turning a correct refutation into an uncertifiable one and,
+    // under mandatory certification, into `unknown`. `eq_reflexive` states
+    // exactly this conflict and its clause is legitimately a unit.
+    if lhs == rhs {
+        return Some((TheoryLemmaKind::EufReflexive, vec![conclusion_eq]));
+    }
+
     // Build adjacency: term -> neighbors with the equality term that connects them.
     let mut adj: HashMap<TermId, Vec<(TermId, TermId)>> = HashMap::default();
     for &eq_term in &premise_eqs {

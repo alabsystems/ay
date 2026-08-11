@@ -35,6 +35,32 @@ use super::NiaSolver;
 const MAX_REFINEMENT_MODEL_BITS: u64 = 4096;
 
 impl NiaSolver<'_> {
+    /// Last-resort SAT-only lane: clausal local search over the ORIGINAL
+    /// assertion formulas (`#nia-clausal-sls`, see `local_search.rs`).
+    ///
+    /// Runs only where every box-shaped fallback has already declined —
+    /// bounded enumeration, capped window search, model repair and factor split
+    /// all need a finite box, and the dominant QF_NIA loss shape (VeryMax /
+    /// AProVE termination VCs) has none. Local search cannot refute, so this
+    /// can only turn `unknown` into an exactly-verified `sat`; it never returns
+    /// `Unsat` and never bumps `conflict_count`.
+    fn try_local_search_lane(&mut self) -> Option<TheoryResult> {
+        let start = ay_core::time::Instant::now();
+        let result = self.try_clausal_local_search();
+        self.timings.enumeration += start.elapsed();
+        debug_assert!(
+            !matches!(result, Some(TheoryResult::Unsat(_))),
+            "clausal local search must never refute"
+        );
+        if let Some(TheoryResult::Sat) = result {
+            if self.debug {
+                safe_eprintln!("[NIA] Clausal local search decided: Sat");
+            }
+            return result;
+        }
+        None
+    }
+
     /// True when any model value the refinement escalation would derive cuts
     /// from (monomial factor/aux vars, division-purification vars) exceeds
     /// [`MAX_REFINEMENT_MODEL_BITS`] (#nia-gomory-cap). O(#vars) bit-length
@@ -927,6 +953,9 @@ impl NiaSolver<'_> {
                                     }
                                     return result;
                                 }
+                                if let Some(result) = self.try_local_search_lane() {
+                                    return result;
+                                }
                             }
                             return TheoryResult::Unknown;
                         }
@@ -958,6 +987,9 @@ impl NiaSolver<'_> {
                                 .or_else(|| self.try_model_repair_search());
                             self.timings.enumeration += enum_start.elapsed();
                             if let Some(result) = fallback {
+                                return result;
+                            }
+                            if let Some(result) = self.try_local_search_lane() {
                                 return result;
                             }
                             return TheoryResult::Unknown;
@@ -1160,6 +1192,9 @@ impl NiaSolver<'_> {
                             }
                             return result;
                         }
+                        if let Some(result) = self.try_local_search_lane() {
+                            return result;
+                        }
                         return TheoryResult::Unknown;
                     }
 
@@ -1282,6 +1317,9 @@ impl NiaSolver<'_> {
                                     result
                                 );
                             }
+                            return result;
+                        }
+                        if let Some(result) = self.try_local_search_lane() {
                             return result;
                         }
                         return TheoryResult::Unknown;

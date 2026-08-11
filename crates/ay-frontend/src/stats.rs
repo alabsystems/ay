@@ -42,6 +42,7 @@ impl FormulaStats {
         self.commands += 1;
         match command {
             Command::DeclareSort(name, _) => self.bump_sort(name),
+            Command::DeclareSortParameter(_) => {}
             Command::DefineSort(_, _, sort) => self.collect_sort(sort),
             Command::DeclareDatatype(_, dt) => {
                 self.bump_theory("datatypes");
@@ -91,6 +92,8 @@ impl FormulaStats {
             | Command::Maximize(term)
             | Command::Minimize(term)
             | Command::Eval(term)
+            | Command::Display(term, _)
+            | Command::DebugSet(_, term, _)
             | Command::Simplify(term) => self.collect_term(term),
             Command::CheckSatAssuming(terms) => {
                 for t in terms {
@@ -328,6 +331,7 @@ fn classify_operator(function: &str) -> &'static str {
     if matches!(
         function,
         "+" | "-"
+            | "~"
             | "*"
             | "/"
             | "div"
@@ -340,6 +344,11 @@ fn classify_operator(function: &str) -> &'static str {
             | "to_real"
             | "to_int"
             | "is_int"
+            | "at-most"
+            | "at-least"
+            | "pble"
+            | "pbge"
+            | "pbeq"
     ) {
         return "arith";
     }

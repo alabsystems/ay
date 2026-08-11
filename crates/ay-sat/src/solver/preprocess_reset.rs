@@ -551,10 +551,12 @@ impl Solver {
                 for (ordinal, clause) in self.cold.original_ledger.iter_clauses().enumerate() {
                     let idx = self.arena.add(clause, false);
                     // Assign clause ID unconditionally (#8197, #8069 Phase 2a).
-                    if idx >= self.cold.clause_ids.len() {
-                        self.cold.clause_ids.resize(idx + 1, 0);
+                    if !self.cold.clause_ids_disabled {
+                        if idx >= self.cold.clause_ids.len() {
+                            self.cold.clause_ids.resize(idx + 1, 0);
+                        }
+                        self.cold.clause_ids[idx] = (ordinal as u64) + 1;
                     }
-                    self.cold.clause_ids[idx] = (ordinal as u64) + 1;
                 }
                 // #8375: Re-add preserved learned clauses after rebuilding
                 // originals from ledger.
@@ -586,10 +588,12 @@ impl Solver {
                     let clause = self.cold.original_ledger.clause(clause_idx);
                     let idx = self.arena.add(clause, false);
                     // Assign clause ID unconditionally (#8197, #8069 Phase 2a).
-                    if idx >= self.cold.clause_ids.len() {
-                        self.cold.clause_ids.resize(idx + 1, 0);
+                    if !self.cold.clause_ids_disabled {
+                        if idx >= self.cold.clause_ids.len() {
+                            self.cold.clause_ids.resize(idx + 1, 0);
+                        }
+                        self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
                     }
-                    self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
 
                     // Subsumption scheduling (#8376): mark variables in new
                     // original clauses as subsume-dirty so the next subsumption
@@ -796,6 +800,7 @@ impl Solver {
         self.wander_abort_base_conflicts = 0;
         self.wander_abort_base_decisions = 0;
         self.num_propagations = 0;
+        self.num_search_propagations = 0;
         self.num_original_clauses = 0;
         // (#8435) Lower the reduce_db threshold for incremental mode so that
         // reduce_db fires within short IC3 queries. After enough incremental
@@ -1138,6 +1143,7 @@ impl Solver {
             self.num_decisions = 0;
             self.wander_abort_base_decisions = 0;
             self.num_propagations = 0;
+            self.num_search_propagations = 0;
             self.conflicts_since_restart = 0;
             self.no_conflict_until = 0;
             self.cold.process_memory_interrupt = false;
@@ -1255,6 +1261,7 @@ impl Solver {
         self.wander_abort_base_conflicts = 0;
         self.wander_abort_base_decisions = 0;
         self.num_propagations = 0;
+        self.num_search_propagations = 0;
         self.num_original_clauses = 0;
         self.cold.next_reduce_db =
             if self.cold.incremental_solve_count >= INCREMENTAL_REDUCE_DB_RAMP {
@@ -1404,10 +1411,12 @@ impl Solver {
                 }
                 // Add to arena even though it's unit (for consistency).
                 let idx = self.arena.add(&clause, false);
-                if idx >= self.cold.clause_ids.len() {
-                    self.cold.clause_ids.resize(idx + 1, 0);
+                if !self.cold.clause_ids_disabled {
+                    if idx >= self.cold.clause_ids.len() {
+                        self.cold.clause_ids.resize(idx + 1, 0);
+                    }
+                    self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
                 }
-                self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
                 continue;
             }
 
@@ -1425,10 +1434,12 @@ impl Solver {
             // are false, record a level-0 conflict.
             let clause_len = clause.len();
             let idx = self.arena.add(&clause, false);
-            if idx >= self.cold.clause_ids.len() {
-                self.cold.clause_ids.resize(idx + 1, 0);
+            if !self.cold.clause_ids_disabled {
+                if idx >= self.cold.clause_ids.len() {
+                    self.cold.clause_ids.resize(idx + 1, 0);
+                }
+                self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
             }
-            self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
 
             if clause_len >= 2 {
                 // Reorder literals in the arena to place non-false literals

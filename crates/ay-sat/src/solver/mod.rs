@@ -120,6 +120,10 @@ impl SolverContext for Solver {
         &self.trail
     }
 
+    fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
     fn conflicts(&self) -> u64 {
         self.num_conflicts
     }

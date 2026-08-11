@@ -27,13 +27,90 @@ impl Solver {
         Self::build(num_vars, Some(proof_output))
     }
 
+    /// Create a solver that also knows how many clauses are coming.
+    ///
+    /// Without the hint the clause arena is pre-sized from `num_vars` alone —
+    /// `num_vars * 4` clauses of 3 literals each — which is guesswork the DIMACS
+    /// loaders do not need to do: they have parsed the header before they
+    /// construct the solver. On the SAT-COMP 2026 reference instance
+    /// (6 737 543 vars / 18 002 239 clauses) the guess reserves 27 M clauses and
+    /// 80.9 M literals against a real 18 M and ~54 M, and on a variable-heavy
+    /// formula it over-reserves by far more.
+    ///
+    /// The hint is advisory: the arena grows normally if it turns out low.
+    pub fn with_clause_hint(num_vars: usize, num_clauses: usize) -> Self {
+        Self::build_with_hint(num_vars, None, Some(num_clauses))
+    }
+
     /// Shared constructor: all Solver initialization in one place.
     fn build(num_vars: usize, proof_output: Option<ProofOutput>) -> Self {
+        Self::build_with_hint(num_vars, proof_output, None)
+    }
+
+    fn build_with_hint(
+        num_vars: usize,
+        proof_output: Option<ProofOutput>,
+        clause_hint: Option<usize>,
+    ) -> Self {
         let has_proof = proof_output.is_some();
         let lrat_enabled = proof_output.as_ref().is_some_and(ProofOutput::is_lrat);
         // Removed 100k cap for BV performance (#757) - BV CNF has ~3-5 clauses/var
-        let clauses_capacity = num_vars.saturating_mul(4);
+        let clauses_capacity = match clause_hint {
+            // Trust the header, with a little slack for clauses preprocessing
+            // adds, but never reserve more than the num_vars-derived guess would
+            // have: this may only shrink the reservation, never grow it.
+            Some(n) => n
+                .saturating_add(n / 8)
+                .min(num_vars.saturating_mul(4))
+                .max(1),
+            None => num_vars.saturating_mul(4),
+        };
         let literals_capacity = clauses_capacity.saturating_mul(3); // avg 3 lits/clause
+                                                                    // `AY_SAT_MEM_PROBE=1`: attribute construction memory per sub-structure.
+                                                                    //
+                                                                    // AY pays ~849 resident bytes per variable before it has seen a clause —
+                                                                    // a two-clause CNF that merely mentions variable 6737543 costs 5.72 GB,
+                                                                    // and that tax costs 17 instances of the official SAT-COMP 2026 set
+                                                                    // outright. Static attribution only reaches ~169 B/var, so this builds
+                                                                    // each num_vars-sized sub-structure standalone and reports what it
+                                                                    // actually commits. Diagnostic only: the probes are dropped immediately
+                                                                    // and nothing here runs without the env var.
+        if std::env::var_os("AY_SAT_MEM_PROBE").is_some() {
+            let mut last = ay_sys::current_footprint_bytes();
+            let mut step = |label: &str, live: &mut usize| {
+                let now = ay_sys::current_footprint_bytes();
+                let delta = now.saturating_sub(*live);
+                eprintln!(
+                    "c mem_probe {label:<26} {:>10.1} MB  {:>7.1} B/var",
+                    delta as f64 / 1e6,
+                    delta as f64 / num_vars.max(1) as f64,
+                );
+                *live = now;
+            };
+            let a = ClauseArena::with_capacity(clauses_capacity, literals_capacity);
+            step("ClauseArena::with_capacity", &mut last);
+            let w = WatchedLists::new(num_vars);
+            step("WatchedLists::new", &mut last);
+            let v = VSIDS::new(num_vars);
+            step("VSIDS::new", &mut last);
+            let c = ConflictAnalyzer::new(num_vars);
+            step("ConflictAnalyzer::new", &mut last);
+            let i = inproc_engines::InprocessingEngines::new(num_vars);
+            step("InprocessingEngines::new", &mut last);
+            let l = lifecycle::VarLifecycle::new(num_vars);
+            step("VarLifecycle::new", &mut last);
+            let m = LitMarks::new(num_vars);
+            step("LitMarks::new", &mut last);
+            let mn = minimization_state::MinimizationState::new(num_vars);
+            step("MinimizationState::new", &mut last);
+            let p = phase_init_state::PhaseInitState::new(num_vars);
+            step("PhaseInitState::new", &mut last);
+            // (ConflictProcessorOutput is behind the `jit` feature and measured
+            // 0.0 B/var, so it is not probed here — referencing `ay_jit`
+            // unconditionally breaks any build without that feature.)
+            drop((a, w, v, c, i, l, m, mn, p));
+        }
+
         #[allow(unused_mut)]
         let mut solver = Self {
             num_vars,
@@ -57,14 +134,22 @@ impl Solver {
             unit_proof_id: vec![0; num_vars],
             unit_proof_sign: vec![0; num_vars],
             pending_theory_unit_proof_ids: Vec::new(),
-            // Pre-size to arena capacity for ensure_reason_clause_marks_current()
-            // lazy rebuild (#8569). BCP no longer calls mark_reason_clause().
-            // Arena word count = clauses * HEADER_WORDS + literals.
-            reason_clause_marks: vec![
-                0;
-                clauses_capacity * crate::clause_arena::HEADER_WORDS
-                    + literals_capacity
-            ],
+            // Grown on demand, never pre-sized. This used to be
+            // `vec![0; clauses_capacity * HEADER_WORDS + literals_capacity]`,
+            // and since both capacities are derived from `num_vars` alone
+            // (`num_vars * 4` clauses, `* 3` literals each) rather than from the
+            // formula's actual size, it committed `num_vars * 24` ZEROED bytes
+            // before a single clause was read: 647 MB on a 6.7 M-variable
+            // SAT-COMP 2026 instance whose real arena is 380 MB, and it is
+            // resident immediately because `vec![0; n]` writes.
+            //
+            // Nothing needed it eagerly. Every access site already handles a
+            // short vector: `mark_reason_clause` falls into
+            // `mark_reason_clause_cold`, which resizes; `refresh_reason_clause_marks`
+            // resizes to `arena.len()`; and the conditioning reader is
+            // bounds-checked. Instances that never reach inprocessing now never
+            // allocate it at all.
+            reason_clause_marks: Vec::new(),
             reason_clause_epoch: 1,
             reason_marks_invalidated: false,
             trail: Vec::new(),
@@ -104,6 +189,7 @@ impl Solver {
             vivify_analyzed: vec![false; num_vars],
             vivify_analyzed_to_clear: Vec::with_capacity(64),
             num_propagations: 0,
+            num_search_propagations: 0,
             pending_garbage_count: 0,
             inproc_ctrl: if has_proof {
                 inproc_control::InprocessingControls::new().with_proof_overrides(lrat_enabled)

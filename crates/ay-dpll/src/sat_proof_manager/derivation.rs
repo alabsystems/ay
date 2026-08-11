@@ -10,7 +10,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::term::TermData;
+use ay_core::term::{Constant, TermData};
 use ay_core::{
     AletheRule, ClausificationProof, Proof, ProofId, ProofStep, TermId, TermStore, TheoryLemmaKind,
     TheoryLemmaProof,
@@ -29,6 +29,64 @@ pub(super) type SatClauseVersion = (Vec<Literal>, ProofId);
 /// scan is skipped (the per-derivation cost is O(entries x propagations)) and
 /// failed replays fall back to pairwise resolution / Trust as before.
 const MAX_RUP_WIDENING_VERSIONS: usize = 100_000;
+
+/// Census of why level-0 RUP empty-clause replay declined (#rup-fallback-census).
+///
+/// Every decline sends the whole refutation to `derive_empty_via_trust_lemma`,
+/// which closes it with ONE trust lemma over the entire negated conflict clause.
+/// That lemma is the single largest source of strict-certification rejections:
+/// `unverified trust rule` (43) plus `unsupported theory lemma kind Generic`
+/// (31) are 74 of the 107 rejections in `ay-dpll --lib`, and the discharge
+/// rescues cannot help because discharging that clause IS re-proving the
+/// problem. See the development design notes.
+///
+/// The replay has three distinct decline paths and no one had measured which
+/// fires, so the fix was never aimed at anything. Set `AY_RUP_FALLBACK_TRACE=1`
+/// and bucket stderr over one `ay-dpll --lib` run to find out.
+///
+/// Diagnostic only: no verdict, proof shape, or control flow depends on this.
+/// MEASURED 2026-08-04 over one `ay-dpll --lib` run:
+///
+/// ```text
+/// 3042  replay-error:RupNoConflict
+///    4  oversized-database
+///    1  no-clause-versions
+/// ```
+///
+/// So it is ONE cause: unit propagation over the assembled clause database
+/// never reaches a conflict. Not the budget, not the literal mapping, not
+/// residual literals. `derive_empty_via_level0_rup`'s own doc names the likely
+/// reason — the extension propagator can detect a level-0 THEORY conflict and
+/// declare UNSAT directly, so the certified conflict lemma lands in the proof
+/// tracker but its clause never reaches the SAT trace. Including recorded
+/// `TheoryLemma` steps in the replay database is the existing mitigation for
+/// exactly that, and this census says it is not covering every case.
+///
+/// Level 3 (skipped=/mapped= plus the variant's own fields) over 3037 declines:
+///
+/// ```text
+/// skipped=0            2989   lemmas are NOT dropped by mapping
+/// propagations: 0        30   propagation does run in almost every case
+/// usable_hint_count<=3 2306   the database is 1-3 clauses
+/// mapped=2             1838
+/// ```
+///
+/// That refutes the obvious hypothesis (lemmas skipped for unmappable literals):
+/// 98% of declines skip nothing, propagation runs, and there is simply almost
+/// nothing to propagate over. The gap is UPSTREAM of both the mapping and the
+/// replay — `clause_versions` arrives essentially empty.
+///
+/// Next step: look at what populates `clause_versions` on the level-0
+/// theory-conflict exit. The replay and the lemma mapping are both measured and
+/// cleared.
+///
+/// `reason` is a closure so the `Err` arm does not format on the hot fallback
+/// path when tracing is off.
+fn rup_fallback_trace(reason: impl FnOnce() -> String) {
+    if std::env::var("AY_RUP_FALLBACK_TRACE").is_ok_and(|v| v == "1") {
+        eprintln!("[rup-fallback] {}", reason());
+    }
+}
 
 /// Cap on how many literals a recorded theory lemma may have beyond the
 /// traced (level-0-minimized) clause for the superset bridge (#rank-4
@@ -350,24 +408,43 @@ impl SatProofManager<'_> {
             // mandate an exact literal ORDER (e.g. or_pos is
             // `(cl (not (or a b c)) a b c)` — disjuncts in the or's own
             // order). Rebuild the spec-shaped clause from the annotation's
-            // source term; fall back to the traced order only when the
-            // traced clause isn't dedup-equal to the spec shape.
-            let step_clause =
+            // source term only when the traced clause is dedup-equal to it.
+            if let Some(step_clause) =
                 Self::canonicalize_tautology_clause(terms, &annot.rule, annot.source_term, clause)
-                    .unwrap_or_else(|| clause.to_vec());
-            let id = proof.add_rule_step(
-                annot.rule.clone(),
-                step_clause,
-                Vec::new(),
-                vec![annot.source_term],
-            );
-            existing_clause_map.insert(key, id);
-            return id;
+            {
+                let id = proof.add_rule_step(
+                    annot.rule.clone(),
+                    step_clause,
+                    Vec::new(),
+                    vec![annot.source_term],
+                );
+                existing_clause_map.insert(key, id);
+                return id;
+            }
+            // A content mismatch means the annotation is not authority for
+            // this clause. Fall through to the ordinary provenance path; a
+            // generated clause then fails closed instead of shipping a
+            // structurally invalid Boolean rule with a stale label.
         }
 
         // Check for theory lemma annotation (#6031 Phase 4). When present,
         // emit a TheoryLemma proof step with the proper Alethe rule.
         if let Some(theory_annot) = theory_annotation {
+            let Some(theory_annot) = Self::rebind_theory_annotation(theory_annot, clause) else {
+                // An indexed annotation that cannot be reconciled with this
+                // traced clause must not be emitted positionally. Keep the
+                // ordinary assumption path; later provenance validation will
+                // demote a generated clause and fail closed if no derivation
+                // exists.
+                return Self::add_original_clause_step(
+                    terms,
+                    proof,
+                    clause,
+                    existing_clause_map,
+                    None,
+                    None,
+                );
+            };
             let id = if let Some(lia) = theory_annot.lia.clone() {
                 proof.add_theory_lemma_with_lia(
                     "theory",
@@ -408,7 +485,12 @@ impl SatProofManager<'_> {
             return id;
         } else {
             // Multi-literal: assume the disjunction, then decompose via `or` rule.
-            let or_term = terms.mk_or(clause.to_vec());
+            // This is proof syntax, not a solver-side Boolean construction.
+            // `mk_or` simplifies (and may flatten, deduplicate, absorb, or
+            // collapse to `true`), which would make the assumed term's
+            // children differ from the conclusion of the following Alethe
+            // `or` step. Preserve the traced clause exactly.
+            let or_term = terms.mk_app(ay_core::Symbol::named("or"), clause, ay_core::Sort::Bool);
             let assume_id = proof.add_assume(or_term, None);
             proof.add_rule_step(AletheRule::Or, clause.to_vec(), vec![assume_id], Vec::new())
         };
@@ -438,6 +520,22 @@ impl SatProofManager<'_> {
     ///   equiv_neg1: (cl (= a b) a b)              equiv_neg2: (cl (= a b) (not a) (not b))
     ///   ite_pos1: (cl (not (ite c t e)) c e)      ite_pos2: (cl (not (ite c t e)) (not c) t)
     ///   ite_neg1: (cl (ite c t e) c (not e))      ite_neg2: (cl (ite c t e) (not c) (not t))
+    ///   true:  (cl true)                          false: (cl (not false))
+    ///
+    /// #boolconst-annotation-cliff — the `true`/`false` arms are NOT optional
+    /// decoration. The Tseitin encoder registers a term-backed variable for each
+    /// Bool constant and annotates its forcing unit with these rules
+    /// (`encode_inner`, 807ffb8f). A whole assertion that PREPROCESSING folded to
+    /// `false` is exactly that constant, so its refutation is
+    /// `assume false` + `(cl (not false)) :rule false` + resolution — the
+    /// fold-to-`false` collapse shape that `try_rebuild_false_collapse` keys on
+    /// to re-prove the contradiction from the ORIGINAL assertion (`la_generic`
+    /// for a cancelling linear conjunct, `cong` for an EUF-congruence collapse).
+    /// Returning `None` here drops the annotation, so the unit falls through to
+    /// the anonymous-`assume` path, `demote_non_problem_assumptions` rewrites it
+    /// to a premiseless `trust`, and the collapse shape is no longer recognizable
+    /// — every specialized rebuild silently declines and the refutation publishes
+    /// as an unattributed `hole` (or is rejected outright as a trust step).
     fn canonicalize_tautology_clause(
         terms: &mut TermStore,
         rule: &AletheRule,
@@ -597,6 +695,22 @@ impl SatProofManager<'_> {
                         vec![source, nc, nt]
                     }
                 }
+            }
+            // Bool-const forcing units from the Tseitin encoder. The source term
+            // must BE the matching constant — an annotation naming any other
+            // term is not authority for these rules, and admitting it would
+            // label a non-tautological unit `:rule true`/`:rule false`.
+            AletheRule::True => {
+                if !matches!(terms.get(source), TermData::Const(Constant::Bool(true))) {
+                    return None;
+                }
+                vec![source]
+            }
+            AletheRule::False => {
+                if !matches!(terms.get(source), TermData::Const(Constant::Bool(false))) {
+                    return None;
+                }
+                vec![not_source]
             }
             _ => return None,
         };
@@ -1626,6 +1740,13 @@ impl SatProofManager<'_> {
         proof: &mut Proof,
     ) -> Option<ProofId> {
         if clause_versions.is_empty() || clause_versions.len() > MAX_RUP_WIDENING_VERSIONS {
+            rup_fallback_trace(|| {
+                if clause_versions.is_empty() {
+                    "no-clause-versions".to_string()
+                } else {
+                    "oversized-database".to_string()
+                }
+            });
             return None;
         }
 
@@ -1636,6 +1757,11 @@ impl SatProofManager<'_> {
         for (&var, &term) in self.var_to_term.iter() {
             atom_to_var.insert(term, var);
         }
+        // #rup-fallback-census, level 3. Lemmas whose literals do not round-trip
+        // through `lit_to_term` are skipped, not guessed -- and a skipped lemma
+        // is a clause missing from the replay database, the leading candidate
+        // for the `RupNoConflict` that dominates the census.
+        let mut skipped_lemmas = 0usize;
         let lemma_steps: Vec<(ProofId, Vec<TermId>)> = proof
             .steps
             .iter()
@@ -1700,6 +1826,8 @@ impl SatProofManager<'_> {
             }
             if mapped {
                 versions.push((sat_clause, proof_id));
+            } else {
+                skipped_lemmas += 1;
             }
         }
 
@@ -1731,6 +1859,9 @@ impl SatProofManager<'_> {
                     derived_sat.is_empty(),
                     "BUG: empty-target RUP replay returned a non-empty clause"
                 );
+                if !derived_sat.is_empty() {
+                    rup_fallback_trace(|| "residual-literals".to_string());
+                }
                 derived_sat.is_empty().then_some(proof_id)
             }
             Err(error) => {
@@ -1739,6 +1870,12 @@ impl SatProofManager<'_> {
                     versions = versions.len(),
                     "level-0 RUP empty-clause replay failed; falling back"
                 );
+                rup_fallback_trace(|| {
+                    format!(
+                        "replay-error:{error:?} skipped={skipped_lemmas} mapped={}",
+                        versions.len()
+                    )
+                });
                 None
             }
         }
@@ -2361,6 +2498,83 @@ impl SatProofManager<'_> {
 
             if !made_progress {
                 break;
+            }
+        }
+
+        // Closure-search introspection (`AY_PROOF_INTROSPECT_PROBE=<path>`).
+        //
+        // The loop above is GREEDY: every step must strictly reduce the mismatch
+        // count. With tens of thousands of candidate clauses that can stall even
+        // when a resolution path to the target exists, so a greedy failure does
+        // NOT prove the target is unreachable. On failure this probe re-searches
+        // allowing PLATEAU moves (mismatch may stay equal) with a visited set and
+        // a hard step bound, and reports whether the target becomes reachable.
+        // It emits no proof steps and cannot change any verdict.
+        let probe_dump = if Self::clauses_equivalent(&current_clause, target_clause) {
+            None
+        } else {
+            std::env::var_os("AY_PROOF_INTROSPECT_PROBE")
+        };
+        if let Some(dump) = probe_dump {
+            const PROBE_MAX_STEPS: usize = 4000;
+            let all_ids: Vec<u64> = clause_terms.keys().copied().collect();
+            let mut probe = current_clause.clone();
+            let mut probe_mismatch = mismatch_count(&probe, &target_set);
+            let mut visited: HashSet<Vec<TermId>> = HashSet::default();
+            visited.insert(Self::normalize_clause(&probe));
+            let mut steps = 0usize;
+            let mut plateau_moves = 0usize;
+            while probe_mismatch > 0 && steps < PROBE_MAX_STEPS {
+                let mut advanced = false;
+                for &cid in &all_ids {
+                    if steps >= PROBE_MAX_STEPS {
+                        break;
+                    }
+                    let Some(rhs) = clause_terms.get(&cid) else {
+                        continue;
+                    };
+                    let Some((_pivot, res)) = self.resolve_once(&probe, rhs) else {
+                        continue;
+                    };
+                    steps += 1;
+                    let m = mismatch_count(&res, &target_set);
+                    if m > probe_mismatch {
+                        continue;
+                    }
+                    let key = Self::normalize_clause(&res);
+                    if !visited.insert(key) {
+                        continue;
+                    }
+                    if m == probe_mismatch {
+                        plateau_moves += 1;
+                    }
+                    probe = res;
+                    probe_mismatch = m;
+                    advanced = true;
+                    break;
+                }
+                if !advanced {
+                    break;
+                }
+            }
+            use std::io::Write as _;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&dump)
+            {
+                let line = format!(
+                    "CLOSURE_PROBE candidates={} start_mismatch={} final_mismatch={} \
+reachable_with_plateau={} plateau_moves={} steps={} hit_step_cap={}\n",
+                    all_ids.len(),
+                    mismatch_count(&current_clause, &target_set),
+                    probe_mismatch,
+                    probe_mismatch == 0,
+                    plateau_moves,
+                    steps,
+                    steps >= PROBE_MAX_STEPS,
+                );
+                let _ = fh.write_all(line.as_bytes());
             }
         }
 

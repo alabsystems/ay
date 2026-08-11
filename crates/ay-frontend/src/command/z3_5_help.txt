@@ -1,0 +1,457 @@
+" (apply <tactic> (<keyword> <value>)*)
+    apply the given tactic to the current context, and print the resultant set of goals.
+    The following options are available:
+      max_memory (unsigned int) (default: infty) maximum amount of memory in megabytes. (default: 4294967295)
+      print (bool) (default: true) print resultant goals.
+      print_benchmark (bool) (default: false) display resultant goals as a SMT2 benchmark.
+      print_dependencies (bool) (default: false) print dependencies when displaying the resultant set of goals.
+      print_model_converter (bool) (default: false) print model converter.
+      print_statistics (bool) (default: false) print statistics.
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+ (assert <term>)
+    assert term.
+ (assert-not <term>)
+    assert negation
+ (assert-soft <formula> [:weight <rational-weight>] [:id <symbol>])
+    assert soft constraint with optional weight and identifier
+    The following options are available:
+      id (symbol) (default: null) partition identifier for soft constraints.
+      weight (rational) (default: 1) penalty of not satisfying constraint.
+ (assume <expr>+)
+    proof command for adding assumption (input assertion)
+ (check-sat <boolean-constants>*)
+    check if the current context is satisfiable. If a list of boolean constants B is provided, then check if the current context is consistent with assigning every constant in B to true.
+ (check-sat-assuming ( hprop_literali* ))
+    check sat assuming a collection of literals
+ (check-sat-using <tactic> (<keyword> <value>)*)
+    check if the current context is satisfiable using the given tactic, use (help-tactic) for the tactic language syntax.
+    The following options are available:
+      max_memory (unsigned int) (default: infty) maximum amount of memory in megabytes. (default: 4294967295)
+      print_model (bool) (default: false) print model.
+      print_proof (bool) (default: false) print proof.
+      print_statistics (bool) (default: false) print statistics.
+      print_unsat_core (bool) (default: false) print unsatisfiable core.
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+ (dbg-bool-flat-rewriter <term>)
+    apply the Boolean (flattening) rewriter to the given term
+ (dbg-bool-rewriter <term>)
+    apply the Boolean rewriter to the given term
+ (dbg-elim-and <term>)
+    apply the Boolean rewriter (eliminating AND operator and flattening) to the given term
+ (dbg-elim-unused-vars <expr>)
+    eliminate unused vars from a quantifier
+ (dbg-get-qbody <symbol> <quantifier>)
+    store the body of the quantifier in the global variable <symbol>
+ (dbg-instantiate <quantifier> (<symbol>*))
+    instantiate the quantifier using the given expressions.
+ (dbg-instantiate-nested <quantifier> (<symbol>*))
+    instantiate the quantifier nested in the outermost quantifier, this command is used to test the instantiation procedure with quantifiers that contain free variables.
+ (dbg-lt <term> <term>)
+    return true if the first term is smaller than the second one in the internal Z3 total order on terms.
+ (dbg-params)
+    test parameters
+ (dbg-pp-var <symbol>)
+    pretty print a global variable that references an AST
+ (dbg-set <symbol> <term>)
+    store <term> in the global variable <symbol>
+ (dbg-set-next-id <unsigned>)
+    set the next expression id to be at least the given value
+ (dbg-sexpr <sexpr>)
+    display an s-expr
+ (dbg-shift-vars <symbol> <uint>)
+    shift the free variables by <uint> in the term referenced by the global variable <symbol>, the result is stored in <symbol>
+ (dbg-size <term>)
+    return the size of the given term
+ (dbg-some-value <sort>)
+    retrieve some value of the given sort
+ (dbg-subst <symbol> (<symbol>*) <symbol>)
+    substitute the free variables in the AST referenced by <symbol> using the ASTs referenced by <symbol>*
+ (dbg-th-rewriter <term> (<keyword> <value>)*)
+    simplify the given term using builtin theory simplification rules.
+    The following options are available:
+      algebraic_number_evaluator (bool) simplify/evaluate expressions containing (algebraic) irrational numbers. (default: true)
+      arith_ineq_lhs (bool) rewrite inequalities so that right-hand-side is a constant. (default: false)
+      arith_lhs (bool) all monomials are moved to the left-hand-side, and the right-hand-side is just a constant. (default: false)
+      bit2bool (bool) try to convert bit-vector terms of size 1 into Boolean terms (default: true)
+      blast_distinct (bool) expand a distinct predicate into a quadratic number of disequalities (default: false)
+      blast_distinct_threshold (unsigned int) when blast_distinct is true, only distinct expressions with less than this number of arguments are blasted (default: 4294967295)
+      blast_eq_value (bool) blast (some) Bit-vector equalities into bits (default: false)
+      blast_select_store (bool) eagerly replace all (select (store ..) ..) term by an if-then-else term (default: false)
+      bv_extract_prop (bool) attempt to partially propagate extraction inwards (default: false)
+      bv_ineq_consistency_test_max (unsigned int) max size of conjunctions on which to perform consistency test based on inequalities on bitvectors. (default: 0)
+      bv_ite2id (bool) rewrite ite that can be simplified to identity (default: false)
+      bv_le2extract (bool) disassemble bvule to extract (default: true)
+      bv_le_extra (bool) additional bu_(u/s)le simplifications (default: false)
+      bv_not_simpl (bool) apply simplifications for bvnot (default: false)
+      bv_sort_ac (bool) sort the arguments of all AC operators (default: true)
+      cache_all (bool) cache all intermediate results. (default: false)
+      elim_and (bool) conjunctions are rewritten using negation and disjunctions (default: false)
+      elim_ite (bool) eliminate ite in favor of and/or (default: true)
+      elim_rem (bool) replace (rem x y) with (ite (>= y 0) (mod x y) (- (mod x y))). (default: false)
+      elim_sign_ext (bool) expand sign-ext operator using concat and extract (default: true)
+      elim_to_real (bool) eliminate to_real from arithmetic predicates that contain only integers. (default: false)
+      enable_der (bool) enable destructive equality resolution to quantifiers. (default: true)
+      eq2ineq (bool) expand equalities into two inequalities (default: false)
+      expand_nested_stores (bool) replace nested stores by a lambda expression (default: false)
+      expand_power (bool) expand (^ t k) into (* t ... t) if  1 < k <= max_degree. (default: false)
+      expand_select_ite (bool) expand select over ite expressions (default: false)
+      expand_select_store (bool) conservatively replace a (select (store ...) ...) term by an if-then-else term (default: false)
+      expand_store_eq (bool) reduce (store ...) = (store ...) with a common base into selects (default: false)
+      expand_tan (bool) replace (tan x) with (/ (sin x) (cos x)). (default: false)
+      flat (bool) create nary applications for +,*,bvadd,bvmul,bvand,bvor,bvxor (default: true)
+      flat_and_or (bool) create nary applications for and,or (default: true)
+      gcd_rounding (bool) use gcd rounding on integer arithmetic atoms. (default: false)
+      hi_div0 (bool) use the 'hardware interpretation' for division by zero (for bit-vector terms) (default: true)
+      hoist_ite (bool) hoist shared summands under ite expressions (default: false)
+      hoist_mul (bool) hoist multiplication over summation to minimize number of multiplications (default: false)
+      ignore_patterns_on_ground_qbody (bool) ignores patterns on quantifiers that don't mention their bound variables. (default: true)
+      ite_extra_rules (bool) extra ite simplifications, these additional simplifications may reduce size locally but increase globally (default: true)
+      local_ctx (bool) perform local (i.e., cheap) context simplifications (default: false)
+      local_ctx_limit (unsigned int) limit for applying local context simplifier (default: 4294967295)
+      max_degree (unsigned int) max degree of algebraic numbers (and power operators) processed by simplifier. (default: 64)
+      max_memory (unsigned int) maximum amount of memory in megabytes (default: 4294967295)
+      max_steps (unsigned int) maximum number of steps (default: 4294967295)
+      mul2concat (bool) replace multiplication by a power of two into a concatenation (default: false)
+      mul_to_power (bool) collpase (* t ... t) into (^ t k), it is ignored if expand_power is true. (default: false)
+      print (bool) (default: true)  print the simplified term.
+      print_proofs (bool) (default: false) print a proof showing the original term is equal to the resultant one.
+      print_statistics (bool) (default: false) print statistics.
+      pull_cheap_ite (bool) pull if-then-else terms when cheap. (default: false)
+      push_ite_arith (bool) push if-then-else over arithmetic terms. (default: false)
+      push_ite_bv (bool) push if-then-else over bit-vector terms. (default: false)
+      push_to_real (bool) distribute to_real over * and +. (default: true)
+      rewrite_patterns (bool) rewrite patterns. (default: false)
+      som (bool) put polynomials in sum-of-monomials form (default: false)
+      som_blowup (unsigned int) maximum increase of monomials generated when putting a polynomial in sum-of-monomials normal form (default: 10)
+      sort_disjunctions (bool) sort subterms in disjunctions (default: true)
+      sort_store (bool) sort nested stores when the indices are known to be different (default: false)
+      sort_sums (bool) sort the arguments of + application. (default: false)
+      split_concat_eq (bool) split equalities of the form (= (concat t1 t2) t3) (default: false)
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+      unfold_recursive_functions (bool) apply simplification recursively on recursive functions. (default: false)
+ (dbg-translator <term>)
+    test AST translator
+ (dbg-used-vars <expr>)
+    test used_vars functor
+ (declare-const <symbol> <sort>)
+    declare a new constant.
+ (declare-datatypes (<symbol>*) (<datatype-declaration>+))
+    declare mutually recursive datatypes.
+    <datatype-declaration> ::= (<symbol> <constructor-decl>+)
+    <constructor-decl> ::= (<symbol> <accessor-decl>*)
+    <accessor-decl> ::= (<symbol> <sort>)
+    example: (declare-datatypes (T) ((BinTree (leaf (value T)) (node (left BinTree) (right BinTree)))))
+ (declare-fun <symbol> (<sort>*) <sort>)
+    declare a new function/constant.
+ (declare-map <symbol> (<sort>+) <func-decl-ref>)
+    declare a new array map operator with name <symbol> using the given function declaration.
+    <func-decl-ref> ::= <symbol>
+                      | (<symbol> (<sort>*) <sort>)
+                      | ((_ <symbol> <numeral>+) (<sort>*) <sort>)
+    The last two cases are used to disambiguate between declarations with the same name and/or select (indexed) builtin declarations.
+    For more details about the array map operator, see 'Generalized and Efficient Array Decision Procedures' (FMCAD 2009).
+    Example: (declare-map set-union (Int) (or (Bool Bool) Bool))
+    Declares a new function (declare-fun set-union ((Array Int Bool) (Array Int Bool)) (Array Int Bool)).
+    The instance of the map axiom for this new declaration is:
+    (forall ((a1 (Array Int Bool)) (a2 (Array Int Bool)) (i Int)) (= (select (set-union a1 a2) i) (or (select a1 i) (select a2 i))))
+ (declare-rel <symbol> (<arg1 sort> ...) <representation>*)
+    declare new relation
+ (declare-sort <symbol> <numeral>?)
+    declare a new uninterpreted sort of arity <numeral>, if arity is not provided, then it is assumed to be 0.
+ (declare-tactic <symbol> <tactic>)
+    declare a new tactic, use (help-tactic) for the tactic language syntax.
+ (declare-var <symbol> <sort>)
+    declare constant as variable
+ (define-sort <symbol> (<symbol>*) <sort>)
+    define a new sort.
+ (del <expr>+)
+    proof command for clause deletion
+ (display <term>)
+    display the given term.
+ (display-dimacs )
+    print benchmark in DIMACS format
+ (echo <string>)
+    display the given string
+ (euf-project (exprs) (vars))
+    perform congruence projection
+ (eufi <expr> <expr> (vars))
+    perform model based interpolation
+ (eval <term> (<keyword> <value>)*)
+    evaluate the given term in the current model.
+    The following options are available:
+      array_as_stores (bool) return array as a set of stores (default: true)
+      array_equalities (bool) evaluate array equalities (default: true)
+      completion (bool) assigns an interptetation to symbols that do not have one in the current model, when evaluating expressions in the current model (default: false)
+      max_memory (unsigned int) maximum amount of memory in megabytes (default: 4294967295)
+      max_steps (unsigned int) maximum number of steps (default: 4294967295)
+      model_index (unsigned int) (default: 0) index of model from box optimization objective
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+ (exit)
+    exit.
+ (get-assertions)
+    retrieve asserted terms when in interactive mode
+ (get-assignment)
+    retrieve assignment
+ (get-consequences (<boolean-variable>*) (<variable>*))
+    retrieve consequences that fix values for supplied variables
+ (get-info <keyword>)
+    (get-info :?) for options.
+ (get-interpolant <expr> <expr>)
+    perform model based interpolation
+ (get-model [<index of box objective>])
+    retrieve model for the last check-sat command.
+    Supply optional index if retrieving a model corresponding to a box optimization objective
+ (get-objectives (get-objectives))
+    retrieve the objective values (after optimization)
+ (get-option <keyword>)
+    get configuration option.
+ (get-proof)
+    retrieve proof
+ (get-proof-graph)
+    retrieve proof and print it in graphviz
+ (get-unsat-assumptions)
+    retrieve subset of assumptions sufficient for unsatisfiability
+ (get-unsat-core)
+    retrieve unsat core
+ (get-user-tactics)
+    display tactics defined using the declare-tactic command.
+ (get-value (<term>+))
+    evaluate the given terms in the current model.
+ (help <symbol>*)
+    print this help.
+ (help-simplifier)
+    display the simplifier combinators and primitives.
+ (help-tactic)
+    display the tactic combinators and primitives.
+ (include <string>)
+    include a file
+ (infer <expr>+)
+    proof command for learned (redundant) clauses
+ (labels)
+    retrieve Simplify-like labels
+ (maximize <term>)
+    check sat modulo objective function
+ (mbi <expr> <expr> (vars))
+    perform model based interpolation
+ (mbp <expr> (<vars>))
+    perform model based projection
+ (mbp-qel (exprs) (vars))
+    Model based projection using e-graphs
+ (minimize <term>)
+    check sat modulo objective function
+ (pop <number>?)
+    pop 1 (or <number>) scopes.
+ (prefer <formula>)
+    set a preferred formula for the solver
+ (push <number>?)
+    push 1 (or <number>) scopes.
+ (qe-lite (lits) (vars))
+    QE lite over e-graphs
+ (qel (lits) (vars))
+    QE lite over e-graphs
+ (query predicate)
+    pose a query to a predicate based on the Horn rules.
+    The following options are available:
+      bmc.linear_unrolling_depth (unsigned int) Maximal level to explore (default: 4294967295)
+      ctrl_c (bool) enable interrupts from ctrl-c (default: true)
+      datalog.all_or_nothing_deltas (bool) compile rules so that it is enough for the delta relation in union and widening operations to determine only whether the updated relation was modified or not (default: false)
+      datalog.check_relation (symbol) name of default relation to check. operations on the default relation will be verified using SMT solving (default: null)
+      datalog.compile_with_widening (bool) widening will be used to compile recursive rules (default: false)
+      datalog.dbg_fpr_nonempty_relation_signature (bool) if true, finite_product_relation will attempt to avoid creating inner relation with empty signature by putting in half of the table columns, if it would have been empty otherwise (default: false)
+      datalog.default_relation (symbol) default relation implementation: external_relation, pentagon (default: pentagon)
+      datalog.default_table (symbol) default table implementation: sparse, hashtable, bitvector, interval (default: sparse)
+      datalog.default_table_checked (bool) if true, the default table will be default_table inside a wrapper that checks that its results are the same as of default_table_checker table (default: false)
+      datalog.default_table_checker (symbol) see default_table_checked (default: null)
+      datalog.explanations_on_relation_level (bool) if true, explanations are generated as history of each relation, rather than per fact (generate_explanations must be set to true for this option to have any effect) (default: false)
+      datalog.generate_explanations (bool) produce explanations for produced facts when using the datalog engine (default: false)
+      datalog.initial_restart_timeout (unsigned int) length of saturation run before the first restart (in ms), zero means no restarts (default: 0)
+      datalog.magic_sets_for_queries (bool) magic set transformation will be used for queries (default: false)
+      datalog.output_profile (bool) determines whether profile information should be output when outputting Datalog rules or instructions (default: false)
+      datalog.print.tuples (bool) determines whether tuples for output predicates should be output (default: true)
+      datalog.profile_timeout_milliseconds (unsigned int) instructions and rules that took less than the threshold will not be printed when printed the instruction/rule list (default: 0)
+      datalog.similarity_compressor (bool) rules that differ only in values of constants will be merged into a single rule (default: true)
+      datalog.similarity_compressor_threshold (unsigned int) if similarity_compressor is on, this value determines how many similar rules there must be in order for them to be merged (default: 11)
+      datalog.subsumption (bool) if true, removes/filters predicates with total transitions (default: true)
+      datalog.timeout (unsigned int) Time limit used for saturation (default: 0)
+      datalog.unbound_compressor (bool) auxiliary relations will be introduced to avoid unbound variables in rule heads (default: true)
+      datalog.use_map_names (bool) use names from map files when displaying tuples (default: true)
+      engine (symbol) Select: auto-config, datalog, bmc, spacer (default: auto-config)
+      generate_proof_trace (bool) trace for 'sat' answer as proof object (default: false)
+      print_aig (symbol) Dump clauses in AIG text format (AAG) to the given file name
+      print_answer (bool) print answer instance(s) to query (default: false)
+      print_boogie_certificate (bool) print certificate for reachability or non-reachability using a format understood by Boogie (default: false)
+      print_certificate (bool) print certificate for reachability or non-reachability (default: false)
+      print_fixedpoint_extensions (bool) use SMT-LIB2 fixedpoint extensions, instead of pure SMT2, when printing rules (default: true)
+      print_low_level_smt2 (bool) use (faster) low-level SMT2 printer (the printer is scalable but the result may not be as readable) (default: false)
+      print_statistics (bool) print statistics (default: false)
+      print_with_variable_declarations (bool) use variable declarations when displaying rules (instead of attempting to use original names) (default: true)
+      rlimit (unsigned int) deterministic resource limit (0 means no limit) (default: 0)
+      spacer.arith.solver (unsigned int) arithmetic solver: 0 - no solver, 1 - bellman-ford based solver (diff. logic only), 2 - simplex based solver, 3 - floyd-warshall based solver (diff. logic only) and no theory combination 4 - utvpi, 5 - infinitary lra, 6 - lra solver (default: 2)
+      spacer.blast_term_ite_inflation (unsigned int) Maximum inflation for non-Boolean ite-terms expansion: 0 (none), k (multiplicative) (default: 3)
+      spacer.ctp (bool) Enable counterexample-to-pushing (default: true)
+      spacer.dump_benchmarks (bool) Dump SMT queries as benchmarks (default: false)
+      spacer.dump_threshold (double) Threshold in seconds on dumping benchmarks (default: 5.0)
+      spacer.elim_aux (bool) Eliminate auxiliary variables in reachability facts (default: true)
+      spacer.eq_prop (bool) Enable equality and bound propagation in arithmetic (default: true)
+      spacer.expand_bnd (bool) Enable expand-bound lemma generalization (default: false)
+      spacer.gg.concretize (bool) Enable global guidance concretize (default: true)
+      spacer.gg.conjecture (bool) Enable global guidance conjecture (default: true)
+      spacer.gg.subsume (bool) Enable global guidance subsume (default: true)
+      spacer.global (bool) Enable global guidance (default: false)
+      spacer.gpdr (bool) Use GPDR solving strategy for non-linear CHC (default: false)
+      spacer.gpdr.bfs (bool) Use BFS exploration strategy for expanding model search (default: true)
+      spacer.ground_pobs (bool) Ground pobs by using values from a model (default: true)
+      spacer.iuc (unsigned int) 0 = use old implementation of unsat-core-generation, 1 = use new implementation of IUC generation, 2 = use new implementation of IUC + min-cut optimization (default: 1)
+      spacer.iuc.arith (unsigned int) 0 = use simple Farkas plugin, 1 = use simple Farkas plugin with constant from other partition (like old unsat-core-generation),2 = use Gaussian elimination optimization (broken), 3 = use additive IUC plugin (default: 1)
+      spacer.iuc.debug_proof (bool) prints proof used by unsat-core-learner for debugging purposes (debugging) (default: false)
+      spacer.iuc.old_hyp_reducer (bool) use old hyp reducer instead of new implementation, for debugging only (default: false)
+      spacer.iuc.print_farkas_stats (bool) prints for each proof how many Farkas lemmas it contains and how many of these participate in the cut (for debugging) (default: false)
+      spacer.iuc.split_farkas_literals (bool) Split Farkas literals (default: false)
+      spacer.keep_proxy (bool) keep proxy variables (internal parameter) (default: true)
+      spacer.logic (symbol) SMT-LIB logic to configure internal SMT solvers
+      spacer.max_level (unsigned int) Maximum level to explore (default: 4294967295)
+      spacer.max_num_contexts (unsigned int) maximal number of contexts to create (default: 500)
+      spacer.mbqi (bool) Enable mbqi (default: true)
+      spacer.min_level (unsigned int) Minimal level to explore (default: 0)
+      spacer.native_mbp (bool) Use native mbp of Z3 (default: true)
+      spacer.order_children (unsigned int) SPACER: order of enqueuing children in non-linear rules : 0 (original), 1 (reverse), 2 (random) (default: 0)
+      spacer.p3.share_invariants (bool) Share invariants lemmas (default: false)
+      spacer.p3.share_lemmas (bool) Share frame lemmas (default: false)
+      spacer.propagate (bool) Enable propagate/pushing phase (default: true)
+      spacer.push_pob (bool) push blocked pobs to higher level (default: false)
+      spacer.push_pob_max_depth (unsigned int) Maximum depth at which push_pob is enabled (default: 4294967295)
+      spacer.q3 (bool) Allow quantified lemmas in frames (default: true)
+      spacer.q3.instantiate (bool) Instantiate quantified lemmas (default: true)
+      spacer.q3.qgen.normalize (bool) normalize cube before quantified generalization (default: true)
+      spacer.q3.use_qgen (bool) use quantified lemma generalizer (default: false)
+      spacer.random_seed (unsigned int) Random seed to be used by SMT solver (default: 0)
+      spacer.reach_dnf (bool) Restrict reachability facts to DNF (default: true)
+      spacer.reset_pob_queue (bool) SPACER: reset pob obligation queue when entering a new level (default: true)
+      spacer.restart_initial_threshold (unsigned int) Initial threshold for restarts (default: 10)
+      spacer.restarts (bool) Enable resetting obligation queue (default: false)
+      spacer.simplify_lemmas_post (bool) simplify derived lemmas after inductive propagation (default: false)
+      spacer.simplify_lemmas_pre (bool) simplify derived lemmas before inductive propagation (default: false)
+      spacer.simplify_pob (bool) simplify pobs by removing redundant constraints (default: false)
+      spacer.trace_file (symbol) Log file for progress events
+      spacer.use_array_eq_generalizer (bool) SPACER: attempt to generalize lemmas with array equalities (default: true)
+      spacer.use_bg_invs (bool) Enable external background invariants (default: false)
+      spacer.use_derivations (bool) SPACER: using derivation mechanism to cache intermediate results for non-linear rules (default: true)
+      spacer.use_euf_gen (bool) Generalize lemmas and pobs using implied equalities (default: false)
+      spacer.use_inc_clause (bool) Use incremental clause to represent trans (default: true)
+      spacer.use_inductive_generalizer (bool) generalize lemmas using induction strengthening (default: true)
+      spacer.use_iuc (bool) Enable Interpolating Unsat Core(IUC) for lemma generalization (default: true)
+      spacer.use_lemma_as_cti (bool) SPACER: use a lemma instead of a CTI in flexible_trace (default: false)
+      spacer.use_lim_num_gen (bool) Enable limit numbers generalizer to get smaller numbers (default: false)
+      spacer.validate_lemmas (bool) Validate each lemma after generalization (default: false)
+      spacer.weak_abs (bool) Weak abstraction (default: true)
+      tab.selection (symbol) selection method for tabular strategy: weight (default), first, var-use (default: weight)
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+      validate (bool) validate result (by proof checking or model checking) (default: false)
+      xform.array_blast (bool) try to eliminate local array terms using Ackermannization -- some array terms may remain (default: false)
+      xform.array_blast_full (bool) eliminate all local array variables by QE (default: false)
+      xform.bit_blast (bool) bit-blast bit-vectors (default: false)
+      xform.coalesce_rules (bool) coalesce rules (default: false)
+      xform.coi (bool) use cone of influence simplification (default: true)
+      xform.compress_unbound (bool) compress tails with unbound variables (default: true)
+      xform.elim_term_ite (bool) Eliminate term-ite expressions (default: false)
+      xform.elim_term_ite.inflation (unsigned int) Maximum inflation for non-Boolean ite-terms blasting: 0 (none), k (multiplicative) (default: 3)
+      xform.fix_unbound_vars (bool) fix unbound variables in tail (default: false)
+      xform.inline_eager (bool) try eager inlining of rules (default: true)
+      xform.inline_linear (bool) try linear inlining method (default: true)
+      xform.inline_linear_branch (bool) try linear inlining method with potential expansion (default: false)
+      xform.instantiate_arrays (bool) Transforms P(a) into P(i, a[i] a) (default: false)
+      xform.instantiate_arrays.enforce (bool) Transforms P(a) into P(i, a[i]), discards a from predicate (default: false)
+      xform.instantiate_arrays.nb_quantifier (unsigned int) Gives the number of quantifiers per array (default: 1)
+      xform.instantiate_arrays.slice_technique (symbol) <no-slicing>=> GetId(i) = i, <smash> => GetId(i) = true (default: no-slicing)
+      xform.instantiate_quantifiers (bool) instantiate quantified Horn clauses using E-matching heuristic (default: false)
+      xform.magic (bool) perform symbolic magic set transformation (default: false)
+      xform.quantify_arrays (bool) create quantified Horn clauses from clauses with arrays (default: false)
+      xform.scale (bool) add scaling variable to linear real arithmetic clauses (default: false)
+      xform.slice (bool) simplify clause set using slicing (default: true)
+      xform.subsumption_checker (bool) Enable subsumption checker (no support for model conversion) (default: true)
+      xform.tail_simplifier_pve (bool) propagate_variable_equivalences (default: true)
+      xform.transform_arrays (bool) Rewrites arrays equalities and applies select over store (default: false)
+      xform.unfold_rules (unsigned int) unfold rules statically using iterative squaring (default: 0)
+ (reset)
+    reset the shell (all declarations and assertions will be erased)
+ (reset-assertions)
+    reset all asserted formulas (but retain definitions and declarations)
+ (reset-preferences )
+    reset all preferred formulas
+ (rule (forall (q) (=> (and body) head)) :optional-name :optional-recursion-bound)
+    add a Horn rule.
+ (set-info <keyword> <value>)
+    set information.
+ (set-initial-value <var> <value>)
+    set an initial value for search as a hint to the solver
+ (set-logic <symbol>)
+    set the background logic.
+ (set-option <keyword> <value>)
+    set configuration option.
+ (set-simplifier <tactic> (<keyword> <value>)*)
+    update main solver with simplification pre-processing.
+    The following options are available:
+ (simplify <term> (<keyword> <value>)*)
+    simplify the given term using builtin theory simplification rules.
+    The following options are available:
+      algebraic_number_evaluator (bool) simplify/evaluate expressions containing (algebraic) irrational numbers. (default: true)
+      arith_ineq_lhs (bool) rewrite inequalities so that right-hand-side is a constant. (default: false)
+      arith_lhs (bool) all monomials are moved to the left-hand-side, and the right-hand-side is just a constant. (default: false)
+      bit2bool (bool) try to convert bit-vector terms of size 1 into Boolean terms (default: true)
+      blast_distinct (bool) expand a distinct predicate into a quadratic number of disequalities (default: false)
+      blast_distinct_threshold (unsigned int) when blast_distinct is true, only distinct expressions with less than this number of arguments are blasted (default: 4294967295)
+      blast_eq_value (bool) blast (some) Bit-vector equalities into bits (default: false)
+      blast_select_store (bool) eagerly replace all (select (store ..) ..) term by an if-then-else term (default: false)
+      bv_extract_prop (bool) attempt to partially propagate extraction inwards (default: false)
+      bv_ineq_consistency_test_max (unsigned int) max size of conjunctions on which to perform consistency test based on inequalities on bitvectors. (default: 0)
+      bv_ite2id (bool) rewrite ite that can be simplified to identity (default: false)
+      bv_le2extract (bool) disassemble bvule to extract (default: true)
+      bv_le_extra (bool) additional bu_(u/s)le simplifications (default: false)
+      bv_not_simpl (bool) apply simplifications for bvnot (default: false)
+      bv_sort_ac (bool) sort the arguments of all AC operators (default: true)
+      cache_all (bool) cache all intermediate results. (default: false)
+      elim_and (bool) conjunctions are rewritten using negation and disjunctions (default: false)
+      elim_ite (bool) eliminate ite in favor of and/or (default: true)
+      elim_rem (bool) replace (rem x y) with (ite (>= y 0) (mod x y) (- (mod x y))). (default: false)
+      elim_sign_ext (bool) expand sign-ext operator using concat and extract (default: true)
+      elim_to_real (bool) eliminate to_real from arithmetic predicates that contain only integers. (default: false)
+      enable_der (bool) enable destructive equality resolution to quantifiers. (default: true)
+      eq2ineq (bool) expand equalities into two inequalities (default: false)
+      expand_nested_stores (bool) replace nested stores by a lambda expression (default: false)
+      expand_power (bool) expand (^ t k) into (* t ... t) if  1 < k <= max_degree. (default: false)
+      expand_select_ite (bool) expand select over ite expressions (default: false)
+      expand_select_store (bool) conservatively replace a (select (store ...) ...) term by an if-then-else term (default: false)
+      expand_store_eq (bool) reduce (store ...) = (store ...) with a common base into selects (default: false)
+      expand_tan (bool) replace (tan x) with (/ (sin x) (cos x)). (default: false)
+      flat (bool) create nary applications for +,*,bvadd,bvmul,bvand,bvor,bvxor (default: true)
+      flat_and_or (bool) create nary applications for and,or (default: true)
+      gcd_rounding (bool) use gcd rounding on integer arithmetic atoms. (default: false)
+      hi_div0 (bool) use the 'hardware interpretation' for division by zero (for bit-vector terms) (default: true)
+      hoist_ite (bool) hoist shared summands under ite expressions (default: false)
+      hoist_mul (bool) hoist multiplication over summation to minimize number of multiplications (default: false)
+      ignore_patterns_on_ground_qbody (bool) ignores patterns on quantifiers that don't mention their bound variables. (default: true)
+      ite_extra_rules (bool) extra ite simplifications, these additional simplifications may reduce size locally but increase globally (default: true)
+      local_ctx (bool) perform local (i.e., cheap) context simplifications (default: false)
+      local_ctx_limit (unsigned int) limit for applying local context simplifier (default: 4294967295)
+      max_degree (unsigned int) max degree of algebraic numbers (and power operators) processed by simplifier. (default: 64)
+      max_memory (unsigned int) maximum amount of memory in megabytes (default: 4294967295)
+      max_steps (unsigned int) maximum number of steps (default: 4294967295)
+      mul2concat (bool) replace multiplication by a power of two into a concatenation (default: false)
+      mul_to_power (bool) collpase (* t ... t) into (^ t k), it is ignored if expand_power is true. (default: false)
+      print (bool) (default: true)  print the simplified term.
+      print_proofs (bool) (default: false) print a proof showing the original term is equal to the resultant one.
+      print_statistics (bool) (default: false) print statistics.
+      pull_cheap_ite (bool) pull if-then-else terms when cheap. (default: false)
+      push_ite_arith (bool) push if-then-else over arithmetic terms. (default: false)
+      push_ite_bv (bool) push if-then-else over bit-vector terms. (default: false)
+      push_to_real (bool) distribute to_real over * and +. (default: true)
+      rewrite_patterns (bool) rewrite patterns. (default: false)
+      som (bool) put polynomials in sum-of-monomials form (default: false)
+      som_blowup (unsigned int) maximum increase of monomials generated when putting a polynomial in sum-of-monomials normal form (default: 10)
+      sort_disjunctions (bool) sort subterms in disjunctions (default: true)
+      sort_store (bool) sort nested stores when the indices are known to be different (default: false)
+      sort_sums (bool) sort the arguments of + application. (default: false)
+      split_concat_eq (bool) split equalities of the form (= (concat t1 t2) t3) (default: false)
+      timeout (unsigned int) (default: infty) timeout in milliseconds. (default: 4294967295)
+      unfold_recursive_functions (bool) apply simplification recursively on recursive functions. (default: false)
+"

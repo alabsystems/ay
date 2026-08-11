@@ -22,10 +22,71 @@ pub(crate) struct SymmetryStats {
     pub(crate) candidate_pairs: u64,
     pub(crate) pairs_detected: u64,
     pub(crate) sb_clauses_added: u64,
+    /// Refined colour classes with >= 2 variables.
+    pub(crate) groups_nontrivial: u64,
+    /// Classes dropped for exceeding the detector's group-size budget.
+    pub(crate) groups_over_budget: u64,
+    /// Largest refined colour class.
+    pub(crate) largest_group: u64,
     pub(crate) last_skipped_reason: Option<SymmetrySkipReason>,
 }
 
+/// Public snapshot of root symmetry preprocessing, for `--stats` consumers.
+///
+/// Symmetry breaking is the single largest technique gap on the SAT-COMP 2026
+/// Main set (satsuma+Kissat solved 276/400 vs 238 for plain Kissat), so whether
+/// the pass ran — and if not, why it bailed — has to be visible from the CLI
+/// rather than only from an in-crate debugger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymmetryReport {
+    /// Times the root pass was entered.
+    pub runs: u64,
+    /// Candidate variable pairs the refinement proposed.
+    pub candidate_pairs: u64,
+    /// Candidate pairs that survived the formula-preserving gate.
+    pub pairs_detected: u64,
+    /// Symmetry-breaking clauses actually added.
+    pub sb_clauses_added: u64,
+    /// Refined colour classes with >= 2 variables — how much symmetry the
+    /// refinement actually saw.
+    pub groups_nontrivial: u64,
+    /// Non-trivial classes discarded for exceeding the group-size budget.
+    pub groups_over_budget: u64,
+    /// Largest refined colour class.
+    pub largest_group: u64,
+    /// Stable tag for why the last run emitted nothing, or `None` when it did
+    /// reach clause emission.
+    pub skipped: Option<&'static str>,
+}
+
+impl SymmetrySkipReason {
+    /// Stable, machine-greppable tag for this skip reason.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Incremental => "incremental",
+            Self::ProofMode => "proof-mode",
+            Self::TooLarge => "too-large",
+            Self::NoActiveClauses => "no-active-clauses",
+            Self::NoPairs => "no-pairs",
+        }
+    }
+}
+
 impl SymmetryStats {
+    pub(crate) fn report(&self) -> SymmetryReport {
+        SymmetryReport {
+            runs: self.runs,
+            candidate_pairs: self.candidate_pairs,
+            pairs_detected: self.pairs_detected,
+            sb_clauses_added: self.sb_clauses_added,
+            groups_nontrivial: self.groups_nontrivial,
+            groups_over_budget: self.groups_over_budget,
+            largest_group: self.largest_group,
+            skipped: self.last_skipped_reason.map(SymmetrySkipReason::tag),
+        }
+    }
+
     pub(crate) fn begin_run(&mut self) {
         self.runs = self.runs.saturating_add(1);
         self.last_skipped_reason = None;

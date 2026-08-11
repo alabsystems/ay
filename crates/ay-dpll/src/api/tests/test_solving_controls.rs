@@ -132,7 +132,39 @@ fn preflight_unknown_retires_prior_model_certificate_and_optimum() {
     assert!(solver.model().is_none());
     assert!(solver.model_str().is_none());
     assert!(solver.get_objective_value(objective).is_none());
-    assert!(solver.executor.last_result().is_none());
+    // The retired state is `Unknown`, NOT absent. `last_result()` returning
+    // `Some(Unknown)` is the production contract, pinned in the opposite
+    // direction by `run.rs`'s `executor_result_matches_public_verdict`, by
+    // `ay unknown-policy-probe`, and by `api/solving/check.rs`. Asserting
+    // `is_none()` here would only be satisfiable by clearing the result, which
+    // would break all three and degrade `(get-info :reason-unknown)` from
+    // `interrupted` to a bare `unknown`.
+    //
+    // Pinned twice on purpose. The structural `matches!` reads the raw
+    // `last_result()` accessor, while `last_result_is_unknown()` is the
+    // separate predicate that `run.rs`'s verdict gate and the unknown-policy
+    // probe actually consult. Checking only the predicate would let a
+    // regression inside it (e.g. reporting `true` for an absent result) pass
+    // unnoticed here; checking only the raw accessor would leave the
+    // production-facing predicate unpinned at this boundary.
+    assert!(matches!(
+        solver.executor.last_result(),
+        Some(SolveResult::Unknown)
+    ));
+    assert!(solver.executor.last_result_is_unknown());
+    // Stronger than the assertion this replaces: pin WHY it is unknown, so a
+    // degradation of the reason or origin is caught too. Preflight publishes
+    // through `replace_last_result_with_unknown(Interrupted)`, which routes to
+    // `publish_unknown_from_origin(UnknownReason::Interrupted.origin())` and
+    // therefore fixes the origin to `InterruptFlag`.
+    assert_eq!(
+        solver.executor.unknown_reason(),
+        Some(crate::UnknownReason::Interrupted)
+    );
+    assert_eq!(
+        solver.executor.unknown_origin(),
+        Some(crate::UnknownOrigin::InterruptFlag)
+    );
     assert!(solver.executor.take_sat_certificate().is_none());
 }
 
@@ -1596,8 +1628,9 @@ fn test_check_sat_with_timeout_zero_all_logic_returns_timeout() {
 
 /// #sat-chokepoint provenance: a surfaced `Sat` always retains the
 /// `SatCertificate` emission witness minted by the `emit_sat_verdict` funnel
-/// (the `from_validated` constructor fail-closes a witness-less `Sat` to
-/// `Unknown`); the test-only `for_testing` bypass carries none.
+/// (`finish_verified_result` publishes registered `Unknown` when the token is
+/// absent, while the definite constructor requires it); the test-only
+/// `for_testing` bypass carries none.
 #[test]
 fn test_sat_result_retains_chokepoint_emission_witness() {
     let mut solver = Solver::new(Logic::QfLia);
@@ -1617,5 +1650,19 @@ fn test_sat_result_retains_chokepoint_emission_witness() {
     assert!(
         !bypass.has_sat_emission_witness(),
         "the test-only constructor bypass never carries the emission witness"
+    );
+}
+
+#[test]
+fn test_unsat_result_retains_chokepoint_emission_witness() {
+    let mut solver = Solver::new(Logic::QfLia);
+    let contradiction = solver.bool_const(false);
+    solver.assert_term(contradiction);
+
+    let verified = solver.check_sat();
+    assert!(verified.is_unsat());
+    assert!(
+        verified.has_unsat_emission_witness(),
+        "strict-proof-certified Unsat must retain its one-shot witness"
     );
 }

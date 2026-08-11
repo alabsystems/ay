@@ -1872,3 +1872,37 @@ fn replace_re_keeps_empty_match_eligibility() {
         Some("Xbbb".to_string())
     );
 }
+
+#[test]
+fn membership_accepts_three_digit_conjunction_witness() {
+    let mut terms = TermStore::new();
+    let digits = (0..3).map(|_| mk_re_range(&mut terms, "0", "9")).collect();
+    let exactly_three = mk_re_concat(&mut terms, digits);
+    let digit = mk_re_range(&mut terms, "0", "9");
+    let any_digits = mk_re_star(&mut terms, digit);
+
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, "000", exactly_three),
+        Some(true)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, "000", any_digits),
+        Some(true)
+    );
+}
+
+#[test]
+fn membership_accepts_literal_between_allchar_stars() {
+    let mut terms = TermStore::new();
+    let any_left = mk_re_allchar(&mut terms);
+    let any_left = mk_re_star(&mut terms, any_left);
+    let needle = mk_str_to_re(&mut terms, "\\<SCRIPT");
+    let any_right = mk_re_allchar(&mut terms);
+    let any_right = mk_re_star(&mut terms, any_right);
+    let regex = mk_re_concat(&mut terms, vec![any_left, needle, any_right]);
+
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, "xx\\<SCRIPTyy", regex),
+        Some(true)
+    );
+}

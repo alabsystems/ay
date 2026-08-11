@@ -126,15 +126,185 @@ fn test_bv_bitblast_accepts_bounded_semantic_tautology() {
 }
 
 #[test]
-fn test_bv_bitblast_rejects_too_wide_unchecked_clause() {
+fn test_bv_bitblast_accepts_wide_clause_with_checked_lrat_refutation() {
     let mut terms = TermStore::new();
-    let bv = terms.mk_var("bv", Sort::bitvec(8));
-    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![bv, bv], Sort::Bool);
+    let bv = terms.mk_var("bv", Sort::bitvec(32));
+    let doubled = terms.mk_app(
+        ay_core::Symbol::named("bvadd"),
+        vec![bv, bv],
+        Sort::bitvec(32),
+    );
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let shifted = terms.mk_app(
+        ay_core::Symbol::named("bvshl"),
+        vec![bv, one],
+        Sort::bitvec(32),
+    );
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![doubled, shifted],
+        Sort::Bool,
+    );
+    validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+        .expect("wide BV identity must carry a checked bit-blast/LRAT refutation");
+}
+
+#[test]
+fn test_bv_bitblast_rejects_wide_falsifiable_clause_after_sat_bitblast() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(32));
+    let zero = terms.mk_bitvec(BigInt::from(0), 32);
+    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![bv, zero], Sort::Bool);
     let err = validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
-        .expect_err("too-wide BV lemma must fail closed");
+        .expect_err("wide falsifiable BV lemma must fail closed");
     assert!(
         matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
         "expected InvalidTheoryLemma, got {err:?}"
+    );
+}
+
+#[test]
+fn test_bv_bitblast_checked_lrat_covers_representative_one_to_sixty_four_bit_widths() {
+    for width in [1_u32, 8, 16, 32, 64] {
+        let mut terms = TermStore::new();
+        let bv = terms.mk_var(format!("bv_{width}"), Sort::bitvec(width));
+        let doubled = terms.mk_app(
+            ay_core::Symbol::named("bvadd"),
+            vec![bv, bv],
+            Sort::bitvec(width),
+        );
+        let one = terms.mk_bitvec(BigInt::from(1), width);
+        let shifted = terms.mk_app(
+            ay_core::Symbol::named("bvshl"),
+            vec![bv, one],
+            Sort::bitvec(width),
+        );
+        let eq = terms.mk_app(
+            ay_core::Symbol::named("="),
+            vec![doubled, shifted],
+            Sort::Bool,
+        );
+        validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+            .unwrap_or_else(|error| panic!("width {width} identity must prove: {error}"));
+    }
+}
+
+#[test]
+fn test_strict_proof_rejects_cumulative_wide_bv_lemma_budget_before_replay() {
+    use ay_core::Proof;
+
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("wide_budget_bv", Sort::bitvec(32));
+    let doubled = terms.mk_app(
+        ay_core::Symbol::named("bvadd"),
+        vec![bv, bv],
+        Sort::bitvec(32),
+    );
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let shifted = terms.mk_app(
+        ay_core::Symbol::named("bvshl"),
+        vec![bv, one],
+        Sort::bitvec(32),
+    );
+    let equality = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![doubled, shifted],
+        Sort::Bool,
+    );
+    let mut proof = Proof::new();
+    for _ in 0..=MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF {
+        proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+    }
+
+    let error = crate::check_proof_strict(&proof, &terms)
+        .expect_err("an untrusted proof may not multiply the per-lemma BV deadline");
+    assert!(
+        matches!(
+            &error,
+            ProofCheckError::InvalidTheoryLemma { step, reason }
+                if step.0 as usize == MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF
+                    && reason.contains("proof-producing BV checker")
+        ),
+        "unexpected cumulative-budget rejection: {error}"
+    );
+}
+
+#[test]
+fn test_bv_bitblast_proof_producer_rejects_unsupported_wide_operator() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(32));
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let quotient = terms.mk_app(
+        ay_core::Symbol::named("bvudiv"),
+        vec![bv, one],
+        Sort::bitvec(32),
+    );
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![quotient, quotient],
+        Sort::Bool,
+    );
+    validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+        .expect_err("unsupported wide operator must fail closed even for a tautological shape");
+}
+
+#[test]
+fn test_bv_bitblast_proof_producer_rejects_width_above_sixty_four() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(65));
+    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![bv, bv], Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+        .expect_err("width 65 is outside the bounded proof-producing fragment");
+}
+
+#[test]
+fn test_bv_bitblast_proof_producer_rejects_oversized_mul_tree_before_search() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(64));
+    let mut product = bv;
+    for _ in 0..8 {
+        product = terms.mk_app(
+            ay_core::Symbol::named("bvmul"),
+            vec![product, bv],
+            Sort::bitvec(64),
+        );
+    }
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![product, product],
+        Sort::Bool,
+    );
+    let error = validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+        .expect_err("oversized multiplier tree must exceed the pre-export gate budget");
+    assert!(
+        error.to_string().contains("estimated bit-blast gates"),
+        "unexpected rejection: {error}"
+    );
+}
+
+#[test]
+fn test_bv_bitblast_proof_producer_rejects_oversized_shift_tree_before_search() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(64));
+    let one = terms.mk_bitvec(BigInt::from(1), 64);
+    let mut shifted = bv;
+    for _ in 0..8 {
+        shifted = terms.mk_app(
+            ay_core::Symbol::named("bvshl"),
+            vec![shifted, one],
+            Sort::bitvec(64),
+        );
+    }
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![shifted, shifted],
+        Sort::Bool,
+    );
+    let error = validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
+        .expect_err("oversized shift tree must exceed the pre-export gate budget");
+    assert!(
+        error.to_string().contains("estimated bit-blast gates"),
+        "unexpected rejection: {error}"
     );
 }
 
@@ -1963,6 +2133,98 @@ fn bv_checker_self_proves_same_width_ops() {
     }
 }
 
+#[test]
+fn unsigned_bv_comparison_matrix_covers_u32_u64_boundaries_and_forged_opposites() {
+    let expected = |op: &str, lhs: u128, rhs: u128| match op {
+        "bvult" => lhs < rhs,
+        "bvule" => lhs <= rhs,
+        "bvugt" => lhs > rhs,
+        "bvuge" => lhs >= rhs,
+        _ => unreachable!(),
+    };
+
+    for width in [32_u32, 64_u32] {
+        let max = if width == 64 {
+            u128::from(u64::MAX)
+        } else {
+            (1_u128 << width) - 1
+        };
+        let pairs = [(0, max), (max, 0), (max - 1, max), (max, max)];
+
+        for op in ["bvult", "bvule", "bvugt", "bvuge"] {
+            // Symbolic equality identities force the proof-producing lane at
+            // both widths, rather than being discharged by ground folding.
+            let mut symbolic = TermStore::new();
+            let x = symbolic.mk_var(format!("x_{op}_{width}"), Sort::bitvec(width));
+            let comparison = symbolic.mk_app(ay_core::Symbol::named(op), vec![x, x], Sort::Bool);
+            let equality_truth = matches!(op, "bvule" | "bvuge");
+            let valid_identity = if equality_truth {
+                comparison
+            } else {
+                symbolic.mk_not(comparison)
+            };
+            assert!(
+                bv_bitblast_requires_proof_producer(&symbolic, &[valid_identity]),
+                "{op} width {width} symbolic identity must exercise surfaced proof replay"
+            );
+            sp_validate(
+                &symbolic,
+                valid_identity,
+                &format!("{op} symbolic equality at width {width}"),
+            );
+            let forged_identity = if equality_truth {
+                symbolic.mk_not(comparison)
+            } else {
+                comparison
+            };
+            assert!(
+                validate_theory_lemma_strict(
+                    &symbolic,
+                    vec![forged_identity],
+                    TheoryLemmaKind::BvBitBlast,
+                )
+                .is_err(),
+                "forged {op} symbolic equality at width {width} must be rejected"
+            );
+
+            // Ground 0/max/equal/adjacent cases independently check both the
+            // true polarity and its falsifiable opposite for every operator.
+            for (lhs_value, rhs_value) in pairs {
+                let mut terms = TermStore::new();
+                let lhs = sp_lit(&mut terms, lhs_value, width);
+                let rhs = sp_lit(&mut terms, rhs_value, width);
+                let comparison =
+                    terms.mk_app(ay_core::Symbol::named(op), vec![lhs, rhs], Sort::Bool);
+                let truth = expected(op, lhs_value, rhs_value);
+                let valid = if truth {
+                    comparison
+                } else {
+                    terms.mk_not(comparison)
+                };
+                sp_validate(
+                    &terms,
+                    valid,
+                    &format!("{op} width {width} boundary {lhs_value:#x},{rhs_value:#x}"),
+                );
+                let forged = if truth {
+                    terms.mk_not(comparison)
+                } else {
+                    comparison
+                };
+                assert!(
+                    validate_theory_lemma_strict(
+                        &terms,
+                        vec![forged],
+                        TheoryLemmaKind::BvBitBlast,
+                    )
+                    .is_err(),
+                    "forged opposite of {op}({lhs_value:#x},{rhs_value:#x}) at width {width} must reject"
+                );
+            }
+        }
+    }
+}
+
 /// The trust kernel self-proves the width-changing / indexed operators
 /// (concat, extract, zero/sign extend, repeat, rotate) against ground truth.
 ///
@@ -2227,6 +2489,139 @@ fn bool_tautology_accepts_exact_packed_connective_clauses_and_rejects_near_misse
     );
 }
 
+/// The DUAL packed shapes, where the gate term occurs POSITIVELY:
+/// Alethe `and_neg` `(or (and t1..tn) (not t1) .. (not tn))` and `or_neg`
+/// `(or (or t1..tn) (not ti))` (#uc-and-neg-packed-tautology).
+///
+/// These are the Tseitin definition clauses AY emits for a top-level `(and ..)`
+/// over theory atoms the bounded Bool/BV evaluator cannot interpret. Before
+/// they were recognized, such a clause reached the strict checker as a bare
+/// `assume` and a CORRECT QF_UF refutation under `:produce-unsat-cores` was
+/// rejected with "assumes term outside the supplied problem obligation",
+/// publishing `unknown` where z3 says `unsat`.
+///
+/// Every near-miss below is FALSIFIABLE, so acceptance here would be a real
+/// forgery channel — the rejections are the load-bearing half of this test.
+#[test]
+fn bool_tautology_accepts_positive_gate_packed_clauses_and_rejects_near_misses() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let eq = |terms: &mut TermStore, a: TermId, b: TermId| {
+        terms.mk_app(ay_core::Symbol::named("="), vec![a, b], Sort::Bool)
+    };
+    let p = eq(&mut terms, x, y);
+    let q = eq(&mut terms, y, z);
+    let r = eq(&mut terms, x, z);
+    let not_p = terms.mk_not_raw(p);
+    let not_q = terms.mk_not_raw(q);
+    let not_r = terms.mk_not_raw(r);
+
+    // `and_neg`: (p /\ q) \/ !p \/ !q — a tautology.
+    let inner_and = terms.mk_app(ay_core::Symbol::named("and"), vec![p, q], Sort::Bool);
+    let and_neg = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![inner_and, not_p, not_q],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![and_neg], TheoryLemmaKind::BoolTautology).is_ok(),
+        "a conjunction OR the negation of every conjunct must validate"
+    );
+
+    // Near miss: drop !q. Falsified by p=true, q=false.
+    let and_neg_missing = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![inner_and, not_p],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![and_neg_missing],
+            TheoryLemmaKind::BoolTautology
+        )
+        .is_err(),
+        "a conjunction missing one conjunct's negation is falsifiable and must be rejected"
+    );
+
+    // Near miss: the negations belong to a DIFFERENT atom. Falsified by
+    // p=true, q=false, r=true.
+    let and_neg_wrong_atom = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![inner_and, not_p, not_r],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![and_neg_wrong_atom],
+            TheoryLemmaKind::BoolTautology
+        )
+        .is_err(),
+        "a conjunction paired with a foreign atom's negation must be rejected"
+    );
+
+    // `or_neg`: (p \/ q) \/ !p — a tautology (one member's negation suffices).
+    let inner_or = terms.mk_app(ay_core::Symbol::named("or"), vec![p, q], Sort::Bool);
+    let or_neg = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![inner_or, not_p],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![or_neg], TheoryLemmaKind::BoolTautology).is_ok(),
+        "a disjunction OR the negation of one of its members must validate"
+    );
+
+    // Near miss: the negated atom is not a member. Falsified by p=q=false,
+    // r=true.
+    let or_neg_wrong_atom = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![inner_or, not_r],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![or_neg_wrong_atom],
+            TheoryLemmaKind::BoolTautology
+        )
+        .is_err(),
+        "a disjunction paired with a non-member's negation must be rejected"
+    );
+
+    // Raw TermStore construction can bypass application sort checking: a
+    // positive gate carrying a non-Boolean member must fail closed even when
+    // the gate's result sort is labelled Bool. This exercises the
+    // `members.iter().any(|m| sort(m) != Bool)` guard in the positive-gate
+    // recognizer, which `continue`s past such a gate so the clause is never
+    // accepted as a tautology.
+    //
+    // The forged negation is built with `mk_app` rather than `mk_not_raw`:
+    // that constructor asserts its operand is Bool and ABORTS the process
+    // here (`BUG: mk_not_raw expects Bool, got Int`), so the test
+    // panicked before reaching its own assertion and had never once checked
+    // the guard it names. A forger is not obliged to use the constructor that
+    // enforces the invariant, which is the whole reason the checker re-derives
+    // sorts itself — so building the ill-sorted literal the way a forger would
+    // is also the more faithful test.
+    let integer = terms.mk_var("integer", Sort::Int);
+    let ill_sorted_and = terms.mk_app(ay_core::Symbol::named("and"), vec![p, integer], Sort::Bool);
+    let not_integer = terms.mk_app(ay_core::Symbol::named("not"), vec![integer], Sort::Bool);
+    let ill_sorted = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![ill_sorted_and, not_p, not_integer],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![ill_sorted], TheoryLemmaKind::BoolTautology)
+            .is_err(),
+        "an ill-sorted positive-gate packed clause must fail closed"
+    );
+}
+
 #[test]
 fn fp_rm_domain_accepts_exact_six_term_pigeonhole_and_rejects_near_misses() {
     fn disequality(terms: &mut TermStore, lhs: TermId, rhs: TermId) -> TermId {
@@ -2382,4 +2777,174 @@ fn ite_same_accepts_identical_branches_and_rejects_the_rest() {
         validate_theory_lemma_strict(&terms, vec![not_ite], TheoryLemmaKind::IteSame).is_err(),
         "a non-ite equality must be rejected"
     );
+}
+
+// ============================================================================
+// Pure-NRA certificate forgeries (#nra-cert)
+// ============================================================================
+//
+// The two NRA kinds carry no payload, so tagging an arbitrary clause with
+// them triggers a full independent re-decision in the checker. Every
+// satisfiable or out-of-fragment clause must yield `InvalidTheoryLemma`,
+// never `Ok` — a false accept here would let a wrong solver publish a
+// certified unsat for a satisfiable formula.
+
+/// Build the blocking literal `not(and cs)` without De Morgan rewriting.
+fn nra_conj_clause(terms: &mut TermStore, cs: Vec<TermId>) -> Vec<TermId> {
+    let conj = terms.mk_and(cs);
+    vec![terms.mk_not_raw(conj)]
+}
+
+#[test]
+fn test_nra_kinds_reject_empty_clause() {
+    let terms = TermStore::new();
+    for kind in [
+        TheoryLemmaKind::NraIntervalUnsat,
+        TheoryLemmaKind::NraUnivariateUnsat,
+    ] {
+        let err = validate_theory_lemma_strict(&terms, vec![], kind)
+            .expect_err("empty clause must be rejected");
+        assert!(
+            matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
+            "expected InvalidTheoryLemma, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn test_nra_kinds_reject_bool_var_clause() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let not_q = terms.mk_not_raw(q);
+    for kind in [
+        TheoryLemmaKind::NraIntervalUnsat,
+        TheoryLemmaKind::NraUnivariateUnsat,
+    ] {
+        validate_theory_lemma_strict(&terms, vec![p, not_q], kind)
+            .expect_err("propositional clause must be rejected by the NRA kinds");
+    }
+}
+
+#[test]
+fn test_nra_interval_rejects_satisfiable_conjunction() {
+    // x >= 0, y >= 0, x*y = 0 is satisfiable at the origin. Tagging its
+    // blocking clause as NraIntervalUnsat must NOT validate.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let gx = terms.mk_ge(x, zero);
+    let gy = terms.mk_ge(y, zero);
+    let prod = terms.mk_mul(vec![x, y]);
+    let eq = terms.mk_eq(prod, zero);
+    let clause = nra_conj_clause(&mut terms, vec![gx, gy, eq]);
+    validate_theory_lemma_strict(&terms, clause, TheoryLemmaKind::NraIntervalUnsat)
+        .expect_err("satisfiable system tagged NraIntervalUnsat must be rejected");
+}
+
+#[test]
+fn test_nra_univariate_rejects_sqrt_two_forgery() {
+    // {x^2 = 2, x > 0} is satisfiable ONLY at irrational sqrt(2); a
+    // rational-sampling checker would forge a refutation. Must reject.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let two = terms.mk_rational(num_rational::BigRational::from(BigInt::from(2)));
+    let sq = terms.mk_mul(vec![x, x]);
+    let eq = terms.mk_eq(sq, two);
+    let gt = terms.mk_gt(x, zero);
+    let clause = nra_conj_clause(&mut terms, vec![eq, gt]);
+    let err = validate_theory_lemma_strict(&terms, clause, TheoryLemmaKind::NraUnivariateUnsat)
+        .expect_err("sqrt(2)-satisfiable system must be rejected");
+    assert!(
+        matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
+        "expected InvalidTheoryLemma, got {err:?}"
+    );
+}
+
+#[test]
+fn test_nra_univariate_rejects_multivariate_cross_tag() {
+    // An mbo-shaped (multivariate) clause cross-tagged as the UNIVARIATE
+    // kind must reject even though the interval kind accepts it.
+    let mut terms = TermStore::new();
+    let h1 = terms.mk_var("h1", Sort::Real);
+    let h2 = terms.mk_var("h2", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let g1 = terms.mk_gt(h1, zero);
+    let g2 = terms.mk_gt(h2, zero);
+    let m = terms.mk_mul(vec![h1, h1, h2]);
+    let eq = terms.mk_eq(m, zero);
+    let clause = nra_conj_clause(&mut terms, vec![g1, g2, eq]);
+    validate_theory_lemma_strict(&terms, clause.clone(), TheoryLemmaKind::NraUnivariateUnsat)
+        .expect_err("multivariate clause tagged univariate must be rejected");
+    validate_theory_lemma_strict(&terms, clause, TheoryLemmaKind::NraIntervalUnsat)
+        .expect("the same clause IS a valid interval refutation");
+}
+
+#[test]
+fn test_nra_kinds_reject_linear_label_stealing() {
+    // A plain LINEAR contradiction (x > 1, x < 0) must be rejected by BOTH
+    // NRA kinds (nonlinearity gate): linear conflicts belong to the
+    // LraFarkas/LiaGeneric lanes and may not be relabeled.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let one = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+    let gt = terms.mk_gt(x, one);
+    let lt = terms.mk_lt(x, zero);
+    let clause = vec![terms.mk_not_raw(gt), terms.mk_not_raw(lt)];
+    for kind in [
+        TheoryLemmaKind::NraIntervalUnsat,
+        TheoryLemmaKind::NraUnivariateUnsat,
+    ] {
+        validate_theory_lemma_strict(&terms, clause.clone(), kind)
+            .expect_err("linear conflict must not certify under an NRA kind");
+    }
+}
+
+#[test]
+fn test_nra_kinds_reject_budget_bomb() {
+    // Degree-300 monomial trips the degree cap in both kinds.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let big = terms.mk_mul(vec![x; 300]);
+    let gt = terms.mk_gt(big, zero);
+    let lt = terms.mk_lt(big, zero);
+    let clause = nra_conj_clause(&mut terms, vec![gt, lt]);
+    for kind in [
+        TheoryLemmaKind::NraIntervalUnsat,
+        TheoryLemmaKind::NraUnivariateUnsat,
+    ] {
+        validate_theory_lemma_strict(&terms, clause.clone(), kind)
+            .expect_err("degree bomb must be rejected fail-closed");
+    }
+}
+
+#[test]
+fn test_nra_valid_instances_accept_under_their_kind() {
+    // Positive control: the mini-mbo interval refutation and the hong_1
+    // univariate refutation validate under their designated kinds through
+    // the full strict dispatcher.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let one = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+
+    let gx = terms.mk_gt(x, zero);
+    let gy = terms.mk_gt(y, zero);
+    let prod = terms.mk_mul(vec![x, y]);
+    let eq = terms.mk_eq(prod, zero);
+    let mbo_clause = nra_conj_clause(&mut terms, vec![gx, gy, eq]);
+    validate_theory_lemma_strict(&terms, mbo_clause, TheoryLemmaKind::NraIntervalUnsat)
+        .expect("strictly-positive product refutation must validate");
+
+    let sq = terms.mk_mul(vec![x, x]);
+    let lt = terms.mk_lt(sq, one);
+    let gt1 = terms.mk_gt(x, one);
+    let hong_clause = vec![terms.mk_not_raw(lt), terms.mk_not_raw(gt1)];
+    validate_theory_lemma_strict(&terms, hong_clause, TheoryLemmaKind::NraUnivariateUnsat)
+        .expect("hong_1-shaped univariate refutation must validate");
 }

@@ -26,6 +26,25 @@ fn test_numerals() {
 }
 
 #[test]
+fn test_leading_zero_runs_are_one_invalid_token() {
+    for source in ["00", "0123", "00.1", "01.25"] {
+        let mut lexer = Token::lexer(source);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token::InvalidLeadingZeroNumeral)),
+            "{source} must not split into legal adjacent numerals"
+        );
+        assert_eq!(lexer.next(), None);
+    }
+
+    let mut lexer = Token::lexer("0 12 0.0 12.003");
+    assert_eq!(lexer.next(), Some(Ok(Token::Numeral("0"))));
+    assert_eq!(lexer.next(), Some(Ok(Token::Numeral("12"))));
+    assert_eq!(lexer.next(), Some(Ok(Token::Decimal("0.0"))));
+    assert_eq!(lexer.next(), Some(Ok(Token::Decimal("12.003"))));
+}
+
+#[test]
 fn test_bitvectors() {
     let input = "#xDEADBEEF #b10101010";
     let mut lexer = Token::lexer(input);
@@ -53,6 +72,12 @@ fn test_keywords() {
 }
 
 #[test]
+fn test_keyword_cannot_start_with_a_digit() {
+    let mut lexer = Token::lexer(":1bad");
+    assert_eq!(lexer.next(), Some(Err(())));
+}
+
+#[test]
 fn test_booleans() {
     let input = "true false";
     let mut lexer = Token::lexer(input);
@@ -75,6 +100,15 @@ fn test_comments() {
 }
 
 #[test]
+fn test_comment_ends_at_carriage_return() {
+    let mut lexer = Token::lexer("; comment\r(check-sat)");
+    assert_eq!(lexer.next(), Some(Ok(Token::LParen)));
+    assert_eq!(lexer.next(), Some(Ok(Token::Symbol("check-sat"))));
+    assert_eq!(lexer.next(), Some(Ok(Token::RParen)));
+    assert_eq!(lexer.next(), None);
+}
+
+#[test]
 fn test_quoted_symbol() {
     let input = "|quoted symbol with spaces|";
     let mut lexer = Token::lexer(input);
@@ -83,6 +117,15 @@ fn test_quoted_symbol() {
         lexer.next(),
         Some(Ok(Token::QuotedSymbol("|quoted symbol with spaces|")))
     );
+}
+
+#[test]
+fn test_z3_500_escaped_quoted_symbol() {
+    let input = r"|\|\||";
+    let mut lexer = Token::lexer(input);
+
+    assert_eq!(lexer.next(), Some(Ok(Token::QuotedSymbol(input))));
+    assert_eq!(lexer.next(), None);
 }
 
 #[test]

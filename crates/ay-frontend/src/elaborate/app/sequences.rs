@@ -198,8 +198,16 @@ impl Context {
             }
             "seq.map" => {
                 self.expect_exact_arity("seq.map", arg_ids, 2)?;
-                let f_sort = self.terms.sort(arg_ids[0]).clone();
-                let result_elem = f_sort.array_element().cloned().unwrap_or(Sort::Int);
+                let (domain, result_elem) = match self.terms.sort(arg_ids[0]).clone() {
+                    Sort::Array(function) => (function.index_sort, function.element_sort),
+                    actual => {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: "Array function: seq.map first operand".to_string(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                };
+                self.expect_arg_sort(arg_ids[1], &Sort::seq(domain))?;
                 Ok(Some(self.terms.mk_app(
                     Symbol::named("seq.map"),
                     &arg_ids,
@@ -212,16 +220,38 @@ impl Context {
                 // `f : (Array Int (Array E R))` (libz3-cross-checked, matching
                 // `Z3_mk_seq_mapi` in ay-ffi). The result element sort is the
                 // INNER layer's range `R`, so peel two layers, not one.
-                let f_sort = self.terms.sort(arg_ids[0]).clone();
-                let result_elem = f_sort
-                    .array_element()
-                    .and_then(|inner| inner.array_element())
-                    .cloned()
-                    .unwrap_or(Sort::Int);
+                let outer = match self.terms.sort(arg_ids[0]).clone() {
+                    Sort::Array(function) => function,
+                    actual => {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: "two-argument Array function: seq.mapi first operand"
+                                .to_string(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                };
+                if outer.index_sort != Sort::Int {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "Int index domain: seq.mapi function".to_string(),
+                        actual: outer.index_sort.to_string(),
+                    });
+                }
+                let inner = match outer.element_sort {
+                    Sort::Array(function) => function,
+                    actual => {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: "two-argument Array function: seq.mapi first operand"
+                                .to_string(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                };
+                self.expect_arg_sort(arg_ids[1], &Sort::Int)?;
+                self.expect_arg_sort(arg_ids[2], &Sort::seq(inner.index_sort.clone()))?;
                 Ok(Some(self.terms.mk_app(
                     Symbol::named("seq.mapi"),
                     &arg_ids,
-                    Sort::seq(result_elem),
+                    Sort::seq(inner.element_sort),
                 )))
             }
             // `seq.fold_left` is z3's SMT-LIB spelling of `seq.foldl` (both

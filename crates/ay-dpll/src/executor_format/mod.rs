@@ -244,41 +244,39 @@ pub(crate) fn format_bigint(val: &num_bigint::BigInt) -> String {
 
 /// Format a `BigInt` as an SMT-LIB BitVec literal.
 ///
-/// SMT-LIB hex literals (#x...) are always 4*k bits wide, so we use:
-/// - `#x...` for widths divisible by 4
-/// - `#b...` for small widths (<=64 bits, not divisible by 4)
-/// - `(_ bv<value> <width>)` for large widths not divisible by 4
+/// This is the single canonical BV-numeral printer for the whole workspace:
+/// the CLI model/`get-value` path, the executor's term printer (which backs the
+/// Z3-compatible C API's `Z3_ast_to_string`), and every model renderer must go
+/// through it. A BV numeral's *printed form encodes its sort*, so getting this
+/// wrong silently changes the width of the term that a consumer reparses.
 ///
-/// (#1793)
-pub(crate) fn format_bitvec(val: &num_bigint::BigInt, width: u32) -> String {
-    use num_traits::ToPrimitive;
+/// SMT-LIB 2.6 hex literals (`#x...`) denote exactly 4 bits per digit, so they
+/// are well-formed only when the width is a multiple of 4. Every other width
+/// must print in binary (`#b...`), which denotes exactly 1 bit per digit. This
+/// matches z3 5.0.0 exactly, at every width (measured: `BV1/1 -> #b1`,
+/// `BV5/17 -> #b10001`, `BV65/1 -> #b0..01`, `BV8/255 -> #xff`).
+///
+/// The indexed `(_ bv<value> <width>)` form is deliberately NOT used: it is
+/// legal SMT-LIB but z3 never emits it, so it would be a gratuitous parity
+/// break. (#1793)
+pub fn format_bitvec(val: &num_bigint::BigInt, width: u32) -> String {
+    // Reduce into [0, 2^width) so negative inputs print their two's-complement
+    // bit pattern. `&` with the mask is only correct for non-negative values in
+    // sign-magnitude BigInt, so use a true modular reduction.
+    let modulus = num_bigint::BigInt::from(1u8) << width;
+    let unsigned_val: num_bigint::BigInt = ((val % &modulus) + &modulus) % &modulus;
 
-    // Compute mask for the given width
-    let mask = if width >= 64 {
-        num_bigint::BigInt::from(1) << width
-    } else {
-        num_bigint::BigInt::from(1u64 << width)
-    };
-
-    // Apply mask to get unsigned value
-    let unsigned_val: num_bigint::BigInt = val & (&mask - 1);
-
-    // Use hex only when width is divisible by 4
+    // Hex only when one hex digit maps to a whole number of bits.
     if width.is_multiple_of(4) {
         let hex_digits = (width / 4) as usize;
-        let hex_str = format!("{unsigned_val:x}");
-        let padded = format!("{hex_str:0>hex_digits$}");
-        return format!("#x{padded}");
+        let hex_str = unsigned_val.to_str_radix(16);
+        return format!("#x{hex_str:0>hex_digits$}");
     }
 
-    // For small non-divisible-by-4 widths, use binary format
-    if width <= 64 {
-        let v = unsigned_val.to_u64().unwrap_or(0);
-        return format!("#b{:0width$b}", v, width = width as usize);
-    }
-
-    // For large non-divisible-by-4 widths, use indexed bv format
-    format!("(_ bv{unsigned_val} {width})")
+    // Every other width: binary, one digit per bit, zero-padded to the width.
+    let bin_str = unsigned_val.to_str_radix(2);
+    let bin_digits = width as usize;
+    format!("#b{bin_str:0>bin_digits$}")
 }
 
 #[cfg(test)]

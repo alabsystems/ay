@@ -1850,11 +1850,13 @@ fn fp_vocabulary_binary64_gate_declines_binding_forms() {
 
 #[test]
 fn fp_dot_error_bound_declines_the_satisfiable_float32_clone() {
-    // THE PREREQUISITE, end to end. Identical parsed terms, two declaration
-    // tables. Both must decline today (the semantic-bridge authority gate is
-    // still closed), but the Float32 one must decline for the FORMAT reason —
-    // which is checked directly by the gate assertions below, so that if the
-    // authority gate is ever opened the Float32 clone stays refused.
+    // THE SINGLE MOST IMPORTANT TEST FOR THIS EMITTER. Identical parsed terms,
+    // two declaration tables. The Float64 original is UNSAT and now EMITS; the
+    // Float32 clone is SATISFIABLE (`guard_claim_guard2_float32_witness.smt2`
+    // pins a model with forward error 16777214 >= 2) and must decline. Nothing
+    // in the TERMS separates them, so the declared-format gate is the only
+    // thing standing between this emitter and a `no_model` certificate for a
+    // satisfiable formula.
     let (parsed, defined) = guard2_parsed_and_defined();
 
     assert!(parsed_fp_vocabulary_is_binary64(
@@ -1868,39 +1870,64 @@ fn fp_dot_error_bound_declines_the_satisfiable_float32_clone() {
         &fp_formats_of((8, 24))
     ));
 
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(
-        &parsed,
-        &defined,
-        &fp_formats_of((8, 24))
-    )
-    .is_none());
     assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
-            .is_none()
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(
+            &parsed,
+            &defined,
+            &fp_formats_of((8, 24))
+        )
+        .is_none(),
+        "the SATISFIABLE Float32 clone must never produce a no_model certificate"
     );
+    // Every OTHER non-binary64 format is refused too, including the wider ones
+    // (a Float128 clone is not something this bound was proved for).
+    for format in [(5, 11), (8, 24), (15, 113), (11, 54), (12, 53)] {
+        assert!(
+            emit_fp_dot_error_bound_firewall_lean_from_parsed(
+                &parsed,
+                &defined,
+                &fp_formats_of(format)
+            )
+            .is_none(),
+            "format {format:?} must decline"
+        );
+    }
+    // A leaf whose declaration is MISSING from the table declines: the emitter
+    // may not vouch for a value whose format it cannot read.
+    let mut missing_nx = f64_formats();
+    missing_nx.retain(|(name, _)| name != "nx");
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &missing_nx).is_none()
+    );
+
+    let lean = emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+        .expect("the binary64 original must emit");
+    assert!(lean.starts_with("import AySoundness.Firewall\nimport AySoundness.FpBridge\n"));
+    assert!(lean.contains("theorem no_model"));
 }
 
 #[test]
-fn declines_fp_dot_error_bound_guard2_inlined_from_parsed() {
+fn emits_fp_dot_error_bound_guard2_inlined_from_parsed() {
     // benchmarks/smt/QF_FPLRA/guard_claim_guard2.smt2 (define-funs inlined):
     // seven Float64 inputs, |n*|<=1, |p*|,|d|<=2^48, and the six-op RNE
     // signed-distance evaluation asserted to differ from the exact real dot by
-    // >= 2.0. The qround lemma alone does not connect this IEEE formula to its
-    // fixed-spacing model, so proof emission must decline.
+    // >= 2.0. Above the certified 17/64 bound, so it emits.
     let mut parsed = guard_mag_constraints("281474976710656.0");
     parsed.push(guard_threshold_inlined("2.0"));
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
-    assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
-            .is_none()
-    );
+    let lean = emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+        .expect("inlined guard2 must emit");
+    // The refuted claim is rendered scaled: `2 <= 1 * (rf - dot)`.
+    assert!(lean.contains("(2 : Rat) ≤ (1 : Rat) *"));
+    assert!(lean.contains("guard_claim_no_model"));
+    assert!(lean.contains("theorem no_model"));
 }
 
 #[test]
-fn declines_fp_dot_error_bound_guard2_with_define_fun_resolution() {
+fn emits_fp_dot_error_bound_guard2_with_define_fun_resolution() {
     // The REAL benchmark shape: rf/rreal/B/t1../s2 are parameter-less define-fun
-    // macros and the assertion references them by name. This remains fail-closed
-    // until an IEEE-to-qround theorem exists.
+    // macros and the assertion references them by name. The emitter resolves
+    // them, so this must produce the SAME artifact as the inlined form.
     let d = |n: &str, body: &str| (n.to_string(), parse_assertion(body));
     let defined = vec![
         d("B", "281474976710656.0"),
@@ -1918,57 +1945,67 @@ fn declines_fp_dot_error_bound_guard2_with_define_fun_resolution() {
     ];
     let mut parsed = guard_mag_constraints("B");
     parsed.push(parse_assertion("(>= (- (fp.to_real rf) rreal) 2.0)"));
-    assert!(
+    let macro_form =
         emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
-            .is_none()
-    );
+            .expect("macro guard2 must emit");
+
+    let mut inlined = guard_mag_constraints("281474976710656.0");
+    inlined.push(guard_threshold_inlined("2.0"));
+    let inlined_form =
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&inlined, &Vec::new(), &f64_formats())
+            .expect("inlined guard2 must emit");
+    assert_eq!(macro_form, inlined_form);
 }
 
 #[test]
-fn declines_fp_dot_error_bound_higher_threshold_without_ieee_bridge() {
-    // A larger threshold does not repair the missing semantic bridge.
+fn fp_dot_error_bound_emits_a_larger_threshold() {
+    // A larger threshold is refuted by the same 17/64 bound.
     let mut parsed = guard_mag_constraints("281474976710656.0");
     parsed.push(guard_threshold_inlined("4.0"));
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
     assert!(
         emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
-            .is_none()
+            .is_some()
     );
 }
 
 #[test]
-fn fp_dot_error_bound_threshold_authority_is_fail_closed_at_boundaries() {
+fn fp_dot_error_bound_threshold_gate_sits_exactly_at_17_over_64() {
+    // The certified accumulated forward error is 17/64 = 0.265625. The gate is
+    // `17*tden < 64*tnum`, i.e. STRICTLY above it: a claim of `error >= 17/64`
+    // is NOT refuted by a bound of `|error| <= 17/64` (equality is a model of
+    // the bound), so the boundary itself must decline.
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
-
-    // The binade-refined qround theorem is promising research, but it lacks a
-    // proved bridge from these IEEE-754 operations and magnitude hypotheses.
-    // Both sides of 0.3 therefore remain non-authoritative.
-    for threshold in ["0.299999999999999999", "0.3"] {
+    let emits = |threshold: &str| {
         let mut parsed = guard_mag_constraints("281474976710656.0");
         parsed.push(guard_threshold_inlined(threshold));
-        assert!(
-            emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
-                .is_none(),
-            "sub-2.0 threshold {threshold} must decline"
-        );
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+            .is_some()
+    };
+
+    // Strictly above 17/64 — refuted.
+    for threshold in [
+        "0.2656250000000001",
+        "0.27",
+        "0.299999999999999999",
+        "0.3",
+        "1.999999999999999999",
+        "2.0",
+        "4.0",
+    ] {
+        assert!(emits(threshold), "threshold {threshold} must emit");
     }
-
-    // The coarse model also lacks an IEEE bridge, on both sides of 2.0.
-    let mut below_two = guard_mag_constraints("281474976710656.0");
-    below_two.push(guard_threshold_inlined("1.999999999999999999"));
-    assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&below_two, &defined, &f64_formats())
-            .is_none(),
-        "threshold immediately below 2.0 must decline"
-    );
-
-    let mut at_two = guard_mag_constraints("281474976710656.0");
-    at_two.push(guard_threshold_inlined("2.0"));
-    assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&at_two, &defined, &f64_formats())
-            .is_none(),
-        "threshold 2.0 must decline without an IEEE-to-qround bridge"
-    );
+    // At or below 17/64 — NOT refuted by this bound.
+    for threshold in [
+        "0.265625",
+        "0.2656249999999999",
+        "0.2",
+        "0.0000001",
+        "0.0",
+        "-1.0",
+    ] {
+        assert!(!emits(threshold), "threshold {threshold} must decline");
+    }
 }
 
 #[test]
@@ -1976,8 +2013,11 @@ fn fp_dot_error_bound_oversized_rationals_decline_without_panicking() {
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
 
     // These exercise i128::MAX, one beyond MAX, textual MIN, a 10^38
-    // denominator, and an arbitrarily larger numeral. None may reach bounded
-    // scaling/cross-product arithmetic while the authority gate is closed.
+    // denominator, and an arbitrarily larger numeral. All are ABOVE 17/64 and
+    // would be genuinely refutable, but the emitter caps numerator and
+    // denominator at 10^18 so the threshold arithmetic and the rendered Lean
+    // literals stay overflow-free by construction: declining is the only
+    // acceptable behaviour, and it must happen without wrapping or panicking.
     for threshold in [
         "170141183460469231731687303715884105727",
         "170141183460469231731687303715884105728",
@@ -2051,6 +2091,166 @@ fn declines_fp_dot_error_bound_subthreshold_and_malformed() {
     assert!(
         emit_fp_dot_error_bound_firewall_lean_from_parsed(&reassoc, &defined, &f64_formats())
             .is_none()
+    );
+}
+
+#[test]
+fn fp_dot_error_bound_declines_every_near_miss_of_the_certified_shape() {
+    // Each case below differs from the emitting shape in exactly ONE way. The
+    // emitted certificate is a fixed thirteen-field model with fixed atoms, so
+    // any of these would make the artifact prove something OTHER than the
+    // asserted formula.
+    let f64s = f64_formats();
+    let none: Vec<(String, ay_frontend::command::Term)> = Vec::new();
+    let decline = |label: &str, parsed: &[ay_frontend::command::Term]| {
+        assert!(
+            emit_fp_dot_error_bound_firewall_lean_from_parsed(parsed, &none, &f64s).is_none(),
+            "{label} must decline"
+        );
+    };
+
+    // Baseline: the shape itself emits, so every decline below is attributable
+    // to the single change and not to a broken fixture.
+    let mut baseline = guard_mag_constraints("281474976710656.0");
+    baseline.push(guard_threshold_inlined("2.0"));
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&baseline, &none, &f64s).is_some(),
+        "baseline fixture must emit"
+    );
+
+    // The `fp.isNormal` conjunct dropped: `fp.to_real` is unspecified on NaN and
+    // ±∞, so `(<= (fp.to_real (fp.abs nx)) 1.0)` alone does not make `nx` a
+    // rational and the extraction of the atoms from a model fails.
+    let mut no_normal = baseline.clone();
+    no_normal[0] = parse_assertion("(<= (fp.to_real (fp.abs nx)) 1.0)");
+    decline("a leaf assertion without fp.isNormal", &no_normal);
+
+    // isNormal on one leaf, the bound on another.
+    let mut crossed = baseline.clone();
+    crossed[0] = parse_assertion("(and (fp.isNormal nx) (<= (fp.to_real (fp.abs ny)) 1.0))");
+    decline("a mismatched isNormal/bound pair", &crossed);
+
+    // A direction leaf bounded by 2^48 instead of 1: the products would no
+    // longer be capped at 2^48 and the certified spacing would not apply.
+    let mut wide_direction = baseline.clone();
+    wide_direction[0] =
+        parse_assertion("(and (fp.isNormal nx) (<= (fp.to_real (fp.abs nx)) 281474976710656.0))");
+    decline("a direction leaf bounded by 2^48", &wide_direction);
+
+    // A position leaf bounded by 1: TIGHTER than certified, so still sound in
+    // principle, but the emitted atom would assert a bound the formula does not
+    // contain. The match is exact in both directions.
+    let mut tight_position = baseline.clone();
+    tight_position[3] = parse_assertion("(and (fp.isNormal px) (<= (fp.to_real (fp.abs px)) 1.0))");
+    decline("a position leaf bounded by 1", &tight_position);
+
+    // Only six magnitude assertions (one duplicated): a leaf would be
+    // unconstrained.
+    let mut duplicated = baseline.clone();
+    duplicated[1] = duplicated[0].clone();
+    decline("a duplicated magnitude assertion", &duplicated);
+
+    // An extra assertion: the emitter models a FIXED eight-assertion set.
+    let mut extra = baseline.clone();
+    extra.push(parse_assertion("(fp.isNormal nx)"));
+    decline("a ninth assertion", &extra);
+
+    // Two claims.
+    let mut two_claims = baseline.clone();
+    two_claims[0] = guard_threshold_inlined("3.0");
+    decline("two claim assertions", &two_claims);
+
+    // An ALIASED leaf: `nx` used in two product slots. The Lean model has
+    // thirteen independent `Rat` fields, so aliasing must not be papered over.
+    let mut aliased = guard_mag_constraints("281474976710656.0");
+    aliased.push(parse_assertion(
+        "(>= (- (fp.to_real \
+            (fp.add RNE (fp.add RNE (fp.add RNE (fp.mul RNE nx px) (fp.mul RNE nx py)) \
+              (fp.mul RNE nz pz)) d)) \
+            (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real nx) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
+    ));
+    decline("an aliased leaf", &aliased);
+
+    // The exact real side naming a DIFFERENT leaf than the rounded side.
+    let mut wrong_real = guard_mag_constraints("281474976710656.0");
+    wrong_real.push(parse_assertion(
+        "(>= (- (fp.to_real \
+            (fp.add RNE (fp.add RNE (fp.add RNE (fp.mul RNE nx px) (fp.mul RNE ny py)) \
+              (fp.mul RNE nz pz)) d)) \
+            (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real px))) 2.0)",
+    ));
+    decline("an exact side naming the wrong offset", &wrong_real);
+
+    // The exact real side with a product's factors swapped: mathematically the
+    // same value, but the emitter transcribes positionally and refuses to
+    // silently reorder.
+    let mut swapped = guard_mag_constraints("281474976710656.0");
+    swapped.push(parse_assertion(
+        "(>= (- (fp.to_real \
+            (fp.add RNE (fp.add RNE (fp.add RNE (fp.mul RNE nx px) (fp.mul RNE ny py)) \
+              (fp.mul RNE nz pz)) d)) \
+            (+ (* (fp.to_real px) (fp.to_real nx)) (* (fp.to_real ny) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
+    ));
+    decline("an exact side with swapped factors", &swapped);
+
+    // `>` instead of `>=`, and `<=` instead of `>=`: the certified conflict is
+    // stated for `tnum <= tden * (rf - dot)`.
+    for op in ["<=", ">", "="] {
+        let mut wrong_op = guard_mag_constraints("281474976710656.0");
+        let claim = format!(
+            "({op} (- (fp.to_real \
+                (fp.add RNE (fp.add RNE (fp.add RNE (fp.mul RNE nx px) (fp.mul RNE ny py)) \
+                  (fp.mul RNE nz pz)) d)) \
+                (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
+                   (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)"
+        );
+        wrong_op.push(parse_assertion(&claim));
+        decline(&format!("a claim with `{op}`"), &wrong_op);
+    }
+
+    // `RNA` is a nearest-value mode and WOULD be sound under the tie-agnostic
+    // spec, but the emitter recognizes only the two RNE spellings.
+    let mut rna = guard_mag_constraints("281474976710656.0");
+    rna.push(parse_assertion(
+        "(>= (- (fp.to_real \
+            (fp.add RNE (fp.add RNE (fp.add RNE (fp.mul RNA nx px) (fp.mul RNE ny py)) \
+              (fp.mul RNE nz pz)) d)) \
+            (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
+    ));
+    decline("an RNA multiplication", &rna);
+
+    // A define-fun CYCLE must terminate in a decline, not a hang.
+    let cyclic = vec![
+        ("rf".to_string(), parse_assertion("(fp.add RNE s2 rf)")),
+        ("s2".to_string(), parse_assertion("rf")),
+    ];
+    let mut with_cycle = guard_mag_constraints("281474976710656.0");
+    with_cycle.push(parse_assertion("(>= (- (fp.to_real rf) rf) 2.0)"));
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&with_cycle, &cyclic, &f64s).is_none(),
+        "a define-fun cycle must decline"
+    );
+
+    // The long spelling of RNE is accepted.
+    let mut long_rne = guard_mag_constraints("281474976710656.0");
+    long_rne.push(parse_assertion(
+        "(>= (- (fp.to_real \
+            (fp.add roundNearestTiesToEven \
+              (fp.add roundNearestTiesToEven \
+                (fp.add roundNearestTiesToEven \
+                  (fp.mul roundNearestTiesToEven nx px) \
+                  (fp.mul roundNearestTiesToEven ny py)) \
+                (fp.mul roundNearestTiesToEven nz pz)) d)) \
+            (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
+    ));
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&long_rne, &none, &f64s).is_some(),
+        "roundNearestTiesToEven must be accepted"
     );
 }
 

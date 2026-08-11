@@ -304,6 +304,21 @@ impl Solver {
         VerifiedSatResult::from_validated(result)
     }
 
+    /// Interruptible solve without ambient environment-driven artifact export.
+    ///
+    /// The bounded in-memory ResolutionDag producer uses this crate-internal
+    /// entry point so an unrelated process environment variable cannot add
+    /// unmetered serialization or filesystem I/O to its resource envelope.
+    pub(crate) fn solve_interruptible_without_artifact<F>(
+        &mut self,
+        should_stop: F,
+    ) -> VerifiedSatResult
+    where
+        F: Fn() -> bool,
+    {
+        VerifiedSatResult::from_validated(self.solve_interruptible_raw(should_stop))
+    }
+
     /// Internal interruptible solve returning raw `SatResult`.
     fn solve_interruptible_raw<F>(&mut self, should_stop: F) -> SatResult
     where
@@ -461,7 +476,7 @@ impl Solver {
         // Each conflict analysis marks original antecedent clause IDs,
         // so the core is available immediately at UNSAT.
         let num_originals = self.cold.next_original_clause_id.saturating_sub(1);
-        if num_originals > 0 {
+        if self.cold.retain_unsat_certificate && num_originals > 0 {
             self.cold.streaming_core_num_originals = num_originals;
             self.cold.streaming_core = Some(vec![false; num_originals as usize]);
         } else {

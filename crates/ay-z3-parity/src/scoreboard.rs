@@ -2,10 +2,12 @@
 // Licensed under the Apache License, Version 2.0
 
 //! `scoreboard` subcommand — a per-division progress tracker for the AY↔z3
-//! parity campaign, on TWO metrics at once:
+//! parity campaign, on THREE metrics at once:
 //!
 //! * the **z3-agreement** metric (does AY decide what z3 decides, and agree),
-//!   and
+//! * the **declared-status** metric (does AY contradict the benchmark's own
+//!   `(set-info :status sat|unsat)`) — the only wrong-answer detector that
+//!   still works when z3 fails to decide the file, and
 //! * AY's own **self-certification** metric (of the answers AY gives, how many
 //!   can AY prove to *itself* via the fail-closed `ay solve --self-check`
 //!   gate) — the campaign's real, z3-independent north star.
@@ -20,9 +22,17 @@
 //! Output is a compact per-division table plus a persisted JSON certificate
 //! carrying all raw per-division and per-file data. Given a prior certificate
 //! via `--baseline`, a DELTA column tracks solved% / selfcert% / rating changes
-//! across runs. Any `sat`-vs-`unsat` DISAGREE (AY vs z3) — or any self-check
-//! answer that contradicts AY's own eval — is a wrong answer: it is surfaced
-//! as a prominent WARNING and forces a nonzero exit.
+//! across runs. Three things are wrong answers, each surfaced as a prominent
+//! WARNING and each forcing a nonzero exit: a `sat`-vs-`unsat` DISAGREE (AY vs
+//! z3), a DECLARED-CONFLICT (AY contradicts the file's own `:status`), and a
+//! self-check answer that contradicts AY's own eval.
+//!
+//! The declared-status gate exists because the z3 comparison has a blind spot
+//! it cannot see past: when z3 times out there is no DISAGREE to raise, so a
+//! wrong AY answer used to be credited as a "beyond z3" win. The benchmark's own
+//! annotation catches exactly that case, and `beyond_z3` credit is additionally
+//! split into self-certified and unverified so an unproved claim cannot read as
+//! demonstrated capability.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -36,11 +46,25 @@ use ay_bench::{PlannedResources, ResourcePlan};
 
 use crate::bench::{
     self, categorize, geomean, host_info, median, ratio_of, resource_evidence, run_one,
-    run_selfcheck, sha256_of, spawn_timeboxed, utc_now_iso, BenchOutcome, Category, OutcomeKind,
-    SelfCheck, WIN_LOSS_MIN_SECS,
+    run_selfcheck, sha256_of, spawn_timeboxed, utc_now_iso, BenchOutcome, Category, DeclaredStatus,
+    OutcomeKind, SelfCheck, WIN_LOSS_MIN_SECS,
 };
 use crate::diff::Verdict;
 use crate::loader;
+
+/// Schema version of the JSON certificate this build writes.
+///
+/// * 3 — added the declared-`:status` oracle: per-file `declared` /
+///   `declared_conflict`, per-division and total `declared_conflict` (a gate
+///   alongside `disagree`), and the `beyond_z3` split into
+///   `beyond_z3_self_certified` / `beyond_z3_unverified`.
+/// * 2 — the rating ladder (`rating` / `rating_ladder`).
+///
+/// Older certificates stay readable: the only reader in this crate is
+/// [`load_baseline`], which looks every field up by name and degrades a missing
+/// one to `new` / `-` in the DELTA column, so a v2 baseline still produces a
+/// DELTA for the metrics it does carry.
+const FORMAT_VERSION: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Rating-ladder noise floors (documented; see `DivStats::rating`)
@@ -375,6 +399,9 @@ struct FileRecord {
     /// `None` when z3 is unavailable (AY stands on self-cert alone).
     z3: Option<BenchOutcome>,
     selfcheck: SelfCheck,
+    /// The benchmark's own `(set-info :status ...)`. DERIVED from the file on
+    /// disk, like `category` and `ratio`, so it is never journalled.
+    declared: DeclaredStatus,
     /// AY-vs-z3 category; `None` when z3 is unavailable.
     category: Option<Category>,
     /// AY/z3 wall ratio, present iff decided-by-both.
@@ -397,9 +424,49 @@ impl FileRecord {
             Some(Category::AgreeSat | Category::AgreeUnsat | Category::AgreeMixed)
         )
     }
+    /// AY's decided answer contradicts the benchmark's OWN declared `:status` —
+    /// a wrong answer proved without z3.
+    ///
+    /// This is the gate z3 cannot supply. When z3 times out there is no
+    /// DISAGREE to raise, yet the file itself already states the answer, so
+    /// without this check a wrong verdict on a z3-timeout file is invisible —
+    /// and worse, gets counted as a `beyond_z3` win.
+    fn declared_conflict(&self) -> bool {
+        let Some(oracle) = self.declared.decided() else {
+            return false;
+        };
+        let Some(verdicts) = self.ay.verdicts() else {
+            return false;
+        };
+        self.ay_decided() && verdicts.iter().any(|v| verdict_contradicts(*v, oracle))
+    }
+
+    /// AY's decided answer matches the benchmark's declared `sat`/`unsat`. The
+    /// positive counterpart of [`Self::declared_conflict`]: on a file z3 does
+    /// not decide, this is what turns a claim into evidence.
+    fn declared_confirmed(&self) -> bool {
+        let Some(oracle) = self.declared.decided() else {
+            return false;
+        };
+        self.ay_decided()
+            && self
+                .ay
+                .verdicts()
+                .is_some_and(|vs| vs.iter().all(|v| *v == oracle))
+    }
+
     /// AY decides where z3 does not (z3 unknown / timeout / crash / no-verdict).
+    ///
+    /// A file whose answer is already known wrong is NOT capability: both an
+    /// AY-vs-z3 disagreement and a contradiction of the file's own `:status`
+    /// disqualify it, so a z3 timeout can no longer convert a wrong answer into
+    /// a credit.
     fn beyond_z3(&self) -> bool {
-        self.z3.is_some() && self.ay_decided() && !self.z3_decided() && !self.disagree()
+        self.z3.is_some()
+            && self.ay_decided()
+            && !self.z3_decided()
+            && !self.disagree()
+            && !self.declared_conflict()
     }
     /// A PAR coverage loss: z3 decides this file but AY does not.
     fn loss(&self) -> bool {
@@ -444,12 +511,18 @@ impl FileRecord {
 }
 
 fn verdicts_conflict(a: &[Verdict], b: &[Verdict]) -> bool {
-    a.iter().zip(b.iter()).any(|(x, y)| {
-        matches!(
-            (x, y),
-            (Verdict::Sat, Verdict::Unsat) | (Verdict::Unsat, Verdict::Sat)
-        )
-    })
+    a.iter()
+        .zip(b.iter())
+        .any(|(x, y)| verdict_contradicts(*x, *y))
+}
+
+/// `sat` against `unsat` — the only pair that proves someone is wrong. An
+/// `unknown` on either side contradicts nothing.
+fn verdict_contradicts(a: Verdict, b: Verdict) -> bool {
+    matches!(
+        (a, b),
+        (Verdict::Sat, Verdict::Unsat) | (Verdict::Unsat, Verdict::Sat)
+    )
 }
 
 /// AY/z3 peak-RSS ratio for one file (< 1 = AY leaner), present only when BOTH
@@ -473,11 +546,42 @@ struct DivStats {
     ay_agree: usize,
     disagree: usize,
     beyond: usize,
+    /// Among `beyond`: files AY also self-certified. The only part of the
+    /// beyond-z3 credit backed by a second AY-independent-of-itself run.
+    beyond_certified: usize,
+    /// Among `beyond`: files nothing corroborated. Reported separately so an
+    /// unverified claim can never be read as demonstrated capability.
+    beyond_unverified: usize,
     losses: usize,
     verdict_shape_mismatches: usize,
     self_cert: usize,
     self_conflict: usize,
+    /// Files declaring a decided `(set-info :status sat|unsat)` — the
+    /// denominator of the declared-status oracle.
+    declared_decided: usize,
+    /// Among `declared_decided`: AY's decided answer matches the declaration.
+    declared_confirmed: usize,
+    /// Among `declared_decided`: AY's decided answer CONTRADICTS the
+    /// declaration. A wrong answer; must be 0, counted whether or not z3
+    /// decided the file.
+    declared_conflict: usize,
+    /// `ay_wall / z3_wall` over EVERY decided-by-both file, each side floored
+    /// at [`bench::RATIO_FLOOR_SECS`] (0.1 ms) — NOT at [`WALL_FLOOR_SECS`].
+    /// On a file both solvers finish in microseconds this is timer granularity,
+    /// not a speed difference, so the geomean of this vector is dominated by
+    /// noise wherever a division is mostly trivial files. Kept for continuity
+    /// with published scoreboards; read [`Self::geo_ratio_timed`] instead.
     ratios: Vec<f64>,
+    /// `ay_wall / z3_wall` restricted to files whose SLOWER side clears
+    /// [`WALL_FLOOR_SECS`] — the same eligibility rule the rating ladder and
+    /// the 2x win/loss counters already use. This is the honest speed headline.
+    ratios_timed: Vec<f64>,
+    /// Σ of AY / z3 wall over decided-by-both files, in seconds. The
+    /// aggregate-cost view: unlike any geomean it is not distorted by a long
+    /// tail of trivial files, and it answers "how much longer does the whole
+    /// division take", which is what a replacement claim actually rests on.
+    sum_ay_wall: f64,
+    sum_z3_wall: f64,
     ay_wins_2x: usize,
     z3_wins_2x: usize,
     // --- rating-ladder accumulators --------------------------------------
@@ -523,6 +627,20 @@ impl DivStats {
         }
         if r.beyond_z3() {
             self.beyond += 1;
+            if r.self_certified() {
+                self.beyond_certified += 1;
+            } else {
+                self.beyond_unverified += 1;
+            }
+        }
+        if r.declared.decided().is_some() {
+            self.declared_decided += 1;
+        }
+        if r.declared_confirmed() {
+            self.declared_confirmed += 1;
+        }
+        if r.declared_conflict() {
+            self.declared_conflict += 1;
         }
         if r.loss() {
             self.losses += 1;
@@ -539,8 +657,14 @@ impl DivStats {
         if let Some(ratio) = r.ratio {
             self.ratios.push(ratio);
             if let Some(z3) = &r.z3 {
+                self.sum_ay_wall += r.ay.wall.as_secs_f64();
+                self.sum_z3_wall += z3.wall.as_secs_f64();
                 let slower = r.ay.wall.as_secs_f64().max(z3.wall.as_secs_f64());
                 if slower >= WIN_LOSS_MIN_SECS {
+                    // Same eligibility rule as the ladder: below the floor the
+                    // ratio is timer granularity, so it must not reach a
+                    // headline speed statistic.
+                    self.ratios_timed.push(ratio);
                     if ratio < 0.5 {
                         self.ay_wins_2x += 1;
                     } else if ratio > 2.0 {
@@ -600,11 +724,19 @@ impl DivStats {
         self.ay_agree += o.ay_agree;
         self.disagree += o.disagree;
         self.beyond += o.beyond;
+        self.beyond_certified += o.beyond_certified;
+        self.beyond_unverified += o.beyond_unverified;
         self.losses += o.losses;
         self.verdict_shape_mismatches += o.verdict_shape_mismatches;
         self.self_cert += o.self_cert;
         self.self_conflict += o.self_conflict;
+        self.declared_decided += o.declared_decided;
+        self.declared_confirmed += o.declared_confirmed;
+        self.declared_conflict += o.declared_conflict;
         self.ratios.extend_from_slice(&o.ratios);
+        self.ratios_timed.extend_from_slice(&o.ratios_timed);
+        self.sum_ay_wall += o.sum_ay_wall;
+        self.sum_z3_wall += o.sum_z3_wall;
         self.ay_wins_2x += o.ay_wins_2x;
         self.z3_wins_2x += o.z3_wins_2x;
         self.both_decided += o.both_decided;
@@ -632,6 +764,20 @@ impl DivStats {
         geomean(&self.ratios)
     }
 
+    /// Geomean WALL ratio over the noise-floor-eligible subset only (slower
+    /// side >= [`WALL_FLOOR_SECS`]). Prefer this over [`Self::geo_ratio`]: the
+    /// unrestricted one floors each side at 0.1 ms and so reports timer
+    /// granularity as a speed difference on trivially fast files.
+    fn geo_ratio_timed(&self) -> Option<f64> {
+        geomean(&self.ratios_timed)
+    }
+
+    /// Σay/Σz3 wall over decided-by-both files — the aggregate-cost ratio.
+    /// `None` when z3 spent no measurable time.
+    fn total_ratio(&self) -> Option<f64> {
+        (self.sum_z3_wall > 0.0).then(|| self.sum_ay_wall / self.sum_z3_wall)
+    }
+
     fn median_ratio(&self) -> Option<f64> {
         let mut s = self.ratios.clone();
         s.sort_by(|a, b| a.partial_cmp(b).expect("no NaN ratios"));
@@ -648,9 +794,10 @@ impl DivStats {
     ///
     /// The three tiers are the owner's definitions, encoded exactly:
     ///
-    /// * **PAR** — DISAGREE = 0, AND AY returns a decisive verdict matching
-    ///   z3's on every file z3 decides (0 undecided losses, 0 verdict-shape
-    ///   mismatches), AND on every decided-by-both file above `WALL_FLOOR`
+    /// * **PAR** — DISAGREE = 0 and DECLARED_CONFLICT = 0 (no wrong answers by
+    ///   either oracle), AND AY returns a decisive verdict matching z3's on
+    ///   every file z3 decides (0 undecided losses, 0 verdict-shape mismatches),
+    ///   AND on every decided-by-both file above `WALL_FLOOR`
     ///   `ay_wall <= z3_wall` (0 wall losses).
     /// * **SUPERIOR** — all of PAR, AND on every decided-by-both file above
     ///   `WALL_FLOOR` `ay_wall <= 0.5*z3_wall` (>= 2x faster; 0 `wall_not_2x`),
@@ -661,12 +808,22 @@ impl DivStats {
     ///   division (decisive on 100% of the track, not merely what z3 decides).
     ///
     /// `n/a` (`Rating::NotApplicable`) when z3 is absent or decided nothing
-    /// here — there is then nothing to rate AY against.
+    /// here — there is then nothing to rate AY against, EXCEPT that a nonzero
+    /// `declared_conflict` is below par outright: that wrong answer was proved
+    /// by the benchmark itself and needs no reference solver.
     fn rating(&self, z3_available: bool) -> Rating {
+        // A wrong answer proved by the benchmark's own `:status` is never
+        // "nothing to rate against": it needed no reference solver. Checked
+        // BEFORE the n/a case so a division z3 could not decide at all cannot
+        // hide a wrong answer behind `n/a`.
+        if self.declared_conflict > 0 {
+            return Rating::BelowPar;
+        }
         if !z3_available || self.z3_decided == 0 {
             return Rating::NotApplicable;
         }
         let par = self.disagree == 0
+            && self.declared_conflict == 0
             && self.losses == 0
             && self.verdict_shape_mismatches == 0
             && self.wall_losses == 0;
@@ -690,7 +847,7 @@ impl DivStats {
             Rating::NotApplicable => "n/a".to_string(),
             Rating::BelowPar => {
                 // uN undecided losses, sM slower-than-z3, dK disagreements,
-                // mJ verdict-shape mismatches.
+                // wL declared-status contradictions, mJ verdict-shape mismatches.
                 let mut parts = Vec::new();
                 if self.losses > 0 {
                     parts.push(format!("u{}", self.losses));
@@ -700,6 +857,9 @@ impl DivStats {
                 }
                 if self.disagree > 0 {
                     parts.push(format!("d{}", self.disagree));
+                }
+                if self.declared_conflict > 0 {
+                    parts.push(format!("w{}", self.declared_conflict));
                 }
                 if self.verdict_shape_mismatches > 0 {
                     parts.push(format!("m{}", self.verdict_shape_mismatches));
@@ -1252,30 +1412,45 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
                     Some(Category::AgreeSat | Category::AgreeUnsat | Category::AgreeMixed)
                 )
                 .then(|| ratio_of(&ay, z3.as_ref().expect("agree implies z3 present")));
-                if replayed {
-                    reused.fetch_add(1, Ordering::Relaxed);
-                }
-                let n_done = done.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!(
-                    "[{n_done}/{total}]{} {division} {}: z3={} ay={} self={} {}",
-                    if replayed { " (resumed)" } else { "" },
-                    file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                    z3.as_ref()
-                        .map(BenchOutcome::label)
-                        .unwrap_or_else(|| "-".into()),
-                    ay.label(),
-                    selfcheck.label(),
-                    category.map(Category::label).unwrap_or(""),
-                );
-                slots.lock().expect("slots poisoned")[i] = Some(FileRecord {
+                // Derived from the file on disk, never journalled — so a resumed
+                // run re-reads the annotation and can never carry a stale one.
+                let declared = bench::declared_status_of_file(file);
+                let record = FileRecord {
                     division: division.clone(),
                     file: file.clone(),
                     ay,
                     z3,
                     selfcheck,
+                    declared,
                     category,
                     ratio,
-                });
+                };
+                if replayed {
+                    reused.fetch_add(1, Ordering::Relaxed);
+                }
+                let n_done = done.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[{n_done}/{total}]{} {division} {}: z3={} ay={} self={} decl={} {}{}",
+                    if replayed { " (resumed)" } else { "" },
+                    file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    record
+                        .z3
+                        .as_ref()
+                        .map(BenchOutcome::label)
+                        .unwrap_or_else(|| "-".into()),
+                    record.ay.label(),
+                    record.selfcheck.label(),
+                    declared.as_str(),
+                    record.category.map(Category::label).unwrap_or(""),
+                    // A wrong answer must be visible the moment it happens, not
+                    // only in the summary 40 hours later.
+                    if record.declared_conflict() {
+                        " !! DECLARED-CONFLICT"
+                    } else {
+                        ""
+                    },
+                );
+                slots.lock().expect("slots poisoned")[i] = Some(record);
             });
         }
     });
@@ -1389,20 +1564,29 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
 
     // ---- soundness verdict + exit code ----
     let disagrees: Vec<&FileRecord> = records.iter().filter(|r| r.disagree()).collect();
+    let declared_conflicts: Vec<&FileRecord> =
+        records.iter().filter(|r| r.declared_conflict()).collect();
     let conflicts: Vec<&FileRecord> = records.iter().filter(|r| r.self_conflict()).collect();
-    let unsound = disagrees.len() + conflicts.len();
+    // A file can trip more than one detector; count FILES, so the headline is a
+    // count of wrong answers and not of alarms.
+    let unsound = records
+        .iter()
+        .filter(|r| r.disagree() || r.declared_conflict() || r.self_conflict())
+        .count();
     if unsound == 0 {
         println!(
-            "RESULT: PASS — 0 sat-vs-unsat disagreements (AY vs z3) and 0 \
-             self-check contradictions across {} files.",
+            "RESULT: PASS — 0 sat-vs-unsat disagreements (AY vs z3), 0 \
+             contradictions of a declared :status, and 0 self-check \
+             contradictions across {} files.",
             totals.files
         );
     } else {
         println!("{}", "!".repeat(72));
         println!(
             "WARNING: {unsound} WRONG ANSWER(S) — {} AY-vs-z3 DISAGREE, {} \
-             self-check contradiction(s). THIS RUN FAILS.",
+             DECLARED-CONFLICT, {} self-check contradiction(s). THIS RUN FAILS.",
             disagrees.len(),
+            declared_conflicts.len(),
             conflicts.len()
         );
         println!("{}", "!".repeat(72));
@@ -1410,9 +1594,23 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
             println!(
                 "  DISAGREE  {}  declared={} z3={} ay={}",
                 r.file.display(),
-                bench::declared_status(&r.file).unwrap_or_else(|| "(none)".into()),
+                r.declared.as_str(),
                 r.z3.as_ref().map(BenchOutcome::label).unwrap_or_default(),
                 r.ay.label()
+            );
+        }
+        // z3's verdict is printed here precisely because it is usually absent:
+        // these are the wrong answers the z3 comparison cannot see.
+        for r in &declared_conflicts {
+            println!(
+                "  DECLARED-CONFLICT  {}  declared={} ay={} z3={} z3-decided={}",
+                r.file.display(),
+                r.declared.as_str(),
+                r.ay.label(),
+                r.z3.as_ref()
+                    .map(BenchOutcome::label)
+                    .unwrap_or_else(|| "(absent)".into()),
+                r.z3_decided()
             );
         }
         for r in &conflicts {
@@ -1445,6 +1643,11 @@ struct Baseline {
     divisions: BTreeMap<String, BaselineDiv>,
 }
 
+/// Load a prior certificate for the DELTA column. Version-tolerant by
+/// construction: every field is looked up by name, so a `format_version` 2
+/// baseline (written before the declared-`:status` fields existed) still yields
+/// a DELTA for solved% / selfcert% / rating, and a field it lacks degrades to
+/// `new` / `-` instead of failing the run.
 fn load_baseline(path: &Path) -> Option<Baseline> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -1549,7 +1752,12 @@ fn stats_row(
         },
         pct_cell(s.selfcert_pct(), s.self_cert, s.ay_decided),
         if z3_available {
-            s.beyond.to_string()
+            // Certified/unverified inline: an unverified claim must never be
+            // readable as demonstrated capability.
+            format!(
+                "{} ({}c/{}u)",
+                s.beyond, s.beyond_certified, s.beyond_unverified
+            )
         } else {
             "n/a".to_string()
         },
@@ -1565,6 +1773,7 @@ fn stats_row(
         },
         s.rating_cell(z3_available),
         s.disagree.to_string(),
+        s.declared_conflict.to_string(),
     ];
     if let Some(b) = baseline {
         row.push(delta_cell(name, s, z3_available, b));
@@ -1588,6 +1797,7 @@ fn render_table(
         "MEM ay/z3",
         "RATING",
         "DISAGREE",
+        "DECL-CONF",
     ];
     if baseline.is_some() {
         headers.push("DELTA s/c/rating");
@@ -1627,14 +1837,18 @@ fn render_table(
     }
     out.push_str(
         "\nSOLVED% = ay-agree / z3-decided | SELFCERT% = ay-self-certified / ay-decided\n\
-         BEYOND = files AY decides but z3 does not\n\
+         BEYOND = files AY decides but z3 does not, as total (Nc self-certified / Nu unverified);\n\
+         \x20 a wrong answer is never credited, so a DECL-CONF file is excluded\n\
+         DISAGREE = positional sat-vs-unsat, AY vs z3 (needs z3 to have decided the file)\n\
+         DECL-CONF = AY's decided answer contradicts the file's own (set-info :status sat|unsat),\n\
+         \x20 counted even when z3 did not decide it — the wrong answers DISAGREE cannot see\n\
          GEO ay/z3 = geomean WALL ratio over decided-by-both (<1 = AY faster)\n\
          MEM ay/z3 = geomean PEAK-RSS ratio over decided-by-both above 5MB (<1 = AY leaner)\n\
          RATING (per division; floors: WALL 10ms, RSS 5MB):\n\
-         \x20 PAR      = DISAGREE 0, AY decides every z3 decision, ay_wall <= z3_wall on every decided-by-both file > 10ms\n\
+         \x20 PAR      = DISAGREE 0 and DECL-CONF 0, AY decides every z3 decision, ay_wall <= z3_wall on every decided-by-both file > 10ms\n\
          \x20 SUPERIOR = PAR + ay_wall <= 0.5*z3_wall (>=2x) on every such file + complete RSS evidence + ay_rss < 0.8*z3_rss on every decided-by-both file > 5MB; missing RSS blocks\n\
          \x20 PERFECT  = SUPERIOR + AY decides 100% of the track's files\n\
-         \x20 below(uN,sM,dK,mJ) = N undecided losses, M slower-than-z3, K disagreements, J verdict-shape mismatches\n\
+         \x20 below(uN,sM,dK,wL,mJ) = N undecided losses, M slower-than-z3, K disagreements, L declared-status contradictions, J verdict-shape mismatches\n\
          \x20 PAR(xN,mM,rK) = N miss 2x speed, M miss <80% memory, K lack RSS evidence | SUPERIOR(uN) = N track files AY doesn't solve\n",
     );
     if baseline.is_some() {
@@ -1675,6 +1889,14 @@ fn build_certificate(
             "ay_agree": s.ay_agree,
             "disagree": s.disagree,
             "beyond_z3": s.beyond,
+            // The beyond-z3 credit, split so an unverified claim cannot be read
+            // as demonstrated capability. certified + unverified == beyond_z3.
+            "beyond_z3_self_certified": s.beyond_certified,
+            "beyond_z3_unverified": s.beyond_unverified,
+            // The z3-independent oracle: the benchmarks' own :status.
+            "declared_decided": s.declared_decided,
+            "declared_confirmed": s.declared_confirmed,
+            "declared_conflict": s.declared_conflict,
             "self_certified": s.self_cert,
             "self_conflict": s.self_conflict,
             "solved_pct": s.solved_pct(),
@@ -1683,6 +1905,16 @@ fn build_certificate(
             "wall_ratio_sample_count": s.ratios.len(),
             "geomean_wall_ratio_ay_over_z3": s.geo_ratio(),
             "median_wall_ratio_ay_over_z3": s.median_ratio(),
+            // The honest speed headline: same eligibility rule as the ladder
+            // (slower side >= wall_floor_secs), so timer granularity on
+            // trivially fast files cannot reach it. Read this one.
+            "wall_ratio_timed_sample_count": s.ratios_timed.len(),
+            "geomean_wall_ratio_timed_ay_over_z3": s.geo_ratio_timed(),
+            // Aggregate cost: Σay/Σz3 over decided-by-both. Undistorted by a
+            // long tail of trivial files.
+            "total_wall_ratio_ay_over_z3": s.total_ratio(),
+            "sum_ay_wall_secs": s.sum_ay_wall,
+            "sum_z3_wall_secs": s.sum_z3_wall,
             "ay_wins_2x": s.ay_wins_2x,
             "z3_wins_2x": s.z3_wins_2x,
             // --- rating ladder (PAR / SUPERIOR / PERFECT / below / n/a) ---
@@ -1698,6 +1930,7 @@ fn build_certificate(
                 "verdict_shape_mismatches": s.verdict_shape_mismatches,
                 "wall_slower_than_z3": s.wall_losses,
                 "disagree": s.disagree,
+                "declared_conflict": s.declared_conflict,
                 // SUPERIOR blockers
                 "wall_below_2x": s.wall_not_2x,
                 "rss_at_or_above_80pct": s.rss_not_80,
@@ -1718,6 +1951,12 @@ fn build_certificate(
                 "self_check_detail": r.selfcheck.detail(),
                 "self_certified": r.self_certified(),
                 "category": r.category.map(Category::label),
+                // The file's own (set-info :status ...): "sat" | "unsat" |
+                // "unknown" | "absent". `absent` (no annotation) is deliberately
+                // distinct from a declared `unknown`.
+                "declared": r.declared.as_str(),
+                "declared_conflict": r.declared_conflict(),
+                "declared_confirmed": r.declared_confirmed(),
                 "beyond_z3": r.beyond_z3(),
                 "loss": r.loss(),
                 "verdict_shape_mismatch": r.verdict_shape_mismatch(),
@@ -1733,9 +1972,30 @@ fn build_certificate(
         .map(|r| {
             serde_json::json!({
                 "file": r.file.display().to_string(),
+                // Kept `null` for an unannotated file, as in format 2; the
+                // four-state token lives in the per-file `declared` field.
                 "declared_status": bench::declared_status(&r.file),
+                "declared": r.declared.as_str(),
                 "z3": r.z3.as_ref().map(BenchOutcome::label),
                 "ay": r.ay.label(),
+            })
+        })
+        .collect();
+    // The wrong answers the z3 comparison structurally cannot see: `z3_decided`
+    // is false for most of these, which is exactly why they need their own list.
+    let declared_conflict_files: Vec<_> = records
+        .iter()
+        .filter(|r| r.declared_conflict())
+        .map(|r| {
+            serde_json::json!({
+                "file": r.file.display().to_string(),
+                "division": r.division,
+                "declared": r.declared.as_str(),
+                "ay": r.ay.label(),
+                "z3": r.z3.as_ref().map(BenchOutcome::label),
+                "z3_decided": r.z3_decided(),
+                "self_check": r.selfcheck.label(),
+                "self_certified": r.self_certified(),
             })
         })
         .collect();
@@ -1750,9 +2010,22 @@ fn build_certificate(
             })
         })
         .collect();
+    // Which verdict oracles sat this run out. Each conflict counter is
+    // vacuously 0 when its oracle did not run, so this list is what keeps
+    // `pass` from being computed off silence. See the `pass` key below.
+    let mut gates_not_run: Vec<&str> = Vec::new();
+    if !z3_available {
+        gates_not_run.push("z3_agreement");
+    }
+    if totals.self_cert == 0 {
+        gates_not_run.push("self_certification");
+    }
+    if totals.declared_decided == 0 {
+        gates_not_run.push("declared_status");
+    }
     serde_json::json!({
         "kind": "ay-z3-scoreboard",
-        "format_version": 2,
+        "format_version": FORMAT_VERSION,
         "generated_utc": utc_now_iso(),
         "invocation": std::env::args().collect::<Vec<_>>().join(" "),
         "host": host_info(),
@@ -1800,11 +2073,15 @@ fn build_certificate(
         "campaign_wall_secs": campaign_wall.as_secs_f64(),
         "baseline": cfg.baseline.as_ref().map(|p| p.display().to_string()),
         "methodology": {
-            "z3_agreement": "solved% = ay-agree / z3-decided; DISAGREE = positional sat-vs-unsat (AY vs z3), must be 0",
+            "z3_agreement": "solved% = ay-agree / z3-decided; DISAGREE = positional sat-vs-unsat (AY vs z3), must be 0. This metric is BLIND wherever z3 did not decide the file — see declared_status, which covers exactly that gap",
+            "declared_status": "each input's own (set-info :status sat|unsat|unknown) is parsed (skipping ; comments, |quoted symbols| and \"strings\", so the prose in a :source blob is never mistaken for the annotation) and reported per file as declared = sat|unsat|absent|unknown, where absent (no annotation) is distinct from a declared unknown. DECLARED_CONFLICT = declared is sat|unsat AND AY decided AND AY's verdict contradicts it: a wrong answer proved without z3, counted even when z3 timed out or crashed on the file. Must be 0; it gates the run exactly as DISAGREE does",
+            "beyond_z3": "files AY decides that z3 does not, split into beyond_z3_self_certified and beyond_z3_unverified so an unverified claim cannot be read as demonstrated capability. A file whose answer is already known wrong (DISAGREE or DECLARED_CONFLICT) is never credited as beyond_z3",
             "self_certification": "selfcert% = files AY self-certifies (a source-coherent ay solve --self-check exits cleanly within the deadline and emits the same decisive verdict AY's eval gives) / files AY decides; the z3-independent metric",
-            "rating_ladder": "per division, highest tier reached. decided-by-both = files AY and z3 both decide. PAR = DISAGREE 0 AND AY returns a decisive verdict matching z3 on every file z3 decides (0 undecided losses + 0 verdict-shape mismatches) AND ay_wall <= z3_wall on every decided-by-both file above the WALL floor. SUPERIOR = PAR AND ay_wall <= 0.5*z3_wall on every such file (>=2x) AND complete peak-RSS evidence with ay_rss < 0.8*z3_rss on every decided-by-both file above the RSS floor (<80% peak). Missing RSS caps the rating at PAR. PERFECT = SUPERIOR AND AY decides 100% of the track's files. n/a when z3 is absent or decided nothing.",
+            "rating_ladder": "per division, highest tier reached. decided-by-both = files AY and z3 both decide. PAR = DISAGREE 0 AND DECLARED_CONFLICT 0 AND AY returns a decisive verdict matching z3 on every file z3 decides (0 undecided losses + 0 verdict-shape mismatches) AND ay_wall <= z3_wall on every decided-by-both file above the WALL floor. SUPERIOR = PAR AND ay_wall <= 0.5*z3_wall on every such file (>=2x) AND complete peak-RSS evidence with ay_rss < 0.8*z3_rss on every decided-by-both file above the RSS floor (<80% peak). Missing RSS caps the rating at PAR. PERFECT = SUPERIOR AND AY decides 100% of the track's files. n/a when z3 is absent or decided nothing.",
             "peak_rss": "each successful bench-one child self-reports getrusage(RUSAGE_SELF).ru_maxrss in BYTES after solver teardown; Darwin reports bytes, Linux kilobytes (normalized to bytes with cfg(target_os)); missing evidence fails closed for SUPERIOR/PERFECT",
             "isolation": "each (file, solver) pair and each self-check runs in a stopped-exec process group with a pre-exec zero-grace RSS watchdog, bounded stdout, and residual-descendant teardown before leader reap",
+            "speed_statistics": "THREE wall statistics are published and they do NOT share a noise floor. geomean_wall_ratio_ay_over_z3 is taken over EVERY decided-by-both file with each side floored at ratio_floor_secs (0.1 ms), so on a division of trivially fast files it reports timer granularity as a speed difference — it is retained only for continuity with previously published scoreboards. geomean_wall_ratio_timed_ay_over_z3 applies the SAME eligibility rule as the rating ladder and the 2x win/loss counters (slower side >= wall_floor_secs) and is the statistic to read; its denominator is wall_ratio_timed_sample_count, which may be far smaller than wall_ratio_sample_count. total_wall_ratio_ay_over_z3 is Σay/Σz3 over decided-by-both and answers the aggregate-cost question a replacement claim actually rests on.",
+            "ratio_floor_secs": bench::RATIO_FLOOR_SECS,
             "win_loss_min_secs": WIN_LOSS_MIN_SECS,
             "wall_floor_secs": WALL_FLOOR_SECS,
             "rss_floor_bytes": RSS_FLOOR_BYTES,
@@ -1813,8 +2090,35 @@ fn build_certificate(
         "totals": div_json("TOTAL", totals),
         "files": files_json,
         "disagree_files": disagree_files,
+        "declared_conflict_files": declared_conflict_files,
         "self_conflict_files": self_conflict_files,
-        "pass": totals.disagree == 0 && totals.self_conflict == 0,
+        // WHICH ORACLES ACTUALLY RAN. Each conflict counter is vacuously 0 when
+        // its oracle did not run, so `pass` computed from the counters alone
+        // reports success for a run that checked nothing. Measured on
+        // 2026-08-03: the z3 dylib defaulted to a python site-packages path that
+        // does not exist on this host, and the ay CLI failed the harness's own
+        // source-identity check, so the z3-agreement gate and the
+        // self-certification gate BOTH sat out — and the certificate still said
+        // `pass: true` off `disagree == 0` and `self_conflict == 0`.
+        "gates": {
+            "z3_agreement": z3_available,
+            // Self-certification ran iff it certified something; the harness
+            // refuses the CLI outright on a source mismatch, which yields 0.
+            "self_certification": totals.self_cert > 0,
+            // The z3-independent oracle: it ran iff some file carried a decided
+            // `(set-info :status)`.
+            "declared_status": totals.declared_decided > 0,
+        },
+        "gates_not_run": gates_not_run,
+        // Every wrong answer gates the run, whichever oracle proved it wrong —
+        // AND a gate that did not run cannot contribute a pass. FAIL-CLOSED:
+        // absent evidence is not evidence of absence.
+        "pass": totals.disagree == 0
+            && totals.declared_conflict == 0
+            && totals.self_conflict == 0
+            && z3_available
+            && totals.self_cert > 0
+            && totals.declared_decided > 0,
     })
 }
 
@@ -1844,7 +2148,8 @@ mod tests {
     }
 
     /// Build a `FileRecord` from fully-specified AY / z3 outcomes (used by the
-    /// rating-ladder tests that need to drive wall AND peak-RSS bars).
+    /// rating-ladder tests that need to drive wall AND peak-RSS bars). The file
+    /// declares nothing; [`declared`] attaches an annotation.
     fn rec_out(ay_o: BenchOutcome, z3_o: Option<BenchOutcome>, sc: SelfCheck) -> FileRecord {
         let category = z3_o.as_ref().map(|z| categorize(&ay_o, z));
         let ratio = matches!(
@@ -1858,9 +2163,16 @@ mod tests {
             ay: ay_o,
             z3: z3_o,
             selfcheck: sc,
+            declared: DeclaredStatus::Absent,
             category,
             ratio,
         }
+    }
+
+    /// Attach a benchmark's own `(set-info :status ...)` to a record.
+    fn declared(mut r: FileRecord, d: DeclaredStatus) -> FileRecord {
+        r.declared = d;
+        r
     }
 
     fn rec(
@@ -1875,6 +2187,64 @@ mod tests {
 
     /// A convenient MB constant for RSS-bar tests (all above the 5 MB floor).
     const MB: u64 = 1024 * 1024;
+
+    fn test_cfg() -> ScoreboardConfig {
+        ScoreboardConfig {
+            ay: PathBuf::from("missing-ay-lib"),
+            ay_cli: None,
+            z3: PathBuf::from("missing-z3-lib"),
+            root: PathBuf::from("missing-corpus"),
+            timeout_secs: 20,
+            jobs: 8,
+            json_out: PathBuf::from("unused.json"),
+            baseline: None,
+            divisions: None,
+            checkpoint: None,
+            resume: false,
+            sample: None,
+            seed: 0,
+            progress: None,
+        }
+    }
+
+    fn test_plan() -> ResourcePlan {
+        ResourcePlan {
+            requested_jobs: 8,
+            jobs: 3,
+            memlimit_mb_per_child: 2048,
+            nbcore_per_child: 2,
+            headroom_mb: 16_384,
+            planner: "scripts/_oom_guard.py".to_string(),
+        }
+    }
+
+    /// Build the JSON certificate for a set of records, as a real run would.
+    fn certificate_of(
+        records: &[FileRecord],
+        divisions: &BTreeMap<String, DivStats>,
+        totals: &DivStats,
+    ) -> serde_json::Value {
+        let cfg = test_cfg();
+        let plan = test_plan();
+        let evidence =
+            resource_evidence(&plan, Duration::from_secs(20), true).expect("resource evidence");
+        build_certificate(
+            &cfg,
+            records,
+            divisions,
+            totals,
+            None,
+            None,
+            None,
+            true,
+            None,
+            Duration::from_secs(1),
+            &plan,
+            &evidence,
+            records.len(),
+            None,
+        )
+    }
 
     #[test]
     fn certificate_uses_true_decided_by_both_and_persists_resource_plan() {
@@ -1892,49 +2262,8 @@ mod tests {
         assert!(stats.ratios.is_empty());
         let mut divisions = BTreeMap::new();
         divisions.insert("D".to_string(), stats.clone());
-        let cfg = ScoreboardConfig {
-            ay: PathBuf::from("missing-ay-lib"),
-            ay_cli: None,
-            z3: PathBuf::from("missing-z3-lib"),
-            root: PathBuf::from("missing-corpus"),
-            timeout_secs: 20,
-            jobs: 8,
-            json_out: PathBuf::from("unused.json"),
-            baseline: None,
-            divisions: None,
-            checkpoint: None,
-            resume: false,
-            sample: None,
-            seed: 0,
-            progress: None,
-        };
-        let plan = ResourcePlan {
-            requested_jobs: 8,
-            jobs: 3,
-            memlimit_mb_per_child: 2048,
-            nbcore_per_child: 2,
-            headroom_mb: 16_384,
-            planner: "scripts/_oom_guard.py".to_string(),
-        };
-        let evidence =
-            resource_evidence(&plan, Duration::from_secs(20), true).expect("resource evidence");
-        let cert = build_certificate(
-            &cfg,
-            &[record],
-            &divisions,
-            &stats,
-            None,
-            None,
-            None,
-            true,
-            None,
-            Duration::from_secs(1),
-            &plan,
-            &evidence,
-            1,
-            None,
-        );
-        assert_eq!(cert["format_version"], 2);
+        let cert = certificate_of(&[record], &divisions, &stats);
+        assert_eq!(cert["format_version"], 3);
         assert_eq!(cert["totals"]["decided_by_both"], 1);
         assert_eq!(cert["totals"]["wall_ratio_sample_count"], 0);
         assert_eq!(cert["totals"]["rating_ladder"]["decided_by_both"], 1);
@@ -2010,6 +2339,204 @@ mod tests {
         s.add(&r);
         assert_eq!(s.disagree, 1);
         assert_eq!(s.rating(true), Rating::BelowPar);
+    }
+
+    // ----------------------------------------------------------------------
+    // The declared-`:status` oracle: the wrong answers z3 cannot see
+    // ----------------------------------------------------------------------
+
+    /// The confirmed hole (scoreboard-2026-07-29-s50): on
+    /// `…UFBV…fixpoint__sdlx-fixpoint-5.smt2` the file declares `unsat`, AY
+    /// answered `sat`, and z3 TIMED OUT. With the gate defined only against z3
+    /// there was no DISAGREE to raise, the run PASSED, and the wrong answer was
+    /// even credited as a `beyond_z3` win. A declared conflict must be counted
+    /// with z3 undecided — that is the entire point of the metric.
+    #[test]
+    fn declared_conflict_counts_when_z3_did_not_decide() {
+        use Verdict::*;
+        let r = declared(
+            rec(
+                v(&[Sat]),
+                500,
+                Some(OutcomeKind::Timeout),
+                20_000,
+                SelfCheck::Timeout,
+            ),
+            DeclaredStatus::Unsat,
+        );
+        assert!(!r.z3_decided(), "premise: z3 decided nothing");
+        assert!(!r.disagree(), "z3 gave no verdict, so there is no DISAGREE");
+        assert!(r.declared_conflict(), "the file itself says AY is wrong");
+        assert!(!r.beyond_z3(), "a wrong answer is not capability");
+
+        let mut s = DivStats::default();
+        s.add(&r);
+        assert_eq!(s.declared_conflict, 1);
+        assert_eq!(s.disagree, 0, "the z3-based metric still reads 0 here");
+        assert_eq!(
+            s.beyond, 0,
+            "the wrong answer must lose its beyond_z3 credit"
+        );
+        assert_eq!(s.declared_decided, 1);
+        assert_eq!(s.declared_confirmed, 0);
+        // It gates the rating exactly as a disagreement does, and cannot hide
+        // behind `n/a` just because z3 decided nothing in this division.
+        assert_eq!(s.rating(true), Rating::BelowPar);
+        assert_eq!(s.rating(false), Rating::BelowPar);
+        assert!(
+            s.rating_cell(true).contains("w1"),
+            "{}",
+            s.rating_cell(true)
+        );
+    }
+
+    /// A declared conflict is reported and fails the run's pass/fail gate, in
+    /// the same certificate that reports the z3-based `disagree` (0 here).
+    #[test]
+    fn certificate_reports_declared_conflicts_and_fails_the_gate() {
+        use Verdict::*;
+        let record = declared(
+            rec(
+                v(&[Sat]),
+                500,
+                Some(OutcomeKind::Timeout),
+                20_000,
+                SelfCheck::Timeout,
+            ),
+            DeclaredStatus::Unsat,
+        );
+        let mut stats = DivStats::default();
+        stats.add(&record);
+        let mut divisions = BTreeMap::new();
+        divisions.insert("UFBV".to_string(), stats.clone());
+        let cert = certificate_of(&[record], &divisions, &stats);
+
+        assert_eq!(cert["format_version"], 3);
+        assert_eq!(cert["totals"]["declared_conflict"], 1);
+        assert_eq!(cert["divisions"][0]["declared_conflict"], 1);
+        assert_eq!(cert["totals"]["rating_ladder"]["declared_conflict"], 1);
+        assert_eq!(cert["totals"]["disagree"], 0);
+        assert_eq!(cert["files"][0]["declared"], "unsat");
+        assert_eq!(cert["files"][0]["declared_conflict"], true);
+        assert_eq!(
+            cert["files"][0]["beyond_z3"], false,
+            "a wrong answer must not read as capability"
+        );
+        assert_eq!(
+            cert["declared_conflict_files"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            cert["declared_conflict_files"][0]["z3_decided"], false,
+            "the entire point: z3 never decided this file"
+        );
+        assert_eq!(cert["disagree_files"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            cert["pass"], false,
+            "a wrong answer must fail the run whichever oracle proved it"
+        );
+    }
+
+    /// `absent` (no annotation) and a declared `unknown` are not oracles and
+    /// must accuse nobody — and neither can an `unknown` from AY.
+    #[test]
+    fn absent_or_unknown_declaration_accuses_nobody() {
+        use Verdict::*;
+        for d in [DeclaredStatus::Absent, DeclaredStatus::Unknown] {
+            let r = declared(
+                rec(
+                    v(&[Sat]),
+                    5,
+                    Some(OutcomeKind::Timeout),
+                    20_000,
+                    SelfCheck::Timeout,
+                ),
+                d,
+            );
+            assert!(!r.declared_conflict(), "{d:?} is not an oracle");
+            assert!(!r.declared_confirmed(), "{d:?} confirms nothing");
+            assert!(r.beyond_z3(), "an uncontradicted answer still counts");
+            let mut s = DivStats::default();
+            s.add(&r);
+            assert_eq!(s.declared_decided, 0, "{d:?} is not a decided declaration");
+        }
+        // AY answering `unknown` contradicts nothing, however the file is marked.
+        let r = declared(
+            rec(
+                v(&[Unknown]),
+                5,
+                None,
+                0,
+                SelfCheck::Verdicts(vec![Unknown]),
+            ),
+            DeclaredStatus::Unsat,
+        );
+        assert!(!r.declared_conflict());
+        assert!(!r.declared_confirmed());
+    }
+
+    /// The positive side of the oracle: AY's answer matching the declaration is
+    /// what turns a beyond-z3 claim into evidence.
+    #[test]
+    fn declared_confirmed_when_ay_matches_the_annotation() {
+        use Verdict::*;
+        let r = declared(
+            rec(
+                v(&[Unsat]),
+                500,
+                Some(OutcomeKind::Timeout),
+                20_000,
+                SelfCheck::Timeout,
+            ),
+            DeclaredStatus::Unsat,
+        );
+        assert!(r.declared_confirmed());
+        assert!(!r.declared_conflict());
+        assert!(r.beyond_z3());
+        let mut s = DivStats::default();
+        s.add(&r);
+        assert_eq!(s.declared_decided, 1);
+        assert_eq!(s.declared_confirmed, 1);
+        assert_eq!(s.declared_conflict, 0);
+    }
+
+    /// Beyond-z3 credit is split by whether AY re-proved the answer to itself.
+    /// 119 beyond-z3 files of which 66 were uncorroborated read as capability
+    /// while the split was invisible.
+    #[test]
+    fn beyond_z3_credit_is_split_into_certified_and_unverified() {
+        use Verdict::*;
+        let mut s = DivStats::default();
+        // AY decides where z3 is unknown, and re-proves it via --self-check.
+        s.add(&rec(
+            v(&[Unsat]),
+            5,
+            Some(v(&[Unknown])),
+            8,
+            SelfCheck::Verdicts(vec![Unsat]),
+        ));
+        // AY decides where z3 times out, with nothing corroborating the answer.
+        s.add(&rec(
+            v(&[Sat]),
+            5,
+            Some(OutcomeKind::Timeout),
+            20_000,
+            SelfCheck::Timeout,
+        ));
+        assert_eq!(s.beyond, 2);
+        assert_eq!(s.beyond_certified, 1);
+        assert_eq!(s.beyond_unverified, 1);
+        assert_eq!(s.beyond_certified + s.beyond_unverified, s.beyond);
+
+        let mut divisions = BTreeMap::new();
+        divisions.insert("D".to_string(), s.clone());
+        let cert = certificate_of(&[], &divisions, &s);
+        assert_eq!(cert["totals"]["beyond_z3"], 2);
+        assert_eq!(cert["totals"]["beyond_z3_self_certified"], 1);
+        assert_eq!(cert["totals"]["beyond_z3_unverified"], 1);
+        // And the table cell states the split rather than one flattering number.
+        let row = stats_row("D", &s, true, None);
+        assert!(row.contains(&"2 (1c/1u)".to_string()), "{row:?}");
     }
 
     #[test]
@@ -2561,6 +3088,64 @@ mod tests {
         assert_eq!(s.rating(true), Rating::Perfect);
     }
 
+    /// The headline speed statistic must not be fabricated by timer
+    /// granularity. `geo_ratio` floors each side at `RATIO_FLOOR_SECS`
+    /// (0.1 ms) and admits every decided-by-both file, so a 3 ms-vs-1 ms pair
+    /// — two solvers that are both instant — enters it as a 3x loss.
+    /// `geo_ratio_timed` applies the ladder's own eligibility rule and
+    /// excludes it. This asymmetry is the whole point of the second statistic:
+    /// if the two floors are ever unified the published 4.496x geomean becomes
+    /// unreproducible, so pin them apart.
+    #[test]
+    fn timed_geomean_excludes_sub_floor_files_that_the_raw_geomean_admits() {
+        use Verdict::*;
+        let mut s = DivStats::default();
+        // 3 ms vs 1 ms: both far below the 10 ms floor. Pure scheduler noise.
+        s.add(&rec_out(
+            ay_rss(v(&[Unsat]), 3, Some(MB)),
+            Some(ay_rss(v(&[Unsat]), 1, Some(MB))),
+            SelfCheck::Verdicts(vec![Unsat]),
+        ));
+        assert_eq!(s.ratios.len(), 1, "raw geomean admits the sub-floor file");
+        assert_eq!(
+            s.ratios_timed.len(),
+            0,
+            "the timed geomean must exclude it — below the floor a ratio is \
+             timer granularity, not a speed difference"
+        );
+        assert!(
+            s.geo_ratio().is_some_and(|g| g > 2.0),
+            "the raw statistic reports this noise as a >2x loss: {:?}",
+            s.geo_ratio()
+        );
+        assert_eq!(
+            s.geo_ratio_timed(),
+            None,
+            "with no eligible file the honest statistic reports nothing, \
+             rather than reporting noise"
+        );
+
+        // Now a genuinely timed file: 200 ms vs 100 ms is a real 2x loss.
+        s.add(&rec_out(
+            ay_rss(v(&[Unsat]), 200, Some(MB)),
+            Some(ay_rss(v(&[Unsat]), 100, Some(MB))),
+            SelfCheck::Verdicts(vec![Unsat]),
+        ));
+        assert_eq!(s.ratios_timed.len(), 1);
+        let timed = s.geo_ratio_timed().expect("one eligible file");
+        assert!(
+            (timed - 2.0).abs() < 1e-9,
+            "timed geomean must be exactly the eligible file's ratio, got {timed}"
+        );
+        // Σay/Σz3 = (3+200)/(1+100) — dominated by the file that took real
+        // time, which is the property that makes it worth publishing.
+        let total = s.total_ratio().expect("z3 spent measurable time");
+        assert!(
+            (total - 203.0 / 101.0).abs() < 1e-9,
+            "aggregate-cost ratio must be sum-based, got {total}"
+        );
+    }
+
     #[test]
     fn mem_geo_is_geomean_of_the_rss_ratios() {
         use Verdict::*;
@@ -2612,6 +3197,48 @@ mod tests {
         };
         let cell = delta_cell("D", &s, true, &base);
         assert!(cell.contains("PAR->SUPERIOR"), "{cell}");
+    }
+
+    /// Bumping `format_version` must not orphan the certificates already on
+    /// disk: a format-2 baseline (written before the declared-`:status` fields
+    /// existed) still loads and still yields a DELTA, because every field is
+    /// looked up by name.
+    #[test]
+    fn baseline_from_a_format_2_certificate_still_yields_delta() {
+        use Verdict::*;
+        let dir = std::env::temp_dir().join(format!(
+            "ay-z3-scoreboard-v2base-{}-{}",
+            std::process::id(),
+            utc_now_iso().replace([':', '-', '.'], "")
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("v2.json");
+        let v2 = serde_json::json!({
+            "kind": "ay-z3-scoreboard",
+            "format_version": 2,
+            "divisions": [
+                {"name": "D", "solved_pct": 90.0, "selfcert_pct": 50.0, "rating": "PAR"},
+            ],
+            "totals": {"name": "TOTAL", "solved_pct": 90.0, "selfcert_pct": 50.0, "rating": "PAR"},
+        });
+        std::fs::write(&path, v2.to_string()).expect("write");
+
+        let base = load_baseline(&path).expect("a format-2 baseline still loads");
+        assert!(base.divisions.contains_key("D"));
+        assert!(base.divisions.contains_key("TOTAL"));
+
+        let mut s = DivStats::default();
+        s.add(&rec_out(
+            ay_rss(v(&[Unsat]), 20, Some(8 * MB)),
+            Some(ay_rss(v(&[Unsat]), 50, Some(20 * MB))),
+            SelfCheck::Verdicts(vec![Unsat]),
+        ));
+        let cell = delta_cell("D", &s, true, &base);
+        assert!(cell.contains("s+10.0"), "{cell}");
+        assert!(cell.contains("c+50.0"), "{cell}");
+        assert!(cell.contains("PAR->PERFECT"), "{cell}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

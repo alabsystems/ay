@@ -194,6 +194,8 @@ struct MockContext {
     values: HashMap<u32, bool>,
     activities: HashMap<u32, f64>,
     decision_level: u32,
+    /// Solver variable-space size, needed by #6846 mid-search minting.
+    num_vars: usize,
 }
 
 impl MockContext {
@@ -202,6 +204,7 @@ impl MockContext {
             trail: vec![],
             values: HashMap::default(),
             activities: HashMap::default(),
+            num_vars: 0,
             decision_level: 0,
         }
     }
@@ -256,6 +259,10 @@ impl SolverContext for MockContext {
 
     fn new_assignments(&self, _last_pos: usize) -> &[Literal] {
         &self.trail
+    }
+
+    fn num_vars(&self) -> usize {
+        self.num_vars
     }
 }
 
@@ -2868,4 +2875,70 @@ fn dispatch_table_skips_non_theory_atoms() {
         0,
         "non-theory atom should not be asserted to theory solver"
     );
+}
+
+/// #6846: mid-search minting must name an unencoded term with a variable that
+/// cannot collide with the solver's existing variable space, must be stable
+/// across repeated lookups, and must refuse when it cannot know where that
+/// space ends.
+#[test]
+fn mint_var_for_term_allocates_above_solver_var_space_and_is_stable() {
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, y, _z]) =
+        create_test_setup();
+    let mut theory = MockTheory::new();
+    let mut ext = TheoryExtension::new(
+        &mut theory,
+        &var_to_term,
+        &term_to_var,
+        &theory_atoms,
+        &theory_atom_set,
+        Some(&terms),
+        None,
+    );
+
+    // An unencoded term: pick a TermId that the pre-solve encoding never mapped.
+    let unencoded = TermId(9_999);
+    assert!(
+        ext.var_for_term(unencoded).is_none(),
+        "precondition: the term must start unnamed"
+    );
+
+    // num_vars == 0 means "unknown"; minting must REFUSE rather than guess an id,
+    // because guessing would alias a fresh term onto a live variable.
+    let blind = MockContext::new();
+    assert!(
+        ext.mint_var_for_term(unencoded, &blind).is_none(),
+        "must refuse to mint when the solver's variable-space size is unknown"
+    );
+    assert!(ext.var_for_term(unencoded).is_none());
+
+    // With a known variable space, the minted id must sit ABOVE it.
+    let mut ctx = MockContext::new();
+    ctx.num_vars = 40;
+    let first = ext
+        .mint_var_for_term(unencoded, &ctx)
+        .expect("minting should succeed once num_vars is known");
+    assert!(
+        first.id() >= 40,
+        "minted id {} must not alias an existing solver variable (num_vars=40)",
+        first.id()
+    );
+
+    // Stability: a term must map to exactly ONE variable for the whole solve,
+    // or two clauses could name the same atom differently.
+    assert_eq!(ext.var_for_term(unencoded), Some(first));
+    assert_eq!(ext.mint_var_for_term(unencoded, &ctx), Some(first));
+
+    // A second distinct term gets a distinct id, still above the space.
+    let second_term = TermId(9_998);
+    let second = ext
+        .mint_var_for_term(second_term, &ctx)
+        .expect("second mint should succeed");
+    assert_ne!(first, second, "distinct terms must not share a variable");
+    assert!(second.id() >= 40);
+
+    // Pre-existing encodings still win: an already-encoded term is never renamed.
+    let x_var = ext.var_for_term(x).expect("x is encoded by the test setup");
+    assert_eq!(ext.mint_var_for_term(x, &ctx), Some(x_var));
+    assert!(ext.var_for_term(y).is_some());
 }

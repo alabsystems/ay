@@ -4,8 +4,10 @@
 //! Theory conflict inference for Alethe proof generation.
 //!
 //! This module maps theory solver conflicts to structured Alethe proof rules
-//! (EUF congruence, transitivity, LRA Farkas). When a structured rule can be
-//! inferred the proof is more precise than the generic `trust` fallback.
+//! (EUF congruence, transitivity, LRA Farkas, array axioms, ground/symbolic
+//! string-regex facts, pure-NRA interval/univariate refutations). When a
+//! structured rule can be inferred the proof is more precise than the generic
+//! `trust` fallback.
 //!
 //! Extracted from `proof_tracker.rs` for file-size hygiene (#4534).
 //! Split into submodules for code health (#5970):
@@ -16,7 +18,7 @@ mod decompose;
 mod euf;
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
     FarkasAnnotation, ProofId, Sort, Symbol, TermData, TermId, TermStore, TheoryConflict,
     TheoryLemmaKind, TheoryLit,
@@ -42,16 +44,27 @@ pub(crate) fn record_theory_conflict_unsat(
         return tracker.add_theory_lemma(conflict.iter().map(|lit| lit.term).collect::<Vec<_>>());
     };
 
-    // When neither EUF nor arithmetic inference succeeds,
-    // this falls back to Generic/trust. Potential improvements: string theory
-    // classifier, array axiom classifier, or combined-theory decomposition.
+    // When no single classifier recognises the whole conflict, try
+    // combined-theory decomposition before falling back to Generic/trust.
     let (kind, ordered_clause) = if let Some(terms) = terms {
-        let result = euf::infer_euf_lemma(terms, negations, conflict)
-            .or_else(|| infer_arith_farkas(terms, conflict, &clause))
-            .or_else(|| infer_array_lemma(terms, &clause))
-            .or_else(|| infer_string_ground_eval_lemma(terms, &clause))
-            .or_else(|| infer_regex_intersect_empty_lemma(terms, &clause));
-        result.unwrap_or((TheoryLemmaKind::Generic, clause))
+        match classify_whole_conflict(terms, negations, conflict, &clause) {
+            Some(result) => result,
+            None => {
+                // #combined-theory-decompose: a conflict no classifier accepts
+                // is usually MIXED — a single-theory core plus literals from
+                // other theories that the combination happened to carry along.
+                // The core's blocking clause IS a checkable single-theory
+                // lemma, and the full blocking clause follows from it by
+                // `weakening`, so emit the core with its real kind and weaken
+                // up to the clause the caller expects.
+                if let Some((core_kind, core_clause, full_clause)) =
+                    classifiable_core_decomposition(terms, negations, conflict, &clause)
+                {
+                    return tracker.add_theory_lemma_weakened(core_clause, core_kind, full_clause);
+                }
+                (TheoryLemmaKind::Generic, clause)
+            }
+        }
     } else {
         (TheoryLemmaKind::Generic, clause)
     };
@@ -134,6 +147,27 @@ pub(crate) fn infer_theory_lemma_kind_from_clause_terms_and_farkas(
     // validator cannot drift.
     if ay_proof::recognize_regex_intersect_empty(terms, clause) {
         return TheoryLemmaKind::RegexIntersectEmpty;
+    }
+
+    // Pure-NRA refutations (#nra-cert): a genuinely NONLINEAR real-arithmetic
+    // conflict (mbo/hong-class) whose negation the strict checker itself
+    // re-refutes. Recognition is the checker's own exact decision
+    // (`ay_proof::recognize_nra_univariate_unsat` — Sturm-based univariate
+    // cell decomposition — and `ay_proof::recognize_nra_interval_unsat` —
+    // bounded exact-rational interval propagation), so classifier and
+    // validator cannot drift. Univariate runs first: its one-variable gate is
+    // cheap and it is the more precise decision on univariate systems.
+    //
+    // These arms run BEFORE `arith_conflict_is_integer` so a nonlinear,
+    // real-refutable NIA conflict certifies instead of being tagged
+    // `LiaGeneric` and rejected; the checkers' nonlinearity gate guarantees
+    // no LINEAR conflict is touched (no label-stealing from
+    // LraFarkas/LiaGeneric).
+    if ay_proof::recognize_nra_univariate_unsat(terms, clause) {
+        return TheoryLemmaKind::NraUnivariateUnsat;
+    }
+    if ay_proof::recognize_nra_interval_unsat(terms, clause) {
+        return TheoryLemmaKind::NraIntervalUnsat;
     }
 
     if arith_conflict_is_integer(terms, &conflict) {
@@ -344,7 +378,7 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas(
     }
 }
 
-fn build_blocking_clause_terms(
+pub(crate) fn build_blocking_clause_terms(
     negations: &HashMap<TermId, TermId>,
     conflict: &[TheoryLit],
 ) -> Option<Vec<TermId>> {
@@ -414,21 +448,23 @@ fn classify_arith_conflict_kind(
     farkas: Option<&FarkasAnnotation>,
 ) -> TheoryLemmaKind {
     if let Some(farkas) = farkas {
-        // Structural shape check only (O(k)): verify coefficient count matches
-        // and all coefficients are non-negative.  The full semantic verification
-        // (`verify_farkas_conflict_lits_full`) parses every term into BigRational,
-        // explores up to 2^n equality-alternative combinations, and was measured
-        // at 42% of total QF_LRA solver time on clocksynchro/sc-* benchmarks.
-        // Classification only determines the Alethe proof rule; correctness does
-        // not depend on it.  Full semantic validation remains available in
-        // debug_assertions builds at the conflict-emission sites.
+        // A positional vector with the right length and sign is not yet proof
+        // authority: SAT/theory reordering or a producer defect can attach valid-
+        // looking coefficients to the wrong inequalities. `la_generic` is an
+        // externally checked proof rule, so classify it only after the exact
+        // LINEAR verifier accepts the certificate against this conflict. The
+        // linear variant deliberately excludes congruence reasoning unavailable
+        // to Alethe checkers.
         //
         // Additionally, ALL conflict literals must be la_generic-eligible:
         // pure linear arithmetic inequalities without equalities or UF terms.
         // Without this check, conflicts containing `(= (f x) 10)` or `(= a b)`
         // are misclassified as LraFarkas, causing Carcara rejection.
-        if ay_core::proof_validation::verify_farkas_annotation_shape(farkas, conflict.len()).is_ok()
-            && conflict_all_arith_literals(terms, conflict)
+        if conflict_all_arith_literals(terms, conflict)
+            && ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+                terms, conflict, farkas,
+            )
+            .is_ok()
         {
             return TheoryLemmaKind::LraFarkas;
         }
@@ -528,14 +564,82 @@ fn is_la_generic_eligible_literal(terms: &TermStore, atom: TermId) -> bool {
 /// applied recursively to pure LA terms.
 ///
 /// Returns false for: uninterpreted function applications like `f(x)`,
-/// select/store, or any non-arithmetic operation.
+/// select/store, or any non-arithmetic operation — and for NONLINEAR
+/// products/quotients, see below.
+///
+/// LINEARITY IS LOAD-BEARING, NOT COSMETIC (#nra-la-generic). `la_generic` is
+/// the LINEAR Farkas rule: a checker sums `Σ λᵢ·¬φᵢ` and demands the variable
+/// terms CANCEL. Accepting `(* skoX (* skoX c))` here classified a NONLINEAR
+/// QF_NRA conflict as `LraFarkas`, and — because the promotion in
+/// `classify_arith_conflict_kind` is a shape-only check on the coefficients,
+/// never a semantic one — AY emitted
+///
+///   (step t1 (cl (<= (* skoC -235/42) skoS)
+///                (<= (* skoX (+ -201381/11500 (* skoX -1258807/23000000))) 41844/23)
+///                (<= (* skoX (+ 57/500 (* skoX 361/1000000))) -12)
+///                (<= skoX 0)) :rule la_generic :args (1 1 1 1))
+///
+/// on `QF_NRA/meti-tarski/Chua/1/IL/L/Chua-1-IL-L-chunk-0034`. carcara rejects
+/// the whole document: nothing cancels, so the claimed contradiction is not
+/// one. The clause is a true tautology of NONLINEAR real arithmetic (it needs
+/// `skoX² ≥ 0`), but `la_generic` cannot express that, and `skoC`/`skoS` occur
+/// in no other literal so no Farkas combination could ever eliminate them.
+///
+/// Rejecting nonlinearity here demotes such conflicts to `Generic`, which the
+/// printer wires to `hole` — an honest unproved step — instead of an `invalid`
+/// certificate. Per `scripts/check_proofs.sh`: "A WRONG PROOF IS WORSE THAN NO
+/// PROOF." The test is purely syntactic (no `BigRational`), so linear logics
+/// are bit-identical: a QF_LRA/QF_LIA term has no variable×variable product.
 fn is_pure_la_term(terms: &TermStore, term: TermId) -> bool {
     match terms.get(term) {
         TermData::Const(ay_core::Constant::Int(_) | ay_core::Constant::Rational(_)) => true,
         TermData::Var(_, _) => matches!(terms.sort(term), Sort::Int | Sort::Real),
         TermData::App(Symbol::Named(name), args) => match name.as_str() {
-            "+" | "-" | "*" | "/" | "to_real" | "to_int" | "div" | "mod" | "abs" => {
+            "*" => {
+                // Linear only when at most ONE factor carries a variable.
                 args.iter().all(|&arg| is_pure_la_term(terms, arg))
+                    && args
+                        .iter()
+                        .filter(|&&arg| !is_ground_arith_term(terms, arg))
+                        .count()
+                        <= 1
+            }
+            "/" | "div" | "mod" => {
+                // Linear only when every DIVISOR is variable-free; `(/ x y)`
+                // and `(div x y)` over two variables are not linear terms.
+                // The UNARY form `(/ x)` is the reciprocal `1/x` — nonlinear
+                // unless `x` itself is ground — so it has no divisor to skip
+                // and every argument must be ground.
+                let divisors = if args.len() >= 2 {
+                    &args[1..]
+                } else {
+                    &args[..]
+                };
+                args.iter().all(|&arg| is_pure_la_term(terms, arg))
+                    && divisors.iter().all(|&arg| is_ground_arith_term(terms, arg))
+            }
+            "+" | "-" | "to_real" | "to_int" | "abs" => {
+                args.iter().all(|&arg| is_pure_la_term(terms, arg))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether an arithmetic term is GROUND (variable-free), i.e. it denotes a
+/// constant. Used by [`is_pure_la_term`] to tell a linear `(* 2 x)` from a
+/// nonlinear `(* x x)`; `(* (+ 1 2) x)` is still linear.
+///
+/// Deliberately conservative: anything not recognised as a ground arithmetic
+/// operator answers `false`, so an unknown shape can only make a term look
+/// LESS linear, never more.
+fn is_ground_arith_term(terms: &TermStore, term: TermId) -> bool {
+    match terms.get(term) {
+        TermData::Const(ay_core::Constant::Int(_) | ay_core::Constant::Rational(_)) => true,
+        TermData::App(Symbol::Named(name), args) => match name.as_str() {
+            "+" | "-" | "*" | "/" | "to_real" | "to_int" | "div" | "mod" | "abs" => {
+                args.iter().all(|&arg| is_ground_arith_term(terms, arg))
             }
             _ => false,
         },
@@ -834,6 +938,49 @@ mod tests {
         assert_eq!(
             infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, Some(&farkas)),
             TheoryLemmaKind::LraFarkas
+        );
+    }
+
+    #[test]
+    fn la_generic_eligibility_rejects_variable_products_and_divisors() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let y = terms.mk_var("y", Sort::Real);
+        let two = terms.mk_rational(num_rational::BigRational::from(BigInt::from(2)));
+
+        let scaled = terms.mk_mul(vec![x, two]);
+        let product = terms.mk_mul(vec![x, y]);
+        let divided_by_constant = terms.mk_div(x, two);
+        let divided_by_variable = terms.mk_div(x, y);
+
+        assert!(is_pure_la_term(&terms, scaled));
+        assert!(!is_pure_la_term(&terms, product));
+        assert!(is_pure_la_term(&terms, divided_by_constant));
+        assert!(!is_pure_la_term(&terms, divided_by_variable));
+    }
+
+    #[test]
+    fn la_generic_classification_requires_semantically_valid_coefficients() {
+        use num_rational::BigRational;
+
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+        let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
+        let le_zero = terms.mk_le(x, zero);
+        let ge_one = terms.mk_ge(x, one);
+        let conflict = [TheoryLit::new(le_zero, true), TheoryLit::new(ge_one, true)];
+
+        let valid = FarkasAnnotation::from_ints(&[1, 1]);
+        assert_eq!(
+            classify_arith_conflict_kind(&terms, &conflict, Some(&valid)),
+            TheoryLemmaKind::LraFarkas
+        );
+
+        let misbound = FarkasAnnotation::from_ints(&[2, 1]);
+        assert_eq!(
+            classify_arith_conflict_kind(&terms, &conflict, Some(&misbound)),
+            TheoryLemmaKind::Generic
         );
     }
 
@@ -1174,4 +1321,130 @@ mod tests {
         assert_eq!(removed, 0);
         assert_eq!(clause.len(), 6);
     }
+}
+
+/// Run the single-theory classifier chain over a whole conflict.
+///
+/// Extracted so the same chain can be applied to a SUB-conflict during
+/// combined-theory decomposition (#combined-theory-decompose).
+fn classify_whole_conflict(
+    terms: &TermStore,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    euf::infer_euf_lemma(terms, negations, conflict)
+        .or_else(|| infer_arith_farkas(terms, conflict, clause))
+        .or_else(|| infer_array_lemma(terms, clause))
+        .or_else(|| infer_string_ground_eval_lemma(terms, clause))
+        .or_else(|| infer_regex_intersect_empty_lemma(terms, clause))
+        .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
+}
+
+/// How many literals the core search may drop from a mixed conflict.
+///
+/// The mixed conflicts observed in practice carry a small number of foreign
+/// literals (sampled shapes: a datatype-tester core plus one or two equalities,
+/// a set/array core plus a select). Three covers those while keeping the search
+/// small; the attempt cap below is the real bound.
+const DECOMPOSE_MAX_DROPPED: usize = 3;
+
+/// Hard cap on classifier invocations per conflict, so a wide conflict cannot
+/// turn proof production into a combinatorial search.
+const DECOMPOSE_MAX_ATTEMPTS: usize = 512;
+
+/// Find a single-theory core inside a mixed conflict (#combined-theory-decompose).
+///
+/// Returns `(kind, core_clause, full_clause)` where `core_clause` is the
+/// classifier's own ordering of the core literals and `full_clause` is the
+/// complete blocking clause with `core_clause` as a PREFIX — the exact shape
+/// `weakening` requires (`ay-proof` `validate_weakening`: the premise clause
+/// must be a prefix of the result).
+///
+/// Soundness: the emitted core lemma is checked by its own kind's validator, and
+/// weakening a valid clause by appending literals preserves validity. The full
+/// clause is literal-for-literal the same SET the caller would have emitted as
+/// `Generic`, so nothing downstream sees a different fact — only a checkable
+/// justification for it.
+fn classifiable_core_decomposition(
+    terms: &TermStore,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>)> {
+    // `clause[i]` is the blocking literal for `conflict[i]`
+    // (`build_blocking_clause_terms` maps them positionally).
+    if conflict.len() != clause.len() || conflict.len() < 2 {
+        return None;
+    }
+
+    let mut attempts = 0usize;
+    let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
+
+    // Prefer the LARGEST core: dropping fewer literals keeps more of the
+    // conflict inside the checked lemma.
+    for dropped in 1..=max_dropped {
+        let mut drop_idx = (0..dropped).collect::<Vec<usize>>();
+        loop {
+            if attempts >= DECOMPOSE_MAX_ATTEMPTS {
+                return None;
+            }
+            attempts += 1;
+
+            let keep: Vec<usize> = (0..conflict.len())
+                .filter(|i| !drop_idx.contains(i))
+                .collect();
+            let sub_conflict: Vec<TheoryLit> = keep.iter().map(|&i| conflict[i]).collect();
+            let sub_clause: Vec<TermId> = keep.iter().map(|&i| clause[i]).collect();
+
+            if let Some((kind, core_clause)) =
+                classify_whole_conflict(terms, negations, &sub_conflict, &sub_clause)
+            {
+                // The classifier may reorder its literals; the core must stay a
+                // prefix, so rebuild the full clause as core ++ dropped.
+                let core_set: HashSet<TermId> = core_clause.iter().copied().collect();
+                if core_set.len() != core_clause.len() {
+                    // Duplicate literals would make the prefix check ambiguous.
+                    return None;
+                }
+                let mut full_clause = core_clause.clone();
+                for &lit in clause {
+                    if !core_set.contains(&lit) {
+                        full_clause.push(lit);
+                    }
+                }
+                // Only accept when the weakened clause still covers the original
+                // blocking clause exactly; otherwise the caller's fact changed.
+                let full_set: HashSet<TermId> = full_clause.iter().copied().collect();
+                let orig_set: HashSet<TermId> = clause.iter().copied().collect();
+                if full_set != orig_set {
+                    return None;
+                }
+                return Some((kind, core_clause, full_clause));
+            }
+
+            // Next combination of dropped indices (lexicographic).
+            let mut pos = dropped;
+            loop {
+                if pos == 0 {
+                    break;
+                }
+                pos -= 1;
+                if drop_idx[pos] < conflict.len() - (dropped - pos) {
+                    drop_idx[pos] += 1;
+                    for later in pos + 1..dropped {
+                        drop_idx[later] = drop_idx[later - 1] + 1;
+                    }
+                    break;
+                }
+                if pos == 0 {
+                    return None;
+                }
+            }
+            if drop_idx[0] > conflict.len() - dropped {
+                break;
+            }
+        }
+    }
+    None
 }

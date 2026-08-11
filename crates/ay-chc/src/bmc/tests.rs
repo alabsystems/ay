@@ -4734,3 +4734,73 @@ fn distinct_body_predicates_still_reach_safe() {
         "distinct body predicates are encoded exactly; this must stay Safe, got {result:?}"
     );
 }
+
+/// Completeness half of the same fix: a repeated-body-predicate problem that is
+/// genuinely UNSAFE must be REFUTED, not merely declined.
+///
+/// Failing closed on the level-flat `Safe` alone leaves every such problem at
+/// `Unknown`. `BmcSolver::solve` now hands them to
+/// `solve_bounded_tree_refutation`, whose derivation-TREE encoding gives each
+/// occurrence of `P` its own fresh variables, so `P(0)` and `P(1)` can be
+/// derived independently and joined by the query. The verdict is published only
+/// after the reconstructed derivation is re-checked against the ORIGINAL
+/// clauses, so this is a refutation, not a guess.
+#[test]
+fn repeated_body_predicate_unsafe_problem_is_refuted() {
+    let smt = r#"
+(set-logic HORN)
+(declare-fun P (Int) Bool)
+(assert (P 0))
+(assert (P 1))
+(assert (forall ((x Int) (y Int)) (=> (and (P x) (P y) (not (= x y))) false)))
+(check-sat)
+"#;
+    let problem = crate::parser::ChcParser::parse(smt).unwrap();
+    let solver = BmcSolver::new(
+        problem,
+        BmcConfig::default()
+            .with_max_depth(4)
+            .with_acyclic_safe(true),
+    );
+    let result = solver.solve();
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("the tree lane must refute this repeated-body-predicate problem, got {result:?}");
+    };
+    let derivation = cex
+        .ground_derivation
+        .as_ref()
+        .expect("the refutation must carry the ground derivation it was accepted on");
+    crate::ground_derivation::validate_ground_derivation(&solver.problem, derivation)
+        .expect("the published derivation must validate against the ORIGINAL clauses");
+    let query_clause =
+        &solver.problem.clauses()[derivation.steps[derivation.query_step].clause_index];
+    assert_eq!(
+        derivation.steps[derivation.query_step].premises.len(),
+        query_clause.body.predicates.len(),
+        "both occurrences of P must be justified by their OWN premise step"
+    );
+}
+
+/// The tree lane itself must reach a query that joins several premises.
+///
+/// `solve_bounded_tree_refutation` used to skip every query whose body has more
+/// than one predicate, which is exactly the shape a repeated body predicate
+/// produces — so the "exact" lane could not see these problems at all.
+#[test]
+fn tree_refutation_handles_multi_premise_query() {
+    let smt = r#"
+(set-logic HORN)
+(declare-fun P (Int) Bool)
+(assert (P 0))
+(assert (P 1))
+(assert (forall ((x Int) (y Int)) (=> (and (P x) (P y) (not (= x y))) false)))
+(check-sat)
+"#;
+    let problem = crate::parser::ChcParser::parse(smt).unwrap();
+    let solver = BmcSolver::new(problem, BmcConfig::default().with_max_depth(4));
+    let result = solver.solve_bounded_tree_refutation(3, std::time::Duration::from_secs(10), 6000);
+    assert!(
+        matches!(result, ChcEngineResult::Unsafe(_)),
+        "the derivation-tree lane must refute a multi-premise query, got {result:?}"
+    );
+}

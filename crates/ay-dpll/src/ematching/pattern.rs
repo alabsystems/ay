@@ -613,6 +613,7 @@ pub(super) fn extract_patterns_with_fallback(
         if !groups.is_empty() {
             let fallback = auto_trigger_groups(
                 terms,
+                quantifier,
                 body,
                 vars.len(),
                 &actual_var_names,
@@ -631,6 +632,7 @@ pub(super) fn extract_patterns_with_fallback(
 
     auto_trigger_groups(
         terms,
+        quantifier,
         body,
         vars.len(),
         &actual_var_names,
@@ -640,6 +642,7 @@ pub(super) fn extract_patterns_with_fallback(
 
 fn auto_trigger_groups(
     terms: &TermStore,
+    quantifier: TermId,
     body: TermId,
     num_vars: usize,
     actual_var_names: &HashMap<String, usize>,
@@ -651,6 +654,7 @@ fn auto_trigger_groups(
         body,
         actual_var_names,
         actual_names_by_idx,
+        terms.quantifier_no_patterns(quantifier),
         &mut patterns,
     );
 

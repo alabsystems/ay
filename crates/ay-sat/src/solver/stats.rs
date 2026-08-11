@@ -759,6 +759,16 @@ impl Solver {
         self.num_propagations
     }
 
+    /// Propagations performed by the CDCL search loop only.
+    ///
+    /// `num_propagations` also counts probing, vivification, sweeping and
+    /// lookahead BCP, so it is *not* the counterpart of Kissat's
+    /// `search_propagations`. Use this one for cross-solver
+    /// propagations-per-conflict comparisons.
+    pub fn num_search_propagations(&self) -> u64 {
+        self.num_search_propagations
+    }
+
     /// Get the number of chronological backtracks performed during solving
     pub fn num_chrono_backtracks(&self) -> u64 {
         self.stats.chrono_backtracks
@@ -1013,6 +1023,20 @@ impl Solver {
     /// Arena compaction reorders clauses in VMTF decision-queue order for
     /// cache locality (CaDiCaL arenatype=3). Triggered after reduce_db when
     /// dead space exceeds the adaptive threshold.
+    pub fn factor_skip_breakdown(&self) -> Vec<(&'static str, u64)> {
+        crate::solver::inprocessing::FactorSkipReason::TAGS
+            .iter()
+            .zip(self.cold.factor_skip_counts)
+            .map(|(&tag, n)| (tag, n))
+            .collect()
+    }
+
+    /// Arena compactions requested at a non-quiescent moment.
+    pub fn num_arena_compaction_skips(&self) -> u64 {
+        self.cold.num_arena_compaction_skips
+    }
+
+    /// Arena compactions performed.
     pub fn num_arena_compactions(&self) -> u64 {
         self.cold.num_arena_compactions
     }
@@ -1593,6 +1617,19 @@ impl Solver {
     /// Get the number of currently active clauses (excludes deleted) (#8131).
     pub fn active_clause_count(&self) -> usize {
         self.arena.active_clause_count()
+    }
+
+    /// Arena words accounted dead, i.e. reclaimable by compaction. This is the
+    /// quantity `should_compact_arena` tests, so it belongs next to
+    /// [`Self::arena_words`] in any memory diagnosis.
+    pub fn arena_dead_words(&self) -> usize {
+        self.arena.dead_words()
+    }
+
+    /// Clause slots the arena has ever allocated and not yet compacted away
+    /// (active plus deleted-but-still-occupying).
+    pub fn arena_clause_slots(&self) -> usize {
+        self.arena.num_clauses()
     }
 
     /// Get phase timing: preprocess wall-clock nanoseconds.

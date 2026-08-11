@@ -83,8 +83,25 @@ Z3_OP_SELECT = 769
 Z3_OP_BNUM = 1024
 Z3_OP_BADD = 1028
 
-Z3_OP_INTERNAL = 1536
-Z3_OP_UNINTERPRETED = 45102
+Z3_OP_FINITE_SET_EMPTY = 49152
+Z3_OP_FINITE_SET_SINGLETON = 49153
+Z3_OP_FINITE_SET_UNION = 49154
+Z3_OP_FINITE_SET_INTERSECT = 49155
+Z3_OP_FINITE_SET_DIFFERENCE = 49156
+Z3_OP_FINITE_SET_IN = 49157
+Z3_OP_FINITE_SET_SIZE = 49158
+Z3_OP_FINITE_SET_SUBSET = 49159
+Z3_OP_FINITE_SET_MAP = 49160
+Z3_OP_FINITE_SET_FILTER = 49161
+Z3_OP_FINITE_SET_RANGE = 49162
+Z3_OP_FINITE_SET_EXT = 49163
+Z3_OP_FINITE_SET_MAP_INVERSE = 49164
+Z3_OP_INTERNAL = 49165
+Z3_OP_RECURSIVE = 49166
+Z3_OP_UNINTERPRETED = 49167
+
+Z3_PARAMETER_INT = 0
+Z3_PARAMETER_SORT = 4
 
 # Sequence/string value decl kind (z3py reports StringVal(...).decl().kind()).
 Z3_OP_SEQ_VALUE = 45100
@@ -590,17 +607,26 @@ def _fd_kind(self):
 
 
 def _fd_params(self):
-    """Integer parameters of the declaration (z3py FuncDeclRef.params()).
-
-    Only the integer parameters AY's C ABI exposes are returned (e.g. an
-    Extract's bit indices). A synthesized const/literal declaration (no backing
-    func_decl handle) has none.
-    """
+    """Typed declaration parameters (z3py FuncDeclRef.params())."""
     if not self.handle:
         return []
     n = lib.Z3_get_decl_num_parameters(self.ctx.ref, self.handle)
-    return [lib.Z3_get_decl_int_parameter(self.ctx.ref, self.handle, i)
-            for i in range(n)]
+    result = []
+    for i in range(n):
+        kind = lib.Z3_get_decl_parameter_kind(self.ctx.ref, self.handle, i)
+        if kind == Z3_PARAMETER_INT:
+            result.append(lib.Z3_get_decl_int_parameter(self.ctx.ref, self.handle, i))
+        elif kind == Z3_PARAMETER_SORT:
+            sort = lib.Z3_get_decl_sort_parameter(self.ctx.ref, self.handle, i)
+            if not sort:
+                self.ctx.check_error("FuncDeclRef.params")
+                raise _M.AyZ3Exception("AY returned a null sort declaration parameter")
+            result.append(_M._sort_from_handle(sort, self.ctx))
+        else:
+            raise _M.AyZ3Exception(
+                f"unsupported declaration parameter kind {kind} at index {i}"
+            )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +673,25 @@ _FUNCDECL_METHODS = {
     "params": _fd_params,
 }
 
+_FINITE_SET_DECL_CONSTANTS = [
+    "Z3_OP_FINITE_SET_EMPTY",
+    "Z3_OP_FINITE_SET_SINGLETON",
+    "Z3_OP_FINITE_SET_UNION",
+    "Z3_OP_FINITE_SET_INTERSECT",
+    "Z3_OP_FINITE_SET_DIFFERENCE",
+    "Z3_OP_FINITE_SET_IN",
+    "Z3_OP_FINITE_SET_SIZE",
+    "Z3_OP_FINITE_SET_SUBSET",
+    "Z3_OP_FINITE_SET_MAP",
+    "Z3_OP_FINITE_SET_FILTER",
+    "Z3_OP_FINITE_SET_RANGE",
+    "Z3_OP_FINITE_SET_EXT",
+    "Z3_OP_FINITE_SET_MAP_INVERSE",
+    "Z3_OP_INTERNAL",
+    "Z3_OP_RECURSIVE",
+    "Z3_OP_UNINTERPRETED",
+]
+
 
 def install(mod):
     """Attach the introspection predicates and accessor methods onto `mod`.
@@ -665,6 +710,9 @@ def install(mod):
 
     exported = []
     for name in _PREDICATES:
+        setattr(mod, name, globals()[name])
+        exported.append(name)
+    for name in _FINITE_SET_DECL_CONSTANTS:
         setattr(mod, name, globals()[name])
         exported.append(name)
 

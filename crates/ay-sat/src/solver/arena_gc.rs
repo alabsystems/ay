@@ -81,6 +81,29 @@ impl Solver {
         (base_pct + overhead_bias).clamp(MIN_THRESHOLD_PCT, MAX_THRESHOLD_PCT)
     }
 
+    /// Run a compaction that `reduce_db` had to defer, if BCP has now drained.
+    ///
+    /// `reduce_db` runs at the tail of conflict analysis, where the asserting
+    /// literal of the freshly learned clause is always still on the propagation
+    /// queue — so compaction there always hit its quiescence guard and did
+    /// nothing at all, letting the arena grow without bound. The search loops
+    /// call this at their post-BCP scheduling point, which is quiescent.
+    pub(super) fn run_deferred_arena_compaction(&mut self) {
+        if !self.cold.arena_compaction_pending {
+            return;
+        }
+        if self.qhead < self.trail.len() || !self.pending_theory_conflicts.is_empty() {
+            return; // still not quiescent; try again next time round
+        }
+        if self.vsids.vmtf_is_deferred() {
+            self.vsids.rebuild_vmtf_from_bump_order(&self.vals);
+        }
+        self.compact_arena_locality();
+        // `compact_arena_locality` clears the flag once it commits; clear it
+        // here too so an empty-order bail-out cannot spin on every iteration.
+        self.cold.arena_compaction_pending = false;
+    }
+
     /// Compact the clause arena in VMTF decision-queue order for cache locality.
     /// Reference: CaDiCaL collect.cpp:385-399 (arenatype=3).
     pub(super) fn compact_arena_locality(&mut self) {
@@ -89,8 +112,10 @@ impl Solver {
         // can happen legitimately during reduce_db since learned clause deletion
         // doesn't drain the propagation queue.
         if self.qhead < self.trail.len() || !self.pending_theory_conflicts.is_empty() {
+            self.cold.num_arena_compaction_skips += 1;
             return;
         }
+        self.cold.arena_compaction_pending = false;
 
         // 1. Build clause visit order from VMTF queue + watch lists.
         let arena_len = self.arena.len();
@@ -137,6 +162,7 @@ impl Solver {
         }
 
         if ordered.is_empty() {
+            self.cold.num_arena_compaction_skips += 1;
             return;
         }
 

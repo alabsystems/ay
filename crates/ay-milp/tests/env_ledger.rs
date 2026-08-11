@@ -31,12 +31,27 @@ use std::path::Path;
 const DOC_EXAMPLES: &[&str] = &["AY_MILP_NO_CUTZ", "AY_", "AY_MILP_NO_", "AY_MILP_"];
 
 /// Pull every `AY_[A-Z0-9_]+` token out of `text`.
+///
+/// The `AY_` must start a WORD. Without that boundary the scan matched the
+/// literal at any byte offset, so ordinary Rust identifiers manufactured
+/// phantom env names out of their own middles: `AMO_MULTIW|AY_MAX_WIDTH` and
+/// `AMO_MULTIW|AY_MAX_CANDIDATES` (`src/cardinality_branch.rs`) were reported
+/// as unregistered knobs.
+///
+/// Registering a phantom is the trap, not the fix. `every_ay_env_name_in_source
+/// _is_in_the_ledger` would pass because the name is now listed, AND
+/// `the_ledger_does_not_invent_names` would pass because it uses this same
+/// scanner and still finds the substring — two mutually self-consistent tests,
+/// both wrong, with `ay-milp knobs --list` advertising a switch nothing reads.
+/// That is precisely the `AY_MILP_NO_CUTZ` defect this ledger exists to catch,
+/// installed inside the ledger. Fix the scanner.
 fn tokens(text: &str) -> BTreeSet<String> {
     let b = text.as_bytes();
     let mut out = BTreeSet::new();
     let mut i = 0;
     while i + 3 <= b.len() {
-        if &b[i..i + 3] == b"AY_" {
+        let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if &b[i..i + 3] == b"AY_" && boundary {
             let mut j = i + 3;
             while j < b.len()
                 && (b[j].is_ascii_uppercase() || b[j].is_ascii_digit() || b[j] == b'_')
@@ -331,6 +346,21 @@ fn the_census_matches_the_survey() {
     // DEFAULT 0 = OFF, so unset is bit-identical to a build without it; it shares
     // `AY_MILP_NO_COLD_LU` rather than adding a second kill switch because it moves the
     // seeding vertex by exactly the mechanism that band already accepted.
+    //
+    // IT IS DEFAULT-OFF BECAUSE IT WAS MEASURED AND DID NOT WIN, which is the reason the
+    // name is registered at all -- an arm nobody can re-run is a result nobody can check.
+    // 52 models, 60s, one frozen binary, both arms: over the 18 promoted models eta
+    // rebuilds fall 29,338 -> 2,383 (12.3x) and REFAC time 271.3s -> 59.7s, and one root
+    // LP goes Stopped -> Optimal. The verdict ledger is still NET NEGATIVE, +3 / -6, with
+    // ZERO ref_obj disagreements -- the losses are tightness and throughput, never a wrong
+    // answer. The cause is the finding the knob was built on, now visible at the decision:
+    // the promotion trades a rebuild bill for an FT UPDATE bill whose size is set by spike
+    // density, and the trigger cannot see spike density. In the promoted arm uccase12 runs
+    // 0.1% dense at 71,690 ns/update while ex9 runs 67.6% at 4,787,213 -- 4.8ms per update
+    // -- and the dense-spike models' partial root bounds get WORSE for the switch (ex9
+    // 7.459 -> 6.218, atlanta-ip 2522.74 -> 1998.49). Closing it needs the DEMOTION half,
+    // which is the one direction where the predictor exists, because `LU_FTRAN_REACH` only
+    // becomes readable once the LU lane is already running.
     // 7 -> 10 dead, and this one was NOT a new name: it is three OLD names that the
     // hand-typed `read_sites` column had been hiding. `read_site_counts_are_derived`
     // now derives the column from the source, and on its first run 23 of 353 entries
@@ -355,8 +385,228 @@ fn the_census_matches_the_survey() {
     // instance; it now refuses the run. A check with no escape hatch is a check
     // people delete, so the hatch is part of the change rather than a concession.
     // It reads INDIRECTLY (via the `ALLOW_UNKNOWN_ENV` const), so it is ROUTED.
-    assert_eq!(total, 354, "AY_* name count moved");
-    assert_eq!(dead, 10, "dead-knob count moved");
+    // 354 -> 356: two KillSwitches, both A/B arms for reporting-only fixes to the
+    // global dual bound. `AY_MILP_NO_TREE_FLOOR` restores the pre-fix
+    // min-over-open-nodes (the tree's claim is now floored by the root's own
+    // bound, which a min over re-derived node duals does not respect).
+    // `AY_MILP_NO_RC_CAP_GUARD` restores reduced-cost caps that close an OPEN
+    // column side at any magnitude at all — measured up to 5.8e20 on a model
+    // whose largest bound is 673.5.
+    // 356 -> 357: `AY_MILP_IMPLIED_COL_BOUNDS`, the OPT-IN arm for the
+    // implied-column-bound rescue in `safe_bound` — a column open on the side its
+    // exact reduced cost charges asks the ROWS for a corner (exact rationals, one
+    // pass, no write-back) instead of forfeiting the node's whole bound. Default
+    // OFF: measured, it closes zero root declines and costs 2.6x node throughput.
+    // 357 -> 358: `AY_MILP_NO_CERT_DECOUPLE` (KillSwitch), the A/B arm for
+    // DECOUPLING the root reductions from tree-certificate capture. The kernel
+    // reformulation and duplicate-column dedup were gated on
+    // `opts.tree_cert_leaves == 0` because neither one's reduced TREE lifts into the
+    // caller's frame — and `SolveOpts` DEFAULTS that field to 256, so both
+    // reductions were off on default options. The trade was one-sided by
+    // construction: `tree_cert` exists on `Outcome::Infeasible` and on no other
+    // variant, so every OPTIMAL / FEASIBLE / BOUND / UNKNOWN solve surrendered a
+    // reduction for an artifact it could never receive. The reductions now run
+    // unconditionally and the artifact is bought only where it is possible, by ONE
+    // re-solve of the caller's own model (`bab::harvest_tree_cert_by_resolve`) — the
+    // same move the symmetry lane has always made at its `Infeasible` exit.
+    // Registered as a kill switch, not an arm, because the decoupling is a shipped
+    // DEFAULT and the repo's rule is that a shipped default keeps an arm restoring
+    // the prior behaviour byte-identically: with it set, both gates collapse back to
+    // `tree_cert_leaves == 0` and the harvest becomes unreachable, so one name
+    // restores the whole prior path rather than half of it.
+    // 358 -> 359: `AY_MILP_NO_MIR_GENINT` (KillSwitch), the A/B arm for NARROWING the
+    // MIR-class self-gate (`cuts::mir_family_inert`) from all-INTEGRAL to all-BINARY.
+    // Registered as a kill switch, not an arm, because the narrowing is a shipped DEFAULT
+    // and the repo's rule is that a shipped default keeps an arm restoring the prior
+    // behaviour byte-identically -- which this one does exactly: the switch is read once
+    // per process into a `OnceLock` and simply swaps `is_integral()` back in for
+    // `== ColKind::Binary`, so with it set every separation decision is the historical
+    // one, INCLUDING the MIR class's per-round wall budget, which is scoped to the models the
+    // narrowing admits. It is also the arm the measurement rests on -- one binary, two runs,
+    // no rebuild between them -- and the measurement is large: haprp goes from a 300s BOUND
+    // 3666028.211734 at 640,876 nodes with NO INCUMBENT AT ALL to OPTIMAL 3673280.681685 in
+    // 63.2s at 357,624 nodes, on a root closure that moves 0% -> 96.2%. Serial root-closure
+    // A/B over the 62 admitted instances: 16 BETTER, 0 WORSE, 30 same on the 46 non-large
+    // members; 0 verdicts gained or lost and 0 soundness violations at a 30s solve budget.
+    // 359 -> 360: `AY_MILP_ADOPT_FT_MAX_ROWS` (Tuning). Not a new lever -- a name for
+    // an EXISTING one. A gate audit found the FT-adoption row ceiling reading
+    // `REFACTOR_TALL_ROWS` directly with no override, while its cold-root sibling has
+    // `AY_MILP_COLD_LU_MAX_ROWS`. 106 of 379 corpus instances sit above that ceiling
+    // and there was no way to run ANY of them with adoption on, so the ceiling's own
+    // premise could not be checked even in principle. The DEFAULT IS UNCHANGED:
+    // making a gate measurable and moving it are different acts, and re-tuning an
+    // unmeasurable gate by guess is how the original size-gate defects were
+    // introduced. Each top-level solve that actually reaches the excluded branch
+    // is now charged once to the forgone-cost census.
+    // 360 -> 362: FEASIBILITY-MODE DETECTION — the objective-≡0 model class
+    // (`Model::objective_is_identically_zero`) and its two consumers. One name per
+    // behaviour, each in the bucket its DEFAULT earns:
+    //
+    //   AY_MILP_NO_FEAS_CONFLICT  KillSwitch. The conflict levers, re-gated on the
+    //     class instead of on SIZE, and SHIPPED ON. Nogood unit propagation and
+    //     nogood-guided branching required 1,000+ LP rows or an assembled
+    //     orbitope, propagation-conflict learning required the orbitope, and VSIDS
+    //     was default-off although its own comment names this regime by name. All
+    //     three arm on BIG models and go dark on SMALL ones — backwards for a
+    //     class whose difficulty is tree SIZE at a few hundred rows and whose dual
+    //     bound is permanently 0. Measured on 46 ny W1 captures at 30s, serial,
+    //     one binary: nodes-to-proof over the 25 instances both arms decide fall
+    //     112,124 -> 10,234 (10.96x), over the 15 UNSAT among them 111,778 ->
+    //     9,888 (11.30x) and their wall 44.9s -> 23.7s, with zero verdict changes
+    //     anywhere. A shipped default keeps an arm that restores the prior
+    //     behaviour byte-identically, and this one does exactly that.
+    //
+    //   AY_MILP_AUTO_MARGIN  Arm, DEFAULT OFF. The margin reframe's AUTO-DETECTED
+    //     row. The `margin` module was written for this exact class ("a relational
+    //     whole-net verifier emits an objective-≡0 FEASIBILITY MILP ... a single
+    //     one-sided violation row") and was UNREACHABLE from a plain `check()`:
+    //     `mark_margin_row`'s only non-test callers require the CALLER to name the
+    //     row, so every model that arrives as a file — every ny W1 model — never
+    //     saw it. Registered as an ARM and not a kill switch for the same reason
+    //     `AY_MILP_CUT_FRAC_PENALTY` and `AY_MILP_RINS_DRYCAP` are: it was
+    //     measured and it LOST, and the value of the name is that the negative
+    //     stays re-checkable. Same 46 captures, same binary: 25/46 -> 22/46
+    //     decided, sat roots 8/10 -> 10/10, unsat roots 2/13 -> 1/13, and 379 ->
+    //     41,867 nodes over the commonly decided set. A margin objective is a
+    //     PRIMAL driver, so it finds witnesses and cannot close the refutation ny
+    //     actually wants. Unset is bit-identical to a build without it.
+    //
+    // Neither can reach a model with a real objective, so off-class byte-identity
+    // is by CONSTRUCTION rather than by a corpus sweep — the criterion `7b439b9b0`
+    // records as the one that hid rout's 30/30 -> 0/30 regression for ten days.
+    // The corpus sample and the four slow provers were re-measured regardless, the
+    // latter as a proof RATE.
+    // 362 -> 364: DUAL FIXING BY LOCK COUNTING (`dualfix.rs`), the crate's first
+    // reduction that is allowed to cut off feasible points. Two names, each
+    // re-read rather than the count bumped:
+    //
+    //   AY_MILP_NO_DUALFIX  KillSwitch. The A/B arm for the reduction, which
+    //     ships ON for objective-≡0 models. Per the repo's rule a shipped default
+    //     keeps an arm that restores the prior behaviour byte-identically, and
+    //     this one does exactly that: the switch is read at the single entry
+    //     point of `dualfix::dual_fix`, which returns `None`, which hands the
+    //     caller's model on untouched. It is also the arm every measurement in
+    //     the journal for this reduction rests on — one binary, two runs, no
+    //     rebuild between them.
+    //
+    //   AY_MILP_DUALFIX_ALL  Arm, DEFAULT OFF. Widens the reduction from
+    //     objective-≡0 models to every model. An ARM and not tuning because what
+    //     it trades is the ARTIFACT and not the speed: the reduction strips
+    //     certificates, the `Infeasible` lane buys its tree back with one
+    //     re-solve, and the OPTIMAL lane has nothing that buys a dual bound back.
+    //     The rule itself is sound with an objective (the sign test is
+    //     implemented, sense-aware, and covered by
+    //     `the_objective_sign_test_is_read_in_the_models_sense` plus the 4,000-
+    //     model brute-force campaign), so what the default encodes is evidence
+    //     economics, not doubt about the algebra.
+    //
+    // Off-class byte-identity is by CONSTRUCTION, not by a corpus sweep: a model
+    // with a nonzero objective coefficient anywhere never reaches `dual_fix` at
+    // all on default settings, so no bound moves and no work is done. That is the
+    // criterion `7b439b9b0` records as the one that hid rout's 30/30 -> 0/30
+    // regression, so the corpus sample and the slow provers were re-measured
+    // anyway.
+    // 364 -> 369 (2026-08-01), five names, each named and bucketed:
+    //   AY_MILP_BINARY_COMPLEMENT_SUB   Arm         binary-complement substitution
+    //   AY_MILP_OBJECTIVE_SINGLETON_SUB Arm         objective-singleton substitution
+    //   AY_MILP_AMO_MULTIWAY            Arm         default-off multiway AMO branching
+    //   AY_MILP_HYBRID_PB_LP            Arm         hybrid PB/LP route selector
+    //   AY_MILP_NO_STRUCTURE_ROUTE      KillSwitch  the A/B arm for the exact
+    //                                               structure-recognition routes.
+    //                                               Added deliberately: those routes
+    //                                               had NO kill switch, so there was
+    //                                               no way to measure what they cost
+    //                                               or to pin a test on the native
+    //                                               proof-producing lane they now
+    //                                               claim first.
+    // 369 -> 371, both from the FILL-RATE TRIP (`Simplex::maybe_trip_bump_fill`),
+    // which arms the Markowitz bump lane on MEASURED fill rather than on the
+    // `AY_MILP_BUMP_LU_MIN` column count. The floor's premise -- "the crash-walk
+    // bases (~160-column bumps, already near-zero-fill) keep the measured PFI path"
+    // -- is falsified by arithmetic: the census charged >= 326 eta entries per bump
+    // column on exactly that branch.
+    //   AY_MILP_BUMP_FILL_TRIP  Arm         opt-in; DEFAULT OFF because the shipped
+    //                                       predicate is known biased (it compares
+    //                                       the bump against the singleton peel,
+    //                                       which is fill-free BY SELECTION)
+    //   AY_MILP_NO_FILL_TRIP    KillSwitch  restores the pure column floor
+    // Both inert at the default, so the shipped lane is byte-identical.
+    //
+    // 372 -> 374, both from making the GMI basis factorization SPARSE, and both
+    // re-read rather than the count bumped:
+    //
+    //   AY_MILP_DENSE_GMI_LU    KillSwitch. Restores the DENSE `m × m` `Bᵀ` and
+    //     `ExactLu`. A shipped default keeps an arm that restores the prior
+    //     behaviour byte-identically, and this one does exactly that -- the switch
+    //     rebuilds the same dense matrix from the same rows (last write wins, stored
+    //     zeros included) and factors it with the untouched `ExactLu`. It is also the
+    //     arm the whole claim rests on: "identical cuts, 43x less peak RSS at
+    //     m=10765" is one binary, two runs, no rebuild between them. (43x is the
+    //     figure in `certify.rs`'s measured table -- 3329 MB dense against 78 MB
+    //     sparse on `decomp2`; an earlier draft of this note said 72x, which no
+    //     measurement in the tree supports.)
+    //
+    //   AY_MILP_GMI_CUT_TRACE   Diagnostic. Per-cut identity fingerprints
+    //     (`sepstat::gmi_cut`). Deliberately NOT folded into `AY_MILP_TRACE`: the
+    //     general trace's output volume is itself a cost, and it perturbs which A/B
+    //     arm runs out of round budget first -- which is the exact confounder these
+    //     lines exist to remove. Measured: on `bg512142` the dense arm separated 4
+    //     cuts to the sparse arm's 8, and the 4 were hash-for-hash the first 4, so
+    //     the whole-run digest disagreed where no cut did.
+    //
+    // Nothing retired; the dead count is unchanged.
+    //
+    // 374 -> 375: AY_MILP_MIN_VIOLATION (Tuning). The measurement arm for the
+    // cut-admission efficacy floor, added while adjudicating cause 6 of
+    // the development design notes. It ships
+    // DEFAULT-IDENTICAL (`unwrap_or(MIN_VIOLATION)`, one `OnceLock` read primed at
+    // solve entry) and exists because the result it carries is NEGATIVE: over 101
+    // instances the floor refuses 163 violated cuts of which only 3 clear the pool's
+    // own DEPTH floor, and turning it off moves root closure on ZERO instances (one
+    // is worse). A negative result is only re-checkable while its arm still exists,
+    // which is this ledger's own stated reason for inventorying names rather than
+    // purging them.
+    // 375 -> 376 (2026-08-02): `AY_MILP_COLD_DUAL_ALL`, a measurement arm that drops the
+    // `wide_tall()` shape gate so the cold dual start is tried on square-ish models too.
+    // It exists because the gate means `try_cold_dual` NEVER RUNS on the square corpus --
+    // the corpus the headline LP numbers were measured on -- so the "5x too many simplex
+    // steps" result never had the dual start in it. The arm is a MEASURED NEGATIVE at MIP
+    // level (blend2 2.1s -> 8.7s, misc07 9.8s -> 12.4s), which is exactly why the name
+    // stays: the negative is only re-checkable while its arm exists.
+    // 376 -> 377 (2026-08-02): `AY_MILP_CUT_SHADOW`, the PERTURBATION-MATCHED CUT
+    // CONTROL. Re-read rather than bumped: it is an Arm, and it is the denominator the
+    // whole cut record has been missing. Every cut arm on file is scored `nodes(cuts) /
+    // nodes(no cuts)`, while this campaign's own controls put the cost of adding an
+    // information-free ROW at 1.209x nodes and a pure vertex change at 1.122x -- larger
+    // than most cut arms' reported effect. This name runs the shipped cut loop unchanged
+    // and then replaces every row it installed with a row of the same shape and no
+    // information (a non-negative combination of the model's own column bounds, tight at
+    // the cut-free root vertex), so `nodes(cuts) / nodes(control)` is measurable at last.
+    // `=slack` selects the weaker construction the report specified, kept because the
+    // comparison between the two is what shows the binding property is load-bearing.
+    // 377 -> 378 (2026-08-03): `AY_MILP_PUMP_WORK_MULT`, the multiplier on the feasibility pump's
+    // new budget cap. The pump's window was `ROOT_HEURISTIC_SHARE x PUMP_SHARE` = 18% of the
+    // CALLER'S REMAINING WALL with no model term at all, so at a 120s limit it handed out 21.6s to
+    // models whose whole heuristic appetite is under a second; `pump_window` now caps it at
+    // `PUMP_WORK_MULT x root_lp`. The name exists because the multiplier is the one fitted number
+    // in the rule and a re-sweep must be possible without a rebuild — the same reason
+    // `AY_MILP_SETPART_SHARE` exists for the constructor's window. Measured at 3.0: gen
+    // 1.141 -> 0.567s, air03 5.958 -> 4.557s, mod010 2.140 -> 1.647s, 0 worse over 15 instances.
+    // 378 -> 379 (2026-08-05): `AY_MILP_NO_SHAPE_CPR`, the kill switch on the shape-gated
+    // per-round cut budget. `AY_MILP_CUTS_PER_ROUND=8` was measured on 16 corpus instances with
+    // BOTH arms seeded, and the sign separates cleanly on `cols/rows >= 4` -- the same predicate
+    // `default_root_cut_eff_floor` already uses: narrow models sum -3.746s (qnet1 -2.053, qiu
+    // -1.009, misc07 -0.665), wide models sum +2.645s (mas76 +1.994, khb05250 +0.546), with a 4x
+    // margin between the classes (narrow tops out at 3.06, wide starts at 10.33). Applied
+    // globally the knob is a WASH (-1.10s, one win cancelling one loss); gated it keeps the win
+    // and declines the loss. The switch exists because the gate is a DEFAULT change and the
+    // corpus guard needs a byte-identical way back to the flat four.
+    assert_eq!(total, 379, "AY_* name count moved");
+    // 10 -> 9 (2026-07-29): `AY_MILP_COND_TIGHTEN` is READ again. It was marked Dead when
+    // conditional big-M tightening became a default and the opt-in name stopped being
+    // consulted; reverting that default (it measured 3.1x WORSE on dcmulti under later
+    // changes) makes the opt-in the live read site once more, so it returns to Arm.
+    assert_eq!(dead, 9, "dead-knob count moved");
 }
 
 #[test]
@@ -635,5 +885,174 @@ fn the_override_lets_a_deliberate_run_proceed() {
         !audit.is_fatal(),
         "{} must let a deliberate run proceed",
         ay_milp::ALLOW_UNKNOWN_ENV
+    );
+}
+
+/// Count `env::var` reads, split by whether a `OnceLock` caches them.
+fn count_env_reads(dir: &Path, live: &mut usize, cached: &mut usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            count_env_reads(&p, live, cached);
+            continue;
+        }
+        if p.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for (i, _) in text.match_indices("env::var") {
+            let rest = &text[i + "env::var".len()..];
+            let rest = rest.strip_prefix("_os").unwrap_or(rest);
+            let Some(rest) = rest.trim_start().strip_prefix('(') else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            if !rest.starts_with("AY_") {
+                continue;
+            }
+            // Char-boundary safe: this source is full of non-ASCII (— × ≤ ⚠).
+            let lo = (i.saturating_sub(400)..=i)
+                .find(|&n| text.is_char_boundary(n))
+                .unwrap_or(i);
+            let back = &text[lo..i];
+            // CACHED means "inside a `OnceLock::get_or_init` initializer", and the
+            // test is deliberately TIGHT rather than a plain look-back. A bare
+            // "is there a OnceLock somewhere behind me" rule misclassifies a LIVE
+            // read that merely sits near a cached accessor — which would silently
+            // defeat this ratchet, since a misclassified live read stops counting
+            // against the ceiling.
+            //
+            // Measured over the whole crate: every one of the 91 genuinely cached
+            // reads is on the SAME LINE as its `get_or_init` (62) or exactly one
+            // line after it (29); none is further. The accessors are all the shape
+            // `*ON.get_or_init(|| env::var("...")...)`, often a brace-less closure.
+            // Two lines is that pattern plus margin.
+            // Strip `//` comments from the look-back before classifying. This file's
+            // OWN doc comments contain the words `OnceLock` and `get_or_init`, so a
+            // live read written just below one of them would be scored as cached and
+            // would stop counting against the ceiling — the ratchet quietly failing
+            // open. A review caught that; it is not hypothetical, the strings are
+            // right here.
+            let code: String = back
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(c) => &l[..c],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // And require a closure to actually open at the `get_or_init`, so a
+            // completed expression elsewhere on the line cannot qualify.
+            let cached_here = code.rfind("get_or_init").is_some_and(|gi| {
+                code.contains("OnceLock")
+                    && code[gi..].starts_with("get_or_init(|")
+                    && code[gi..].matches('\n').count() <= 2
+            });
+            if cached_here {
+                *cached += 1;
+            } else {
+                *live += 1;
+            }
+        }
+    }
+}
+
+/// THE RESIDUAL RACE SURFACE MAY NOT GROW.
+///
+/// `tune.rs` advertises that the environment is read once and never again. That is
+/// true of the `tune` layer and **false of this crate**: most `AY_*` reads are LIVE
+/// — a fresh `env::var` on every invocation, at any depth, on any thread — and a
+/// consumer that rewrites its environment between window solves can race any one of
+/// them. `bab::prime_env_all` forces the `OnceLock`-cached subset at solve entry;
+/// nothing can force a live read, because there is no cache to force.
+///
+/// So this is a RATCHET, not an assertion of correctness. The counts are pinned so
+/// that the migration to a typed per-solve config can only move them down. A new
+/// live read fails here and has to be justified or routed through `tune`.
+///
+/// Derived, never declared — the same rule `read_site_counts_are_derived` enforces
+/// for the ledger, applied to the thing the ledger does not cover.
+#[test]
+fn the_live_env_read_surface_does_not_grow() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut live, mut cached) = (0usize, 0usize);
+    count_env_reads(&root.join("src"), &mut live, &mut cached);
+
+    // Measured 2026-08-01 BY THIS SCANNER, after `prime_env_all` landed. `cached` is
+    // the primed set; `live` is the part priming cannot reach and is the real
+    // remaining exposure.
+    //
+    // The number is whatever the scanner above says, deliberately: an ad-hoc script
+    // reported 318 for the same tree because it took a different look-back window
+    // when deciding "is this read inside a OnceLock initializer". One classifier has
+    // to be the definition, and it should be the one that enforces the bound. That
+    // is the same rule as `read_site_counts_are_derived` -- the checker defines the
+    // number, and no hand-carried figure is allowed to compete with it.
+    // 319 -> 321 when the classifier was TIGHTENED (>=2 lines from `get_or_init`).
+    // Not new reads: two that the looser look-back had been counting as cached are
+    // in fact live, and a ratchet that miscounts in the permissive direction is
+    // worse than a slightly higher honest number.
+    //
+    // 321 -> 325 (2026-08-01). The structure-recognition lanes arrived with NINE new
+    // bare `env::var_os("AY_MILP_TRACE")` predicates, one per module — exactly the
+    // shape this ratchet asks to be cached. All nine were routed through a
+    // module-local `OnceLock` (`direct_cnf`, `pb_route`, `sat_relu`,
+    // `network_design_route`, `network_design_benders`, `hybrid_pb_lp`, `parity`,
+    // `presolve::binary_complement`, `presolve::objective_singleton`), so they cost
+    // the ratchet nothing.
+    //
+    // The four that remain are ARM SELECTORS and must stay live:
+    //   AY_MILP_AMO_MULTIWAY   x2  (bab.rs)
+    //   AY_MILP_ORBITOPE_DYN   x1  (bab.rs, the new dynamic-orbitope site)
+    //   AY_MILP_HYBRID_PB_LP   x1  (session.rs)
+    // `bab.rs` tests flip AMO_MULTIWAY and ORBITOPE_DYN with `ScopedEnvVar` inside a
+    // single process. A `OnceLock` would latch the first value read and silently make
+    // the arm unswitchable — the A/B campaign would then measure one arm twice and
+    // record the result as a finding, which is the `AY_MILP_NO_CUTZ` failure mode this
+    // whole ledger exists to prevent. Caching them would be the WRONG way to make this
+    // number go down.
+    //
+    // 325 -> 326 (2026-08-02): `AY_MILP_CUT_SHADOW`, the perturbation-matched cut
+    // control (`bab::shadow_control_model`). It is the FIFTH arm selector on the list
+    // above and takes the list's rule, not an exception to it: an arm cached in a
+    // `OnceLock` latches the first value the process reads, and a three-arm cut
+    // measurement whose C arm silently re-runs B is precisely the `AY_MILP_NO_CUTZ`
+    // failure this ledger exists to catch. It is read ONCE per `add_root_cuts` and
+    // threaded to its two use sites as a local, so the count is one and not two.
+    //
+    // 326 -> 327 (2026-08-03): `AY_MILP_PUMP_WORK_MULT`, the multiplier on the pump's new
+    // root-LP-denominated budget cap (`bab::pump_window`). It is the SIXTH entry on the arm-selector
+    // list and takes the list's rule, not an exception to it. `bab.rs`'s own
+    // `pump_share_override_bypasses_the_work_cap_and_mult_rejects_nonfinite` flips this knob and
+    // `AY_MILP_PUMP_SHARE` several times inside ONE process with `ScopedEnvVar`; a `OnceLock` would
+    // latch the first value and make the cap unswitchable, so a sweep would silently measure one arm
+    // repeatedly and record it as a finding — the `AY_MILP_NO_CUTZ` failure this ledger exists to
+    // catch. Net growth is one, not two: `pump_window` needs to distinguish a PINNED share from an
+    // unset one, and rather than add a second `AY_MILP_PUMP_SHARE` read for that, the existing
+    // `pump_share()` was refactored onto a single `pump_share_override()` site that both callers use.
+    const LIVE_CEILING: usize = 327;
+    // 90 -> 100 (2026-08-01): the ten accessors moved off the live count above
+    // land here. Growth in THIS number is the ratchet working — a cached read is
+    // forced once at solve entry by `bab::prime_env_all` and cannot be raced
+    // afterwards. Every one of the ten is registered there.
+    const CACHED_AT_LAST_MEASURE: usize = 100;
+
+    assert!(
+        live <= LIVE_CEILING,
+        "live (uncached) AY_* env reads grew {live} > {LIVE_CEILING}. Every one is a \
+         fresh getenv on the solve path that a concurrent set_var can race, and that \
+         priming cannot help. Route it through `tune` or justify it here."
+    );
+    assert!(
+        cached <= CACHED_AT_LAST_MEASURE + 8,
+        "cached env reads grew to {cached}; add the accessor to its module's \
+         `prime_env()` so it is forced at solve entry, then raise this bound"
     );
 }

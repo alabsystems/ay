@@ -14,14 +14,29 @@
 //! supported by carcara and SMTCoq. It uses SMT-LIB syntax with
 //! additional proof commands.
 //!
+//! ## A proof document contains PROOF COMMANDS ONLY
+//!
+//! The checker reads the problem file separately, and — MEASURED against
+//! carcara 1.1.0 — its Alethe proof grammar accepts **no** declaration
+//! command at any position: `declare-fun` and `declare-const`, at line 0 or
+//! mid-file, all abort with `parser error: unexpected token`. A single
+//! declaration line therefore makes the whole document uncheckable, which is
+//! strictly worse than emitting nothing.
+//!
+//! Symbols the proof needs but the problem does not declare (theory Skolems,
+//! extensionality witnesses, datatype field splits) must be RESUGARED into
+//! terms — Alethe's `choice` binder — or DEFINED with `define-fun` as the term
+//! they denote. Where neither is possible the problem-scoped exporter declines
+//! ([`AlethePrintError::UndeclarableProofSymbols`]).
+//!
 //! ## Example
 //!
 //! ```text
-//! ; Declarations from problem
-//! (declare-const a Int)
-//! (declare-const b Int)
+//! ; problem file (read separately by the checker)
+//! ;   (declare-const a Int)
+//! ;   (declare-const b Int)
 //!
-//! ; Proof commands
+//! ; proof document — commands only, no declarations
 //! (assume h1 (= a b))
 //! (assume h2 (not (= a a)))
 //! (step t1 (cl (= a a)) :rule refl)
@@ -31,11 +46,12 @@
 #![warn(clippy::all)]
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{quote_symbol, TermId, TermStore};
 pub use ay_core::{AletheRule, BvGateType, Proof, ProofId, ProofStep, TheoryLemmaKind};
 use std::fmt::Write;
 
+mod alethe_parser;
 mod alethe_printer;
 mod bundle;
 pub mod bv_blast_export;
@@ -49,6 +65,10 @@ mod quality;
 mod terminal_trust;
 mod variables;
 
+pub use alethe_parser::{
+    check_alethe_document, checkable_rule_names, AletheDefect, AletheDocumentChecker,
+    AletheDocumentReport, AletheSelfCheckWriter, Pos as AlethePos, ProblemScope,
+};
 pub use alethe_printer::AlethePrintError;
 pub use bundle::{
     re_check_bundle_strict, render_term_canonical, BundleReCheck, SerializableProofBundle,
@@ -56,9 +76,9 @@ pub use bundle::{
 };
 pub use bv_blast_export::{
     export_bv_blast_proof, BitLemma, BitLemmaKind, BvBlastExportError, BvBlastProof,
-    BvBlastValidateError, BvOp, Clause, ClauseProvenance, Lit, OperandRef, Refutation, ResRule,
-    ResolutionStep, SliceObligation, VarRole, VarTable, FORMAT_VERSION as BV_BLAST_FORMAT_VERSION,
-    SLICE_WIDTH,
+    BvBlastValidateError, BvBlastValidateLimits, BvOp, Clause, ClauseProvenance, Lit, OperandRef,
+    Refutation, ResRule, ResolutionStep, SliceObligation, VarRole, VarTable,
+    FORMAT_VERSION as BV_BLAST_FORMAT_VERSION, SLICE_WIDTH,
 };
 pub use bv_blast_lean::render_bv_blast_proof_lean;
 pub use bv_blast_solver::{
@@ -66,12 +86,20 @@ pub use bv_blast_solver::{
     BvSolvedExportError, SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
+pub use checker::recognize_fp_forward_error;
 pub use checker::recognize_fp_rounding_mode_domain;
 pub use checker::recognize_ite_same;
+pub use checker::recognize_nra_interval_unsat;
+pub use checker::recognize_nra_univariate_unsat;
+pub use checker::recognize_order_ite_tautology;
 pub use checker::recognize_regex_intersect_empty;
 pub use checker::recognize_rounding_mode_domain;
 pub use checker::recognize_string_ground_eval;
 pub use checker::recognize_string_length_lemma;
+pub use checker::{
+    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
+    recognize_bv_ground_evaluate, MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+};
 pub use checker::{
     check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,
     ProofCheckError,
@@ -81,8 +109,10 @@ pub use checker::{
     recognize_array_select_store, recognize_array_theory_lemma,
     recognize_folded_array_extensionality, ExtDiffRegistry,
 };
-pub use checker::{recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate};
-pub use checker::{recognize_datatype_distinct, recognize_datatype_selector_project};
+pub use checker::{
+    recognize_datatype_distinct, recognize_datatype_selector_project,
+    recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
+};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use partial::{check_proof_partial, PartialProofCheck};
 pub use quality::{
@@ -96,8 +126,21 @@ pub use terminal_trust::{
 
 use alethe_printer::AlethePrinter;
 use variables::{
-    collect_auxiliary_proof_declarations, collect_proof_variables, SymbolSortConflict,
+    collect_auxiliary_proof_declarations, collect_proof_variables, free_var_names,
+    SymbolSortConflict,
 };
+
+/// The problem-declared symbol names the Alethe exporter treats as already in
+/// scope.
+///
+/// The round-trip self-check needs a [`ProblemScope`]; when the problem text
+/// is not available on disk (stdin mode) this is the in-process substitute.
+/// Sorts are not recoverable this way, so the resulting scope tolerates
+/// unknown sort names — see [`ProblemScope::from_symbols`].
+#[must_use]
+pub fn problem_scope_symbol_names(terms: &TermStore, problem_assertions: &[TermId]) -> Vec<String> {
+    variables::problem_scope_symbol_names(terms, problem_assertions)
+}
 
 impl From<SymbolSortConflict> for AlethePrintError {
     fn from(conflict: SymbolSortConflict) -> Self {
@@ -166,6 +209,18 @@ pub fn export_alethe(proof: &Proof, terms: &TermStore) -> String {
 /// converts the error into a loudly-marked document for backwards
 /// compatibility.
 ///
+/// ## Not the checker-facing artifact
+///
+/// This entry point has no notion of a problem file, so it declares EVERY
+/// symbol the proof mentions and its output is consequently a standalone
+/// dump, not something carcara can read (see the module docs: an Alethe proof
+/// document admits no declaration command). The artifact AY writes to
+/// `<input>.alethe`, and everything the external-checker measurements are
+/// taken over, comes from
+/// [`try_export_alethe_with_problem_scope_overrides_and_budget_to`], which
+/// emits proof commands only and declines when a symbol can be neither
+/// resugared nor defined.
+///
 /// # Errors
 ///
 /// Returns an [`AlethePrintError`] when a step cannot be rendered as a
@@ -194,13 +249,22 @@ pub fn try_export_alethe(proof: &Proof, terms: &TermStore) -> Result<String, Ale
     Ok(output)
 }
 
-/// Export a proof to Alethe format with proof-only auxiliary declarations.
+/// Export a proof to Alethe format against the original problem's declaration
+/// scope: the emitted document contains PROOF COMMANDS ONLY.
 ///
-/// This variant emits `(declare-fun ...)` lines for auxiliary symbols that are:
-/// 1. Referenced by proof steps, and
-/// 2. Not part of the original problem assertion scope.
+/// The checker reads the problem file separately, so the proof must not
+/// re-declare its symbols — and must not declare anything at all: carcara
+/// 1.1.0's Alethe proof grammar has no declaration command, and one
+/// `(declare-fun ...)` line anywhere aborts the parse before any rule is
+/// checked. This variant used to open the document with exactly such a
+/// preamble for every symbol free in the proof but absent from
+/// `problem_assertions`. It now emits a `define-fun` for each symbol whose
+/// defining term AY recorded (Skolem constants — see
+/// [`ay_core::SkolemChoice`]) and DECLINES for the rest
+/// ([`AlethePrintError::UndeclarableProofSymbols`]).
 ///
-/// The declaration preamble is deterministic (sorted by symbol name).
+/// The `define-fun` preamble is deterministic (mint order, so a body may name
+/// an earlier definition).
 ///
 /// Fail-loud behavior matches [`export_alethe`] (#8821).
 #[must_use]
@@ -317,6 +381,72 @@ impl std::fmt::Display for AletheStreamError {
 
 impl std::error::Error for AletheStreamError {}
 
+/// Maximum symbol names quoted in an
+/// [`AlethePrintError::UndeclarableProofSymbols`] message. Wide preambles
+/// (hundreds of datatype field-split symbols) would otherwise render a
+/// multi-kilobyte one-line warning.
+const UNDECLARABLE_SYMBOLS_IN_MESSAGE: usize = 8;
+
+/// Whether every symbol in the emitted `define-fun` preamble resolves.
+///
+/// The preamble is the only text this exporter writes that is not a proof
+/// command, and it is the only place a symbol can be INTRODUCED. Parsing it
+/// back with [`AletheDocumentChecker`] turns the guard from a claim about
+/// terms into a check of the bytes: an
+/// [`AletheDefect::UndefinedSymbol`](alethe_parser::AletheDefect::UndefinedSymbol)
+/// here is exactly carcara's `identifier '<x>' is not defined`.
+///
+/// Defects surface eagerly from `push_str`, so `finish()` — which would demand
+/// an empty clause the preamble alone cannot derive — is never called.
+///
+/// The scope is built from the problem's free variables PLUS its application
+/// heads. The heads matter: `problem_scope_symbol_names` walks only `Var`
+/// nodes, so a scope without them would fail to resolve `P` in a body like
+/// `(choice ((x Int)) (P x))` and reject a correct definition. Sorts are left
+/// open (`ProblemScope::from_symbols`), because AY does not retain the
+/// problem's `declare-sort` names in-process and sorts are not a known defect
+/// source.
+fn skolem_definition_preamble_resolves(
+    definitions: &[String],
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+) -> bool {
+    let mut symbols = free_var_names(terms, problem_assertions.iter().copied());
+    symbols.extend(variables::application_symbol_names(
+        terms,
+        problem_assertions.iter().copied(),
+    ));
+    let mut checker = AletheDocumentChecker::new(ProblemScope::from_symbols(symbols));
+    for definition in definitions {
+        if checker.push_str(definition).is_err() || checker.push_str("\n").is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build the fail-closed error naming the symbols that made the document
+/// unrenderable.
+fn undeclarable_proof_symbols_error(names: &[String]) -> AlethePrintError {
+    let mut shown = names
+        .iter()
+        .take(UNDECLARABLE_SYMBOLS_IN_MESSAGE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > UNDECLARABLE_SYMBOLS_IN_MESSAGE {
+        let _ = write!(
+            shown,
+            ", ... +{} more",
+            names.len() - UNDECLARABLE_SYMBOLS_IN_MESSAGE
+        );
+    }
+    AlethePrintError::UndeclarableProofSymbols {
+        count: names.len(),
+        names: shown,
+    }
+}
+
 /// Streaming variant of
 /// [`try_export_alethe_with_problem_scope_overrides_and_budget`]: renders the
 /// proof step-by-step directly into `out` instead of materializing the whole
@@ -350,15 +480,76 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
         .prepare_proof(proof)
         .map_err(AletheStreamError::Print)?;
 
+    // An Alethe PROOF document has no declaration command (see
+    // `AlethePrintError::UndeclarableProofSymbols` for the carcara
+    // measurement). Every symbol free in the proof but absent from the problem
+    // must therefore be either RESUGARED away, DEFINED as the term it denotes,
+    // or the export must DECLINE. Nothing is declared, ever.
     let auxiliary_declarations =
         collect_auxiliary_proof_declarations(proof, terms, problem_assertions)
             .map_err(|conflict| AletheStreamError::Print(conflict.into()))?;
-    for (name, sort) in auxiliary_declarations {
-        if printer.is_skolem_witness_name(&name) {
-            continue;
-        }
-        writeln!(out, "(declare-fun {} () {sort})", quote_symbol(&name))
-            .map_err(AletheStreamError::Io)?;
+    // A witness already resugared to an inline `choice` is not a free symbol of
+    // the printed document at all, so it needs nothing in the preamble.
+    let pending: Vec<String> = auxiliary_declarations
+        .into_iter()
+        .map(|(name, _sort)| name)
+        .filter(|name| !printer.is_skolem_witness_name(name))
+        .collect();
+    // Skolem CONSTANTS are DEFINED as the Hilbert `choice` term they denote, in
+    // mint order so a later definition may name an earlier one.
+    let wanted: HashSet<String> = pending.iter().cloned().collect();
+    let problem_symbols = free_var_names(terms, problem_assertions.iter().copied());
+    let (definitions, defined) = printer.skolem_choice_definitions(&wanted, &problem_symbols);
+    // (D) Post-emission invariant, checked on the TEXT rather than trusted.
+    //
+    // Everything above reasons about TERMS. The bytes that actually ship are
+    // rendered through surface overrides, so a body can name a symbol the
+    // term-level guard never saw. Re-read the preamble with AY's own Alethe
+    // parser — the same one that reproduces carcara's document-layer
+    // acceptance — and drop the whole preamble if any symbol in it fails to
+    // resolve. Those witnesses then land in `undeclarable` below and the
+    // export declines.
+    //
+    // Cost is O(preamble), not O(document): skipped outright when there is no
+    // definition to check, which is the overwhelming majority of proofs. That
+    // is why this can run unconditionally while the whole-document round-trip
+    // (`AY_PROOF_SELF_CHECK`) stays opt-in — the latter re-parses certificates
+    // that reach hundreds of MB.
+    //
+    // TODO(#alethe-free-symbol-invariant): the FULL invariant is "every free
+    // symbol of the emitted document is bound — problem-declared, define-fun
+    // bound, or locally bound". This checks the preamble, which is the only
+    // place a symbol is INTRODUCED, but not the steps. One gap survives: the
+    // `is_skolem_witness_name` filter above suppresses a witness from `pending`
+    // on the PRINTER'S CLAIM to have resugared it to an inline `choice`. That
+    // claim is unverified here, and a surface-override string that textually
+    // mentions the raw witness name would leak it into a step, where it is
+    // neither defined nor declined. Closing it needs the whole-document check,
+    // which is exactly `AletheDocumentChecker` via `AletheSelfCheckWriter` —
+    // already wired at `crates/ay/src/run.rs` behind `AY_PROOF_SELF_CHECK` and
+    // default-OFF because its false-reject rate over the corpus is measured,
+    // not proved. Making it default-ON is a separate, measured decision.
+    let (definitions, defined) = if definitions.is_empty() {
+        (definitions, defined)
+    } else if skolem_definition_preamble_resolves(&definitions, terms, problem_assertions) {
+        (definitions, defined)
+    } else {
+        (Vec::new(), HashSet::default())
+    };
+    // DECLINE BEFORE WRITING A BYTE. The sink is a file the caller publishes on
+    // success; a partial prefix followed by an error is exactly the unparseable
+    // artifact this whole path exists to prevent.
+    let undeclarable: Vec<String> = pending
+        .into_iter()
+        .filter(|name| !defined.contains(name))
+        .collect();
+    if !undeclarable.is_empty() {
+        return Err(AletheStreamError::Print(undeclarable_proof_symbols_error(
+            &undeclarable,
+        )));
+    }
+    for definition in definitions {
+        writeln!(out, "{definition}").map_err(AletheStreamError::Io)?;
     }
 
     for (idx, step) in proof.steps.iter().enumerate() {

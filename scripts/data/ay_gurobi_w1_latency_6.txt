@@ -1,0 +1,10 @@
+# Frozen W1 cases whose repeated one-thread process wall favored Gurobi in the
+# 2026-08-01 route-selected head-to-head.  Fields are MPS stem and the frozen
+# expected verdict for the captured MILP (the source-family `sat` label does
+# not imply that every downstream capture remains feasible).
+W1_sat_v83_c328_000008 INFEASIBLE
+W1_sat_v91_c217_000000 OPTIMAL
+W1_sat_v83_c328_000000 OPTIMAL
+W1_sat_v91_c217_000008 INFEASIBLE
+W1_sat_v51_c255_000000 OPTIMAL
+W1_sat_v51_c255_000008 INFEASIBLE

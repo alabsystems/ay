@@ -28,7 +28,7 @@ use super::MAX_SPLITS_LIA;
 use crate::combined_solvers::{UfSeqLiaSolver, UfSeqSolver};
 use crate::ematching::collect_quantifiers;
 use crate::executor::model::Model;
-use crate::executor_types::{Result, SolveResult, UnknownReason};
+use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::{Symbol, TermData, TermId};
@@ -432,7 +432,7 @@ impl Executor {
         self.unfold_ho_seq_ops();
         if self.assertions_contain_unsupported_seq_ops() {
             self.record_mixed_collection_unsupported_fragment_diagnostics("seq-array-ops");
-            self.last_unknown_reason = Some(UnknownReason::UnsupportedMixedCollection);
+            self.record_unknown_from_origin(UnknownOrigin::UnsupportedMixedCollection);
             return Ok(SolveResult::Unknown);
         }
 

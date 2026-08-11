@@ -987,8 +987,14 @@ fn non_solve_early_modes_reject_requested_export_and_remove_stale_artifact() {
         if mode == "features" {
             command.arg("--dump-bv-cnf").arg(&dump).arg("--features");
         } else {
+            // `-p` is the parameter dump. This arm asserted `--z3-print-params`,
+            // a flag AY has never had -- clap rejected it as an unknown
+            // argument, so the arm proved nothing about early-mode export
+            // rejection. The property it was written for is real and now
+            // holds: a parameter dump never runs a check-sat, so a requested
+            // export is refused and any stale artifact removed.
             command
-                .arg("--z3-print-params")
+                .arg("-p")
                 .env("AY_DUMP_BV_CNF", &dump)
                 .env_remove("AY_DUMP_BV_DIMACS");
         }

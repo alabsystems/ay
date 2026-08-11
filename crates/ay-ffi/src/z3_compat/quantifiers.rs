@@ -14,11 +14,61 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    bounded_sort_hi, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
+    activate_finite_set_quantifier_gate, bounded_sort_hi, ffi_count_within_limit,
+    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, finite_set_engine_public_sort,
     lookup_ast_sort, range_guard_term, record_ast_sort, require_term_ast_or_return,
-    require_term_asts_or_return, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
-    MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
+    require_term_asts_or_return, sort_mentions_finite_set, term_to_ast, QuantifierFfiMetadata,
+    SymbolKey, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS,
+    Z3_INVALID_ARG, Z3_INVALID_USAGE,
 };
+
+/// Metadata supplied alongside one quantifier construction. Keeping it in the
+/// same builder call makes hash-cons conflict detection atomic.
+pub(crate) struct QuantifierMetadataInput<'a> {
+    pub(crate) weight: c_uint,
+    pub(crate) quantifier_id: Option<SymbolKey>,
+    pub(crate) skolem_id: Option<SymbolKey>,
+    pub(crate) no_pattern_asts: &'a [Z3_ast],
+}
+
+fn register_quantifier_metadata(
+    ctx: &mut Z3Context,
+    term: Term,
+    input: QuantifierMetadataInput<'_>,
+    no_patterns: Vec<Term>,
+) -> bool {
+    let metadata = QuantifierFfiMetadata {
+        weight: input.weight,
+        quantifier_id: input.quantifier_id,
+        skolem_id: input.skolem_id,
+        no_patterns,
+    };
+    if let Some(existing) = ctx.quantifier_ffi_metadata.get(&term) {
+        if existing != &metadata {
+            ctx.last_error = Z3_INVALID_USAGE;
+            ctx.error_msg = Some(
+                "quantifier construction conflicts with metadata on an existing hash-consed AST"
+                    .to_string(),
+            );
+            return false;
+        }
+        return true;
+    }
+
+    ctx.quantifier_weights.insert(term, metadata.weight);
+    if !metadata.no_patterns.is_empty() {
+        ctx.quantifier_no_patterns
+            .insert(term, metadata.no_patterns.clone());
+    }
+    if let Some(id) = &metadata.quantifier_id {
+        ctx.solver.set_quantifier_id(term, &id.display_name());
+    }
+    if let Some(id) = &metadata.skolem_id {
+        ctx.solver.set_skolem_id(term, &id.display_name());
+    }
+    ctx.quantifier_ffi_metadata.insert(term, metadata);
+    true
+}
 
 // ============================================================================
 // Pattern (Trigger) Handle
@@ -143,7 +193,8 @@ pub unsafe extern "C" fn Z3_mk_bound(c: Z3_context, index: c_uint, ty: Z3_sort) 
         ffi_guard_ast(c, |ctx| {
             // Create a named variable that encodes the de Bruijn index.
             let name = format!("__db{index}");
-            let term = ctx.solver.declare_const(&name, sort.clone());
+            let engine_sort = finite_set_engine_public_sort(ctx, &sort);
+            let term = ctx.solver.declare_const(&name, engine_sort);
             let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
@@ -194,7 +245,8 @@ fn guard_bounded_quantifier_body(
 ///
 /// `bound` contains the constants to bind. `patterns` contains
 /// optional trigger patterns. `weight` is a priority hint (lower = higher
-/// priority); AY ignores it.
+/// priority). AY preserves it for exact C-API introspection while the decision
+/// engine is free to ignore the heuristic hint.
 ///
 /// # Safety
 /// All pointers must be valid. `bound` must point to `num_bound` elements.
@@ -202,7 +254,7 @@ fn guard_bounded_quantifier_body(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_forall_const(
     c: Z3_context,
-    _weight: c_uint,
+    weight: c_uint,
     num_bound: c_uint,
     bound: *const Z3_ast,
     num_patterns: c_uint,
@@ -221,7 +273,23 @@ pub unsafe extern "C" fn Z3_mk_forall_const(
         return 0;
     }
     // SAFETY: caller guarantees pointer validity per function contract
-    unsafe { mk_quantifier_const(c, true, num_bound, bound, num_patterns, patterns, body) }
+    unsafe {
+        mk_quantifier_const(
+            c,
+            true,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
+    }
 }
 
 /// Create an existentially quantified formula using constants.
@@ -233,7 +301,7 @@ pub unsafe extern "C" fn Z3_mk_forall_const(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_exists_const(
     c: Z3_context,
-    _weight: c_uint,
+    weight: c_uint,
     num_bound: c_uint,
     bound: *const Z3_ast,
     num_patterns: c_uint,
@@ -252,22 +320,50 @@ pub unsafe extern "C" fn Z3_mk_exists_const(
         return 0;
     }
     // SAFETY: caller guarantees pointer validity per function contract
-    unsafe { mk_quantifier_const(c, false, num_bound, bound, num_patterns, patterns, body) }
+    unsafe {
+        mk_quantifier_const(
+            c,
+            false,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
+    }
 }
 
 /// Shared implementation for `Z3_mk_forall_const` and `Z3_mk_exists_const`.
 ///
 /// # Safety
 /// All pointers must be valid.
-unsafe fn mk_quantifier_const(
+pub(crate) unsafe fn mk_quantifier_const(
     c: Z3_context,
     is_forall: bool,
+    metadata: QuantifierMetadataInput<'_>,
     num_bound: c_uint,
     bound: *const Z3_ast,
     num_patterns: c_uint,
     patterns: *const Z3_pattern,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: every caller forwards a null or live context; the checker only
+    // updates its error state and rejects oversized arrays before pointer use.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "quantifier bound variables and patterns",
+            &[num_bound, num_patterns],
+        )
+    } {
+        return 0;
+    }
     if num_bound == 0 || bound.is_null() {
         // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
         // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -333,8 +429,17 @@ unsafe fn mk_quantifier_const(
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let vars = require_term_asts_or_return!(ctx, &bound_asts, "quantifier construction", 0);
+            let has_finite_set_binder = bound_asts.iter().any(|&ast| {
+                lookup_ast_sort(ctx, ast).is_some_and(|sort| sort_mentions_finite_set(ctx, sort))
+            });
             let body_term =
                 require_term_ast_or_return!(ctx, body, "quantifier construction", "body", 0);
+            let no_pattern_terms = require_term_asts_or_return!(
+                ctx,
+                metadata.no_pattern_asts,
+                "quantifier no-pattern expressions",
+                0
+            );
             let trigger_slices = match trigger_data.as_deref() {
                 Some(patterns) => {
                     let Some(slices) =
@@ -375,6 +480,13 @@ unsafe fn mk_quantifier_const(
             match result {
                 Ok(term) => {
                     let ast = term_to_ast(ctx, term);
+                    if !register_quantifier_metadata(ctx, term, metadata, no_pattern_terms) {
+                        return 0;
+                    }
+                    ctx.quantifier_public_bound_terms.insert(term, vars.clone());
+                    if has_finite_set_binder {
+                        activate_finite_set_quantifier_gate(ctx, term, "constant-style quantifier");
+                    }
                     record_ast_sort(ctx, ast, Sort::Bool);
                     ast
                 }
@@ -395,7 +507,8 @@ unsafe fn mk_quantifier_const(
 /// Create a universally quantified formula using de Bruijn indices.
 ///
 /// `sorts` and `decl_names` specify the bound variables (innermost = index 0).
-/// `patterns` contains optional triggers. `weight` is a priority hint (ignored).
+/// `patterns` contains optional triggers. `weight` is a priority hint retained
+/// for C-API introspection.
 ///
 /// The body should reference bound variables created via [`Z3_mk_bound`].
 ///
@@ -404,7 +517,7 @@ unsafe fn mk_quantifier_const(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_forall(
     c: Z3_context,
-    _weight: c_uint,
+    weight: c_uint,
     num_patterns: c_uint,
     patterns: *const Z3_pattern,
     num_decls: c_uint,
@@ -417,6 +530,12 @@ pub unsafe extern "C" fn Z3_mk_forall(
         mk_quantifier_db(
             c,
             true,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
             num_patterns,
             patterns,
             num_decls,
@@ -436,7 +555,7 @@ pub unsafe extern "C" fn Z3_mk_forall(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_exists(
     c: Z3_context,
-    _weight: c_uint,
+    weight: c_uint,
     num_patterns: c_uint,
     patterns: *const Z3_pattern,
     num_decls: c_uint,
@@ -449,6 +568,12 @@ pub unsafe extern "C" fn Z3_mk_exists(
         mk_quantifier_db(
             c,
             false,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
             num_patterns,
             patterns,
             num_decls,
@@ -466,9 +591,10 @@ pub unsafe extern "C" fn Z3_mk_exists(
 ///
 /// # Safety
 /// All pointers must be valid.
-unsafe fn mk_quantifier_db(
+pub(crate) unsafe fn mk_quantifier_db(
     c: Z3_context,
     is_forall: bool,
+    metadata: QuantifierMetadataInput<'_>,
     num_patterns: c_uint,
     patterns: *const Z3_pattern,
     num_decls: c_uint,
@@ -547,10 +673,19 @@ unsafe fn mk_quantifier_db(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let has_finite_set_binder = decl_data
+                .iter()
+                .any(|(sort, _)| sort_mentions_finite_set(ctx, sort));
             // Authenticate every caller-provided term/pattern before declaring
             // bound variables, so a rejected call leaves the solver unchanged.
             let body_term =
                 require_term_ast_or_return!(ctx, body, "quantifier construction", "body", 0);
+            let no_pattern_terms = require_term_asts_or_return!(
+                ctx,
+                metadata.no_pattern_asts,
+                "quantifier no-pattern expressions",
+                0
+            );
             let trigger_slices: Option<Vec<Vec<Term>>> = if num_patterns > 0 && !patterns.is_null()
             {
                 let mut pattern_data = Vec::new();
@@ -588,7 +723,8 @@ unsafe fn mk_quantifier_db(
 
             let mut vars: Vec<Term> = Vec::with_capacity(decl_data.len());
             for (sort, name) in &decl_data {
-                let term = ctx.solver.declare_const(name, sort.clone());
+                let engine_sort = finite_set_engine_public_sort(ctx, sort);
+                let term = ctx.solver.declare_const(name, engine_sort);
                 let ast = term_to_ast(ctx, term);
                 record_ast_sort(ctx, ast, sort.clone());
                 vars.push(term);
@@ -621,6 +757,13 @@ unsafe fn mk_quantifier_db(
             match result {
                 Ok(term) => {
                     let ast = term_to_ast(ctx, term);
+                    if !register_quantifier_metadata(ctx, term, metadata, no_pattern_terms) {
+                        return 0;
+                    }
+                    ctx.quantifier_public_bound_terms.insert(term, vars.clone());
+                    if has_finite_set_binder {
+                        activate_finite_set_quantifier_gate(ctx, term, "de-Bruijn quantifier");
+                    }
                     record_ast_sort(ctx, ast, Sort::Bool);
                     ast
                 }

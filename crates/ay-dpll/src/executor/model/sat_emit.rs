@@ -16,7 +16,8 @@
 //! the full gate sequence
 //!
 //! ```text
-//!   strict gate  ->  independent gate  ->  authoritative-failclosed gate
+//!   strict gate  ->  quantified gate  ->  independent gate
+//!                ->  authoritative-failclosed gate  ->  non-string-seq gate
 //!                ->  formula-neutral output completion
 //!                ->  validation-evidence postcondition  ->  certificate mint
 //! ```
@@ -37,8 +38,8 @@ use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult};
 
 /// Unforgeable witness that a `Sat` verdict passed the full
-/// [`Executor::emit_sat_verdict`] funnel (strict + independent +
-/// authoritative-failclosed gates).
+/// [`Executor::emit_sat_verdict`] funnel (strict, quantified, independent,
+/// authoritative-failclosed, and non-string-sequence gates).
 ///
 /// The single-element tuple field is PRIVATE to this module, so a
 /// `SatCertificate` can only ever be constructed inside `emit_sat_verdict`
@@ -73,16 +74,18 @@ impl Executor {
     ///    ([`apply_strict_model_gate`](Executor::apply_strict_model_gate)). If
     ///    that gate repairs the model, full validation is rerun so evidence
     ///    always describes the final emitted witness;
-    /// 3. the INDEPENDENT, fail-closed model-check gate
+    /// 3. the quantified-assertion certificate gate, which can independently
+    ///    discharge quantified leaf conjuncts and fails closed otherwise;
+    /// 4. the INDEPENDENT, fail-closed model-check gate
     ///    ([`apply_independent_model_gate`](Executor::apply_independent_model_gate));
-    /// 4. the AUTHORITATIVE-FAILCLOSED gate
+    /// 5. the AUTHORITATIVE-FAILCLOSED gate
     ///    ([`apply_authoritative_failclosed_gate`](Executor::apply_authoritative_failclosed_gate)),
-    ///    which closes the `CannotConfirm` fail-open hole for authoritative
-    ///    theories.
-    /// 5. formula-neutral arity>0 output completion, after the gates so it
+    ///    retained as a theory-specific defense in depth after the universal
+    ///    `CannotConfirm -> Unknown` boundary.
+    /// 6. formula-neutral arity>0 output completion, after the gates so it
     ///    cannot manufacture EUF validation evidence and before minting so the
     ///    certificate refers to the final printer-visible model;
-    /// 6. a release-mode validation-evidence postcondition: a non-trivial
+    /// 7. a release-mode validation-evidence postcondition: a non-trivial
     ///    `Sat` may not escape unless model validation completed. Deferred
     ///    inner solves never reach this public emission funnel; their scope
     ///    restores `skip_model_eval` before the outer verdict is emitted.
@@ -122,6 +125,19 @@ impl Executor {
             if proposed != SolveResult::Sat {
                 self.last_sat_certificate = None;
                 return Ok(proposed);
+            }
+
+            // A finite-table certificate can run residual validity probes
+            // after constructing its outer witness. Those nested solves are
+            // allowed to overwrite `last_model`; install the parked certified
+            // witness only here, at the final public Sat funnel after every
+            // result-mapping probe has finished.
+            if self.finite_table_cert_grant_active {
+                if let Some((model, pins)) = self.finite_table_cert_pending_witness.take() {
+                    self.last_model = Some(model);
+                    self.mbqi_sat_cert_pins = pins;
+                    super::eval_memo_clear();
+                }
             }
 
             // Vacuous SAT (no assertions and no assumption roots): the empty
@@ -181,25 +197,35 @@ impl Executor {
             };
             self.record_gate_span_ms("phase.sat_gate.strict.ms", span);
 
+            // (2) QUANTIFIED-ASSERTION certificate gate. It runs before the
+            // compositional evaluator and outside its caches because its nested
+            // solves build models of other formulas. On success it records an
+            // exact certificate marker; the independent pass then skips only
+            // those quantified leaf conjuncts and still checks every ground
+            // sibling. Deferred or indeterminate checks fail closed here.
+            let span = Instant::now();
+            let gated = self.apply_quantified_model_failclosed_gate(gated);
+            self.record_gate_span_ms("phase.sat_gate.quantified.ms", span);
+
             // The independent and authoritative passes are read-only over the
             // now-final witness unless they reject it. Share only solver-side
             // leaf-evaluation and view caches across those two passes; their
             // independent compositional evaluator remains separate.
             let _gate_eval_memo = super::EvalMemoSession::new();
             let _gate_view_caches = super::independent_gate::GateViewCacheSession::new();
-            // (2) INDEPENDENT, fail-closed model-check gate (soundness kernel): a
-            // `Sat` whose model is not independently confirmed and IS refuted is
-            // downgraded to `Unknown`.
+            // (3) INDEPENDENT, fail-closed model-check gate (soundness kernel):
+            // every Sat whose model is either refuted or cannot be independently
+            // confirmed is downgraded to Unknown.
             let span = Instant::now();
             let gated = self.apply_independent_model_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.independent.ms", span);
-            // (3) AUTHORITATIVE-FAILCLOSED gate: inverts the independent gate's
-            // `CannotConfirm` fail-open default to fail-closed for authoritative
-            // theories (arrays/LIA/LRA/BV/UF) over a fully-pinned model.
+            // (4) AUTHORITATIVE-FAILCLOSED defense in depth. The universal gate
+            // above already rejects CannotConfirm; this preserves the narrower
+            // ground-theory classifier and its regression diagnostics.
             let span = Instant::now();
             let gated = self.apply_authoritative_failclosed_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.authoritative.ms", span);
-            // (3b) NON-STRING-SEQUENCE FAIL-CLOSED gate: AY's symbolic non-string
+            // (4b) NON-STRING-SEQUENCE FAIL-CLOSED gate: AY's symbolic non-string
             // sequence theory ((Seq Int)/(Seq Bool)/(Seq (_ BitVec n))/(Seq Real))
             // is systemically unsound on the sat side — many `seq.*` ops return a
             // wrong `sat` whose model cannot be produced/validated. Over a `Sat`
@@ -213,23 +239,8 @@ impl Executor {
             self.record_gate_span_ms("phase.sat_gate.nonstring_seq.ms", span);
             drop(_gate_view_caches);
             drop(_gate_eval_memo);
-            // (3c) QUANTIFIED-ASSERTION fail-closed gate: no other gate
-            // evaluates a quantifier (the independent evaluator fails closed on
-            // Forall/Exists, its `CannotConfirm` arm fails OPEN, the
-            // authoritative gate skips quantified assertions, and the strict
-            // gate disables itself when any quantifier is present), so a `Sat`
-            // whose emitted model FALSIFIES a quantified assertion could ship.
-            // Every quantified assertion must now be confirmed against the
-            // emitted model by an isolated nested solve, refuted (downgrade +
-            // alarm), or fail CLOSED to Unknown. Runs after the gate cache
-            // sessions are dropped: its nested solves build models of OTHER
-            // formulas, which must not poison the shared per-(model,assertions)
-            // caches. Zero cost on quantifier-free problems.
-            let span = Instant::now();
-            let gated = self.apply_quantified_model_failclosed_gate(gated);
-            self.record_gate_span_ms("phase.sat_gate.quantified.ms", span);
             self.record_gate_span_ms("phase.sat_gate.total.ms", funnel_started_at);
-            // (4) Complete only arity>0 functions absent from every assertion and
+            // (5) Complete only arity>0 functions absent from every assertion and
             // assumption. This must run after the gates (creating an otherwise-
             // absent EUF model earlier would change their evidence classification)
             // but before the certificate is minted, so the certified model is the
@@ -237,7 +248,7 @@ impl Executor {
             if gated == SolveResult::Sat {
                 self.complete_unconstrained_functions_for_output(roots);
             }
-            // (5) RELEASE-MODE POSTCONDITION. The debug assertion at the public
+            // (6) RELEASE-MODE POSTCONDITION. The debug assertion at the public
             // check-sat boundary is useful diagnosis, but it cannot be the soundness
             // policy: optimized builds compile it out. Defense in depth at the only
             // SAT minting site guarantees that a future early return or stale defer

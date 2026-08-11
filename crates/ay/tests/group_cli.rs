@@ -16,6 +16,20 @@ mod strings_kill_switches;
 #[path = "group_cli/allsat_phase1_8777.rs"]
 mod allsat_phase1_8777;
 
+#[path = "group_cli/dimacs_sat_exit_codes.rs"]
+mod dimacs_sat_exit_codes;
+#[path = "group_cli/uncertifiable_symmetry_refusal.rs"]
+mod uncertifiable_symmetry_refusal;
+
+#[path = "group_cli/set_option_unknown_key.rs"]
+mod set_option_unknown_key;
+
+#[path = "group_cli/unconfirmed_diagnostic_scope.rs"]
+mod unconfirmed_diagnostic_scope;
+
+#[path = "group_cli/set_card_certification.rs"]
+mod set_card_certification;
+
 #[path = "group_cli/assert_soft_maxsmt.rs"]
 mod assert_soft_maxsmt;
 
@@ -94,6 +108,9 @@ mod gate_cli;
 #[path = "group_cli/firewall_route_rejection.rs"]
 mod firewall_route_rejection;
 
+#[path = "group_cli/proof_certificate_disclosure.rs"]
+mod proof_certificate_disclosure;
+
 #[path = "group_cli/fail_closed_result_authority.rs"]
 mod fail_closed_result_authority;
 
@@ -131,6 +148,11 @@ mod progress_json_e2e_8155;
 #[path = "group_cli/proof_artifact_v1_8885.rs"]
 mod proof_artifact_v1_8885;
 
+// Read-only-directory behaviour is expressed with POSIX mode bits
+// (`PermissionsExt::from_mode(0o555)`), which have no Windows equivalent; the
+// module cannot compile off unix and previously broke the whole `group_cli`
+// test binary on Windows.
+#[cfg(unix)]
 #[path = "group_cli/proof_write_readonly_dir.rs"]
 mod proof_write_readonly_dir;
 

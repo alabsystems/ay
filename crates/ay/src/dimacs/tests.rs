@@ -3770,9 +3770,9 @@ fn authenticated_lean_snapshot_is_anonymous_and_never_cleans_named_replacements(
 #[test]
 fn authenticated_lean_snapshot_fails_closed_without_anonymous_descriptors() {
     let executable = std::env::current_exe().expect("current executable");
-    let metadata = std::fs::metadata(executable).expect("current executable metadata");
+    let file = std::fs::File::open(executable).expect("open current executable");
     let published = super::PublishedDimacsProof {
-        identity: super::ProofFileIdentity::from_metadata(&metadata),
+        identity: super::ProofFileIdentity::from_file(&file).expect("current executable identity"),
         len: 0,
         sha256: [0; 32],
     };
@@ -4649,7 +4649,7 @@ fn proof_tombstones_reject_empty_clause_input_that_accepts_empty_drat() {
     assert!(ay_lrat_check::lrat_parser::parse_binary_lrat(&binary_tombstone).is_err());
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[test]
 fn unsupported_platform_proof_gate_mutates_no_paths() {
     let dir = tempfile::tempdir().expect("tempdir");

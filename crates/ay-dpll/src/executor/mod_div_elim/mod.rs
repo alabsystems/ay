@@ -192,6 +192,7 @@ fn eliminate_int_mod_div_impl(
         constraints: Vec::new(),
         memo: HashMap::default(),
         const_divmod_qr: HashMap::default(),
+        sym_divmod_qr: HashMap::default(),
         symbolic_divisors,
         introduced_unconstrained_div_mod: false,
         created_zero_divisor: false,
@@ -407,6 +408,12 @@ struct ModDivElimState {
     /// `a = k*(div a k) + (mod a k)` was only derivable via a uniqueness
     /// argument the LIA layer left as `unknown` (and could spin on).
     const_divmod_qr: HashMap<(TermId, BigInt), (TermId, TermId)>,
+    /// Shared `(quotient, remainder)` per `(rewritten dividend, rewritten
+    /// SYMBOLIC divisor)` — the symbolic-divisor twin of `const_divmod_qr`. One
+    /// pair serves both `(div x y)` and `(mod x y)` and is constrained once per
+    /// call, so the Euclidean identity linking them is immediate rather than a
+    /// uniqueness deduction. See [`ModDivElimState::symbolic_divmod_var`].
+    sym_divmod_qr: HashMap<(TermId, TermId), (TermId, TermId)>,
     symbolic_divisors: bool,
     /// See `ModDivElimResult::introduced_unconstrained_div_mod`.
     introduced_unconstrained_div_mod: bool,
@@ -677,6 +684,83 @@ impl ModDivElimState {
         terms.mk_var(name, Sort::Int)
     }
 
+    /// Deterministic quotient/remainder variable for a SYMBOLIC-divisor
+    /// `(div a b)` / `(mod a b)` — the counterpart of [`Self::zero_divisor_var`]
+    /// for the case the literal-zero path never sees. `kind` is `"q"` (the
+    /// quotient, i.e. the value of `(div a b)`) or `"r"` (the remainder, i.e.
+    /// the value of `(mod a b)`).
+    ///
+    /// #symbolic-div0-unpinned — these used to be `mk_fresh_var("_div_q", ..)`,
+    /// whose name is a bare counter, so nothing outside this pass could map the
+    /// application `(div a b)` back to the variable holding the value the
+    /// solver chose for it. When `b` is symbolic but evaluates to 0 the SMT-LIB
+    /// result is UNCONSTRAINED, `add_symbolic_division_constraints` leaves the
+    /// variable free, the solver picks a value — and the model published none,
+    /// so the mandatory independent gate could not confirm a correct `sat`.
+    /// There is nothing for the evaluator to RECOMPUTE in that case, so it has
+    /// to read the chosen value back, and interning by
+    /// `(kind, dividend-id, divisor-id)` is what lets it find the variable —
+    /// while also making every occurrence of the SAME application resolve to
+    /// the SAME variable, as SMT-LIB requires of a single consistent (if
+    /// unspecified) value. `model::eval_arith` reconstructs this exact name;
+    /// THE TWO MUST BE CHANGED TOGETHER.
+    ///
+    /// The name deliberately does NOT encode the OPERATOR: `(div a b)` and
+    /// `(mod a b)` over the same operands share ONE `(q, r)` pair, exactly as
+    /// [`Self::constant_divmod_qr`] does for a constant divisor. Both operators
+    /// are defined by the SAME constraint system (see
+    /// [`Self::add_symbolic_division_constraints`], which does not even look at
+    /// its `result_kind`), and for `b != 0` the Euclidean pair is unique, so
+    /// sharing is sound; it also makes
+    /// `a = b*(div a b) + (mod a b)` immediate instead of a uniqueness deduction
+    /// the LIA layer leaves as `unknown` (and can spin on). For `b = 0` the
+    /// constraint's `b = 0` disjunct leaves both free, and `q` and `r` are
+    /// SEPARATE variables, so `(div a 0)` and `(mod a 0)` stay independent as
+    /// SMT-LIB (and z3 #9140) require.
+    ///
+    /// The prefix is deliberately outside the `_mod_q`/`_div_q`/`_divmod_q`
+    /// family that `proof_rewrite_division` recognises by name: those matches
+    /// are meant to be the CLIENT's quotient/remainder encoding, and a match on
+    /// AY's own auxiliaries is what #authored-aux-name-collision is about.
+    fn symbolic_divmod_var(
+        terms: &mut TermStore,
+        kind: &str,
+        dividend: TermId,
+        divisor: TermId,
+    ) -> TermId {
+        let name = format!("_ay_symdiv_{kind}_{}_{}", dividend.index(), divisor.index());
+        terms.mk_var(name, Sort::Int)
+    }
+
+    /// The shared `(quotient, remainder)` pair for a symbolic-divisor
+    /// `(op dividend divisor)`, with the defining constraint emitted exactly
+    /// ONCE per pair per elimination call. See [`Self::symbolic_divmod_var`] for
+    /// why `div` and `mod` share the pair.
+    ///
+    /// The memo is deliberately per-call state. The variables intern globally by
+    /// NAME, but a later call must still re-emit the defining constraint
+    /// alongside its own rewritten formulas: suppressing emission because the
+    /// variable already exists in the (append-only) store would leave it free
+    /// whenever the earlier call's constraints are not in scope — a wrong-SAT.
+    fn symbolic_divmod_qr(
+        &mut self,
+        terms: &mut TermStore,
+        dividend: TermId,
+        divisor: TermId,
+        result_kind: SymbolicDivResult,
+    ) -> (TermId, TermId) {
+        let q = Self::symbolic_divmod_var(terms, "q", dividend, divisor);
+        let r = Self::symbolic_divmod_var(terms, "r", dividend, divisor);
+        if self
+            .sym_divmod_qr
+            .insert((dividend, divisor), (q, r))
+            .is_none()
+        {
+            self.add_symbolic_division_constraints(terms, dividend, divisor, q, r, result_kind);
+        }
+        (q, r)
+    }
+
     /// Scan the WHOLE store for literal-zero-divisor vars created by
     /// `zero_divisor_var`, returning `(is_mod, dividend, var)` for each distinct
     /// one. Scanning the whole store (not just this call's state) is required
@@ -795,10 +879,11 @@ impl ModDivElimState {
     ///
     /// Both spellings denote the same function application `op(value, 0)` whenever
     /// `value(d) = value(x)` and `value(y) = 0`, so they must give equal results.
-    /// The per-term fresh-var replacement keeps these in two SEPARATE classes
-    /// (`zero_divisor_var` for the literal-0 path, a `_div_q`/`_mod_r` fresh var
-    /// for the symbolic path), so neither `emit_zero_divisor_congruence` nor
-    /// `emit_symbolic_divisor_congruence` ever pairs them. Without this link a
+    /// The per-term var replacement keeps these in two SEPARATE classes
+    /// (`zero_divisor_var` → `_ay_zerodiv_*` for the literal-0 path,
+    /// `symbolic_divmod_var` → `_ay_symdiv_*` for the symbolic path), so neither
+    /// `emit_zero_divisor_congruence` nor `emit_symbolic_divisor_congruence`
+    /// ever pairs them. Without this link a
     /// model can assign `(div x 0)` and `(div (* x x) x)` different values when
     /// `x = 0` (both are `div(0,0)`), dodging an otherwise-forced contradiction —
     /// a wrong-SAT (e.g. `x=0 ∧ (distinct (div x 0) (div (* x x) x))`).
@@ -857,16 +942,17 @@ impl ModDivElimState {
     ) -> TermId {
         let x = self.rewrite_term(terms, dividend);
         let y = self.rewrite_term(terms, divisor);
-        let q = terms.mk_fresh_var("_mod_q", Sort::Int);
-        let r = terms.mk_fresh_var("_mod_r", Sort::Int);
 
         // A symbolic divisor may be zero; the `divisor == 0` disjunct in the
         // constraints below leaves q/r unconstrained (matching the SMT-LIB
-        // under-specification). The standard model evaluator returns Unknown on
-        // the zero-divisor original term, so SAT results that depend on this
-        // case must route through the validation bypass (#div0).
+        // under-specification). There is then nothing for the standard model
+        // evaluator to recompute, so it reads back the value the solve chose for
+        // `r` — possible only because `symbolic_divmod_var` gives it a
+        // deterministic name (#symbolic-div0-unpinned). SAT results that depend
+        // on this case still route through the validation bypass (#div0): the
+        // read-back restores completeness, it does not certify the rewrite.
         self.introduced_unconstrained_div_mod = true;
-        self.add_symbolic_division_constraints(terms, x, y, q, r, SymbolicDivResult::Mod);
+        let (_, r) = self.symbolic_divmod_qr(terms, x, y, SymbolicDivResult::Mod);
         self.symbolic_terms.push((true, x, y, r));
         r
     }
@@ -879,13 +965,13 @@ impl ModDivElimState {
     ) -> TermId {
         let x = self.rewrite_term(terms, dividend);
         let y = self.rewrite_term(terms, divisor);
-        let q = terms.mk_fresh_var("_div_q", Sort::Int);
-        let r = terms.mk_fresh_var("_div_r", Sort::Int);
 
         // See `rewrite_mod_symbolic`: the symbolic zero-divisor case is
-        // unconstrained, so SAT must route through the validation bypass (#div0).
+        // unconstrained, so SAT must route through the validation bypass (#div0)
+        // and the evaluator reads the chosen `q` back by name. Sharing the pair
+        // with `(mod x y)` is what links `x = y*q + r` for both operators.
         self.introduced_unconstrained_div_mod = true;
-        self.add_symbolic_division_constraints(terms, x, y, q, r, SymbolicDivResult::Div);
+        let (q, _) = self.symbolic_divmod_qr(terms, x, y, SymbolicDivResult::Div);
         self.symbolic_terms.push((false, x, y, q));
         q
     }

@@ -394,7 +394,14 @@ impl Solver {
         // clause/var density — the same quantity the preprocess site gates on.
         let factor_dense = config_preprocess_policy::factor_dense_enabled()
             && bve_density >= config_preprocess_policy::factor_dense_min_density();
-        if self.should_factor() && (!skip_expensive_equivalence_passes || factor_dense) {
+        // Record why a scheduled factor pass did not run (one evaluation, reused
+        // by both arms below) so `--stats` can attribute a factor-less run to a
+        // schedule gate rather than to the pass finding nothing.
+        let factor_skip = self.factor_skip_reason();
+        if let Some(reason) = factor_skip {
+            self.cold.factor_skip_counts[reason.index()] += 1;
+        }
+        if factor_skip.is_none() && (!skip_expensive_equivalence_passes || factor_dense) {
             self.jit_invalidate_for_structural_pass(); // factor: structural (#8128)
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::Factor, Self::factorize);
             passes_run.push("factor");
@@ -405,7 +412,7 @@ impl Solver {
             if self.propagate_check_unsat() {
                 return true;
             }
-        } else if self.should_factor() && skip_expensive_equivalence_passes {
+        } else if factor_skip.is_none() && skip_expensive_equivalence_passes {
             self.inproc_ctrl
                 .factor
                 .reschedule(self.num_conflicts, FACTOR_INTERVAL);

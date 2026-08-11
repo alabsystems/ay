@@ -335,19 +335,17 @@ pub(crate) fn run(
 // tolerated (incompleteness), and files without a decided `:status` contribute
 // no judgement. This lets the pre-push gate run with zero z3 dependency.
 
-/// Parse a benchmark's own `(set-info :status sat|unsat|unknown)` annotation —
-/// ground truth independent of any solver. Whole-word match so `:status` text
-/// elsewhere cannot leak in. Mirrors `bench::parse_declared_status`.
+/// The DECIDED part of a benchmark's own `(set-info :status sat|unsat|unknown)`
+/// annotation — ground truth independent of any solver. `None` for `unknown`,
+/// for an absent annotation, and for a self-contradicting one: all three are
+/// "no usable oracle".
+///
+/// One parser, in [`crate::bench::parse_declared_status`], for every lane: this
+/// used to be a hand-rolled copy that took the first `:status` substring in the
+/// raw bytes, which reads the prose inside a `(set-info :source | ... |)` blob
+/// as the answer.
 pub(crate) fn declared_status_of(text: &str) -> Option<Verdict> {
-    let idx = text.find(":status")?;
-    text[idx + ":status".len()..]
-        .split(|c: char| c.is_whitespace() || c == ')')
-        .find(|t| !t.is_empty())
-        .and_then(|t| match t {
-            "sat" => Some(Verdict::Sat),
-            "unsat" => Some(Verdict::Unsat),
-            _ => None, // "unknown" (or anything else) = no usable oracle
-        })
+    crate::bench::parse_declared_status(text).decided()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

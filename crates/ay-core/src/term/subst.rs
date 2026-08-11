@@ -121,7 +121,9 @@ impl TermStore {
                     term
                 } else {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Forall(vars, new_body, triggers), sort)
+                    let rebuilt = self.intern(TermData::Forall(vars, new_body, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 }
             }
             TermData::Exists(vars, body, triggers) => {
@@ -130,7 +132,9 @@ impl TermStore {
                     term
                 } else {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Exists(vars, new_body, triggers), sort)
+                    let rebuilt = self.intern(TermData::Exists(vars, new_body, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 }
             }
         };
@@ -216,7 +220,9 @@ impl TermStore {
                 let new_body = self.substitute_inner(body, from, to, cache);
                 if new_body != body {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Forall(vars, new_body, triggers), sort)
+                    let rebuilt = self.intern(TermData::Forall(vars, new_body, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 } else {
                     term
                 }
@@ -225,7 +231,9 @@ impl TermStore {
                 let new_body = self.substitute_inner(body, from, to, cache);
                 if new_body != body {
                     let sort = self.sort(term).clone();
-                    self.intern(TermData::Exists(vars, new_body, triggers), sort)
+                    let rebuilt = self.intern(TermData::Exists(vars, new_body, triggers), sort);
+                    self.copy_quantifier_metadata(term, rebuilt);
+                    rebuilt
                 } else {
                     term
                 }
@@ -464,6 +472,100 @@ mod tests {
         sort: Sort,
     ) -> crate::term::TermId {
         s.intern(TermData::App(Symbol::named(op), args), sort)
+    }
+
+    fn attach_quantifier_metadata(
+        s: &mut TermStore,
+        quantifier: crate::term::TermId,
+        no_pattern: crate::term::TermId,
+        no_mbqi: bool,
+    ) {
+        if no_mbqi {
+            s.mark_no_mbqi(quantifier);
+        }
+        s.set_quantifier_id(quantifier, "metadata-qid".to_string());
+        s.set_skolem_id(quantifier, "metadata-skid".to_string());
+        s.set_quantifier_weight(quantifier, 17);
+        s.set_quantifier_no_patterns(quantifier, vec![no_pattern]);
+    }
+
+    fn assert_quantifier_metadata(
+        s: &TermStore,
+        quantifier: crate::term::TermId,
+        no_pattern: crate::term::TermId,
+        no_mbqi: bool,
+    ) {
+        assert_eq!(s.is_no_mbqi(quantifier), no_mbqi);
+        assert_eq!(s.quantifier_id(quantifier), Some("metadata-qid"));
+        assert_eq!(s.skolem_id(quantifier), Some("metadata-skid"));
+        assert_eq!(s.explicit_quantifier_weight(quantifier), Some(17));
+        assert_eq!(s.quantifier_no_patterns(quantifier), &[no_pattern]);
+    }
+
+    #[test]
+    fn simplify_preserves_rebuilt_forall_metadata() {
+        let mut s = store();
+        let p = s.mk_var("simplify_metadata_p", Sort::Bool);
+        let t = s.mk_bool(true);
+        let raw_body = raw_app(&mut s, "and", vec![t, p], Sort::Bool);
+        let quantifier = s.mk_forall(vec![("x".to_string(), Sort::Bool)], raw_body);
+        attach_quantifier_metadata(&mut s, quantifier, p, true);
+
+        let rebuilt = s.simplify(quantifier);
+
+        assert_ne!(
+            rebuilt, quantifier,
+            "simplification must rebuild the forall"
+        );
+        assert!(matches!(s.get(rebuilt), TermData::Forall(_, body, _) if *body == p));
+        assert_quantifier_metadata(&s, rebuilt, p, true);
+    }
+
+    #[test]
+    fn substitute_preserves_rebuilt_exists_metadata() {
+        let mut s = store();
+        let p = s.mk_var("substitute_metadata_p", Sort::Bool);
+        let replacement = s.mk_var("substitute_metadata_replacement", Sort::Bool);
+        let quantifier = s.mk_exists(vec![("x".to_string(), Sort::Bool)], p);
+        attach_quantifier_metadata(&mut s, quantifier, p, false);
+
+        let rebuilt = s.substitute(quantifier, &[p], &[replacement]);
+
+        assert_ne!(rebuilt, quantifier, "substitution must rebuild the exists");
+        assert!(matches!(s.get(rebuilt), TermData::Exists(_, body, _) if *body == replacement));
+        assert_quantifier_metadata(&s, rebuilt, p, false);
+    }
+
+    #[test]
+    fn substitute_var_preserves_rebuilt_forall_metadata() {
+        let mut s = store();
+        let outer = s.mk_var("substitute_var_metadata_outer", Sort::Bool);
+        let replacement = s.mk_var("substitute_var_metadata_replacement", Sort::Bool);
+        let quantifier = s.mk_forall(vec![("bound".to_string(), Sort::Bool)], outer);
+        attach_quantifier_metadata(&mut s, quantifier, outer, true);
+
+        let rebuilt = s.substitute_var(quantifier, outer, replacement);
+
+        assert_ne!(rebuilt, quantifier, "substitution must rebuild the forall");
+        assert!(matches!(s.get(rebuilt), TermData::Forall(_, body, _) if *body == replacement));
+        assert_quantifier_metadata(&s, rebuilt, outer, true);
+    }
+
+    #[test]
+    fn substitute_terms_preserves_rebuilt_exists_metadata() {
+        let mut s = store();
+        let from = s.mk_var("substitute_terms_metadata_from", Sort::Bool);
+        let replacement = s.mk_var("substitute_terms_metadata_replacement", Sort::Bool);
+        let quantifier = s.mk_exists(vec![("bound".to_string(), Sort::Bool)], from);
+        attach_quantifier_metadata(&mut s, quantifier, from, false);
+        let mut substitutions = crate::kani_compat::det_hash_map_new();
+        substitutions.insert(from, replacement);
+
+        let rebuilt = s.substitute_terms(quantifier, &substitutions);
+
+        assert_ne!(rebuilt, quantifier, "substitution must rebuild the exists");
+        assert!(matches!(s.get(rebuilt), TermData::Exists(_, body, _) if *body == replacement));
+        assert_quantifier_metadata(&s, rebuilt, from, false);
     }
 
     #[test]

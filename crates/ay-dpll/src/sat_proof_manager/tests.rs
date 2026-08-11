@@ -304,6 +304,7 @@ fn test_add_original_clause_step_emits_theory_lemma_when_annotated() {
     let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
 
     let theory_annot = TheoryLemmaProof {
+        clause: clause.clone(),
         kind: TheoryLemmaKind::LraFarkas,
         farkas: Some(FarkasAnnotation::from_ints(&[1, 1])),
         lia: None,
@@ -346,6 +347,127 @@ fn test_add_original_clause_step_emits_theory_lemma_when_annotated() {
     }
 }
 
+#[test]
+fn test_farkas_annotation_rebinds_by_literal_and_merges_duplicates() {
+    use ay_core::{FarkasAnnotation, TheoryLemmaKind, TheoryLemmaProof};
+    use num_rational::Rational64;
+
+    let (_terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let annotation = TheoryLemmaProof {
+        clause: vec![p, q, p],
+        kind: TheoryLemmaKind::LraFarkas,
+        farkas: Some(FarkasAnnotation::new(vec![
+            Rational64::new(1, 2),
+            Rational64::from(1),
+            Rational64::new(1, 2),
+        ])),
+        lia: None,
+    };
+
+    let rebound = SatProofManager::rebind_theory_annotation(&annotation, &[q, p])
+        .expect("permutation and duplicate normalization must rebind");
+    assert_eq!(rebound.clause, vec![q, p]);
+    assert_eq!(
+        rebound.farkas.expect("Farkas").coefficients,
+        vec![Rational64::from(1), Rational64::from(1)]
+    );
+
+    let rebound_with_target_duplicate =
+        SatProofManager::rebind_theory_annotation(&annotation, &[q, p, p])
+            .expect("target duplicates must receive a single merged multiplier");
+    assert_eq!(
+        rebound_with_target_duplicate
+            .farkas
+            .expect("Farkas")
+            .coefficients,
+        vec![
+            Rational64::from(1),
+            Rational64::from(1),
+            Rational64::from(0),
+        ]
+    );
+
+    assert!(SatProofManager::rebind_theory_annotation(&annotation, &[q]).is_none());
+}
+
+#[test]
+fn test_cutting_plane_farkas_rebinds_with_clause_permutation() {
+    use ay_core::{
+        CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation, TheoryLemmaKind, TheoryLemmaProof,
+    };
+    use num_rational::Rational64;
+
+    let (_terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let annotation = TheoryLemmaProof {
+        clause: vec![p, q, p],
+        kind: TheoryLemmaKind::LiaGeneric,
+        farkas: None,
+        lia: Some(LiaAnnotation::CuttingPlane(CuttingPlaneAnnotation {
+            farkas: FarkasAnnotation::new(vec![
+                Rational64::new(1, 2),
+                Rational64::from(1),
+                Rational64::new(1, 2),
+            ]),
+            divisor: 2,
+        })),
+    };
+
+    let rebound = SatProofManager::rebind_theory_annotation(&annotation, &[q, p])
+        .expect("cutting-plane coefficients must follow literal identity");
+    let Some(LiaAnnotation::CuttingPlane(cutting_plane)) = rebound.lia else {
+        panic!("expected cutting-plane annotation");
+    };
+    assert_eq!(cutting_plane.divisor, 2);
+    assert_eq!(
+        cutting_plane.farkas.coefficients,
+        vec![Rational64::from(1), Rational64::from(1)]
+    );
+}
+
+#[test]
+fn test_indexed_theory_annotation_emits_rebound_farkas_order() {
+    use ay_core::{FarkasAnnotation, TheoryLemmaKind, TheoryLemmaProof};
+    use num_rational::Rational64;
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let annotation = TheoryLemmaProof {
+        clause: vec![p, q],
+        kind: TheoryLemmaKind::LraFarkas,
+        farkas: Some(FarkasAnnotation::new(vec![
+            Rational64::new(1, 2),
+            Rational64::from(1),
+        ])),
+        lia: None,
+    };
+    let mut proof = Proof::new();
+    let mut existing_clause_map = HashMap::default();
+
+    let id = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &[q, p],
+        &mut existing_clause_map,
+        None,
+        Some(&annotation),
+    );
+    let ProofStep::TheoryLemma { clause, farkas, .. } =
+        proof.get_step(id).expect("rebound theory lemma")
+    else {
+        panic!("expected a theory lemma");
+    };
+    assert_eq!(clause, &[q, p]);
+    assert_eq!(
+        farkas.as_ref().expect("Farkas").coefficients,
+        vec![Rational64::from(1), Rational64::new(1, 2)]
+    );
+}
+
 /// Theory lemma annotation: duplicate clause only emits once (#6031 Phase 4).
 ///
 /// When the same normalized clause appears twice in the trace, the second
@@ -361,6 +483,7 @@ fn test_add_original_clause_step_deduplicates_theory_lemma() {
     let clause = vec![p, q];
     let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
     let theory_annot = TheoryLemmaProof {
+        clause: clause.clone(),
         kind: TheoryLemmaKind::LraFarkas,
         farkas: Some(FarkasAnnotation::from_ints(&[1, 1])),
         lia: None,
@@ -423,6 +546,147 @@ fn test_add_original_clause_step_without_annotation_emits_assume_or() {
         }
         other => panic!("expected Or step, got {:?}", std::mem::discriminant(other)),
     }
+}
+
+/// Proof-side clause encoding must not simplify nested disjunction literals.
+/// A SAT literal can itself denote an `or`; flattening it in the premise makes
+/// the subsequent Alethe `or` conclusion structurally invalid.
+#[test]
+fn test_add_original_clause_step_preserves_nested_or_literal() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let r = terms.mk_var("r", Sort::Bool);
+    let nested_or = terms.mk_or(vec![p, q]);
+    let clause = vec![nested_or, r];
+    let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
+
+    let mut proof = Proof::new();
+    let id = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &clause,
+        &mut existing_clause_map,
+        None,
+        None,
+    );
+
+    let ProofStep::Step { premises, .. } = proof.get_step(id).expect("proof step must exist")
+    else {
+        panic!("expected Or step");
+    };
+    let Some(ProofStep::Assume(or_term)) = proof.get_step(premises[0]) else {
+        panic!("expected Or premise to be an assumption");
+    };
+    let TermData::App(ay_core::Symbol::Named(name), children) = terms.get(*or_term) else {
+        panic!("expected assumed term to be an or application");
+    };
+    assert_eq!(name, "or");
+    assert_eq!(children, &clause, "assumption must preserve exact literals");
+}
+
+/// The same nested-`or` clause, but adjudicated by the REAL trust root.
+///
+/// `test_add_original_clause_step_preserves_nested_or_literal` inspects the
+/// assumed term's shape; this test instead hands the emitter's own output to
+/// `ay_proof::check_proof_strict`, which is the checker that actually decides
+/// whether an UNSAT verdict may be published. It pins the exact regression
+/// that converted real refutations into `Unknown`:
+///
+/// ```text
+/// strict UNSAT proof validation failed:
+/// step tN has invalid or rule: conclusion clause must contain exactly the
+/// or children
+/// ```
+///
+/// Mechanism: `TermStore::mk_or` is a SIMPLIFYING constructor (it flattens
+/// nested `or`s, dedups, sorts, drops `false`), while the `or` step's
+/// conclusion is the unsimplified traced SAT clause. A Tseitin gate literal
+/// for an `(or ..)` subterm IS an `or` application, so building the premise
+/// with `mk_or` flattens it away and the premise's children stop matching the
+/// conclusion. The Alethe `or` rule is exactly that structural
+/// correspondence — premise `(cl (or f1 .. fn))` yields `(cl f1 .. fn)` — so
+/// the checker is right to refuse, and the emitter must preserve the clause.
+///
+/// The refutation is completed with two unit assumptions and two resolutions
+/// so `check_proof_strict` sees a terminal empty clause; the `or` step is the
+/// only part under test.
+#[test]
+fn test_original_clause_or_step_with_nested_or_literal_passes_strict_checker() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let r = terms.mk_var("r", Sort::Bool);
+    // `nested_or` is a single SAT literal whose term is itself `(or p q)` —
+    // exactly the Tseitin gate-literal shape that `mk_or` would flatten.
+    let nested_or = terms.mk_or(vec![p, q]);
+    let clause = vec![nested_or, r];
+    let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
+
+    let mut proof = Proof::new();
+    let or_step = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &clause,
+        &mut existing_clause_map,
+        None,
+        None,
+    );
+
+    // Close the refutation: (nested_or r), (not nested_or), (not r) |- false.
+    let not_nested_or = terms.mk_not_raw(nested_or);
+    let not_r = terms.mk_not_raw(r);
+    let assume_not_nested_or = proof.add_assume(not_nested_or, None);
+    let assume_not_r = proof.add_assume(not_r, None);
+    let resolved_r = proof.add_resolution(vec![r], nested_or, or_step, assume_not_nested_or);
+    proof.add_resolution(Vec::new(), r, resolved_r, assume_not_r);
+
+    ay_proof::check_proof_strict(&proof, &terms).unwrap_or_else(|error| {
+        panic!(
+            "strict checker rejected the emitter's own `or` step for a clause \
+             carrying a nested-or literal: {error}"
+        )
+    });
+}
+
+/// Companion channel: `mk_or` also DEDUPLICATES. A traced clause that repeats
+/// a literal must still be reproduced verbatim in the assumed disjunction —
+/// `clause_matches_unordered` is a multiset compare, so a deduplicated premise
+/// with a duplicate-carrying conclusion is rejected exactly like the flatten
+/// case. (Removing a repeated literal is Alethe `contraction`, not `or`.)
+#[test]
+fn test_add_original_clause_step_preserves_duplicate_literal() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let clause = vec![p, q, p];
+    let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
+
+    let mut proof = Proof::new();
+    let id = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &clause,
+        &mut existing_clause_map,
+        None,
+        None,
+    );
+
+    let ProofStep::Step { premises, .. } = proof.get_step(id).expect("proof step must exist")
+    else {
+        panic!("expected Or step");
+    };
+    let Some(ProofStep::Assume(or_term)) = proof.get_step(premises[0]) else {
+        panic!("expected Or premise to be an assumption");
+    };
+    let TermData::App(ay_core::Symbol::Named(name), children) = terms.get(*or_term) else {
+        panic!("expected assumed term to be an or application");
+    };
+    assert_eq!(name, "or");
+    assert_eq!(
+        children, &clause,
+        "assumption must preserve the duplicate literal verbatim"
+    );
 }
 
 #[test]
@@ -531,6 +795,74 @@ fn test_add_original_clause_step_clausification_annotation_emits_tautology_rule(
         &vec![and_term],
         "source term should be forwarded as an argument"
     );
+}
+
+#[test]
+fn test_original_annotation_uses_reserved_clause_id_slot() {
+    use ay_core::ClausificationProof;
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let stale_source = terms.mk_ite(p, p, q);
+    let expected_source = terms.mk_or(vec![p, q]);
+    let annotations = vec![
+        Some(ClausificationProof {
+            rule: AletheRule::IteNeg1,
+            source_term: stale_source,
+        }),
+        Some(ClausificationProof {
+            rule: AletheRule::OrPos(0),
+            source_term: expected_source,
+        }),
+    ];
+
+    let selected = SatProofManager::original_annotation_by_id(Some(&annotations), 2)
+        .expect("clause ID 2 must select slot 1 even when ID 1 was omitted");
+    assert_eq!(selected.rule, AletheRule::OrPos(0));
+    assert_eq!(selected.source_term, expected_source);
+}
+
+#[test]
+fn test_mismatched_clausification_annotation_fails_closed() {
+    use ay_core::ClausificationProof;
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let or_term = terms.mk_or(vec![p, q]);
+    let clause = vec![terms.mk_not_raw(or_term), p, q];
+    let stale_source = terms.mk_ite(p, p, q);
+    let stale = ClausificationProof {
+        rule: AletheRule::IteNeg1,
+        source_term: stale_source,
+    };
+    let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
+    let mut proof = Proof::new();
+
+    let id = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &clause,
+        &mut existing_clause_map,
+        Some(&stale),
+        None,
+    );
+
+    assert!(matches!(
+        proof.get_step(id),
+        Some(ProofStep::Step {
+            rule: AletheRule::Or,
+            ..
+        })
+    ));
+    assert!(proof.steps.iter().all(|step| !matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::IteNeg1,
+            ..
+        }
+    )));
 }
 
 /// or_pos clause literals must be emitted in the Alethe spec order —

@@ -21,10 +21,10 @@
 //!     gate eval) certifying `Val` is INHABITED, so `no_model`'s `∀ m` is
 //!     non-vacuous. Without it, an adversarial proof with contradictory gate
 //!     respects (uninhabited `Val`) would let `no_model` check vacuously for a
-//!     *satisfiable* `original` — a false "verified". `validate()` cannot catch
-//!     that (it sees clause/resolution well-formedness, not joint satisfiability of
-//!     the respects), so the witness is emitted here and an uninhabited `Val` fails
-//!     `val_inhabited`'s `decide` → the kernel rejects the file (fail-closed).
+//!     *satisfiable* `original` — a false "verified". Native `validate()` now
+//!     rejects malformed gate topology too, but the renderer is a public API and
+//!     may be called directly; the witness therefore remains an independent
+//!     boundary where an uninhabited `Val` makes `val_inhabited` fail to check.
 //!   * `no_model` — `firewall_combined_unsat … = ∀ m, ¬ Sat (atomVal m) original`.
 //!
 //! Atom convention: firewall atom = bit-blast variable id (0-based) + 1, so literal
@@ -82,7 +82,10 @@ fn clause_to_lean(lits: &[Lit]) -> String {
 /// the `structure Val` field (where `α` is the bound field), or `"m.α "` inside a
 /// proof where `m : Val`.
 fn av(prefix: &str, var: u32) -> String {
-    format!("{prefix}{}", atom(var))
+    // Parenthesize the function application so it remains one operand when
+    // nested beneath prefix functions such as `Bool.xor`. Without this,
+    // `Bool.xor α 3 α 3` is parsed as applying `xor` to the function `α`.
+    format!("({prefix}{})", atom(var))
 }
 
 /// The `gateEval` expression for a gate kind over its input variables, as a Lean
@@ -303,14 +306,28 @@ pub fn render_bv_blast_proof_lean(proof: &BvBlastProof, module: &str) -> String 
 mod tests {
     use super::*;
     use crate::bv_blast_export::{
-        BitLemma, BvBlastProof, BvOp, Clause, ClauseProvenance, OperandRef, Refutation, ResRule,
-        ResolutionStep, SliceObligation, VarRole, VarTable,
+        export_bv_blast_proof, BitLemma, BvBlastProof, BvOp, Clause, ClauseProvenance, OperandRef,
+        Refutation, ResRule, ResolutionStep, SliceObligation, VarRole, VarTable,
     };
 
-    /// Build the small UNSAT obligation `(a ∧ b) = 1 ∧ a = 0` as a hand-checked
-    /// `BvBlastProof` (one And2 gate). The gate's full Tseitin CNF (4 clauses, the
-    /// producer's enumeration) plus the two assertion clauses, refuted by a 3-step
-    /// resolution chain to the empty clause. `validate()` confirms well-formedness.
+    /// A producer-authored certificate accepted by the same native validator
+    /// that gates the public BV proof lane. Renderer parity tests must use this
+    /// fixture rather than merely well-shaped arbitrary CNF.
+    pub(super) fn accepted_and1_proof() -> BvBlastProof {
+        export_bv_blast_proof(SliceObligation::identical_at(BvOp::And, 1))
+            .expect("the one-bit reflexive AND disequality must export")
+    }
+
+    /// A second accepted fixture with a deeper arithmetic gate DAG.
+    pub(super) fn accepted_add2_proof() -> BvBlastProof {
+        export_bv_blast_proof(SliceObligation::identical_at(BvOp::Add, 2))
+            .expect("the two-bit reflexive ADD disequality must export")
+    }
+
+    /// Build the legacy small UNSAT CNF `(a ∧ b) = 1 ∧ a = 0` used to exercise
+    /// renderer failure behavior. This predates the exact equality-certificate
+    /// layout and is intentionally rejected by native `validate()`; positive
+    /// renderer parity uses [`accepted_and1_proof`] instead.
     pub(super) fn and2_unsat_proof() -> BvBlastProof {
         // vars: 0 = a, 1 = b, 2 = out (= a ∧ b).
         let mut vars = VarTable::default();
@@ -524,29 +541,42 @@ mod tests {
     }
 
     #[test]
-    fn hand_built_proof_is_well_formed() {
-        and2_unsat_proof()
-            .validate()
-            .expect("hand-built proof must validate");
-        and_chain_unsat_proof()
-            .validate()
-            .expect("chain proof must validate");
+    fn arbitrary_original_cnf_fixtures_are_not_native_equality_certificates() {
+        assert!(matches!(
+            and2_unsat_proof().validate(),
+            Err(crate::bv_blast_export::BvBlastValidateError::MalformedBitEqLayout { .. })
+                | Err(crate::bv_blast_export::BvBlastValidateError::MalformedDisequality { .. })
+        ));
+        assert!(matches!(
+            and_chain_unsat_proof().validate(),
+            Err(crate::bv_blast_export::BvBlastValidateError::MalformedBitEqLayout { .. })
+                | Err(crate::bv_blast_export::BvBlastValidateError::MalformedDisequality { .. })
+        ));
     }
 
     #[test]
     fn render_contains_the_firewall_shape() {
-        let lean = render_bv_blast_proof_lean(&and2_unsat_proof(), "RenderedAnd2");
+        let proof = accepted_and1_proof();
+        proof
+            .validate()
+            .expect("the renderer fixture must pass native certificate validation");
+        let lean = render_bv_blast_proof_lean(&proof, "RenderedAnd1");
         // Grounds in the verified firewall, not a re-defined/native checker.
         assert!(lean.contains("import AySoundness.Firewall"));
         assert!(lean.contains("firewall_combined_unsat"));
         assert!(!lean.contains("native_decide"));
         assert!(!lean.contains("sorry"));
-        // The gate respect uses bare `α` (the bound field), out atom 3 = α1 && α2.
-        assert!(lean.contains("respects_0 : α 3 = (α 1 && α 2)"));
-        // atoms are var+1; the disequality `out = 1` clause is [3], `a = 0` is [-1].
-        assert!(lean.contains("def original : List (Cid × Clause) := [(5, [3]), (6, [-1])]"));
-        // last proof step derives the empty clause.
-        assert!(lean.contains("(9, [], [8, 6])"));
+        assert!(lean.contains("respects_0 :"));
+        assert!(
+            lean.contains("Bool.xor (α 3) (α 3)"),
+            "prefix-function operands must remain parenthesized Lean terms"
+        );
+        assert!(lean.contains("def original : List (Cid × Clause) :="));
+        assert!(lean.contains("def proof : List (Cid × Clause × List Int) :="));
+        assert!(
+            lean.contains(", [], ["),
+            "the last proof step derives the empty clause"
+        );
         // the inhabitation witness makes `no_model`'s `∀ m : Val` non-vacuous.
         assert!(lean.contains("def wα : Nat → Bool"));
         assert!(lean.contains("theorem val_inhabited : Nonempty Val"));
@@ -571,18 +601,21 @@ mod golden {
     fn renderer_matches_kernel_checked_artifacts() {
         let cases: &[(BvBlastProof, &str, &str)] = &[
             (
-                tests::and2_unsat_proof(),
+                tests::accepted_and1_proof(),
                 "CombinedBvBlastRendered",
                 include_str!("../../../verification/lean/AySoundness/CombinedBvBlastRendered.lean"),
             ),
             (
-                tests::and_chain_unsat_proof(),
+                tests::accepted_add2_proof(),
                 "CombinedBvBlastChain",
                 include_str!("../../../verification/lean/AySoundness/CombinedBvBlastChain.lean"),
             ),
         ];
         let dump = std::env::var("AY_DUMP_RENDER").is_ok();
         for (proof, module, golden) in cases {
+            proof.validate().unwrap_or_else(|error| {
+                panic!("golden renderer fixture {module} must validate natively: {error}")
+            });
             let rendered = render_bv_blast_proof_lean(proof, module);
             if dump {
                 std::fs::write(format!("{DIR}{module}.lean"), &rendered).unwrap();
@@ -606,14 +639,9 @@ mod fail_closed {
     };
 
     /// The adversarial proof from the soundness review: `ConstTrue(out=0)` AND
-    /// `ConstFalse(out=0)`. `validate()` ACCEPTS it (both gate clauses are genuine
-    /// Tseitin clauses of their cited lemmas, and `[0],[¬0]` resolve to ⊥), yet
-    /// `Val` is UNINHABITED — so without the inhabitation witness `no_model` would
-    /// kernel-check vacuously for the SATISFIABLE `original = [1]` (a false
-    /// "verified"). The emitted `val_inhabited` closes this: its witness assigns the
-    /// conflicted bit ONE value, contradicting the other gate's respect, so the
-    /// `by decide` fails and the kernel REJECTS the file (verified empirically: the
-    /// rendered `AttackUninhab` is rejected at `wα 1 = true`).
+    /// `ConstFalse(out=0)`. Native validation now rejects the duplicate output
+    /// definition directly. The emitted Lean inhabitation witness remains a
+    /// second fail-closed boundary for callers that render without validation.
     fn uninhabited_proof() -> BvBlastProof {
         let mut vars = VarTable::default();
         let _ = vars.alloc(VarRole::Out { bit: 0 }); // var 0 = conflicted gate output
@@ -672,10 +700,12 @@ mod fail_closed {
     }
 
     #[test]
-    fn uninhabited_proof_validates_but_render_is_fail_closed() {
+    fn uninhabited_proof_is_rejected_and_render_is_independently_fail_closed() {
         let proof = uninhabited_proof();
-        // validate() cannot see inhabitation, so it ACCEPTS this faithfulness-broken proof.
-        proof.validate().expect("adversarial proof validates");
+        assert!(matches!(
+            proof.validate(),
+            Err(crate::bv_blast_export::BvBlastValidateError::DuplicateGateOutput { .. })
+        ));
         let lean = render_bv_blast_proof_lean(&proof, "AttackUninhab");
         // The witness assigns the conflicted bit (atom 1) `false` (ConstFalse wins the
         // fixpoint), but gate 0's respect demands it be `true` — so `val_inhabited`'s

@@ -2191,6 +2191,63 @@ impl PlannedResources {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        self.run_external_transcript_impl(program, args, stdin, timeout, label, &[])
+    }
+
+    /// Run one byte transcript while removing dynamic-loader injection and
+    /// search-path variables from the child before its first `exec`.
+    ///
+    /// Use this for authenticated shared-library probes: clearing only inside a
+    /// shell wrapper is too late because the wrapper itself has already been
+    /// loaded under the inherited environment. The RSS watchdog and explicit
+    /// `MEMLIMIT`/`NBCORE` settings remain identical to
+    /// [`Self::run_external_transcript`].
+    pub fn run_external_transcript_scrubbed<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        stdin: &[u8],
+        timeout: Duration,
+        label: &str,
+    ) -> Result<GuardedTranscriptOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        const LOADER_ENVIRONMENT: &[&str] = &[
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_IMAGE_SUFFIX",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_ROOT_PATH",
+            "DYLD_VERSIONED_FRAMEWORK_PATH",
+            "DYLD_VERSIONED_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_DEBUG",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_PROFILE",
+            "LIBPATH",
+            "SHLIB_PATH",
+        ];
+        self.run_external_transcript_impl(program, args, stdin, timeout, label, LOADER_ENVIRONMENT)
+    }
+
+    fn run_external_transcript_impl<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        stdin: &[u8],
+        timeout: Duration,
+        label: &str,
+        removed_environment: &[&str],
+    ) -> Result<GuardedTranscriptOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         if stdin.len() > GUARDED_TRANSCRIPT_INPUT_LIMIT {
             return Err(BenchError::InvalidArgs {
                 reason: format!(
@@ -2203,6 +2260,9 @@ impl PlannedResources {
 
         let started = Instant::now();
         let mut command = self.external_command(program);
+        for variable in removed_environment {
+            command.env_remove(variable);
+        }
         command
             .args(args)
             .env("MEMLIMIT", self.plan.memlimit_mb_per_child.to_string())

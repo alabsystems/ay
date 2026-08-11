@@ -98,6 +98,14 @@ impl Executor {
             }
         }
 
+        // `(= s seq.empty) <=> (= (seq.len s) 0)`, which no other generator
+        // emits for a query without a var-concat word equation
+        // (#seq-empty-diseq-witness). Collected here rather than inside
+        // `generate_axioms_from_scan` so it runs exactly once per collection: it
+        // re-walks the assertions itself instead of reading the scan, so the
+        // second (new-terms-only) pass would just redo the same work.
+        axioms.extend(self.generate_seq_emptiness_biconditional_axioms());
+
         axioms
     }
 
@@ -2686,6 +2694,163 @@ impl Executor {
         }
 
         axioms
+    }
+
+    /// Emptiness biconditional for a seq equality against the EMPTY sequence
+    /// (#seq-empty-diseq-witness).
+    ///
+    /// `(= s seq.empty) <=> (= (seq.len s) 0)` is a theorem of the sequence
+    /// theory, but the only generator that emitted it —
+    /// [`Self::collect_seq_length_constraint_axioms`] — first builds a relevance
+    /// set seeded exclusively from var-CONCAT word equations and returns early
+    /// when that set is empty. A query with no `seq.++` at all therefore got NO
+    /// length fact about `s`, and a bare
+    /// `(assert (not (= s (as seq.empty (Seq Int)))))` reached model building
+    /// with `s` completely unpinned.
+    ///
+    /// The sequence-class completion numbers unpinned classes with the lengths
+    /// `0, 1, 2, ...` in carrier order, so the FIRST unpinned class receives the
+    /// EMPTY sequence — precisely the value the disequality forbids. The strict
+    /// `sequences` oracle then rejected the model and a plainly satisfiable
+    /// query published `unknown`. The verdict was decided by DECLARATION ORDER:
+    /// in
+    ///
+    /// ```smtlib
+    /// (declare-const t (Seq Int))
+    /// (declare-const src (Seq Int))
+    /// (assert (not (= t src)))
+    /// (assert (not (= src (as seq.empty (Seq Int)))))
+    /// ```
+    ///
+    /// `src` is the second class, draws length 1, and the query is `sat`;
+    /// swapping the two `declare-const` lines makes `src` the first class, draws
+    /// length 0, and the same query is `unknown`.
+    ///
+    /// Emitting the biconditional puts `(seq.len s) != 0` into the LIA system,
+    /// so the length-pinned witness reconstruction (preferred by the completion
+    /// over its arbitrary "next unused length") builds a genuinely non-empty
+    /// `s`. Unlike the word-equation pass this needs no relevance set: the fact
+    /// holds of every sequence, so there is nothing to scope it to.
+    ///
+    /// SOUNDNESS. `s = empty <=> |s| = 0` is true in every model of the sequence
+    /// theory, so conjoining it is equisatisfiable — it can neither create a
+    /// model (no wrong SAT) nor destroy one (no wrong UNSAT). It is emitted as a
+    /// single `=` over the EXISTING equality atom, so it introduces no new case
+    /// split, and the model it enables is still re-checked by the strict and
+    /// independent gates before publication.
+    ///
+    /// Scope: [`Self::collect_seq_equality_atoms`] admits only `Sort::Seq(_)`
+    /// operands, so `Sort::String` equalities (whose length operator is
+    /// `str.len`, not `seq.len`) are never touched.
+    fn generate_seq_emptiness_biconditional_axioms(&mut self) -> Vec<TermId> {
+        // Same bound as the word-equation length pass: two axioms per atom.
+        const MAX_EMPTINESS_ATOMS: usize = 256;
+        let assertions = self.ctx.assertions.clone();
+        let mut eq_atoms: Vec<TermId> = Vec::new();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        for &assertion in &assertions {
+            self.collect_seq_equality_atoms(assertion, &mut eq_atoms, &mut seen);
+        }
+
+        let zero = self.ctx.terms.mk_int(BigInt::zero());
+        let one = self.ctx.terms.mk_int(BigInt::from(1));
+        let mut axioms = Vec::new();
+        for eq_term in eq_atoms.into_iter().take(MAX_EMPTINESS_ATOMS) {
+            let (lhs, rhs) = match self.ctx.terms.get(eq_term).clone() {
+                TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
+                    (args[0], args[1])
+                }
+                _ => continue,
+            };
+            // Exactly one side is the empty sequence. With BOTH empty the atom
+            // is a tautology the core already decides; with NEITHER empty this
+            // generator has nothing to say and the length-congruence pass owns
+            // the atom.
+            let lhs_empty = self.seq_term_is_empty(lhs);
+            let rhs_empty = self.seq_term_is_empty(rhs);
+            if lhs_empty == rhs_empty {
+                continue;
+            }
+            let other = if lhs_empty { rhs } else { lhs };
+            let other_len = self.mk_seq_len(other);
+            let len_zero = self.ctx.terms.mk_eq(other_len, zero);
+            axioms.push(self.ctx.terms.mk_eq(eq_term, len_zero));
+            axioms.push(self.ctx.terms.mk_ge(other_len, zero));
+        }
+
+        // Definitely-true non-emptiness, as an UNCONDITIONAL lower bound.
+        //
+        // The biconditional above is the general fact, but it reaches the model
+        // builder only as a Bool-atom equivalence: the SAT layer assigns
+        // `(= s empty)` false and therefore `(= (seq.len s) 0)` false, yet the
+        // arithmetic model never has to COMMIT `(seq.len s)` to a number. The
+        // completion's `length_pinned_seq_witness` requires a RESOLVED length —
+        // an unresolved one is fail-closed `None` — so it falls back to the
+        // arbitrary "next unused length" and the bug survives. MEASURED, on
+        //
+        // ```smtlib
+        // (declare-const s (Seq Int))
+        // (assert (not (= s (as seq.empty (Seq Int)))))
+        // ```
+        //
+        // adding `(>= (seq.len s) 0)` alone still yields `unknown`, while either
+        // `(>= (seq.len s) 1)` or `(not (= (seq.len s) 0))` as a TOP-LEVEL unit
+        // yields `sat` with `s = (seq.unit 0)`. So the unit form is what the
+        // length-pinned reconstruction actually consumes.
+        //
+        // SOUNDNESS. Emitted only for a DEFINITELY-TRUE disequality — a
+        // top-level assertion or a conjunct of a top-level `and`, which is true
+        // in every model of the query, exactly the discipline
+        // `collect_definitely_true_seq_equalities` documents for length facts.
+        // `s != empty` implies `|s| >= 1` in every such model, so this prunes no
+        // model. It is NOT emitted for a disequality under `or`/`ite`/nested
+        // `not`, which may be false; there the biconditional above still carries
+        // the (weaker) fact.
+        for (lhs, rhs) in self.collect_definitely_true_seq_disequalities() {
+            let lhs_empty = self.seq_term_is_empty(lhs);
+            let rhs_empty = self.seq_term_is_empty(rhs);
+            if lhs_empty == rhs_empty {
+                continue;
+            }
+            let other = if lhs_empty { rhs } else { lhs };
+            let other_len = self.mk_seq_len(other);
+            axioms.push(self.ctx.terms.mk_ge(other_len, one));
+        }
+        axioms
+    }
+
+    /// Seq-sorted disequalities that hold in EVERY model of the query: a
+    /// top-level `(not (= a b))` assertion, or such a conjunct of a top-level
+    /// `and`. Mirrors [`Self::collect_definitely_true_seq_equalities`], which
+    /// documents why length facts may be derived only from definitely-true
+    /// premises (deriving them from an equality under `not`/`or`/`ite` was the
+    /// earlier version's wrong-UNSAT source).
+    fn collect_definitely_true_seq_disequalities(&self) -> Vec<(TermId, TermId)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<TermId> = self.ctx.assertions.clone();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t).clone() {
+                // Only `and` is descended: every conjunct of a true conjunction
+                // is itself true. `or`/`ite` branches are not.
+                TermData::App(sym, args) if sym.name() == "and" => stack.extend(args),
+                TermData::Not(inner) => {
+                    if let TermData::App(sym, args) = self.ctx.terms.get(inner).clone() {
+                        if sym.name() == "="
+                            && args.len() == 2
+                            && self.ctx.terms.sort(args[0]).is_seq()
+                        {
+                            out.push((args[0], args[1]));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Generate `seq.nth` axioms from collected terms (#5841).

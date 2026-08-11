@@ -39,11 +39,17 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::One;
 
+pub mod algebraic;
 mod bitvec;
 pub mod dt_axiom;
 mod eval;
+pub mod fp;
+pub mod ieee;
+mod regex;
 mod residual;
 mod seq;
+pub mod sets;
+pub mod strings;
 
 #[cfg(test)]
 mod tests;
@@ -67,7 +73,9 @@ pub const MAX_EVAL_DEPTH: usize = 2000;
 ///
 /// These are the only value shapes the independent evaluator understands. Each
 /// is an *exact* representation (bignum integers, exact rationals, width-tagged
-/// bitvectors) — there is no floating point anywhere in the gate.
+/// bitvectors, and concrete IEEE floating-point payloads).  Floating-point
+/// values retain their exact sign/exponent/significand fields; the gate never
+/// rounds them through a host float.
 #[derive(Clone, Debug)]
 pub enum ModelValue {
     /// Boolean.
@@ -83,6 +91,25 @@ pub enum ModelValue {
         /// Unsigned numeric value in `[0, 2^width)`.
         value: BigInt,
     },
+    /// Exact SMT-LIB floating-point value. `significand_bits` includes the
+    /// hidden bit, so `significand` contains exactly
+    /// `significand_bits - 1` stored fraction bits.  The representation keeps
+    /// positive and negative zero distinct, as SMT-LIB structural equality
+    /// requires.  NaN and infinity are represented exactly but operations
+    /// whose SMT-LIB result is unspecified (notably `fp.to_real`) reject them
+    /// fail-closed.
+    FloatingPoint {
+        /// Sign bit (`true` means negative).
+        sign: bool,
+        /// Biased exponent field.
+        exponent: u64,
+        /// Stored fraction/significand field (without the hidden bit).
+        significand: u64,
+        /// Exponent-field width.
+        exponent_bits: u32,
+        /// Total significand precision, including the hidden bit.
+        significand_bits: u32,
+    },
     /// String (sequence of Unicode code points).
     Str(String),
     /// An element of an uninterpreted sort, identified by an opaque token.
@@ -95,6 +122,13 @@ pub enum ModelValue {
     Array(Box<ArrayValue>),
     /// A sequence value: its elements in order.
     Seq(Vec<ModelValue>),
+    /// A real algebraic number that is not rational — e.g. `sqrt(2)`, which
+    /// z3 publishes as `(root-obj (+ (^ x 2) (- 2)) 2)`. [`Self::Real`] holds
+    /// a `BigRational` and cannot represent one, so without this variant an
+    /// irrational witness reaches the gate as an unpinned leaf and the verdict
+    /// fails closed. See [`crate::algebraic`] for the exact arithmetic and its
+    /// soundness argument.
+    Algebraic(Box<crate::algebraic::Algebraic>),
     /// A datatype value: the constructor name and its field values in order.
     Datatype {
         /// Constructor name.
@@ -163,6 +197,22 @@ pub(crate) fn value_eq(a: &ModelValue, b: &ModelValue) -> Result<bool, String> {
                 value: v2,
             },
         ) => Ok(w1 == w2 && v1 == v2),
+        // `=` on floating-point is identity of the DENOTED ELEMENT, which is
+        // raw-field identity everywhere except NaN — see `fp::same_element`.
+        (V::FloatingPoint { .. }, V::FloatingPoint { .. }) => Ok(fp::same_element(a, b)),
+        // Algebraic equality is decided by reduction in one extension. Values
+        // in DIFFERENT extensions come back `None` and fall through to the
+        // incomparable arm -- deciding those needs resultants, and guessing
+        // would let the gate confirm a wrong model.
+        (V::Algebraic(x), V::Algebraic(y)) => x
+            .equals(y)
+            .ok_or_else(|| "algebraic equality across different extensions".to_string()),
+        // An algebraic value equals a rational exactly when it reduces to that
+        // constant -- `sqrt(2)^2` reduces to `2`, `sqrt(2)` itself to nothing.
+        (V::Algebraic(a), V::Real(q)) | (V::Real(q), V::Algebraic(a)) => Ok(a.equals_rational(q)),
+        (V::Algebraic(a), V::Int(n)) | (V::Int(n), V::Algebraic(a)) => {
+            Ok(a.equals_rational(&BigRational::from(n.clone())))
+        }
         (V::Str(x), V::Str(y)) => Ok(x == y),
         (V::Uninterpreted(x), V::Uninterpreted(y)) => Ok(x == y),
         (V::Seq(x), V::Seq(y)) => {
@@ -188,7 +238,18 @@ pub(crate) fn value_eq(a: &ModelValue, b: &ModelValue) -> Result<bool, String> {
             }
             Ok(true)
         }
-        _ => Err("equality between incomparable model values".to_string()),
+        // Name BOTH shapes. The bare message sent a reader looking for a
+        // missing comparison rule, when the real signal is that the model
+        // published ONE value in TWO encodings -- e.g. a nullary constructor as
+        // both `Datatype { ctor: "v1" }` and `Uninterpreted("v1")`, or a
+        // constant array as both an `Array` and its unparsed SMT-LIB text.
+        // The fix for that is to normalize the PRODUCER; teaching `value_eq` to
+        // equate encodings would loosen the comparison this gate depends on.
+        (a, b) => Err(format!(
+            "equality between incomparable model values ({} vs {})",
+            value_shape(a),
+            value_shape(b)
+        )),
     }
 }
 
@@ -287,6 +348,36 @@ pub trait ModelView {
     /// model uninterpreted functions keeps the sound fail-closed behaviour: any
     /// assertion needing a UF value becomes `CannotConfirm`).
     fn uf_app_value(&self, _t: TermId) -> Option<ModelValue> {
+        None
+    }
+
+    /// The value an asserted definition fixes for the application `t`, asked
+    /// ONLY at a point where SMT-LIB constrains the result to NOTHING AT ALL.
+    ///
+    /// Today that is exactly `fp.to_real` of a NaN or an infinity: the theory
+    /// declares the result unspecified, so EVERY real is a legal interpretation
+    /// and `(= (fp.to_real x) 5.0)` is satisfiable (z3 answers `sat`). No model
+    /// commits a value for such an application — there is nothing to commit —
+    /// so [`uf_app_value`](ModelView::uf_app_value) returns `None` and the gate
+    /// would fail closed on a witness the standard plainly admits.
+    ///
+    /// WHY THIS IS A SEPARATE METHOD, AND WHY IT IS SOUND.  An implementor may
+    /// answer this from the ASSERTION ITSELF, which `uf_app_value` must never
+    /// do for a theory head: for an operation the gate computes, "no value"
+    /// means the gate's own evaluator failed, and adopting the assertion's
+    /// claim would turn that evaluator bug into a confirmed wrong `sat`. The
+    /// caller therefore reaches this method only after its FP evaluator has
+    /// POSITIVELY established, from the operand's independently evaluated IEEE
+    /// fields, that the operand is a NaN or an infinity — never from a failure.
+    /// Adoption then cannot admit a forbidden model, because choosing the
+    /// interpretation that satisfies the definition is itself a legal
+    /// interpretation, every other assertion is still checked against that
+    /// choice, and the gate's value-keyed `uf_graph` still forces all
+    /// applications with equal argument values (all NaN payloads denote the ONE
+    /// NaN element — see `fp::same_element`) to the SAME result.
+    ///
+    /// Default: `None` — fail closed, exactly as before.
+    fn unconstrained_app_value(&self, _t: TermId) -> Option<ModelValue> {
         None
     }
 
@@ -475,4 +566,21 @@ pub fn confirm_model(
         return GateVerdict::ConfirmedSat;
     }
     GateVerdict::CannotConfirm { reason }
+}
+
+/// The shape name of a model value, for diagnostics only.
+fn value_shape(value: &ModelValue) -> &'static str {
+    match value {
+        ModelValue::Bool(_) => "Bool",
+        ModelValue::Int(_) => "Int",
+        ModelValue::Real(_) => "Real",
+        ModelValue::BitVec { .. } => "BitVec",
+        ModelValue::FloatingPoint { .. } => "FloatingPoint",
+        ModelValue::Str(_) => "Str",
+        ModelValue::Uninterpreted(_) => "Uninterpreted",
+        ModelValue::Seq(_) => "Seq",
+        ModelValue::Array(_) => "Array",
+        ModelValue::Algebraic(_) => "Algebraic",
+        ModelValue::Datatype { .. } => "Datatype",
+    }
 }

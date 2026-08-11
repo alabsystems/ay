@@ -74,6 +74,49 @@ fn strict_proofs_downgrades_rand_70_300_11_false_unsat() {
     );
 }
 
+/// FP forward-error UNSATs are in the strict proof subset: the refutation
+/// closes through the typed `fp_forward_error` theory lemma (independently
+/// re-derived by `ay-proof`'s analytic checker), not `:rule trust`, so
+/// `--strict-proofs` must keep the verdict `unsat` (it previously downgraded
+/// to `unknown (incomplete proof-trusted)`).
+#[test]
+#[timeout(60_000)]
+fn strict_proofs_preserves_fp_forward_error_unsat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fp_forward_error_guard_claim.smt2");
+    let mut f = std::fs::File::create(&path).expect("create tmp smt2");
+    writeln!(
+        f,
+        "(set-logic QF_FPLRA)\n\
+         (declare-const x Float64)\n\
+         (declare-const y Float64)\n\
+         (assert (and (fp.isNormal x) (<= (fp.to_real (fp.abs x)) 1.0)))\n\
+         (assert (and (fp.isNormal y) (<= (fp.to_real (fp.abs y)) 1.0)))\n\
+         (assert (>= (- (fp.to_real (fp.add RNE x y))\n\
+                        (+ (fp.to_real x) (fp.to_real y)))\n\
+                     0.3))\n\
+         (check-sat)\n\
+         (exit)"
+    )
+    .expect("write tmp smt2");
+    drop(f);
+
+    let output = Command::new(ay_bin())
+        .arg("--strict-proofs")
+        .arg("-t:30000")
+        .arg(&path)
+        .output_timeout(DEFAULT_CHILD_TIMEOUT)
+        .expect("failed to spawn ay");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.trim().lines().next().unwrap_or("").to_string();
+    assert_eq!(
+        first_line, "unsat",
+        "strict-proof mode must accept the independently checked forward-error \
+         refutation: got {first_line:?}.\nstdout:\n{stdout}"
+    );
+}
+
 /// #8759: strict-proof mode must preserve true UNSAT verdicts that do not
 /// rely on `:rule trust` — i.e., it must not regress correctness on clean
 /// `th_resolution`-terminated proofs.

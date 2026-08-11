@@ -98,6 +98,9 @@ fn test_parse_get_objectives() {
     let sexp = parse_sexp("(get-objectives)").unwrap();
     let cmd = Command::from_sexp(&sexp).unwrap();
     assert_eq!(cmd, Command::GetObjectives);
+
+    let extra = parse_sexp("(get-objectives extra)").unwrap();
+    assert!(Command::from_sexp(&extra).is_err());
 }
 
 #[test]
@@ -138,6 +141,154 @@ fn test_parse_assert() {
         }
         _ => panic!("Expected Assert command"),
     }
+}
+
+#[test]
+fn test_parse_assert_not_desugars_to_negated_assertion() {
+    let sexp = parse_sexp("(assert-not (> x 0))").unwrap();
+    let cmd = Command::from_sexp(&sexp).unwrap();
+    assert_eq!(
+        cmd,
+        Command::Assert(Term::App(
+            "not".to_string(),
+            vec![Term::App(
+                ">".to_string(),
+                vec![
+                    Term::Symbol("x".to_string()),
+                    Term::Const(Constant::Numeral("0".to_string())),
+                ],
+            )],
+        ))
+    );
+}
+
+#[test]
+fn test_parse_assert_not_requires_exactly_one_term() {
+    for source in ["(assert-not)", "(assert-not true false)"] {
+        let sexp = parse_sexp(source).unwrap();
+        let error = Command::from_sexp(&sexp).unwrap_err();
+        assert_eq!(error.message, "assert-not requires exactly one term");
+    }
+}
+
+#[test]
+fn test_parse_help_simplifier_uses_exact_z3_5_registry_snapshot() {
+    let sexp = parse_sexp("(help-simplifier)").unwrap();
+    let cmd = Command::from_sexp(&sexp).unwrap();
+    let Command::Echo(output) = cmd else {
+        panic!("help-simplifier must use the fixed-output query path");
+    };
+
+    assert_eq!(output.len(), 16_717);
+    assert!(output.starts_with("\"combinators:\n"));
+    assert!(output.contains("builtin simplifiers:\n"));
+    assert!(output.contains("- simplify apply simplification rules.\n"));
+    assert!(output.ends_with('\"'));
+    assert!(!output.ends_with('\n'));
+}
+
+#[test]
+fn test_parse_help_simplifier_rejects_arguments_and_recovers_next_command() {
+    let malformed = parse_sexp("(help-simplifier extra)").unwrap();
+    let error = Command::from_sexp(&malformed).unwrap_err();
+    assert_eq!(error.message, "invalid command, too many arguments");
+
+    let recovered = parse_sexp("(echo \"recovered\")").unwrap();
+    assert_eq!(
+        Command::from_sexp(&recovered).unwrap(),
+        Command::Echo("recovered".to_string())
+    );
+}
+
+#[test]
+fn test_parse_help_tactic_uses_exact_z3_5_registry_snapshot() {
+    let sexp = parse_sexp("(help-tactic)").unwrap();
+    let Command::Echo(output) = Command::from_sexp(&sexp).unwrap() else {
+        panic!("help-tactic must use the fixed-output query path");
+    };
+
+    assert_eq!(output.len(), 979_063);
+    assert!(output.starts_with("\"combinators:\n"));
+    assert!(output.contains("builtin tactics:\n"));
+    assert!(output.contains("- qflia "));
+    assert!(output.contains("builtin probes:\n"));
+    assert!(output.ends_with("\n\""));
+    assert!(!output.ends_with('\n'));
+}
+
+#[test]
+fn test_parse_help_tactic_rejects_arguments() {
+    let malformed = parse_sexp("(help-tactic extra)").unwrap();
+    let error = Command::from_sexp(&malformed).unwrap_err();
+    assert_eq!(error.message, "invalid command, too many arguments");
+}
+
+#[test]
+fn test_parse_help_uses_exact_z3_5_registry_snapshot() {
+    let sexp = parse_sexp("(help)").unwrap();
+    let Command::Echo(output) = Command::from_sexp(&sexp).unwrap() else {
+        panic!("help must use the fixed-output query path");
+    };
+
+    assert_eq!(output.len(), 35_240);
+    assert!(output.starts_with("\" (apply "));
+    assert!(output.contains("\n (help <symbol>*)\n"));
+    assert!(output.ends_with("\n\""));
+    assert_eq!(output.match_indices("\n (").count() + 1, 86);
+    assert!(!output.ends_with('\n'));
+}
+
+#[test]
+fn test_parse_help_selects_complete_entries_in_request_order() {
+    let sexp = parse_sexp("(help display assert-not display)").unwrap();
+    assert_eq!(
+        Command::from_sexp(&sexp).unwrap(),
+        Command::Echo(
+            concat!(
+                "\" (display <term>)\n",
+                "    display the given term.\n",
+                " (assert-not <term>)\n",
+                "    assert negation\n",
+                " (display <term>)\n",
+                "    display the given term.\n",
+                "\""
+            )
+            .to_string()
+        )
+    );
+
+    let quoted = parse_sexp("(help |display|)").unwrap();
+    assert_eq!(
+        Command::from_sexp(&quoted).unwrap(),
+        Command::Echo("\" (display <term>)\n    display the given term.\n\"".to_string())
+    );
+}
+
+#[test]
+fn test_parse_help_rejects_unknown_and_nonsymbol_arguments_then_recovers() {
+    for (source, expected) in [
+        (
+            "(help no-such-command)",
+            "unknown command 'no-such-command'",
+        ),
+        ("(help true)", "unknown command 'true'"),
+        ("(help false)", "unknown command 'false'"),
+        (
+            "(help :display)",
+            "invalid command argument, symbol expected",
+        ),
+        ("(help 1)", "invalid command argument, symbol expected"),
+    ] {
+        let malformed = parse_sexp(source).unwrap();
+        let error = Command::from_sexp(&malformed).unwrap_err();
+        assert_eq!(error.message, expected, "{source}");
+    }
+
+    let recovered = parse_sexp("(echo \"recovered\")").unwrap();
+    assert_eq!(
+        Command::from_sexp(&recovered).unwrap(),
+        Command::Echo("recovered".to_string())
+    );
 }
 
 #[test]
@@ -400,6 +551,140 @@ fn test_parse_push_pop() {
 
     let pop = parse_sexp("(pop 1)").unwrap();
     assert_eq!(Command::from_sexp(&pop).unwrap(), Command::Pop(1));
+}
+
+#[test]
+fn standard_commands_reject_trailing_arguments() {
+    let commands = [
+        "(assert true extra)",
+        "(check-sat-assuming () extra)",
+        "(declare-const x Bool extra)",
+        "(declare-datatype D ((d)) extra)",
+        "(declare-datatypes ((D 0)) (((d))) extra)",
+        "(declare-fun f () Bool extra)",
+        "(declare-sort S 0 extra)",
+        "(declare-sort-parameter X extra)",
+        "(define-const x Bool true extra)",
+        "(define-fun f () Bool true extra)",
+        "(define-fun-rec f () Bool true extra)",
+        "(define-funs-rec ((f () Bool)) (true) extra)",
+        "(define-sort S () Bool extra)",
+        "(echo \"x\" extra)",
+        "(exit extra)",
+        "(get-assertions extra)",
+        "(get-assignment extra)",
+        "(get-info :name extra)",
+        "(get-model extra)",
+        "(get-option :print-success extra)",
+        "(get-proof extra)",
+        "(get-unsat-assumptions extra)",
+        "(get-unsat-core extra more)",
+        "(get-value (true) extra)",
+        "(pop 1 extra)",
+        "(push 1 extra)",
+        "(reset extra)",
+        "(reset-assertions extra)",
+        "(set-info :status sat extra)",
+        "(set-logic QF_UF extra)",
+        "(set-option :print-success true extra)",
+    ];
+    for source in commands {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert!(
+            Command::from_sexp(&sexp).is_err(),
+            "standard command accepted a trailing argument: {source}"
+        );
+    }
+}
+
+#[test]
+fn generic_attributes_accept_optional_values() {
+    let cases = [
+        ("(set-info :custom)", true),
+        ("(set-info :custom value)", false),
+        ("(set-option :custom)", true),
+        ("(set-option :custom value)", false),
+    ];
+    for (source, valueless) in cases {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        let command = Command::from_sexp(&sexp).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert_eq!(
+            matches!(
+                command,
+                Command::SetInfoAttribute(_) | Command::SetOptionAttribute(_)
+            ),
+            valueless,
+            "wrong generic-attribute production for {source}"
+        );
+    }
+}
+
+#[test]
+fn generic_attribute_values_reject_nested_keywords() {
+    // SMT-LIB 2.7 `attribute_value` is a spec constant, symbol, or
+    // S-expression list; a keyword is a distinct lexical category. Exact Z3
+    // 5.0.0 likewise rejects both forms as `invalid option value`.
+    for source in ["(set-info :custom :nested)", "(set-option :custom :nested)"] {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        let error = Command::from_sexp(&sexp).expect_err("nested keyword is not attribute_value");
+        assert!(
+            error.message.contains("attribute_value"),
+            "unexpected error for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn z3_optional_numerals_default_but_malformed_values_are_rejected() {
+    let defaults = [
+        ("(declare-sort S)", Command::DeclareSort("S".into(), 0)),
+        ("(push)", Command::Push(1)),
+        ("(pop)", Command::Pop(1)),
+    ];
+    for (source, expected) in defaults {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert_eq!(
+            Command::from_sexp(&sexp).unwrap_or_else(|error| panic!("{source}: {error}")),
+            expected,
+            "wrong Z3-compatible default for {source}"
+        );
+    }
+
+    for source in ["(declare-sort S nope)", "(push nope)", "(pop nope)"] {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert!(
+            Command::from_sexp(&sexp).is_err(),
+            "malformed numeral was accepted: {source}"
+        );
+    }
+}
+
+#[test]
+fn z3_check_sat_terms_are_temporary_assumptions() {
+    let sexp = parse_sexp("(check-sat true false)").unwrap();
+    let command = Command::from_sexp(&sexp).unwrap();
+    match command {
+        Command::CheckSatAssuming(terms) => assert_eq!(terms.len(), 2),
+        other => panic!("wrong Z3 overlay command: {other:?}"),
+    }
+}
+
+#[test]
+fn z3_get_model_accepts_variable_unsigned_index_arity() {
+    for source in ["(get-model)", "(get-model 0)", "(get-model 1 2 3)"] {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert_eq!(Command::from_sexp(&sexp).unwrap(), Command::GetModel);
+    }
+    for source in ["(get-model nope)", "(get-model 4294967296)"] {
+        let sexp = parse_sexp(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert!(Command::from_sexp(&sexp).is_err(), "accepted {source}");
+    }
+}
+
+#[test]
+fn get_value_requires_one_or_more_terms() {
+    let sexp = parse_sexp("(get-value ())").unwrap();
+    assert!(Command::from_sexp(&sexp).is_err());
 }
 
 #[test]
@@ -905,6 +1190,134 @@ fn test_parse_simplify_basic() {
             assert_eq!(args.len(), 2);
         }
         _ => panic!("Expected Simplify command"),
+    }
+}
+
+#[test]
+fn test_parse_display_and_labels() {
+    let display = parse_sexp("(display (and true false))").unwrap();
+    assert_eq!(
+        Command::from_sexp(&display).unwrap(),
+        Command::Display(
+            Term::App(
+                "and".to_string(),
+                vec![Term::Const(Constant::True), Term::Const(Constant::False)],
+            ),
+            "(and true false)".to_string(),
+        )
+    );
+
+    let labels = parse_sexp("(labels)").unwrap();
+    assert_eq!(Command::from_sexp(&labels).unwrap(), Command::Labels);
+
+    for source in ["(display)", "(display true false)", "(labels extra)"] {
+        let malformed = parse_sexp(source).unwrap();
+        assert!(Command::from_sexp(&malformed).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn test_parse_z3_debug_parameter_and_sexpr_queries() {
+    let params = parse_sexp("(dbg-params)").unwrap();
+    assert_eq!(
+        Command::from_sexp(&params).unwrap(),
+        Command::Echo("worked".to_string())
+    );
+
+    for (source, expected) in [
+        ("(dbg-sexpr (a :b 1 \"x\"))", "(a :b 1 \"x\")"),
+        ("(dbg-sexpr |a b|)", "a b"),
+        ("(dbg-sexpr \"a\"\"b\")", "\"a\\\"b\""),
+    ] {
+        let sexpr = parse_sexp(source).unwrap();
+        assert_eq!(
+            Command::from_sexp(&sexpr).unwrap(),
+            Command::Echo(expected.to_string()),
+            "{source}"
+        );
+    }
+
+    for source in ["(dbg-params extra)", "(dbg-sexpr)", "(dbg-sexpr a b)"] {
+        let malformed = parse_sexp(source).unwrap();
+        assert!(Command::from_sexp(&malformed).is_err(), "{source}");
+    }
+
+    let translator = parse_sexp("(dbg-translator (and true false))").unwrap();
+    assert_eq!(
+        Command::from_sexp(&translator).unwrap(),
+        Command::Display(
+            Term::App(
+                "and".to_string(),
+                vec![Term::Const(Constant::True), Term::Const(Constant::False)],
+            ),
+            "(and true false)\n--->\n(and true false)".to_string(),
+        )
+    );
+
+    for source in ["(dbg-translator)", "(dbg-translator true false)"] {
+        let malformed = parse_sexp(source).unwrap();
+        assert!(Command::from_sexp(&malformed).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn z3_debug_ast_introspection_commands_have_pinned_outputs() {
+    for (source, expected) in [
+        ("(dbg-size (and true false true))", "4"),
+        ("(dbg-size (let ((x (+ 1 2))) (* x x)))", "4"),
+        (
+            "(dbg-used-vars (forall ((x Int) (y Bool)) (= x 3)))",
+            "(vars\n  (0      <not-used>)\n  (1      Int))",
+        ),
+        (
+            "(dbg-elim-unused-vars (forall ((x Int) (y Bool)) (= x 0)))",
+            "(forall ((x Int)) (= x 0))",
+        ),
+        (
+            "(dbg-instantiate (forall ((x Int) (y Bool)) (or y (= x 3))) (7 false))",
+            "(or false (= 7 3))",
+        ),
+    ] {
+        let sexpr = parse_sexp(source).unwrap();
+        let command = Command::from_sexp(&sexpr).unwrap();
+        let Command::Display(_, output) = command else {
+            panic!("{source} must use the validated display-result path");
+        };
+        assert_eq!(output, expected, "{source}");
+    }
+}
+
+#[test]
+fn z3_debug_global_ast_commands_preserve_authored_terms() {
+    let set = parse_sexp("(dbg-set saved (and true false))").unwrap();
+    assert_eq!(
+        Command::from_sexp(&set).unwrap(),
+        Command::DebugSet(
+            "saved".to_string(),
+            Term::App(
+                "and".to_string(),
+                vec![Term::Const(Constant::True), Term::Const(Constant::False)],
+            ),
+            "(and true false)".to_string(),
+        )
+    );
+
+    let print = parse_sexp("(dbg-pp-var saved)").unwrap();
+    assert_eq!(
+        Command::from_sexp(&print).unwrap(),
+        Command::DebugPpVar("saved".to_string())
+    );
+
+    for source in [
+        "(dbg-size)",
+        "(dbg-used-vars true false)",
+        "(dbg-elim-unused-vars)",
+        "(dbg-instantiate true ())",
+        "(dbg-set saved)",
+        "(dbg-pp-var)",
+    ] {
+        let malformed = parse_sexp(source).unwrap();
+        assert!(Command::from_sexp(&malformed).is_err(), "{source}");
     }
 }
 

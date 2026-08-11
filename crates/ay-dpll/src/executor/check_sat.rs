@@ -10,7 +10,8 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::time::Instant;
-use ay_core::TermId;
+use ay_core::{TermData, TermId, TermStore};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -23,7 +24,7 @@ use super::theories::bv_cnf_dump;
 use super::theories::ArrayExtWitnessRootViolation;
 use super::Executor;
 use crate::ematching::contains_quantifier;
-use crate::executor_types::{Result, SolveResult, StatValue, UnknownReason};
+use crate::executor_types::{Result, SolveResult, StatValue, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use crate::logic_detection::LogicCategory;
 
@@ -36,6 +37,94 @@ use super::{EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE};
 /// soundness — peel clauses are array tautologies and verdicts stay licensed
 /// by the solve pipeline + independent model gate.
 const MGR_ROW_PEEL_CLAUSE_CAP: usize = 20_000;
+
+/// #nested-array-residue-rescue: hard cap on residue conjuncts. Past it the
+/// rescue declines — a residue that large is not the small entailed slice this
+/// path exists for, and building it would cost more than the verdict is worth.
+const MAX_RESIDUE_CONJUNCTS: usize = 4096;
+
+/// Wall-clock cap on the residue probe. Measured: the converting NASA residues
+/// finish in <= 0.36s, so this only fences the pathological tail.
+// 1s, not 2s: every measured CONVERTING residue finishes in 0.02-0.39s, so a
+// second buys nothing but doubles the worst case a non-converting session pays.
+// Combined with RESIDUE_MAX_FAILURES this bounds the whole rescue at ~2s per
+// session — 0.2% of a 1200s competition budget — however many check-sats run.
+const RESIDUE_MAX_BUDGET: Duration = Duration::from_secs(1);
+
+/// The probe may claim at most this fraction (1/N) of the outer solve's
+/// remaining budget, so a short `-T:` never has its tail eaten by the rescue.
+const RESIDUE_BUDGET_SHARE: u32 = 4;
+
+/// How many FAILED residue probes a session tolerates before the rescue stands
+/// down.
+///
+/// `RESIDUE_MAX_BUDGET` bounds ONE probe, and the rescue is "one attempt per
+/// public check-sat" — but an incremental script has many check-sats and
+/// nothing bounded the aggregate. Measured: a nested-array file plus four extra
+/// bare `(check-sat)` commands ran 10.15s with the rescue on against 0.12s off,
+/// an 85x wall-clock blowup for ZERO verdict gain, because every check-sat
+/// re-paid the full budget on a residue that had already failed.
+///
+/// Counting FAILURES rather than spending time is the right shape here, because
+/// the two outcomes have opposite economics: a conversion costs 0.02-0.39s and
+/// buys a verdict, while a failure costs the full per-probe budget and buys
+/// nothing. A session may therefore convert without limit, but it stops
+/// re-paying for a residue shape that has already proven unproductive.
+const RESIDUE_MAX_FAILURES: u32 = 2;
+
+/// Detect a typed SMT-LIB 2.7 integer-exponentiation application that the
+/// frontend could not eliminate because its exponent is symbolic.
+///
+/// Such an application must never fall through as an ordinary UF: doing so
+/// would assign arbitrary semantics to the built-in and could publish a wrong
+/// verdict. Literal exponents are lowered exactly by `ay-frontend`, so every
+/// surviving `**` node is a capability boundary and forces `unknown` before
+/// theory dispatch.
+pub(super) fn contains_symbolic_integer_power(terms: &TermStore, roots: &[TermId]) -> bool {
+    let mut pending = roots.to_vec();
+    let mut seen = HashMap::<TermId, ()>::default();
+    while let Some(term) = pending.pop() {
+        if seen.insert(term, ()).is_some() {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::App(symbol, args) => {
+                if symbol.name() == "**" {
+                    return true;
+                }
+                pending.extend(args.iter().copied());
+            }
+            TermData::Let(bindings, body) => {
+                pending.extend(bindings.iter().map(|(_, value)| *value));
+                pending.push(*body);
+            }
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(condition, then_term, else_term) => {
+                pending.extend([*condition, *then_term, *else_term]);
+            }
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                pending.push(*body);
+                pending.extend(triggers.iter().flatten().copied());
+            }
+            TermData::Const(_) | TermData::Var(_, _) => {}
+            // `TermData` is non-exhaustive. A future compound term might hide
+            // `**`; fail closed until its children are included above.
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// `AY_NESTED_ARRAY_RESIDUE_RESCUE=0` opts out of the nested-array-free
+/// entailed-residue rescue (AY `=0` convention), restoring byte-identical
+/// pre-change behavior: the quarantine degrades on every nested-array UNSAT.
+///
+/// Read fresh rather than cached in a `OnceLock`: this path is cold (only on a
+/// quarantine that would otherwise fire), and the A/B tests flip the variable
+/// within a single process.
+fn nested_array_residue_rescue_enabled() -> bool {
+    !std::env::var("AY_NESTED_ARRAY_RESIDUE_RESCUE").is_ok_and(|value| value == "0")
+}
 
 /// Verify the finalized private CNF/DRAT pair emitted for a `--self-check`
 /// QF_BV solve. This runs at the executor boundary, before any API caller can
@@ -171,7 +260,6 @@ impl Executor {
             UnknownReason::UnsupportedMixedCollection => ("theory-combination", "mixed-collection"),
             UnknownReason::Unsupported => ("theory-combination", "unsupported-fragment"),
             UnknownReason::InternalError => ("executor", "internal-error"),
-            UnknownReason::ProofTrusted => ("proof-validation", "trusted-proof-step"),
             // "soundness-gate", not "theory-search": nothing was missing, a
             // computed verdict was refuted.
             UnknownReason::SelfCheckRejected => ("soundness-gate", "self-check-rejected"),
@@ -227,9 +315,6 @@ impl Executor {
                 "the selected theory combination is unsupported".to_string()
             }
             UnknownReason::InternalError => "executor reported an internal error".to_string(),
-            UnknownReason::ProofTrusted => {
-                "strict proof mode rejected a trusted proof step".to_string()
-            }
             UnknownReason::Incomplete | UnknownReason::Unknown => {
                 "solver returned Unknown without a more specific completion reason".to_string()
             }
@@ -340,7 +425,7 @@ impl Executor {
         );
         if truncation_artifact {
             if let Some(reason) = externally_stopped {
-                self.last_unknown_reason = Some(reason);
+                self.record_unknown_from_origin(reason.origin());
                 // Overwrite any diagnostic recorded by the (truncated) breaking
                 // site so phase/cost-center/detail agree with the reason.
                 let detail = self.default_unknown_detail(reason);
@@ -348,6 +433,11 @@ impl Executor {
             }
         }
         let reason = self.last_unknown_reason.unwrap_or(UnknownReason::Unknown);
+        // Publication already revoked result artifacts; diagnostics may still
+        // reattribute a truncated internal classification to an external stop.
+        // Re-canonicalize the public pair here so a reason can never drift away
+        // from its unique authoritative origin.
+        self.record_unknown_from_origin(reason.origin());
         if self.last_statistics.get_string("unknown.phase").is_none() {
             let detail = self.default_unknown_detail(reason);
             self.record_unknown_diagnostic(reason, detail);
@@ -364,6 +454,22 @@ impl Executor {
     /// quantified-LIA div/mod bailout, solver dispatch, and result remapping.
     pub(super) fn solve_current_assertions_with_quantifier_support(
         &mut self,
+    ) -> Result<SolveResult> {
+        let solve_input_assertions = self.ctx.assertions.clone();
+        self.solve_current_assertions_with_quantifier_support_from(&solve_input_assertions)
+    }
+
+    /// Quantifier-enabled solve with an explicit pre-preprocessing obligation.
+    ///
+    /// `check_sat_internal_preprocess_and_solve` performs sound ground
+    /// propagation before entering the quantifier pipeline.  That propagation
+    /// may remove a unit equality which is nevertheless part of the model and
+    /// SAT-certificate obligation.  Callers that have such an earlier snapshot
+    /// pass it here; direct and nested callers use the wrapper above and
+    /// therefore certify exactly their own current assertion window.
+    fn solve_current_assertions_with_quantifier_support_from(
+        &mut self,
+        solve_input_assertions: &[TermId],
     ) -> Result<SolveResult> {
         // `defer_model_validation` is SET (line ~314 below) and CONSUMED/cleared
         // (restore_assertions) WITHIN this call. The nested alternation re-entries
@@ -848,7 +954,26 @@ impl Executor {
         // The theory solver would validate against ground instances instead of the original
         // quantified assertions, causing false violations (#2862). Validation happens after
         // original_assertions are restored in map_quantifier_result.
-        if qr.original_assertions.is_some() {
+        if let Some(restored) = qr.original_assertions.as_mut() {
+            // Quantifier preprocessing may begin after an earlier ground pass
+            // has removed unit equalities. Preserve the quantifier loop's
+            // semantics-preserving normalized roots (notably merged binder
+            // towers), but append every missing solve-input ground sibling so
+            // restoration and SAT certificates cover the whole obligation.
+            for &term in solve_input_assertions {
+                if !contains_quantifier(&self.ctx.terms, term) && !restored.contains(&term) {
+                    restored.push(term);
+                }
+            }
+            self.defer_model_validation = true;
+        } else if solve_input_assertions
+            .iter()
+            .any(|&term| contains_quantifier(&self.ctx.terms, term))
+        {
+            // Quantifier preprocessing eliminated the quantified roots
+            // completely; retain the exact input so the post-solve gate still
+            // validates the original obligation.
+            qr.original_assertions = Some(solve_input_assertions.to_vec());
             self.defer_model_validation = true;
         }
 
@@ -865,7 +990,7 @@ impl Executor {
                 &qr.cegqi_state,
             )
         {
-            self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+            self.record_unknown_from_origin(UnknownOrigin::CegqiRefinement);
             let result = Ok(SolveResult::Unknown);
             let quantifier_loop_restores = qr.original_assertions.is_some();
             let mapped = self.map_quantifier_result(result, qr, category);
@@ -1061,7 +1186,7 @@ impl Executor {
         let snapshot = self.ctx.assertions.clone();
         // Shape gate: at least one top-level datatype-binder forall.
         let has_dt_forall = snapshot.iter().any(|&a| {
-            matches!(self.ctx.terms.get(a), ay_core::TermData::Forall(vars, _, _)
+            matches!(self.ctx.terms.get(a), TermData::Forall(vars, _, _)
                 if vars.iter().any(|(_, s)| self.dt_cert_sort_is_datatype(s)))
         });
         let dbg = std::env::var_os("AY_DEBUG_CERT").is_some();
@@ -1210,6 +1335,19 @@ impl Executor {
         // the post-solve nested-array UNSAT quarantine examines the exact public
         // problem, not an internally rewritten assertion set.
         let decision_roots = self.public_solve_roots(&[]);
+        // HARD assertions only: the residue rescue may only build its entailed
+        // subset from constraints that MUST hold. Soft constraints and
+        // objectives (which `decision_roots` also carries) are not implied by
+        // the problem, so they are excluded by construction.
+        //
+        // This is a BORROW, not a clone. `public_solve_roots` extends
+        // `ctx.assertions` FIRST (see its definition), then soft, then
+        // objectives, then extra — so the leading slice is byte-identical to a
+        // clone taken at this same instant, at zero cost. Cloning here ran on
+        // EVERY check_sat (a shared entry point that internal probes also use)
+        // and measured a 2.9-4.4% throughput regression on QF_Datatypes, a
+        // banked division win — for an allocation that was already in hand.
+        let hard_len = self.ctx.assertions.len();
         // `--self-check` BV DRAT self-certification: arm the eager bit-blast
         // CNF+DRAT export at the self-cert temp paths for a top-level pure-QF_BV
         // query. The arm is a thread-local RAII guard, so all export gating
@@ -1240,7 +1378,11 @@ impl Executor {
             Ok(result)
         });
         result = result.map(|solve_result| {
-            self.quarantine_unverified_nested_array_unsat(&decision_roots, solve_result)
+            self.quarantine_unverified_nested_array_unsat(
+                &decision_roots,
+                Some(&decision_roots[..hard_len]),
+                solve_result,
+            )
         });
         // The eager BV solver finishes its DRAT before returning, while
         // `finish_check` above seals the matching CNF. Verify that finalized
@@ -1840,9 +1982,15 @@ impl Executor {
     /// This boundary is shared by plain and assumption-based public checks so a
     /// caller cannot bypass it by moving the same nested-array formula into an
     /// assumption literal.
+    ///
+    /// `hard` is the caller-authored HARD assertion snapshot (pre-preprocessing)
+    /// when — and only when — the query's verdict rests on those assertions
+    /// alone; it enables the entailed-residue rescue below. Assumption and
+    /// optimization boundaries pass `None`.
     pub(in crate::executor) fn quarantine_unverified_nested_array_unsat(
         &mut self,
         roots: &[TermId],
+        hard: Option<&[TermId]>,
         result: SolveResult,
     ) -> SolveResult {
         // Consume-once: this marker authorizes EXACTLY the result it
@@ -1850,6 +1998,7 @@ impl Executor {
         // earlier query can never leak authorization into a later untrusted
         // one (every public UNSAT funnels through this boundary).
         let trusted_row_reduction = std::mem::take(&mut self.nested_array_row_reduction_unsat);
+        let trusted_ho_seq_unfold = std::mem::take(&mut self.ho_seq_unfold_array_free_unsat);
 
         if !result.is_unsat() || !StaticFeatures::collect(&self.ctx.terms, roots).has_nested_arrays
         {
@@ -1867,7 +2016,57 @@ impl Executor {
             return result;
         }
 
+        // Exempt a refutation the higher-order sequence unfolder left with no
+        // nested array to reason about (#ho-seq-array-free). The marker is set
+        // by `unfold_ho_seq_ops` BEFORE solving, so it asserts that the solver
+        // was never handed the guarded structure at all — not the far weaker
+        // post-hoc observation that the residue looks array-free. Unfolding is
+        // an equivalence, so refuting what remains refutes the original. See
+        // `note_ho_seq_unfold_left_no_nested_arrays`. Without this, every
+        // `seq.foldl`/`seq.foldli` goal is unrefutable: the curried
+        // function-as-array those combinators require is itself a nested array,
+        // so the declared-sort test above fires on all of them.
+        if trusted_ho_seq_unfold {
+            return result;
+        }
+
+        // SECOND, INDEPENDENT EVIDENCE PATH (#nested-array-residue-rescue).
+        //
+        // The gate above is a DECLARED-SORT test over the whole root DAG, not a
+        // test of what the refutation actually used. The NASA AUFLIRA family
+        // declares matrix operators over `(Array Int (Array Int Real))` while
+        // refuting on a single-level store chain, so a correct UNSAT is thrown
+        // away on evidence that never touched the guarded combination.
+        //
+        // Rather than weaken the gate, PRODUCE NEW EVIDENCE: refute a
+        // nested-array-FREE subset of the problem's own consequences. UNSAT of
+        // an entailed subset forces UNSAT of the whole (see
+        // `collect_entailed_conjuncts`), and the subset is by construction a
+        // query this very gate declares authoritative. On decline — including
+        // every `Sat`, `Unknown`, error and budget exhaustion — control falls
+        // through to the unchanged degrade below.
+        //
+        // Unreachable on any non-UNSAT outcome: the `is_unsat` test above has
+        // already returned. So this can never mint, promote or preserve a `sat`.
+        if let Some(hard) = hard {
+            if nested_array_residue_rescue_enabled() && self.nested_array_free_residue_unsat(hard) {
+                tracing::debug!(
+                    "nested-array UNSAT re-derived from a nested-array-free entailed residue; retained"
+                );
+                return result;
+            }
+        }
+
         self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+        // Attribute the degrade to the array-combination boundary that actually
+        // caused it. Without this the `Incomplete` reason inherits whatever
+        // phase the quantifier pipeline last set, and `:unknown.phase` reports
+        // `quantifier-result-mapping` — a misattribution that has already sent
+        // two corpus-mapping passes to the wrong subsystem.
+        self.set_active_solve_phase(
+            "array-combination-quarantine",
+            "nested-array-unsat-quarantine",
+        );
         self.record_unknown_diagnostic(
             UnknownReason::Incomplete,
             "nested-array UNSAT is quarantined pending a trust-free theory-combination proof",
@@ -1876,6 +2075,261 @@ impl Executor {
             "nested-array UNSAT lacked an authoritative theory-combination proof; degrading to Unknown"
         );
         SolveResult::Unknown
+    }
+
+    /// Re-derive a quarantined UNSAT from a nested-array-FREE entailed residue
+    /// (#nested-array-residue-rescue). Returns `true` iff the residue is
+    /// definitively UNSAT, which licenses retaining the outer UNSAT.
+    ///
+    /// SOUNDNESS. Two independent arguments, both required to hold:
+    ///
+    /// A. ENTAILMENT. Every residue conjunct is a logical consequence of the
+    ///    hard assertions (`collect_entailed_conjuncts` applies only
+    ///    entailment-preserving splits), and the nested-array filter only
+    ///    REMOVES conjuncts, which weakens the residue further. So
+    ///    `hard |= /\ residue`, and `/\ residue` unsatisfiable forces `hard`
+    ///    unsatisfiable. This is the same subset-of-consequences argument that
+    ///    already licenses `instance_closure_ground_unsat`; it is strictly
+    ///    weaker, since it needs only propositional conjunct extraction and no
+    ///    universal instantiation.
+    ///
+    /// B. NO NEW TRUST. The filter is LITERALLY the predicate this quarantine
+    ///    tests with, so `StaticFeatures::collect(terms, residue)
+    ///    .has_nested_arrays == false` holds by construction. The residue is
+    ///    therefore an ordinary non-nested query — exactly the class the gate
+    ///    itself declares authoritative — and the fail-closed lazy array+arith
+    ///    combination the gate guards is out of its reach.
+    ///
+    /// Together with the outer solve's own (independently computed) UNSAT, the
+    /// retained verdict rests on two agreeing derivations, one of which uses no
+    /// distrusted machinery at all.
+    ///
+    /// The rescue provably declines on the guarded false-UNSAT reproducer
+    /// (`repros/cs_stateful-1.i_2.MINIMIZED.smt2`): that input is SATISFIABLE,
+    /// so every subset of its consequences is satisfiable, so the residue solve
+    /// cannot return UNSAT.
+    ///
+    /// WORK BUDGET. Reached only when the quarantine would otherwise fire (the
+    /// search is already spent and its result about to be discarded), one
+    /// attempt per public check-sat, under a sub-deadline. Zero cost on every
+    /// other path.
+    fn nested_array_free_residue_unsat(&mut self, hard: &[TermId]) -> bool {
+        // Never start fresh work after an external stop: the outer verdict is
+        // being degraded either way, and the probe would only burn the caller's
+        // grace period.
+        if self.external_stop_reason().is_some() {
+            return false;
+        }
+        // One attempt per check-sat: the probe re-enters this very boundary.
+        if self.in_nested_array_residue_probe {
+            return false;
+        }
+        // Proof mode: the retained UNSAT would carry `last_proof`, a proof
+        // reconstructed from the DISTRUSTED full-problem search, while the
+        // rescue's evidence is a separate refutation with no proof object of
+        // its own. Handing back a proof this path cannot vouch for would be a
+        // strictly weaker trust claim than today's Unknown, so fail closed.
+        //
+        // The question is "did the CALLER ask for a proof", so the predicate is
+        // `is_producing_proofs()`, not `produce_proofs_enabled()`. The latter
+        // also reports the INTERNAL tracker, which `begin_public_solve` turns on
+        // for every public decision because the UNSAT certificate is mandatory —
+        // it is therefore unconditionally true here, and this guard was refusing
+        // 100% of the time, leaving the whole rescue DEAD CODE. Measured on the
+        // pinned regression input (`test_nested_array_free_residue_retains_unsat`,
+        // z3 = unsat): `[residue] decline: produce_proofs_enabled` fires before
+        // any residue is even built.
+        //
+        // This is the same defect, and the same repair, that `d238594eec`
+        // applied to ten other passes when the certificate became mandatory
+        // (see the doc comment on `produce_proofs_enabled`, which names this
+        // exact hazard: "a preprocessing or routing pass gated on
+        // `!produce_proofs_enabled()` is therefore DEAD, not opted out"). The
+        // rescue landed a week earlier and was missed. `is_producing_proofs()`
+        // covers BOTH the API request (`set_produce_proofs`) and the in-script
+        // `(set-option :produce-proofs true)`, so every caller that can observe
+        // a proof still gets the unchanged fail-closed decline.
+        if self.is_producing_proofs() {
+            return false;
+        }
+
+        // 1. Entailed conjuncts of the caller-authored hard assertions.
+        let mut conjuncts: Vec<TermId> = Vec::new();
+        for &assertion in hard {
+            super::quantifier_loop::collect_entailed_conjuncts(
+                &mut self.ctx.terms,
+                assertion,
+                0,
+                MAX_RESIDUE_CONJUNCTS,
+                &mut conjuncts,
+            );
+            if conjuncts.len() > MAX_RESIDUE_CONJUNCTS {
+                return false;
+            }
+        }
+
+        // 2. Filter with the quarantine's OWN predicate. This also drops every
+        //    `forall` with a nested-array binder — precisely the class partial
+        //    E-matching cannot discharge soundly.
+        let mut residue: Vec<TermId> = Vec::with_capacity(conjuncts.len());
+        let mut seen = ay_core::kani_compat::DetHashSet::<TermId>::default();
+        let mut dropped_any = false;
+        for conjunct in conjuncts {
+            if !seen.insert(conjunct) {
+                continue;
+            }
+            if StaticFeatures::collect(&self.ctx.terms, &[conjunct]).has_nested_arrays {
+                dropped_any = true;
+                continue;
+            }
+            residue.push(conjunct);
+        }
+
+        // 3. Require a STRICT, non-empty subset.
+        //    - Empty residue: nothing to refute. Never read a vacuous verdict.
+        //    - Nothing dropped: the residue is equivalent to the input, so the
+        //      re-solve would re-run the same distrusted query for no gain.
+        if residue.is_empty() || !dropped_any {
+            return false;
+        }
+
+        // 4. Re-solve the residue in isolation through the ORDINARY pipeline,
+        //    so it gets the full existing quantifier machinery (E-matching,
+        //    CEGQI, MBQI, the AUFLIRA lane). No parallel implementation: the
+        //    whole point is that the residue is a plain non-nested problem the
+        //    engine already handles.
+        //
+        //    `check_sat_guarded` mutates far more state than a category solve,
+        //    so every field it can leave behind is snapshotted here and
+        //    restored unconditionally below. A leak would corrupt the OUTER
+        //    verdict, which is the one real risk this rescue carries.
+        // SESSION budget gate: an incremental script has many check-sats, and
+        // a residue that failed once will usually fail again. Without this the
+        // aggregate is unbounded — measured at an 85x wall-clock blowup for
+        // zero verdict gain. Charge every probe and stop once the session
+        // allowance is gone.
+        if self.residue_probe_failures >= RESIDUE_MAX_FAILURES {
+            return false;
+        }
+        self.in_nested_array_residue_probe = true;
+
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, residue);
+        let saved_theory_state = self.incr_theory_state.take();
+        let saved_bv_state = self.incr_bv_state.take();
+        let saved_model = self.last_model.take();
+        let saved_model_validated = self.last_model_validated;
+        let saved_validation_stats = self.last_validation_stats.take();
+        let saved_unknown_reason = self.last_unknown_reason;
+        let saved_result = self.last_result.take();
+        let saved_statistics = std::mem::take(&mut self.last_statistics);
+        let saved_proof = self.last_proof.take();
+        let saved_sat_certificate = self.last_sat_certificate.take();
+        let saved_defer = self.defer_model_validation;
+        let saved_skip_model_eval = self.skip_model_eval;
+        let saved_support_axioms = std::mem::take(&mut self.active_support_axioms);
+        let saved_quantifier_manager = self.quantifier_manager.take();
+        let saved_original_had_quantifiers = self.original_problem_had_quantifiers;
+        let saved_bv_drat_self_cert = self.last_bv_drat_self_cert;
+        let saved_phase = self.active_solve_phase.take();
+        let saved_cost_center = self.active_solve_cost_center.take();
+        let saved_deadline = self.solve_deadline.get();
+        let saved_backstop_installed = self.quantifier_deadline_backstop_installed;
+        self.defer_model_validation = false;
+        self.solve_deadline
+            .set(Self::residue_sub_deadline(saved_deadline).or(saved_deadline));
+        // Latch the quantified-solve wall-clock backstop CLOSED for the probe.
+        // It is a one-shot the outer call normally consumed already, but on a
+        // ground outer solve it would still be armed — and it multiplies the
+        // live deadline by 4, which is exactly the sub-deadline this probe just
+        // installed. The probe is optional extra work; it does not get an
+        // extension.
+        self.quantifier_deadline_backstop_installed = true;
+
+        // Same stack-growth guard the public entry uses: the residue runs the
+        // same deeply recursive pipeline (#6783).
+        //
+        // PANIC-SAFE. The restores below are plain statements, so an unwind out
+        // of `check_sat_guarded` would sail straight past every one of them and
+        // leave `ctx.assertions` PERMANENTLY set to the residue — every
+        // nested-array conjunct deleted. That is not hypothetical here:
+        // `panic = "unwind"` is deliberate (Cargo.toml), `run.rs` wraps every
+        // executed command in `catch_unwind`, prints `unknown`, and CONTINUES
+        // on the same executor, and `api/solving/panic_safe.rs` hands the
+        // caller a still-usable Solver. So a panic on the residue — a brand-new
+        // query shape — would silently weaken the problem and the NEXT
+        // check-sat could answer `sat` for an unsatisfiable input.
+        //
+        // Catch here, restore unconditionally, then re-raise: the same pattern
+        // `with_isolated_incremental_state` (theories/incremental_scope.rs)
+        // already uses for exactly these swaps.
+        let probe = catch_unwind(AssertUnwindSafe(|| {
+            stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
+                self.check_sat_guarded()
+            })
+        }));
+
+        self.solve_deadline.set(saved_deadline);
+        self.quantifier_deadline_backstop_installed = saved_backstop_installed;
+        self.ctx.assertions = saved_assertions;
+        self.incr_theory_state = saved_theory_state;
+        self.incr_bv_state = saved_bv_state;
+        self.last_model = saved_model;
+        self.last_model_validated = saved_model_validated;
+        self.last_validation_stats = saved_validation_stats;
+        self.last_unknown_reason = saved_unknown_reason;
+        self.last_result = saved_result;
+        self.last_statistics = saved_statistics;
+        self.last_proof = saved_proof;
+        self.last_sat_certificate = saved_sat_certificate;
+        self.defer_model_validation = saved_defer;
+        self.skip_model_eval = saved_skip_model_eval;
+        self.active_support_axioms = saved_support_axioms;
+        self.quantifier_manager = saved_quantifier_manager;
+        self.original_problem_had_quantifiers = saved_original_had_quantifiers;
+        self.last_bv_drat_self_cert = saved_bv_drat_self_cert;
+        self.active_solve_phase = saved_phase;
+        self.active_solve_cost_center = saved_cost_center;
+        // The caller already CONSUMED this marker (`mem::take`) before dispatching
+        // here, so its post-take value is `false`. The probe re-arms it whenever
+        // its own solve hits the store-flat reduction; clear it again so a
+        // residue's authorization can never leak into a later public query.
+        self.nested_array_row_reduction_unsat = false;
+        self.ho_seq_unfold_array_free_unsat = false;
+        self.in_nested_array_residue_probe = false;
+
+        // Every field is restored above; only now is it safe to re-raise.
+        let probe = match probe {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        };
+
+        // Accept ONLY a definitive refutation. `Sat`, `Unknown`, an error, or a
+        // budget-exhausted probe all decline and fall through to the degrade.
+        let refuted = matches!(probe, Ok(ref solve_result) if solve_result.is_unsat());
+        if !refuted {
+            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
+        }
+        refuted
+    }
+
+    /// Sub-deadline for the residue probe: a quarter of what the outer solve has
+    /// left, capped, so a pathological residue cannot eat the caller's budget.
+    ///
+    /// A probe stopped by this deadline returns `Unknown` and simply declines —
+    /// the deadline can change WHEN the probe gives up, never what it decides.
+    ///
+    /// `None` means the sub-deadline instant did not fit in an `Instant`; the
+    /// caller then keeps the OUTER deadline rather than running unbounded.
+    fn residue_sub_deadline(outer: Option<Instant>) -> Option<Instant> {
+        let now = Instant::now();
+        let budget = match outer {
+            Some(deadline) => (deadline.saturating_duration_since(now) / RESIDUE_BUDGET_SHARE)
+                .min(RESIDUE_MAX_BUDGET),
+            // No outer deadline in force (proof-seeking solves run this way):
+            // still bound the probe, it is an optional extra.
+            None => RESIDUE_MAX_BUDGET,
+        };
+        now.checked_add(budget)
     }
 
     /// Fail closed when caller-authored input captures a solver-generated
@@ -1930,7 +2384,7 @@ impl Executor {
         }
         // Set-cardinality fail-closed gate: see `terms_contain_set_has_size`.
         if self.terms_contain_set_has_size(&solve_roots) {
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.record_unknown_from_origin(UnknownOrigin::IncompleteSolverLane);
             self.last_result = Some(SolveResult::Unknown);
             self.last_model = None;
             self.last_proof = None;
@@ -1939,12 +2393,19 @@ impl Executor {
         self.last_model_validated = false;
         self.last_validation_stats = None;
         self.dt_cert_grant_active = false;
+        self.finite_table_cert_grant_active = false;
+        self.const_interp_cert_grant_active = false;
+        self.mbqi_sat_cert_grant_active = false;
+        self.mbqi_sat_cert_pins.clear();
+        self.finite_table_cert_pending_witness = None;
+        self.const_interp_cert_witness.clear();
         self.model_validation_delegated_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
         // Reset the trust-free nested-array store-flat reduction marker; it is
         // re-established only when that exact reduction fires this solve.
         self.nested_array_row_reduction_unsat = false;
+        self.ho_seq_unfold_array_free_unsat = false;
         // Fail-closed default, re-enabled at ENTRY (original assertion shapes,
         // before preprocessing erases array structure) only via the
         // route-independent observational-completeness argument; the
@@ -2169,7 +2630,7 @@ impl Executor {
         // check-sat (reentry latch) and only when proofs are off, so proof-mode and
         // proof-consuming callers never pay a second solve.
         if result.is_unsat()
-            && !self.produce_proofs_enabled()
+            && !self.is_producing_proofs()
             && !self.corroborating_nonstring_seq_unsat
             && !self.solve_deadline.expired()
             && self
@@ -2194,13 +2655,42 @@ impl Executor {
             // verdict was already captured in `corroborated_unsat`.
             let _ = corroboration?;
             self.last_model = None;
-            self.last_proof = None;
             if corroborated_unsat {
                 // Reconfirmed: keep the original UNSAT verdict (`result` still
                 // holds the first solve's `Unsat(cert)`; the corroboration ran on
                 // a separate local binding and never touched it).
+                //
+                // KEEP `last_proof`. This arm used to null it unconditionally,
+                // one line above, on the reasoning that "the user's run does not
+                // produce proofs". True of the ARTIFACT SURFACE, but the proof is
+                // also the input to the MANDATORY certification funnel: control
+                // reaches `certify_unsat_for_publication` -> `mint_unsat_certificate`,
+                // which requires `last_proof.is_some()` and otherwise fails
+                // `MissingProof` — so the arm paid for a proof-producing re-solve,
+                // threw the proof away, and the gate then rejected the very verdict
+                // the re-solve had just corroborated. Result: `unknown`.
+                //
+                // That is two independently-correct soundness mechanisms colliding,
+                // not a real limitation. Measured: 105 of the 117 `group_strings`
+                // failures were this, and it fires on any problem merely MENTIONING
+                // a non-Char Seq leaf — a pure-LIA refutation (`x>5 & x<3`) with an
+                // unused `(Seq Int)` declaration degraded too, because the trigger
+                // is `assertion_references_nonstring_seq`, not the refutation.
+                //
+                // Retaining it leaks nothing: `get_proof` returns
+                // "proof generation is not enabled" from `!is_producing_proofs()`
+                // BEFORE it ever consults `last_proof` (proof.rs:6029), so the
+                // artifact surface stays closed in a no-proof run.
+                //
+                // The two SIBLING retry arms in this function (:2485, :2522) already
+                // do exactly this; only this arm omitted it.
+                if self.last_proof.is_none() {
+                    // `build_unsat_proof` is NOT idempotent — guard on `is_none`.
+                    self.build_unsat_proof();
+                }
                 self.last_unknown_reason = None;
             } else {
+                self.last_proof = None;
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.record_model_validation_unknown_diagnostic(
                     "non-string sequence UNSAT not corroborated by a proof-producing re-solve",
@@ -2240,6 +2730,7 @@ impl Executor {
         } else {
             result
         };
+        let result = self.finalize_unknown_publication(result);
         self.last_result = Some(result);
 
         // D1 lazy-extensionality shadow: correlate the EAGER witness set against
@@ -2580,7 +3071,7 @@ impl Executor {
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
-            self.last_unknown_reason = Some(UnknownReason::Interrupted);
+            self.record_unknown_from_origin(UnknownOrigin::InterruptFlag);
             self.last_result = Some(SolveResult::Unknown);
             self.record_unknown_diagnostic(
                 UnknownReason::Interrupted,
@@ -2590,7 +3081,7 @@ impl Executor {
         }
 
         if self.solve_deadline.expired() {
-            self.last_unknown_reason = Some(UnknownReason::Timeout);
+            self.record_unknown_from_origin(UnknownOrigin::SolveDeadline);
             self.last_result = Some(SolveResult::Unknown);
             self.record_unknown_diagnostic(
                 UnknownReason::Timeout,
@@ -2611,7 +3102,7 @@ impl Executor {
         //    rather than only at the check-sat boundary. Soundness-neutral: it
         //    can only drive Unknown, never a wrong SAT/UNSAT.
         if crate::memory::memory_exceeded(self.memory_limit) || ay_sys::process_memory_exceeded() {
-            self.last_unknown_reason = Some(UnknownReason::MemoryLimit);
+            self.record_unknown_from_origin(UnknownOrigin::MemoryBudget);
             self.last_result = Some(SolveResult::Unknown);
             self.record_unknown_diagnostic(
                 UnknownReason::MemoryLimit,
@@ -2691,6 +3182,11 @@ impl Executor {
         // which reads last_model.euf_model for congruence-aware E-matching (Phase B1b #3325).
         self.last_assumptions = None;
         self.last_assumption_core = None;
+        // The BV-MBQI entailment certificate authorises a Sat that would
+        // otherwise fail closed, so it must never survive from a previous
+        // `check_sat`: a stale `true` would wave through an unrelated Sat at the
+        // post-restore gate.
+        self.bv_quantifier_full_domain_proof = false;
         self.last_core_term_to_name = None;
         self.last_proof = None;
         self.last_proof_term_overrides = None;
@@ -2717,6 +3213,7 @@ impl Executor {
         // survives recursive/internal retries. Recapturing the current
         // assertion window here could authorize generated repair constraints.
         self.quant_expansion_records.clear();
+        self.ematching_proof_records.clear();
         self.last_proof_rebuild_originals.clear();
         self.last_statistics = crate::executor_types::Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
@@ -2742,6 +3239,11 @@ impl Executor {
         self.last_model_validated = false;
         self.last_validation_stats = None;
         self.dt_cert_grant_active = false;
+        self.finite_table_cert_grant_active = false;
+        self.const_interp_cert_grant_active = false;
+        self.mbqi_sat_cert_grant_active = false;
+        self.mbqi_sat_cert_pins.clear();
+        self.const_interp_cert_witness.clear();
         self.model_validation_delegated_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
@@ -2772,6 +3274,39 @@ impl Executor {
         // Reset proof content for new solving session (keep scope tracking
         // for incremental push/pop balance) (#5992)
         self.proof_tracker.reset_session();
+
+        // Scanned BEFORE the empty-hard-assertion shortcut below: an objective
+        // or a soft constraint is part of the public problem even when nothing
+        // is asserted, so an objective-only problem still has semantic roots and
+        // must clear the symbolic-power capability gate before any fast path
+        // reports SAT and hands the model to the optimizer. `(maximize (** 2 e))`
+        // with no `(assert ...)` used to take the shortcut, answer `sat`, and
+        // then error inside optimization, because this scan sat BELOW it and
+        // never ran on an assertion-free problem.
+        //
+        // Behaviour-preserving when there are no objectives and no soft
+        // constraints: the roots are then exactly the (empty) assertions, the
+        // scan finds nothing, and control falls through to the same early `Sat`.
+        // Verified: bare `(check-sat)` and `(maximize x)` still answer `sat`.
+        //
+        // This is deliberately a `check_sat` reorder and NOT the elaboration-time
+        // classification it might look like it wants to be: objectives are
+        // scope-tracked, so a reason stamped at `(maximize)` time could not be
+        // un-stamped by a later `(pop 1)`, and
+        // `(push 1)(maximize (** 2 e))(pop 1)(assert ...)` must still answer
+        // `sat`. Scanning here reads the objectives live in the current scope.
+        let mut public_problem_roots = self.ctx.assertions.clone();
+        public_problem_roots.extend(self.ctx.objectives().iter().map(|objective| objective.term));
+        public_problem_roots.extend(self.ctx.soft_constraints().iter().map(|soft| soft.term));
+        if contains_symbolic_integer_power(&self.ctx.terms, &public_problem_roots) {
+            self.last_model = None;
+            self.record_unknown_from_origin(UnknownOrigin::UnsupportedArithmeticFragment);
+            self.record_unknown_diagnostic(
+                UnknownReason::UnsupportedArithmetic,
+                "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
+            );
+            return Ok(SolveResult::Unknown);
+        }
 
         if self.ctx.assertions.is_empty() {
             self.last_model = None;
@@ -2807,13 +3342,40 @@ impl Executor {
         // (retry or probe solve) restores the outer window on the way out and can
         // never lend its narrower snapshot to the outer verdict. Only paid for
         // under `--self-check`; otherwise the field stays `None` (fails closed).
-        let saved_authored = if self.self_check {
-            self.self_check_authored_assertions
-                .replace(scope_tracked_assertions.clone())
-        } else {
-            self.self_check_authored_assertions.take()
-        };
-        let result = self.check_sat_internal_preprocess_and_solve();
+        // ALWAYS publish the authored snapshot, not only under `--self-check`.
+        //
+        // The comment above says the field "stays `None` (fails closed)" in
+        // default mode. It does NOT fail closed. `independent_gate_query_roots`
+        // (model/independent_gate.rs:55) reads this field IF SET and otherwise
+        // falls back to `self.ctx.assertions` — the POST-PREPROCESSING window —
+        // so in default mode an assertion that preprocessing eliminated never
+        // reaches the model gate at all. That is fail-OPEN: the gate certifies a
+        // model against a formula the user did not write.
+        //
+        // Measured consequence, and the reason this is not hypothetical: the
+        // wrong SAT fixed in the two preceding commits published
+        // `:model_check_gate.result "confirmed-sat"` with `AY_G3_GATE_DUMP`
+        // reporting `n_false=0 n_uneval=0` — the gate evaluated ZERO assertions —
+        // and a published model of literally `(model )`. The gate's own verdict
+        // function is sound (empty roots and unevaluable each yield
+        // `CannotConfirm`); it was being handed the wrong roots.
+        //
+        // Cost is one extra `Vec<TermId>` clone per check-sat: the snapshot is
+        // already taken on the line above for `scope_tracked_assertions`.
+        //
+        // COMPLETENESS COST, stated rather than hidden: the gate must now confirm
+        // the AUTHORED form, which it may evaluate less well than the
+        // preprocessed one. Any such case degrades `Sat` -> `Unknown`, never the
+        // reverse — the gate cannot make a verdict unsound, only decline to
+        // certify it. An uncertified `sat` is exactly what shipped a wrong answer
+        // today, so that is the correct direction to fail.
+        //
+        // Save/restore is unchanged, so a nested probe or retry solve still
+        // cannot lend its narrower window to the outer verdict.
+        let saved_authored = self
+            .self_check_authored_assertions
+            .replace(scope_tracked_assertions.clone());
+        let result = self.check_sat_internal_preprocess_and_solve(&scope_tracked_assertions);
         self.self_check_authored_assertions = saved_authored;
         self.ctx.assertions = scope_tracked_assertions;
         result
@@ -2825,14 +3387,17 @@ impl Executor {
     /// (`check_sat_internal`) snapshots and restores the scope-tracked
     /// assertion vector around this call, so no in-place residue can survive
     /// into a later `(pop)`/`(check-sat)` (#incremental-pushpop-soundness).
-    fn check_sat_internal_preprocess_and_solve(&mut self) -> Result<SolveResult> {
+    fn check_sat_internal_preprocess_and_solve(
+        &mut self,
+        solve_input_assertions: &[TermId],
+    ) -> Result<SolveResult> {
         // Named-assert rewrite provenance is strictly per-preprocessing-run
         // (#uc-named-provenance): entries recorded by THIS call's passes are
         // consumed by THIS call's named-core redirect and never leak into a
         // later check.
         self.named_assert_rewrites.clear();
 
-        if !self.produce_proofs_enabled() {
+        if !self.is_producing_proofs() {
             self.rewrite_dense_bv_array_initializer_selects();
         }
 
@@ -3172,6 +3737,14 @@ impl Executor {
                     // reach unsat through it. Skipped when provenance is
                     // broken: the minimized core would be discarded below
                     // anyway.
+                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                        eprintln!(
+                            "c phase-trace uc-redirect provenance_broken={} named={} parse_keys={}",
+                            provenance_broken,
+                            named_assumptions.len(),
+                            parse_named_keys.len()
+                        );
+                    }
                     let result = if provenance_broken {
                         result
                     } else {
@@ -3194,7 +3767,8 @@ impl Executor {
             }
         }
 
-        let final_result = self.solve_current_assertions_with_quantifier_support();
+        let final_result =
+            self.solve_current_assertions_with_quantifier_support_from(solve_input_assertions);
 
         // #9037: Several theory/preprocessing fast paths can prove UNSAT before
         // entering SAT-level proof tracing. The check-sat boundary still owns the
@@ -3363,7 +3937,7 @@ impl Executor {
                     self.solve_lia()
                 }
             }
-            LogicCategory::QfNia => self.solve_nia(),
+            LogicCategory::QfNia | LogicCategory::QfEia => self.solve_nia(),
             LogicCategory::QfNra => self.solve_nra(),
             LogicCategory::QfNira => {
                 if features.has_real {
@@ -4031,18 +4605,16 @@ impl Executor {
         let new_asserts: Vec<TermId> = asserts
             .iter()
             .map(|&a| match self.ctx.terms.get(a).clone() {
-                ay_core::term::TermData::Ite(c, t, e) => {
+                TermData::Ite(c, t, e) => {
                     changed = true;
                     self.bool_ite_to_and_implies(c, t, e)
                 }
-                ay_core::term::TermData::App(sym, args) if sym.name() == "and" => {
+                TermData::App(sym, args) if sym.name() == "and" => {
                     let mut conj_changed = false;
                     let new_args: Vec<TermId> = args
                         .iter()
                         .map(|&x| {
-                            if let ay_core::term::TermData::Ite(c, t, e) =
-                                self.ctx.terms.get(x).clone()
-                            {
+                            if let TermData::Ite(c, t, e) = self.ctx.terms.get(x).clone() {
                                 conj_changed = true;
                                 self.bool_ite_to_and_implies(c, t, e)
                             } else {
@@ -4279,7 +4851,7 @@ mod quantifier_determinism_tests {
     use std::time::{Duration, Instant};
 
     use super::super::Executor;
-    use crate::executor_types::{SolveResult, UnknownReason};
+    use crate::executor_types::{SolveResult, UnknownOrigin, UnknownReason};
 
     #[test]
     fn quantifier_deadline_backstop_extends_by_scaled_remaining() {
@@ -4410,6 +4982,7 @@ mod quantifier_determinism_tests {
         exec.solve_interrupt = Some(Arc::new(AtomicBool::new(true)));
         exec.finalize_unknown_diagnostics();
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::Interrupted));
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::InterruptFlag));
     }
 
     #[test]
@@ -4423,6 +4996,7 @@ mod quantifier_determinism_tests {
         exec.set_deadline(Some(past));
         exec.finalize_unknown_diagnostics();
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::Timeout));
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::SolveDeadline));
     }
 
     #[test]
@@ -4435,6 +5009,7 @@ mod quantifier_determinism_tests {
         exec.solve_interrupt = Some(Arc::new(AtomicBool::new(true)));
         exec.finalize_unknown_diagnostics();
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::MemoryLimit));
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::MemoryBudget));
     }
 
     #[test]
@@ -4449,6 +5024,10 @@ mod quantifier_determinism_tests {
         assert_eq!(
             exec.last_unknown_reason,
             Some(UnknownReason::QuantifierUnhandled)
+        );
+        assert_eq!(
+            exec.unknown_origin(),
+            Some(UnknownOrigin::UnhandledQuantifier)
         );
     }
 

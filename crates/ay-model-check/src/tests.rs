@@ -14,6 +14,7 @@
 use super::*;
 use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort, Symbol, TermId, TermStore};
 use num_bigint::BigInt;
+use num_rational::BigRational;
 use std::collections::HashMap;
 
 /// A trivial stub model: a fixed map from leaf `TermId` to value.
@@ -92,6 +93,158 @@ fn sat_int_arithmetic() {
     let eq = app(&mut ts, "=", &[sum, four], Sort::Bool);
     let m = StubModel::new().with(x, ModelValue::Int(int(3)));
     assert_confirmed(&verdict(&ts, &m, &[eq]));
+}
+
+#[test]
+fn regex_membership_confirms_literal_between_allchar_stars() {
+    let mut ts = TermStore::new();
+    let subject = ts.mk_var("subject", Sort::String);
+    let allchar = app(&mut ts, "re.allchar", &[], Sort::RegLan);
+    let left = app(&mut ts, "re.*", &[allchar], Sort::RegLan);
+    let needle_text = ts.mk_string("\\<SCRIPT".to_string());
+    let needle = app(&mut ts, "str.to_re", &[needle_text], Sort::RegLan);
+    let allchar = app(&mut ts, "re.allchar", &[], Sort::RegLan);
+    let right = app(&mut ts, "re.*", &[allchar], Sort::RegLan);
+    let regex = app(&mut ts, "re.++", &[left, needle, right], Sort::RegLan);
+    let membership = app(&mut ts, "str.in_re", &[subject, regex], Sort::Bool);
+
+    let satisfying = StubModel::new().with(subject, ModelValue::Str("xx\\<SCRIPTyy".to_string()));
+    assert_confirmed(&verdict(&ts, &satisfying, &[membership]));
+
+    let violating = StubModel::new().with(subject, ModelValue::Str("xx<SCRIPTyy".to_string()));
+    assert_violates(&verdict(&ts, &violating, &[membership]));
+}
+
+#[test]
+fn regex_membership_confirms_digit_intersection_witness() {
+    let mut ts = TermStore::new();
+    let subject = ts.mk_var("subject", Sort::String);
+    let zero = ts.mk_string("0".to_string());
+    let nine = ts.mk_string("9".to_string());
+    let d0 = app(&mut ts, "re.range", &[zero, nine], Sort::RegLan);
+    let d1 = app(&mut ts, "re.range", &[zero, nine], Sort::RegLan);
+    let d2 = app(&mut ts, "re.range", &[zero, nine], Sort::RegLan);
+    let exactly_three = app(&mut ts, "re.++", &[d0, d1, d2], Sort::RegLan);
+    let digit = app(&mut ts, "re.range", &[zero, nine], Sort::RegLan);
+    let any_digits = app(&mut ts, "re.*", &[digit], Sort::RegLan);
+    let in_three = app(&mut ts, "str.in_re", &[subject, exactly_three], Sort::Bool);
+    let in_any = app(&mut ts, "str.in_re", &[subject, any_digits], Sort::Bool);
+    let model = StubModel::new().with(subject, ModelValue::Str("000".to_string()));
+
+    assert_confirmed(&verdict(&ts, &model, &[in_three, in_any]));
+}
+
+#[test]
+fn unsupported_regex_operator_fails_closed() {
+    let mut ts = TermStore::new();
+    let subject = ts.mk_var("subject", Sort::String);
+    let opaque = app(&mut ts, "re.future", &[], Sort::RegLan);
+    let membership = app(&mut ts, "str.in_re", &[subject, opaque], Sort::Bool);
+    let model = StubModel::new().with(subject, ModelValue::Str("anything".to_string()));
+
+    assert_cannot(&verdict(&ts, &model, &[membership]));
+}
+
+#[test]
+fn sat_fp_to_real_uses_exact_ieee_fields() {
+    let mut ts = TermStore::new();
+    let fp16 = Sort::FloatingPoint(5, 11);
+    let x = ts.mk_var("x", fp16);
+    let to_real = app(&mut ts, "fp.to_real", &[x], Sort::Real);
+    let five_halves = ts.mk_rational(BigRational::new(int(5), int(2)));
+    let exact = app(&mut ts, "=", &[to_real, five_halves], Sort::Bool);
+
+    // Float16 2.5 = sign 0, biased exponent 16, stored fraction 1/4.
+    let model = StubModel::new().with(
+        x,
+        ModelValue::FloatingPoint {
+            sign: false,
+            exponent: 16,
+            significand: 256,
+            exponent_bits: 5,
+            significand_bits: 11,
+        },
+    );
+    assert_confirmed(&verdict(&ts, &model, &[exact]));
+}
+
+#[test]
+fn fp_to_real_handles_subnormal_sign_and_both_zeros_exactly() {
+    let mut ts = TermStore::new();
+    let fp16 = Sort::FloatingPoint(5, 11);
+    let negative_min = ts.mk_var("negative-min-subnormal", fp16.clone());
+    let positive_zero = ts.mk_var("positive-zero", fp16.clone());
+    let negative_zero = ts.mk_var("negative-zero", fp16);
+    let negative_min_real = app(&mut ts, "fp.to_real", &[negative_min], Sort::Real);
+    let positive_zero_real = app(&mut ts, "fp.to_real", &[positive_zero], Sort::Real);
+    let negative_zero_real = app(&mut ts, "fp.to_real", &[negative_zero], Sort::Real);
+    let expected_min = ts.mk_rational(BigRational::new(int(-1), BigInt::from(1u8) << 24usize));
+    let zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let min_exact = app(&mut ts, "=", &[negative_min_real, expected_min], Sort::Bool);
+    let positive_zero_exact = app(&mut ts, "=", &[positive_zero_real, zero], Sort::Bool);
+    let negative_zero_exact = app(&mut ts, "=", &[negative_zero_real, zero], Sort::Bool);
+    let model = StubModel::new()
+        .with(
+            negative_min,
+            ModelValue::FloatingPoint {
+                sign: true,
+                exponent: 0,
+                significand: 1,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .with(
+            positive_zero,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 0,
+                significand: 0,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .with(
+            negative_zero,
+            ModelValue::FloatingPoint {
+                sign: true,
+                exponent: 0,
+                significand: 0,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        );
+    assert_confirmed(&verdict(
+        &ts,
+        &model,
+        &[min_exact, positive_zero_exact, negative_zero_exact],
+    ));
+}
+
+#[test]
+fn fp_to_real_nan_infinity_and_malformed_payloads_fail_closed() {
+    for (label, exponent, significand) in [
+        ("positive-infinity", 31, 0),
+        ("nan", 31, 512),
+        ("malformed-significand", 0, 1024),
+    ] {
+        let mut ts = TermStore::new();
+        let x = ts.mk_var(label, Sort::FloatingPoint(5, 11));
+        let to_real = app(&mut ts, "fp.to_real", &[x], Sort::Real);
+        let zero = ts.mk_rational(BigRational::from_integer(int(0)));
+        let assertion = app(&mut ts, "=", &[to_real, zero], Sort::Bool);
+        let model = StubModel::new().with(
+            x,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent,
+                significand,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        );
+        assert_cannot(&verdict(&ts, &model, &[assertion]));
+    }
 }
 
 #[test]
@@ -205,6 +358,82 @@ fn array_default_reduces_const_and_store_but_unpinned_leaf_fails_closed() {
     let zero = ts.mk_int(int(0));
     let unpinned_eq = app(&mut ts, "=", &[unpinned_default, zero], Sort::Bool);
     assert_cannot(&verdict(&ts, &StubModel::new(), &[unpinned_eq]));
+}
+
+#[test]
+fn dependent_lambda_default_uses_only_committed_opaque_scalar() {
+    let mut ts = TermStore::new();
+    let bound = ts.mk_var("bound", Sort::Bool);
+    let one = ts.mk_int(int(1));
+    let zero = ts.mk_int(int(0));
+    let body = ts.mk_ite(bound, one, zero);
+    let lambda = ts.mk_lambda_array(bound, body);
+    let default = ts.mk_array_default(lambda);
+    let two = ts.mk_int(int(2));
+    let equals_two = app(&mut ts, "=", &[default, two], Sort::Bool);
+
+    assert_confirmed(&verdict(
+        &ts,
+        &UfStubModel::new().uf(default, ModelValue::Int(int(2))),
+        &[equals_two],
+    ));
+    assert_cannot(&verdict(&ts, &UfStubModel::new(), &[equals_two]));
+}
+
+#[test]
+fn aliased_dependent_lambda_default_uses_only_committed_opaque_scalar() {
+    let mut ts = TermStore::new();
+    let bound = ts.mk_var("bound", Sort::Bool);
+    let one = ts.mk_int(int(1));
+    let zero = ts.mk_int(int(0));
+    let body = ts.mk_ite(bound, one, zero);
+    let lambda = ts.mk_lambda_array(bound, body);
+    // Model an expanded define-fun/alias whose outer syntax hides the lambda
+    // from `eval_array_default`'s direct fast path.
+    let true_term = ts.mk_bool(true);
+    let alias = ts.mk_ite(true_term, lambda, lambda);
+    let default = ts.mk_array_default(alias);
+    let two = ts.mk_int(int(2));
+    let equals_two = app(&mut ts, "=", &[default, two], Sort::Bool);
+
+    assert_confirmed(&verdict(
+        &ts,
+        &UfStubModel::new().uf(default, ModelValue::Int(int(2))),
+        &[equals_two],
+    ));
+    assert_cannot(&verdict(&ts, &UfStubModel::new(), &[equals_two]));
+}
+
+#[test]
+fn finite_store_default_uses_committed_scalar_instead_of_base_default() {
+    let mut ts = TermStore::new();
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let false_term = ts.mk_bool(false);
+    let array_sort = Sort::array(Sort::Bool, Sort::Int);
+    let base = app(&mut ts, "const-array", &[zero], array_sort.clone());
+    let stored = app(&mut ts, "store", &[base, false_term, one], array_sort);
+    let default = app(&mut ts, "default", &[stored], Sort::Int);
+    let assertion = app(&mut ts, "=", &[default, one], Sort::Bool);
+    let model = UfStubModel::new().uf(default, ModelValue::Int(int(1)));
+
+    assert_confirmed(&verdict(&ts, &model, &[assertion]));
+}
+
+#[test]
+fn unit_store_default_is_structurally_the_stored_value() {
+    let mut ts = TermStore::new();
+    let unit_sort = Sort::FiniteDomain("Unit".to_string(), 1);
+    let unit = ts.mk_var("unit", unit_sort.clone());
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let array_sort = Sort::array(unit_sort, Sort::Int);
+    let base = app(&mut ts, "const-array", &[zero], array_sort.clone());
+    let stored = app(&mut ts, "store", &[base, unit, one], array_sort);
+    let default = app(&mut ts, "default", &[stored], Sort::Int);
+    let assertion = app(&mut ts, "=", &[default, one], Sort::Bool);
+
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[assertion]));
 }
 
 #[test]
@@ -1780,6 +2009,150 @@ fn seq_last_indexof_semantics() {
     assert_eq!(li(&[1, 1, 1], &[1, 1]), int(1)); // rightmost multi-element match
 }
 
+// ---------------------------------------------------------------------------
+// Higher-order combinators (#ho-seq).
+//
+// The function operand is a FUNCTION-AS-ARRAY, curried exactly as
+// `Z3_mk_seq_map` / `Z3_mk_seq_foldl` build it. Before these, the gate reported
+// `unsupported sequence operator seq.map` for EVERY assertion mentioning one,
+// so a genuine `sat` over a ground `seq.map` could never be confirmed and
+// always degraded to `unknown`. Values are hand-computed from the combinator
+// definitions; the fail-closed corners (non-array function operand, an
+// unevaluable curried layer) are pinned alongside.
+
+/// An `(Array Int Int)` value from explicit `index -> value` pins.
+fn mvarr_i(default: i64, pins: &[(i64, i64)]) -> ModelValue {
+    ModelValue::Array(Box::new(ArrayValue {
+        default: ModelValue::Int(int(default)),
+        store: pins
+            .iter()
+            .map(|&(k, v)| (ModelValue::Int(int(k)), ModelValue::Int(int(v))))
+            .collect(),
+    }))
+}
+
+/// An `(Array Int (Array Int Int))` value from a default inner array plus pins.
+fn mvarr2_i(default_inner: ModelValue, pins: &[(i64, ModelValue)]) -> ModelValue {
+    ModelValue::Array(Box::new(ArrayValue {
+        default: default_inner,
+        store: pins
+            .iter()
+            .map(|(k, v)| (ModelValue::Int(int(*k)), v.clone()))
+            .collect(),
+    }))
+}
+
+fn int_of(value: &ModelValue) -> BigInt {
+    match value {
+        ModelValue::Int(n) => n.clone(),
+        other => panic!("expected Int, got {other:?}"),
+    }
+}
+
+fn ints_of(value: &ModelValue) -> Vec<i64> {
+    match value {
+        ModelValue::Seq(v) => v
+            .iter()
+            .map(|e| match e {
+                ModelValue::Int(n) => n.try_into().unwrap(),
+                other => panic!("expected Int element, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected Seq, got {other:?}"),
+    }
+}
+
+#[test]
+fn seq_map_applies_the_function_as_array_pointwise() {
+    let f = mvarr_i(0, &[(1, 3), (2, 4)]);
+    let mapped = seq::eval("seq.map", &[f.clone(), mvseq_i(&[1, 2])]).unwrap();
+    assert_eq!(ints_of(&mapped), vec![3, 4]);
+    // The default covers indices with no pin.
+    let mapped = seq::eval("seq.map", &[f, mvseq_i(&[1, 7])]).unwrap();
+    assert_eq!(ints_of(&mapped), vec![3, 0]);
+    // Length is preserved, so the empty sequence maps to the empty sequence.
+    let empty = seq::eval("seq.map", &[mvarr_i(5, &[]), mvseq_i(&[])]).unwrap();
+    assert_eq!(ints_of(&empty), Vec::<i64>::new());
+    // A non-array function operand is unevaluable, never a guessed value.
+    assert!(seq::eval("seq.map", &[ModelValue::Int(int(1)), mvseq_i(&[1])]).is_err());
+}
+
+#[test]
+fn seq_mapi_curries_the_index_outermost() {
+    // f[i][e]: at index 0 add 10, at index 1 add 20.
+    let f = mvarr2_i(
+        mvarr_i(0, &[]),
+        &[(0, mvarr_i(0, &[(5, 15)])), (1, mvarr_i(0, &[(6, 26)]))],
+    );
+    let mapped = seq::eval(
+        "seq.mapi",
+        &[f.clone(), ModelValue::Int(int(0)), mvseq_i(&[5, 6])],
+    )
+    .unwrap();
+    assert_eq!(ints_of(&mapped), vec![15, 26]);
+    // The index operand is the BASE, so it offsets every element position.
+    let shifted = seq::eval("seq.mapi", &[f, ModelValue::Int(int(1)), mvseq_i(&[6])]).unwrap();
+    assert_eq!(ints_of(&shifted), vec![26]);
+}
+
+#[test]
+fn seq_foldl_chains_the_accumulator_outermost() {
+    // f[acc][e] = acc + e, pinned over exactly the reachable pairs.
+    let f = mvarr2_i(
+        mvarr_i(0, &[]),
+        &[
+            (0, mvarr_i(0, &[(1, 1), (2, 2)])),
+            (1, mvarr_i(0, &[(2, 3)])),
+            (3, mvarr_i(0, &[(4, 7)])),
+        ],
+    );
+    let folded = seq::eval(
+        "seq.foldl",
+        &[f.clone(), ModelValue::Int(int(0)), mvseq_i(&[1, 2, 4])],
+    )
+    .unwrap();
+    assert_eq!(int_of(&folded), int(7));
+    // Over the EMPTY sequence the fold IS the accumulator — `f` is never
+    // applied, so it need not even be well-shaped beyond being an array.
+    let identity = seq::eval("seq.foldl", &[f, ModelValue::Int(int(42)), mvseq_i(&[])]).unwrap();
+    assert_eq!(int_of(&identity), int(42));
+    // A curried layer that is not an array fails closed.
+    assert!(seq::eval(
+        "seq.foldl",
+        &[
+            mvarr_i(0, &[(0, 9)]),
+            ModelValue::Int(int(0)),
+            mvseq_i(&[1])
+        ],
+    )
+    .is_err());
+}
+
+#[test]
+fn seq_foldli_chains_index_then_accumulator() {
+    // f[i][acc][e]: only the (i=0, acc=0, e=5) and (i=1, acc=5, e=6) steps.
+    let inner0 = mvarr2_i(mvarr_i(0, &[]), &[(0, mvarr_i(0, &[(5, 5)]))]);
+    let inner1 = mvarr2_i(mvarr_i(0, &[]), &[(5, mvarr_i(0, &[(6, 11)]))]);
+    let f = ModelValue::Array(Box::new(ArrayValue {
+        default: inner0.clone(),
+        store: vec![
+            (ModelValue::Int(int(0)), inner0),
+            (ModelValue::Int(int(1)), inner1),
+        ],
+    }));
+    let folded = seq::eval(
+        "seq.foldli",
+        &[
+            f,
+            ModelValue::Int(int(0)),
+            ModelValue::Int(int(0)),
+            mvseq_i(&[5, 6]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(int_of(&folded), int(11));
+}
+
 #[test]
 fn seq_replace_all_semantics() {
     assert_eq!(ra(&[1, 2, 1], &[1], &[9]), vec![9, 2, 9]); // both occurrences
@@ -1789,4 +2162,462 @@ fn seq_replace_all_semantics() {
     assert_eq!(ra(&[1, 2], &[1], &[8, 8]), vec![8, 8, 2]); // expanding dst
     assert_eq!(ra(&[1, 2, 1], &[1], &[]), vec![2]); // deleting dst
     assert_eq!(ra(&[1, 1], &[1, 1], &[9]), vec![9]); // whole-sequence match
+}
+
+// ===========================================================================
+// str.replace_re / str.replace_re_all
+//
+// SMT-LIB 2.6 Unicode Strings decomposes `s = x ++ w ++ z` with `w` in `[[r]]`,
+// `|x|` minimal and THEN `|w|` minimal (leftmost, then shortest).
+// `str.replace_re` rewrites that one occurrence; `str.replace_re_all` recurses
+// on `z`, under the extra `w != ""` side condition. A regex that accepts the
+// empty word is where the two clauses come apart, and this gate deliberately
+// fails closed there — see `crate::regex::replace`.
+//
+// Every case below is fully ground, so the verdict is decided entirely by this
+// crate's evaluator and its own interval matcher.
+// ===========================================================================
+
+fn re_lit(ts: &mut TermStore, text: &str) -> TermId {
+    let s = ts.mk_string(text.to_string());
+    app(ts, "str.to_re", &[s], Sort::RegLan)
+}
+
+fn re_range(ts: &mut TermStore, lo: &str, hi: &str) -> TermId {
+    let lo = ts.mk_string(lo.to_string());
+    let hi = ts.mk_string(hi.to_string());
+    app(ts, "re.range", &[lo, hi], Sort::RegLan)
+}
+
+/// Gate `(= (<op> <subject> <regex> <replacement>) <expected>)`.
+fn replace_re_verdict(
+    op: &str,
+    build_regex: impl FnOnce(&mut TermStore) -> TermId,
+    subject: &str,
+    replacement: &str,
+    expected: &str,
+) -> GateVerdict {
+    let mut ts = TermStore::new();
+    let regex = build_regex(&mut ts);
+    let s = ts.mk_string(subject.to_string());
+    let t = ts.mk_string(replacement.to_string());
+    let call = app(&mut ts, op, &[s, regex, t], Sort::String);
+    let want = ts.mk_string(expected.to_string());
+    let eq = app(&mut ts, "=", &[call, want], Sort::Bool);
+    verdict(&ts, &StubModel::new(), &[eq])
+}
+
+// ── the shape the group_strings regression exercised: a union pattern ──
+
+#[test]
+fn replace_re_union_replaces_the_leftmost_match() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| {
+            let a = re_lit(ts, "a");
+            let b = re_lit(ts, "b");
+            app(ts, "re.union", &[a, b], Sort::RegLan)
+        },
+        "abc",
+        "X",
+        "Xbc",
+    ));
+}
+
+#[test]
+fn replace_re_union_skips_to_the_first_position_that_matches() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| {
+            let one = re_lit(ts, "1");
+            let two = re_lit(ts, "2");
+            app(ts, "re.union", &[one, two], Sort::RegLan)
+        },
+        "a1b2c",
+        "X",
+        "aXb2c",
+    ));
+}
+
+#[test]
+fn replace_re_all_union_replaces_every_match() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| {
+            let one = re_lit(ts, "1");
+            let two = re_lit(ts, "2");
+            app(ts, "re.union", &[one, two], Sort::RegLan)
+        },
+        "a1b2c",
+        "X",
+        "aXbXc",
+    ));
+}
+
+// ── the two halves of "leftmost, THEN shortest" ──
+
+#[test]
+fn replace_re_takes_the_shortest_match_at_the_leftmost_position() {
+    // `(re.union (str.to_re "ab") (str.to_re "a"))` matches both "ab" and "a"
+    // at position 0. The clause minimizes |w| there, so "a" is replaced and
+    // "bc" survives. A longest-match (PCRE-style greedy) reading would yield
+    // "Xc" instead.
+    let build = |ts: &mut TermStore| {
+        let ab = re_lit(ts, "ab");
+        let a = re_lit(ts, "a");
+        app(ts, "re.union", &[ab, a], Sort::RegLan)
+    };
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "abc",
+        "X",
+        "Xbc",
+    ));
+    assert_violates(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "abc",
+        "X",
+        "Xc",
+    ));
+}
+
+#[test]
+fn replace_re_prefers_a_leftmost_long_match_over_a_later_short_one() {
+    // In "xab" the union matches "ab" at 1 and "b" at 2. `|x|` is minimized
+    // FIRST, so the length-2 match at position 1 wins over the length-1 match
+    // at position 2 — shortness only breaks ties within one position.
+    let build = |ts: &mut TermStore| {
+        let ab = re_lit(ts, "ab");
+        let b = re_lit(ts, "b");
+        app(ts, "re.union", &[ab, b], Sort::RegLan)
+    };
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "xab",
+        "X",
+        "xX",
+    ));
+    assert_violates(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "xab",
+        "X",
+        "xaX",
+    ));
+}
+
+#[test]
+fn replace_re_plus_takes_the_shortest_repetition() {
+    // `(re.+ (re.range "0" "9"))` matches "1", "12" and "123" at position 1;
+    // the shortest is the one replaced.
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| {
+            let d = re_range(ts, "0", "9");
+            app(ts, "re.+", &[d], Sort::RegLan)
+        },
+        "a123b",
+        "N",
+        "aN23b",
+    ));
+}
+
+#[test]
+fn replace_re_all_plus_takes_the_shortest_repetition_each_time() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| {
+            let d = re_range(ts, "0", "9");
+            app(ts, "re.+", &[d], Sort::RegLan)
+        },
+        "a12b34",
+        "N",
+        "aNNbNN",
+    ));
+}
+
+// ── first-only vs all, and the no-rescan rule ──
+
+#[test]
+fn replace_re_rewrites_only_the_first_occurrence() {
+    let build = |ts: &mut TermStore| re_lit(ts, "X");
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "aXbXc",
+        "Y",
+        "aYbXc",
+    ));
+    // The wrong-answer class this gate exists to catch: claiming replace_re
+    // behaves like replace_re_all must be REFUTED, not merely unconfirmed.
+    assert_violates(&replace_re_verdict(
+        "str.replace_re",
+        build,
+        "aXbXc",
+        "Y",
+        "aYbYc",
+    ));
+}
+
+#[test]
+fn replace_re_all_rewrites_every_occurrence() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| re_lit(ts, "X"),
+        "aXbXc",
+        "Y",
+        "aYbYc",
+    ));
+}
+
+#[test]
+fn replace_re_all_matches_are_non_overlapping_left_to_right() {
+    // "aaa" has an "aa" at 0 and at 1; the recursion continues on the SUFFIX
+    // after the first match, so only one replacement fires.
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| re_lit(ts, "aa"),
+        "aaa",
+        "X",
+        "Xa",
+    ));
+}
+
+#[test]
+fn replace_re_all_never_rescans_the_text_it_just_inserted() {
+    // The clause recurses on `z`, never on `t ++ z`. Rescanning would not
+    // terminate here; it must produce "aab", not diverge or over-replace.
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| re_lit(ts, "a"),
+        "ab",
+        "aa",
+        "aab",
+    ));
+}
+
+// ── no match, empty subject, and char (not byte) indexing ──
+
+#[test]
+fn replace_re_without_a_match_returns_the_subject() {
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| {
+            let x = re_lit(ts, "x");
+            let z = re_lit(ts, "z");
+            app(ts, "re.union", &[x, z], Sort::RegLan)
+        },
+        "hello",
+        "Q",
+        "hello",
+    ));
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| {
+            let x = re_lit(ts, "x");
+            let z = re_lit(ts, "z");
+            app(ts, "re.union", &[x, z], Sort::RegLan)
+        },
+        "hello",
+        "Q",
+        "hello",
+    ));
+}
+
+#[test]
+fn replace_re_on_the_empty_subject_is_the_identity() {
+    // With a non-nullable regex the empty string admits no decomposition.
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| re_lit(ts, "a"),
+        "",
+        "X",
+        "",
+    ));
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| re_lit(ts, "a"),
+        "",
+        "X",
+        "",
+    ));
+}
+
+#[test]
+fn replace_re_splices_at_code_point_boundaries_not_byte_boundaries() {
+    // Every character here is multi-byte, so a byte-indexed splice would cut a
+    // code point in half or land on the wrong one.
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re",
+        |ts| re_lit(ts, "\u{3b2}"),
+        "\u{3b1}\u{3b2}\u{3b3}",
+        "X",
+        "\u{3b1}X\u{3b3}",
+    ));
+    assert_confirmed(&replace_re_verdict(
+        "str.replace_re_all",
+        |ts| re_range(ts, "\u{3b1}", "\u{3b2}"),
+        "\u{3b1}\u{3b2}\u{3b3}",
+        "-",
+        "--\u{3b3}",
+    ));
+}
+
+#[test]
+fn replace_re_reads_its_subject_from_the_model() {
+    // Not ground: the subject is a leaf the model pins, which is the shape the
+    // gate actually meets when re-checking a solver model.
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("x", Sort::String);
+    let digit = re_range(&mut ts, "0", "9");
+    let regex = app(&mut ts, "re.+", &[digit], Sort::RegLan);
+    let t = ts.mk_string("#".to_string());
+    let call = app(&mut ts, "str.replace_re_all", &[x, regex, t], Sort::String);
+    let want = ts.mk_string("a#b#".to_string());
+    let eq = app(&mut ts, "=", &[call, want], Sort::Bool);
+
+    let satisfying = StubModel::new().with(x, ModelValue::Str("a1b2".to_string()));
+    assert_confirmed(&verdict(&ts, &satisfying, &[eq]));
+
+    let violating = StubModel::new().with(x, ModelValue::Str("a1b".to_string()));
+    assert_violates(&verdict(&ts, &violating, &[eq]));
+
+    // An unpinned subject must not be guessed.
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[eq]));
+}
+
+// ── deliberately fail-closed shapes ──────────────────────────────────────
+//
+// Each of these returns CannotConfirm. That is a completeness cost only: the
+// gate never assumes an assertion it cannot compute, so a refusal can only
+// leave a verdict at `unknown`, never publish a wrong `sat`.
+
+#[test]
+fn replace_re_fails_closed_on_a_star_regex() {
+    // `re.*` accepts the empty word. `str.replace_re`'s clause has no
+    // `w != ""` side condition and `str.replace_re_all`'s does, so the two
+    // disagree about what the empty match means; the gate declines both.
+    for op in ["str.replace_re", "str.replace_re_all"] {
+        assert_cannot(&replace_re_verdict(
+            op,
+            |ts| {
+                let a = re_lit(ts, "a");
+                app(ts, "re.*", &[a], Sort::RegLan)
+            },
+            "bbb",
+            "X",
+            "Xbbb",
+        ));
+    }
+}
+
+#[test]
+fn replace_re_fails_closed_on_an_empty_literal_regex() {
+    for op in ["str.replace_re", "str.replace_re_all"] {
+        assert_cannot(&replace_re_verdict(
+            op,
+            |ts| re_lit(ts, ""),
+            "abc",
+            "X",
+            "Xabc",
+        ));
+    }
+}
+
+#[test]
+fn replace_re_fails_closed_on_re_all_and_re_opt() {
+    for op in ["str.replace_re", "str.replace_re_all"] {
+        assert_cannot(&replace_re_verdict(
+            op,
+            |ts| app(ts, "re.all", &[], Sort::RegLan),
+            "abc",
+            "X",
+            "Xabc",
+        ));
+        assert_cannot(&replace_re_verdict(
+            op,
+            |ts| {
+                let a = re_lit(ts, "a");
+                app(ts, "re.opt", &[a], Sort::RegLan)
+            },
+            "abc",
+            "X",
+            "Xabc",
+        ));
+    }
+}
+
+#[test]
+fn replace_re_detects_nullability_below_the_top_level() {
+    // The union is nullable only because one alternative is; the check is a
+    // real emptiness probe of the whole regex, not a syntactic top-level test.
+    assert_cannot(&replace_re_verdict(
+        "str.replace_re",
+        |ts| {
+            let a = re_lit(ts, "a");
+            let eps = re_lit(ts, "");
+            app(ts, "re.union", &[a, eps], Sort::RegLan)
+        },
+        "bab",
+        "X",
+        "Xbab",
+    ));
+}
+
+#[test]
+fn replace_re_fails_closed_on_an_unsupported_regex_operator() {
+    assert_cannot(&replace_re_verdict(
+        "str.replace_re",
+        |ts| app(ts, "re.future", &[], Sort::RegLan),
+        "abc",
+        "X",
+        "Xbc",
+    ));
+}
+
+#[test]
+fn replace_re_fails_closed_on_a_non_reglan_pattern_argument() {
+    let mut ts = TermStore::new();
+    let s = ts.mk_string("abc".to_string());
+    let pattern = ts.mk_string("a".to_string());
+    let t = ts.mk_string("X".to_string());
+    let call = app(&mut ts, "str.replace_re", &[s, pattern, t], Sort::String);
+    let want = ts.mk_string("Xbc".to_string());
+    let eq = app(&mut ts, "=", &[call, want], Sort::Bool);
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[eq]));
+}
+
+#[test]
+fn replace_re_fails_closed_outside_the_smtlib_alphabet() {
+    // U+30000 is above the SMT-LIB Unicode Strings alphabet bound (0x2FFFF).
+    // Both the subject and the spliced-in replacement are held to it, so the
+    // gate can never confirm a value it would refuse to read back.
+    assert_cannot(&replace_re_verdict(
+        "str.replace_re",
+        |ts| re_lit(ts, "a"),
+        "\u{30000}a",
+        "X",
+        "\u{30000}X",
+    ));
+    assert_cannot(&replace_re_verdict(
+        "str.replace_re",
+        |ts| re_lit(ts, "a"),
+        "za",
+        "\u{30000}",
+        "z\u{30000}",
+    ));
+}
+
+#[test]
+fn replace_re_fails_closed_on_wrong_arity() {
+    let mut ts = TermStore::new();
+    let s = ts.mk_string("abc".to_string());
+    let regex = re_lit(&mut ts, "a");
+    let call = app(&mut ts, "str.replace_re", &[s, regex], Sort::String);
+    let want = ts.mk_string("abc".to_string());
+    let eq = app(&mut ts, "=", &[call, want], Sort::Bool);
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[eq]));
 }

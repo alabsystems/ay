@@ -8,7 +8,8 @@
 //   Z3_solver_add_simplifier.
 //
 // A simplifier is a preprocessing transformer attached to a solver so the solver
-// runs it before each check-sat. The core check: build a simplifier
+// runs it before each check-sat. The registry check freezes the exact 37 names
+// and order reported by Z3 5.0.0. The core semantic check builds a simplifier
 // (`solve-eqs` and_then `propagate-values`), ATTACH it to a solver, assert a
 // formula, and confirm the verdict is PRESERVED — it equals both (a) the verdict
 // of a plain solver without the simplifier and (b) what libz3 returns for the
@@ -65,6 +66,46 @@ static void err_handler(Z3_context c, unsigned int e) { (void)c; (void)e; }
 #endif
 
 static Z3_context C;
+
+static const char *z3_5_simplifiers[] = {
+    "bit2int",
+    "bit-blast",
+    "bv1-blast",
+    "cheap-fourier-motzkin",
+    "elim-term-ite",
+    "max-bv-sharing",
+    "pull-nested-quantifiers",
+    "push-app-ite-conservative",
+    "push-app-ite",
+    "ng-push-app-ite-conservative",
+    "ng-push-app-ite",
+    "randomizer",
+    "refine-injectivity",
+    "simplify",
+    "qe-light",
+    "card2bv",
+    "factor",
+    "propagate-ineqs",
+    "propagate-bv-bounds",
+    "bv-divrem-bounds",
+    "bv-slice",
+    "bvarray2uf",
+    "blast-term-ite",
+    "cofactor-term-ite",
+    "demodulator",
+    "der",
+    "distribute-forall",
+    "dom-simplify",
+    "elim-unconstrained",
+    "elim-predicates",
+    "fold-unfold",
+    "injectivity",
+    "propagate-values",
+    "reduce-args",
+    "solve-eqs",
+    "special-relations",
+    "euf-completion",
+};
 
 // inc_ref a freshly built simplifier (libz3 requires it; ay's inc_ref is a no-op).
 static Z3_simplifier S(Z3_simplifier s) { Z3_simplifier_inc_ref(C, s); return s; }
@@ -173,6 +214,24 @@ int main(void) {
     CHECK_I(solve_with_simplifier(simp, 1), Z3_L_TRUE, "simplify preserves SAT");
     CHECK_I(solve_with_simplifier(simp, 0), Z3_L_FALSE, "simplify preserves UNSAT");
 
+    // ---- Exact Z3 5.0.0 registry: 37 names, same order, all constructible ----
+    unsigned int num_simplifiers = Z3_get_num_simplifiers(C);
+    CHECK_I(num_simplifiers, 37, "Z3 5.0.0 simplifier count");
+    for (unsigned int i = 0; i < 37; i++) {
+        Z3_string got = Z3_get_simplifier_name(C, i);
+        CHECK_B(got != NULL, 1, "enumerated simplifier name non-null");
+        if (got != NULL) {
+            CHECK_B(strcmp(got, z3_5_simplifiers[i]) == 0, 1,
+                    "enumerated simplifier matches Z3 5.0.0 order");
+        }
+        Z3_simplifier entry = Z3_mk_simplifier(C, z3_5_simplifiers[i]);
+        CHECK_B(entry != NULL, 1, "enumerated Z3 5.0.0 simplifier builds");
+        Z3_string entry_descr =
+            Z3_simplifier_get_descr(C, z3_5_simplifiers[i]);
+        CHECK_B(entry_descr != NULL && entry_descr[0] != '\0', 1,
+                "enumerated simplifier has description");
+    }
+
 #ifndef AY_TWIN_USE_Z3
     // ---- AY-only honesty checks (libz3 diverges/aborts on these) ----
     // get_descr(unknown) -> NULL + Z3_INVALID_ARG (libz3 returns "" + error).
@@ -180,14 +239,16 @@ int main(void) {
     CHECK_B(du == NULL, 1, "descr(unknown)=NULL (ay honest)");
     CHECK_I(Z3_get_error_code(C), Z3_INVALID_ARG, "descr(unknown) sets INVALID_ARG");
 
-    // AY documented superset: elim-and / nnf build as simplifiers and have a
-    // description (libz3 has no such simplifier name and rejects them).
+    // elim-and / nnf are tactics, not Z3 5.0.0 simplifiers. The old AY-only
+    // registry extras must now be rejected.
     for (int i = 0; i < 2; i++) {
         const char *nm = (i == 0) ? "elim-and" : "nnf";
-        Z3_simplifier s = Z3_mk_simplifier(C, nm);
-        CHECK_B(s != NULL, 1, "ay superset simplifier builds");
+        Z3_simplifier old_extra = Z3_mk_simplifier(C, nm);
+        CHECK_B(old_extra == NULL, 1, "old AY-only simplifier is rejected");
+        CHECK_I(Z3_get_error_code(C), Z3_INVALID_ARG,
+                "old AY-only simplifier sets INVALID_ARG");
         Z3_string d = Z3_simplifier_get_descr(C, nm);
-        CHECK_B(d != NULL && d[0] != '\0', 1, "ay superset descr non-empty");
+        CHECK_B(d == NULL, 1, "old AY-only simplifier has no description");
     }
 
     // Tactic-only control names are NOT simplifiers: honest NULL + error.

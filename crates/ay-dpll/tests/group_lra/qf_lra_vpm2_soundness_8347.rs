@@ -24,7 +24,17 @@ use anyhow::Result;
 #[ntest::timeout(30_000)]
 fn test_vpm2_30_never_returns_unsat_8347() -> Result<()> {
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/vpm2-30.smt2");
-    assert!(path.exists(), "Benchmark not found: {}", path.display());
+    // `benchmarks/smtcomp/` is gitignored (see .gitignore, only two QF_LRA files
+    // are whitelisted), so a clean checkout has no corpus. Gate on presence the
+    // same way the two sibling tests below already do, rather than hard-failing
+    // on an absent fixture. The soundness guard (never UNSAT) is unchanged.
+    if !path.exists() {
+        eprintln!(
+            "SKIP test_vpm2_30_never_returns_unsat_8347: corpus benchmark not found: {}",
+            path.display()
+        );
+        return Ok(());
+    }
 
     // Run with a short timeout — we only need to verify the answer is not UNSAT.
     // If AY solves it quickly, great. If it times out, that's acceptable.

@@ -267,6 +267,62 @@ impl Outcome {
     }
 }
 
+/// COMPILE-TIME COVERAGE GUARD FOR THE CLI's `--format json`.
+///
+/// `Outcome` and `UnknownReason` are `#[non_exhaustive]`, so `src/bin/ay-milp.rs`
+/// — a different crate — must carry a wildcard arm and cannot be told by the
+/// compiler that a new variant exists. Its status/JSON coverage list would just
+/// go on passing while the new variant fell into the untested `OTHER {other:?}`
+/// arm.
+///
+/// These matches live in the DEFINING crate, where `non_exhaustive` does not
+/// apply and the compiler checks them. Adding a variant breaks this build, and
+/// the fix is to add it here AND to `every_outcome` / `every_unknown_reason` in
+/// `src/bin/ay-milp.rs`'s `json_output_tests`.
+#[cfg(test)]
+mod cli_json_coverage {
+    use super::*;
+
+    /// The status token `verdict_line` must print. Keep in step with the binary.
+    fn status_token(o: &Outcome) -> &'static str {
+        match o {
+            Outcome::Optimal { .. } => "OPTIMAL",
+            Outcome::Feasible { .. } => "FEASIBLE",
+            Outcome::Infeasible { .. } => "INFEASIBLE",
+            Outcome::Unbounded => "UNBOUNDED",
+            Outcome::Bound { .. } => "BOUND",
+            Outcome::Unknown { .. } => "UNKNOWN",
+        }
+    }
+
+    /// Whether this reason's `Debug` carries free text — i.e. whether it can
+    /// break a hand-rolled JSON writer. Exhaustive on purpose.
+    fn carries_free_text(r: &UnknownReason) -> bool {
+        match r {
+            UnknownReason::Timeout
+            | UnknownReason::Interrupted
+            | UnknownReason::IterationLimit
+            | UnknownReason::MemoryLimit
+            | UnknownReason::CertificateUnavailable => false,
+            UnknownReason::SolverIncomplete { .. } | UnknownReason::WitnessRejected { .. } => true,
+        }
+    }
+
+    #[test]
+    fn the_binarys_status_vocabulary_is_closed() {
+        let o = Outcome::Unknown {
+            reason: UnknownReason::SolverIncomplete {
+                detail: String::new(),
+            },
+        };
+        assert_eq!(status_token(&o), "UNKNOWN");
+        assert!(carries_free_text(&UnknownReason::SolverIncomplete {
+            detail: String::new()
+        }));
+        assert!(!carries_free_text(&UnknownReason::Timeout));
+    }
+}
+
 #[cfg(test)]
 mod trust_tests {
     use super::*;
@@ -303,7 +359,7 @@ mod trust_tests {
     fn optimal_with_a_certificate_is_not_rim_closed_on_an_integral_model() {
         // A certificate object; its CONTENT is irrelevant here, because `trust`
         // reports what the verify path CHECKS, not whether this instance verifies.
-        let cert = crate::cert::OptimalityCertificate {
+        let cert = OptimalityCertificate {
             sense: crate::model::Sense::Minimize,
             objective: Vec::new(),
             bound: BigRational::zero(),

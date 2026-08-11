@@ -61,7 +61,7 @@ mod fpa_introspect;
 mod introspect;
 mod model_parse;
 mod model_parse_compound;
-mod proofs;
+pub(crate) mod proofs;
 mod rec_defs;
 mod sequences;
 pub(crate) mod solving;
@@ -94,7 +94,8 @@ pub use proofs::{
     UnsatProofArtifact,
 };
 pub use solving::{
-    ApplyResult, Goal, PatchStrength, PatchSuggestion, SolverScope, Tactic, TacticFailure,
+    ApplyResult, Goal, ParsedPublicFormulaMetadata, ParsedPublicTermMetadata, ParsedSmtlib2Batch,
+    ParsedSmtlib2Formula, PatchStrength, PatchSuggestion, SolverScope, Tactic, TacticFailure,
     TacticSolver,
 };
 pub use types::*;
@@ -384,8 +385,13 @@ impl Solver {
         // exists only in frames protected by the stack guard above, and what
         // escapes to the caller is a small `Solver` holding a heap pointer.
         let mut executor = Box::new(Executor::new());
-        // Set the logic and propagate errors
-        executor.execute(&Command::SetLogic(logic.as_str().to_string()))?;
+        // Install the logic WITHOUT recording a command-stream `(set-logic ...)`.
+        // Going through `Command::SetLogic` marks the logic as having been set
+        // by the command stream, which then rejects the first `(set-logic ...)`
+        // of any script this solver later parses — z3 accepts that, because for
+        // it "already been set" is parser state and `SolverFor` is not part of
+        // the stream.
+        executor.set_initial_logic(logic.as_str())?;
         let native_replay_events = vec![NativeReplayEvent::new(
             0,
             NativeReplayEventKind::SetLogic {
@@ -438,6 +444,28 @@ impl Solver {
     /// Access the internal term store mutably
     fn terms_mut(&mut self) -> &mut TermStore {
         &mut self.executor.context_mut().terms
+    }
+
+    /// Mark the native term arena as containing a user-shadowed `to_real`.
+    ///
+    /// This is a narrow friend hook for `ay-ffi`'s cross-context translation
+    /// tests.  It is absent from ordinary `ay-dpll` builds; production native
+    /// callers should create declarations through [`Self::try_declare_fun`],
+    /// which maintains the latch automatically.
+    #[cfg(feature = "z3-compat-internals")]
+    #[doc(hidden)]
+    pub fn z3_compat_mark_to_real_shadowed(&mut self) {
+        self.terms_mut().mark_to_real_shadowed();
+    }
+
+    /// Whether the user-shadowed `to_real` latch is active.
+    ///
+    /// See [`Self::z3_compat_mark_to_real_shadowed`].
+    #[cfg(feature = "z3-compat-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn z3_compat_to_real_is_shadowed(&self) -> bool {
+        self.terms().to_real_is_shadowed()
     }
 
     fn expect_bitvec(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {

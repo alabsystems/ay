@@ -11,6 +11,40 @@ use crate::api::proofs::strict_verdict_from_result;
 use crate::api::*;
 use ay_core::{AletheRule, ProofStep, Symbol, TheoryLemmaKind};
 
+/// A native API assertion of literal `false` is already an empty-clause
+/// obligation. It must still publish a concrete, strictly checked artifact;
+/// consumers must not have to synthesize proof metadata for this fast path.
+#[test]
+fn artifact_literal_false_is_present_and_strict_verified() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::QfLia);
+    solver.set_produce_proofs(true);
+
+    let false_term = solver.bool_const(false);
+    solver.assert_term(false_term);
+
+    assert!(solver.check_sat().is_unsat());
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("literal false UNSAT must publish a proof artifact");
+    assert!(!artifact.alethe.is_empty(), "Alethe text must be non-empty");
+    assert!(
+        artifact.quality.is_complete(),
+        "literal false proof must have zero trust/hole: {}",
+        artifact.quality,
+    );
+    assert!(
+        matches!(&artifact.strict_verdict, StrictProofVerdict::Verified(_)),
+        "literal false artifact must pass strict checking: {:?}",
+        artifact.strict_verdict,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+}
+
 /// pure Boolean contradiction: p AND NOT p.
 /// The proof should be trust-free and restricted-rule-subset.
 #[test]
@@ -72,6 +106,47 @@ fn artifact_qf_bool_accepts_strict_and_restricted_subset() {
         artifact.accept_for_consumer(ProofAcceptanceMode::RestrictedRuleSubset),
         Ok(()),
         "pure Boolean artifact should be acceptable in restricted-rule-subset mode",
+    );
+}
+
+/// DEDUCTIVE_CHECKS's zero-arity spec-function path registers the function as a Bool
+/// constant, asserts its exact body definition at base scope, and checks the
+/// caller's negated postcondition in a pushed scope. The refutation must be
+/// reconstructed from those authored roots; a synthetic `trust` leaf is not a
+/// certificate for the definition-to-result implication.
+#[test]
+fn zero_arity_bool_spec_definition_in_push_is_strict_verified() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver.set_produce_unsat_cores(true);
+
+    let spec_value = solver.declare_const("crate::m::f", Sort::Bool);
+    let result = solver.declare_const("target::result", Sort::Bool);
+
+    // `f() -> bool { true }` and the caller's return-value binding.
+    solver.assert_term(spec_value);
+    let result_is_spec = solver.eq(result, spec_value);
+    solver.assert_term(result_is_spec);
+
+    solver.push();
+    let negated_postcondition = solver.not(result);
+    solver.assert_term(negated_postcondition);
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "Bool spec-definition implication must publish certified UNSAT, got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("strict Bool definition proof artifact");
+    assert!(
+        matches!(artifact.strict_verdict, StrictProofVerdict::Verified(ref q) if q.is_complete()),
+        "strict checker rejected Bool definition proof: {:?}\n{}",
+        artifact.strict_verdict,
+        artifact.alethe,
     );
 }
 
@@ -744,6 +819,41 @@ fn conjunctive_lia_unsat_proof_is_strict_verified() {
         artifact.quality.is_complete(),
         "proof must have zero trust/hole steps: {} \n{}",
         artifact.quality,
+        artifact.alethe,
+    );
+}
+
+/// Exact integer system emitted by Trust's rational-clearing bridge:
+/// `x <= 2 /\ 2*x >= 7`. The LIA producer must orient and normalize its Farkas
+/// coefficients against the authored literals before strict replay.
+#[test]
+fn rational_clearing_lia_conjunction_is_strict_verified() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+
+    let x = solver.declare_const("x", Sort::Int);
+    let two = solver.int_const(2);
+    let seven = solver.int_const(7);
+    let upper = solver.le(x, two);
+    let twice_x = solver.mul(two, x);
+    let lower = solver.ge(twice_x, seven);
+    let violation = solver.and(upper, lower);
+    solver.assert_term(violation);
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "cleared rational system must publish certified UNSAT, got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("strict rational-clearing proof artifact");
+    assert!(
+        matches!(artifact.strict_verdict, StrictProofVerdict::Verified(ref q) if q.is_complete()),
+        "strict checker rejected rational-clearing proof: {:?}\n{}",
+        artifact.strict_verdict,
         artifact.alethe,
     );
 }

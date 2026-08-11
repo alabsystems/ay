@@ -1904,11 +1904,105 @@ fn test_all_quantifier_assertions_degrade_to_unknown_7979() {
         .execute_all(&commands)
         .expect("invariant: execute succeeds");
 
-    // Must NOT return SAT — the quantified assertion was never verified.
-    // Unknown is the correct conservative result.
+    // #7979's invariant is "no SAT WITHOUT VERIFICATION EVIDENCE". It was
+    // originally expressed as "this formula must not return sat", because at
+    // the time no lane could produce evidence for an all-quantifier problem, so
+    // evidence-free and sat-on-this-formula were the same thing.
+    //
+    // They are no longer the same thing. `(forall ((x Int)) (P x))` is
+    // satisfiable — z3 4.15.4 answers `sat` with `(define-fun P ((x!0 Int))
+    // Bool true)` — and the CONSTANT-INTERPRETATION certificate now produces
+    // exactly that witness and machine-checks it: substituting `P := λx. true`
+    // reduces the body to the constant `true`, so the assertion is valid under
+    // that interpretation for every `x`.
+    //
+    // So the assertion below now tests the INVARIANT rather than its former
+    // proxy: a `sat` here is admissible only if a certificate authority was
+    // actually recorded. That is strictly STRONGER than the old check for the
+    // wrong-SAT class #7979 guards against — an evidence-free `sat`, which is
+    // what the bug was, still fails this test.
+    if outputs == vec!["sat"] {
+        assert!(
+            exec.const_interp_cert_grant_active,
+            "BUG #7979: all-quantifier formula returned sat WITHOUT a recorded \
+             certificate authority (evidence-free sat is the #7979 defect)"
+        );
+        // And the certificate's interpretation must be RETRIEVABLE. A `sat`
+        // nobody can inspect is not a solved problem, and
+        // `check_sat_internal`'s boundary postcondition (#4642) requires the
+        // model to exist. `(error ...)` here is the failure mode the
+        // certificate used to avoid by declining outright.
+        let model = exec.model();
+        assert!(
+            !model.starts_with("(error"),
+            "BUG #7979/#4642: certified sat published no model: {model}"
+        );
+    } else {
+        assert!(
+            outputs == vec!["unknown"] || outputs == vec!["unsat"],
+            "BUG #7979: all-quantifier formula must not return sat, got: {outputs:?}"
+        );
+    }
+}
+
+#[test]
+fn const_interp_certificate_publishes_its_interpretation_as_the_model() {
+    // The WITNESS half of the constant-interpretation certificate.
+    //
+    // The certificate's proof object is an interpretation `I` under which every
+    // axiom was machine-checked, so `I` IS the model. Until it could RENDER `I`
+    // it declined this whole shape (`declined: no model to carry the witness`)
+    // and the query published `unknown`, because emitting a `Sat` with no model
+    // trips `check_sat_internal`'s boundary postcondition (#4642) in debug and
+    // ships a witness-free `sat` in release.
+    //
+    // z3 4.15.4 on this exact query:
+    //     sat
+    //     (
+    //       (define-fun P ((x!0 Int)) Bool
+    //         true)
+    //     )
+    // AY must now report the same interpretation, and `(get-value)` must agree
+    // with it — a printed model that the evaluator contradicts is not a model.
+    let input = r#"
+        (set-logic UFLIA)
+        (declare-fun P (Int) Bool)
+        (assert (forall ((x Int)) (P x)))
+        (check-sat)
+        (get-model)
+        (get-value ((P 3) (P 99)))
+    "#;
+
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+
+    assert_eq!(
+        outputs[0], "sat",
+        "the constant-interpretation certificate decides this query"
+    );
     assert!(
-        outputs == vec!["unknown"] || outputs == vec!["unsat"],
-        "BUG #7979: all-quantifier formula must not return sat, got: {outputs:?}"
+        outputs[1].contains("(define-fun P ((x!0 Int)) Bool"),
+        "the model must name P's interpretation the way z3 does, got: {}",
+        outputs[1]
+    );
+    assert!(
+        outputs[1].contains("true"),
+        "P's certified interpretation is the constant `true`, got: {}",
+        outputs[1]
+    );
+    assert!(
+        !outputs[1].contains("false"),
+        "a `false` anywhere in P's entry would be the sort default leaking \
+         through and would NOT satisfy the axiom, got: {}",
+        outputs[1]
+    );
+    // The evaluator must read the same interpretation the printer wrote.
+    assert_eq!(
+        outputs[2], "(((P 3) true) ((P 99) true))",
+        "(get-value) must agree with the published model"
     );
 }
 

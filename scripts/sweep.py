@@ -14,19 +14,46 @@ Usage:
       --solver ay=./target/release/ay [--solver kissat=/tmp/kissat/build/kissat] \
       --out results.json
 """
-import argparse, concurrent.futures as cf, json, os, sys, time, glob
+import argparse, concurrent.futures as cf, functools, glob, json, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build
 
-def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1):
+@functools.lru_cache(maxsize=None)
+def kissat_accepts_options(path):
+    """True when this Kissat build still has its command-line options compiled in.
+
+    Competition builds (`./configure --competition` = `--no-options --quiet`)
+    reject every short/long option, so the harness must invoke them bare and
+    lean on its own process-group wall clock instead of `--time`.
+    """
+    try:
+        probe = subprocess.run([path, "--time=1", "--version"],
+                               capture_output=True, timeout=30)
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1, extra=(),
+            proof_mode=False):
     """Run one solver on one instance. Returns dict."""
     if solver_name.startswith("ay"):
-        cmd = [cmd_template, "--no-proof", "-t", str(int(timeout_s * 1000)),
-               "--memory", str(mem_mb), cnf]
+        # `--no-proof` was hard-coded here, so NO sweep could ever measure a
+        # competition configuration -- and the submission always passes --proof
+        # (competition/prepare_sat26_submission.sh:784). That blind spot hid
+        # three separate defects: the orbitope route and the XOR route are both
+        # skipped under a proof surface, and composite symmetry emits
+        # certificates an external checker rejects. Pass --proof-mode to measure
+        # what a submission would actually score.
+        proof_args = [] if proof_mode else ["--no-proof"]
+        cmd = [cmd_template, *proof_args, "-t", str(int(timeout_s * 1000)),
+               "--memory", str(mem_mb), *extra, cnf]
     elif solver_name.startswith("kissat"):
-        cmd = [cmd_template, "-q", f"--time={int(timeout_s)}", cnf]
+        if kissat_accepts_options(cmd_template):
+            cmd = [cmd_template, "-q", f"--time={int(timeout_s)}", *extra, cnf]
+        else:
+            cmd = [cmd_template, *extra, cnf]
     else:
-        cmd = [cmd_template, cnf]
+        cmd = [cmd_template, *extra, cnf]
     start = time.monotonic()
     verdict = "unknown"
     # External wall-clock guard = solver timeout + grace; SIGKILL the group.
@@ -51,7 +78,12 @@ def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1):
     elif result.cancelled:
         verdict = "cancelled"
     elif result.output_truncated:
-        verdict = "error"
+        # A solver that ran to completion and exited 10/20 answered, even if its
+        # model overflowed our bounded capture — a large SAT witness routinely
+        # does. Scoring that as `error` silently deletes solved instances from a
+        # sweep (it cost one on the SAT-COMP 2026 sample). Only a truncated
+        # stream with no conclusive exit code is unusable.
+        verdict = {10: "sat", 20: "unsat"}.get(rc, "error")
     else:
         # Parse only a complete, non-killed stream; fall back to conventional
         # SAT solver exit codes when no status line was emitted.
@@ -79,6 +111,14 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--mem-mb", type=int, default=4000)
     ap.add_argument("--solver", action="append", default=[], help="name=path")
+    ap.add_argument("--solver-extra", action="append", default=[],
+                    help="name=ARGS: extra whitespace-split argv inserted before "
+                         "the CNF path for that solver (e.g. ay=--competition)")
+    ap.add_argument("--proof-mode", action="store_true",
+                    help="do NOT pass --no-proof to ay* solvers, so the run matches the "
+                         "competition configuration (the submission always writes a proof). "
+                         "Pair with a solver wrapper that requests --proof and checks the "
+                         "certificate, e.g. ~/ay-bench/bin/ay-proofmode.")
     ap.add_argument("--out", default="sweep_results.json")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -91,6 +131,12 @@ def main():
         solvers[name] = path
     if not solvers:
         solvers["ay"] = "./target/release/ay"
+    extras = {}
+    for s in args.solver_extra:
+        name, argline = s.split("=", 1)
+        if name not in solvers:
+            ap.error(f"--solver-extra names unknown solver {name!r}")
+        extras[name] = tuple(argline.split())
 
     cnfs = []
     if args.dir:
@@ -124,7 +170,7 @@ def main():
     done = 0
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(run_one, n, p, c, args.timeout, enforced_mem_mb,
-                          plan.nbcore): (n, c)
+                          plan.nbcore, extras.get(n, ()), args.proof_mode): (n, c)
                 for (n, p, c) in jobs}
         for fut in cf.as_completed(futs):
             r = fut.result()

@@ -935,3 +935,200 @@ fn test_non_overloaded_nullary_constructor_still_binds_its_inhabitant() {
         "a zero-field single-constructor datatype has exactly one inhabitant"
     );
 }
+
+// --- Alethe surface rendering of the invented single-constructor field
+// --- constants (`Context::dt_field_surface_overrides`, `DtFieldSurface`).
+//
+// Eager single-constructor elimination rewrites `(declare-fun s_ () Record)`
+// into `(Record s_!left s_!center s_!right)`. Those field names are minted by
+// AY and appear in NO problem file, so an exported proof that spells them is
+// unreadable to an external checker: on
+// `QF_DT/20230720-blocksworld/..._bmc_2` they were 14 distinct names in 26,366
+// occurrences under an EMPTY declaration preamble, and carcara 1.1.0 stopped in
+// the PARSER — `identifier 's_tmp___!left' is not defined` — before checking a
+// single rule. Each one must instead print as the selector application it
+// denotes, over the constant the problem really declares.
+
+fn ctor_args(ctx: &Context, term: TermId) -> Vec<TermId> {
+    match ctx.terms.get(term) {
+        TermData::App(_, args) => args.clone(),
+        other => panic!("expected a constructor application, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_dt_field_surface_renders_depth_one_field_as_selector_application() {
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Rec 0)) (((mk (left Int) (right Int)))))\n\
+         (declare-const s Rec)",
+    );
+    let fields = ctor_args(&ctx, declared_const_term(&ctx, "s"));
+    let overrides = ctx.dt_field_surface_overrides();
+
+    assert_eq!(
+        overrides.get(&fields[0]).map(String::as_str),
+        Some("(left s)"),
+        "the invented field constant must print as the selector applied to the \
+         DECLARED parent, which needs no new declaration"
+    );
+    assert_eq!(
+        overrides.get(&fields[1]).map(String::as_str),
+        Some("(right s)")
+    );
+    // The parent's constructor application prints structurally from the
+    // already-rendered arguments; overriding it would collapse `(mk (left s)
+    // (right s))` to `s` by surjective pairing, which no Alethe rule justifies.
+    assert!(!overrides.contains_key(&declared_const_term(&ctx, "s")));
+}
+
+#[test]
+fn test_dt_field_surface_composes_recursively_at_depth_two() {
+    // `build_const_term` recurses when a field's sort is itself a
+    // single-constructor datatype, minting `s!right!top`. The rendering must
+    // compose through the whole chain: `(top s!right)` would just name another
+    // symbol the problem never declared.
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Inner 0)) (((mkI (top Int) (bot Int)))))\n\
+         (declare-datatypes ((Outer 0)) (((mkO (right Inner) (lft Int)))))\n\
+         (declare-const s Outer)",
+    );
+    let outer_fields = ctor_args(&ctx, declared_const_term(&ctx, "s"));
+    let inner_fields = ctor_args(&ctx, outer_fields[0]);
+    let overrides = ctx.dt_field_surface_overrides();
+
+    assert_eq!(
+        overrides.get(&inner_fields[0]).map(String::as_str),
+        Some("(top (right s))"),
+        "nested field constants must compose the full selector chain down to \
+         the declared root"
+    );
+    assert_eq!(
+        overrides.get(&inner_fields[1]).map(String::as_str),
+        Some("(bot (right s))")
+    );
+    assert_eq!(
+        overrides.get(&outer_fields[1]).map(String::as_str),
+        Some("(lft s)")
+    );
+    assert!(
+        !overrides.values().any(|rendering| rendering.contains('!')),
+        "no rendering may leak an invented `parent!field` name: {overrides:?}"
+    );
+}
+
+#[test]
+fn test_dt_field_surface_never_rewrites_a_user_symbol_containing_bang() {
+    // THE TRAP. QF_DT/blocksworld declares `c!0`, `c!1`, `c!2` as USER
+    // constants. Any rule that recovers the parent by SPLITTING a name on '!'
+    // turns `c!0` into the nonsense `(0 c)`. Membership comes from the
+    // frontend's own mint-time record, keyed by `TermId`, so a user symbol can
+    // never enter it however it is spelled.
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Rec 0)) (((mk (left Int)))))\n\
+         (declare-const c!0 Int)\n\
+         (declare-const c!1 Int)\n\
+         (declare-const s Rec)",
+    );
+    let overrides = ctx.dt_field_surface_overrides();
+
+    for user in ["c!0", "c!1"] {
+        assert!(
+            !overrides.contains_key(&declared_const_term(&ctx, user)),
+            "user symbol '{user}' must keep its own spelling, not be rewritten"
+        );
+    }
+    assert!(
+        !overrides
+            .values()
+            .any(|rendering| rendering.contains(" c)")),
+        "no rendering may treat the '!' in a user symbol as a selector \
+         boundary: {overrides:?}"
+    );
+    // The genuine field constant is still rendered.
+    let field = ctor_args(&ctx, declared_const_term(&ctx, "s"))[0];
+    assert_eq!(overrides.get(&field).map(String::as_str), Some("(left s)"));
+}
+
+#[test]
+fn test_dt_field_surface_drops_a_field_whose_root_was_rebound() {
+    // Liveness: after `pop`, `s` names a DIFFERENT constant. The old field
+    // terms live on in the store, and rendering one of them as `(left s)` would
+    // state something false about the new `s`. The guard re-walks the root's
+    // current binding, so the stale entry is withheld.
+    let commands = parse(
+        "(declare-datatypes ((Rec 0)) (((mk (left Int)))))\n\
+         (push 1)\n\
+         (declare-const s Rec)",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        ctx.process_command(cmd).unwrap();
+    }
+    let stale = ctor_args(&ctx, declared_const_term(&ctx, "s"))[0];
+    assert_eq!(
+        ctx.dt_field_surface_overrides()
+            .get(&stale)
+            .map(String::as_str),
+        Some("(left s)")
+    );
+
+    for cmd in &parse("(pop 1)\n(declare-const s Rec)").unwrap() {
+        ctx.process_command(cmd).unwrap();
+    }
+    let fresh = ctor_args(&ctx, declared_const_term(&ctx, "s"))[0];
+    let overrides = ctx.dt_field_surface_overrides();
+
+    assert_ne!(stale, fresh, "the redeclaration must mint a fresh field");
+    assert!(
+        !overrides.contains_key(&stale),
+        "a field of the POPPED constant must never print as a selector over \
+         the new binding of the same name"
+    );
+    assert_eq!(overrides.get(&fresh).map(String::as_str), Some("(left s)"));
+}
+
+#[test]
+fn test_dt_field_surface_withholds_a_shadowed_selector_name() {
+    // An external checker's symbol table is flat and last-declaration-wins
+    // (measured on carcara 1.1.0), so a selector name registered twice may
+    // resolve to the other binding — loudly when the signatures differ, but
+    // SILENTLY when they match. Fail closed: emit nothing, leaving the term to
+    // print as its (unreadable, but never wrong) invented name.
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Rec 0)) (((mk (left Int)))))\n\
+         (declare-datatypes ((Rec2 0)) (((mk2 (left Bool)))))\n\
+         (declare-const s Rec)",
+    );
+    let field = ctor_args(&ctx, declared_const_term(&ctx, "s"))[0];
+    assert!(
+        !ctx.dt_field_surface_overrides().contains_key(&field),
+        "a selector name bound by two datatypes is not safely renderable"
+    );
+}
+
+#[test]
+fn test_dt_field_surface_qualifies_polymorphic_overload_root() {
+    let ctx = elaborate_script(
+        "(declare-sort-parameter A)\n\
+         (declare-datatype |Rec sort| ((mk (|left field| Bool))))\n\
+         (declare-const |c root| A)",
+    );
+    let rec_sort = Sort::Uninterpreted("Rec sort".to_string());
+    let rec_term = ctx
+        .overloaded_symbols
+        .get("c root")
+        .expect("polymorphic constant has concrete overloads")
+        .iter()
+        .find(|info| info.arg_sorts.is_empty() && info.sort == rec_sort)
+        .and_then(|info| info.term)
+        .expect("datatype overload has an eager product term");
+    let field = ctor_args(&ctx, rec_term)[0];
+
+    assert_eq!(
+        ctx.dt_field_surface_overrides()
+            .get(&field)
+            .map(String::as_str),
+        Some("(|left field| (as |c root| |Rec sort|))")
+    );
+}

@@ -236,33 +236,38 @@ pub unsafe extern "C" fn Z3_get_sort_kind(_c: Z3_context, t: Z3_sort) -> c_uint 
     // `ffi_guard_uint` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_uint(_c, Z3_UNKNOWN_AST, |_ctx| match &(*t).sort {
-            Sort::Bool => Z3_BOOL_SORT,
-            Sort::Int => Z3_INT_SORT,
-            Sort::Real => Z3_REAL_SORT,
-            Sort::BitVec(_) => Z3_BV_SORT,
-            Sort::Array(_) => Z3_ARRAY_SORT,
-            Sort::Uninterpreted(_) => Z3_UNINTERPRETED_SORT,
-            // An algebraic datatype (declared via Z3_mk_datatype /
-            // declare-datatypes) reports Z3_DATATYPE_SORT, matching z3py's
-            // Z3_get_sort_kind on a DatatypeSortRef (#phase3-dt).
-            Sort::Datatype(_) => Z3_DATATYPE_SORT,
-            // A String is a sequence (of characters) in Z3's model, so both
-            // report Z3_SEQ_SORT (#phase3-seq).
-            Sort::Seq(_) | Sort::String => Z3_SEQ_SORT,
-            // The regular-expression sort (RegLan) reports Z3_RE_SORT, matching
-            // z3py's Z3_get_sort_kind on a ReSortRef.
-            Sort::RegLan => Z3_RE_SORT,
-            // The character sort reports Z3_CHAR_SORT, matching z3py's
-            // Z3_get_sort_kind on a CharSortRef (AY models a Char as a bounded
-            // Int code point).
-            Sort::Char => Z3_CHAR_SORT,
-            // A finite-domain sort (bounded-Int lowering, like Char) reports
-            // Z3_FINITE_DOMAIN_SORT; a type variable reports Z3_TYPE_VAR —
-            // both verified against libz3 4.16.
-            Sort::FiniteDomain(_, _) => Z3_FINITE_DOMAIN_SORT,
-            Sort::TypeVar(_) => Z3_TYPE_VAR,
-            _ => Z3_UNKNOWN_AST,
+        ffi_guard_uint(_c, Z3_UNKNOWN_AST, |ctx| {
+            if super::finite_set_basis(ctx, &(*t).sort).is_some() {
+                return super::FINITE_SET_SORT_KIND;
+            }
+            match &(*t).sort {
+                Sort::Bool => Z3_BOOL_SORT,
+                Sort::Int => Z3_INT_SORT,
+                Sort::Real => Z3_REAL_SORT,
+                Sort::BitVec(_) => Z3_BV_SORT,
+                Sort::Array(_) => Z3_ARRAY_SORT,
+                Sort::Uninterpreted(_) => Z3_UNINTERPRETED_SORT,
+                // An algebraic datatype (declared via Z3_mk_datatype /
+                // declare-datatypes) reports Z3_DATATYPE_SORT, matching z3py's
+                // Z3_get_sort_kind on a DatatypeSortRef (#phase3-dt).
+                Sort::Datatype(_) => Z3_DATATYPE_SORT,
+                // A String is a sequence (of characters) in Z3's model, so both
+                // report Z3_SEQ_SORT (#phase3-seq).
+                Sort::Seq(_) | Sort::String => Z3_SEQ_SORT,
+                // The regular-expression sort (RegLan) reports Z3_RE_SORT, matching
+                // z3py's Z3_get_sort_kind on a ReSortRef.
+                Sort::RegLan => Z3_RE_SORT,
+                // The character sort reports Z3_CHAR_SORT, matching z3py's
+                // Z3_get_sort_kind on a CharSortRef (AY models a Char as a bounded
+                // Int code point).
+                Sort::Char => Z3_CHAR_SORT,
+                // A finite-domain sort (bounded-Int lowering, like Char) reports
+                // Z3_FINITE_DOMAIN_SORT; a type variable reports Z3_TYPE_VAR —
+                // both verified against libz3 4.16.
+                Sort::FiniteDomain(_, _) => Z3_FINITE_DOMAIN_SORT,
+                Sort::TypeVar(_) => Z3_TYPE_VAR,
+                _ => Z3_UNKNOWN_AST,
+            }
         })
     }
 }
@@ -355,7 +360,11 @@ pub unsafe extern "C" fn Z3_sort_to_string(c: Z3_context, s: Z3_sort) -> *const 
     // so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let sort_str = super::ffi_surface_text(ctx, &format!("{}", (*s).sort));
+            let sort_str = if super::sort_mentions_finite_set(ctx, &(*s).sort) {
+                super::render_public_sort(ctx, &(*s).sort)
+            } else {
+                super::ffi_surface_text(ctx, &format!("{}", (*s).sort))
+            };
             cache_string(ctx, sort_str)
         })
     }

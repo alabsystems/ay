@@ -10,8 +10,6 @@
 //! combined variants) and cross-check AY's DPLL(T) result against lightweight
 //! oracles.
 
-use ntest::timeout;
-use proptest::prelude::*;
 use ay_core::term::Symbol;
 use ay_core::{Sort, TermId, TermStore, TheoryResult, TheorySolver, Tseitin};
 use ay_dpll::DpllT;
@@ -19,6 +17,8 @@ use ay_euf::EufSolver;
 use ay_lia::LiaSolver;
 use ay_lra::LraSolver;
 use ay_sat::SatResult;
+use ntest::timeout;
+use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
 pub(crate) enum BoolExpr {

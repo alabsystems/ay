@@ -327,6 +327,43 @@ pub(crate) fn collect_observability_stats_from_theory(
     }
 }
 
+/// Rebind a fresh LRA checker's positional certificate to the bound axiom's
+/// solver-visible clause order. The checker is free to return its conflict
+/// literals in tableau order, which need not match `(t1, t2)`.
+pub(crate) fn rebind_bound_axiom_farkas(
+    conflict: ay_core::TheoryConflict,
+    asserted_negations: &[(ay_core::TermId, bool)],
+) -> Option<ay_core::FarkasAnnotation> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let farkas = conflict.farkas?;
+    if farkas.coefficients.len() != conflict.literals.len() {
+        return None;
+    }
+
+    let zero = num_rational::Rational64::from(0);
+    let mut by_literal = BTreeMap::new();
+    for (literal, coefficient) in conflict.literals.iter().zip(&farkas.coefficients) {
+        *by_literal
+            .entry((literal.term, literal.value))
+            .or_insert(zero) += *coefficient;
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut rebound = Vec::with_capacity(asserted_negations.len());
+    for &literal in asserted_negations {
+        if seen.insert(literal) {
+            rebound.push(by_literal.remove(&literal).unwrap_or(zero));
+        } else {
+            rebound.push(zero);
+        }
+    }
+    if by_literal.values().any(|coefficient| *coefficient != zero) {
+        return None;
+    }
+    Some(ay_core::FarkasAnnotation::new(rebound))
+}
+
 pub(crate) fn pipeline_add_bound_axiom_clauses(
     terms: &mut ay_core::TermStore,
     proof_tracker: &mut crate::proof_tracker::ProofTracker,
@@ -371,10 +408,14 @@ pub(crate) fn pipeline_add_bound_axiom_clauses(
                     let mut check_lra = ay_lra::LraSolver::new(&*terms);
                     ay_core::TheorySolver::assert_literal(&mut check_lra, t1, !p1);
                     ay_core::TheorySolver::assert_literal(&mut check_lra, t2, !p2);
-                    let ba_new_farkas = match ay_core::TheorySolver::check(&mut check_lra) {
-                        ay_core::TheoryResult::UnsatWithFarkas(conflict) => conflict.farkas,
+                    let conflict = match ay_core::TheorySolver::check(&mut check_lra) {
+                        ay_core::TheoryResult::UnsatWithFarkas(conflict) => Some(conflict),
                         _ => None,
                     };
+                    drop(check_lra);
+                    let ba_new_farkas = conflict.and_then(|conflict| {
+                        rebind_bound_axiom_farkas(conflict, &[(t1, !p1), (t2, !p2)])
+                    });
                     farkas_store[ba_i] = ba_new_farkas.clone();
                     ba_new_farkas
                 };
@@ -387,20 +428,22 @@ pub(crate) fn pipeline_add_bound_axiom_clauses(
                 match (&kind, &farkas) {
                     (_, Some(farkas)) => {
                         let _ = proof_tracker.add_theory_lemma_with_farkas_and_kind(
-                            clause_terms,
+                            clause_terms.clone(),
                             farkas.clone(),
                             kind,
                         );
                     }
                     (ay_core::TheoryLemmaKind::Generic, None) => {
-                        let _ = proof_tracker.add_theory_lemma(clause_terms);
+                        let _ = proof_tracker.add_theory_lemma(clause_terms.clone());
                     }
                     (_, None) => {
-                        let _ = proof_tracker.add_theory_lemma_with_kind(clause_terms, kind);
+                        let _ =
+                            proof_tracker.add_theory_lemma_with_kind(clause_terms.clone(), kind);
                     }
                 }
                 local_clausification_proofs.push(None);
                 local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
+                    clause: clause_terms,
                     kind,
                     farkas,
                     lia: None,
@@ -870,6 +913,62 @@ pub(crate) struct CapturedSplitUnsatProof {
 /// `proof_enabled` is false. `solver` is only read (so it can be borrowed
 /// disjointly from the `&mut self` the shim later needs for `build_unsat_proof`);
 /// the shim assigns the returned data to `Executor::last_*` and breaks the loop.
+/// Provenance introspection for proof-reconstruction var maps
+/// (`AY_PROOF_INTROSPECT=<path>`).
+///
+/// `var_to_term` is known to cover only a dense PREFIX of the SAT variable
+/// space at the CONSUMING end, and any clause mentioning an index above it is
+/// discarded wholesale (measured: 97% of trace entries). There are several
+/// capture sites, so each one records the map size it stored against the
+/// solver's own counts; a site whose `map_len` is far below `num_vars` is the
+/// one pairing a stale map with a larger trace.
+pub(crate) fn record_var_map_provenance(site: &str, solver: &ay_sat::Solver, map_len: usize) {
+    let Some(path) = std::env::var_os("AY_PROOF_INTROSPECT") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut fh) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = format!(
+            "VAR_COUNTS site={site} map_len={} user_num_vars={} num_vars={} scope_depth={}\n",
+            map_len,
+            solver.user_num_vars(),
+            <ay_sat::Solver as ay_sat::SolverContext>::num_vars(solver),
+            solver.scope_depth(),
+        );
+        let _ = fh.write_all(line.as_bytes());
+    }
+}
+
+/// Variant for capture sites where the solver borrow is already released:
+/// compares the stored map size against the clause trace it will be paired
+/// with, which is the comparison that actually matters for reconstruction.
+pub(crate) fn record_var_map_provenance_trace(
+    site: &str,
+    map_len: usize,
+    trace: Option<&ay_sat::ClauseTrace>,
+) {
+    let Some(path) = std::env::var_os("AY_PROOF_INTROSPECT") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut fh) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = format!(
+            "VAR_COUNTS site={site} map_len={} trace_entries={}\n",
+            map_len,
+            trace.map_or(0, ay_sat::ClauseTrace::len),
+        );
+        let _ = fh.write_all(line.as_bytes());
+    }
+}
+
 pub(crate) fn capture_split_unsat_proof(
     solver: &ay_sat::Solver,
     proof_enabled: bool,
@@ -891,6 +990,7 @@ pub(crate) fn capture_split_unsat_proof(
             local_theory_proofs.resize(original_count, None);
         }
     }
+    record_var_map_provenance("split_eager", solver, local_var_to_term.len());
     Some(CapturedSplitUnsatProof {
         clause_trace,
         clausification_proofs: local_clausification_proofs.clone(),
@@ -898,4 +998,42 @@ pub(crate) fn capture_split_unsat_proof(
         var_to_term: local_var_to_term.clone(),
         negations: negations.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebind_bound_axiom_farkas;
+    use ay_core::{FarkasAnnotation, Sort, TermStore, TheoryConflict, TheoryLit};
+    use num_bigint::BigInt;
+    use num_rational::Rational64;
+
+    #[test]
+    fn bound_axiom_farkas_rebinds_reversed_conflict_order() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let minus_two = terms.mk_int(BigInt::from(-2));
+        let two = terms.mk_int(BigInt::from(2));
+        let minus_two_x = terms.mk_mul(vec![x, minus_two]);
+        let upper = terms.mk_le(minus_two, minus_two_x);
+        let lower = terms.mk_le(two, x);
+        // The fresh LRA solver may report [lower, upper]. Its coefficients are
+        // valid in that order: 1*(2 <= x) + 1/2*(-2 <= -2*x).
+        let reversed = TheoryConflict::with_farkas(
+            vec![TheoryLit::new(lower, true), TheoryLit::new(upper, true)],
+            FarkasAnnotation::new(vec![Rational64::from(1), Rational64::new(1, 2)]),
+        );
+        let rebound = rebind_bound_axiom_farkas(reversed, &[(upper, true), (lower, true)])
+            .expect("same literals in a different order must rebind");
+
+        assert_eq!(
+            rebound.coefficients,
+            vec![Rational64::new(1, 2), Rational64::from(1)]
+        );
+        ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+            &terms,
+            &[TheoryLit::new(upper, true), TheoryLit::new(lower, true)],
+            &rebound,
+        )
+        .expect("rebound coefficients must certify the clause order");
+    }
 }

@@ -378,7 +378,7 @@ pub(crate) fn executor_redecides_definitive_sat(resolve_ctx: &ay_frontend::Conte
 ///    ([`check_bv_assertions_unsat`]). A SAT/Unknown/unmodellable result keeps
 ///    the step unaccepted. An empty assertion set is never accepted (an empty
 ///    conjunction is satisfiable).
-fn discharge_trust_clause(
+pub(crate) fn discharge_trust_clause(
     terms: &ay_core::TermStore,
     clause: &[ay_core::TermId],
     assertions: &[ay_core::TermId],
@@ -401,10 +401,92 @@ fn discharge_trust_clause(
         BvStepVerdict::Unchecked { .. } => {}
     }
     match check_array_clause(terms, clause) {
-        ArrayStepVerdict::Valid => Some(()),
-        ArrayStepVerdict::Skipped
-        | ArrayStepVerdict::Invalid { .. }
-        | ArrayStepVerdict::Unchecked { .. } => None,
+        ArrayStepVerdict::Valid => return Some(()),
+        // Invalid: an independent solve refuted it. Never accept.
+        ArrayStepVerdict::Invalid { .. } => return None,
+        // Neither specialised checker can MODEL this clause — that is a
+        // coverage limit of those checkers, not evidence about the clause.
+        ArrayStepVerdict::Skipped | ArrayStepVerdict::Unchecked { .. } => {}
+    }
+
+    let mut discharge_terms = terms.clone();
+    let negated: Vec<ay_core::TermId> = clause
+        .iter()
+        .map(|&literal| discharge_terms.mk_not(literal))
+        .collect();
+
+    // ENTAILMENT DISCHARGE (#unsat-cert-entailment).
+    //
+    // Try the context-aware obligation BEFORE the context-free generic probe.
+    // Most emitted trust clauses are consequences of the authored problem, not
+    // standalone tautologies. In particular, incremental LIA refutations used
+    // to spend the generic probe's full one-second budget at every depth before
+    // this stronger check succeeded in milliseconds. Since `P ∧ ¬C` UNSAT also
+    // holds for every standalone tautology C, this ordering changes no
+    // acceptance condition; the smaller context-free probe remains below as a
+    // fallback when the larger problem is harder for the solver.
+    //
+    // The test asks whether the PROBLEM entails `C`: assert `P ∧ ¬C` in a fresh
+    // executor and require UNSAT.
+    //
+    // SOUNDNESS. Suppose every deferred clause passes this test and the rest of
+    // the proof passes strict validation. If `P` were satisfiable, then
+    // `P ∧ ¬C` unsat gives `P ⊨ C` for each such `C`, so every clause the proof
+    // leans on is a logical consequence of `P`; the strictly-checked remainder
+    // then derives the empty clause from `P`, contradicting satisfiability.
+    // So `P` is unsat and the published verdict is correct.
+    //
+    // The degenerate case is harmless: if `P` is itself unsat then it entails
+    // every C, but that is exactly the verdict being certified. `Unsat` is the
+    // only accepting outcome; Sat, Unknown, and timeout all decline.
+    if !assertions.is_empty() {
+        let mut entail = ay_frontend::Context::new();
+        entail.terms = discharge_terms.clone();
+        entail.assertions = assertions.to_vec();
+        entail.assertions.extend_from_slice(&negated);
+        let mut exec = crate::Executor::new();
+        exec.ctx = entail;
+        exec.set_deadline(Some(
+            ay_core::time::Instant::now() + std::time::Duration::from_millis(1000),
+        ));
+        if matches!(exec.check_sat(), Ok(result) if result.is_unsat()) {
+            return Some(());
+        }
+    }
+
+    // THEORY-AGNOSTIC STANDALONE FALLBACK (#unsat-cert-general-discharge).
+    //
+    // `check_bv_clause` / `check_array_clause` are specialised: they model the
+    // clause in one theory and decline everything else. Most trust steps in
+    // quantified problems are neither — they are LIA / quantifier-instantiation
+    // lemmas — so both decline, the clause goes undischarged, and a correct
+    // refutation is thrown away. Measured: 48 of the 49 verdict failures in
+    // `group_quantifiers` are exactly this, `expected unsat, got unknown`, with
+    // messages like "closed false universal", "evil broadcast" and the
+    // per-element `seq` invariants.
+    //
+    // The generic test is the definition of the obligation itself: a clause `C`
+    // is a tautology iff `¬C` is unsatisfiable. Assert `¬C` into a FRESH
+    // executor and require UNSAT. This subsumes what the specialised checkers do
+    // and extends it to every theory the solver can decide, without assuming
+    // anything about which one the clause belongs to.
+    //
+    // SOUND and fail-closed. `Unsat` is the only accepting outcome: a `Sat`
+    // means `C` is refutable and must not be accepted, and an `Unknown`/timeout
+    // means we did not establish it, so it is not accepted either. The nested
+    // solve re-enters the publication funnel, which is why the caller holds a
+    // re-entrancy guard; nested certification falls back to plain strict.
+    let mut probe = ay_frontend::Context::new();
+    probe.terms = discharge_terms;
+    probe.assertions = negated.clone();
+    let mut exec = crate::Executor::new();
+    exec.ctx = probe;
+    exec.set_deadline(Some(
+        ay_core::time::Instant::now() + std::time::Duration::from_millis(1000),
+    ));
+    match exec.check_sat() {
+        Ok(result) if result.is_unsat() => Some(()),
+        _ => None,
     }
 }
 

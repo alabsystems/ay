@@ -443,6 +443,32 @@ impl Solver {
             })
     }
 
+    /// Register a caller-visible alias with an exact public sort signature.
+    ///
+    /// This hidden adapter hook is used by the Z3 5.0.0 parser context to
+    /// retain `FiniteSet` identity over a native declaration's lowered engine
+    /// signature.
+    #[doc(hidden)]
+    pub fn try_register_native_public_function_alias(
+        &mut self,
+        surface_name: &str,
+        decl: &FuncDecl,
+        public_arg_sorts: Vec<ay_frontend::PublicSort>,
+        public_sort: ay_frontend::PublicSort,
+    ) -> Result<(), SolverError> {
+        self.executor
+            .register_native_global_public_function_alias(
+                surface_name.to_string(),
+                decl.name.clone(),
+                public_arg_sorts,
+                public_sort,
+            )
+            .map_err(|error| SolverError::InvalidArgument {
+                operation: "register_native_public_function_alias",
+                message: error.to_string(),
+            })
+    }
+
     /// Define a non-recursive function for inline expansion (#8613).
     ///
     /// This is the programmatic equivalent of SMT-LIB `(define-fun ...)`.
@@ -797,7 +823,7 @@ impl Solver {
             && ctx.has_symbol_with_signature(&func.name, &term_domain, &term_range)
     }
 
-    fn substitute_defined_fun_body(
+    pub(in crate::api) fn substitute_defined_fun_body(
         &mut self,
         term: TermId,
         subst: &HashMap<TermId, TermId>,

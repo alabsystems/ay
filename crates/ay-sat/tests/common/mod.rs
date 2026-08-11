@@ -127,9 +127,19 @@ pub fn require_ay_drat_check() -> &'static BuiltWorkspaceBinary {
 }
 
 fn missing_optional_benchmark_message(path: &Path) -> String {
+    // Name the provisioning step that actually applies to this corpus: the two
+    // optional corpora have different ones (`reference/creusat` is an external
+    // checkout; `benchmarks/sat/satcomp2024-sample` is downloaded).
+    let provisioning = if path
+        .components()
+        .any(|c| c.as_os_str() == "satcomp2024-sample")
+    {
+        "run scripts/fetch_satcomp_sample.sh to provision it"
+    } else {
+        "place a CreuSAT benchmark checkout under reference/creusat to run it"
+    };
     format!(
-        "Optional external benchmark corpus file missing: {} \
-         (place a CreuSAT benchmark checkout under reference/creusat to run it)",
+        "Optional external benchmark corpus file missing: {} ({provisioning})",
         path.display()
     )
 }

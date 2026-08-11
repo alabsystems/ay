@@ -21,7 +21,10 @@ use num_rational::BigRational;
 use num_traits::Zero;
 
 use crate::cert::{BoundSide, CertifiedRow, FarkasCertificate, OptimalityCertificate};
-use crate::certify::{certified_weak_dual_row, certify, MAX_EXACT_BASIS_ROWS};
+use crate::certify::{
+    certified_weak_dual_row, certify, certify_model_basis_with_deadline, certify_with_deadline,
+    MAX_EXACT_BASIS_ROWS,
+};
 use crate::error::{MilpError, ModelError};
 use crate::exact::{Budget, ExactLp, LpFeasibility, LpOptimum};
 use crate::model::{exact, Col, Model, Row, Sense};
@@ -61,6 +64,229 @@ fn capped_assignment_tree_advice_deadline(
         (Some(outer), Some(local)) => Some(outer.min(local)),
         (outer, None) => outer,
         (None, local) => local,
+    }
+}
+
+/// Budget for the experimental binary-master/continuous-LP route.
+///
+/// The route has not yet earned default ownership of a production solve.  When
+/// explicitly enabled for an A/B, it receives at most one fifth of the caller's
+/// remaining time and never more than two seconds.  A structural or resource
+/// decline therefore leaves a deterministic native-MILP reserve instead of
+/// consuming the whole outer deadline.
+fn hybrid_pb_lp_trial_deadline(
+    enabled: bool,
+    outer_deadline: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    if !enabled {
+        return None;
+    }
+    const CAP: Duration = Duration::from_secs(2);
+    match outer_deadline {
+        Some(outer) => {
+            let slice = outer.saturating_duration_since(now) / 5;
+            Some(now.checked_add(slice.min(CAP)).unwrap_or(outer).min(outer))
+        }
+        None => now.checked_add(CAP),
+    }
+}
+
+/// Budget for the compact exact bounded-PB portfolio trial.
+///
+/// Translation and every adopted result are exact, but the general portfolio
+/// is still search.  It receives at most one tenth of the remaining caller
+/// budget and never more than 500 ms; a decline therefore cannot consume the
+/// native solver's solve.  The adapter has independent variable/row/term caps.
+fn pb_portfolio_trial_deadline(outer_deadline: Option<Instant>, now: Instant) -> Option<Instant> {
+    const CAP: Duration = Duration::from_millis(500);
+    match outer_deadline {
+        Some(outer) => {
+            let slice = outer.saturating_duration_since(now) / 10;
+            let deadline = now.checked_add(slice.min(CAP)).unwrap_or(outer).min(outer);
+            (deadline > now).then_some(deadline)
+        }
+        None => now.checked_add(CAP),
+    }
+}
+
+/// Bound a speculative prelude arm by the cost of a cheaper arm already run on
+/// the SAME model, rather than by a slice of the caller's patience.
+///
+/// THE UNIT PROBLEM. `pb_portfolio_trial_deadline` returns `min(500ms,
+/// deadline/10)`: it mentions how long the user is willing to wait and never
+/// mentions the model. Three infeasibility probes then share that one absolute
+/// deadline, so on a FEASIBLE model — where by construction none of them can
+/// succeed — the trio may burn the whole slice before native search starts.
+/// Measured on the general MIPLIB corpus, `try_prove_multi_row_infeasibility`
+/// did exactly that, to the millisecond, and hit ZERO times:
+///
+/// ```text
+///   p0201  0.502s   gt2    0.502s   mod010 0.500s
+///   misc07 0.499s   qnet1  0.410s   ...      0 hits, 12 of 12 instances
+/// ```
+///
+/// while the single-row probe ahead of it declined the same models in
+/// 0.07–17 ms. That ratio is the fix: the cheap probe is a structural pass over
+/// the same rows, so its cost is a free, exact, model-derived estimate of what
+/// this model costs to look at. An arm that needs two dozen times that and
+/// still has nothing is not about to produce a proof.
+///
+/// The caller's cap and deadline still bound the result from above, and a model
+/// whose cheap probe was too fast to time keeps a real floor. This cannot
+/// refuse a lane — it only declines to spend the user's wall on a shape the
+/// cheap pass already failed to recognise.
+fn probe_scaled_deadline(
+    reference: Duration,
+    outer_trial_deadline: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    const MULTIPLE: u32 = 24;
+    // The floor must clear the arm's own START-UP cost, or the slice buys
+    // nothing: the lane is entered, sets up, and is cut off before it can
+    // conclude — strictly worse than declining, since the wall is spent either
+    // way.
+    //
+    // THIS NUMBER IS NOW MEASURED FOR THESE LANES; THE PREVIOUS ONE WAS NOT.
+    // It was first set to 48 ms by INHERITING the exact-PB portfolio's measured
+    // 32.3 ms set-up (`GENERIC_PORTFOLIO_TRIAL_FLOOR`), reasoning that these are
+    // the same family of exact PB/BDD engines and that no test covered them
+    // through the session budget. The inheritance was wrong, and it was
+    // expensive. On a genuine two-row weighted-binary contradiction the
+    // multi-row lane reaches `hit=true` in 0.000060 s — sixty MICROseconds,
+    // eight hundred times under the inherited floor. Meanwhile that floor was
+    // being consumed IN FULL, to the millisecond, by lanes that never succeed:
+    //
+    //   khb05250   hybrid_pb_lp  0.048288s  hit=false
+    //   p0201      multi_row     0.048203s  hit=false
+    //   dcmulti    hybrid_pb_lp  0.056337s  hit=false
+    //
+    // — 7-13% of those solves spent on arms that cannot conclude. 2 ms still
+    // leaves 33x headroom over the measured set-up.
+    //
+    // The 60 us figure is from instrumenting THIS call site, not a sibling. And
+    // the capability does not rest on this budget alone: mutation-testing the
+    // new session-level routing test (starving MULTIPLE and FLOOR to zero) does
+    // NOT break it, because `multi_row_bdd_infeasibility_certificate` has two
+    // further assignment sites inside the specialized/portfolio route handling,
+    // each with its own budget. A starved probe loses time, not the verdict.
+    const FLOOR: Duration = Duration::from_millis(2);
+    let outer = outer_trial_deadline?;
+    let slice = reference
+        .checked_mul(MULTIPLE)
+        .unwrap_or(FLOOR)
+        .max(FLOOR)
+        .min(outer.saturating_duration_since(now));
+    let deadline = now.checked_add(slice)?.min(outer);
+    (deadline > now).then_some(deadline)
+}
+
+/// Budget for an exactly recognized SAT/ReLU model's proof-producing CDCL run.
+///
+/// Recognition has already rebuilt the complete CNF, so this is not a blind
+/// portfolio arm: this is the production engine for the recognized family.
+/// Give it the caller's complete remaining budget so a slower conclusive CDCL
+/// run is never discarded and restarted in a generic lane. The bounded ay-sat
+/// API requires an absolute deadline, so an otherwise-unlimited solve receives
+/// a documented 60-second route deadline; this is above the known production
+/// corpus maximum while retaining a finite control-loop bound.
+fn sat_relu_proof_trial_deadline(outer_deadline: Option<Instant>, now: Instant) -> Option<Instant> {
+    const DEFAULT_ROUTE_LIMIT: Duration = Duration::from_secs(60);
+    match outer_deadline {
+        Some(outer) => (outer > now).then_some(outer),
+        None => now.checked_add(DEFAULT_ROUTE_LIMIT),
+    }
+}
+
+#[cfg(test)]
+mod hybrid_pb_lp_trial_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_route_gets_no_deadline_or_work() {
+        assert_eq!(
+            hybrid_pb_lp_trial_deadline(false, None, Instant::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn finite_trial_preserves_native_time_and_honours_outer_deadline() {
+        let now = Instant::now();
+        let outer = now + Duration::from_secs(5);
+        assert_eq!(
+            hybrid_pb_lp_trial_deadline(true, Some(outer), now),
+            Some(now + Duration::from_secs(1))
+        );
+
+        let short_outer = now + Duration::from_millis(10);
+        assert_eq!(
+            hybrid_pb_lp_trial_deadline(true, Some(short_outer), now),
+            Some(now + Duration::from_millis(2))
+        );
+    }
+
+    #[test]
+    fn unlimited_outer_still_gets_a_bounded_trial() {
+        let now = Instant::now();
+        assert_eq!(
+            hybrid_pb_lp_trial_deadline(true, None, now),
+            Some(now + Duration::from_secs(2))
+        );
+    }
+}
+
+#[cfg(test)]
+mod pb_portfolio_trial_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn finite_trial_is_capped_and_preserves_native_time() {
+        let now = Instant::now();
+        let long = now + Duration::from_secs(60);
+        assert_eq!(
+            pb_portfolio_trial_deadline(Some(long), now),
+            Some(now + Duration::from_millis(500))
+        );
+
+        let short = now + Duration::from_millis(100);
+        assert_eq!(
+            pb_portfolio_trial_deadline(Some(short), now),
+            Some(now + Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn unlimited_and_expired_trials_are_bounded_or_declined() {
+        let now = Instant::now();
+        assert_eq!(
+            pb_portfolio_trial_deadline(None, now),
+            Some(now + Duration::from_millis(500))
+        );
+        assert_eq!(pb_portfolio_trial_deadline(Some(now), now), None);
+    }
+}
+
+#[cfg(test)]
+mod sat_relu_proof_trial_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn production_route_receives_the_full_caller_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            sat_relu_proof_trial_deadline(Some(now + Duration::from_secs(10)), now),
+            Some(now + Duration::from_secs(10))
+        );
+        assert_eq!(
+            sat_relu_proof_trial_deadline(Some(now + Duration::from_millis(80)), now),
+            Some(now + Duration::from_millis(80))
+        );
+        assert_eq!(
+            sat_relu_proof_trial_deadline(None, now),
+            Some(now + Duration::from_secs(60))
+        );
+        assert_eq!(sat_relu_proof_trial_deadline(Some(now), now), None);
     }
 }
 
@@ -336,44 +562,163 @@ fn cert_budget_native(model: &Model, opts: &SolveOpts) -> Budget {
 
 /// Exact objective coefficients of `coeffs` (f64) — validated finite.
 fn exact_obj(coeffs: &[(u32, f64)]) -> Vec<(u32, Rational)> {
-    let mut out: Vec<(u32, Rational)> = coeffs
-        .iter()
-        .filter(|&&(_, a)| a != 0.0)
-        .map(|&(c, a)| {
-            (
+    let mut unlimited = |_| true;
+    exact_obj_with_work(coeffs, &mut unlimited).expect("unbounded objective conversion")
+}
+
+fn exact_obj_with_work<F>(coeffs: &[(u32, f64)], work: &mut F) -> Option<Vec<(u32, Rational)>>
+where
+    F: FnMut(usize) -> bool + ?Sized,
+{
+    let mut out = Vec::with_capacity(coeffs.len());
+    for (index, &(c, a)) in coeffs.iter().enumerate() {
+        if index & 0xff == 0 && !work(0x100.min(coeffs.len().saturating_sub(index))) {
+            return None;
+        }
+        if a != 0.0 {
+            out.push((
                 c,
                 Rational::from_big(exact(a).expect("validated objective coefficient")),
-            )
-        })
-        .collect();
+            ));
+        }
+    }
     out.sort_unstable_by_key(|&(c, _)| c);
-    out
+    Some(out)
+}
+
+/// Independently checked evidence carried beside [`Outcome`].  Most proof
+/// objects live directly in the outcome; exact reduction artifacts have their
+/// own typed export channel and must be named explicitly at this policy gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupplementalProof {
+    None,
+    VerifiedSatReluInfeasibility,
+    VerifiedBlockAngularOptimality,
+    VerifiedParityInfeasibility,
+    VerifiedNetworkDesignInfeasibility,
+    VerifiedNetworkDesignOptimality,
+    VerifiedSingleMachineSchedulingOptimality,
+    VerifiedSingleRowDpInfeasibility,
+    VerifiedMultiRowBddInfeasibility,
+    VerifiedOpenDomainSingleRowDpInfeasibility,
+    VerifiedOpenDomainMultiRowBddInfeasibility,
+    VerifiedOpenDomainHybridPbLpInfeasibility,
+    VerifiedOpenDomainHybridIntegerLiftInfeasibility,
+    VerifiedHybridPbLpInfeasibility,
+    VerifiedHybridIntegerLiftInfeasibility,
+}
+
+impl SupplementalProof {
+    fn certifies_infeasibility(self) -> bool {
+        matches!(
+            self,
+            Self::VerifiedSatReluInfeasibility
+                | Self::VerifiedParityInfeasibility
+                | Self::VerifiedNetworkDesignInfeasibility
+                | Self::VerifiedSingleRowDpInfeasibility
+                | Self::VerifiedMultiRowBddInfeasibility
+                | Self::VerifiedOpenDomainSingleRowDpInfeasibility
+                | Self::VerifiedOpenDomainMultiRowBddInfeasibility
+                | Self::VerifiedOpenDomainHybridPbLpInfeasibility
+                | Self::VerifiedOpenDomainHybridIntegerLiftInfeasibility
+                | Self::VerifiedHybridPbLpInfeasibility
+                | Self::VerifiedHybridIntegerLiftInfeasibility
+        )
+    }
+
+    fn certifies_optimality(self) -> bool {
+        matches!(
+            self,
+            Self::VerifiedBlockAngularOptimality
+                | Self::VerifiedNetworkDesignOptimality
+                | Self::VerifiedSingleMachineSchedulingOptimality
+        )
+    }
 }
 
 /// Apply `require_certificates` policy: strip-or-degrade uncertified
 /// verdicts.
-fn apply_cert_policy(outcome: Outcome, opts: &SolveOpts) -> Outcome {
+fn apply_cert_policy(
+    outcome: Outcome,
+    model: &Model,
+    opts: &SolveOpts,
+    supplemental_proof: SupplementalProof,
+) -> Outcome {
     if !opts.require_certificates {
         return outcome;
     }
-    match &outcome {
-        // A whole-tree certificate satisfies the policy: it is exact,
-        // independently checkable evidence, same as the root Farkas.
-        Outcome::Infeasible {
+    match outcome {
+        Outcome::Optimal {
+            value,
+            model_values,
+            cert: Some(cert),
+        } if cert.bound.clone() + model.obj_offset_exact() == value => Outcome::Optimal {
+            value,
+            model_values,
+            cert: Some(cert),
+        },
+        Outcome::Optimal {
+            value,
+            model_values,
             cert: None,
-            tree_cert: None,
-        }
-        | Outcome::Optimal { cert: None, .. } => Outcome::Unknown {
+        } if supplemental_proof.certifies_optimality() => Outcome::Optimal {
+            value,
+            model_values,
+            cert: None,
+        },
+        Outcome::Optimal { .. } => Outcome::Unknown {
             reason: UnknownReason::CertificateUnavailable,
         },
-        _ => outcome,
+        // A feasible point is independently checked against the exact model,
+        // but its interrupted-tree dual bound has no exported proof object.
+        Outcome::Feasible {
+            model_values,
+            incumbent_only,
+            ..
+        } => Outcome::Feasible {
+            model_values,
+            incumbent_only,
+            dual_bound: None,
+        },
+        // Root Farkas, whole-tree, and typed exact-reduction artifacts are all
+        // independently replayable infeasibility evidence.
+        Outcome::Infeasible { cert, tree_cert }
+            if cert.is_some()
+                || tree_cert.is_some()
+                || supplemental_proof.certifies_infeasibility() =>
+        {
+            Outcome::Infeasible { cert, tree_cert }
+        }
+        Outcome::Infeasible { .. } | Outcome::Unbounded | Outcome::Bound { .. } => {
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable,
+            }
+        }
+        Outcome::Unknown { reason } => Outcome::Unknown { reason },
     }
 }
 
-/// A model objective in exact rationals: `(coeffs, offset)`. Present only when
-/// the model carries inexact objective coefficients (rounded `f64` proxies);
-/// then the re-derivation gate must read the TRUE objective, not the `f64` one.
+/// A model objective in exact rationals: `(coeffs, offset)`. Materialized when
+/// the model carries any authoritative exact side store; then the re-derivation
+/// gate must read the TRUE objective, not assume every `f64` proxy is complete.
 type ExactObjective = (Vec<(u32, BigRational)>, BigRational);
+
+fn authoritative_exact_objective(model: &Model) -> Option<ExactObjective> {
+    if !model.has_inexact_coeffs() {
+        return None;
+    }
+    Some((
+        (0..model.num_cols())
+            .filter_map(|column| {
+                let column = column as u32;
+                let proxy = model.obj_coeff(Col(column));
+                let exact = model.obj_coeff_exact_at(column, proxy);
+                (!exact.is_zero()).then_some((column, exact))
+            })
+            .collect(),
+        model.obj_offset_exact(),
+    ))
+}
 
 /// The objective a solve actually ran against. Not always the model's own:
 /// `LpSession::optimize` bounds a single column, and `tighten_col_bounds`
@@ -383,31 +728,70 @@ struct SolvedObjective<'a> {
     sense: Sense,
     offset: f64,
     /// The TRUE rational objective, set ONLY when `coeffs` IS the model's own
-    /// objective AND the model carries inexact obj coefficients. When present
-    /// `value_at` re-derives the reported value from it, closing the
+    /// objective AND the model carries an exact side store. When present
+    /// `value_at` and `value_at_with_work` re-derive the reported value from
+    /// it, closing the
     /// rounded-objective wrong-value hole (a rounded reported value and the
     /// rounded re-derivation would otherwise agree with each other).
     exact: Option<ExactObjective>,
 }
 
 impl SolvedObjective<'_> {
+    /// Whether every variable coefficient is exactly zero. The constant offset
+    /// is intentionally irrelevant: an empty multiplier certificate bounds the
+    /// variable part by zero, and the session adds the caller's exact offset.
+    fn coefficients_are_zero(&self) -> bool {
+        self.exact.as_ref().map_or_else(
+            || self.coeffs.is_empty(),
+            |(coeffs, _)| coeffs.iter().all(|(_, coefficient)| coefficient.is_zero()),
+        )
+    }
+
     /// The exact objective value at an exact point.
     fn value_at(&self, values: &[BigRational]) -> BigRational {
+        let mut unlimited = |_| true;
+        self.value_at_with_work(values, &mut unlimited)
+            .expect("unbounded objective replay cannot decline")
+    }
+
+    fn value_at_with_work<F>(&self, values: &[BigRational], work: &mut F) -> Option<BigRational>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
         if let Some((coeffs, offset)) = &self.exact {
             let mut acc = offset.clone();
-            for (c, a) in coeffs {
+            for (index, (c, a)) in coeffs.iter().enumerate() {
+                if index & 0xff == 0 && !work(0x100.min(coeffs.len().saturating_sub(index))) {
+                    return None;
+                }
                 acc += a * &values[*c as usize];
             }
-            return acc;
+            return Some(acc);
         }
         let mut acc = exact(self.offset).unwrap_or_else(BigRational::zero);
-        for &(c, a) in self.coeffs {
+        for (index, &(c, a)) in self.coeffs.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(self.coeffs.len().saturating_sub(index))) {
+                return None;
+            }
             if let Some(a) = exact(a) {
                 acc += a * &values[c as usize];
             }
         }
-        acc
+        Some(acc)
     }
+}
+
+fn zero_cost_optimality_certificate(
+    objective: &SolvedObjective<'_>,
+) -> Option<OptimalityCertificate> {
+    objective
+        .coefficients_are_zero()
+        .then(|| OptimalityCertificate {
+            sense: objective.sense,
+            objective: Vec::new(),
+            bound: BigRational::zero(),
+            multipliers: Vec::new(),
+        })
 }
 
 /// Re-derive a verdict's claims from the model alone, consulting no solver
@@ -422,6 +806,31 @@ fn validate_witnesses(
     model: &Model,
     obj: &SolvedObjective<'_>,
 ) -> Result<(), String> {
+    let mut unlimited = |_| true;
+    validate_witnesses_with_work_inner(outcome, model, obj, &mut unlimited)
+}
+
+fn validate_witnesses_with_work<F>(
+    outcome: &Outcome,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    work: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(usize) -> bool + ?Sized,
+{
+    validate_witnesses_with_work_inner(outcome, model, obj, work)
+}
+
+fn validate_witnesses_with_work_inner<F>(
+    outcome: &Outcome,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    work: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(usize) -> bool + ?Sized,
+{
     let check_arity = |vals: &[BigRational]| -> Result<(), String> {
         if vals.len() == model.num_cols() {
             Ok(())
@@ -440,17 +849,26 @@ fn validate_witnesses(
             cert,
         } => {
             check_arity(model_values)?;
-            if let Err(v) = model.check_point(model_values) {
+            if let Err(v) = model.check_point_with_work(model_values, work) {
                 return Err(format!("the point claimed optimal is infeasible: {v:?}"));
             }
-            let attained = obj.value_at(model_values);
+            let attained = obj
+                .value_at_with_work(model_values, work)
+                .ok_or_else(|| "objective replay exceeded its resource envelope".to_owned())?;
             if attained != *value {
                 return Err(format!(
                     "the point attains {attained}, not the reported optimum {value}"
                 ));
             }
             if let Some(cert) = cert {
-                cert.verify(model)
+                let mut cert_work = |units| {
+                    if work(units) {
+                        Ok(())
+                    } else {
+                        Err(crate::CertificateError::DeadlineExceeded)
+                    }
+                };
+                cert.verify_with_work(model, &mut cert_work)
                     .map_err(|e| format!("optimality certificate does not verify: {e}"))?;
                 let offset = obj.exact.as_ref().map_or_else(
                     || exact(obj.offset).unwrap_or_else(BigRational::zero),
@@ -487,13 +905,15 @@ fn validate_witnesses(
         } => {
             check_arity(model_values)?;
             model
-                .check_point(model_values)
+                .check_point_with_work(model_values, work)
                 .map_err(|v| format!("the point claimed feasible is infeasible: {v:?}"))?;
             if let Some(bound) = dual_bound {
                 // The tree's bound may trail the incumbent across the remaining
                 // gap, but it may never cross it — a "bound" beyond the point in
                 // hand is a contradiction, not a gap.
-                let attained = obj.value_at(model_values);
+                let attained = obj
+                    .value_at_with_work(model_values, work)
+                    .ok_or_else(|| "objective replay exceeded its resource envelope".to_owned())?;
                 let crossed = match obj.sense {
                     Sense::Minimize => bound > &attained,
                     Sense::Maximize => bound < &attained,
@@ -508,10 +928,20 @@ fn validate_witnesses(
         }
         Outcome::Infeasible { cert, tree_cert } => {
             if let Some(cert) = cert {
-                cert.verify(model)
+                let mut cert_work = |units| {
+                    if work(units) {
+                        Ok(())
+                    } else {
+                        Err(crate::CertificateError::DeadlineExceeded)
+                    }
+                };
+                cert.verify_with_work(model, &mut cert_work)
                     .map_err(|e| format!("Farkas certificate does not verify: {e}"))?;
             }
             if let Some(tree_cert) = tree_cert {
+                if !work(1) {
+                    return Err("tree certificate replay exceeded its resource envelope".into());
+                }
                 tree_cert
                     .verify(model)
                     .map_err(|e| format!("tree certificate does not verify: {e}"))?;
@@ -528,10 +958,395 @@ fn validate_witnesses(
 fn finish(outcome: Outcome, model: &Model, obj: &SolvedObjective<'_>, opts: &SolveOpts) -> Outcome {
     let outcome = fail_closed_for_inexact(outcome, model);
     match validate_witnesses(&outcome, model, obj) {
-        Ok(()) => apply_cert_policy(outcome, opts),
+        Ok(()) => apply_cert_policy(outcome, model, opts, SupplementalProof::None),
         Err(detail) => Outcome::Unknown {
             reason: UnknownReason::WitnessRejected { detail },
         },
+    }
+}
+
+/// Finalize a SAT point already checked against the complete source model by
+/// [`crate::sat_route::lift_and_check_assignment`].
+///
+/// The [`crate::sat_route::CheckedSatPoint`] token cannot be constructed by a
+/// reduction, so consuming it here skips exactly one duplicate full-model
+/// primal scan without weakening the boundary. Objective semantics are still
+/// re-derived from the session's exact objective, and the pinned deadline is
+/// polled both before and after that derivation.
+fn finish_checked_sat_point(
+    checked: crate::sat_route::CheckedSatPoint,
+    has_objective: bool,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    opts: &SolveOpts,
+) -> Outcome {
+    let expired = || opts.deadline.is_some_and(|limit| Instant::now() >= limit);
+    if expired() {
+        return Outcome::Unknown {
+            reason: UnknownReason::Timeout,
+        };
+    }
+    let model_values = checked.into_values();
+    if model_values.len() != model.num_cols() {
+        return Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected {
+                detail: format!(
+                    "checked SAT point has {} values for a {}-column model",
+                    model_values.len(),
+                    model.num_cols()
+                ),
+            },
+        };
+    }
+    let outcome = if has_objective {
+        // All exact SAT routes currently admit only zero variable costs. Keep
+        // the explicit-objective semantics (`Optimal`, not `Feasible`) and
+        // carry the same exact empty-multiplier bound as native B&B. This is
+        // essential in full posture: returning an uncertified optimum here
+        // would degrade a conclusive checked SAT result to
+        // `CertificateUnavailable`.
+        let cert = zero_cost_optimality_certificate(obj);
+        Outcome::Optimal {
+            value: obj.value_at(&model_values),
+            model_values,
+            cert,
+        }
+    } else {
+        Outcome::Feasible {
+            model_values,
+            incumbent_only: false,
+            dual_bound: None,
+        }
+    };
+    if expired() {
+        return Outcome::Unknown {
+            reason: UnknownReason::Timeout,
+        };
+    }
+    apply_cert_policy(outcome, model, opts, SupplementalProof::None)
+}
+
+/// Resource-bounded twin of [`finish`] for a speculative route that owns one
+/// cumulative work/deadline meter.  It preserves the exact same witness and
+/// policy boundary; only the loop checkpoints differ.
+fn finish_with_work<F>(
+    outcome: Outcome,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    opts: &SolveOpts,
+    work: &mut F,
+) -> Outcome
+where
+    F: FnMut(usize) -> bool + ?Sized,
+{
+    let outcome = fail_closed_for_inexact(outcome, model);
+    match validate_witnesses_with_work(&outcome, model, obj, work) {
+        Ok(()) => apply_cert_policy(outcome, model, opts, SupplementalProof::None),
+        Err(detail) => Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected { detail },
+        },
+    }
+}
+
+/// Exit for a reduction that read the authoritative exact model throughout.
+///
+/// [`fail_closed_for_inexact`] protects verdicts produced by float search over
+/// rounded proxy coefficients. An exact structural reduction has no such proxy
+/// dependency: its admission read every objective/row fact through `Model`'s
+/// rational side store. SAT lifts now leave through the private checked-point
+/// finalizer above; this function retains the independent witness gate for the
+/// other exact reductions. Applying the float-search backstop here would turn
+/// a sound Direct-CNF UNSAT into `CertificateUnavailable` merely because its
+/// exact coefficient needed a side-store entry.
+fn finish_exact_reduction(
+    outcome: Outcome,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    opts: &SolveOpts,
+) -> Outcome {
+    match validate_witnesses(&outcome, model, obj) {
+        Ok(()) => apply_cert_policy(outcome, model, opts, SupplementalProof::None),
+        Err(detail) => Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected { detail },
+        },
+    }
+}
+
+/// Exit for an exact reduction whose typed side-channel artifact has already
+/// been independently rebuilt and replayed against `model`.
+fn finish_exact_reduction_with_supplemental_proof(
+    outcome: Outcome,
+    model: &Model,
+    obj: &SolvedObjective<'_>,
+    opts: &SolveOpts,
+    supplemental_proof: SupplementalProof,
+) -> Outcome {
+    match validate_witnesses(&outcome, model, obj) {
+        Ok(()) => apply_cert_policy(outcome, model, opts, supplemental_proof),
+        Err(detail) => Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected { detail },
+        },
+    }
+}
+
+#[cfg(test)]
+mod certificate_policy_tests {
+    use super::*;
+    use crate::cert::OptimalityCertificate;
+    use num_traits::One as _;
+
+    fn full_opts() -> SolveOpts {
+        SolveOpts::new().with_require_certificates(true)
+    }
+
+    #[test]
+    fn zero_proxy_nonzero_exact_objective_refuses_the_empty_bound() {
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        model.set_objective(&[], Sense::Minimize);
+        let tiny = BigRational::new(1.into(), num_bigint::BigInt::from(10u8).pow(400));
+        model.record_inexact_obj_coeff(x.0, tiny.clone());
+        assert_eq!(model.obj_coeff(x), 0.0, "the search proxy underflowed");
+
+        let proxy_coeffs: Vec<(u32, f64)> = Vec::new();
+        let objective = SolvedObjective {
+            coeffs: &proxy_coeffs,
+            sense: model.sense(),
+            offset: model.objective_offset(),
+            exact: authoritative_exact_objective(&model),
+        };
+        assert_eq!(
+            objective.value_at(&[BigRational::one()]),
+            tiny,
+            "reported values retain the authoritative side-store coefficient"
+        );
+        assert!(
+            zero_cost_optimality_certificate(&objective).is_none(),
+            "a nonzero exact objective must never receive the empty zero-cost bound"
+        );
+    }
+
+    #[test]
+    fn full_policy_requires_an_optcert_that_meets_the_offset_value() {
+        let mut model = Model::new();
+        model.set_objective_offset(2.0);
+        let cert = OptimalityCertificate {
+            sense: Sense::Minimize,
+            objective: Vec::new(),
+            bound: BigRational::zero(),
+            multipliers: Vec::new(),
+        };
+        let value = BigRational::from_integer(2.into());
+        let accepted = apply_cert_policy(
+            Outcome::Optimal {
+                value: value.clone(),
+                model_values: Vec::new(),
+                cert: Some(cert.clone()),
+            },
+            &model,
+            &full_opts(),
+            SupplementalProof::None,
+        );
+        assert!(matches!(accepted, Outcome::Optimal { .. }));
+
+        let rejected = apply_cert_policy(
+            Outcome::Optimal {
+                value: value + BigRational::one(),
+                model_values: Vec::new(),
+                cert: Some(cert),
+            },
+            &model,
+            &full_opts(),
+            SupplementalProof::None,
+        );
+        assert!(matches!(
+            rejected,
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable
+            }
+        ));
+    }
+
+    #[test]
+    fn full_policy_keeps_only_the_verified_primal_part_of_feasible() {
+        let model = Model::new();
+        let kept = apply_cert_policy(
+            Outcome::Feasible {
+                model_values: Vec::new(),
+                incumbent_only: true,
+                dual_bound: Some(BigRational::zero()),
+            },
+            &model,
+            &full_opts(),
+            SupplementalProof::None,
+        );
+        assert!(matches!(
+            kept,
+            Outcome::Feasible {
+                dual_bound: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn full_policy_accepts_typed_side_refutations_only_when_named() {
+        let model = Model::new();
+        let bare = || Outcome::Infeasible {
+            cert: None,
+            tree_cert: None,
+        };
+        assert!(matches!(
+            apply_cert_policy(bare(), &model, &full_opts(), SupplementalProof::None),
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable
+            }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedParityInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedNetworkDesignInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedSingleRowDpInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedOpenDomainHybridPbLpInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedOpenDomainHybridIntegerLiftInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedHybridPbLpInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedHybridIntegerLiftInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedMultiRowBddInfeasibility
+            ),
+            Outcome::Infeasible { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedNetworkDesignOptimality
+            ),
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable
+            }
+        ));
+    }
+
+    #[test]
+    fn full_policy_accepts_only_the_named_network_optimality_artifact() {
+        let model = Model::new();
+        let bare = || Outcome::Optimal {
+            value: BigRational::zero(),
+            model_values: Vec::new(),
+            cert: None,
+        };
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedNetworkDesignOptimality
+            ),
+            Outcome::Optimal { .. }
+        ));
+        assert!(matches!(
+            apply_cert_policy(
+                bare(),
+                &model,
+                &full_opts(),
+                SupplementalProof::VerifiedNetworkDesignInfeasibility
+            ),
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable
+            }
+        ));
+    }
+
+    #[test]
+    fn full_policy_withholds_unexported_bound_and_unbounded_claims() {
+        let model = Model::new();
+        for outcome in [
+            Outcome::Unbounded,
+            Outcome::Bound {
+                dual_bound: BigRational::zero(),
+                rigorous: true,
+            },
+        ] {
+            assert!(matches!(
+                apply_cert_policy(outcome, &model, &full_opts(), SupplementalProof::None),
+                Outcome::Unknown {
+                    reason: UnknownReason::CertificateUnavailable
+                }
+            ));
+        }
+        assert!(matches!(
+            apply_cert_policy(
+                Outcome::Unknown {
+                    reason: UnknownReason::Timeout
+                },
+                &model,
+                &full_opts(),
+                SupplementalProof::None
+            ),
+            Outcome::Unknown {
+                reason: UnknownReason::Timeout
+            }
+        ));
     }
 }
 
@@ -744,6 +1559,99 @@ pub const MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES: usize = 16;
 /// candidates therefore cost at most 44 bounded advice calls. The three-stage
 /// five-leaf comb costs 36 quick probes at the same candidate cap.
 pub const MAX_TARGET_FSB_CANDIDATES: usize = 8;
+
+/// Maximum caller shortlist for the staged four-column shared-prefix selector.
+///
+/// The selector probes every candidate only at the root, then keeps five and
+/// follows one rigorous-bound bottleneck box for its remaining three stages.
+/// At this cap it therefore spends at most 34 quick advice calls rather than
+/// probing the complete 16-leaf prefix tree.
+pub const MAX_TARGET_FSB_PREFIX_CANDIDATES: usize = 8;
+
+/// Resource caps for staged target-objective shared-prefix selection.
+///
+/// This policy is used only by the explicit marked-margin prefix-candidate
+/// entry. It reuses the native tree's already-solved target root; its bounded
+/// child LPs rank four prefix columns and have no proof or verdict authority.
+/// The local wall limit is hard-clamped to 750 milliseconds by the selector,
+/// even if a caller supplies a larger value, and is also bounded by the
+/// session's already-pinned search deadline. The clock is polled before and
+/// after every quick solve and safe-bound sweep; a single in-progress O(nnz)
+/// bound sweep may cross the wall, but its result is then discarded with the
+/// whole scan. A partial scan is never used. The local scratch cap includes the
+/// bounded safe-bound repair workspace; optional LU reuse remains governed by
+/// the simplex's separate LU fill guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetFsbPrefixOpts {
+    max_probe_pivots_per_call: u64,
+    max_probe_calls: usize,
+    probe_time_limit: Duration,
+    max_probe_scratch_bytes: usize,
+}
+
+impl Default for TargetFsbPrefixOpts {
+    fn default() -> Self {
+        Self {
+            max_probe_pivots_per_call: 8,
+            max_probe_calls: 34,
+            probe_time_limit: Duration::from_millis(750),
+            max_probe_scratch_bytes: 64 << 20,
+        }
+    }
+}
+
+impl TargetFsbPrefixOpts {
+    /// Default bounded staged-prefix policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the dual-pivot cap for each advice child.
+    #[must_use]
+    pub fn with_max_probe_pivots_per_call(mut self, pivots: u64) -> Self {
+        self.max_probe_pivots_per_call = pivots;
+        self
+    }
+
+    /// Set the total advice-call cap.
+    #[must_use]
+    pub fn with_max_probe_calls(mut self, calls: usize) -> Self {
+        self.max_probe_calls = calls;
+        self
+    }
+
+    /// Set the local advice wall cap. Values above 750 milliseconds are
+    /// clamped by the selector; smaller values are useful for tighter callers.
+    #[must_use]
+    pub fn with_probe_time_limit(mut self, limit: Duration) -> Self {
+        self.probe_time_limit = limit;
+        self
+    }
+
+    /// Set the cap on incremental prefix-selection workspace.
+    #[must_use]
+    pub fn with_max_probe_scratch_bytes(mut self, bytes: usize) -> Self {
+        self.max_probe_scratch_bytes = bytes;
+        self
+    }
+
+    pub(crate) fn max_probe_pivots_per_call(self) -> u64 {
+        self.max_probe_pivots_per_call
+    }
+
+    pub(crate) fn max_probe_calls(self) -> usize {
+        self.max_probe_calls
+    }
+
+    pub(crate) fn probe_time_limit(self) -> Duration {
+        self.probe_time_limit
+    }
+
+    pub(crate) fn max_probe_scratch_bytes(self) -> usize {
+        self.max_probe_scratch_bytes
+    }
+}
 
 /// Resource caps for target-objective full strong branching.
 ///
@@ -2108,6 +3016,33 @@ impl LpSession {
         })
     }
 
+    /// Bounded constructor for a continuous model assembled internally by a
+    /// speculative route from already-validated exact data.  It avoids a
+    /// second uninterruptible validation scan and clones every retained row
+    /// through the caller's shared work/deadline callback.
+    pub(crate) fn new_prevalidated_with_work(
+        model: &Model,
+        opts: &SolveOpts,
+        work: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Option<Self>, MilpError> {
+        if !work(model.num_cols()) {
+            return Ok(None);
+        }
+        if model.has_integrality() {
+            return Err(MilpError::Model(ModelError::Unsupported {
+                reason: "LpSession requires a continuous model; use BabSession for MILP".to_owned(),
+            }));
+        }
+        let Some(model) = model.clone_with_work(work) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            model,
+            opts: opts.clone(),
+            lp: None,
+        }))
+    }
+
     /// Lower one float LP with the path advice scoped to this session.
     fn float_lp(&self, objective: &[(u32, f64)], sense: Sense) -> Option<FloatLp> {
         let mut lp = FloatLp::from_model(&self.model, objective, sense)?;
@@ -2138,7 +3073,10 @@ impl LpSession {
             .map(|i| (i as u32, self.model.obj_coeff(Col(i as u32))))
             .filter(|&(_, a)| a != 0.0)
             .collect();
-        let exact = self.model_objective_exact(&coeffs);
+        // This entry always optimizes the model's own objective.  Scan every
+        // column so an authoritative nonzero whose f64 proxy underflowed to
+        // zero is still present in witness/value replay.
+        let exact = authoritative_exact_objective(&self.model);
         Ok(self.optimize_linear(
             &coeffs,
             self.model.sense(),
@@ -2147,18 +3085,98 @@ impl LpSession {
         ))
     }
 
-    /// The TRUE rational form of the model's own objective `coeffs`, when the
-    /// model carries inexact obj coefficients; `None` on the exact fast path.
-    fn model_objective_exact(&self, coeffs: &[(u32, f64)]) -> Option<ExactObjective> {
-        if !self.model.has_inexact_coeffs() {
-            return None;
+    /// Attempt only the float search plus its exact basis/certificate rim.
+    ///
+    /// This is a crate-private bounded-materialization entry for speculative
+    /// structure routes.  Unlike [`Self::optimize_model_objective`], a float
+    /// decline returns `None`; it never materializes the independently much
+    /// larger [`ExactLp`] fallback.  A returned verdict has passed the same
+    /// exact `certify`/`finish` authority as the ordinary float fast path.
+    /// Models carrying an exact side store use the rounded matrix only to find
+    /// a combinatorial basis; that basis is reconstructed and certified from
+    /// the authoritative rational [`Model`] before it can return a verdict.
+    pub(crate) fn optimize_model_objective_float_only(
+        &mut self,
+        work: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Option<Outcome>, MilpError> {
+        let Some((coeffs, exact)) = self.model_objective_with_work(work) else {
+            return Ok(None);
+        };
+        let sense = self.model.sense();
+        let offset = self.model.objective_offset();
+        let solved = SolvedObjective {
+            coeffs: &coeffs,
+            sense,
+            offset,
+            exact,
+        };
+        let deadline = self.opts.effective_deadline(Instant::now());
+        Ok(self
+            .try_float_lane_deadline_bounded(&coeffs, sense, offset, deadline)
+            .map(|outcome| finish_with_work(outcome, &self.model, &solved, &self.opts, work)))
+    }
+
+    /// Authoritative exact-only twin used after a speculative route's rounded
+    /// advice misses.  ExactLp remains the search engine, while the existing
+    /// `finish_with_work` boundary replays the primal, objective, certificate,
+    /// and certificate policy under the caller's shared envelope.
+    pub(crate) fn optimize_model_objective_exact_only(
+        &mut self,
+        work: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Option<Outcome>, MilpError> {
+        let Some((coeffs, exact_objective)) = self.model_objective_with_work(work) else {
+            return Ok(None);
+        };
+        let sense = self.model.sense();
+        let offset = self.model.objective_offset();
+        let deadline = self.opts.effective_deadline(Instant::now());
+        Ok(Some(self.optimize_linear_until_with_work(
+            &coeffs,
+            sense,
+            offset,
+            exact_objective,
+            deadline,
+            false,
+            work,
+        )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_rim_is_materialized(&self) -> bool {
+        self.lp.is_some()
+    }
+
+    /// Materialize the rounded search objective and, when present, its
+    /// authoritative rational twin under the caller's shared work envelope.
+    ///
+    /// The exact census deliberately visits every column.  A nonzero rational
+    /// coefficient can have an `f64` proxy of zero after underflow and must
+    /// still participate in witness replay and certificate policy.
+    fn model_objective_with_work(
+        &self,
+        work: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<(Vec<(u32, f64)>, Option<ExactObjective>)> {
+        let mut coeffs = Vec::new();
+        let mut exact_coefficients = self.model.has_inexact_coeffs().then(Vec::new);
+        for i in 0..self.model.num_cols() {
+            if i & 0xff == 0 && !work(0x100.min(self.model.num_cols().saturating_sub(i))) {
+                return None;
+            }
+            let column = i as u32;
+            let rounded = self.model.obj_coeff(Col(column));
+            if rounded != 0.0 {
+                coeffs.push((column, rounded));
+            }
+            if let Some(exact_coefficients) = &mut exact_coefficients {
+                let coefficient = self.model.obj_coeff_exact_at(column, rounded);
+                if !coefficient.is_zero() {
+                    exact_coefficients.push((column, coefficient));
+                }
+            }
         }
         Some((
-            coeffs
-                .iter()
-                .map(|&(c, a)| (c, self.model.obj_coeff_exact_at(c, a)))
-                .collect(),
-            self.model.obj_offset_exact(),
+            coeffs,
+            exact_coefficients.map(|coefficients| (coefficients, self.model.obj_offset_exact())),
         ))
     }
 
@@ -2203,6 +3221,47 @@ impl LpSession {
         }
         let proven = certify(&self.model, &lp, &cand)?;
         let offset = exact(offset).unwrap_or_else(BigRational::zero);
+        Some(Outcome::Optimal {
+            value: proven.value + offset,
+            model_values: proven.values,
+            cert: Some(proven.cert),
+        })
+    }
+
+    /// The float-only speculative-route twin of [`Self::try_float_lane`].
+    /// It uses the same exact authority, but threads the route's already-pinned
+    /// deadline through basis construction and elimination; a miss declines
+    /// instead of falling through to `ExactLp`.
+    fn try_float_lane_deadline_bounded(
+        &self,
+        coeffs: &[(u32, f64)],
+        sense: Sense,
+        offset: f64,
+        deadline: Option<Instant>,
+    ) -> Option<Outcome> {
+        if !float_lane_enabled() {
+            return None;
+        }
+        let mut lp = FloatLp::from_model_with_deadline(&self.model, coeffs, sense, deadline)?;
+        lp.set_chain_distress_probe_iters(self.opts.chain_distress_probe_iters());
+        if self.opts.range_logical_triangular_crash() {
+            lp.request_range_logical_triangular_crash();
+        }
+        lp.plain_cold = true;
+        let cand = lp.solve(deadline);
+        if cand.status != SimplexStatus::Optimal {
+            return None;
+        }
+        let proven = if self.model.has_inexact_coeffs() {
+            certify_model_basis_with_deadline(&self.model, &cand.basis, &cand.at, deadline)?
+        } else {
+            certify_with_deadline(&self.model, &lp, &cand, deadline)?
+        };
+        let offset = if self.model.has_inexact_coeffs() {
+            self.model.obj_offset_exact()
+        } else {
+            exact(offset).unwrap_or_else(BigRational::zero)
+        };
         Some(Outcome::Optimal {
             value: proven.value + offset,
             model_values: proven.values,
@@ -2294,11 +3353,44 @@ impl LpSession {
         deadline: Option<Instant>,
         allow_float_lane: bool,
     ) -> Outcome {
+        let mut unlimited = |_| true;
+        self.optimize_linear_until_with_work(
+            coeffs,
+            sense,
+            offset,
+            model_obj_exact,
+            deadline,
+            allow_float_lane,
+            &mut unlimited,
+        )
+    }
+
+    fn optimize_linear_until_with_work<F>(
+        &mut self,
+        coeffs: &[(u32, f64)],
+        sense: Sense,
+        offset: f64,
+        model_obj_exact: Option<ExactObjective>,
+        deadline: Option<Instant>,
+        allow_float_lane: bool,
+        work: &mut F,
+    ) -> Outcome
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        let exact_terms = model_obj_exact
+            .as_ref()
+            .map_or(0, |(coefficients, _)| coefficients.len());
+        if !work(exact_terms.saturating_add(1)) {
+            return Outcome::Unknown {
+                reason: UnknownReason::Timeout,
+            };
+        }
         let solved = SolvedObjective {
             coeffs,
             sense,
             offset,
-            exact: model_obj_exact.clone(),
+            exact: model_obj_exact,
         };
         // The float certificate lane is built from ROUNDED `f64` coefficients;
         // on an inexact model its certificate would bound the wrong linear form.
@@ -2306,7 +3398,7 @@ impl LpSession {
         // answer. The exact-coeff fast path is unchanged.
         if allow_float_lane && !self.model.has_inexact_coeffs() {
             if let Some(fast) = self.try_float_lane(coeffs, sense, offset, deadline) {
-                return finish(fast, &self.model, &solved, &self.opts);
+                return finish_with_work(fast, &self.model, &solved, &self.opts, work);
             }
         }
 
@@ -2321,35 +3413,61 @@ impl LpSession {
         };
         if self.lp.is_none() {
             let Some(lp) = ExactLp::new_within(&self.model, budget.deadline) else {
-                return finish(
+                return finish_with_work(
                     Outcome::Unknown {
                         reason: UnknownReason::Timeout,
                     },
                     &self.model,
                     &solved,
                     &self.opts,
+                    work,
                 );
             };
             self.lp = Some(lp);
         }
         // On an inexact model the exact rim minimizes the TRUE objective from
         // the side-store, and its certificate names that same true objective.
-        let obj: Vec<(u32, Rational)> = match &model_obj_exact {
+        let obj: Vec<(u32, Rational)> = match &solved.exact {
             Some((c, _)) => {
-                let mut v: Vec<(u32, Rational)> = c
-                    .iter()
-                    .map(|(i, r)| (*i, Rational::from_big(r.clone())))
-                    .collect();
+                let mut v = Vec::with_capacity(c.len());
+                for (index, (column, coefficient)) in c.iter().enumerate() {
+                    if index & 0xff == 0 && !work(0x100.min(c.len().saturating_sub(index))) {
+                        return Outcome::Unknown {
+                            reason: UnknownReason::Timeout,
+                        };
+                    }
+                    v.push((*column, Rational::from_big(coefficient.clone())));
+                }
                 v.sort_unstable_by_key(|&(i, _)| i);
                 v
             }
-            None => exact_obj(coeffs),
+            None => {
+                let Some(objective) = exact_obj_with_work(coeffs, work) else {
+                    return Outcome::Unknown {
+                        reason: UnknownReason::Timeout,
+                    };
+                };
+                objective
+            }
         };
         // Minimize form: negate for Maximize, un-negate the optimum below.
-        let solve_obj: Vec<(u32, Rational)> = match sense {
-            Sense::Minimize => obj.clone(),
-            Sense::Maximize => obj.iter().map(|(c, a)| (*c, -a.clone())).collect(),
-        };
+        let mut solve_obj = Vec::with_capacity(obj.len());
+        for (index, (column, coefficient)) in obj.iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(obj.len().saturating_sub(index))) {
+                return Outcome::Unknown {
+                    reason: UnknownReason::Timeout,
+                };
+            }
+            solve_obj.push(match sense {
+                Sense::Minimize => (*column, coefficient.clone()),
+                Sense::Maximize => (*column, -coefficient.clone()),
+            });
+        }
+        if !work(1) {
+            return Outcome::Unknown {
+                reason: UnknownReason::Timeout,
+            };
+        }
         let lp = self
             .lp
             .as_mut()
@@ -2360,40 +3478,44 @@ impl LpSession {
                     Sense::Minimize => value,
                     Sense::Maximize => -value,
                 };
-                let offset = match &model_obj_exact {
+                let offset = match &solved.exact {
                     Some((_, o)) => o.clone(),
                     None => exact(offset).unwrap_or_else(BigRational::zero),
                 };
+                let mut certificate_objective = Vec::with_capacity(obj.len());
+                for (index, (column, coefficient)) in obj.iter().enumerate() {
+                    if index & 0xff == 0 && !work(0x100.min(obj.len().saturating_sub(index))) {
+                        return Outcome::Unknown {
+                            reason: UnknownReason::Timeout,
+                        };
+                    }
+                    certificate_objective.push((*column, coefficient.to_big()));
+                }
                 let cert = OptimalityCertificate {
                     sense,
-                    objective: obj.iter().map(|(c, a)| (*c, a.to_big())).collect(),
+                    objective: certificate_objective,
                     bound: bound.clone(),
                     multipliers,
                 };
-                debug_assert!(
-                    cert.verify(&self.model).is_ok(),
-                    "exact-lane certificate must verify"
-                );
+                let Some(model_values) = lp.structural_values_with_work(work) else {
+                    return Outcome::Unknown {
+                        reason: UnknownReason::Timeout,
+                    };
+                };
                 Outcome::Optimal {
                     value: bound + offset,
-                    model_values: lp.structural_values(),
+                    model_values,
                     cert: Some(cert),
                 }
             }
             LpOptimum::Unbounded => Outcome::Unbounded,
-            LpOptimum::Infeasible(cert) => {
-                debug_assert!(
-                    cert.verify(&self.model).is_ok(),
-                    "exact-lane Farkas certificate must verify"
-                );
-                Outcome::Infeasible {
-                    cert: Some(cert),
-                    tree_cert: None,
-                }
-            }
+            LpOptimum::Infeasible(cert) => Outcome::Infeasible {
+                cert: Some(cert),
+                tree_cert: None,
+            },
             LpOptimum::Unknown(reason) => Outcome::Unknown { reason },
         };
-        finish(outcome, &self.model, &solved, &self.opts)
+        finish_with_work(outcome, &self.model, &solved, &self.opts, work)
     }
 
     /// A rigorous bound on `col` in `sense`.
@@ -2411,6 +3533,210 @@ impl LpSession {
     ///
     /// # Errors
     /// Propagates session errors (e.g. an out-of-range column).
+    /// The FLOAT lane's dual vector for a linear objective — fast, and explicitly UNTRUSTED.
+    ///
+    /// ## Why this is exposed
+    ///
+    /// [`Self::rigorous_bound_expr`] is rigorous but pays for it: when Neumaier–Shcherbina
+    /// declines it falls to the exact rational rim, which on tight, near-degenerate polytopes
+    /// is the common case and costs ~300 ms. A caller that can VERIFY a bound itself does not
+    /// need the rim — it only needs a good multiplier vector, and the float simplex produces
+    /// one in microseconds.
+    ///
+    /// This is the untrusted half of an untrusted-solver / trusted-verifier split. Weak LP
+    /// duality makes any `y` of the right sign yield a valid bound, so the caller can turn
+    /// this into a sound result with its own directed-rounding evaluation and never trust the
+    /// float lane at all. Star-set reachability does exactly that: it holds the box
+    /// `α ∈ [-1,1]` explicitly, so its own Lagrangian evaluation is always finite — which is
+    /// precisely where NS's infinite-row-bound case bites.
+    ///
+    /// SOUNDNESS: the returned duals carry NO guarantee. Using them as if they were a bound
+    /// is unsound. They are only useful to a caller that re-derives a bound from them.
+    ///
+    /// Returns `None` when the float lane is disabled or the simplex does not settle.
+    ///
+    /// # Errors
+    /// [`MilpError::Session`] if a column index is out of range or a weight is non-finite.
+    pub fn float_dual_for_expr(
+        &mut self,
+        expr: &[(Col, f64)],
+        sense: Sense,
+    ) -> Result<Option<Vec<f64>>, MilpError> {
+        for (col, w) in expr {
+            if col.index() >= self.model.num_cols() {
+                return Err(MilpError::Session {
+                    message: format!("column {} out of range", col.index()),
+                });
+            }
+            if !w.is_finite() {
+                return Err(MilpError::Session {
+                    message: "non-finite objective weight".to_string(),
+                });
+            }
+        }
+        if expr.is_empty() || !float_lane_enabled() {
+            return Ok(None);
+        }
+        let scale = match sense {
+            Sense::Minimize => 1.0_f64,
+            Sense::Maximize => -1.0_f64,
+        };
+        let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, w * scale)).collect();
+        let Some(mut lp) = self.float_lp(&scaled, Sense::Minimize) else {
+            return Ok(None);
+        };
+        lp.plain_cold = true;
+        let cand = lp.solve(self.opts.effective_deadline(Instant::now()));
+        if cand.status != SimplexStatus::Optimal {
+            return Ok(None);
+        }
+        Ok(Some(cand.duals))
+    }
+
+    /// Rigorous bound on an arbitrary LINEAR EXPRESSION `Σ wᵢ·x_{cᵢ}`, without
+    /// materialising a column for it.
+    ///
+    /// [`Self::rigorous_bound`] can only bound a single column, so a caller wanting a bound
+    /// on a linear form has to add a column plus an equality row tying it to that form. That
+    /// is expensive twice over: the model grows by a column AND a row per form, and solve
+    /// time scales with model size. A caller bounding many forms over one polytope (star-set
+    /// reachability, for instance) pays it on every query.
+    ///
+    /// This takes the objective directly. The model is untouched, so bounding N forms costs
+    /// N solves over the ORIGINAL model rather than N solves over a model that has grown by
+    /// 2N entries.
+    ///
+    /// ## Soundness
+    ///
+    /// Identical to [`Self::rigorous_bound`]: the Neumaier–Shcherbina bound is valid for the
+    /// exact LP no matter how wrong the float dual is, because soundness rests on weak
+    /// duality and directed rounding, never on the dual being optimal.
+    ///
+    /// Two tiers, exactly like [`Self::rigorous_bound`]: the NS bound first, then the EXACT
+    /// rim. The rim needs no materialised column — `optimize_linear` already takes an
+    /// objective vector and `optimize` is merely its one-entry case — so the expression form
+    /// is as TIGHT as the column form, not just cheaper. Anything the rim cannot decide
+    /// (infeasible, unbounded, timeout) passes through unchanged; never a non-rigorous
+    /// answer.
+    ///
+    /// An empty expression bounds the constant `0` and returns that exactly.
+    ///
+    /// # Errors
+    /// [`MilpError::Session`] if any column index is out of range.
+    pub fn rigorous_bound_expr(
+        &mut self,
+        expr: &[(Col, f64)],
+        sense: Sense,
+    ) -> Result<Outcome, MilpError> {
+        for (col, w) in expr {
+            if col.index() >= self.model.num_cols() {
+                return Err(MilpError::Session {
+                    message: format!("column {} out of range", col.index()),
+                });
+            }
+            if !w.is_finite() {
+                return Err(MilpError::Session {
+                    message: "non-finite objective weight".to_string(),
+                });
+            }
+        }
+        if expr.is_empty() {
+            return Ok(Outcome::Bound {
+                dual_bound: BigRational::from_integer(0.into()),
+                rigorous: true,
+            });
+        }
+        // Tier 1 — Neumaier-Shcherbina off a single float solve. Cheap, and rigorous
+        // however wrong the float dual is.
+        if let Some(dual_bound) = self.ns_bound_expr(expr, sense) {
+            return Ok(Outcome::Bound {
+                dual_bound,
+                rigorous: true,
+            });
+        }
+        // Tier 2 — the EXACT rim, same as `rigorous_bound` falls back to. `optimize_linear`
+        // already takes an objective vector (`optimize` is just its one-entry case), so the
+        // rim never needed a materialised column — only the public API did. Without this
+        // tier a weak or declined NS answer was final, which made the expression form lose
+        // to the column form on exactly the queries where tightness matters.
+        let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, *w)).collect();
+        Ok(match self.optimize_linear(&scaled, sense, 0.0, None) {
+            Outcome::Optimal { value, .. } => Outcome::Bound {
+                dual_bound: value,
+                rigorous: true,
+            },
+            other => other,
+        })
+    }
+
+    /// [`Self::ns_bound`] generalised from a single column to a linear expression.
+    ///
+    /// The single-column case is exactly this with a one-entry objective, so the two share
+    /// their soundness argument: run the float lane once for a dual vector, then evaluate the
+    /// weak-duality bound with directed rounding.
+    fn ns_bound_expr(&self, expr: &[(Col, f64)], sense: Sense) -> Option<BigRational> {
+        // Same side-store caveat as `ns_bound`: NS encloses the f64 matrix, not a different
+        // true rational held alongside it.
+        if self.model.has_inexact_coeffs() || !float_lane_enabled() {
+            return None;
+        }
+        // Minimize form; `-1` scaling encodes maximize.
+        let (scale, flip) = match sense {
+            Sense::Minimize => (1.0_f64, false),
+            Sense::Maximize => (-1.0_f64, true),
+        };
+        let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, w * scale)).collect();
+        let mut lp = self.float_lp(&scaled, Sense::Minimize)?;
+        lp.plain_cold = true;
+        let cand = lp.solve(self.opts.effective_deadline(Instant::now()));
+        if cand.status != SimplexStatus::Optimal {
+            return None;
+        }
+        let mut obj = vec![0.0_f64; self.model.num_cols()];
+        for (c, w) in &scaled {
+            // Accumulate: a caller may legitimately repeat a column.
+            obj[*c as usize] += *w;
+        }
+        let neg_y: Vec<f64> = cand.duals.iter().map(|d| -d).collect();
+        // A dual component paired with an INFINITE row bound sends the NS slack term
+        // `min_{s in [lb,ub]} y_r*s` to -inf, and the whole bound with it. The two global
+        // sign candidates fix that only when one flip suits EVERY row — true for a
+        // single-column objective, but not once the objective spans several columns and the
+        // true dual carries mixed signs across one-sided rows.
+        //
+        // Zeroing the offending component is SOUND: it is exactly dropping that constraint
+        // from the dual, and weak duality holds for any validly-signed multiplier vector.
+        // The bound is weaker but FINITE, which beats declining outright.
+        let clamp = |src: &[f64]| -> Vec<f64> {
+            src.iter()
+                .enumerate()
+                .map(|(r, &yr)| {
+                    let (_coeffs, lb, ub) = self.model.row(Row(r as u32));
+                    if (yr > 0.0 && !lb.is_finite()) || (yr < 0.0 && !ub.is_finite()) {
+                        0.0
+                    } else {
+                        yr
+                    }
+                })
+                .collect()
+        };
+        let clamped_y = clamp(&cand.duals);
+        let clamped_neg = clamp(&neg_y);
+        let best = [
+            crate::ns::rigorous_lower_bound(&self.model, &obj, &cand.duals),
+            crate::ns::rigorous_lower_bound(&self.model, &obj, &neg_y),
+            crate::ns::rigorous_lower_bound(&self.model, &obj, &clamped_y),
+            crate::ns::rigorous_lower_bound(&self.model, &obj, &clamped_neg),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(f64::NEG_INFINITY, f64::max);
+        if !best.is_finite() {
+            return None;
+        }
+        exact(if flip { -best } else { best })
+    }
+
     pub fn rigorous_bound(&mut self, col: Col, sense: Sense) -> Result<Outcome, MilpError> {
         if col.index() >= self.model.num_cols() {
             return Err(MilpError::Session {
@@ -4461,6 +5787,260 @@ impl LpSession {
     }
 }
 
+/// Convert an exact, independently checked point into native MILP incumbent
+/// advice. This conversion carries no proof authority: `solve_milp_seeded`
+/// validates the resulting floating candidate against the original model and
+/// simply drops it if rounding moved it outside the feasible set.
+fn exact_point_to_f64_seed(point: &[BigRational]) -> Option<Vec<f64>> {
+    use num_traits::ToPrimitive;
+
+    point
+        .iter()
+        .map(|value| value.to_f64().filter(|value| value.is_finite()))
+        .collect()
+}
+
+/// A feasible point closes a decision problem, but on an optimization model an
+/// explicitly anytime result is only an incumbent. It must not pre-empt the
+/// complete native proof path.
+fn exact_reduction_feasible_must_continue_native(
+    has_objective: bool,
+    incumbent_only: bool,
+) -> bool {
+    has_objective && incumbent_only
+}
+
+#[cfg(test)]
+mod exact_reduction_fallback_tests {
+    use super::*;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn anytime_pb_point_never_terminates_optimization() {
+        assert!(exact_reduction_feasible_must_continue_native(true, true));
+        assert!(!exact_reduction_feasible_must_continue_native(false, true));
+        assert!(!exact_reduction_feasible_must_continue_native(true, false));
+    }
+
+    #[test]
+    fn checked_network_replay_handoff_is_one_shot_and_model_scoped() {
+        let mut model = Model::new();
+        model.add_binary_col();
+        let mut session = BabSession::new(model, &SolveOpts::new()).expect("valid session");
+        session.pending_network_design_replay = Some(NetworkDesignReplayHandoff::ReadyReplay(
+            crate::pb_route::PbRouteDecision::Infeasible,
+        ));
+
+        assert!(matches!(
+            session.take_pending_network_design_replay(),
+            Some(NetworkDesignReplayHandoff::ReadyReplay(
+                crate::pb_route::PbRouteDecision::Infeasible
+            ))
+        ));
+        assert!(session.take_pending_network_design_replay().is_none());
+
+        session.pending_network_design_replay = Some(NetworkDesignReplayHandoff::LazyOnly(None));
+        assert!(matches!(
+            session.take_pending_network_design_replay(),
+            Some(NetworkDesignReplayHandoff::LazyOnly(None))
+        ));
+        assert!(session.take_pending_network_design_replay().is_none());
+
+        session.pending_network_design_replay = Some(NetworkDesignReplayHandoff::LazyOnly(None));
+        session.invalidate_last_evidence();
+        assert!(session.take_pending_network_design_replay().is_none());
+    }
+
+    #[test]
+    fn pending_network_continuation_keeps_priority_over_block_angular() {
+        let mut model = Model::new();
+        model.add_binary_col();
+        let mut session = BabSession::new(model, &SolveOpts::new()).expect("valid session");
+        assert!(session.may_offer_block_angular_before_network_replay());
+
+        session.install_network_design_replay_handoff(NetworkDesignReplayHandoff::LazyOnly(None));
+        assert!(
+            !session.may_offer_block_angular_before_network_replay(),
+            "a speculative block route must not spend the shared deadline before a checked \
+             lazy-network continuation"
+        );
+        assert!(matches!(
+            session.take_pending_network_design_replay(),
+            Some(NetworkDesignReplayHandoff::LazyOnly(None))
+        ));
+        assert!(session.may_offer_block_angular_before_network_replay());
+    }
+
+    #[test]
+    fn checked_network_optimum_seeds_native_before_full_policy_drops_replay() {
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        model.set_objective(&[(x, 1.0)], Sense::Minimize);
+        let opts = SolveOpts::new().with_require_certificates(true);
+        let mut session = BabSession::new(model, &opts).expect("valid full-policy session");
+        let point = vec![BigRational::from_integer(BigInt::from(1))];
+
+        session.install_network_design_replay_handoff(NetworkDesignReplayHandoff::ReadyReplay(
+            crate::pb_route::PbRouteDecision::Optimal {
+                value: BigRational::from_integer(BigInt::from(1)),
+                model_values: point,
+            },
+        ));
+
+        assert_eq!(session.incumbent_seed, Some(vec![1.0]));
+        assert!(session.take_pending_network_design_replay().is_none());
+    }
+
+    #[test]
+    fn default_policy_keeps_seeded_network_replay_one_shot() {
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        model.set_objective(&[(x, 1.0)], Sense::Maximize);
+        let mut session = BabSession::new(model, &SolveOpts::new()).expect("valid session");
+
+        session.install_network_design_replay_handoff(NetworkDesignReplayHandoff::ReadyReplay(
+            crate::pb_route::PbRouteDecision::Optimal {
+                value: BigRational::from_integer(BigInt::from(1)),
+                model_values: vec![BigRational::from_integer(BigInt::from(1))],
+            },
+        ));
+
+        assert_eq!(session.incumbent_seed, Some(vec![1.0]));
+        assert!(matches!(
+            session.take_pending_network_design_replay(),
+            Some(NetworkDesignReplayHandoff::ReadyReplay(
+                crate::pb_route::PbRouteDecision::Optimal { .. }
+            ))
+        ));
+        assert!(session.take_pending_network_design_replay().is_none());
+    }
+
+    #[test]
+    fn full_policy_drops_lazy_network_handoff_without_disturbing_existing_seed() {
+        let mut model = Model::new();
+        model.add_binary_col();
+        let opts = SolveOpts::new().with_require_certificates(true);
+        let mut session = BabSession::new(model, &opts).expect("valid full-policy session");
+        session.incumbent_seed = Some(vec![0.0]);
+
+        session.install_network_design_replay_handoff(NetworkDesignReplayHandoff::LazyOnly(None));
+
+        assert_eq!(session.incumbent_seed, Some(vec![0.0]));
+        assert!(session.take_pending_network_design_replay().is_none());
+    }
+
+    #[test]
+    fn full_policy_seeds_checked_lazy_incumbent_before_dropping_handoff() {
+        let mut model = Model::new();
+        model.add_binary_col();
+        let opts = SolveOpts::new().with_require_certificates(true);
+        let mut session = BabSession::new(model, &opts).expect("valid full-policy session");
+
+        session.install_network_design_replay_handoff(NetworkDesignReplayHandoff::LazyOnly(Some(
+            crate::pb_route::PbRouteDecision::Feasible {
+                model_values: vec![BigRational::from_integer(BigInt::from(1))],
+                incumbent_only: true,
+            },
+        )));
+
+        assert_eq!(session.incumbent_seed, Some(vec![1.0]));
+        assert!(session.take_pending_network_design_replay().is_none());
+    }
+
+    #[test]
+    fn exact_point_seed_conversion_fails_closed_on_non_finite_values() {
+        let finite = vec![
+            BigRational::from_integer(BigInt::from(0)),
+            BigRational::new(BigInt::from(1), BigInt::from(3)),
+        ];
+        let converted = exact_point_to_f64_seed(&finite).expect("finite point");
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0], 0.0);
+        assert!(converted[1].is_finite());
+
+        let enormous = vec![BigRational::from_integer(BigInt::from(1) << 20_000usize)];
+        assert!(exact_point_to_f64_seed(&enormous).is_none());
+    }
+
+    #[test]
+    fn full_policy_adopts_revalidated_parity_infeasibility() {
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        let y0 = model.add_int_col(0.0, f64::INFINITY);
+        let y1 = model.add_int_col(0.0, f64::INFINITY);
+        model.add_row(0.0, 0.0, &[(x, 1.0), (y0, -2.0)]);
+        model.add_row(-1.0, -1.0, &[(x, 1.0), (y1, -2.0)]);
+        model.set_objective(&[(x, 1.0)], Sense::Minimize);
+
+        let opts = SolveOpts::new()
+            .with_time_limit(Duration::from_secs(5))
+            .with_require_certificates(true);
+        let mut session = BabSession::new(model, &opts).expect("session");
+        let outcome = session.check().expect("parity solve");
+        assert!(matches!(outcome, Outcome::Infeasible { .. }));
+        let certificate = session
+            .parity_infeasibility_certificate()
+            .expect("typed parity refutation");
+        crate::verify_parity_infeasibility_certificate(session.model(), certificate)
+            .expect("session certificate must replay against its source model");
+    }
+
+    #[test]
+    fn native_session_adopts_revalidated_open_domain_infeasibility() {
+        for require_certificates in [false, true] {
+            let mut model = Model::new();
+            let x = model.add_binary_col();
+            let open = model.add_int_col(0.0, f64::INFINITY);
+            model.add_row(2.0, f64::INFINITY, &[(open, 1.0)]);
+            model.add_row(1.0, f64::INFINITY, &[(x, 1.0)]);
+            model.add_row(f64::NEG_INFINITY, 0.0, &[(x, 1.0)]);
+
+            let opts = SolveOpts::new()
+                .with_time_limit(Duration::from_secs(5))
+                .with_require_certificates(require_certificates);
+            let mut session = BabSession::new(model, &opts).expect("session");
+            let outcome = session.check().expect("open-domain solve");
+            assert!(matches!(outcome, Outcome::Infeasible { .. }));
+            assert!(session.replay_claims().is_empty());
+            assert!(
+                session
+                    .open_domain_single_row_dp_infeasibility_certificate()
+                    .is_some()
+                    || session
+                        .open_domain_multi_row_bdd_infeasibility_certificate()
+                        .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn native_session_adopts_revalidated_open_domain_optimum() {
+        let mut model = Model::new();
+        let bounded = model.add_int_col(0.0, 2.0);
+        let open = model.add_int_col(0.0, f64::INFINITY);
+        model.add_row(3.0, f64::INFINITY, &[(bounded, 1.0), (open, 1.0)]);
+        model.set_objective(&[(bounded, 1.0), (open, 2.0)], Sense::Minimize);
+
+        let opts = SolveOpts::new().with_time_limit(Duration::from_secs(5));
+        let mut session = BabSession::new(model, &opts).expect("session");
+        let outcome = session.check().expect("open-domain solve");
+        let Outcome::Optimal {
+            value,
+            model_values,
+            ..
+        } = outcome
+        else {
+            panic!("open-domain route must close the model")
+        };
+        assert_eq!(value, BigRational::from_integer(BigInt::from(4)));
+        session.model().check_point(&model_values).unwrap();
+        assert!(session
+            .replay_claims()
+            .iter()
+            .any(|claim| claim.claim == "open-domain-cap-optimal"));
+    }
+}
+
 /// The largest f64 `≤ r` (round toward −∞) — the exact→f64 commit of a
 /// rigorous LOWER bound: weakening it outward excludes no feasible point.
 /// `None` on overflow to non-finite (commit nothing; fail closed).
@@ -4540,11 +6120,74 @@ enum MilpLane {
     Exact,
 }
 
+/// How one [`BabSession`] entry treats a marked margin.
+enum MarginMode<'a> {
+    Auto,
+    Disabled,
+    Required,
+    ReframedProof(crate::margin::MarginProofTarget<'a>),
+}
+
+/// One-shot continuation passed from certificate-first network work to the
+/// later default/replay boundary in the same `check`. It either carries a
+/// checked conclusive raw result or authorizes exactly the distinct lazy
+/// Hoffman/Benders arm, optionally seeded by a checked incumbent.
+enum NetworkDesignReplayHandoff {
+    ReadyReplay(crate::pb_route::PbRouteDecision),
+    LazyOnly(Option<crate::pb_route::PbRouteDecision>),
+}
+
 /// Whether a MILP goes down the old ay-dpll lowering instead of the native
 /// branch-and-bound. The A/B switch the native lane is measured against.
 fn smt_lane_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| std::env::var_os("AY_MILP_SMT").is_some())
+}
+
+/// Whether the exact structure-recognition routes may claim an ordinary native
+/// check. Off process-wide via `AY_MILP_NO_STRUCTURE_ROUTE=1`: the A/B arm the
+/// routed lanes are measured against, and the escape hatch that pins a solve on
+/// native branch-and-bound (the only lane exporting a root Farkas or a
+/// whole-tree case-split certificate). Read once — this sits on the per-solve
+/// path. Per-session control is [`SolveOpts::with_structure_routing`].
+fn structure_routing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_NO_STRUCTURE_ROUTE").is_none())
+}
+
+fn structure_trace_enabled() -> bool {
+    std::env::var_os("AY_MILP_TRACE").is_some()
+}
+
+/// The verdict word, for the one message a consumer must be able to read
+/// without a debugger: the portfolio disagreement trap.
+fn verdict_word(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Optimal { .. } => "OPTIMAL",
+        Outcome::Feasible { .. } => "FEASIBLE",
+        Outcome::Infeasible { .. } => "INFEASIBLE",
+        Outcome::Unbounded => "UNBOUNDED",
+        Outcome::Bound { .. } => "BOUND",
+        Outcome::Unknown { .. } => "UNKNOWN",
+    }
+}
+
+/// Which single exit a lane's verdict leaves through.
+///
+/// `ExactReduction` re-validates the witness against the caller's exact model;
+/// `AlreadyFinished` preserves a private checked-point or supplemental-proof
+/// finalizer. Naming them lets
+/// [`BabSession::admit_or_defer`] be the ONE place the evidence floor is
+/// consulted, instead of the floor being re-implemented at every lane's own
+/// `return`.
+#[derive(Clone, Copy)]
+enum Finisher {
+    ExactReduction,
+    /// The lane's private finalizer has already checked the exact point or
+    /// supplemental artifact and applied certificate policy. Admission still
+    /// owns whether the resulting claim may end the solve, but must not erase
+    /// proof information that is carried outside `Outcome`.
+    AlreadyFinished,
 }
 
 /// A MILP session with scoped `fix_col`/`add_row`, feasibility and
@@ -4554,10 +6197,28 @@ pub struct BabSession {
     opts: SolveOpts,
     lane: MilpLane,
     scopes: Vec<ScopeFrame>,
+    /// A verdict a lane produced that is NOT allowed to end the solve yet,
+    /// because [`crate::claim::may_close`] found its evidence below what the
+    /// anchor could still reach on this model.
+    ///
+    /// This is where the `W1_unsat_v9_c14_000008` evidence downgrade is
+    /// repaired. It is a HOLDING slot, never a discard slot: the claim is
+    /// published verbatim the moment the anchor's bounded first refusal fails
+    /// to do better, so the portfolio can lose latency here and can never lose
+    /// a verdict.
+    deferred_claim: Option<crate::claim::Deferred>,
+    /// `(lane, claim)` the evidence floor held back during the last check.
+    /// Reported by [`BabSession::deferred_lane`]; see it for why this is
+    /// recorded rather than inferred.
+    last_deferred: Option<(&'static str, &'static str)>,
     /// Advice-only incumbent seeds and branching guidance for the native engine.
     incumbent_seed: Option<Vec<f64>>,
     branch_hints: Vec<Col>,
     root_strong_branch_shortlist: Vec<Col>,
+    /// One continuation produced by certificate-first network work. The later
+    /// replay/default boundary consumes it instead of rebuilding and searching
+    /// the identical eager projection a second time in the same check.
+    pending_network_design_replay: Option<NetworkDesignReplayHandoff>,
     /// Replay claims filed by the LAST [`Self::check`]: verdicts a device
     /// reached by exhaustive computation with NO exportable certificate.
     ///
@@ -4565,6 +6226,132 @@ pub struct BabSession {
     /// "trust me" annotation attach to another solve's verdict, which is
     /// precisely the failure the certificate format exists to prevent.
     replay_claims: Vec<crate::cert_io::ReplayClaim>,
+    /// Exact source-row parity contradiction produced by the GF(2) route.
+    parity_infeasibility_certificate: Option<crate::ParityInfeasibilityCertificate>,
+    /// Exact SAT/ReLU projection plus independently replayed RUP refutation.
+    sat_relu_infeasibility_certificate: Option<crate::SatReluInfeasibilityCertificate>,
+    /// Exact Hoffman-master refutation produced by the last certified network
+    /// design route.
+    network_design_infeasibility_certificate: Option<crate::NetworkDesignInfeasibilityCertificate>,
+    /// Exact strict-better-face refutation produced by the last certified
+    /// network design optimum.
+    network_design_optimality_certificate: Option<crate::NetworkDesignOptimalityCertificate>,
+    /// Exact Lagrangian lower bound for the last recognized integral
+    /// conservation-chain block-angular optimum.
+    block_angular_optimality_certificate: Option<crate::BlockAngularOptimalityCertificate>,
+    /// Exact sequence and independently replayed DP optimum produced by the
+    /// last recognized single-machine scheduling solve.
+    single_machine_scheduling_optimality_certificate:
+        Option<crate::SingleMachineSchedulingOptimalityCertificate>,
+    /// Independently replayable proof exported by the last exact single-row
+    /// PB infeasibility route, when that route owned the verdict.
+    single_row_dp_infeasibility_certificate:
+        Option<ay_pb_core::SingleRowDpInfeasibilityCertificate>,
+    /// Independently replayable proof exported by the last exact general PB
+    /// infeasibility route, when that route owned the verdict.
+    multi_row_bdd_infeasibility_certificate:
+        Option<ay_pb_core::MultiRowBddInfeasibilityCertificate>,
+    /// Residual PB proof exported by the last exact open-domain projection.
+    /// It is intentionally distinct from a direct source-model PB proof.
+    open_domain_single_row_dp_infeasibility_certificate:
+        Option<ay_pb_core::SingleRowDpInfeasibilityCertificate>,
+    /// General residual PB proof from the last exact open-domain projection.
+    open_domain_multi_row_bdd_infeasibility_certificate:
+        Option<ay_pb_core::MultiRowBddInfeasibilityCertificate>,
+    /// Hybrid proof over a deterministically rebuilt open-domain residual.
+    open_domain_hybrid_pb_lp_infeasibility_certificate:
+        Option<crate::HybridPbLpInfeasibilityCertificate>,
+    /// Integer-lifted hybrid proof over a rebuilt open-domain residual.
+    open_domain_hybrid_integer_lift_infeasibility_certificate:
+        Option<crate::HybridIntegerLiftInfeasibilityCertificate>,
+    /// Exact cut ledger plus final PB refutation from the last binary-master /
+    /// continuous-recourse hybrid verdict.
+    hybrid_pb_lp_infeasibility_certificate: Option<crate::HybridPbLpInfeasibilityCertificate>,
+    /// Nested hybrid proof whose bounded general-integer radix lift is rebuilt
+    /// from the source model by the independent checker.
+    hybrid_integer_lift_infeasibility_certificate:
+        Option<crate::HybridIntegerLiftInfeasibilityCertificate>,
+}
+
+/// Census-frame ownership for one `BabSession::check`.
+///
+/// Only a check with no inherited carrier is a `TopLevelOwner`: it creates the
+/// frame and defines the one-solve census unit. Internal checks, currently the
+/// margin reframe, are `NestedBorrower`s and must retain that exact frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtAdoptionFrameOwnership {
+    TopLevelOwner,
+    NestedBorrower,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FT_ADOPTION_FRAME_ENTRY_COUNTS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn ft_adoption_frame_entry_counts() -> (u64, u64) {
+    FT_ADOPTION_FRAME_ENTRY_COUNTS.with(std::cell::Cell::get)
+}
+
+/// Installs one census frame for the duration of a check and removes its local
+/// carriers on every return or unwind.
+///
+/// A nested session owns cloned model/options carriers, so clearing them does
+/// not disturb the outer session's carriers or the shared latch.
+struct FtAdoptionFrame<'a> {
+    session: &'a mut BabSession,
+    _ownership: FtAdoptionFrameOwnership,
+}
+
+impl<'a> FtAdoptionFrame<'a> {
+    fn enter(session: &'a mut BabSession) -> Self {
+        let model_latch = session.model.ft_adoption_solve_latch();
+        let opts_latch = session.opts.ft_adoption_solve_latch();
+        let (latch, ownership) = match (model_latch, opts_latch) {
+            (Some(model_latch), Some(opts_latch)) => {
+                debug_assert!(
+                    model_latch.same_frame(&opts_latch),
+                    "model and solve options carried different FT-adoption frames"
+                );
+                (opts_latch, FtAdoptionFrameOwnership::NestedBorrower)
+            }
+            (Some(latch), None) | (None, Some(latch)) => {
+                (latch, FtAdoptionFrameOwnership::NestedBorrower)
+            }
+            (None, None) => (
+                crate::sepstat::FtAdoptionSolveLatch::new(),
+                FtAdoptionFrameOwnership::TopLevelOwner,
+            ),
+        };
+        #[cfg(test)]
+        FT_ADOPTION_FRAME_ENTRY_COUNTS.with(|counts| {
+            let (owners, borrowers) = counts.get();
+            counts.set(match ownership {
+                FtAdoptionFrameOwnership::TopLevelOwner => (owners + 1, borrowers),
+                FtAdoptionFrameOwnership::NestedBorrower => (owners, borrowers + 1),
+            });
+        });
+        session.model.set_ft_adoption_solve_latch(latch.clone());
+        session.opts.set_ft_adoption_solve_latch(latch);
+        Self {
+            session,
+            _ownership: ownership,
+        }
+    }
+
+    #[cfg(test)]
+    fn ownership(&self) -> FtAdoptionFrameOwnership {
+        self._ownership
+    }
+}
+
+impl Drop for FtAdoptionFrame<'_> {
+    fn drop(&mut self) {
+        self.session.model.clear_ft_adoption_solve_latch();
+        self.session.opts.clear_ft_adoption_solve_latch();
+    }
 }
 
 impl BabSession {
@@ -4600,10 +6387,27 @@ impl BabSession {
             opts: opts.clone(),
             lane,
             scopes: Vec::new(),
+            deferred_claim: None,
+            last_deferred: None,
             incumbent_seed: None,
             branch_hints: Vec::new(),
             root_strong_branch_shortlist: Vec::new(),
+            pending_network_design_replay: None,
             replay_claims: Vec::new(),
+            parity_infeasibility_certificate: None,
+            sat_relu_infeasibility_certificate: None,
+            network_design_infeasibility_certificate: None,
+            network_design_optimality_certificate: None,
+            block_angular_optimality_certificate: None,
+            single_machine_scheduling_optimality_certificate: None,
+            single_row_dp_infeasibility_certificate: None,
+            multi_row_bdd_infeasibility_certificate: None,
+            open_domain_single_row_dp_infeasibility_certificate: None,
+            open_domain_multi_row_bdd_infeasibility_certificate: None,
+            open_domain_hybrid_pb_lp_infeasibility_certificate: None,
+            open_domain_hybrid_integer_lift_infeasibility_certificate: None,
+            hybrid_pb_lp_infeasibility_certificate: None,
+            hybrid_integer_lift_infeasibility_certificate: None,
         })
     }
 
@@ -4620,12 +6424,307 @@ impl BabSession {
         &self.replay_claims
     }
 
+    /// Which lane, if any, had a verdict HELD BACK by the evidence floor during
+    /// the last [`Self::check`], and what it asserted.
+    ///
+    /// `None` means every lane that produced a verdict was allowed to publish it
+    /// — either because its evidence already matched what the anchor could reach,
+    /// or because no lane produced one at all.
+    ///
+    /// This exists because "did the floor engage?" is otherwise only observable
+    /// through wall-clock behaviour, and a test that infers it from timing is a
+    /// test that passes on a fast machine and fails on a slow one. It is also
+    /// the honest thing to be able to ask a solver: *did you hold something
+    /// back, and what was it?*
+    #[must_use]
+    pub fn deferred_lane(&self) -> Option<(&'static str, &'static str)> {
+        self.last_deferred
+    }
+
+    /// **THE ONE PLACE A LANE IS ALLOWED TO END THE SOLVE.**
+    ///
+    /// `Some(out)` — the lane's evidence for every claim its verdict asserts is
+    /// at least as strong as anything the anchor could still have attached, so
+    /// it publishes and the solve is over.
+    ///
+    /// `None` — at least one claim is below the anchor's reach. The verdict is
+    /// NOT discarded and NOT weakened: it is parked in `deferred_claim` and the
+    /// caller falls through to native search, which gets a bounded first
+    /// refusal at producing something better. Whatever native comes back with,
+    /// [`Self::publish_deferred_if_native_did_not_decide`] guarantees the
+    /// deferred verdict is published if native did not decide — so deferring
+    /// costs latency and can never cost a verdict.
+    ///
+    /// The lane's replay claims travel WITH the deferred verdict rather than
+    /// staying in the thread-local ledger. That is not tidiness: a claim left in
+    /// the ledger would attach to whatever verdict is returned next, which is
+    /// exactly the cross-attribution the `replay_claims` doc comment warns
+    /// about and which speculation makes more likely, not less.
+    fn admit_or_defer(
+        &mut self,
+        lane: &crate::claim::LaneFloor,
+        outcome: Outcome,
+        solved: &SolvedObjective<'_>,
+        lane_claims: Vec<crate::cert_io::ReplayClaim>,
+        finisher: Finisher,
+    ) -> Option<Outcome> {
+        // `AY_MILP_ANCHOR_FIRST_REFUSAL_MS=0` is the DEGENERATE POINT: deferral
+        // off, every lane closes exactly as it did before the evidence floor
+        // existed. Keeping that arm alive is what lets a differential test
+        // assert the invariant on one binary instead of arguing about two.
+        let deferral_available = !crate::claim::anchor_first_refusal_cap().is_zero();
+        if !deferral_available
+            || crate::claim::may_close_outcome(lane, &outcome, &self.model, &self.opts)
+        {
+            for claim in lane_claims {
+                crate::cert_io::ledger::record(claim);
+            }
+            return Some(match finisher {
+                Finisher::ExactReduction => {
+                    finish_exact_reduction(outcome, &self.model, solved, &self.opts)
+                }
+                Finisher::AlreadyFinished => outcome,
+            });
+        }
+        if structure_trace_enabled() {
+            // Name the claim AND both sides of the comparison. "deferred" on its
+            // own is not diagnosable; "infeasible REPLAY < SUCCINCT" says which
+            // cell of the floor table fired and what would change it.
+            let below: Vec<String> = crate::claim::claims_of(&outcome)
+                .iter()
+                .filter(|&&c| !crate::claim::may_close(lane, c, &self.model, &self.opts))
+                .map(|&c| {
+                    format!(
+                        "{} {} < {}",
+                        c.token(),
+                        lane.get(c).token(),
+                        crate::claim::anchor_cap(&self.model, &self.opts, c).token(),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "AY_MILP_TRACE portfolio: lane={} DEFERRED ({}) — native gets first refusal",
+                lane.lane,
+                below.join("; "),
+            );
+        }
+        // First writer wins, deterministically: lanes run in source order, so
+        // the first below-floor verdict is the one held. A second lane reaching
+        // here has produced the same verdict with no better evidence (or it
+        // would have closed), so replacing the held one would change nothing.
+        //
+        // Its replay claim is still FILED rather than dropped. Two independent
+        // exact devices that both refuted the model is worth more in the `.ayc`
+        // than one, and silently discarding evidence is the habit this whole
+        // change exists to break.
+        if self.deferred_claim.is_some() {
+            for claim in lane_claims {
+                crate::cert_io::ledger::record(claim);
+            }
+            return None;
+        }
+        self.last_deferred = Some((
+            lane.lane,
+            crate::claim::claims_of(&outcome)
+                .first()
+                .copied()
+                .unwrap_or(crate::claim::ClaimKind::Infeasible)
+                .token(),
+        ));
+        self.deferred_claim = Some(crate::claim::Deferred {
+            lane: lane.lane,
+            outcome,
+            replay_claims: lane_claims,
+        });
+        None
+    }
+
+    /// Succinct exact GF(2) source-row contradiction produced by the last check.
+    #[must_use]
+    pub fn parity_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::ParityInfeasibilityCertificate> {
+        self.parity_infeasibility_certificate.as_ref()
+    }
+
+    /// Model-bound resolution refutation produced by the SAT/ReLU route.
+    #[must_use]
+    pub fn sat_relu_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::SatReluInfeasibilityCertificate> {
+        self.sat_relu_infeasibility_certificate.as_ref()
+    }
+
+    /// Succinct exact Hoffman-projection refutation produced by the last check.
+    #[must_use]
+    pub fn network_design_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::NetworkDesignInfeasibilityCertificate> {
+        self.network_design_infeasibility_certificate.as_ref()
+    }
+
+    /// Succinct strict-better-face proof for the last network-design optimum.
+    #[must_use]
+    pub fn network_design_optimality_certificate(
+        &self,
+    ) -> Option<&crate::NetworkDesignOptimalityCertificate> {
+        self.network_design_optimality_certificate.as_ref()
+    }
+
+    /// Succinct exact Lagrangian proof for the last block-angular optimum.
+    #[must_use]
+    pub fn block_angular_optimality_certificate(
+        &self,
+    ) -> Option<&crate::BlockAngularOptimalityCertificate> {
+        self.block_angular_optimality_certificate.as_ref()
+    }
+
+    /// Exact source sequence plus independently replayable scheduling optimum.
+    #[must_use]
+    pub fn single_machine_scheduling_optimality_certificate(
+        &self,
+    ) -> Option<&crate::SingleMachineSchedulingOptimalityCertificate> {
+        self.single_machine_scheduling_optimality_certificate
+            .as_ref()
+    }
+
+    /// Succinct exact single-row PB proof produced by the last check.
+    #[must_use]
+    pub fn single_row_dp_infeasibility_certificate(
+        &self,
+    ) -> Option<&ay_pb_core::SingleRowDpInfeasibilityCertificate> {
+        self.single_row_dp_infeasibility_certificate.as_ref()
+    }
+
+    /// Succinct exact multi-row PB decision-DAG proof produced by the last check.
+    #[must_use]
+    pub fn multi_row_bdd_infeasibility_certificate(
+        &self,
+    ) -> Option<&ay_pb_core::MultiRowBddInfeasibilityCertificate> {
+        self.multi_row_bdd_infeasibility_certificate.as_ref()
+    }
+
+    /// Succinct single-row proof over a deterministically rebuilt open-domain
+    /// residual produced by the last check.
+    #[must_use]
+    pub fn open_domain_single_row_dp_infeasibility_certificate(
+        &self,
+    ) -> Option<&ay_pb_core::SingleRowDpInfeasibilityCertificate> {
+        self.open_domain_single_row_dp_infeasibility_certificate
+            .as_ref()
+    }
+
+    /// Succinct general PB proof over a deterministically rebuilt open-domain
+    /// residual produced by the last check.
+    #[must_use]
+    pub fn open_domain_multi_row_bdd_infeasibility_certificate(
+        &self,
+    ) -> Option<&ay_pb_core::MultiRowBddInfeasibilityCertificate> {
+        self.open_domain_multi_row_bdd_infeasibility_certificate
+            .as_ref()
+    }
+
+    /// Succinct hybrid refutation over a rebuilt open-domain residual.
+    #[must_use]
+    pub fn open_domain_hybrid_pb_lp_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::HybridPbLpInfeasibilityCertificate> {
+        self.open_domain_hybrid_pb_lp_infeasibility_certificate
+            .as_ref()
+    }
+
+    /// Succinct integer-lifted hybrid refutation over an open-domain residual.
+    #[must_use]
+    pub fn open_domain_hybrid_integer_lift_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::HybridIntegerLiftInfeasibilityCertificate> {
+        self.open_domain_hybrid_integer_lift_infeasibility_certificate
+            .as_ref()
+    }
+
+    /// Succinct hybrid PB/LP cut-ledger refutation produced by the last check.
+    #[must_use]
+    pub fn hybrid_pb_lp_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::HybridPbLpInfeasibilityCertificate> {
+        self.hybrid_pb_lp_infeasibility_certificate.as_ref()
+    }
+
+    /// Succinct exact integer-lifted hybrid refutation produced by the last check.
+    #[must_use]
+    pub fn hybrid_integer_lift_infeasibility_certificate(
+        &self,
+    ) -> Option<&crate::HybridIntegerLiftInfeasibilityCertificate> {
+        self.hybrid_integer_lift_infeasibility_certificate.as_ref()
+    }
+
     /// The model this session owns (Lever A accessor). Callers that used to keep
     /// their own copy of the pre-`new` model — e.g. to compute the objective value
     /// of an outcome — read it here instead, so only ONE f64 matrix is resident.
     #[must_use]
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Evidence belongs to the exact model state solved by the last check.
+    /// Any model mutation invalidates every replay annotation and typed side
+    /// artifact before the mutation can become externally observable.
+    fn invalidate_last_evidence(&mut self) {
+        self.pending_network_design_replay = None;
+        self.replay_claims.clear();
+        self.parity_infeasibility_certificate = None;
+        self.sat_relu_infeasibility_certificate = None;
+        crate::parity::clear_pending_infeasibility_certificate();
+        self.network_design_infeasibility_certificate = None;
+        self.network_design_optimality_certificate = None;
+        self.block_angular_optimality_certificate = None;
+        self.single_machine_scheduling_optimality_certificate = None;
+        self.single_row_dp_infeasibility_certificate = None;
+        self.multi_row_bdd_infeasibility_certificate = None;
+        self.open_domain_single_row_dp_infeasibility_certificate = None;
+        self.open_domain_multi_row_bdd_infeasibility_certificate = None;
+        self.open_domain_hybrid_pb_lp_infeasibility_certificate = None;
+        self.open_domain_hybrid_integer_lift_infeasibility_certificate = None;
+        self.hybrid_pb_lp_infeasibility_certificate = None;
+        self.hybrid_integer_lift_infeasibility_certificate = None;
+    }
+
+    fn take_pending_network_design_replay(&mut self) -> Option<NetworkDesignReplayHandoff> {
+        self.pending_network_design_replay.take()
+    }
+
+    fn may_offer_block_angular_before_network_replay(&self) -> bool {
+        self.pending_network_design_replay.is_none()
+    }
+
+    /// Install a checked one-shot network continuation for the replay posture.
+    /// A checked witness is useful incumbent advice even when full-certificate
+    /// policy disables replay routes. In that posture retain the seed but not
+    /// the otherwise-unconsumable exact handoff.
+    fn install_network_design_replay_handoff(&mut self, handoff: NetworkDesignReplayHandoff) {
+        if self.incumbent_seed.is_none() {
+            let checked_decision = match &handoff {
+                NetworkDesignReplayHandoff::ReadyReplay(decision)
+                | NetworkDesignReplayHandoff::LazyOnly(Some(decision)) => Some(decision),
+                NetworkDesignReplayHandoff::LazyOnly(None) => None,
+            };
+            if let Some(decision) = checked_decision {
+                match decision {
+                    crate::pb_route::PbRouteDecision::Feasible { model_values, .. }
+                    | crate::pb_route::PbRouteDecision::Optimal { model_values, .. } => {
+                        self.incumbent_seed = exact_point_to_f64_seed(model_values);
+                    }
+                    crate::pb_route::PbRouteDecision::Infeasible
+                    | crate::pb_route::PbRouteDecision::CertifiedSingleRowInfeasible { .. }
+                    | crate::pb_route::PbRouteDecision::CertifiedMultiRowInfeasible { .. } => {}
+                }
+            }
+        }
+        self.pending_network_design_replay = if self.opts.require_certificates {
+            None
+        } else {
+            Some(handoff)
+        };
     }
 
     /// Open a scope. `fix_col`/`add_row` inside it are undone by [`Self::pop`].
@@ -4646,6 +6745,7 @@ impl BabSession {
         let frame = self.scopes.pop().ok_or_else(|| MilpError::Session {
             message: "pop at scope depth 0".to_owned(),
         })?;
+        self.invalidate_last_evidence();
         #[cfg(feature = "smt")]
         if let MilpLane::Smt(smt) = &mut self.lane {
             smt.pop()?;
@@ -4674,6 +6774,7 @@ impl BabSession {
             let (lb, ub) = self.model.col_bounds(col);
             frame.saved_bounds.push((col.index(), lb, ub));
         }
+        self.invalidate_last_evidence();
         self.model.fix_col(col, value);
         #[cfg(feature = "smt")]
         if let MilpLane::Smt(smt) = &mut self.lane {
@@ -4684,6 +6785,7 @@ impl BabSession {
 
     /// Add a row `lb <= coeffs·x <= ub` in the current scope (lazy cuts).
     pub fn add_row(&mut self, lb: f64, ub: f64, coeffs: &[(Col, f64)]) -> Result<Row, MilpError> {
+        self.invalidate_last_evidence();
         let row = self.model.add_row(lb, ub, coeffs);
         #[cfg(feature = "smt")]
         if let MilpLane::Smt(smt) = &mut self.lane {
@@ -4736,7 +6838,7 @@ impl BabSession {
     /// `Feasible` where [`LpSession`] answered `Optimal { value: 0 }` on the
     /// very same model.
     pub fn check(&mut self) -> Result<Outcome, MilpError> {
-        self.check_with_shared_binary_prefix(&[], None)
+        self.check_with_shared_binary_prefix(&[], None, MarginMode::Auto, None)
     }
 
     /// Solve one complete binary-prefix partition inside ONE native
@@ -4766,7 +6868,65 @@ impl BabSession {
     /// caller-frame model by [`finish`].
     pub fn check_shared_binary_prefix(&mut self, split_cols: &[Col]) -> Result<Outcome, MilpError> {
         self.validate_shared_binary_prefix(split_cols)?;
-        self.check_with_shared_binary_prefix(split_cols, None)
+        self.check_with_shared_binary_prefix(split_cols, None, MarginMode::Disabled, None)
+    }
+
+    /// Solve one marked decision margin over a complete binary-prefix
+    /// partition in one native branch-and-bound session.
+    ///
+    /// This explicit API requires a clean one-sided margin named by
+    /// [`Model::mark_margin_row`]. A rigorous interrupted-tree bound may
+    /// trigger caller-frame proof replay only after a strict exact threshold
+    /// crossing; the bound itself is never verdict authority. Infeasibility
+    /// still requires an independently verified
+    /// [`MilpInfeasibilityCertificate`] against the original model, even when
+    /// the generic [`SolveOpts::with_require_certificates`] policy is disabled.
+    ///
+    /// Prefix validation, incumbent ownership, and the single absolute
+    /// deadline are identical to [`Self::check_shared_binary_prefix`].
+    pub fn check_marked_margin_shared_binary_prefix(
+        &mut self,
+        split_cols: &[Col],
+    ) -> Result<Outcome, MilpError> {
+        self.validate_shared_binary_prefix(split_cols)?;
+        self.check_with_shared_binary_prefix(split_cols, None, MarginMode::Required, None)
+    }
+
+    /// Select four marked-margin shared-prefix columns with a bounded staged
+    /// target-FSB scan, then solve the same complete prefix partition.
+    ///
+    /// `fallback_prefix` is the exact prefix used when advice is disabled or
+    /// declines. `candidates` is an independent ordered shortlist of four
+    /// through eight binary columns. The selector runs
+    /// only after the reframed native solver has prepared its ordinary root LP,
+    /// so it reuses that target-objective basis instead of paying for a second
+    /// root. It probes every candidate at the root, retains five, then selects
+    /// the remaining columns only inside one worst-bound child at each stage.
+    /// It never probes the complete 16-leaf prefix.
+    ///
+    /// Every probe bound is rigorous weak-duality arithmetic but remains
+    /// ranking advice only. The selected columns merely replace the ordered
+    /// inputs to the existing complete frontier; all pruning, replay, and
+    /// verdict authority remain unchanged. An invalid shortlist, incomplete
+    /// scan, memory refusal, or local/caller deadline returns to
+    /// `fallback_prefix` as a whole. A completed probe with no finite safe bound
+    /// remains the weakest possible (`-infinity`) advice, so mixed or
+    /// all-missing numerical evidence backfills deterministically in caller
+    /// order without acquiring proof authority. No partial scan is used.
+    pub fn check_marked_margin_target_fsb_shared_binary_prefix(
+        &mut self,
+        fallback_prefix: &[Col; 4],
+        candidates: &[Col],
+        fsb_opts: &TargetFsbPrefixOpts,
+    ) -> Result<Outcome, MilpError> {
+        self.validate_shared_binary_prefix(fallback_prefix)?;
+        let request = crate::bab::TargetFsbPrefixRequest::new(candidates, *fsb_opts);
+        self.check_with_shared_binary_prefix(
+            fallback_prefix,
+            None,
+            MarginMode::Required,
+            Some(request),
+        )
     }
 
     /// Solve a complete binary-prefix partition with proof-first parallel
@@ -4794,7 +6954,7 @@ impl BabSession {
         workers: NonZeroUsize,
     ) -> Result<Outcome, MilpError> {
         self.validate_shared_binary_prefix(split_cols)?;
-        self.check_with_shared_binary_prefix(split_cols, Some(workers))
+        self.check_with_shared_binary_prefix(split_cols, Some(workers), MarginMode::Disabled, None)
     }
 
     fn validate_shared_binary_prefix(&self, split_cols: &[Col]) -> Result<(), MilpError> {
@@ -4849,6 +7009,89 @@ impl BabSession {
         &mut self,
         shared_binary_prefix: &[Col],
         proof_first_workers: Option<NonZeroUsize>,
+        margin_mode: MarginMode<'_>,
+        target_fsb_prefix: Option<crate::bab::TargetFsbPrefixRequest<'_>>,
+    ) -> Result<Outcome, MilpError> {
+        let frame = FtAdoptionFrame::enter(self);
+        frame.session.check_with_shared_binary_prefix_in_frame(
+            shared_binary_prefix,
+            proof_first_workers,
+            margin_mode,
+            target_fsb_prefix,
+        )
+    }
+
+    /// THE ONE EXIT A DEFERRED CLAIM CANNOT ESCAPE.
+    ///
+    /// The routing prelude has twenty-odd `return Ok(out)` sites, and a claim
+    /// parked by [`Self::admit_or_defer`] must be resolved on EVERY one of them,
+    /// not just on the native path. Two things go wrong otherwise, and the
+    /// second is the dangerous one:
+    ///
+    /// * a claim held when some later lane closes would survive into the NEXT
+    ///   `check()` on this session and attach to a different model's verdict;
+    /// * a later lane that CONTRADICTS the deferred claim would win silently,
+    ///   which is exactly the "first recogniser wins" failure a portfolio is
+    ///   uniquely able to see.
+    ///
+    /// Wrapping the body is what makes the resolution total. Rather than
+    /// auditing every early return — the audit that has to be redone each time
+    /// someone adds a lane — the claim is resolved HERE, once, on whatever the
+    /// body returned.
+    fn check_with_shared_binary_prefix_in_frame(
+        &mut self,
+        shared_binary_prefix: &[Col],
+        proof_first_workers: Option<NonZeroUsize>,
+        margin_mode: MarginMode<'_>,
+        target_fsb_prefix: Option<crate::bab::TargetFsbPrefixRequest<'_>>,
+    ) -> Result<Outcome, MilpError> {
+        // A claim from a PREVIOUS check on this session is never live here.
+        self.deferred_claim = None;
+        self.last_deferred = None;
+        // The same objective view the body builds, rebuilt here because the
+        // body owns its copy. Identical construction, deliberately duplicated
+        // rather than plumbed out of twenty return sites.
+        let objective_for_exit: Vec<(u32, f64)> = (0..self.model.num_cols())
+            .map(|i| (i as u32, self.model.obj_coeff(Col(i as u32))))
+            .filter(|&(_, a)| a != 0.0)
+            .collect();
+        let exact_for_exit = authoritative_exact_objective(&self.model);
+        let result = self.check_with_shared_binary_prefix_in_frame_inner(
+            shared_binary_prefix,
+            proof_first_workers,
+            margin_mode,
+            target_fsb_prefix,
+        );
+        let Ok(outcome) = result else {
+            // An error path publishes nothing, so a held claim is simply
+            // dropped rather than attached to a verdict that does not exist.
+            self.deferred_claim = None;
+            return result;
+        };
+        if self.deferred_claim.is_none() {
+            return Ok(outcome);
+        }
+        let solved = SolvedObjective {
+            coeffs: &objective_for_exit,
+            sense: self.model.sense(),
+            offset: self.model.objective_offset(),
+            exact: exact_for_exit,
+        };
+        let out = self.publish_deferred_if_native_did_not_decide(outcome, &solved);
+        // EXTEND, do not assign. Every early return inside the body has already
+        // drained the ledger into `replay_claims`; resolving the deferred claim
+        // then files ITS claims, and overwriting here would silently delete the
+        // evidence the body had collected. Appending is the only correct join.
+        self.replay_claims.extend(crate::cert_io::ledger::take());
+        Ok(out)
+    }
+
+    fn check_with_shared_binary_prefix_in_frame_inner(
+        &mut self,
+        shared_binary_prefix: &[Col],
+        proof_first_workers: Option<NonZeroUsize>,
+        margin_mode: MarginMode<'_>,
+        target_fsb_prefix: Option<crate::bab::TargetFsbPrefixRequest<'_>>,
     ) -> Result<Outcome, MilpError> {
         // ONE deadline, fixed here, for every lane this call touches.
         //
@@ -4866,7 +7109,7 @@ impl BabSession {
         // Any claim left on this thread by an earlier solve is not this solve's
         // evidence. Drop it before starting rather than risk attributing it.
         let _ = crate::cert_io::ledger::take();
-        self.replay_claims.clear();
+        self.invalidate_last_evidence();
         self.opts.deadline = self.opts.effective_deadline(started);
         self.opts.time_limit = None;
         let expired = |o: &SolveOpts| o.deadline.is_some_and(|d| Instant::now() >= d);
@@ -4876,30 +7119,1721 @@ impl BabSession {
             .filter(|&(_, a)| a != 0.0)
             .collect();
         let has_objective = self.model.has_objective();
-        // TRUE rational objective for the re-derivation gate / exact rim, present
-        // only when the model carries inexact obj coefficients.
-        let exact_objective: Option<ExactObjective> = if self.model.has_inexact_coeffs() {
-            Some((
-                objective
-                    .iter()
-                    .map(|&(c, a)| (c, self.model.obj_coeff_exact_at(c, a)))
-                    .collect(),
-                self.model.obj_offset_exact(),
-            ))
-        } else {
-            None
-        };
-        // MARGIN REFRAME (opt-in via `Model::mark_margin_row`). When the model
-        // names a band-violation row in an objective-≡0 feasibility problem,
-        // solve the equivalent margin OPTIMIZATION so dual-bound pruning wakes
-        // up, then map the reframed optimum back to the ORIGINAL feasibility
-        // verdict. `reframe` DECLINES (returns `None`, and the plain lanes below
-        // run unchanged) whenever no margin is named, the shape does not fit, or
-        // the kill switch is set — so every model without a margin mark is
-        // byte-identical. The mapped verdict still leaves through the shared
-        // `finish` gate, which re-validates its witness against THIS model.
-        if shared_binary_prefix.is_empty() {
-            if let Some(reframed) = crate::margin::reframe(&self.model, &self.opts) {
+        // TRUE rational objective for the re-derivation gate / exact rim,
+        // materialized whenever the model has an authoritative side store.
+        let exact_objective = authoritative_exact_objective(&self.model);
+
+        // Some zero-objective verification MILPs are a mechanically compiled
+        // SAT instance: clause ReLUs, one identity and one booleanization ReLU
+        // per input, and two output rows that require every clause to hold and
+        // every input to round to {0,1}.  Recovering that representation avoids
+        // asking generic branch-and-bound to rediscover CDCL through millions
+        // of LP boxes.  The recognizer is exact and fail-closed, and a SAT point
+        // still leaves through `finish`, which independently checks every
+        // original MILP row and bound.
+        //
+        // Refutations leave only through the model-bound `sat-relu-rup`
+        // channel: the exact projection is rebuilt and its bounded RUP proof
+        // independently replayed before the session can publish it.
+        let ordinary_native_check = matches!(&self.lane, MilpLane::Native)
+            && shared_binary_prefix.is_empty()
+            && proof_first_workers.is_none()
+            && target_fsb_prefix.is_none()
+            && matches!(&margin_mode, MarginMode::Auto)
+            // A MARKED MARGIN ROW IS AN OPT-IN PROOF STRATEGY, NOT A SHAPE.
+            //
+            // `MarginMode::Auto` is the default for every model, so gating on
+            // it alone let the structure routes claim margin models too. That
+            // returned before the margin dispatch, so `margin::reframe` was
+            // never called, no nested session was created, and — the part that
+            // matters — the margin lane's own evidence gate (it REFUSES to
+            // report infeasible without a verified margin tree) was skipped
+            // along with it. The lane was silently deleted on every model the
+            // routes could settle.
+            //
+            // A caller that calls `Model::mark_margin_row` has named the proof
+            // it wants, and that proof lands on `Outcome::Infeasible.tree_cert`
+            // where `validate_witnesses` re-checks it — a better carrier than a
+            // session side channel. Yield to it.
+            && self.model.margin_row().is_none()
+            && self.opts.structure_routing
+            && structure_routing_enabled();
+
+        // A NOTE ON THE PRELUDE TAX, AND ON A FIX THAT WAS TRIED AND REJECTED.
+        //
+        // The lattice device belongs to the ANCHOR — `AY_MILP_NO_STRUCTURE_ROUTE=1`
+        // runs it at the top of `bab::structural_prologue` — and on the
+        // market-split family it is the whole answer. Reaching it only through
+        // branch-and-bound means the speculative prelude runs first, and on
+        // `markshare_5_0` that costs a measured 7.5x:
+        //
+        // ```text
+        //   default                        OPTIMAL 1 @ 1.13 s   3/3
+        //   AY_MILP_NO_STRUCTURE_ROUTE=1   OPTIMAL 1 @ 0.15 s   3/3
+        // ```
+        //
+        // (`pb_route::try_solve_production_portfolio` alone held 398 of 730
+        // profile samples.) Same verdict, same evidence — pure prelude tax.
+        //
+        // TWO FIXES WERE TRIED HERE AND BOTH WERE WITHDRAWN, and recording why
+        // is more useful than the code would have been:
+        //
+        // 1. Running `lattice::try_prove` at session level and returning its
+        //    optimum directly. It restored the 0.15 s and SILENTLY DROPPED the
+        //    postsolve certificate lift `bab::solve_milp_in` performs on the way
+        //    out — `Optimal` with caller-frame evidence became
+        //    `Unknown{CertificateUnavailable}` under `--require full`. A new exit
+        //    path is a new place to lose evidence.
+        //
+        // 2. Skipping the speculative prelude whenever `lattice::recognises`
+        //    matched. Its shape scan also matches small weighted-Boolean
+        //    feasibility rows, so `6x + 10y + 14z = 18` over binaries — which
+        //    the single-row DP route refutes with a SUCCINCT typed artifact —
+        //    came back `evidence infeasible REPLAY feasibility-face-empty`
+        //    instead. Narrowing the predicate to objective-bearing models did
+        //    not save it.
+        //
+        // Both were the routing defect this file is being repaired FOR, wearing
+        // a different hat: a recogniser deciding, on its own authority, that
+        // another lane does not get to run. The tax is a BUDGET problem — the
+        // prelude's lanes are handed slices sized from the caller's deadline
+        // rather than from the model — and it should be fixed there, where the
+        // repair cannot remove anyone's ability to publish a proof.
+        // Both postures give the exact SAT/ReLU plan one proof-enabled CDCL
+        // pass: SAT lifts through the private checked-point boundary, while
+        // UNSAT binds the already replayed DAG to this model. If that bounded
+        // path declines, either posture continues to established proof lanes.
+        // Either posture may run ordinary CDCL once only when the caller has
+        // explicitly disabled its memory envelope; that legacy engine has no
+        // enforceable retained-memory limit of its own.
+        let mut pending_sat_relu_fallback = None;
+        if ordinary_native_check {
+            if let Some(plan) = crate::sat_relu::prepare_with_memory_budget(
+                &self.model,
+                self.opts.deadline,
+                self.opts.memory_budget,
+            ) {
+                let ordinary_fallback_allowed = self.opts.memory_budget.is_none();
+                let proof_deadline =
+                    sat_relu_proof_trial_deadline(self.opts.deadline, Instant::now());
+                let sat_relu_frame = crate::claim::LaneFrame::enter();
+                let proof_decision = proof_deadline.and_then(|deadline| {
+                    plan.try_solve_with_proof(&self.model, Some(deadline), self.opts.memory_budget)
+                });
+                let proof_conclusive = match proof_decision {
+                    Some(crate::sat_relu::SatReluProofDecision::Sat(checked)) => {
+                        #[cfg(test)]
+                        crate::sat_relu::test_wait_before_session_finish();
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective.clone(),
+                        };
+                        let outcome = finish_checked_sat_point(
+                            checked,
+                            has_objective,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                        );
+                        let lane_claims = sat_relu_frame.take_lane_claims();
+                        if let Some(out) = self.admit_or_defer(
+                            &crate::claim::SAT_RELU_PROOF,
+                            outcome,
+                            &solved,
+                            lane_claims,
+                            Finisher::AlreadyFinished,
+                        ) {
+                            self.replay_claims = crate::cert_io::ledger::take();
+                            return Ok(out);
+                        }
+                        true
+                    }
+                    Some(crate::sat_relu::SatReluProofDecision::Unsat(certificate)) => {
+                        self.sat_relu_infeasibility_certificate = Some(certificate);
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective.clone(),
+                        };
+                        let outcome = Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        };
+                        let outcome = finish_exact_reduction_with_supplemental_proof(
+                            outcome,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                            SupplementalProof::VerifiedSatReluInfeasibility,
+                        );
+                        let lane_claims = sat_relu_frame.take_lane_claims();
+                        if let Some(out) = self.admit_or_defer(
+                            &crate::claim::SAT_RELU_PROOF,
+                            outcome,
+                            &solved,
+                            lane_claims,
+                            Finisher::AlreadyFinished,
+                        ) {
+                            self.replay_claims = crate::cert_io::ledger::take();
+                            return Ok(out);
+                        }
+                        true
+                    }
+                    None if ordinary_fallback_allowed => {
+                        // The bounded proof path can decline on its local
+                        // deadline/codec envelope. Retain the recognized plan,
+                        // but do not solve it yet: certified routes get first
+                        // refusal and the ordinary fallback runs at most once
+                        // at its claim-lattice position below.
+                        drop(sat_relu_frame);
+                        false
+                    }
+                    None => {
+                        drop(sat_relu_frame);
+                        false
+                    }
+                };
+
+                if !proof_conclusive && ordinary_fallback_allowed {
+                    pending_sat_relu_fallback = Some(plan);
+                }
+            }
+        }
+
+        // The GF(2) route historically lived only inside `bab::solve_milp`.
+        // That is too late for a session: one of the proof-exporting exact
+        // routes below may return before branch-and-bound is entered, leaving
+        // a valid parity contradiction with no parity artifact attached to the
+        // session. Give the narrowly recognized family first refusal here,
+        // then independently replay its source-row contradiction before it is
+        // allowed to satisfy the full-evidence policy.
+        //
+        // A parity optimum is intentionally different. GF(2) enumeration is
+        // an exact internal proof, but it does not yet export a typed
+        // optimality artifact. In `require full` posture retain its exact point
+        // only as an incumbent seed and continue to a proof-producing route;
+        // never let the infeasibility side artifact certify an optimum.
+        if ordinary_native_check {
+            if let Some(parity_outcome) = crate::parity::try_solve(&self.model, self.opts.deadline)
+            {
+                let parity_certificate = crate::parity::take_pending_infeasibility_certificate();
+                match parity_outcome {
+                    outcome @ Outcome::Infeasible { .. } => {
+                        if let Some(certificate) = parity_certificate.filter(|certificate| {
+                            crate::verify_parity_infeasibility_certificate(&self.model, certificate)
+                                .is_ok()
+                        }) {
+                            self.parity_infeasibility_certificate = Some(certificate);
+                            let solved = SolvedObjective {
+                                coeffs: &objective,
+                                sense: self.model.sense(),
+                                offset: self.model.objective_offset(),
+                                exact: exact_objective,
+                            };
+                            let out = finish_exact_reduction_with_supplemental_proof(
+                                outcome,
+                                &self.model,
+                                &solved,
+                                &self.opts,
+                                SupplementalProof::VerifiedParityInfeasibility,
+                            );
+                            self.replay_claims = crate::cert_io::ledger::take();
+                            return Ok(out);
+                        }
+                        // Missing or malformed side evidence cannot authorize
+                        // an early infeasibility verdict. Fall through to the
+                        // ordinary independently certified routes.
+                    }
+                    Outcome::Optimal { model_values, .. } if self.opts.require_certificates => {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                    }
+                    Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        ..
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                    }
+                    outcome => {
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let out = finish_exact_reduction(outcome, &self.model, &solved, &self.opts);
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+
+        // Complete disjunctive single-machine scheduling formulations are
+        // solved by an exact subset/Pareto DP. Recognition consumes every
+        // source row and column, reconstruction is checked against the source
+        // model, and this posture independently replays the typed model-bound
+        // artifact before it may certify optimality. A structural, resource,
+        // deadline, or source-witness miss falls through unchanged.
+        if ordinary_native_check {
+            if let Some(scheduling) =
+                crate::scheduling_route::try_solve_certified(&self.model, self.opts.deadline)
+            {
+                let crate::scheduling_route::SingleMachineSchedulingDecision::Optimal {
+                    value,
+                    model_values,
+                    certificate,
+                } = scheduling;
+                self.single_machine_scheduling_optimality_certificate = Some(certificate);
+                let solved = SolvedObjective {
+                    coeffs: &objective,
+                    sense: self.model.sense(),
+                    offset: self.model.objective_offset(),
+                    exact: exact_objective,
+                };
+                let outcome = Outcome::Optimal {
+                    value,
+                    model_values,
+                    cert: None,
+                };
+                let out = finish_exact_reduction_with_supplemental_proof(
+                    outcome,
+                    &self.model,
+                    &solved,
+                    &self.opts,
+                    SupplementalProof::VerifiedSingleMachineSchedulingOptimality,
+                );
+                self.replay_claims = crate::cert_io::ledger::take();
+                return Ok(out);
+            }
+        }
+
+        // PROOF-EXPORTING ROUTES RUN IN BOTH POSTURES AFTER THE BOUNDED
+        // SAT/RELU PROOF ROUTE HAS DECLINED.
+        //
+        // Every lane below exports a typed artifact that is independently
+        // replayed against a freshly rebuilt projection of THIS source model
+        // before the verdict is returned, and is published on the session's
+        // typed accessors.  Gating that on `require_certificates` was a
+        // measured evidence DOWNGRADE: the CLI ships `--require witness`, so
+        // the default posture fell through to the REPLAY-only lanes below
+        // (`sat-relu-cnf-unsat`, `direct-cnf-unsat`, `pb-projection-*`) and a
+        // model that could be refuted by a succinct, third-party-checkable
+        // proof emitted an unbacked replay claim instead —
+        // `ay-milp verify` exit 10 under the default and exit 0 under
+        // `--require full` on the SAME model.
+        //
+        // The exact SAT/ReLU route above participates in both postures and
+        // returns its checked SAT point or model-bound UNSAT artifact directly.
+        // Only a bounded proof miss reaches this point. A recognized plan from
+        // a caller without an explicit memory envelope is retained, but its
+        // ordinary-CDCL fallback waits until every typed route below has had
+        // first refusal; budgeted postures never enter that unmetered engine.
+        // Every other REPLAY-only route remains behind the sealed lanes, so a
+        // generic model that can export a succinct proof still does so.
+        // Feasible/optimal answers and bare exhaustion otherwise stay on the
+        // native proof-producing path.
+        if ordinary_native_check {
+            // The network route has its own model-bound artifact boundary: it
+            // rebuilds the eager Hoffman projection and independently replays
+            // either the empty master or the strict-better objective face.
+            // A proof-export miss carries a one-shot continuation: a checked
+            // conclusive raw result, or exactly the distinct lazy Benders arm.
+            // It never authorizes the eager/symmetry/PB work to run twice.
+            let network_attempt_started = Instant::now();
+            let network_attempt = crate::network_design_route::try_solve_certified_attempt(
+                &self.model,
+                self.opts.deadline,
+            );
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE network-design-attempt t={:.6}s applicable={}",
+                    network_attempt_started.elapsed().as_secs_f64(),
+                    !matches!(
+                        network_attempt,
+                        crate::network_design_route::CertifiedNetworkDesignAttempt::NotApplicable
+                    ),
+                );
+            }
+            let certified_network = match network_attempt {
+                crate::network_design_route::CertifiedNetworkDesignAttempt::NotApplicable => None,
+                crate::network_design_route::CertifiedNetworkDesignAttempt::Decided(decision) => {
+                    Some(decision)
+                }
+                crate::network_design_route::CertifiedNetworkDesignAttempt::ReadyReplay(
+                    decision,
+                ) => {
+                    self.install_network_design_replay_handoff(
+                        NetworkDesignReplayHandoff::ReadyReplay(decision),
+                    );
+                    None
+                }
+                crate::network_design_route::CertifiedNetworkDesignAttempt::LazyOnly(incumbent) => {
+                    self.install_network_design_replay_handoff(
+                        NetworkDesignReplayHandoff::LazyOnly(incumbent),
+                    );
+                    None
+                }
+            };
+            if let Some(network) = certified_network {
+                match network {
+                    crate::network_design_route::CertifiedNetworkDesignDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        self.install_network_design_replay_handoff(
+                            NetworkDesignReplayHandoff::LazyOnly(Some(
+                                crate::pb_route::PbRouteDecision::Feasible {
+                                    model_values,
+                                    incumbent_only,
+                                },
+                            )),
+                        );
+                    }
+                    crate::network_design_route::CertifiedNetworkDesignDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } => {
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let outcome = Outcome::Feasible {
+                            model_values,
+                            incumbent_only,
+                            dual_bound: None,
+                        };
+                        let out = finish_exact_reduction(outcome, &self.model, &solved, &self.opts);
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                    crate::network_design_route::CertifiedNetworkDesignDecision::Infeasible(
+                        certificate,
+                    ) => {
+                        self.network_design_infeasibility_certificate = Some(certificate);
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let outcome = Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        };
+                        let out = finish_exact_reduction_with_supplemental_proof(
+                            outcome,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                            SupplementalProof::VerifiedNetworkDesignInfeasibility,
+                        );
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                    crate::network_design_route::CertifiedNetworkDesignDecision::Optimal {
+                        value,
+                        model_values,
+                        certificate,
+                    } => {
+                        self.network_design_optimality_certificate = Some(certificate);
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let outcome = Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        };
+                        let out = finish_exact_reduction_with_supplemental_proof(
+                            outcome,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                            SupplementalProof::VerifiedNetworkDesignOptimality,
+                        );
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+            }
+
+            // Integral conservation chains coupled only by covering rows
+            // admit an exact Dantzig--Wolfe decomposition. Give that typed
+            // route first refusal after network design, but only behind its
+            // advice-only matrix scout. This avoids repeatedly radix-lifting
+            // matching general-integer models through the generic PB lanes;
+            // an exact recognition or proof miss still falls through under
+            // the same caller deadline. Network design remains ahead of this
+            // broader recognizer, preserving rout's specialized path.
+            if self.may_offer_block_angular_before_network_replay()
+                && crate::block_angular_route::is_coarse_block_angular_candidate(&self.model)
+            {
+                let block_angular_frame = crate::claim::LaneFrame::enter();
+                let block_angular = crate::block_angular_route::try_solve_certified(
+                    &self.model,
+                    self.opts.deadline,
+                    self.opts.memory_budget,
+                );
+                if let Some(block_angular) = block_angular {
+                    let crate::block_angular_route::BlockAngularDecision {
+                        value,
+                        model_values,
+                        certificate,
+                    } = block_angular;
+                    self.block_angular_optimality_certificate = Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective.clone(),
+                    };
+                    let outcome = Outcome::Optimal {
+                        value,
+                        model_values,
+                        cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedBlockAngularOptimality,
+                    );
+                    let lane_claims = block_angular_frame.take_lane_claims();
+                    if let Some(out) = self.admit_or_defer(
+                        &crate::claim::BLOCK_ANGULAR,
+                        out,
+                        &solved,
+                        lane_claims,
+                        Finisher::AlreadyFinished,
+                    ) {
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                } else {
+                    drop(block_angular_frame);
+                }
+            }
+
+            let proof_deadline = pb_portfolio_trial_deadline(self.opts.deadline, Instant::now());
+            let infeasibility_probe_started = Instant::now();
+            let single_row = proof_deadline.and_then(|trial_deadline| {
+                crate::pb_route::try_prove_single_row_infeasibility(&self.model, trial_deadline)
+            });
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE infeasibility-probe single_row={:.6}s hit={}",
+                    infeasibility_probe_started.elapsed().as_secs_f64(),
+                    single_row.is_some(),
+                );
+            }
+            if let Some(crate::pb_route::PbRouteDecision::CertifiedSingleRowInfeasible {
+                certificate,
+            }) = single_row
+            {
+                self.single_row_dp_infeasibility_certificate = Some(certificate);
+                let solved = SolvedObjective {
+                    coeffs: &objective,
+                    sense: self.model.sense(),
+                    offset: self.model.objective_offset(),
+                    exact: exact_objective,
+                };
+                let outcome = Outcome::Infeasible {
+                    cert: None,
+                    tree_cert: None,
+                };
+                let out = finish_exact_reduction_with_supplemental_proof(
+                    outcome,
+                    &self.model,
+                    &solved,
+                    &self.opts,
+                    SupplementalProof::VerifiedSingleRowDpInfeasibility,
+                );
+                self.replay_claims = crate::cert_io::ledger::take();
+                return Ok(out);
+            }
+
+            // The single-row probe just declined this model; its cost is the
+            // model-derived unit that bounds the heavier BDD arm. See
+            // `probe_scaled_deadline`.
+            let single_row_cost = infeasibility_probe_started.elapsed();
+            let multi_row_started = Instant::now();
+            let multi_row = probe_scaled_deadline(
+                single_row_cost,
+                proof_deadline,
+                multi_row_started,
+            )
+            .and_then(|trial_deadline| {
+                crate::pb_route::try_prove_multi_row_infeasibility(&self.model, trial_deadline)
+            });
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE infeasibility-probe multi_row={:.6}s hit={}",
+                    multi_row_started.elapsed().as_secs_f64(),
+                    multi_row.is_some(),
+                );
+            }
+            if let Some(crate::pb_route::PbRouteDecision::CertifiedMultiRowInfeasible {
+                certificate,
+            }) = multi_row
+            {
+                self.multi_row_bdd_infeasibility_certificate = Some(certificate);
+                let solved = SolvedObjective {
+                    coeffs: &objective,
+                    sense: self.model.sense(),
+                    offset: self.model.objective_offset(),
+                    exact: exact_objective,
+                };
+                let outcome = Outcome::Infeasible {
+                    cert: None,
+                    tree_cert: None,
+                };
+                let out = finish_exact_reduction_with_supplemental_proof(
+                    outcome,
+                    &self.model,
+                    &solved,
+                    &self.opts,
+                    SupplementalProof::VerifiedMultiRowBddInfeasibility,
+                );
+                self.replay_claims = crate::cert_io::ledger::take();
+                return Ok(out);
+            }
+
+            let open_domain_started = Instant::now();
+            let open_domain = proof_deadline.and_then(|trial_deadline| {
+                crate::open_domain_route::try_prove_infeasibility(&self.model, trial_deadline)
+            });
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE infeasibility-probe open_domain={:.6}s hit={}",
+                    open_domain_started.elapsed().as_secs_f64(),
+                    open_domain.is_some(),
+                );
+            }
+            match open_domain {
+                Some(
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedSingleRowInfeasible {
+                        certificate,
+                    },
+                ) => {
+                    self.open_domain_single_row_dp_infeasibility_certificate = Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedOpenDomainSingleRowDpInfeasibility,
+                    );
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+                Some(
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedMultiRowInfeasible {
+                        certificate,
+                    },
+                ) => {
+                    self.open_domain_multi_row_bdd_infeasibility_certificate = Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedOpenDomainMultiRowBddInfeasibility,
+                    );
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+                Some(
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedHybridPbLpInfeasible {
+                        certificate,
+                    },
+                ) => {
+                    self.open_domain_hybrid_pb_lp_infeasibility_certificate = Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedOpenDomainHybridPbLpInfeasibility,
+                    );
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+                Some(
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedHybridIntegerLiftInfeasible {
+                        certificate,
+                    },
+                ) => {
+                    self.open_domain_hybrid_integer_lift_infeasibility_certificate =
+                        Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedOpenDomainHybridIntegerLiftInfeasibility,
+                    );
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+                _ => {}
+            }
+
+            // Same unit as the BDD arm above: the cheap single-row structural
+            // pass already declined this model. See `probe_scaled_deadline`.
+            let direct_hybrid_started = Instant::now();
+            let direct_hybrid =
+                probe_scaled_deadline(single_row_cost, proof_deadline, direct_hybrid_started)
+                    .and_then(|trial_deadline| {
+                        crate::hybrid_pb_lp::try_solve_certified(&self.model, Some(trial_deadline))
+                    });
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE infeasibility-probe hybrid_pb_lp={:.6}s hit={}",
+                    direct_hybrid_started.elapsed().as_secs_f64(),
+                    direct_hybrid.is_some(),
+                );
+            }
+            match direct_hybrid {
+                Some(crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Infeasible(certificate)) => {
+                    self.hybrid_pb_lp_infeasibility_certificate = Some(certificate);
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    let out = finish_exact_reduction_with_supplemental_proof(
+                        outcome,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                        SupplementalProof::VerifiedHybridPbLpInfeasibility,
+                    );
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+                Some(_) => {}
+                None => {
+                    let lifted_hybrid_started = Instant::now();
+                    let lifted_hybrid = probe_scaled_deadline(
+                        single_row_cost,
+                        proof_deadline,
+                        lifted_hybrid_started,
+                    )
+                    .and_then(|trial_deadline| {
+                        crate::hybrid_integer_lift::try_solve_certified(
+                            &self.model,
+                            Some(trial_deadline),
+                        )
+                    });
+                    if let Some(
+                        crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Infeasible(
+                            certificate,
+                        ),
+                    ) = lifted_hybrid
+                    {
+                        self.hybrid_integer_lift_infeasibility_certificate = Some(certificate);
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let outcome = Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        };
+                        let out = finish_exact_reduction_with_supplemental_proof(
+                            outcome,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                            SupplementalProof::VerifiedHybridIntegerLiftInfeasibility,
+                        );
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        // POSTURE IS A FILTER ON EVIDENCE, NOT A SWITCH ON WORK.
+        //
+        // This block used to read `&& !self.opts.require_certificates`, and
+        // that one conjunct WAS the posture inversion. `--require full` skipped
+        // the whole block and fell through to the proof-producing tree, while
+        // the shipped default (`--require witness`) ran it and took the REPLAY.
+        // The strict mode therefore got the succinct proof and the DEFAULT got
+        // the weak one. MEASURED on `W1_unsat_v9_c14_000008` before this change:
+        //
+        // ```text
+        //   --require none      INFEASIBLE     758 bytes   verify exit 10
+        //   --require witness   INFEASIBLE     758 bytes   verify exit 10   <- the default
+        //   --require full      INFEASIBLE  19,664 bytes   verify exit  0
+        // ```
+        //
+        // The CLI's own documentation already called `--require` a "post-hoc
+        // verdict FILTER, not a work switch"; the code disagreed. With the
+        // conjunct gone every posture sees the same candidate set and
+        // `apply_cert_policy` filters the winner, so a weaker posture can never
+        // produce a weaker result — non-inversion by construction rather than
+        // by policy. `posture_never_inverts_the_evidence_it_admits` pins it.
+        //
+        // What replaces the conjunct is the EVIDENCE FLOOR: a lane may end the
+        // solve only when `claim::may_close` finds its evidence for the claim it
+        // is making at least as strong as anything the anchor could still have
+        // attached. That test is posture-independent, so deleting the conjunct
+        // does not hand the REPLAY lanes the models they were wrongly taking —
+        // it moves the decision from "which posture is this?" to "is this
+        // evidence good enough?", which is the question that was never asked.
+        if let Some(plan) = pending_sat_relu_fallback.take() {
+            // The proof-producing pass declined, and every earlier exact proof
+            // route got first refusal. Ordinary CDCL now runs once from the
+            // retained plan. Both its checked SAT point and replay-only UNSAT
+            // still pass through the claim lattice before they may publish.
+            crate::sat_relu::trace_ordinary_fallback();
+            let sat_relu_frame = crate::claim::LaneFrame::enter();
+            match plan.solve(&self.model, self.opts.deadline) {
+                Some(crate::sat_relu::SatReluDecision::Sat(checked)) => {
+                    #[cfg(test)]
+                    crate::sat_relu::test_wait_before_session_finish();
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective.clone(),
+                    };
+                    let outcome = finish_checked_sat_point(
+                        checked,
+                        has_objective,
+                        &self.model,
+                        &solved,
+                        &self.opts,
+                    );
+                    let lane_claims = sat_relu_frame.take_lane_claims();
+                    if let Some(out) = self.admit_or_defer(
+                        &crate::claim::SAT_RELU_FALLBACK,
+                        outcome,
+                        &solved,
+                        lane_claims,
+                        Finisher::AlreadyFinished,
+                    ) {
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+                Some(crate::sat_relu::SatReluDecision::Unsat) => {
+                    crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                        claim: "sat-relu-cnf-unsat".to_owned(),
+                        device: "sat-relu-reduction".to_owned(),
+                        method: "exact-structural-recovery+cdcl".to_owned(),
+                        arithmetic: "exact-dyadic+rational-rounding".to_owned(),
+                        nodes_visited: None,
+                        node_budget: 0,
+                        outcome: "exhausted".to_owned(),
+                        nondeterminism: Vec::new(),
+                        reproduce: "ay-milp solve <model> --require none".to_owned(),
+                        tcb: "ay-milp/src/sat_relu.rs+ay-milp/src/sat_route.rs+ay-sat".to_owned(),
+                    });
+                    let lane_claims = sat_relu_frame.take_lane_claims();
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        // A deferred fallback continues through every later
+                        // route and into the native anchor, so its exact
+                        // objective must survive.
+                        exact: exact_objective.clone(),
+                    };
+                    let outcome = Outcome::Infeasible {
+                        cert: None,
+                        tree_cert: None,
+                    };
+                    if let Some(out) = self.admit_or_defer(
+                        &crate::claim::SAT_RELU_FALLBACK,
+                        outcome,
+                        &solved,
+                        lane_claims,
+                        Finisher::ExactReduction,
+                    ) {
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+                None => drop(sat_relu_frame),
+            }
+        }
+        if ordinary_native_check {
+            // General semantic clause-MILP route. Unlike `sat_relu`, this is
+            // independent of a compiler layout: every exact finite row side is
+            // admitted only when it is a scaled Boolean clause (or a Boolean
+            // tautology/contradiction), and fixed 0/1 domains become units.
+            let direct_cnf_frame = crate::claim::LaneFrame::enter();
+            let direct_cnf_decision = crate::direct_cnf::try_solve(&self.model, self.opts.deadline);
+            if let Some(decision) = direct_cnf_decision {
+                let outcome = match decision {
+                    crate::sat_route::SatDecision::Sat(checked) => {
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        let out = finish_checked_sat_point(
+                            checked,
+                            has_objective,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                        );
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                    crate::sat_route::SatDecision::Unsat => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "direct-cnf-unsat".to_owned(),
+                            device: "direct-cnf-reduction".to_owned(),
+                            method: "exact-boolean-row-recovery+cdcl".to_owned(),
+                            arithmetic: "exact-rational".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/direct_cnf.rs+ay-milp/src/sat_route.rs+ay-sat"
+                                .to_owned(),
+                        });
+                        Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        }
+                    }
+                };
+                let lane_claims = direct_cnf_frame.take_lane_claims();
+                let solved = SolvedObjective {
+                    coeffs: &objective,
+                    sense: self.model.sense(),
+                    offset: self.model.objective_offset(),
+                    // Cloned for the same reason as the `sat_relu` arm above.
+                    exact: exact_objective.clone(),
+                };
+                if let Some(out) = self.admit_or_defer(
+                    &crate::claim::DIRECT_CNF,
+                    outcome,
+                    &solved,
+                    lane_claims,
+                    Finisher::ExactReduction,
+                ) {
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+            } else {
+                drop(direct_cnf_frame);
+            }
+
+            // Small capacitated network blocks can be eliminated exactly from
+            // fixed-charge formulations.  The recognizer emits the complete
+            // Hoffman projection onto a bounded-integral master; a bounded PB
+            // trial proves that master, and every surviving master point is
+            // completed by exact rational max-flow and checked against this
+            // original model.  Non-network models take only the cheap
+            // column-shape decline.  A PB/resource/deadline decline preserves
+            // most of the outer budget for native MILP search.
+            let network_decision = match self.take_pending_network_design_replay() {
+                Some(NetworkDesignReplayHandoff::ReadyReplay(decision)) => Some(decision),
+                Some(NetworkDesignReplayHandoff::LazyOnly(incumbent)) => {
+                    crate::network_design_route::try_solve_lazy_only(
+                        &self.model,
+                        self.opts.deadline,
+                        incumbent,
+                    )
+                }
+                None => crate::network_design_route::try_solve(&self.model, self.opts.deadline),
+            };
+            if let Some(decision) = network_decision {
+                let outcome = match decision {
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        None
+                    }
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } => Some(Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        dual_bound: None,
+                    }),
+                    // DELIBERATELY NOT PUBLISHED as a typed artifact. This PB
+                    // residual is a refutation of the network-design MASTER,
+                    // not of a projection of this model, so
+                    // `verify_*_infeasibility_certificate_with_deadline(&self.model, ..)`
+                    // would refute it. Publishing it would turn an honest
+                    // REPLAY claim into a SUCCINCT claim our own `.ayc` checker
+                    // rejects. The network lane's own model-bound artifact is
+                    // the `network_design_*_certificate` pair, produced by
+                    // `network_design_route::try_solve_certified` above.
+                    crate::pb_route::PbRouteDecision::Infeasible
+                    | crate::pb_route::PbRouteDecision::CertifiedSingleRowInfeasible { .. }
+                    | crate::pb_route::PbRouteDecision::CertifiedMultiRowInfeasible { .. } => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "network-design-projection-infeasible".to_owned(),
+                            device: "hoffman-network-pb-projection".to_owned(),
+                            method: "exact-hoffman-projection+bounded-pb-exhaustion".to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/presolve.rs+\
+                                  ay-milp/src/network_design_pb.rs+\
+                                  ay-milp/src/network_design_route.rs+\
+                                  ay-milp/src/pb_translate.rs+ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::Optimal {
+                        value,
+                        model_values,
+                    } => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "network-design-projection-optimal".to_owned(),
+                            device: "hoffman-network-pb-projection".to_owned(),
+                            method: "exact-hoffman-projection+bounded-pb-exhaustion+\
+                                     rational-transshipment"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/presolve.rs+\
+                                  ay-milp/src/network_design_pb.rs+\
+                                  ay-milp/src/network_design_route.rs+\
+                                  ay-milp/src/pb_translate.rs+ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        })
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let out = finish_exact_reduction(outcome, &self.model, &solved, &self.opts);
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+            }
+
+            // Bounded exact single-row pseudo-Boolean specialization. Unlike
+            // Direct-CNF, this accepts arbitrary exact rational weights and
+            // objectives over integral domains contained in {0,1}. The
+            // translator proves the PB projection exactly (including both
+            // sides of a range row and max/objective-offset mapping), the DP
+            // independently repeats negative/optimal passes, and the adapter
+            // re-checks every returned point and objective against this model.
+            // A structural/resource decline returns here immediately: generic
+            // raw PB-CDCL is trial-only and cannot consume the production
+            // solve's remaining deadline. As above, certificate-required
+            // solves stay on the case-split tree until this exhaustion proof
+            // has an exportable model-bound certificate format.
+            if let Some(decision) =
+                crate::pb_route::try_solve_specialized(&self.model, self.opts.deadline)
+            {
+                let outcome = match decision {
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        // An anytime PB incumbent is useful advice, but it is not
+                        // authority to stop an optimization solve.  Preserve a
+                        // caller-supplied seed; otherwise hand the independently
+                        // checked PB point to native branch-and-bound and keep
+                        // proving under the same absolute deadline.  The native
+                        // seeded entry point rechecks the floating representation
+                        // before using it, so an inexact/unrepresentable lift can
+                        // only be ignored.
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        None
+                    }
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } => Some(Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        dual_bound: None,
+                    }),
+                    crate::pb_route::PbRouteDecision::CertifiedSingleRowInfeasible {
+                        certificate,
+                    } => {
+                        self.single_row_dp_infeasibility_certificate = Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::CertifiedMultiRowInfeasible {
+                        certificate,
+                    } => {
+                        self.multi_row_bdd_infeasibility_certificate = Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::Infeasible => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "pb-projection-infeasible".to_owned(),
+                            device: "milp-to-pb-reduction".to_owned(),
+                            method: "exact-rational-boolean-projection+redundant-single-row-dp"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/pb_translate.rs+ay-milp/src/pb_route.rs+\
+                                  ay-pb-core/src/single_row_dp.rs"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::Optimal {
+                        value,
+                        model_values,
+                    } => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "pb-projection-optimal".to_owned(),
+                            device: "milp-to-pb-reduction".to_owned(),
+                            method: "exact-rational-boolean-projection+redundant-single-row-dp"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/pb_translate.rs+ay-milp/src/pb_route.rs+\
+                                  ay-pb-core/src/single_row_dp.rs"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        })
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let out = finish_exact_reduction(outcome, &self.model, &solved, &self.opts);
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+            }
+
+            // Compact multi-row bounded-integer models (and exact continuous
+            // objective singletons eliminated by `pb_translate`) get a bounded
+            // trial in AY's complete PB portfolio.  Exact translation owns the
+            // structural budget decision: the small dense Boolean optimization
+            // class receives a proof-sized slice, while every other translation
+            // keeps the historical short generic trial.  A decline or timeout
+            // always returns to native branch-and-bound under the same outer
+            // deadline.
+            let pb_portfolio_workers = (!self.opts.determinism)
+                .then(|| NonZeroUsize::new(self.opts.threads as usize))
+                .flatten()
+                .filter(|workers| workers.get() > 1);
+            let pb_portfolio_decision = crate::pb_route::try_solve_production_portfolio(
+                &self.model,
+                self.opts.deadline,
+                pb_portfolio_workers,
+            );
+            if let Some(decision) = pb_portfolio_decision {
+                let outcome = match decision {
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        None
+                    }
+                    crate::pb_route::PbRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } => Some(Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        dual_bound: None,
+                    }),
+                    crate::pb_route::PbRouteDecision::CertifiedMultiRowInfeasible {
+                        certificate,
+                    } => {
+                        self.multi_row_bdd_infeasibility_certificate = Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    // A typed single-row refutation is evidence; folding it into
+                    // the bare arm below traded a succinct, replayable artifact
+                    // for an unbacked replay string. Publish it exactly as the
+                    // specialized route does.
+                    crate::pb_route::PbRouteDecision::CertifiedSingleRowInfeasible {
+                        certificate,
+                    } => {
+                        self.single_row_dp_infeasibility_certificate = Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::Infeasible => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "pb-portfolio-projection-infeasible".to_owned(),
+                            device: "bounded-milp-to-pb-portfolio".to_owned(),
+                            method: "exact-rational-bounded-integer-projection+pb-exhaustion"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/pb_translate.rs+ay-milp/src/pb_route.rs+\
+                                  ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::pb_route::PbRouteDecision::Optimal {
+                        value,
+                        model_values,
+                    } => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "pb-portfolio-projection-optimal".to_owned(),
+                            device: "bounded-milp-to-pb-portfolio".to_owned(),
+                            method: "exact-rational-bounded-integer-projection+pb-exhaustion"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/pb_translate.rs+ay-milp/src/pb_route.rs+\
+                                  ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        })
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    // THROUGH THE EVIDENCE FLOOR, like every other verdict-ending
+                    // lane. The portfolio's OPTIMALITY is an exhaustion argument
+                    // over its own projection, not an exported object — and on a
+                    // model with a real objective the anchor can lift a checkable
+                    // `OptimalityCertificate`, so the portfolio must not preempt
+                    // it. See `claim::PB_PORTFOLIO`.
+                    let lane_claims = crate::cert_io::ledger::take();
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective.clone(),
+                    };
+                    if let Some(out) = self.admit_or_defer(
+                        &crate::claim::PB_PORTFOLIO,
+                        outcome,
+                        &solved,
+                        lane_claims,
+                        Finisher::ExactReduction,
+                    ) {
+                        self.replay_claims = crate::cert_io::ledger::take();
+                        return Ok(out);
+                    }
+                }
+            }
+
+            // Structurally open integer domains cannot enter the bounded PB
+            // routes above directly.  The open-domain adapter first removes
+            // only monotone existential columns, then (for optimization) uses
+            // the independently checked lifted point to build an inclusive,
+            // finite objective cap.  Both transformations are rebuilt against
+            // this exact source model before a verdict is promoted.  A typed
+            // residual refutation remains succinct because its checker rebuilds
+            // this projection; only a backend that cannot export one falls back
+            // to replay evidence.
+            if let Some(decision) =
+                crate::open_domain_route::try_solve(&self.model, self.opts.deadline)
+            {
+                let outcome = match decision {
+                    crate::open_domain_route::OpenDomainRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        None
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::Feasible {
+                        model_values,
+                        incumbent_only,
+                    } => Some(Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        dual_bound: None,
+                    }),
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedSingleRowInfeasible {
+                        certificate,
+                    } => {
+                        self.open_domain_single_row_dp_infeasibility_certificate =
+                            Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedMultiRowInfeasible {
+                        certificate,
+                    } => {
+                        self.open_domain_multi_row_bdd_infeasibility_certificate =
+                            Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedHybridPbLpInfeasible {
+                        certificate,
+                    } => {
+                        self.open_domain_hybrid_pb_lp_infeasibility_certificate =
+                            Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::CertifiedHybridIntegerLiftInfeasible {
+                        certificate,
+                    } => {
+                        self.open_domain_hybrid_integer_lift_infeasibility_certificate =
+                            Some(certificate);
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::Infeasible => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "open-domain-projection-infeasible".to_owned(),
+                            device: "monotone-open-domain-projection".to_owned(),
+                            method: "exact-monotone-projection+bounded-exact-exhaustion".to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/open_domain.rs+\
+                                  ay-milp/src/open_domain_route.rs+\
+                                  ay-milp/src/pb_translate.rs+ay-milp/src/hybrid_pb_lp.rs+\
+                                  ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    crate::open_domain_route::OpenDomainRouteDecision::Optimal {
+                        value,
+                        model_values,
+                    } => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "open-domain-cap-optimal".to_owned(),
+                            device: "bounded-open-domain-objective-cap".to_owned(),
+                            method: "exact-monotone-projection+inclusive-objective-cap+\
+                                     bounded-exact-optimization"
+                                .to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/open_domain.rs+\
+                                  ay-milp/src/open_domain_route.rs+\
+                                  ay-milp/src/pb_translate.rs+ay-milp/src/hybrid_pb_lp.rs+\
+                                  ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        })
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let out = finish_exact_reduction(outcome, &self.model, &solved, &self.opts);
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+            }
+
+            // Experimental mixed bounded-integer/continuous route, explicitly
+            // armed for controlled A/Bs only. General-integer master columns
+            // first receive an exact finite radix lift; the resulting compact
+            // PB master is coupled to continuous LP subproblems. Exact Farkas
+            // combinations project valid Benders rows (or license one-assignment
+            // no-goods) back to the master. The trial deadline above reserves the
+            // native path after a decline. Infeasibility is adopted only with the
+            // typed cut-ledger/refutation artifact; an optimality result remains
+            // replay evidence because this route does not export a matching dual
+            // optimum proof.
+            let hybrid_enabled = matches!(
+                std::env::var("AY_MILP_HYBRID_PB_LP").as_deref(),
+                Ok("1") | Ok("force")
+            );
+            enum HybridCertifiedDecision {
+                Direct(crate::hybrid_pb_lp::CertifiedHybridPbLpDecision),
+                IntegerLift(crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision),
+            }
+            let hybrid_decision =
+                hybrid_pb_lp_trial_deadline(hybrid_enabled, self.opts.deadline, Instant::now())
+                    .and_then(|trial_deadline| {
+                        crate::hybrid_pb_lp::try_solve_certified(&self.model, Some(trial_deadline))
+                            .map(HybridCertifiedDecision::Direct)
+                            .or_else(|| {
+                                crate::hybrid_integer_lift::try_solve_certified(
+                                    &self.model,
+                                    Some(trial_deadline),
+                                )
+                                .map(HybridCertifiedDecision::IntegerLift)
+                            })
+                    });
+            if let Some(decision) = hybrid_decision {
+                let mut supplemental_proof = SupplementalProof::None;
+                let outcome = match decision {
+                    HybridCertifiedDecision::Direct(
+                        crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Feasible {
+                            model_values,
+                            incumbent_only,
+                        },
+                    )
+                    | HybridCertifiedDecision::IntegerLift(
+                        crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Feasible {
+                            model_values,
+                            incumbent_only,
+                        },
+                    ) if exact_reduction_feasible_must_continue_native(
+                        has_objective,
+                        incumbent_only,
+                    ) =>
+                    {
+                        if self.incumbent_seed.is_none() {
+                            self.incumbent_seed = exact_point_to_f64_seed(&model_values);
+                        }
+                        None
+                    }
+                    HybridCertifiedDecision::Direct(
+                        crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Feasible {
+                            model_values,
+                            incumbent_only,
+                        },
+                    )
+                    | HybridCertifiedDecision::IntegerLift(
+                        crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Feasible {
+                            model_values,
+                            incumbent_only,
+                        },
+                    ) => Some(Outcome::Feasible {
+                        model_values,
+                        incumbent_only,
+                        dual_bound: None,
+                    }),
+                    HybridCertifiedDecision::Direct(
+                        crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Infeasible(certificate),
+                    ) => {
+                        self.hybrid_pb_lp_infeasibility_certificate = Some(certificate);
+                        supplemental_proof = SupplementalProof::VerifiedHybridPbLpInfeasibility;
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    HybridCertifiedDecision::IntegerLift(
+                        crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Infeasible(
+                            certificate,
+                        ),
+                    ) => {
+                        self.hybrid_integer_lift_infeasibility_certificate = Some(certificate);
+                        supplemental_proof =
+                            SupplementalProof::VerifiedHybridIntegerLiftInfeasibility;
+                        Some(Outcome::Infeasible {
+                            cert: None,
+                            tree_cert: None,
+                        })
+                    }
+                    HybridCertifiedDecision::Direct(
+                        crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Optimal {
+                            value,
+                            model_values,
+                        },
+                    )
+                    | HybridCertifiedDecision::IntegerLift(
+                        crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Optimal {
+                            value,
+                            model_values,
+                        },
+                    ) => {
+                        crate::cert_io::ledger::record(crate::cert_io::ReplayClaim {
+                            claim: "hybrid-pb-lp-optimal".to_owned(),
+                            device: "binary-master-continuous-lp".to_owned(),
+                            method: "exact-pb-master+farkas-benders".to_owned(),
+                            arithmetic: "exact-rational+i128-pseudo-boolean".to_owned(),
+                            nodes_visited: None,
+                            node_budget: 0,
+                            outcome: "exhausted".to_owned(),
+                            nondeterminism: Vec::new(),
+                            reproduce: "ay-milp solve <model> --require none".to_owned(),
+                            tcb: "ay-milp/src/hybrid_integer_lift.rs+\
+                                  ay-milp/src/hybrid_pb_lp.rs+ay-milp/src/cert.rs+\
+                                  ay-milp/src/exact.rs+ay-pb-core"
+                                .to_owned(),
+                        });
+                        Some(Outcome::Optimal {
+                            value,
+                            model_values,
+                            cert: None,
+                        })
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    let out = if supplemental_proof.certifies_infeasibility() {
+                        finish_exact_reduction_with_supplemental_proof(
+                            outcome,
+                            &self.model,
+                            &solved,
+                            &self.opts,
+                            supplemental_proof,
+                        )
+                    } else {
+                        finish_exact_reduction(outcome, &self.model, &solved, &self.opts)
+                    };
+                    self.replay_claims = crate::cert_io::ledger::take();
+                    return Ok(out);
+                }
+            }
+        }
+        // `Auto` is the historical empty-prefix margin behavior. `Required`
+        // creates one nested optimization session under this already-pinned
+        // deadline. `ReframedProof` reaches the native call below; its exact
+        // bound can trigger proof replay but cannot authorize a verdict.
+        let margin_proof_target = match margin_mode {
+            MarginMode::Auto => {
+                if let Some(reframed) = crate::margin::reframe(&self.model, &self.opts) {
+                    let solved = SolvedObjective {
+                        coeffs: &objective,
+                        sense: self.model.sense(),
+                        offset: self.model.objective_offset(),
+                        exact: exact_objective,
+                    };
+                    return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
+                }
+                None
+            }
+            MarginMode::Disabled => None,
+            MarginMode::Required => {
+                let crate::margin::PreparedMargin {
+                    reframed_model,
+                    mapping,
+                } = crate::margin::prepare(&self.model).ok_or_else(|| MilpError::Session {
+                    message: "marked-margin shared prefix requires an enabled, objective-zero, \
+                              nonempty one-sided margin row"
+                        .to_owned(),
+                })?;
+                let target = mapping.proof_target(&self.model);
+                // Certificate policy belongs to the ORIGINAL verdict. A
+                // reframed MILP optimum may carry no optimality artifact even
+                // though its point is a complete original-feasibility witness;
+                // rejecting it here would discard authority the outer
+                // `finish` can independently check. The outer policy still
+                // requires evidence for any mapped Infeasible claim.
+                let sub_opts = self.opts.clone().with_require_certificates(false);
+                let mut sub = BabSession::new(reframed_model, &sub_opts)?;
+                sub.hint_branch_order(&self.branch_hints);
+                sub.shortlist_root_strong_branch_candidates(&self.root_strong_branch_shortlist);
+                let reframed_outcome = sub.check_with_shared_binary_prefix(
+                    shared_binary_prefix,
+                    None,
+                    MarginMode::ReframedProof(target),
+                    target_fsb_prefix,
+                )?;
+                let mut reframed = mapping.map(&self.model, reframed_outcome);
+                // This explicit proof API has a stronger contract than the
+                // generic `require_certificates` policy: an UNSAT mapping is
+                // authoritative only with a complete caller-frame MILP tree.
+                // In particular, a fully solved reframed MILP may report an
+                // uncertified `Optimal` result; mapping its value past the
+                // threshold must not manufacture a bare original-model
+                // `Infeasible` when the caller left the generic policy off.
+                //
+                // `MarginMapping::map` has already filtered tree artifacts
+                // against the original model. Presence here therefore means
+                // verified; the outer `finish` gate independently verifies the
+                // retained tree again without adding another full tree walk at
+                // this boundary.
+                let has_verified_margin_tree = matches!(
+                    &reframed.verdict,
+                    Outcome::Infeasible {
+                        tree_cert: Some(_),
+                        ..
+                    }
+                );
+                if reframed.verdict.is_infeasible() && !has_verified_margin_tree {
+                    reframed.verdict = Outcome::Unknown {
+                        reason: UnknownReason::CertificateUnavailable,
+                    };
+                }
                 let solved = SolvedObjective {
                     coeffs: &objective,
                     sense: self.model.sense(),
@@ -4908,7 +8842,8 @@ impl BabSession {
                 };
                 return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
             }
-        }
+            MarginMode::ReframedProof(target) => Some(target),
+        };
         let outcome = match &mut self.lane {
             MilpLane::Native => {
                 // Native branch-and-bound is the FAST path, not the only one. It
@@ -4920,43 +8855,109 @@ impl BabSession {
                 // exact rim.
                 // A session-supplied incumbent seed (advice only — exactly re-checked
                 // inside; a bad seed is dropped, never believed) reaches the tree here.
+                //
+                // THE ANCHOR'S BOUNDED FIRST REFUSAL. When a lane's verdict was
+                // deferred for being below the anchor's evidence reach, native
+                // search runs on a TIGHTENED deadline: long enough to produce
+                // the stronger proof if it can, short enough that failing to
+                // costs bounded latency rather than the caller's whole budget.
+                // The slice is derived from the model, never from how patient
+                // the caller happened to be — see `claim::ANCHOR_FIRST_REFUSAL_CAP`
+                // for why deadline-derived speculation is the specific shape
+                // that made `markshare_5_0` slower the more time it was given.
+                //
+                // With no deferred claim this is `self.opts` unchanged, so the
+                // ordinary path is byte-identical.
+                let anchor_opts = match (&self.deferred_claim, &self.opts.deadline) {
+                    (Some(_), _) => {
+                        match crate::claim::AnchorFirstRefusal::plan(
+                            Instant::now(),
+                            self.opts.deadline,
+                        ) {
+                            Some(refusal) => {
+                                let mut tightened = self.opts.clone();
+                                tightened.deadline = Some(refusal.until);
+                                std::borrow::Cow::Owned(tightened)
+                            }
+                            None => std::borrow::Cow::Borrowed(&self.opts),
+                        }
+                    }
+                    _ => std::borrow::Cow::Borrowed(&self.opts),
+                };
+                let anchor_opts: &SolveOpts = &anchor_opts;
                 let mut raw = match self.incumbent_seed.as_deref() {
                     Some(seed) => crate::bab::solve_milp_seeded(
                         &self.model,
-                        &self.opts,
+                        anchor_opts,
                         seed,
                         &self.branch_hints,
                         &self.root_strong_branch_shortlist,
                     ),
-                    None if !shared_binary_prefix.is_empty() => match proof_first_workers {
-                        Some(workers) => crate::bab::solve_milp_shared_binary_prefix_proof_first(
-                            &self.model,
-                            &self.opts,
-                            shared_binary_prefix,
-                            workers,
-                            &self.branch_hints,
-                            &self.root_strong_branch_shortlist,
-                        ),
-                        None => crate::bab::solve_milp_shared_binary_prefix(
-                            &self.model,
-                            &self.opts,
-                            shared_binary_prefix,
-                            &self.branch_hints,
-                            &self.root_strong_branch_shortlist,
-                        ),
-                    },
+                    None if !shared_binary_prefix.is_empty() => {
+                        match (proof_first_workers, margin_proof_target.as_ref()) {
+                            (Some(workers), None) => {
+                                crate::bab::solve_milp_shared_binary_prefix_proof_first(
+                                    &self.model,
+                                    &self.opts,
+                                    shared_binary_prefix,
+                                    workers,
+                                    &self.branch_hints,
+                                    &self.root_strong_branch_shortlist,
+                                )
+                            }
+                            (None, Some(target)) => {
+                                crate::bab::solve_milp_shared_binary_prefix_with_margin_proof(
+                                    &self.model,
+                                    &self.opts,
+                                    shared_binary_prefix,
+                                    target,
+                                    &self.branch_hints,
+                                    &self.root_strong_branch_shortlist,
+                                    target_fsb_prefix,
+                                )
+                            }
+                            (None, None) => crate::bab::solve_milp_shared_binary_prefix(
+                                &self.model,
+                                &self.opts,
+                                shared_binary_prefix,
+                                &self.branch_hints,
+                                &self.root_strong_branch_shortlist,
+                            ),
+                            (Some(_), Some(_)) => {
+                                return Err(MilpError::Session {
+                                    message: "marked-margin proof target does not compose with \
+                                              proof-first prefix workers"
+                                        .to_owned(),
+                                });
+                            }
+                        }
+                    }
                     None if self.branch_hints.is_empty()
                         && self.root_strong_branch_shortlist.is_empty() =>
                     {
-                        crate::bab::solve_milp(&self.model, &self.opts)
+                        crate::bab::solve_milp(&self.model, anchor_opts)
                     }
                     None => crate::bab::solve_milp_advised(
                         &self.model,
-                        &self.opts,
+                        anchor_opts,
                         &self.branch_hints,
                         &self.root_strong_branch_shortlist,
                     ),
                 };
+                // The parity device lives below branch-and-bound's public
+                // `Outcome`, so drain its typed side artifact immediately after
+                // that call.  Rebuild the contradiction from this session's
+                // source model before retaining it; a stale, malformed, or
+                // non-infeasible pairing is discarded and can authorize
+                // neither the full-evidence policy nor certificate emission.
+                if let Some(certificate) = crate::parity::take_pending_infeasibility_certificate() {
+                    if raw.is_infeasible()
+                        && crate::verify_parity_infeasibility_certificate(&self.model, &certificate)
+                            .is_ok()
+                    {
+                        self.parity_infeasibility_certificate = Some(certificate);
+                    }
+                }
                 // An interrupted tree that holds nothing but a rigorous dual bound
                 // now reports `Bound` rather than `Unknown` (see the no-incumbent
                 // arms of `solve_milp_in`). That is still "no primal verdict", so
@@ -5019,7 +9020,7 @@ impl BabSession {
                     Outcome::Infeasible {
                         cert: None,
                         tree_cert: None,
-                    } => {
+                    } if self.parity_infeasibility_certificate.is_none() => {
                         // Bounded post-verdict certificate pass.
                         // Only when NO evidence exists yet: with a tree
                         // certificate in hand the verdict is already
@@ -5030,16 +9031,41 @@ impl BabSession {
                         // budget without finding root evidence. Hence the
                         // bounded grace: see `cert_budget_native`.
                         let budget = cert_budget_native(&self.model, &self.opts);
-                        let mut lp = ExactLp::new(&self.model);
-                        match lp.make_feasible(&budget) {
-                            LpFeasibility::Infeasible(cert) => Outcome::Infeasible {
+                        // FLOAT-FIRST, RIM-AUTHORITY (see
+                        // `tree_cert::root_float_farkas`). The exact rim alone
+                        // could not AFFORD this witness at real scale: measured
+                        // on the downstream optimization consumer's captured W1 corpus, two presolve-decided
+                        // infeasible models (1980x1567 and 1600x1290, zero
+                        // branch-and-bound nodes) shipped `evidence infeasible
+                        // NONE` because the grace expired — and the witness was
+                        // there the whole time, reachable in 5.6 ms / 3.2 ms
+                        // once the float lane proposes the ray and the rationals
+                        // only have to CHECK it (29.0 s / 16.4 s for the exact
+                        // rim to derive the same thing from cold, measured with
+                        // `AY_MILP_CERT_GRACE=0`).
+                        //
+                        // Strictly additive: the returned certificate is already
+                        // exact-verified against this model, a declining float
+                        // lane falls through to the identical exact pass below,
+                        // and `finish` re-verifies either one.
+                        match crate::tree_cert::root_float_farkas(&self.model, budget.deadline) {
+                            Some(cert) => Outcome::Infeasible {
                                 cert: Some(cert),
                                 tree_cert: None,
                             },
-                            _ => Outcome::Infeasible {
-                                cert: None,
-                                tree_cert: None,
-                            },
+                            None => {
+                                let mut lp = ExactLp::new(&self.model);
+                                match lp.make_feasible(&budget) {
+                                    LpFeasibility::Infeasible(cert) => Outcome::Infeasible {
+                                        cert: Some(cert),
+                                        tree_cert: None,
+                                    },
+                                    _ => Outcome::Infeasible {
+                                        cert: None,
+                                        tree_cert: None,
+                                    },
+                                }
+                            }
                         }
                     }
                     other => other,
@@ -5080,21 +9106,33 @@ impl BabSession {
                         cert: None,
                         tree_cert: None,
                     } => {
-                        // Bounded post-verdict certificate pass.
+                        // Bounded post-verdict certificate pass, float-first for
+                        // the same reason the native lane above is: the exact
+                        // rim derives the SAME object from cold in seconds that
+                        // checking a proposed ray takes in milliseconds. See
+                        // `tree_cert::root_float_farkas`.
                         let budget = cert_budget_for(&self.model, &self.opts);
-                        let mut lp = ExactLp::new(&self.model);
-                        match lp.make_feasible(&budget) {
-                            LpFeasibility::Infeasible(cert) => {
-                                debug_assert!(cert.verify(&self.model).is_ok());
-                                Outcome::Infeasible {
-                                    cert: Some(cert),
-                                    tree_cert: None,
-                                }
-                            }
-                            _ => Outcome::Infeasible {
-                                cert: None,
+                        match crate::tree_cert::root_float_farkas(&self.model, budget.deadline) {
+                            Some(cert) => Outcome::Infeasible {
+                                cert: Some(cert),
                                 tree_cert: None,
                             },
+                            None => {
+                                let mut lp = ExactLp::new(&self.model);
+                                match lp.make_feasible(&budget) {
+                                    LpFeasibility::Infeasible(cert) => {
+                                        debug_assert!(cert.verify(&self.model).is_ok());
+                                        Outcome::Infeasible {
+                                            cert: Some(cert),
+                                            tree_cert: None,
+                                        }
+                                    }
+                                    _ => Outcome::Infeasible {
+                                        cert: None,
+                                        tree_cert: None,
+                                    },
+                                }
+                            }
                         }
                     }
                     other => other,
@@ -5174,12 +9212,167 @@ impl BabSession {
             offset: self.model.objective_offset(),
             exact: exact_objective,
         };
-        let out = finish(outcome, &self.model, &solved, &self.opts);
+        // A threshold-crossing margin tree is finalized in the ORIGINAL
+        // feasibility frame, not this nested reframed model. Let it leave the
+        // nested session only after direct original-frame verification; the
+        // outer margin map and outer `finish` verify it again.
+        let original_margin_tree_verified = match (&margin_proof_target, &outcome) {
+            (
+                Some(target),
+                Outcome::Infeasible {
+                    tree_cert: Some(tree),
+                    ..
+                },
+            ) => tree.verify(target.proof_model()).is_ok(),
+            _ => false,
+        };
+        let parity_infeasibility_verified = outcome.is_infeasible()
+            && self
+                .parity_infeasibility_certificate
+                .as_ref()
+                .is_some_and(|certificate| {
+                    crate::verify_parity_infeasibility_certificate(&self.model, certificate).is_ok()
+                });
+        if !parity_infeasibility_verified && outcome.is_infeasible() {
+            self.parity_infeasibility_certificate = None;
+        }
+        let out = if original_margin_tree_verified {
+            outcome
+        } else if parity_infeasibility_verified {
+            finish_exact_reduction_with_supplemental_proof(
+                outcome,
+                &self.model,
+                &solved,
+                &self.opts,
+                SupplementalProof::VerifiedParityInfeasibility,
+            )
+        } else {
+            finish(outcome, &self.model, &solved, &self.opts)
+        };
+        // THE DEFERRED CLAIM COMES BACK. This is the half of the invariant that
+        // makes deferral safe: a claim held for being below the anchor's
+        // evidence reach is published verbatim whenever the anchor did not in
+        // fact do better. There is no path on which it is dropped.
+        let out = self.publish_deferred_if_native_did_not_decide(out, &solved);
         // Drain the ledger into the session that produced it. A verdict the
         // `finish` gate withheld keeps its claims too: `--emit-cert` on an
         // `Unknown` still reports what the device tried.
         self.replay_claims = crate::cert_io::ledger::take();
         Ok(out)
+    }
+
+    /// Resolve a deferred lane verdict against what native search came back
+    /// with. Three cases, and only three:
+    ///
+    /// 1. **Native decided, and agrees.** Native's verdict is published. Its
+    ///    evidence is by construction at least as strong as the deferred claim's
+    ///    (that is precisely why the claim was deferred), so this is the case the
+    ///    deferral was FOR — on `W1_unsat_v9_c14_000008` it turns 758
+    ///    unverifiable bytes into a 19,664-byte tree certificate `verify`
+    ///    accepts at exit 0. The lane's replay claim rides along as
+    ///    corroboration rather than being discarded.
+    /// 2. **Native did not decide** (timeout, `Bound`, `Unknown`). The deferred
+    ///    verdict is published unchanged. The comparison here is `verdict`
+    ///    against `Unknown` and `Replay` against nothing — dominance on both
+    ///    axes, with nothing predicted and nothing to tune.
+    /// 3. **Native decided and CONTRADICTS the deferred claim.** Two independent
+    ///    exact engines disagree about the same model. Neither answer may be
+    ///    published: the greedy router resolved this silently by letting
+    ///    whichever lane ran first win, and that is the one failure mode a
+    ///    portfolio is uniquely able to SEE. Fail closed to `WitnessRejected`
+    ///    naming both sides. Across ~3,300 adversarial models, 542 corpus solves
+    ///    and 393 certificate splices this has never fired; if it ever does,
+    ///    saying so is worth more than either answer.
+    fn publish_deferred_if_native_did_not_decide(
+        &mut self,
+        native: Outcome,
+        solved: &SolvedObjective<'_>,
+    ) -> Outcome {
+        let Some(deferred) = self.deferred_claim.take() else {
+            return native;
+        };
+        // CASE 3 IS CHECKED FIRST, AND IT IS CHECKED AGAINST *ANY* NATIVE
+        // ANSWER, NOT ONLY A DECIDED ONE. A native `Feasible` is not a decided
+        // verdict — it is an interrupted search holding a point — but a POINT
+        // still flatly contradicts a refutation, and resolving that by the
+        // ordinary "native did not decide, publish the deferred claim" rule
+        // would publish INFEASIBLE for a model native had just exhibited a
+        // feasible point of. That is the greedy router's silent-resolution
+        // failure re-created inside the fix, so it is ruled out here rather
+        // than downstream.
+        let native_exhibits_a_point =
+            matches!(native, Outcome::Feasible { .. } | Outcome::Optimal { .. });
+        let deferred_refutes = matches!(deferred.outcome, Outcome::Infeasible { .. });
+        let deferred_exhibits_a_point = matches!(
+            deferred.outcome,
+            Outcome::Feasible { .. } | Outcome::Optimal { .. }
+        );
+        let native_refutes = matches!(native, Outcome::Infeasible { .. });
+        let trap = |native: &Outcome, deferred: &crate::claim::Deferred| Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected {
+                detail: format!(
+                    "portfolio disagreement: native search returned {} while lane `{}` \
+                     returned {} for the same model; neither verdict is published",
+                    verdict_word(native),
+                    deferred.lane,
+                    verdict_word(&deferred.outcome),
+                ),
+            },
+        };
+        if (native_exhibits_a_point && deferred_refutes)
+            || (native_refutes && deferred_exhibits_a_point)
+        {
+            return trap(&native, &deferred);
+        }
+        let native_decided = !matches!(
+            native,
+            Outcome::Unknown { .. } | Outcome::Bound { .. } | Outcome::Feasible { .. }
+        );
+        if native_decided {
+            // Remaining cross-class disagreements (an unbounded objective
+            // against a refutation, say).
+            let contradiction = match (&native, &deferred.outcome) {
+                (Outcome::Infeasible { .. }, Outcome::Infeasible { .. }) => false,
+                (Outcome::Unbounded, Outcome::Unbounded) => false,
+                (Outcome::Optimal { .. }, Outcome::Optimal { .. }) => false,
+                (Outcome::Infeasible { .. }, _) | (_, Outcome::Infeasible { .. }) => true,
+                _ => false,
+            };
+            if contradiction {
+                return trap(&native, &deferred);
+            }
+            // Case 1. Publish native's verdict WITH native's artifacts AND the
+            // lane's replay claim. The union, not a choice: native decided, but
+            // native's own evidence is not guaranteed to be the stronger one —
+            // measured on a PHP(8,7) refutation, native returns
+            // `Infeasible{cert:None,tree_cert:None}` (census NONE) while the
+            // deferred lane held a REPLAY claim. Filing the lane's claim rather
+            // than dropping it is what makes this a least-upper-bound over the
+            // two answers instead of a preference for one.
+            if structure_trace_enabled() {
+                eprintln!(
+                    "AY_MILP_TRACE portfolio: native decided inside its first-refusal slice; \
+                     publishing native's verdict, lane `{}` claim filed as corroboration",
+                    deferred.lane,
+                );
+            }
+            for claim in deferred.replay_claims {
+                crate::cert_io::ledger::record(claim);
+            }
+            return native;
+        }
+        // Case 2.
+        if structure_trace_enabled() {
+            eprintln!(
+                "AY_MILP_TRACE portfolio: native did not decide inside its first-refusal \
+                 slice; publishing deferred verdict from lane `{}`",
+                deferred.lane,
+            );
+        }
+        for claim in deferred.replay_claims {
+            crate::cert_io::ledger::record(claim);
+        }
+        finish_exact_reduction(deferred.outcome, &self.model, solved, &self.opts)
     }
 
     /// Decide whether the exact SMT fallback can plausibly respect the caller's
@@ -5250,6 +9443,181 @@ impl BabSession {
     #[must_use]
     pub fn root_strong_branch_shortlist(&self) -> &[Col] {
         &self.root_strong_branch_shortlist
+    }
+}
+
+#[cfg(test)]
+mod ft_adoption_frame_tests {
+    use super::*;
+
+    fn tiny_integral_session() -> BabSession {
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        model.add_row(0.0, 1.0, &[(x, 1.0)]);
+        BabSession::new(model, &SolveOpts::new()).expect("valid tiny integral session")
+    }
+
+    #[test]
+    fn completed_check_clears_carriers_from_post_check_standalone_lp() {
+        let _guard = crate::sepstat::adoption_test_guard();
+        let mut session = tiny_integral_session();
+        let _ = session.check().expect("tiny check succeeds");
+
+        assert!(session.model.ft_adoption_solve_latch().is_none());
+        assert!(session.opts.ft_adoption_solve_latch().is_none());
+        let standalone =
+            FloatLp::from_model(session.model(), &[], Sense::Minimize).expect("standalone LP");
+        let before = crate::sepstat::adoption_forgone();
+        assert!(
+            !standalone.charge_ft_adoption_exclusion(),
+            "post-check public model leaked a stale census frame"
+        );
+        assert_eq!(crate::sepstat::adoption_forgone(), before);
+    }
+
+    #[test]
+    fn check_unwind_clears_both_local_frame_carriers() {
+        let mut session = tiny_integral_session();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _frame = FtAdoptionFrame::enter(&mut session);
+            panic!("exercise census-frame unwind cleanup");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(session.model.ft_adoption_solve_latch().is_none());
+        assert!(session.opts.ft_adoption_solve_latch().is_none());
+    }
+
+    #[test]
+    fn repeated_public_checks_clear_and_allocate_distinct_top_level_frames() {
+        let _guard = crate::sepstat::adoption_test_guard();
+        let mut session = tiny_integral_session();
+        for _ in 0..2 {
+            let _ = session.check().expect("repeated tiny check succeeds");
+            assert!(session.model.ft_adoption_solve_latch().is_none());
+            assert!(session.opts.ft_adoption_solve_latch().is_none());
+        }
+
+        let before = crate::sepstat::adoption_forgone();
+        let first = {
+            let frame = FtAdoptionFrame::enter(&mut session);
+            assert_eq!(frame.ownership(), FtAdoptionFrameOwnership::TopLevelOwner);
+            let latch = frame
+                .session
+                .model
+                .ft_adoption_solve_latch()
+                .expect("owner installed model carrier");
+            assert!(latch.charge(7));
+            latch
+        };
+        assert!(session.model.ft_adoption_solve_latch().is_none());
+        assert!(session.opts.ft_adoption_solve_latch().is_none());
+        let second = {
+            let frame = FtAdoptionFrame::enter(&mut session);
+            assert_eq!(frame.ownership(), FtAdoptionFrameOwnership::TopLevelOwner);
+            let latch = frame
+                .session
+                .opts
+                .ft_adoption_solve_latch()
+                .expect("owner installed options carrier");
+            assert!(!first.same_frame(&latch));
+            assert!(latch.charge(13));
+            latch
+        };
+        assert!(!first.same_frame(&second));
+        assert!(session.model.ft_adoption_solve_latch().is_none());
+        assert!(session.opts.ft_adoption_solve_latch().is_none());
+
+        let after = crate::sepstat::adoption_forgone();
+        assert_eq!(after.0 - before.0, 2);
+        assert_eq!(after.1 - before.1, 20);
+    }
+
+    #[test]
+    fn margin_style_nested_check_borrows_outer_frame_without_double_count() {
+        let _guard = crate::sepstat::adoption_test_guard();
+        let mut outer = tiny_integral_session();
+        let before = crate::sepstat::adoption_forgone();
+
+        {
+            let outer_frame = FtAdoptionFrame::enter(&mut outer);
+            assert_eq!(
+                outer_frame.ownership(),
+                FtAdoptionFrameOwnership::TopLevelOwner
+            );
+            let outer_latch = outer_frame
+                .session
+                .model
+                .ft_adoption_solve_latch()
+                .expect("outer model carrier");
+
+            // `margin::reframe` clones the outer model, clones these options
+            // through `BabSession::new`, then invokes the nested check.
+            let reframed_model = outer_frame.session.model.clone();
+            let nested_opts = outer_frame.session.opts.clone();
+            let mut nested =
+                BabSession::new(reframed_model, &nested_opts).expect("valid nested session");
+            {
+                let nested_frame = FtAdoptionFrame::enter(&mut nested);
+                assert_eq!(
+                    nested_frame.ownership(),
+                    FtAdoptionFrameOwnership::NestedBorrower
+                );
+                let nested_latch = nested_frame
+                    .session
+                    .opts
+                    .ft_adoption_solve_latch()
+                    .expect("nested options carrier");
+                assert!(outer_latch.same_frame(&nested_latch));
+                assert!(nested_latch.charge(29));
+            }
+            assert!(nested.model.ft_adoption_solve_latch().is_none());
+            assert!(nested.opts.ft_adoption_solve_latch().is_none());
+            assert!(
+                !outer_latch.charge(101),
+                "outer and margin-nested paths charged separate frames"
+            );
+            assert!(outer_frame
+                .session
+                .model
+                .ft_adoption_solve_latch()
+                .is_some_and(|latch| latch.same_frame(&outer_latch)));
+        }
+        assert!(outer.model.ft_adoption_solve_latch().is_none());
+        assert!(outer.opts.ft_adoption_solve_latch().is_none());
+
+        let after = crate::sepstat::adoption_forgone();
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 29);
+    }
+
+    #[test]
+    fn actual_margin_reframe_enters_one_owner_and_one_borrower() {
+        let _env_lock = ay_test_support::env::lock_env();
+        let _margin_reframe =
+            ay_test_support::env::ScopedEnvVar::unset("AY_MILP_NO_MARGIN_REFRAME");
+        let mut model = Model::new();
+        let x = model.add_binary_col();
+        let y = model.add_binary_col();
+        model.add_row(2.0, 2.0, &[(x, 1.0), (y, 1.0)]);
+        let margin = model.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
+        model
+            .mark_margin_row(margin)
+            .expect("fixture has a one-sided margin");
+        let mut session = BabSession::new(model, &SolveOpts::new()).expect("valid margin session");
+        let before = ft_adoption_frame_entry_counts();
+
+        let outcome = session.check().expect("margin reframe check succeeds");
+        assert!(outcome.is_infeasible());
+        let after = ft_adoption_frame_entry_counts();
+        assert_eq!(after.0 - before.0, 1, "outer check owns exactly one frame");
+        assert_eq!(
+            after.1 - before.1,
+            1,
+            "production margin reframe must borrow the outer frame"
+        );
+        assert!(session.model.ft_adoption_solve_latch().is_none());
+        assert!(session.opts.ft_adoption_solve_latch().is_none());
     }
 }
 
@@ -5560,6 +9928,262 @@ mod tests {
     /// is `2x >= 1` and has minimum 1/2.  Returning the proxy's 1 as a rigorous
     /// lower bound would let OBBT delete the true optimum.
     #[test]
+    fn rigorous_bound_expr_survives_mixed_sign_duals_on_one_sided_rows() {
+        use num_traits::ToPrimitive as _;
+        // REGRESSION: a multi-column objective over one-sided rows (lb = -inf) yields a dual
+        // with mixed signs. The NS slack term is then -inf for the wrong-signed rows and
+        // NEITHER global flip rescues it, so the bound was declined even though the column
+        // form succeeded on the very same model. Zeroing the offending components restores a
+        // finite bound. Coefficients come from a real star-set reachability query, where
+        // this showed up as a 100% decline rate.
+        let mut m = Model::new();
+        let cols: Vec<_> = (0..5).map(|_| m.add_col(-1.0, 1.0)).collect();
+        let a = [
+            [
+                0.316_227_766_016_837_94,
+                -0.707_106_781_186_547_6,
+                0.141_421_356_237_309_5,
+                0.0,
+                0.948_683_298_050_513_8,
+            ],
+            [
+                -0.057_735_026_918_962_58,
+                0.288_675_134_594_812_9,
+                -0.866_025_403_784_438_6,
+                0.115_470_053_837_925_15,
+                0.0,
+            ],
+            [
+                0.001_224_744_871_391_589_2,
+                0.0,
+                0.0,
+                -0.048_989_794_855_663_56,
+                0.244_948_974_278_317_83,
+            ],
+        ];
+        let b = [
+            -0.123_091_490_979_332_72,
+            0.447_213_595_499_957_9,
+            -0.001_897_366_596_101_027_5,
+        ];
+        for (row, rhs) in a.iter().zip(b.iter()) {
+            let coeffs: Vec<_> = row
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| **w != 0.0)
+                .map(|(j, &w)| (cols[j], w))
+                .collect();
+            m.add_row(f64::NEG_INFINITY, *rhs, &coeffs);
+        }
+        let g = [
+            0.774_596_669_241_483_4,
+            -0.258_198_889_747_161_1,
+            0.516_397_779_494_322_2,
+            0.0,
+            -0.129_099_444_873_580_55,
+        ];
+        let expr: Vec<_> = cols
+            .iter()
+            .zip(g.iter())
+            .filter(|(_, w)| **w != 0.0)
+            .map(|(&c, &w)| (c, w))
+            .collect();
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        for sense in [Sense::Minimize, Sense::Maximize] {
+            match s.rigorous_bound_expr(&expr, sense).expect("expr bound") {
+                Outcome::Bound { dual_bound, .. } => {
+                    assert!(
+                        dual_bound.to_f64().expect("f64").is_finite(),
+                        "{sense:?} produced a non-finite bound"
+                    );
+                }
+                other => panic!("{sense:?} declined on a solvable model: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rigorous_bound_expr_is_as_tight_as_the_column_form() {
+        use num_traits::ToPrimitive as _;
+        // The expression form must not merely be CHEAPER than the column form, it must be as
+        // TIGHT. Before the exact-rim tier existed, a weak NS answer was final and the
+        // expression form lost on exactly the queries where tightness decides an outcome.
+        // Bound x + y two ways: directly as an expression, and via a materialised column
+        // z = x + y. The answers must agree.
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(-1.0, 1.0);
+        let z = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0), (y, 1.0)]);
+        m.add_row(f64::NEG_INFINITY, 0.25, &[(x, 1.0), (y, -1.0)]);
+        // z - x - y = 0
+        m.add_row(0.0, 0.0, &[(z, 1.0), (x, -1.0), (y, -1.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+
+        for sense in [Sense::Minimize, Sense::Maximize] {
+            let via_col = match s.rigorous_bound(z, sense).expect("col") {
+                Outcome::Bound { dual_bound, .. } => dual_bound.to_f64().expect("f64"),
+                other => panic!("column form gave {other:?}"),
+            };
+            let via_expr = match s
+                .rigorous_bound_expr(&[(x, 1.0), (y, 1.0)], sense)
+                .expect("expr")
+            {
+                Outcome::Bound { dual_bound, .. } => dual_bound.to_f64().expect("f64"),
+                other => panic!("expression form gave {other:?}"),
+            };
+            assert!(
+                (via_col - via_expr).abs() < 1e-9,
+                "{sense:?}: expression {via_expr} is not as tight as column {via_col}"
+            );
+        }
+    }
+
+    #[test]
+    fn float_dual_for_expr_returns_a_usable_multiplier_vector() {
+        // The contract is only that the vector has one entry per row and is finite — it is
+        // explicitly UNTRUSTED, so there is nothing else to assert about its values. What
+        // matters is that a caller can turn it into a sound bound by weak duality, which is
+        // what the star-set caller does.
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(-1.0, 1.0);
+        m.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0), (y, 1.0)]);
+        m.add_row(f64::NEG_INFINITY, 0.25, &[(x, 1.0), (y, -1.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+
+        for sense in [Sense::Minimize, Sense::Maximize] {
+            let duals = s
+                .float_dual_for_expr(&[(x, 1.0), (y, 1.0)], sense)
+                .expect("no error")
+                .expect("float lane settles on a 2x2");
+            assert_eq!(duals.len(), 2, "one dual per row");
+            assert!(duals.iter().all(|v| v.is_finite()), "duals must be finite");
+        }
+    }
+
+    #[test]
+    fn float_dual_for_expr_validates_input_and_declines_the_empty_form() {
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        m.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        assert!(s
+            .float_dual_for_expr(&[(Col(99), 1.0)], Sense::Minimize)
+            .is_err());
+        assert!(s
+            .float_dual_for_expr(&[(x, f64::NAN)], Sense::Minimize)
+            .is_err());
+        assert!(s
+            .float_dual_for_expr(&[], Sense::Minimize)
+            .expect("no error")
+            .is_none());
+    }
+
+    #[test]
+    fn rigorous_bound_expr_matches_the_single_column_form() {
+        use num_traits::ToPrimitive as _;
+        // The expression API must agree with the column API on a one-column objective,
+        // otherwise callers cannot migrate to it.
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(-1.0, 1.0);
+        m.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0), (y, 1.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+
+        for sense in [Sense::Minimize, Sense::Maximize] {
+            let col_form = s.rigorous_bound(x, sense).expect("col bound");
+            let expr_form = s
+                .rigorous_bound_expr(&[(x, 1.0)], sense)
+                .expect("expr bound");
+            match (&col_form, &expr_form) {
+                (Outcome::Bound { dual_bound: a, .. }, Outcome::Bound { dual_bound: b, .. }) => {
+                    assert_eq!(a, b, "column and expression forms disagree for {sense:?}")
+                }
+                other => panic!("expected two bounds, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rigorous_bound_expr_bounds_a_true_linear_form() {
+        use num_traits::ToPrimitive as _;
+        // x + y over {x,y in [-1,1], x + y <= 0.5}: min -2, max 0.5. The bound must
+        // enclose that, and must NOT be tighter than it.
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(-1.0, 1.0);
+        m.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0), (y, 1.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+
+        let lo = match s
+            .rigorous_bound_expr(&[(x, 1.0), (y, 1.0)], Sense::Minimize)
+            .expect("min")
+        {
+            Outcome::Bound { dual_bound, .. } => dual_bound.to_f64().expect("f64"),
+            other => panic!("expected a bound, got {other:?}"),
+        };
+        let hi = match s
+            .rigorous_bound_expr(&[(x, 1.0), (y, 1.0)], Sense::Maximize)
+            .expect("max")
+        {
+            Outcome::Bound { dual_bound, .. } => dual_bound.to_f64().expect("f64"),
+            other => panic!("expected a bound, got {other:?}"),
+        };
+        assert!(lo <= -2.0 + 1e-9, "lower {lo} must not exceed the true -2");
+        assert!(
+            hi >= 0.5 - 1e-9,
+            "upper {hi} must not undercut the true 0.5"
+        );
+        assert!(
+            lo > -10.0 && hi < 10.0,
+            "bounds should still be useful: [{lo}, {hi}]"
+        );
+    }
+
+    #[test]
+    fn rigorous_bound_expr_accumulates_a_repeated_column() {
+        use num_traits::ToPrimitive as _;
+        // (x, 1.0) twice must mean 2x, not x.
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        let doubled = match s
+            .rigorous_bound_expr(&[(x, 1.0), (x, 1.0)], Sense::Maximize)
+            .expect("max")
+        {
+            Outcome::Bound { dual_bound, .. } => dual_bound.to_f64().expect("f64"),
+            other => panic!("expected a bound, got {other:?}"),
+        };
+        assert!(
+            doubled >= 2.0 - 1e-9,
+            "2x over [-1,1] maxes at 2, got {doubled}"
+        );
+    }
+
+    #[test]
+    fn rigorous_bound_expr_rejects_bad_input_and_handles_the_empty_form() {
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+
+        assert!(s
+            .rigorous_bound_expr(&[(Col(99), 1.0)], Sense::Minimize)
+            .is_err());
+        assert!(s
+            .rigorous_bound_expr(&[(x, f64::NAN)], Sense::Minimize)
+            .is_err());
+
+        // The empty expression is the constant 0.
+        match s.rigorous_bound_expr(&[], Sense::Minimize).expect("empty") {
+            Outcome::Bound { dual_bound, .. } => {
+                assert_eq!(dual_bound, BigRational::from_integer(0.into()));
+            }
+            other => panic!("expected an exact 0, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rigorous_bound_declines_ns_on_exact_side_store_models() {
         let mut m = Model::new();
         let x = m.add_col(0.0, 2.0);
@@ -5720,4 +10344,32 @@ mod tests {
         let s = BabSession::new(binary_model(1_025), &opts).unwrap();
         assert!(!s.smt_fallback_within_reach());
     }
+}
+
+/// Force every lazily-cached environment read in this module to happen NOW.
+///
+/// # The race this closes
+///
+/// `tune.rs` states the property the crate is supposed to have: *"The environment
+/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
+/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
+/// of the crate: 2 accessors here cache their value in a `OnceLock` and call
+/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
+/// happens to reach them — at an arbitrary point, on an arbitrary thread.
+///
+/// That is the exact hazard `EngineEconomics` was built to remove.
+/// the development design notes records the consumer's mitigation:
+/// it *"rewrites the same constant values before every window solve"*, so a
+/// `set_var` on one thread can land while another thread is mid-solve taking its
+/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
+/// is `unsafe` in edition 2024.
+///
+/// Priming collapses those windows into ONE, at solve entry, before any worker is
+/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
+/// It only moves *when* they are read, from "scattered across the solve" to "once,
+/// at a point the caller controls".
+pub(crate) fn prime_env() {
+    let _ = float_lane_enabled();
+    let _ = smt_lane_forced();
+    let _ = structure_routing_enabled();
 }

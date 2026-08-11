@@ -372,11 +372,24 @@ fn chc_required_gate_default_certificate_failure_downgrades_to_unknown() {
                 .any(|line| matches!(line.trim(), "sat" | "unsat")),
             "{gate} leaked a definitive CHC verdict: {stdout}"
         );
+        // The gate must SAY why it withheld the verdict, naming the gate that
+        // forced it. The exact phrasing is not the contract -- this asserted
+        // "required synthesized certificate generation/publication failed",
+        // which the CHC replay path no longer emits; it now reports that the
+        // certificate could not be re-discharged and that the verdict was
+        // demoted for soundness. Both are explicit fail-closed diagnostics, so
+        // the assertion pins the property rather than one superseded sentence.
         assert!(
-            stderr.contains(gate)
-                && stderr
-                    .contains("required synthesized certificate generation/publication failed"),
-            "missing required-certificate diagnostic: {stderr}"
+            stderr.contains(gate),
+            "{gate}: the diagnostic must name the gate that forced the \
+             demotion: {stderr}"
+        );
+        assert!(
+            stderr.contains("certificate")
+                && (stderr.contains("demoted to unknown")
+                    || stderr.contains("failed")
+                    || stderr.contains("could not")),
+            "{gate}: missing an explicit certificate-failure diagnostic: {stderr}"
         );
         assert!(
             stderr.contains("\"result\":\"unknown\"") || stderr.contains("\"result\": \"unknown\""),

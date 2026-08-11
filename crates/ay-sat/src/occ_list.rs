@@ -140,12 +140,42 @@ impl OccList {
     }
 
     /// Add a clause to occurrence lists for all its literals.
+    /// Grow every parallel array so literal index `idx` is addressable.
+    ///
+    /// Kept out of line: it fires once per literal-space extension, never on the
+    /// steady-state `add_clause` path.
+    #[cold]
+    #[inline(never)]
+    fn grow_to_literal(&mut self, idx: usize) {
+        let target = idx + 1;
+        self.occ.resize_with(target, Vec::new);
+        if self.track_pos_map {
+            while self.pos_map.len() < target {
+                self.pos_map.push(PosMap::default());
+            }
+        }
+        if self.track_partners {
+            self.partner.resize_with(self.occ.len(), Vec::new);
+        }
+    }
+
     pub(crate) fn add_clause(&mut self, clause_idx: usize, literals: &[Literal]) {
         let track = self.track_partners;
         let is_binary = literals.len() == 2;
         for (i, &lit) in literals.iter().enumerate() {
             let idx = lit.index();
-            if idx < self.occ.len() {
+            // Grow to cover this literal. Previously an out-of-range literal was
+            // SILENTLY DROPPED, which made the occurrence list quietly wrong
+            // whenever it had not been pre-sized — a latent hazard, and the
+            // thing that forced every engine to allocate `2 * num_vars` slots at
+            // solver construction (128 resident bytes per variable each, paid on
+            // every instance whether or not the engine ever runs). Self-sizing
+            // here lets those allocations be lazy without any caller having to
+            // remember `ensure_num_vars`.
+            if idx >= self.occ.len() {
+                self.grow_to_literal(idx);
+            }
+            {
                 let pos = self.occ[idx].len();
                 self.occ[idx].push(clause_idx);
                 if self.track_pos_map {

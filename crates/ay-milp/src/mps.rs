@@ -41,8 +41,9 @@ use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
+use smallvec::SmallVec;
 
-use crate::model::{Col, Model, Sense};
+use crate::model::{exact, Col, Model, Sense};
 
 /// A model read from an MPS file, with the names needed to report a solution in the
 /// caller's own vocabulary.
@@ -153,6 +154,13 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
     let mut ranges: Vec<Option<BigRational>> = Vec::new();
     let mut obj_offset = BigRational::zero();
     let mut integral_now = false;
+    // Generator-produced MPS files commonly repeat a very small coefficient
+    // vocabulary thousands of times.  In particular, exact decimal expansions
+    // of dyadic f64 values are expensive enough to parse that reconstructing the
+    // same rational for every nonzero dominates small-model process wall.  Cache
+    // only successful parses; callers still receive an owned value, and the
+    // mathematical result is exactly `number(text, line)`.
+    let mut number_cache: HashMap<&str, BigRational> = HashMap::new();
 
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
@@ -161,7 +169,11 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
             continue;
         }
         let indented = raw.starts_with([' ', '\t']);
-        let f: Vec<&str> = raw.split_whitespace().collect();
+        // Free-form MPS data lines normally contain at most two (name, value)
+        // pairs. Keep those fields inline instead of allocating once per line;
+        // SmallVec still preserves the reader's existing acceptance of longer
+        // extension lines by spilling only those exceptional records.
+        let f: SmallVec<[&str; 6]> = raw.split_whitespace().collect();
         if f.is_empty() {
             continue;
         }
@@ -236,8 +248,13 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                     continue;
                 }
                 let cname = f[0];
-                let c = *col_of.entry(cname.to_string()).or_insert_with(|| {
-                    col_names.push(cname.to_string());
+                let c = if let Some(&existing) = col_of.get(cname) {
+                    existing
+                } else {
+                    let index = cols.len();
+                    let owned_name = cname.to_owned();
+                    col_of.insert(owned_name.clone(), index);
+                    col_names.push(owned_name);
                     obj_coeff.push(BigRational::zero());
                     cols.push(ColBuild {
                         lb: Some(BigRational::zero()),
@@ -245,8 +262,8 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                         integral: integral_now,
                         lb_set: false,
                     });
-                    cols.len() - 1
-                });
+                    index
+                };
                 // Two (row, value) pairs per line is the norm, not the exception.
                 for pair in f[1..].chunks(2) {
                     let [rname, v] = pair else {
@@ -255,7 +272,7 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                     let r = *row_of
                         .get(*rname)
                         .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    let v = number(v, line)?;
+                    let v = cached_number(&mut number_cache, v, line)?;
                     if Some(r) == obj_row {
                         obj_coeff[c] = v;
                     } else if row_type[r] != RowType::Free {
@@ -268,7 +285,7 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                     let r = *row_of
                         .get(rname)
                         .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    let v = number(v, line)?;
+                    let v = cached_number(&mut number_cache, v, line)?;
                     if Some(r) == obj_row {
                         // An RHS on the objective row is the NEGATIVE of the objective constant.
                         obj_offset = -v;
@@ -282,7 +299,7 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                     let r = *row_of
                         .get(rname)
                         .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    ranges[r] = Some(number(v, line)?);
+                    ranges[r] = Some(cached_number(&mut number_cache, v, line)?);
                 }
             }
             Section::Bounds => {
@@ -305,9 +322,9 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
                 let c = *col_of
                     .get(cname)
                     .ok_or_else(|| err(line, &format!("no column named `{cname}`")))?;
-                let value = || -> Result<BigRational, MpsError> {
+                let mut value = || -> Result<BigRational, MpsError> {
                     let v = val.ok_or_else(|| err(line, &format!("bound `{ty}` needs a value")))?;
-                    number(v, line)
+                    cached_number(&mut number_cache, v, line)
                 };
                 match ty.as_str() {
                     "UP" | "UI" => {
@@ -605,21 +622,44 @@ fn add_scaled_row(
     // representable -- which is the entire reason the scaling was done. Any positive factor
     // preserves the row's feasible set, so this is free.
     let scale = &scale * pow2_normaliser(terms.iter().map(|(_, v)| v).chain(lo).chain(hi), &scale);
-    // Sum duplicate columns EXACTLY (matching `Model::add_row`'s dedup) so the
-    // side-store key matches the coefficient the model actually keeps.
-    let mut exact_by_col: std::collections::BTreeMap<u32, BigRational> =
-        std::collections::BTreeMap::new();
-    for (c, v) in terms {
-        let entry = exact_by_col
-            .entry(handles[*c].0)
-            .or_insert_with(BigRational::zero);
-        *entry += v * &scale;
-    }
-    let mut coeffs: Vec<(Col, f64)> = Vec::with_capacity(exact_by_col.len());
-    for (&c, sv) in &exact_by_col {
-        if sv.is_zero() {
-            continue; // a genuine cancellation: no coefficient at all
+    // MPS is column-major, so the ordinary reader path has already assembled
+    // each row in strictly increasing column order. Preserve that canonical
+    // representation directly. Non-contiguous repeated column records are
+    // legal, though, so retain exact BTreeMap consolidation as the fail-safe
+    // fallback rather than assuming generator behavior for correctness.
+    let ordered_unique = terms
+        .windows(2)
+        .all(|pair| handles[pair[0].0].0 < handles[pair[1].0].0);
+    let exact_by_col: Vec<(u32, BigRational)> = if ordered_unique {
+        terms
+            .iter()
+            .filter_map(|(column, value)| {
+                if value.is_zero() {
+                    None
+                } else {
+                    Some((handles[*column].0, value * &scale))
+                }
+            })
+            .collect()
+    } else {
+        let mut merged: std::collections::BTreeMap<u32, BigRational> =
+            std::collections::BTreeMap::new();
+        for (column, value) in terms {
+            if value.is_zero() {
+                continue;
+            }
+            let entry = merged
+                .entry(handles[*column].0)
+                .or_insert_with(BigRational::zero);
+            *entry += value * &scale;
         }
+        merged
+            .into_iter()
+            .filter(|(_, value)| !value.is_zero())
+            .collect()
+    };
+    let mut coeffs: Vec<(u32, f64)> = Vec::with_capacity(exact_by_col.len());
+    for &(c, ref sv) in &exact_by_col {
         let f = to_f64(sv);
         // Refuse ONLY what has no usable `f64` at all: a non-finite proxy, or a
         // nonzero true coefficient that would round to 0.0 (its term would
@@ -630,7 +670,7 @@ fn add_scaled_row(
                 "a row coefficient has no finite nonzero f64 representation",
             ));
         }
-        coeffs.push((Col(c), f));
+        coeffs.push((c, f));
     }
     let lo_exact = lo.map(|v| v * &scale);
     let hi_exact = hi.map(|v| v * &scale);
@@ -654,12 +694,12 @@ fn add_scaled_row(
         }
         None => f64::INFINITY,
     };
-    let row = model.add_row(lo_f, hi_f, &coeffs);
+    // `exact_by_col` is now sorted, unique and nonzero. Consume the prepared
+    // float row rather than asking `Model::add_row` to copy/sort/dedup it a
+    // second time.
+    let row = model.add_row_sorted_unique(lo_f, hi_f, coeffs);
     // Record the TRUE rational wherever the `f64` is only a rounded proxy.
-    for (&c, sv) in &exact_by_col {
-        if sv.is_zero() {
-            continue;
-        }
+    for &(c, ref sv) in &exact_by_col {
         if !exactly_f64(sv) {
             model.record_inexact_row_coeff(row, c, sv.clone());
         }
@@ -690,6 +730,9 @@ fn pow2_normaliser<'a, I: Iterator<Item = &'a BigRational>>(
     const TARGET: f64 = 1024.0;
     let mut biggest = 0.0f64;
     for v in vals {
+        if v.is_zero() {
+            continue;
+        }
         let m = (v * scale).to_f64().unwrap_or(0.0).abs();
         if m > biggest {
             biggest = m;
@@ -720,9 +763,29 @@ fn integralising_scale<'a, I: Iterator<Item = &'a BigRational>>(vals: I) -> BigR
         if v.is_zero() {
             continue;
         }
-        l = l.lcm(v.denom());
+        let denominator = v.denom();
+        // Exact f64s are dyadic, so parser-produced neural/network rows are
+        // overwhelmingly powers of two in the denominator. Their LCM is just
+        // the larger power: avoid running a BigInt GCD for every matrix term.
+        // The moment either operand is not a power of two, retain the general
+        // integer LCM path with identical mathematical semantics.
+        match (
+            power_of_two_exponent(&l),
+            power_of_two_exponent(denominator),
+        ) {
+            (Some(current), Some(candidate)) if candidate > current => {
+                l.clone_from(denominator);
+            }
+            (Some(_), Some(_)) => {}
+            _ => l = l.lcm(denominator),
+        }
     }
     BigRational::from_integer(l)
+}
+
+fn power_of_two_exponent(value: &BigInt) -> Option<u64> {
+    let trailing = value.trailing_zeros()?;
+    (value.bits() == trailing + 1).then_some(trailing)
 }
 
 /// Is `v` exactly an `f64`?
@@ -740,18 +803,21 @@ fn to_f64(v: &BigRational) -> f64 {
 ///
 /// `RHS`/`RANGES` lines carry an optional set name that nothing else references, so the field
 /// count is the only thing that says whether it is there. An odd count means it is.
-fn pairs<'a>(f: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+fn pairs<'text, 'slice>(
+    f: &'slice [&'text str],
+) -> impl Iterator<Item = (&'text str, &'text str)> + 'slice
+where
+    'text: 'slice,
+{
     let body = if f.len().is_multiple_of(2) {
         f
     } else {
         &f[1..]
     };
-    body.chunks(2)
-        .filter_map(|c| match c {
-            [a, b] => Some((*a, *b)),
-            _ => None,
-        })
-        .collect()
+    body.chunks(2).filter_map(|c| match c {
+        [a, b] => Some((*a, *b)),
+        _ => None,
+    })
 }
 
 fn parse_sense(w: &str, line: usize) -> Result<Sense, MpsError> {
@@ -770,6 +836,29 @@ fn parse_sense(w: &str, line: usize) -> Result<Sense, MpsError> {
 fn number(s: &str, line: usize) -> Result<BigRational, MpsError> {
     let t = s.trim();
     let bad = || err(line, &format!("`{s}` is not a number"));
+
+    // MPS matrices are overwhelmingly integral after generator-side scaling.
+    // Avoid building 10^0 and asking BigRational to run a GCD for that common
+    // case. This is only a representation fast path: the returned integer is
+    // exactly the same mathematical value as the general decimal parser.
+    if !t
+        .as_bytes()
+        .iter()
+        .any(|&byte| matches!(byte, b'.' | b'e' | b'E'))
+    {
+        let (digits, negative) = match t.strip_prefix('-') {
+            Some(rest) => (rest, true),
+            None => (t.strip_prefix('+').unwrap_or(t), false),
+        };
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            let magnitude: BigInt = digits.parse().map_err(|_| bad())?;
+            return Ok(BigRational::from_integer(if negative {
+                -magnitude
+            } else {
+                magnitude
+            }));
+        }
+    }
 
     // Split off an exponent, then read the mantissa as a plain decimal.
     let (mant, exp) = match t.find(['e', 'E']) {
@@ -794,21 +883,46 @@ fn number(s: &str, line: usize) -> Result<BigRational, MpsError> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
-    let numer: BigInt = digits.parse().map_err(|_| bad())?;
-    // Ten to the power of (fraction digits) is the denominator; the exponent shifts it.
-    let mut v = BigRational::new(
-        numer,
-        BigInt::from(10u8).pow(u32::try_from(frac_part.len()).map_err(|_| bad())?),
-    );
-    let ten = BigRational::from_integer(BigInt::from(10u8));
-    for _ in 0..exp.abs() {
-        if exp > 0 {
-            v *= &ten;
-        } else {
-            v /= &ten;
+    let magnitude: BigInt = digits.parse().map_err(|_| bad())?;
+    let mut numer = if neg { -magnitude } else { magnitude };
+    let decimal_power = i64::try_from(frac_part.len())
+        .map_err(|_| bad())?
+        .checked_sub(i64::from(exp))
+        .ok_or_else(bad)?;
+    let ten = BigInt::from(10u8);
+    let denom = if decimal_power >= 0 {
+        ten.pow(u32::try_from(decimal_power).map_err(|_| bad())?)
+    } else {
+        numer *= ten.pow(u32::try_from(-decimal_power).map_err(|_| bad())?);
+        BigInt::one()
+    };
+
+    // Many generated MPS files print the complete decimal expansion of an
+    // f64 dyadic. Recognize that case by exact cross multiplication and reuse
+    // the already-reduced dyadic representation. A value such as 0.9 fails
+    // this equality and takes the general decimal-rational path below.
+    if let Ok(float) = t.parse::<f64>() {
+        if let Some(candidate) = exact(float) {
+            if &numer * candidate.denom() == candidate.numer() * &denom {
+                return Ok(candidate);
+            }
         }
     }
-    Ok(if neg { -v } else { v })
+
+    Ok(BigRational::new(numer, denom))
+}
+
+fn cached_number<'a>(
+    cache: &mut HashMap<&'a str, BigRational>,
+    text: &'a str,
+    line: usize,
+) -> Result<BigRational, MpsError> {
+    if let Some(value) = cache.get(text) {
+        return Ok(value.clone());
+    }
+    let value = number(text, line)?;
+    cache.insert(text, value.clone());
+    Ok(value)
 }
 
 fn err(line: usize, message: &str) -> MpsError {
@@ -847,6 +961,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complete_f64_decimal_expansions_reuse_the_exact_dyadic_value() {
+        for encoded in [
+            "1.00001013278961181640625",
+            "0.0000000000000000000000000000000000000000001205116679319342680994407441629327872901025270013803563711078724145220331109840117278508841991424560546875",
+        ] {
+            let parsed = number(encoded, 1).expect("complete decimal expansion parses");
+            let float: f64 = encoded.parse().expect("finite f64");
+            assert_eq!(parsed, exact(float).expect("exact dyadic"));
+        }
+    }
+
+    #[test]
+    fn repeated_numbers_share_one_exact_parse_cache_entry() {
+        let mut cache = HashMap::new();
+        let encoded = "1.00001013278961181640625";
+        let first = cached_number(&mut cache, encoded, 1).expect("first parse");
+        let second = cached_number(&mut cache, encoded, 2).expect("cached parse");
+        assert_eq!(first, second);
+        assert_eq!(cache.len(), 1);
+
+        // Invalid text must not poison a later line's diagnostic or the cache.
+        assert_eq!(
+            cached_number(&mut cache, "not-a-number", 17)
+                .unwrap_err()
+                .line,
+            17
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn integralising_scale_handles_dyadic_and_general_denominators() {
+        let dyadic = [
+            BigRational::new(1.into(), 8.into()),
+            BigRational::new(3.into(), 32.into()),
+            BigRational::from_integer(7.into()),
+        ];
+        assert_eq!(
+            integralising_scale(dyadic.iter()),
+            BigRational::from_integer(32.into())
+        );
+
+        let general = [
+            BigRational::new(1.into(), 6.into()),
+            BigRational::new(1.into(), 10.into()),
+            BigRational::new(1.into(), 7.into()),
+        ];
+        assert_eq!(
+            integralising_scale(general.iter()),
+            BigRational::from_integer(210.into())
+        );
+    }
+
     /// A row with a `0.9` in it must come out with coefficients an f64 holds exactly, and the
     /// SAME feasible set: scaling by 10 turns `0.9x - y = 0` into `9x - 10y = 0`.
     #[test]
@@ -879,6 +1047,32 @@ ENDATA
                 BigRational::from_integer((a as i64).into())
             );
         }
+    }
+
+    /// Although ordinary column-major MPS input yields already ordered rows,
+    /// a repeated non-contiguous column record must still consolidate exactly.
+    /// This pins the fallback behind the parser's prepared-row fast path.
+    #[test]
+    fn noncontiguous_column_records_still_sum_exactly() {
+        let src = "\
+NAME          repeats
+ROWS
+ N  obj
+ E  r1
+COLUMNS
+    x         r1                 1
+    y         r1                 4
+    x         r1                 2
+RHS
+    R         r1                 7
+ENDATA
+";
+        let problem = read_mps(src).expect("reads repeated columns");
+        let (coefficients, lower, upper) = problem
+            .model
+            .row(problem.model.row_at(0).expect("constraint row"));
+        assert_eq!(coefficients, &[(0, 3.0), (1, 4.0)]);
+        assert_eq!((lower, upper), (7.0, 7.0));
     }
 
     #[test]

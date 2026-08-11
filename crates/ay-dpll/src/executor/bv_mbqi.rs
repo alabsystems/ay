@@ -54,6 +54,27 @@ const BV_EXHAUSTIVE_MAX_WIDTH: u32 = 8;
 /// and Sat cannot be concluded (fail-closed).
 const BV_EXHAUSTIVE_TOTAL_CAP: u64 = 1 << 16;
 
+/// Verdict of the SYMBOLIC, model-relative check of a single `forall`.
+///
+/// Enumeration can only prove a `forall` by visiting every value of every
+/// binder, so it is confined to narrow binders (`BV_EXHAUSTIVE_MAX_WIDTH`).
+/// The symbolic check reaches the same conclusion with ONE ground solve
+/// regardless of width — a width-32 binder is 4.3 billion values to enumerate
+/// but an ordinary bit-blasted query to refute.
+enum BvForallCheck {
+    /// The skolemized negation is UNSAT under the pinned model ⇒ NO binder
+    /// value falsifies the body ⇒ the `forall` HOLDS under that model. This is
+    /// a proof over the binder's ENTIRE domain, exactly like an exhaustive
+    /// enumeration, so it carries the same authority to conclude Sat.
+    Holds,
+    /// The negation is SAT: these binder values falsify the body under the
+    /// pinned model. A model-BASED counterexample — the "MB" in MBQI — rather
+    /// than a blind sample from the boundary heuristic.
+    Counterexample(Vec<TermId>),
+    /// Undecided; fail closed to the enumeration path.
+    Unknown,
+}
+
 /// BV boundary candidate generator.
 ///
 /// Given a bitvector width and optional constants from the formula body,
@@ -245,6 +266,173 @@ impl Executor {
     ///
     /// Returns `Some(result)` if BV-MBQI resolved the formula (SAT or UNSAT),
     /// or `None` if it did not find a definitive result.
+    /// Decide one `forall` against the current model SYMBOLICALLY.
+    ///
+    /// Builds `x1 = M(x1) ∧ … ∧ xn = M(xn) ∧ ¬body[skolem]` and solves it as an
+    /// isolated ground problem:
+    ///
+    /// * **UNSAT** ⇒ no assignment to the binders falsifies the body while the
+    ///   model's symbols hold their values ⇒ the `forall` holds under the model.
+    /// * **SAT** ⇒ the skolem constants' values ARE a counterexample.
+    ///
+    /// ## Why the UNSAT direction is sound
+    ///
+    /// If `M_eqs ∧ ¬body[skolem]` is UNSAT then every assignment satisfying
+    /// `M_eqs` satisfies `body` for EVERY value of the skolems — the skolems are
+    /// fresh and unconstrained, so they range over the full domain. The model
+    /// satisfies its own equalities, so the `forall` holds under it.
+    ///
+    /// This argument does not depend on which symbols were pinned, which is what
+    /// makes it safe: pinning FEWER symbols only makes UNSAT harder to reach
+    /// (never wrongly reachable), so a symbol the model does not value simply
+    /// costs completeness. That is why only leaf symbols are pinned and never
+    /// compound terms — a set of equalities binding distinct variables to one
+    /// value each is satisfiable by construction, so the premise can never be
+    /// vacuously UNSAT and mint a `Holds` out of a contradictory pin set.
+    ///
+    /// ## Why the SAT direction is sound
+    ///
+    /// The instance is added conjunctively, and the caller only ever passes
+    /// foralls in conjunctive position, so any ground instance is ENTAILED by
+    /// the asserted universal: asserting it cannot turn a satisfiable problem
+    /// unsatisfiable. This holds even if the counterexample used a value for an
+    /// unpinned symbol that differs from the model's — an entailed instance is
+    /// always safe to add, it is merely less targeted.
+    fn bv_symbolic_model_check(
+        &mut self,
+        vars: &[(String, Sort)],
+        body: TermId,
+        fallback_category: LogicCategory,
+    ) -> BvForallCheck {
+        // A nested quantifier would survive into the "ground" negation and the
+        // ground solve cannot decide it.
+        if crate::ematching::contains_quantifier(&self.ctx.terms, body) {
+            return BvForallCheck::Unknown;
+        }
+
+        // Skolemize the binders to fresh, unconstrained constants.
+        let mut subst: HashMap<String, TermId> = HashMap::default();
+        let mut skolems: Vec<TermId> = Vec::with_capacity(vars.len());
+        for (name, sort) in vars {
+            let fresh = self
+                .ctx
+                .terms
+                .mk_fresh_var(&format!("bvmbqi!{name}"), sort.clone());
+            subst.insert(name.clone(), fresh);
+            skolems.push(fresh);
+        }
+        let skolem_body = subst_vars(&mut self.ctx.terms, body, &subst);
+        let neg = self.ctx.terms.mk_not(skolem_body);
+
+        // PREMISE: the GROUND slice of the current assertions.
+        //
+        // Proving `G AND NOT body[skolem]` UNSAT establishes `G |= forall x.
+        // body` — an ENTAILMENT, not a model-relative fact. That distinction is
+        // what makes the resulting Sat cashable: the model-relative alternative
+        // (pin each symbol to its value in M) is cheaper to refute, but it only
+        // shows the forall holds under M, so it needs M to have passed the
+        // validation gate — and at this point validation is still DEFERRED
+        // (measured: `validated=false defer=true` at the Sat return). The
+        // entailment form sidesteps the model entirely.
+        //
+        // Ground instances added by earlier rounds/E-matching may appear in G.
+        // That is sound: each is entailed by an asserted universal, so any model
+        // of `G AND (all foralls)` still satisfies the original assertions.
+        let assertions = self.ctx.assertions.clone();
+        let mut sub_assertions: Vec<TermId> = Vec::with_capacity(assertions.len() + 1);
+        for a in assertions {
+            if !crate::ematching::contains_quantifier(&self.ctx.terms, a) {
+                sub_assertions.push(a);
+            }
+        }
+        sub_assertions.push(neg);
+
+        // Solve in isolation, saving every piece of state the ground solve
+        // perturbs so the enclosing solve is unaffected on every path.
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, sub_assertions.clone());
+        let saved_theory_state = self.incr_theory_state.take();
+        let saved_bv_state = self.incr_bv_state.take();
+        let saved_model = self.last_model.take();
+        let saved_model_validated = self.last_model_validated;
+        let saved_validation_stats = self.last_validation_stats.take();
+        let saved_unknown_reason = self.last_unknown_reason;
+        let saved_defer = self.defer_model_validation;
+        // The ground sub-solve runs the full check pipeline, so it also writes
+        // `last_result` and `skip_model_eval`. Leaving those perturbed leaks the
+        // sub-solve's verdict into the enclosing quantifier loop, which then
+        // mis-maps the outer result.
+        let saved_last_result = self.last_result.take();
+        let saved_skip_model_eval = self.skip_model_eval;
+        self.defer_model_validation = false;
+
+        let (detected, _) = self.detect_logic_category(&sub_assertions);
+        let sub_category = if matches!(detected, LogicCategory::Other) {
+            fallback_category
+        } else {
+            detected
+        };
+        let sub_result = self.solve_for_category(sub_category);
+
+        // Read the counterexample out BEFORE the model is restored.
+        let verdict = match sub_result {
+            Ok(SolveResult::Unsat(_)) => BvForallCheck::Holds,
+            Ok(SolveResult::Sat) => {
+                // Read the raw values out first: building the constant terms
+                // needs `&mut self.ctx.terms`, which cannot overlap the borrow
+                // of `self.last_model`.
+                let mut raw: Vec<(BigInt, u32)> = Vec::with_capacity(skolems.len());
+                let mut complete = true;
+                match self.last_model {
+                    Some(ref model) => {
+                        for &sk in &skolems {
+                            let width = match self.ctx.terms.sort(sk) {
+                                Sort::BitVec(bv_sort) => bv_sort.width,
+                                _ => {
+                                    complete = false;
+                                    break;
+                                }
+                            };
+                            match model.bv_model.as_ref().and_then(|m| m.values.get(&sk)) {
+                                Some(val) => raw.push((val.clone(), width)),
+                                None => {
+                                    // The model does not value this skolem, so
+                                    // there is no counterexample to extract.
+                                    // Fail closed rather than invent one.
+                                    complete = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => complete = false,
+                }
+                if complete {
+                    let values: Vec<TermId> = raw
+                        .into_iter()
+                        .map(|(val, width)| self.ctx.terms.mk_bitvec(val, width))
+                        .collect();
+                    BvForallCheck::Counterexample(values)
+                } else {
+                    BvForallCheck::Unknown
+                }
+            }
+            _ => BvForallCheck::Unknown,
+        };
+
+        self.ctx.assertions = saved_assertions;
+        self.incr_theory_state = saved_theory_state;
+        self.incr_bv_state = saved_bv_state;
+        self.last_model = saved_model;
+        self.last_model_validated = saved_model_validated;
+        self.last_validation_stats = saved_validation_stats;
+        self.last_unknown_reason = saved_unknown_reason;
+        self.defer_model_validation = saved_defer;
+        self.last_result = saved_last_result;
+        self.skip_model_eval = saved_skip_model_eval;
+
+        verdict
+    }
+
     pub(in crate::executor) fn try_bv_mbqi_refinement(
         &mut self,
         bv_quantifiers: &[TermId],
@@ -297,16 +485,95 @@ impl Executor {
             // forall here was enumerated EXHAUSTIVELY; only an exhaustive,
             // counterexample-free pass may conclude Sat.
             let mut all_exhaustive = true;
+            // Every forall discharged by the SYMBOLIC entailment check (as
+            // opposed to enumeration, which is model-relative). Only an
+            // all-entailed pass may emit Sat upstream.
+            let mut all_entailed = true;
 
             for &quant in bv_quantifiers {
                 let (vars, body) = match self.ctx.terms.get(quant) {
                     TermData::Forall(v, b, _) => (v.clone(), *b),
-                    _ => continue,
+                    _ => {
+                        // Not a forall we can analyse: it is NOT proven, so the
+                        // pass must not claim to have covered every quantifier.
+                        // (Before the symbolic path below, a wide binder always
+                        // cleared `all_exhaustive` anyway, so these skips could
+                        // not reach the Sat conclusion. Now that a proof is
+                        // reachable, every unanalysed quantifier must fail
+                        // closed explicitly.)
+                        all_exhaustive = false;
+                        all_entailed = false;
+                        continue;
+                    }
                 };
 
                 if vars.is_empty() || !all_vars_are_bv(&vars) {
+                    all_exhaustive = false;
+                    all_entailed = false;
                     continue;
                 }
+
+                // SYMBOLIC PATH. Enumeration proves a forall only by visiting
+                // every value of every binder, so it is confined to widths
+                // <= BV_EXHAUSTIVE_MAX_WIDTH; a width-32 binder is 4.3 billion
+                // values and one SMT-LIB benchmark binds width 2501. Measured on
+                // the official Single-Query Bitvec selection, 51 of 92 binders
+                // across the fast-bailing files exceed the width cap, and raising
+                // the cartesian cap 64x (2^16 -> 2^22) solved ZERO additional
+                // files — the per-binder width is the wall, and no cap reaches it.
+                //
+                // So when enumeration CANNOT be exhaustive, decide the forall
+                // with one ground solve instead. This is a gate on the actual
+                // reason (enumeration is infeasible here) rather than on a tuned
+                // size, and it is self-adapting: narrow binders keep the cheap
+                // enumeration, which needs no sub-solve to prove anything.
+                let enumerable = vars.iter().all(|(_, sort)| {
+                    matches!(sort, Sort::BitVec(bv) if bv.width <= BV_EXHAUSTIVE_MAX_WIDTH)
+                }) && vars
+                    .iter()
+                    .map(|(_, sort)| match sort {
+                        Sort::BitVec(bv) => 1u128 << bv.width,
+                        _ => u128::MAX,
+                    })
+                    .try_fold(1u128, |acc, d| acc.checked_mul(d))
+                    .is_some_and(|total| total <= u128::from(BV_EXHAUSTIVE_TOTAL_CAP));
+
+                if !enumerable && !model_less {
+                    match self.bv_symbolic_model_check(&vars, body, category) {
+                        BvForallCheck::Holds => {
+                            // Proven over the binders' entire domain — the same
+                            // authority an exhaustive enumeration would carry.
+                            continue;
+                        }
+                        BvForallCheck::Counterexample(values) => {
+                            let var_names: Vec<String> =
+                                vars.iter().map(|(n, _)| n.clone()).collect();
+                            let subst_map: HashMap<String, TermId> = var_names
+                                .iter()
+                                .cloned()
+                                .zip(values.iter().copied())
+                                .collect();
+                            let ground_body = subst_vars(&mut self.ctx.terms, body, &subst_map);
+                            if seen_instantiations.insert(ground_body) {
+                                new_instantiations.push(ground_body);
+                            }
+                            all_satisfied = false;
+                            all_entailed = false;
+                            continue;
+                        }
+                        BvForallCheck::Unknown => {
+                            // Fall through to the heuristic enumeration, which
+                            // can still refute even though it cannot prove.
+                        }
+                    }
+                }
+
+                // Reaching the enumeration path means this forall was not
+                // discharged by entailment (it was enumerable, model-less, or
+                // the sub-solve was undecided), so the pass loses the proof
+                // certificate even if enumeration goes on to prove it
+                // model-relatively.
+                all_entailed = false;
 
                 // Build candidate generators per variable
                 let mut generators: Vec<BvCandidateGenerator> = Vec::with_capacity(vars.len());
@@ -497,6 +764,13 @@ impl Executor {
                 // ground model there is no validated ground Sat to extend, so
                 // even an exhaustive constant-folded pass must not conclude Sat
                 // here (fail-closed; no new SAT-acceptance authority).
+                // Both proof routes cover the complete binder domain. Symbolic
+                // entailment has no candidate set; exhaustive enumeration's
+                // candidate set is the carrier itself. Preserve either proof
+                // across assertion restoration, while sampled enumeration and
+                // model-less passes remain fail-closed.
+                self.bv_quantifier_full_domain_proof =
+                    all_satisfied && (all_entailed || all_exhaustive) && !model_less;
                 if all_satisfied && all_exhaustive && !model_less {
                     return Some(Ok(SolveResult::Sat));
                 }

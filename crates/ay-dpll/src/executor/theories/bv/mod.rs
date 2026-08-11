@@ -767,7 +767,7 @@ impl Executor {
             phase_trace!("phase0.pre-bvand-flatten");
             self.flatten_bv1_bvand_assertions_with_sources(&mut source_sets);
             phase_trace!("phase0.pre-packed-mux");
-            if !self.produce_proofs_enabled() {
+            if !self.is_producing_proofs() {
                 let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
                 if derived > 0 {
                     source_sets.resize(self.ctx.assertions.len(), Vec::new());
@@ -827,7 +827,7 @@ impl Executor {
             // can collapse downstream BV users of the derived equality.
             std::mem::swap(&mut self.ctx.assertions, &mut preprocessed);
             current_assertion_source_sets = Some(preprocessed_source_sets);
-            if !self.produce_proofs_enabled() {
+            if !self.is_producing_proofs() {
                 let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
                 if derived > 0 {
                     let source_sets = current_assertion_source_sets
@@ -951,12 +951,13 @@ impl Executor {
             // where it would cause term explosion. The fixpoint loop creates
             // new selects via congruence axioms, compounding O(N^2) term growth.
             //
-            // Gate: skip the fixpoint when the formula has too many selects
-            // (> 80), since the O(selects^2) congruence axiom generation is
-            // too expensive. For smaller formulas, the fixpoint runs with a
-            // term budget (10K terms, #8140) that prevents runaway expansion
-            // on deep store chains (bubble_sort, wchains). The budget is
-            // enforced inside run_array_axiom_fixpoint_inner.
+            // Gate: skip the general fixpoint when the formula has too many
+            // selects (> 80), since the O(selects^2) congruence generation is
+            // too expensive, EXCEPT when a symbolic array `default` is active:
+            // its carrier-sensitive store axioms are semantic requirements and
+            // cannot be dropped by a performance throttle. For smaller formulas
+            // (or a required default), the fixpoint runs with a term budget (10K
+            // terms, #8140) enforced inside run_array_axiom_fixpoint_inner.
             //
             // When the fixpoint is skipped or bails on budget, the
             // expand_select_store pass and ROW axioms in
@@ -968,7 +969,9 @@ impl Executor {
             // csplit-query QF_ABV benchmarks have 2000+ trivial selects but
             // only 8 complex ones). Skipping the fixpoint causes false SAT.
             let complex_selects = self.count_complex_array_selects_in_assertions();
-            if complex_selects <= 80 {
+            let default_fixpoint_required =
+                self.has_symbolic_array_default_in_roots(assumption_roots);
+            if complex_selects <= 80 || default_fixpoint_required {
                 if assumption_roots.is_empty() {
                     if let Some(primary_formula_len) = primary_formula_len {
                         self.run_array_axiom_fixpoint_at(

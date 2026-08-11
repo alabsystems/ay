@@ -14,6 +14,7 @@ fn logic_category_from_logic_recognizes_common_logics() {
         LogicCategory::Propositional
     );
     assert_eq!(LogicCategory::from_logic("QF_BV"), LogicCategory::QfBv);
+    assert_eq!(LogicCategory::from_logic("QF_EIA"), LogicCategory::QfEia);
     assert_eq!(LogicCategory::from_logic("QF_DT"), LogicCategory::QfDt);
     assert_eq!(
         LogicCategory::from_logic("UNKNOWN_LOGIC"),
@@ -83,6 +84,7 @@ fn test_with_datatypes_propositional_upgrade() {
 fn test_with_datatypes_unsupported_returns_other() {
     // NIA + DT is not supported — must not silently drop DT axioms.
     assert_eq!(LogicCategory::QfNia.with_datatypes(), LogicCategory::Other);
+    assert_eq!(LogicCategory::QfEia.with_datatypes(), LogicCategory::Other);
     assert_eq!(LogicCategory::QfNra.with_datatypes(), LogicCategory::Other);
     assert_eq!(LogicCategory::QfNira.with_datatypes(), LogicCategory::Other);
     assert_eq!(
@@ -1088,10 +1090,12 @@ fn z3_recognizer_truth_table_pins_measured_frontier() {
     for accept in [
         "ALL",
         "HORN",
+        "HO_ALL",
         "QF_FD",
         "FP",
         "QF_FP",
-        "QF_S", // exact set
+        "QF_S",
+        "SMTFD", // exact set
         "XLIA",
         "FOOLIA",
         "LIAX",
@@ -1110,6 +1114,9 @@ fn z3_recognizer_truth_table_pins_measured_frontier() {
         "QF_SLRA",
         "QF_FPDTLIA",
         "UFBVDT", // substring / A-prefix / QF_A-prefix
+        "FS",
+        "XFS",
+        "FSX",
         "ZFP",
         "FPX", // z3 5.0.0 recognizes FP as a substring (unlike 4.15.4)
         // the five named probes and their combined siblings:
@@ -1140,6 +1147,9 @@ fn z3_recognizer_truth_table_pins_measured_frontier() {
         "M",
         "HORNBLOWER",
         "XHORN",
+        "XHO_ALL",
+        "XSMTFD",
+        "QF_SX",
         "qf_lia",
         "Qf_Lia",
         "QF_FOOBAR",

@@ -156,7 +156,9 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                         split.disequality_term,
                     )
                 else {
-                    $self.last_unknown_reason = Some(UnknownReason::ExpressionSplit);
+                    $self.record_unknown_from_origin(
+                        $crate::UnknownOrigin::UnsupportedExpressionSplit,
+                    );
                     $self.last_result = Some(SolveResult::Unknown);
                     break $loop_label Ok(SolveResult::Unknown);
                 };

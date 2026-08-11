@@ -10,8 +10,8 @@
 use ay_core::{ProofId, TermId, TermStore};
 
 use super::boolean::{
-    clause_matches_expected, clause_matches_unordered, decode_app, err, find_app, find_ite,
-    find_negated_app, find_negated_ite, make_err, ExpectedLit,
+    apps, check_any_candidate, clause_matches_expected, clause_matches_unordered, decode_app, err,
+    ites, make_err, negated_apps, negated_ites, ExpectedLit,
 };
 use super::ProofCheckError;
 
@@ -22,20 +22,27 @@ pub(crate) fn validate_equiv_pos1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_eq, args) = find_negated_app(terms, clause, "=")
-        .ok_or_else(|| make_err(step, "equiv_pos1", "clause must contain (not (= ...))"))?;
-    if args.len() != 2 {
-        return err(step, "equiv_pos1", "equality must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(not_eq),
-        ExpectedLit::Lit(args[0]),
-        ExpectedLit::Not(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "equiv_pos1", "clause shape does not match equality");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "equiv_pos1",
+        "clause must contain (not (= ...))",
+        negated_apps(terms, clause, "="),
+        |(not_eq, args)| {
+            if args.len() != 2 {
+                return Err("equality must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(not_eq),
+                ExpectedLit::Lit(args[0]),
+                ExpectedLit::Not(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match equality")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_equiv_pos2(
@@ -43,20 +50,27 @@ pub(crate) fn validate_equiv_pos2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_eq, args) = find_negated_app(terms, clause, "=")
-        .ok_or_else(|| make_err(step, "equiv_pos2", "clause must contain (not (= ...))"))?;
-    if args.len() != 2 {
-        return err(step, "equiv_pos2", "equality must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(not_eq),
-        ExpectedLit::Not(args[0]),
-        ExpectedLit::Lit(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "equiv_pos2", "clause shape does not match equality");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "equiv_pos2",
+        "clause must contain (not (= ...))",
+        negated_apps(terms, clause, "="),
+        |(not_eq, args)| {
+            if args.len() != 2 {
+                return Err("equality must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(not_eq),
+                ExpectedLit::Not(args[0]),
+                ExpectedLit::Lit(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match equality")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_equiv_neg1(
@@ -64,20 +78,27 @@ pub(crate) fn validate_equiv_neg1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (eq_term, args) = find_app(terms, clause, "=")
-        .ok_or_else(|| make_err(step, "equiv_neg1", "clause must contain an equality"))?;
-    if args.len() != 2 {
-        return err(step, "equiv_neg1", "equality must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(eq_term),
-        ExpectedLit::Not(args[0]),
-        ExpectedLit::Not(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "equiv_neg1", "clause shape does not match equality");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "equiv_neg1",
+        "clause must contain an equality",
+        apps(terms, clause, "="),
+        |(eq_term, args)| {
+            if args.len() != 2 {
+                return Err("equality must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(eq_term),
+                ExpectedLit::Not(args[0]),
+                ExpectedLit::Not(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match equality")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_equiv_neg2(
@@ -85,16 +106,23 @@ pub(crate) fn validate_equiv_neg2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (eq_term, args) = find_app(terms, clause, "=")
-        .ok_or_else(|| make_err(step, "equiv_neg2", "clause must contain an equality"))?;
-    if args.len() != 2 {
-        return err(step, "equiv_neg2", "equality must be binary");
-    }
-    let expected = [eq_term, args[0], args[1]];
-    if !clause_matches_unordered(clause, &expected) {
-        return err(step, "equiv_neg2", "clause shape does not match equality");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "equiv_neg2",
+        "clause must contain an equality",
+        apps(terms, clause, "="),
+        |(eq_term, args)| {
+            if args.len() != 2 {
+                return Err("equality must be binary");
+            }
+            let expected = [eq_term, args[0], args[1]];
+            if clause_matches_unordered(clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match equality")
+            }
+        },
+    )
 }
 
 // ---- ITE tautology rules ----
@@ -104,13 +132,20 @@ pub(crate) fn validate_ite_pos1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_ite, (c, _t, e)) = find_negated_ite(terms, clause)
-        .ok_or_else(|| make_err(step, "ite_pos1", "clause must contain (not (ite ...))"))?;
-    let expected = [not_ite, c, e];
-    if !clause_matches_unordered(clause, &expected) {
-        return err(step, "ite_pos1", "clause shape does not match ite");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "ite_pos1",
+        "clause must contain (not (ite ...))",
+        negated_ites(terms, clause),
+        |(not_ite, (c, _t, e))| {
+            let expected = [not_ite, c, e];
+            if clause_matches_unordered(clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match ite")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_ite_pos2(
@@ -118,17 +153,24 @@ pub(crate) fn validate_ite_pos2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_ite, (c, t, _e)) = find_negated_ite(terms, clause)
-        .ok_or_else(|| make_err(step, "ite_pos2", "clause must contain (not (ite ...))"))?;
-    let expected = [
-        ExpectedLit::Lit(not_ite),
-        ExpectedLit::Not(c),
-        ExpectedLit::Lit(t),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "ite_pos2", "clause shape does not match ite");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "ite_pos2",
+        "clause must contain (not (ite ...))",
+        negated_ites(terms, clause),
+        |(not_ite, (c, t, _e))| {
+            let expected = [
+                ExpectedLit::Lit(not_ite),
+                ExpectedLit::Not(c),
+                ExpectedLit::Lit(t),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match ite")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_ite_neg1(
@@ -136,17 +178,24 @@ pub(crate) fn validate_ite_neg1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (ite, (c, _t, e)) = find_ite(terms, clause)
-        .ok_or_else(|| make_err(step, "ite_neg1", "clause must contain an ite term"))?;
-    let expected = [
-        ExpectedLit::Lit(ite),
-        ExpectedLit::Lit(c),
-        ExpectedLit::Not(e),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "ite_neg1", "clause shape does not match ite");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "ite_neg1",
+        "clause must contain an ite term",
+        ites(terms, clause),
+        |(ite, (c, _t, e))| {
+            let expected = [
+                ExpectedLit::Lit(ite),
+                ExpectedLit::Lit(c),
+                ExpectedLit::Not(e),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match ite")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_ite_neg2(
@@ -154,17 +203,24 @@ pub(crate) fn validate_ite_neg2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (ite, (c, t, _e)) = find_ite(terms, clause)
-        .ok_or_else(|| make_err(step, "ite_neg2", "clause must contain an ite term"))?;
-    let expected = [
-        ExpectedLit::Lit(ite),
-        ExpectedLit::Not(c),
-        ExpectedLit::Not(t),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "ite_neg2", "clause shape does not match ite");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "ite_neg2",
+        "clause must contain an ite term",
+        ites(terms, clause),
+        |(ite, (c, t, _e))| {
+            let expected = [
+                ExpectedLit::Lit(ite),
+                ExpectedLit::Not(c),
+                ExpectedLit::Not(t),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match ite")
+            }
+        },
+    )
 }
 
 // ---- XOR tautology rules ----
@@ -174,16 +230,23 @@ pub(crate) fn validate_xor_pos1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_xor, args) = find_negated_app(terms, clause, "xor")
-        .ok_or_else(|| make_err(step, "xor_pos1", "clause must contain (not (xor ...))"))?;
-    if args.len() != 2 {
-        return err(step, "xor_pos1", "xor must be binary");
-    }
-    let expected = [not_xor, args[0], args[1]];
-    if !clause_matches_unordered(clause, &expected) {
-        return err(step, "xor_pos1", "clause shape does not match xor");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "xor_pos1",
+        "clause must contain (not (xor ...))",
+        negated_apps(terms, clause, "xor"),
+        |(not_xor, args)| {
+            if args.len() != 2 {
+                return Err("xor must be binary");
+            }
+            let expected = [not_xor, args[0], args[1]];
+            if clause_matches_unordered(clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match xor")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_xor_pos2(
@@ -191,20 +254,27 @@ pub(crate) fn validate_xor_pos2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (not_xor, args) = find_negated_app(terms, clause, "xor")
-        .ok_or_else(|| make_err(step, "xor_pos2", "clause must contain (not (xor ...))"))?;
-    if args.len() != 2 {
-        return err(step, "xor_pos2", "xor must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(not_xor),
-        ExpectedLit::Not(args[0]),
-        ExpectedLit::Not(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "xor_pos2", "clause shape does not match xor");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "xor_pos2",
+        "clause must contain (not (xor ...))",
+        negated_apps(terms, clause, "xor"),
+        |(not_xor, args)| {
+            if args.len() != 2 {
+                return Err("xor must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(not_xor),
+                ExpectedLit::Not(args[0]),
+                ExpectedLit::Not(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match xor")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_xor_neg1(
@@ -212,20 +282,27 @@ pub(crate) fn validate_xor_neg1(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (xor_term, args) = find_app(terms, clause, "xor")
-        .ok_or_else(|| make_err(step, "xor_neg1", "clause must contain a xor term"))?;
-    if args.len() != 2 {
-        return err(step, "xor_neg1", "xor must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(xor_term),
-        ExpectedLit::Lit(args[0]),
-        ExpectedLit::Not(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "xor_neg1", "clause shape does not match xor");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "xor_neg1",
+        "clause must contain a xor term",
+        apps(terms, clause, "xor"),
+        |(xor_term, args)| {
+            if args.len() != 2 {
+                return Err("xor must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(xor_term),
+                ExpectedLit::Lit(args[0]),
+                ExpectedLit::Not(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match xor")
+            }
+        },
+    )
 }
 
 pub(crate) fn validate_xor_neg2(
@@ -233,20 +310,27 @@ pub(crate) fn validate_xor_neg2(
     step: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (xor_term, args) = find_app(terms, clause, "xor")
-        .ok_or_else(|| make_err(step, "xor_neg2", "clause must contain a xor term"))?;
-    if args.len() != 2 {
-        return err(step, "xor_neg2", "xor must be binary");
-    }
-    let expected = [
-        ExpectedLit::Lit(xor_term),
-        ExpectedLit::Not(args[0]),
-        ExpectedLit::Lit(args[1]),
-    ];
-    if !clause_matches_expected(terms, clause, &expected) {
-        return err(step, "xor_neg2", "clause shape does not match xor");
-    }
-    Ok(())
+    check_any_candidate(
+        step,
+        "xor_neg2",
+        "clause must contain a xor term",
+        apps(terms, clause, "xor"),
+        |(xor_term, args)| {
+            if args.len() != 2 {
+                return Err("xor must be binary");
+            }
+            let expected = [
+                ExpectedLit::Lit(xor_term),
+                ExpectedLit::Not(args[0]),
+                ExpectedLit::Lit(args[1]),
+            ];
+            if clause_matches_expected(terms, clause, &expected) {
+                Ok(())
+            } else {
+                Err("clause shape does not match xor")
+            }
+        },
+    )
 }
 
 // ---- Derived (premise-based) rules ----

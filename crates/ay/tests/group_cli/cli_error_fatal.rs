@@ -185,9 +185,18 @@ fn test_cli_timeout_after_recoverable_error_reports_diagnostic() {
 #[timeout(60000)]
 fn test_cli_file_continues_after_unknown_command() {
     // Per-command error recovery (continued-execution) for FILE input: an
-    // unknown command between two valid (check-sat) commands must print an
-    // (error "...") and still run BOTH check-sats. Mirrors z3's behavior and
-    // the advertised (:error-behavior continued-execution).
+    // unknown command between two valid (check-sat) commands must still run
+    // BOTH check-sats.
+    //
+    // An unknown command is `unsupported` on stdout, NOT `(error ...)`, and it
+    // does NOT fail the run. Measured on z3 5.0.0 for this exact input:
+    //
+    //     stdout: sat / unsupported / sat
+    //     stderr: ; bogus-command line: 1 position: 63
+    //     exit:   0
+    //
+    // Reporting `(error ...)` and exiting non-zero -- which AY used to do --
+    // failed the whole run for any caller that checks `$?`.
     let ay_path = env!("CARGO_BIN_EXE_ay");
     let input = "(declare-const x Int)(assert (> x 0))(check-sat)(bogus-command)(assert (< x 5))(check-sat)\n";
 
@@ -205,28 +214,34 @@ fn test_cli_file_continues_after_unknown_command() {
     eprintln!("AY stderr: {stderr:?}");
     eprintln!("AY exit: {:?}", output.status);
 
-    // The transcript on stdout is exactly: sat, (error ...), sat.
+    // The transcript on stdout is exactly: sat, unsupported, sat.
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         lines.len(),
         3,
-        "Expected exactly sat / error / sat on stdout, got: {stdout:?}"
+        "Expected exactly sat / unsupported / sat on stdout, got: {stdout:?}"
     );
     assert_eq!(lines[0], "sat", "first command must be sat: {stdout:?}");
-    assert!(
-        lines[1].starts_with("(error ") && lines[1].contains("bogus-command"),
-        "second line must be the recoverable (error ...): {stdout:?}"
+    assert_eq!(
+        lines[1], "unsupported",
+        "an unknown command is `unsupported`, as z3 reports it: {stdout:?}"
     );
     assert_eq!(lines[2], "sat", "third command must be sat: {stdout:?}");
-    // Recoverable SMT-LIB errors stay on stdout.
+    // Never an `(error ...)` for an unknown command, on either stream.
     assert!(
-        !stderr.contains("(error"),
-        "recoverable errors must not duplicate on stderr: {stderr}"
+        !stdout.contains("(error") && !stderr.contains("(error"),
+        "an unknown command must not raise (error ...): {stdout:?} / {stderr}"
     );
-    // An error occurred, so the process exits non-zero.
+    // The name and the closing paren's position go to stderr as a comment.
+    // Position 63 is the `)` of `(bogus-command)`, which opens at column 49.
     assert!(
-        !output.status.success(),
-        "Expected non-zero exit after a recoverable error, got {:?}",
+        stderr.contains("; bogus-command line: 1 position: 63"),
+        "expected z3's unsupported-command diagnostic on stderr, got: {stderr}"
+    );
+    // Continued execution: an unknown command does not fail the run.
+    assert!(
+        output.status.success(),
+        "an unknown command must not fail the run (z3 exits 0), got {:?}",
         output.status
     );
 }

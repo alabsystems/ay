@@ -17,6 +17,555 @@ fn emit_firewall_lean(exec: &Executor, proof: &Proof) -> Vec<String> {
 }
 
 #[test]
+fn bool_tautology_leaf_promotion_is_semantic_and_fail_closed() {
+    let mut exec = Executor::new();
+    let p = exec.ctx.terms.mk_var("bool-leaf-p", Sort::Bool);
+    let q = exec.ctx.terms.mk_var("bool-leaf-q", Sort::Bool);
+    let not_p = exec.ctx.terms.mk_not_raw(p);
+    let eq = exec.ctx.terms.mk_eq(p, q);
+    let not_eq = exec.ctx.terms.mk_not_raw(eq);
+
+    // Equality transfer: p and p=q entail q.
+    let tautology = exec.ctx.terms.mk_or(vec![q, not_p, not_eq]);
+    // One-polarity mutation is false at p=false,q=false and must stay Trust.
+    let near_tautology = exec.ctx.terms.mk_or(vec![q, p, not_eq]);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, vec![tautology], Vec::new(), Vec::new());
+    proof.add_rule_step(
+        AletheRule::Trust,
+        vec![near_tautology],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    Executor::promote_bool_tautology_leaves(&exec.ctx.terms, &mut proof);
+
+    assert!(matches!(
+        &proof.steps[0],
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::BoolTautology,
+            clause,
+            ..
+        } if clause == &[tautology]
+    ));
+    assert!(matches!(
+        &proof.steps[1],
+        ProofStep::Step {
+            rule: AletheRule::Trust,
+            clause,
+            ..
+        } if clause == &[near_tautology]
+    ));
+}
+
+#[test]
+fn lra_reconstruction_rebinds_solver_coefficients_to_clause_order() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("farkas-order-x", Sort::Int);
+    let two = terms.mk_int(BigInt::from(2));
+    let seven = terms.mk_int(BigInt::from(7));
+    let x_le_two = terms.mk_le(x, two);
+    let two_x = terms.mk_mul(vec![two, x]);
+    let seven_le_two_x = terms.mk_le(seven, two_x);
+    let not_x_le_two = terms.mk_not_raw(x_le_two);
+    let not_seven_le_two_x = terms.mk_not_raw(seven_le_two_x);
+    let clause = vec![not_x_le_two, not_seven_le_two_x];
+
+    let mut farkas = None;
+    let mut kind = TheoryLemmaKind::Generic;
+    assert!(super::super::proof_farkas::try_lra_farkas_reconstruction(
+        &terms,
+        &clause,
+        &mut farkas,
+        &mut kind,
+    ));
+
+    let farkas = farkas.expect("an exact Farkas certificate");
+    assert_eq!(
+        farkas.coefficients,
+        vec![
+            num_rational::Rational64::new(1, 1),
+            num_rational::Rational64::new(1, 2),
+        ],
+        "coefficients must follow the target proof-clause order, not the LRA conflict order"
+    );
+    assert!(!kind.is_trust());
+}
+
+#[test]
+fn exact_authored_false_gets_a_trust_free_strict_refutation() {
+    let mut exec = Executor::new();
+    let false_term = exec.ctx.terms.false_term();
+    exec.ctx
+        .add_assertion_with_parsed(false_term, FrontendTerm::Const(FrontendConstant::False));
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert_eq!(proof.steps.len(), 3);
+    assert!(matches!(proof.steps[0], ProofStep::Assume(term) if term == false_term));
+    assert!(matches!(
+        proof.steps[1],
+        ProofStep::Step {
+            rule: AletheRule::False,
+            ..
+        }
+    ));
+    assert!(matches!(
+        proof.steps[2],
+        ProofStep::Resolution { ref clause, .. } if clause.is_empty()
+    ));
+    exec.check_proof_strict_with_datatypes(&proof)
+        .expect("exact authored false refutation must pass the full strict boundary");
+    assert!(ay_proof::terminal_trust_report(&proof).is_trust_free());
+}
+
+#[test]
+fn affine_uf_refutation_uses_exact_inequality_bounds() {
+    let mut exec = Executor::new();
+    let x = exec.ctx.terms.mk_var("affine-uf-x", Sort::Int);
+    let y = exec.ctx.terms.mk_var("affine-uf-y", Sort::Int);
+    let five = exec.ctx.terms.mk_int(BigInt::from(5));
+    let ten = exec.ctx.terms.mk_int(BigInt::from(10));
+    let twenty = exec.ctx.terms.mk_int(BigInt::from(20));
+    let x_ge_five = exec.ctx.terms.mk_ge(x, five);
+    let x_le_five = exec.ctx.terms.mk_le(x, five);
+    let y_eq_five = exec.ctx.terms.mk_eq(y, five);
+    let f_x = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("affine-uf-f"), [x], Sort::Int);
+    let f_y = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("affine-uf-f"), [y], Sort::Int);
+    let f_x_eq_ten = exec.ctx.terms.mk_eq(f_x, ten);
+    let f_y_eq_twenty = exec.ctx.terms.mk_eq(f_y, twenty);
+    for root in [x_ge_five, x_le_five, y_eq_five, f_x_eq_ten, f_y_eq_twenty] {
+        exec.ctx
+            .add_assertion_with_parsed(root, parsed_placeholder());
+    }
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    exec.replace_with_exact_authored_affine_euf_refutation(&mut proof);
+
+    assert!(ay_proof::terminal_trust_report(&proof).is_trust_free());
+    exec.check_proof_strict_with_datatypes(&proof)
+        .expect("inequality bounds must compose with EUF under strict replay");
+    ay_proof::validate_reachable_assumes_in_problem_scope(
+        &proof,
+        &[x_ge_five, x_le_five, y_eq_five, f_x_eq_ten, f_y_eq_twenty],
+    )
+    .expect("the reconstructed proof may assume only exact authored roots");
+}
+
+#[test]
+fn affine_uf_refutation_skips_interpreted_incremental_lia_terms() {
+    let mut exec = Executor::new();
+    let mut counts = Vec::new();
+    for step in 0..=10 {
+        counts.push(
+            exec.ctx
+                .terms
+                .mk_var(format!("lia-count-{step}"), Sort::Int),
+        );
+    }
+    let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+    let one = exec.ctx.terms.mk_int(BigInt::from(1));
+    let twenty = exec.ctx.terms.mk_int(BigInt::from(20));
+    let init = exec.ctx.terms.mk_eq(counts[0], zero);
+    exec.ctx
+        .add_assertion_with_parsed(init, parsed_placeholder());
+    for step in 1..=10 {
+        let increment = exec.ctx.terms.mk_add(vec![counts[step - 1], one]);
+        let transition = exec.ctx.terms.mk_eq(counts[step], increment);
+        exec.ctx
+            .add_assertion_with_parsed(transition, parsed_placeholder());
+    }
+    let safe = exec.ctx.terms.mk_le(counts[10], twenty);
+    let violation = exec.ctx.terms.mk_not_raw(safe);
+    exec.ctx
+        .add_assertion_with_parsed(violation, parsed_placeholder());
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    exec.replace_with_exact_authored_affine_euf_refutation(&mut proof);
+
+    assert!(matches!(
+        proof.steps.as_slice(),
+        [ProofStep::Step {
+            rule: AletheRule::Trust,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn solver_only_false_cannot_authorize_the_authored_false_rewrite() {
+    let mut exec = Executor::new();
+    let authored = exec.ctx.terms.mk_var("authored", Sort::Bool);
+    exec.ctx
+        .add_assertion_with_parsed(authored, parsed_placeholder());
+    // Deliberately append `false` without a parallel parsed/authored entry.
+    // This models a solver-generated assertion outside the problem scope.
+    let false_term = exec.ctx.terms.false_term();
+    exec.ctx.assertions.push(false_term);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert_eq!(format!("{:?}", proof.steps), original);
+}
+
+#[test]
+fn solver_only_false_cannot_authorize_rewrite_without_parsed_retention() {
+    let mut exec = Executor::new();
+    exec.ctx.set_retain_parsed_assertions(false);
+    let authored = exec.ctx.terms.mk_var("authored-no-ast", Sort::Bool);
+    exec.ctx
+        .add_assertion_with_parsed(authored, parsed_placeholder());
+    assert!(exec.ctx.assertions_parsed().is_empty());
+
+    // The transient term is indistinguishable from an authored term in the
+    // raw solver stack; only Context's concrete-authored provenance may grant
+    // the canonical false refutation.
+    let false_term = exec.ctx.terms.false_term();
+    exec.ctx.assertions.push(false_term);
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert_eq!(format!("{:?}", proof.steps), original);
+}
+
+#[test]
+fn exact_authored_false_still_authorizes_without_parsed_retention() {
+    let mut exec = Executor::new();
+    exec.ctx.set_retain_parsed_assertions(false);
+    let false_term = exec.ctx.terms.false_term();
+    exec.ctx
+        .add_assertion_with_parsed(false_term, FrontendTerm::Const(FrontendConstant::False));
+    assert!(exec.ctx.assertions_parsed().is_empty());
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert!(matches!(
+        proof.steps.last(),
+        Some(ProofStep::Resolution { clause, .. }) if clause.is_empty()
+    ));
+    exec.check_proof_strict_with_datatypes(&proof)
+        .expect("the exact concrete-authored false term remains authoritative");
+}
+
+#[test]
+fn folded_authored_false_cannot_masquerade_as_literal_false_without_parsed_retention() {
+    let mut exec = Executor::new();
+    exec.ctx.set_retain_parsed_assertions(false);
+    let false_term = exec.ctx.terms.false_term();
+    // This source is contradictory and therefore elaborates to the same
+    // canonical false TermId, but the problem did not literally assert
+    // `false`. The compact authored-source bit must retain that distinction
+    // after the full parsed tree is discarded.
+    let folded_source = FrontendTerm::App(
+        "not".to_string(),
+        vec![FrontendTerm::Const(FrontendConstant::True)],
+    );
+    exec.ctx
+        .add_assertion_with_parsed(false_term, folded_source);
+    assert!(exec.ctx.assertions_parsed().is_empty());
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert_eq!(format!("{:?}", proof.steps), original);
+}
+
+fn terminal_empty_trust(proof: &mut Proof, premise: Option<ProofId>) {
+    proof.add_rule_step(
+        AletheRule::Trust,
+        Vec::new(),
+        premise.into_iter().collect(),
+        Vec::new(),
+    );
+}
+
+#[test]
+fn terminal_trust_rebuilds_from_exact_multi_assertion_bv_refutation() {
+    let mut exec = Executor::new();
+    let x = exec.ctx.terms.mk_var("mc-join-x", Sort::bitvec(32));
+    let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0), 32);
+    let one = exec.ctx.terms.mk_bitvec(BigInt::from(1), 32);
+    let x_is_zero = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), vec![x, zero], Sort::Bool);
+    let x_is_one = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), vec![x, one], Sort::Bool);
+    exec.ctx
+        .add_assertion_with_parsed(x_is_zero, parsed_placeholder());
+    exec.ctx
+        .add_assertion_with_parsed(x_is_one, parsed_placeholder());
+
+    let mut proof = Proof::new();
+    let old = proof.add_assume(x_is_zero, Some("legacy".to_string()));
+    terminal_empty_trust(&mut proof, Some(old));
+    exec.replace_with_exact_authored_bv_refutation(&mut proof);
+
+    assert!(ay_proof::terminal_trust_report(&proof).is_trust_free());
+    assert!(matches!(
+        proof.steps.last(),
+        Some(ProofStep::Step { rule: AletheRule::ThResolution, clause, .. })
+            if clause.is_empty()
+    ));
+    exec.check_proof_strict_with_datatypes(&proof)
+        .expect("the reconstructed exact authored BV proof must replay strictly");
+}
+
+fn add_authored_roots(exec: &mut Executor, assertions: &[TermId]) {
+    for &assertion in assertions {
+        exec.ctx
+            .add_assertion_with_parsed(assertion, parsed_placeholder());
+    }
+}
+
+fn assert_terminal_bv_rebuild_is_strict(exec: &mut Executor) {
+    let mut proof = Proof::new();
+    terminal_empty_trust(&mut proof, None);
+    exec.replace_with_exact_authored_bv_refutation(&mut proof);
+    assert!(
+        ay_proof::terminal_trust_report(&proof).is_trust_free(),
+        "the exact authored QF_BV roots must replace terminal trust"
+    );
+    exec.check_proof_strict_with_datatypes(&proof)
+        .expect("the reconstructed authored QF_BV proof must replay strictly");
+}
+
+#[test]
+fn terminal_trust_rebuilds_real_mc_join_guard_bvuge_obligation() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let condition = terms.mk_var("mc_join_condition", Sort::Bool);
+    let guard_else = terms.mk_var("mc_join_else", Sort::Bool);
+    let guard_then = terms.mk_var("mc_join_then", Sort::Bool);
+    let guard_join = terms.mk_var("mc_join_guard", Sort::Bool);
+    let value = terms.mk_var("mc_join_value", Sort::bitvec(32));
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let two = terms.mk_bitvec(BigInt::from(2), 32);
+
+    let not_condition = terms.mk_not(condition);
+    let else_definition = terms.mk_eq(guard_else, not_condition);
+    let then_definition = terms.mk_eq(guard_then, condition);
+    let branch_join = terms.mk_or(vec![guard_else, guard_then]);
+    let join_definition = terms.mk_eq(guard_join, branch_join);
+    let value_is_two = terms.mk_eq(value, two);
+    let value_is_one = terms.mk_eq(value, one);
+    let else_value = terms.mk_implies(guard_else, value_is_two);
+    let then_value = terms.mk_implies(guard_then, value_is_one);
+    let lower_bound = terms.mk_app(Symbol::named("bvuge"), vec![value, one], Sort::Bool);
+    let violates_lower_bound = terms.mk_not(lower_bound);
+    let terminal = terms.mk_and(vec![guard_join, violates_lower_bound]);
+    add_authored_roots(
+        &mut exec,
+        &[
+            else_definition,
+            then_definition,
+            join_definition,
+            else_value,
+            then_value,
+            terminal,
+        ],
+    );
+    assert_terminal_bv_rebuild_is_strict(&mut exec);
+}
+
+#[test]
+fn terminal_trust_rebuilds_real_mc_switch_default_bvule_obligation() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let selector = terms.mk_var("mc_switch_selector", Sort::bitvec(32));
+    let value = terms.mk_var("mc_switch_value", Sort::bitvec(32));
+    let case_two = terms.mk_var("mc_switch_case_two", Sort::Bool);
+    let case_one = terms.mk_var("mc_switch_case_one", Sort::Bool);
+    let case_zero = terms.mk_var("mc_switch_case_zero", Sort::Bool);
+    let default = terms.mk_var("mc_switch_default", Sort::Bool);
+    let join = terms.mk_var("mc_switch_join", Sort::Bool);
+    let zero = terms.mk_bitvec(BigInt::from(0), 32);
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let two = terms.mk_bitvec(BigInt::from(2), 32);
+    let three = terms.mk_bitvec(BigInt::from(3), 32);
+
+    let selector_is_zero = terms.mk_eq(selector, zero);
+    let selector_is_one = terms.mk_eq(selector, one);
+    let selector_is_two = terms.mk_eq(selector, two);
+    let case_zero_definition = terms.mk_eq(case_zero, selector_is_zero);
+    let case_one_definition = terms.mk_eq(case_one, selector_is_one);
+    let case_two_definition = terms.mk_eq(case_two, selector_is_two);
+    let selector_not_zero = terms.mk_not(selector_is_zero);
+    let selector_not_one = terms.mk_not(selector_is_one);
+    let selector_not_two = terms.mk_not(selector_is_two);
+    let is_default = terms.mk_and(vec![selector_not_zero, selector_not_one, selector_not_two]);
+    let default_definition = terms.mk_eq(default, is_default);
+    let joined = terms.mk_or(vec![case_two, case_one, case_zero, default]);
+    let join_definition = terms.mk_eq(join, joined);
+    let value_is_three = terms.mk_eq(value, three);
+    let value_is_two = terms.mk_eq(value, two);
+    let value_is_one = terms.mk_eq(value, one);
+    let value_is_zero = terms.mk_eq(value, zero);
+    let case_two_value = terms.mk_implies(case_two, value_is_three);
+    let case_one_value = terms.mk_implies(case_one, value_is_two);
+    let case_zero_value = terms.mk_implies(case_zero, value_is_one);
+    let default_value = terms.mk_implies(default, value_is_zero);
+    let upper_bound = terms.mk_app(Symbol::named("bvule"), vec![value, three], Sort::Bool);
+    let violates_upper_bound = terms.mk_not(upper_bound);
+    let terminal = terms.mk_and(vec![join, violates_upper_bound]);
+    add_authored_roots(
+        &mut exec,
+        &[
+            case_two_definition,
+            case_one_definition,
+            case_zero_definition,
+            default_definition,
+            join_definition,
+            case_two_value,
+            case_one_value,
+            case_zero_value,
+            default_value,
+            terminal,
+        ],
+    );
+    assert_terminal_bv_rebuild_is_strict(&mut exec);
+}
+
+#[test]
+fn terminal_trust_bv_rebuild_rejects_sat_or_non_authored_roots() {
+    let mut exec = Executor::new();
+    let x = exec.ctx.terms.mk_var("mc-sat-x", Sort::bitvec(32));
+    let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0), 32);
+    let x_is_zero = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), vec![x, zero], Sort::Bool);
+    exec.ctx
+        .add_assertion_with_parsed(x_is_zero, parsed_placeholder());
+    let mut proof = Proof::new();
+    terminal_empty_trust(&mut proof, None);
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_bv_refutation(&mut proof);
+    assert_eq!(
+        format!("{:?}", proof.steps),
+        original,
+        "a SAT root is not a refutation"
+    );
+
+    let mut transient_only = Executor::new();
+    let y = transient_only
+        .ctx
+        .terms
+        .mk_var("transient-only-y", Sort::bitvec(32));
+    let zero = transient_only.ctx.terms.mk_bitvec(BigInt::from(0), 32);
+    let one = transient_only.ctx.terms.mk_bitvec(BigInt::from(1), 32);
+    let y0 = transient_only
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), vec![y, zero], Sort::Bool);
+    let y1 = transient_only
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), vec![y, one], Sort::Bool);
+    transient_only.ctx.assertions.extend([y0, y1]);
+    let mut transient_proof = Proof::new();
+    terminal_empty_trust(&mut transient_proof, None);
+    let original = format!("{:?}", transient_proof.steps);
+    transient_only.replace_with_exact_authored_bv_refutation(&mut transient_proof);
+    assert_eq!(format!("{:?}", transient_proof.steps), original);
+}
+
+#[test]
+fn terminal_trust_bv_rebuild_enforces_authored_root_cap() {
+    let mut exec = Executor::new();
+    let x = exec.ctx.terms.mk_var("mc-cap-x", Sort::bitvec(32));
+    for value in 0..65_u32 {
+        let constant = exec.ctx.terms.mk_bitvec(BigInt::from(value), 32);
+        let assertion = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), vec![x, constant], Sort::Bool);
+        exec.ctx
+            .add_assertion_with_parsed(assertion, parsed_placeholder());
+    }
+    let mut proof = Proof::new();
+    terminal_empty_trust(&mut proof, None);
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_bv_refutation(&mut proof);
+    assert_eq!(format!("{:?}", proof.steps), original);
+}
+
+#[test]
+fn non_false_authored_boolean_cannot_authorize_the_false_rewrite() {
+    let mut exec = Executor::new();
+    let authored = exec.ctx.terms.mk_var("authored", Sort::Bool);
+    exec.ctx
+        .add_assertion_with_parsed(authored, parsed_placeholder());
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    let original = format!("{:?}", proof.steps);
+    exec.replace_with_exact_authored_false_refutation(&mut proof);
+
+    assert_eq!(format!("{:?}", proof.steps), original);
+}
+
+#[test]
+fn bv_promotion_caps_cumulative_proof_producer_attempts() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv-promotion-budget", Sort::bitvec(32));
+    let doubled = terms.mk_app(Symbol::named("bvadd"), vec![bv, bv], Sort::bitvec(32));
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let shifted = terms.mk_app(Symbol::named("bvshl"), vec![bv, one], Sort::bitvec(32));
+    let equality = terms.mk_app(Symbol::named("="), vec![doubled, shifted], Sort::Bool);
+    let mut proof = Proof::new();
+    for _ in 0..=ay_proof::MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF {
+        proof.add_theory_lemma("generic", vec![equality]);
+    }
+
+    Executor::promote_semantically_checked_bv_lemmas(&terms, &mut proof);
+
+    assert_eq!(
+        proof
+            .steps
+            .iter()
+            .filter(|step| matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::BvBitBlast,
+                    ..
+                }
+            ))
+            .count(),
+        ay_proof::MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF
+    );
+    assert!(matches!(
+        proof.steps.last(),
+        Some(ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::Generic,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn contextual_row2_unit_is_rebuilt_as_guarded_strict_proof() {
     let mut exec = Executor::new();
     let array_sort = Sort::array(Sort::Int, Sort::Int);
@@ -560,9 +1109,16 @@ fn test_qf_dt_selector_projection_collapse_is_strict_checkable() {
         !text.contains(":rule trust"),
         "DT selector-projection collapse must not fall back to trust; got:\n{text}"
     );
+    // `dt_project` is AY's kind name, not an Alethe rule (carcara has no
+    // datatype rules at all), so on the wire the lemma is an honest `hole`.
+    // The datatype-aware strict checker below still validates the real step.
     assert!(
-        text.contains("dt_project"),
-        "reconstructed proof should carry the dt_project lemma; got:\n{text}"
+        text.contains(":rule hole"),
+        "reconstructed proof should carry the projection lemma as an honest hole; got:\n{text}"
+    );
+    assert!(
+        !text.contains("dt_project"),
+        "must not emit a rule name no Alethe checker implements; got:\n{text}"
     );
     let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
     // Validation requires the constructor→selector registry, so go through the
@@ -571,6 +1127,101 @@ fn test_qf_dt_selector_projection_collapse_is_strict_checkable() {
         Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
         Err(e) => panic!("DT selector-projection proof must pass strict check, got {e:?}"),
     }
+}
+
+#[test]
+fn test_qf_dt_concrete_tester_evaluation_is_strict_checkable() {
+    for (label, actual_ctor, authored_is_positive) in [
+        ("matching-negative", "red", false),
+        ("distinct-positive", "green", true),
+    ] {
+        // The SMT-LIB elaborator deliberately evaluates a concrete tester at
+        // parse time, so an end-to-end script reaches the earlier literal-false
+        // lane and cannot prove that this producer is wired. Retain the public
+        // datatype declaration, but construct the exact native-API root without
+        // simplification so this test exercises DatatypeTesterEval itself.
+        let mut exec = Executor::new();
+        let declarations = parse(
+            r#"
+            (set-option :produce-proofs true)
+            (set-logic QF_DT)
+            (declare-datatype Color ((red) (green)))
+            "#,
+        )
+        .unwrap();
+        assert!(exec.execute_all(&declarations).unwrap().is_empty());
+
+        let color = Sort::Uninterpreted("Color".to_string());
+        let actual = exec.ctx.terms.mk_var(actual_ctor, color);
+        let theorem = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-red"), [actual], Sort::Bool);
+        let root = if authored_is_positive {
+            theorem
+        } else {
+            exec.ctx.terms.mk_not_raw(theorem)
+        };
+        exec.ctx
+            .add_assertion_with_parsed(root, parsed_placeholder());
+
+        let mut proof = Proof::new();
+        terminal_empty_trust(&mut proof, None);
+        exec.replace_with_exact_authored_datatype_refutation(&mut proof);
+        assert!(
+            proof.steps.iter().any(|step| matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::DatatypeTesterEval,
+                    ..
+                }
+            )),
+            "{label}: reconstructed proof must carry the declaration-backed tester theorem"
+        );
+        assert!(
+            ay_proof::terminal_trust_report(&proof).is_trust_free(),
+            "{label}: concrete tester proof must be trust-free"
+        );
+        exec.check_proof_strict_with_datatypes(&proof)
+            .unwrap_or_else(|error| panic!("{label}: strict datatype replay failed: {error:?}"));
+    }
+}
+
+#[test]
+fn test_qf_lia_sorting_network_order_ite_proof_is_strict_checkable() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_LIA)
+        (declare-const a Int)
+        (declare-const b Int)
+        (declare-const c Int)
+        (define-fun lo ((x Int) (y Int)) Int (ite (> x y) y x))
+        (define-fun hi ((x Int) (y Int)) Int (ite (> x y) x y))
+        (assert
+          (not
+            (let ((a1 (lo a b)) (b1 (hi a b)))
+              (let ((b2 (lo b1 c)) (c2 (hi b1 c)))
+                (let ((a3 (lo a1 b2)) (b3 (hi a1 b2)))
+                  (and (<= a3 b3) (<= b3 c2) (<= a3 c2)))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::OrderIteTautology,
+                ..
+            }
+        )),
+        "sorting-network proof must use the exact bounded order-ITE theorem"
+    );
+    assert!(ay_proof::terminal_trust_report(proof).is_trust_free());
+    exec.check_proof_strict_with_datatypes(proof)
+        .expect("sorting-network proof must pass independent strict replay");
 }
 
 #[test]
@@ -631,6 +1282,51 @@ fn test_qf_bv_idempotent_collapse_is_strict_checkable() {
             Err(e) => panic!("{body} proof must pass strict check, got {e:?}"),
         }
     }
+}
+
+/// The last-resort QF_BV `hole` rescue must never overwrite a specialized
+/// certificate.
+///
+/// `rescue_bv_bitblast_collapse` is the fallback for collapses no specific
+/// promoter could reconstruct: it re-anchors the refutation on the parsed
+/// assertions and marks the bit-blasting gap with an honest `hole`. Its
+/// eligibility gate was briefly widened to "any proof deriving the empty
+/// clause", which made it fire on the proof `promote_bv_identity_collapse` had
+/// built four lines earlier — replacing a strict-checkable `BvBitBlast` lemma
+/// with an unchecked hole, and with it the Lean firewall artifact keyed on that
+/// lemma kind. Pin the ordering contract directly, not just through the
+/// firewall it feeds.
+#[test]
+fn bv_identity_certificate_survives_the_last_resort_hole_rescue() {
+    let input = r#"(set-option :produce-proofs true)(set-logic QF_BV)
+        (declare-const x (_ BitVec 4))
+        (assert (not (= (bvand x x) x)))(check-sat)"#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::BvBitBlast,
+                ..
+            }
+        )),
+        "the specialized BvBitBlast certificate must survive the rescue; got {:#?}",
+        proof.steps
+    );
+    assert!(
+        !proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::Hole,
+                ..
+            }
+        )),
+        "no hole may replace a lemma the promoter already certified; got {:#?}",
+        proof.steps
+    );
 }
 
 #[test]
@@ -727,6 +1423,58 @@ fn test_qf_fp_classification_is_strict_checkable() {
 }
 
 #[test]
+fn test_qf_fplra_forward_error_is_strict_checkable() {
+    // A forward-error rounding-claim UNSAT (the geometry_consumer guard-claim shape, one
+    // fp.add): the tactic refutes it outside the SAT loop, the proof closes
+    // via `derive_empty_via_trust_lemma`, and `promote_fp_forward_error_lemmas`
+    // re-tags the Generic lemma to the strict-checkable `FpForwardError` kind
+    // (full analytic re-derivation in ay-proof) — trust-free.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_FPLRA)
+        (declare-const x Float64)
+        (declare-const y Float64)
+        (assert (and (fp.isNormal x) (<= (fp.to_real (fp.abs x)) 1.0)))
+        (assert (and (fp.isNormal y) (<= (fp.to_real (fp.abs y)) 1.0)))
+        (assert (>= (- (fp.to_real (fp.add RNE x y))
+                       (+ (fp.to_real x) (fp.to_real y)))
+                    0.3))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+    let text = exec.get_proof();
+    assert!(
+        text.contains(":rule hole") && !text.contains(":rule fp_forward_error"),
+        "FpForwardError is an internally certified AY kind, not an Alethe rule; \
+         the wire proof must expose the unsupported semantic step as an honest hole:\n{text}"
+    );
+    assert!(
+        !text.contains(":rule trust"),
+        "forward-error UNSAT must not fall back to trust; got:\n{text}"
+    );
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::FpForwardError,
+            ..
+        }
+    )));
+    let report = ay_proof::terminal_trust_report(proof);
+    assert!(
+        report.is_trust_free(),
+        "empty-clause path must be trust-free, got {report:?}"
+    );
+    match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
+        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
+        Err(e) => panic!("forward-error proof must pass strict check, got {e:?}"),
+    }
+}
+
+#[test]
 fn test_qf_bool_tautology_emits_firewall_lean() {
     let input = r#"(set-option :produce-proofs true)(set-logic QF_UF)(declare-const p Bool)(assert (not (= (not (not p)) p)))(check-sat)"#;
     let cmds = parse(input).unwrap();
@@ -766,7 +1514,12 @@ fn test_qf_ite_same_emits_firewall_lean() {
     let ite = fw
         .iter()
         .find(|f| f.contains("IteSame"))
-        .expect("expected an IteSame firewall file");
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an IteSame firewall file; proof={:#?}",
+                exec.last_proof.as_ref().unwrap().steps
+            )
+        });
     assert!(ite.contains("firewall_combined_unsat"));
     assert!(ite.contains("abbrev Val := Int × Bool"));
     assert!(ite.contains("simp [ite_self]"));
@@ -829,10 +1582,12 @@ fn test_closed_identity_classes_emit_firewall_lean() {
             "{body}"
         );
         let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
-        let f = fw
-            .iter()
-            .find(|f| f.contains(tag))
-            .unwrap_or_else(|| panic!("expected a {tag} firewall for {body}"));
+        let f = fw.iter().find(|f| f.contains(tag)).unwrap_or_else(|| {
+            panic!(
+                "expected a {tag} firewall for {body}; proof={:#?}",
+                exec.last_proof.as_ref().unwrap().steps
+            )
+        });
         assert!(f.contains("firewall_combined_unsat"));
     }
 }
@@ -904,6 +1659,66 @@ fn test_qf_dt_selector_over_matching_ctor_emits_firewall_lean() {
         .expect("expected a DtSelCtor selector-over-constructor firewall file");
     assert!(f.contains("firewall_combined_unsat"));
     assert!(f.contains("def sel : D -> Int"));
+}
+
+/// Pin the shape-3 (`false`-constant) collapse recognizer directly.
+///
+/// The seven collapse promoters all gate on `proof_is_single_empty_trust`.
+/// Elaboration now folds an identity-negation assertion all the way to the
+/// `false` CONSTANT and records the refutation as
+/// `Assume(false) + lemma[(not false)] + resolution` — a third encoding that
+/// neither the legacy single-`trust` shape nor the `:rule false` shape matched,
+/// so every promoter no-opped and the step printed as an untyped `hole`. This
+/// test pins both directions: the degenerate shape is recognised, and a proof
+/// carrying ANY real content is not (which is what keeps the promoters — all of
+/// which clear the proof before rebuilding — from clobbering a genuine
+/// derivation).
+#[test]
+fn false_constant_collapse_is_recognized_and_content_bearing_proofs_are_not() {
+    let mut exec = Executor::new();
+    let false_t = exec.ctx.terms.false_term();
+    let not_false = exec.ctx.terms.mk_not_raw(false_t);
+
+    // The measured shape: assume the folded `false`, the `(not false)` wiring
+    // lemma, and the resolution that closes them.
+    let mut collapsed = Proof::new();
+    let assume_id = collapsed.add_assume(false_t, None);
+    let lemma_id = collapsed.add_theory_lemma_with_kind(
+        "Bool",
+        vec![not_false],
+        TheoryLemmaKind::BoolTautology,
+    );
+    collapsed.add_resolution(vec![], false_t, assume_id, lemma_id);
+    assert!(
+        Executor::proof_is_single_empty_trust(&collapsed),
+        "the false-constant collapse must be recognised as a degenerate proof"
+    );
+
+    // Same three-step skeleton, but the assumption is a real atom rather than
+    // the `false` constant: this proof carries content and must NOT be treated
+    // as a collapse.
+    let p = exec.ctx.terms.mk_var("shape3-p", Sort::Bool);
+    let not_p = exec.ctx.terms.mk_not_raw(p);
+    let mut real = Proof::new();
+    let a = real.add_assume(p, None);
+    let l = real.add_theory_lemma_with_kind("Bool", vec![not_p], TheoryLemmaKind::BoolTautology);
+    real.add_resolution(vec![], p, a, l);
+    assert!(
+        !Executor::proof_is_single_empty_trust(&real),
+        "a proof whose assumption is a real atom is not the false-constant collapse"
+    );
+
+    // A fourth step of genuine theory content also disqualifies the shape.
+    let mut extra = Proof::new();
+    let assume_id = extra.add_assume(false_t, None);
+    let lemma_id =
+        extra.add_theory_lemma_with_kind("Bool", vec![not_false], TheoryLemmaKind::BoolTautology);
+    extra.add_theory_lemma_with_kind("Bool", vec![p], TheoryLemmaKind::BoolTautology);
+    extra.add_resolution(vec![], false_t, assume_id, lemma_id);
+    assert!(
+        !Executor::proof_is_single_empty_trust(&extra),
+        "a proof with an extra content step is not the false-constant collapse"
+    );
 }
 
 #[test]
@@ -1214,9 +2029,19 @@ fn test_failed_equality_farkas_promotion_stays_trusted_8866() {
         !rendered.contains("UNVERIFIABLE PROOF"),
         "failed synthesis must export as honest trust, not as an uncertified arithmetic rule:\n{rendered}"
     );
+    // Terminal-trust detection reads the proof IR — `trust_theory_lemma_on_path`
+    // and `has_terminal_trust()` are asserted above and are unchanged. The
+    // printed name is `hole`: `trust` is not an Alethe rule, so emitting it
+    // made the document `invalid` rather than merely unproved. `hole` is the
+    // spec's placeholder and `terminal_trust` counts it identically
+    // (`hole_rule_on_path`), so nothing becomes invisible.
     assert!(
-        rendered.contains(":rule trust"),
-        "failed synthesis should remain visible to terminal-trust detection:\n{rendered}"
+        rendered.contains(":rule hole"),
+        "failed synthesis should remain visible as an honest hole:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(":rule trust"),
+        "must not emit a rule name no Alethe checker implements:\n{rendered}"
     );
 }
 
@@ -1341,6 +2166,62 @@ fn test_trust_lemma_negation_preserves_checker_pivots() {
         proof.steps.last(),
         Some(ProofStep::Step { clause, .. }) if clause.is_empty()
     ));
+}
+
+/// #trust-lemma-dup-assume — the same term asserted twice must not produce a
+/// no-op `th_resolution`.
+///
+/// `derive_empty_via_trust_lemma` collects one entry per `Assume`/unit-`Trust`
+/// step, so a repeated term used to contribute the SAME negated literal to the
+/// trust lemma more than once. The chain then removed all copies on the first
+/// resolution, and every later step against that term resolved nothing: its
+/// conclusion equalled premise 0's clause and premise 1 was unused. The strict
+/// checker rejects that as `invalid th_resolution derivation` — 6178 such steps
+/// were emitted across one `ay-chc --lib` run.
+#[test]
+fn trust_lemma_chain_is_valid_when_an_assumption_is_repeated() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let not_b = terms.mk_not(b);
+
+    let mut proof = Proof::new();
+    // `a` twice — the duplicate is what used to break the chain.
+    proof.add_assume(a, Some("h0".to_string()));
+    proof.add_assume(a, Some("h1".to_string()));
+    proof.add_assume(not_b, Some("h2".to_string()));
+
+    crate::executor::proof_resolution::empty_clause::derive_empty_via_trust_lemma(
+        &mut terms, &mut proof,
+    );
+
+    let (_summary, error) = check_proof_partial(&proof, &terms);
+    assert!(
+        error.is_none(),
+        "repeated assumption must still yield a checker-valid chain, got {error:?}"
+    );
+    assert!(
+        matches!(proof.steps.last(), Some(ProofStep::Step { clause, .. }) if clause.is_empty()),
+        "trust-lemma fallback must still close on the empty clause"
+    );
+    // One resolution per DISTINCT assumption term, not per collected entry.
+    let resolutions = proof
+        .steps
+        .iter()
+        .filter(|s| {
+            matches!(
+                s,
+                ProofStep::Step {
+                    rule: AletheRule::ThResolution,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        resolutions, 2,
+        "expected one th_resolution per distinct assumption term"
+    );
 }
 
 /// Direct unit test for prune_to_empty_clause_derivation.
@@ -2622,9 +3503,18 @@ fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
         !text.contains(":rule trust"),
         "ground-regex refutation must not fall back to trust; got:\n{text}"
     );
+    // The ground-eval lemma's identity lives in the proof IR (asserted above
+    // as `TheoryLemmaKind::StringGroundEval`), not in the printed rule name:
+    // `string_ground_eval` is not an Alethe rule, and emitting it made carcara
+    // reject the whole document as `invalid`. On the wire it is an honest
+    // `hole`; the congruence bridge is a real rule and still prints as one.
     assert!(
-        text.contains(":rule string_ground_eval") && text.contains(":rule cong"),
-        "expected the ground-eval lemma and the congruence bridge; got:\n{text}"
+        text.contains(":rule hole") && text.contains(":rule cong"),
+        "expected the ground-eval lemma as an honest hole and the congruence bridge; got:\n{text}"
+    );
+    assert!(
+        !text.contains(":rule string_ground_eval"),
+        "must not emit a rule name no Alethe checker implements; got:\n{text}"
     );
     assert!(
         exec.unsat_proof_self_certified(),
@@ -2698,9 +3588,16 @@ fn qf_s_symbolic_regex_intersection_refutation_self_certifies() {
         !text.contains(":rule trust"),
         "symbolic regex refutation must not fall back to trust; got:\n{text}"
     );
+    // `regex_intersect_empty` is AY's kind name, not an Alethe rule; on the
+    // wire the lemma is an honest `hole` (the kind itself is asserted on the
+    // proof IR below).
     assert!(
-        text.contains(":rule regex_intersect_empty"),
-        "expected the regex-emptiness lemma; got:\n{text}"
+        text.contains(":rule hole"),
+        "expected the regex-emptiness lemma as an honest hole; got:\n{text}"
+    );
+    assert!(
+        !text.contains(":rule regex_intersect_empty"),
+        "must not emit a rule name no Alethe checker implements; got:\n{text}"
     );
     assert!(
         exec.unsat_proof_self_certified(),
@@ -2771,9 +3668,15 @@ fn qf_slia_str_len_axiom_refutation_self_certifies() {
         Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
         Err(e) => panic!("str.len length refutation must pass strict check, got {e:?}"),
     }
+    // `string_length_lemma` is AY's kind name, not an Alethe rule; on the wire
+    // the certified length lemma is an honest `hole`.
     assert!(
-        text.contains(":rule string_length_lemma"),
-        "expected the certified length lemma; got:\n{text}"
+        text.contains(":rule hole"),
+        "expected the certified length lemma as an honest hole; got:\n{text}"
+    );
+    assert!(
+        !text.contains(":rule string_length_lemma"),
+        "must not emit a rule name no Alethe checker implements; got:\n{text}"
     );
     assert!(
         exec.unsat_proof_self_certified(),
@@ -2880,10 +3783,12 @@ fn qf_ax_store_flat_refutation_self_certifies_from_authored_assertions() {
 }
 
 #[test]
-fn nested_row_auxiliary_proof_stays_in_authored_problem_scope() {
+fn nested_row_auxiliary_hole_requires_independent_publication_certificate() {
     // The private nested-row rescue folds the two authored array assertions to
-    // the array-free residue `false`. Its refutation is useful in default mode,
-    // but the folded premise must never escape as authored proof authority.
+    // the array-free residue `false`. Its native proof retains an explicit hole,
+    // so it is not self-certified by the strict proof checker alone. The public
+    // UNSAT funnel may nevertheless publish the correct verdict after its
+    // independent fresh-executor discharge re-decides the exact authored query.
     let input = r#"
         (set-option :produce-proofs true)
         (set-logic QF_AUFNIA)
@@ -2898,26 +3803,23 @@ fn nested_row_auxiliary_proof_stays_in_authored_problem_scope() {
     "#;
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
-    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
-
-    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
-    let scope = exec.proof_export_scope_assertions();
-    assert!(
-        ay_proof::validate_reachable_assumes_in_problem_scope(proof, &scope).is_ok(),
-        "the accepted auxiliary proof must not assume its folded residue"
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "the mandatory publication funnel must independently discharge the \
+         private store-flat hole against the exact authored query; proof={:#?}",
+        exec.last_proof.as_ref().map(|proof| &proof.steps)
     );
 
-    let text = exec
-        .try_export_last_proof_alethe_for_problem_scope()
-        .expect("proof after UNSAT")
-        .expect("problem-scoped Alethe export");
+    assert_eq!(exec.get_reason_unknown(), None);
     assert!(
-        !text.contains(":rule trust"),
-        "reduced-only proof leaves must use attributed holes, not trust:\n{text}"
+        exec.last_proof.is_some(),
+        "a certified UNSAT keeps its attributed native proof"
     );
     assert!(
-        text.contains(":rule hole"),
-        "the uncertified store-flat reduction must remain explicit:\n{text}"
+        exec.take_unsat_certificate().is_some(),
+        "publication must mint a one-shot certificate after independent discharge"
     );
     assert!(
         exec.last_lrat_certificate().is_none(),
@@ -2925,7 +3827,7 @@ fn nested_row_auxiliary_proof_stays_in_authored_problem_scope() {
     );
     assert!(
         !exec.unsat_proof_self_certified(),
-        "a holey auxiliary refutation must remain fail-closed under self-check"
+        "the holey native proof itself must remain honestly non-self-certified"
     );
 }
 

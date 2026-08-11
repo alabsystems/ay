@@ -41,6 +41,9 @@ impl Solver {
     /// singleton (#8506, #8834) so the env var is resolved exactly once
     /// per process.
     pub(super) fn maybe_dump_encoding(&self) {
+        if !self.cold.ambient_artifacts_enabled {
+            return;
+        }
         let Some(path) = ay_core::trace_config().dump_encoding_path.as_deref() else {
             return;
         };

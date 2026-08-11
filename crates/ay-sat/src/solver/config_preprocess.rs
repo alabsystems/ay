@@ -175,6 +175,17 @@ impl Solver {
 
         for _round in 0..1 {
             // Check interrupt at the start of each preprocessing round (#3638).
+            //
+            // Poll the process memory limit here too. `poll_process_memory_limit`
+            // is gated on a CONFLICT cadence and its call sites are the CDCL loop
+            // tops, propagation, and IC3 — so nothing enforces the limit during
+            // preprocessing, which is exactly where unbounded growth happens.
+            // Measured on the SAT-COMP 2026 set: `--memory 6000` was ignored
+            // entirely while `post-cbmc-aes-ee-r2` (a 33 MB file) grew steadily
+            // past 12 GB, and `lightsout_sat_23` (180 KB) reached 71.7 GB. Same
+            // shape as the large-workload / compiler_consumer 300 GB incident that motivated
+            // `poll_process_memory_limit_now` for the zero-conflict spin.
+            self.poll_process_memory_limit_now();
             if self.is_interrupted() || self.preprocess_timed_out() {
                 return false;
             }

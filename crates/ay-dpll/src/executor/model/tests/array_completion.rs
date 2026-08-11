@@ -475,3 +475,119 @@ fn equality_pinned_unknown_read_completes_to_genuine_witness() {
         "the completed model must satisfy the asserted pin a[0] = 9"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #opaque-array-app-def: OPAQUE array-valued UF applications as definition
+// targets, and the congruence filter that decides admission.
+//
+// These are WHITE-BOX tests of `collect_array_completion_graph`. The
+// end-to-end verdicts live in `model::tests::seq_array_uf_def`, but those
+// cannot distinguish "the filter refused" from "the solver refuted first" —
+// every congruence-conflicting input is UNSAT and never reaches the model
+// gate. Reading the admitted definition set directly is what makes the filter
+// itself testable.
+// ---------------------------------------------------------------------------
+
+/// Parse + execute a declaration/assertion prelude (no `check-sat`), then read
+/// the array-completion definition edges the graph builder admits.
+fn admitted_array_definitions(input: &str) -> (Executor, Vec<(TermId, TermId)>) {
+    let commands = ay_frontend::parse(input).expect("valid SMT-LIB input");
+    let mut executor = Executor::new();
+    executor
+        .execute_all(&commands)
+        .expect("declarations and assertions execute");
+    let (_relevant, _edges, _aliases, definitions, _required_reads) =
+        executor.collect_array_completion_graph(&empty_model(), &[]);
+    (executor, definitions)
+}
+
+/// Whether any admitted definition TARGETS an application of `symbol`.
+fn defines_application_of(
+    executor: &Executor,
+    definitions: &[(TermId, TermId)],
+    symbol: &str,
+) -> bool {
+    definitions.iter().any(|&(target, _)| {
+        matches!(executor.ctx.terms.get(target), TermData::App(sym, _) if sym.name() == symbol)
+    })
+}
+
+const OPAQUE_APP_PRELUDE: &str = "(set-logic ALL)\
+     (declare-sort Elem 0)\
+     (declare-fun v () Elem)\
+     (declare-fun w () Elem)\
+     (declare-fun g (Elem) (Array (_ BitVec 4) Int))";
+
+/// The admitting case: a single application of `g`, defined once by a
+/// const-array. Congruence relates it to nothing, so the definition is safe to
+/// publish — and this is the edge that turns
+/// `array_valued_uf_select_over_bitvec_index_resolves_through_its_definition`
+/// from `unknown` into `sat`.
+#[test]
+fn lone_opaque_array_app_definition_is_admitted() {
+    let (executor, definitions) = admitted_array_definitions(&format!(
+        "{OPAQUE_APP_PRELUDE}\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 7) (g v)))\
+         (assert (= (select (g v) #x3) 7))"
+    ));
+    assert!(
+        defines_application_of(&executor, &definitions, "g"),
+        "a lone array-valued application with one const-array definition is a \
+         definition target"
+    );
+}
+
+/// CONGRUENCE FILTER, clause (ii): a SECOND application of the same symbol
+/// exists, so `v = w` could force the two to denote one array. Publishing a
+/// value for `(g v)` alone could then contradict what the same model says
+/// about `(g w)` — nothing downstream re-derives UF congruence over whole-array
+/// values — so the definition must be REFUSED and the application falls back to
+/// its reads-derived candidate.
+#[test]
+fn opaque_array_app_definition_is_refused_with_a_congruent_sibling() {
+    let (executor, definitions) = admitted_array_definitions(&format!(
+        "{OPAQUE_APP_PRELUDE}\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 7) (g v)))\
+         (assert (= (select (g w) #x3) 5))"
+    ));
+    assert!(
+        !defines_application_of(&executor, &definitions, "g"),
+        "a sibling application of the same symbol must fail the definition \
+         closed (congruence could relate them)"
+    );
+}
+
+/// CONGRUENCE FILTER, clause (i): the SAME application carries two different
+/// definitions. There is no principled winner, so both are refused rather than
+/// one being chosen — the same discipline
+/// `unique_array_constructor_definition_excluding` applies to array variables.
+#[test]
+fn ambiguous_opaque_array_app_definitions_are_refused() {
+    let (executor, definitions) = admitted_array_definitions(&format!(
+        "{OPAQUE_APP_PRELUDE}\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 0) (g v)))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 1) (g v)))"
+    ));
+    assert!(
+        !defines_application_of(&executor, &definitions, "g"),
+        "competing definitions of one application must both be refused"
+    );
+}
+
+/// An ordinary array VARIABLE definition is untouched by the new arm: the
+/// filter is additive, never a restriction on the pre-existing `TermData::Var`
+/// classification.
+#[test]
+fn array_variable_definitions_are_unaffected_by_the_opaque_app_arm() {
+    let (executor, definitions) = admitted_array_definitions(
+        "(set-logic ALL)\
+         (declare-fun a () (Array (_ BitVec 4) Int))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 7) a))",
+    );
+    assert!(
+        definitions.iter().any(|&(target, _)| {
+            matches!(executor.ctx.terms.get(target), TermData::Var(name, _) if name == "a")
+        }),
+        "the array-variable definition edge must still be recorded"
+    );
+}

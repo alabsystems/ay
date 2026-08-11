@@ -126,25 +126,45 @@ struct ProofFileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(not(any(unix, windows)))]
     created: Option<std::time::SystemTime>,
 }
 
 impl ProofFileIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    /// Identity of the file behind an open descriptor.
+    ///
+    /// Windows has no stable `Metadata` accessor for file identity (the
+    /// `windows_by_handle` feature is unstable, rust-lang/rust#63010), so the
+    /// exact `(volume serial, file index)` pair — the analogue of unix
+    /// `(dev, ino)` — is read through the handle instead of approximated by a
+    /// creation timestamp.
+    fn from_file(file: &File) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            Self {
+            let metadata = file.metadata()?;
+            Ok(Self {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            }
+            })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            Self {
-                created: metadata.created().ok(),
-            }
+            let info = ay_sys::windows_fs::file_info(file)?;
+            Ok(Self {
+                volume_serial_number: info.volume_serial_number,
+                file_index: info.file_index,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self {
+                created: file.metadata()?.created().ok(),
+            })
         }
     }
 }
@@ -156,11 +176,11 @@ struct PublishedDimacsProof {
     sha256: Sha256Digest,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const DIMACS_PROOF_STAGING_ATTEMPTS: u64 = 128;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const DIMACS_PROOF_STAGING_PREFIX: &str = ".ay-dimacs-proof-";
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 static DIMACS_PROOF_STAGING_NONCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -183,7 +203,7 @@ struct OwnedDimacsProof {
     invalidation: DimacsPublicationInvalidation,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct DimacsProofStatusReservation {
     proof_path: PathBuf,
     status_path: PathBuf,
@@ -192,7 +212,7 @@ struct DimacsProofStatusReservation {
     lock_identity: ProofFileIdentity,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 struct DimacsProofStatusReservation;
 
 struct RetainedDimacsPublication {
@@ -211,7 +231,7 @@ enum DimacsPublicationInvalidation {
     Proof { binary: bool },
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectedDimacsProofCreateFailure {
     Identity,
@@ -220,24 +240,24 @@ enum InjectedDimacsProofCreateFailure {
 
 #[cfg(test)]
 std::thread_local! {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_PROOF_CREATE_FAILURE:
         std::cell::Cell<Option<InjectedDimacsProofCreateFailure>> = const { std::cell::Cell::new(None) };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_PROOF_CLEANUP_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR:
         std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_RENAME_NOREPLACE_ERROR:
         std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
@@ -286,7 +306,7 @@ fn inject_dimacs_rename_noreplace_error_once(raw_os_error: i32) {
     INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.set(Some(raw_os_error)));
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 fn take_injected_dimacs_proof_create_failure(expected: InjectedDimacsProofCreateFailure) -> bool {
     INJECTED_DIMACS_PROOF_CREATE_FAILURE.with(|failure| {
         if failure.get() == Some(expected) {
@@ -298,12 +318,12 @@ fn take_injected_dimacs_proof_create_failure(expected: InjectedDimacsProofCreate
     })
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 fn take_injected_dimacs_proof_cleanup_failure() -> bool {
     INJECTED_DIMACS_PROOF_CLEANUP_FAILURE.with(|failure| failure.replace(false))
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 fn take_injected_dimacs_proof_cleanup_replacement() -> bool {
     INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.replace(false))
 }
@@ -313,7 +333,7 @@ fn take_injected_optional_dimacs_writer_failure() -> bool {
     INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.replace(false))
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 fn take_injected_dimacs_status_lock_identity_failure() -> bool {
     INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE.with(|failure| failure.replace(false))
 }
@@ -323,7 +343,7 @@ fn take_injected_anonymous_dimacs_staging_error() -> Option<i32> {
     INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR.with(|error| error.replace(None))
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 fn take_injected_dimacs_rename_noreplace_error() -> Option<i32> {
     INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.replace(None))
 }
@@ -384,7 +404,20 @@ fn regular_single_link_identity(file: &File, path: &Path) -> io::Result<ProofFil
             ));
         }
     }
-    Ok(ProofFileIdentity::from_metadata(&metadata))
+    #[cfg(windows)]
+    {
+        let links = ay_sys::windows_fs::file_info(file)?.number_of_links;
+        if links != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "DIMACS proof output '{}' has {links} hard links; exactly one is required",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    ProofFileIdentity::from_file(file)
 }
 
 fn open_dimacs_regular_file(path: &Path) -> io::Result<File> {
@@ -405,6 +438,18 @@ fn open_dimacs_regular_file(path: &Path) -> io::Result<File> {
                 format!("'{}' is not a regular file", path.display()),
             ));
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // See create_named_dimacs_staging_file: a reader holding this file
+            // open must not block the quarantine rename that fail-closed
+            // cleanup performs on the same path.
+            OpenOptions::new()
+                .read(true)
+                .share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE)
+                .open(path)
+        }
+        #[cfg(not(windows))]
         File::open(path)
     }
 }
@@ -420,10 +465,10 @@ fn regular_file_identity(file: &File, path: &Path) -> io::Result<ProofFileIdenti
             ),
         ));
     }
-    Ok(ProofFileIdentity::from_metadata(&metadata))
+    ProofFileIdentity::from_file(file)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_private_dimacs_staging_directory(target: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
@@ -511,7 +556,25 @@ fn anonymous_dimacs_staging_is_unsupported(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(nix::libc::EOPNOTSUPP))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(windows)]
+fn create_anonymous_dimacs_staging_file(_target: &Path) -> io::Result<File> {
+    // Windows has no O_TMPFILE-style anonymous inode either. Take the same
+    // route macOS takes: report "cannot stage anonymously" so the caller falls
+    // back to the named single-link stage, which Windows publishes with
+    // no-replace semantics via MoveFileExW without MOVEFILE_REPLACE_EXISTING
+    // (`ay_sys::fs::rename_noreplace`).
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "anonymous DIMACS proof staging is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn anonymous_dimacs_staging_is_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
@@ -536,6 +599,17 @@ fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)
                 .mode(0o600)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // Windows refuses MoveFileExW/DeleteFile on a path whose file still
+            // has an open handle unless EVERY handle permits deletion. The
+            // staged publication path renames the staging file while its
+            // descriptor is still held (that descriptor is the authentication
+            // root and cannot be closed first), so FILE_SHARE_DELETE is
+            // mandatory here; without it publication fails with ERROR_ACCESS_DENIED.
+            options.share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE);
+        }
         match options.open(&staging_path) {
             Ok(file) => return Ok((staging_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -550,7 +624,7 @@ fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn cleanup_unregistered_dimacs_staging(
     descriptor: &File,
     staging_path: &Path,
@@ -578,7 +652,7 @@ fn cleanup_unregistered_dimacs_staging(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn dimacs_proof_setup_error(
     error: io::Error,
     cleanup: io::Result<()>,
@@ -593,7 +667,7 @@ fn dimacs_proof_setup_error(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io::Error {
     let detail = error.map_or_else(String::new, |error| format!(": {error}"));
     io::Error::new(
@@ -612,7 +686,7 @@ fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io:
 /// Unsupported platforms fail before reserving any proof/status pathname. The
 /// registry retains a descriptor for every later seal, verification, artifact
 /// scan, and cleanup.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_owned_dimacs_proof_file_with_status(
     path: &str,
     status_reservation: &mut Option<DimacsProofStatusReservation>,
@@ -711,7 +785,7 @@ fn create_owned_dimacs_proof_file_with_status(
     Ok(file)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn create_owned_dimacs_proof_file_with_status(
     _path: &str,
     _status_reservation: &mut Option<DimacsProofStatusReservation>,
@@ -732,7 +806,7 @@ fn create_owned_dimacs_proof_file(path: &str) -> io::Result<File> {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> {
     if !proof.synthesized_default {
         let mut status_reservation = None;
@@ -768,7 +842,7 @@ fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> 
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn create_configured_dimacs_proof_file(_proof: &ProofConfig) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -939,7 +1013,7 @@ fn publish_dimacs_descriptor_noreplace(descriptor: &File, target: &Path) -> io::
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn rename_dimacs_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     #[cfg(test)]
     if let Some(raw_os_error) = take_injected_dimacs_rename_noreplace_error() {
@@ -948,7 +1022,7 @@ fn rename_dimacs_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     ay_sys::fs::rename_noreplace(source, target)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn move_dimacs_proof_to_private_quarantine(source: &Path, target: &Path) -> io::Result<()> {
     // Never remove a public pathname unless the same platform can atomically
     // restore a quarantined replacement without clobbering another object.
@@ -1002,7 +1076,7 @@ fn remove_authenticated_visible_file(
         )));
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let path_matches = match open_dimacs_regular_file(path) {
             Ok(visible) => {
@@ -1021,7 +1095,7 @@ fn remove_authenticated_visible_file(
         };
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         let (private_directory, _) = match create_private_dimacs_staging_directory(path) {
             Ok(staging) => staging,
@@ -1210,7 +1284,7 @@ fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
                 .staging_path
                 .clone()
                 .ok_or_else(|| io::Error::other("named DIMACS proof staging path is missing"))?;
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             if let Err(error) = rename_dimacs_noreplace(&staging_path, &resolved) {
                 return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                     preexisting_dimacs_proof_error(&resolved, Some(&error))
@@ -1218,7 +1292,7 @@ fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
                     error
                 });
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1250,7 +1324,7 @@ fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
     let before_len = visible.metadata()?.len();
     let (len, sha256) = hash_file(&mut visible)?;
     let after_metadata = visible.metadata()?;
-    if ProofFileIdentity::from_metadata(&after_metadata) != state.identity
+    if ProofFileIdentity::from_file(&visible)? != state.identity
         || before_len != len
         || after_metadata.len() != len
     {
@@ -1304,7 +1378,7 @@ fn validate_published_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProo
     let before_len = file.metadata()?.len();
     let (len, sha256) = hash_file(&mut file)?;
     let after = file.metadata()?;
-    if ProofFileIdentity::from_metadata(&after) != published.identity
+    if ProofFileIdentity::from_file(&file)? != published.identity
         || before_len != published.len
         || len != published.len
         || after.len() != published.len
@@ -1519,7 +1593,7 @@ pub(crate) fn read_published_dimacs_proof(
     let mut bytes = Vec::with_capacity(capacity);
     file.read_to_end(&mut bytes)?;
     let after = file.metadata()?;
-    if ProofFileIdentity::from_metadata(&after) != published.identity
+    if ProofFileIdentity::from_file(&file)? != published.identity
         || after.len() != published.len
         || bytes.len() as u64 != published.len
         || sha256_digest(&bytes) != expected_sha256
@@ -1627,7 +1701,7 @@ impl AuthenticatedLeanSnapshot {
 
     fn validate(&mut self) -> io::Result<()> {
         let metadata = self.descriptor.metadata()?;
-        if ProofFileIdentity::from_metadata(&metadata) != self.identity
+        if ProofFileIdentity::from_file(&self.descriptor)? != self.identity
             || metadata.len() != self.len
         {
             return Err(io::Error::other(
@@ -1780,7 +1854,7 @@ fn exit_with_circuit_multiplier22_retained_sat_model(model: &[bool]) -> ! {
     emit_dimacs_sat_model(model);
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    std::process::exit(10);
+    std::process::exit(crate::dimacs_verdict_exit_code(10));
 }
 
 fn emit_dimacs_sat_model_to_writer<W: Write>(model: &[bool], out: &mut W) -> io::Result<()> {
@@ -2284,7 +2358,7 @@ pub(super) fn dimacs_proof_status_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn dimacs_proof_digest_hex(digest: Sha256Digest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -2295,7 +2369,7 @@ fn dimacs_proof_digest_hex(digest: Sha256Digest) -> String {
     encoded
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn dimacs_proof_status_content(status: &str, sha256: Option<Sha256Digest>) -> String {
     let mut content = format!(
         "ay-dimacs-proof-status-v1\nstatus={status}\nproducer_pid={}\n",
@@ -2309,7 +2383,7 @@ fn dimacs_proof_status_content(status: &str, sha256: Option<Sha256Digest>) -> St
     content
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn status_transaction_error(
     operation_error: io::Error,
     cleanup: io::Result<bool>,
@@ -2323,7 +2397,7 @@ fn status_transaction_error(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
     let proof_path = resolved_dimacs_proof_path(proof_path)?;
     let status_path = dimacs_proof_status_path_from_path(&proof_path);
@@ -2336,6 +2410,17 @@ fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatus
         options
             .mode(0o600)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Windows refuses MoveFileExW/DeleteFile on a path whose file still
+        // has an open handle unless EVERY handle permits deletion. The
+        // staged publication path renames the staging file while its
+        // descriptor is still held (that descriptor is the authentication
+        // root and cannot be closed first), so FILE_SHARE_DELETE is
+        // mandatory here; without it publication fails with ERROR_ACCESS_DENIED.
+        options.share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE);
     }
     let mut lock_descriptor = options.open(&lock_path).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
@@ -2455,7 +2540,7 @@ fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatus
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2463,7 +2548,7 @@ fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatu
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn rewrite_reserved_dimacs_proof_status(
     descriptor: &File,
     path: &Path,
@@ -2491,7 +2576,7 @@ fn rewrite_reserved_dimacs_proof_status(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn publish_reserved_dimacs_proof_status(
     reservation: DimacsProofStatusReservation,
     status: &str,
@@ -2530,6 +2615,13 @@ fn publish_reserved_dimacs_proof_status(
         None,
         DimacsPublicationInvalidation::Empty,
     )?;
+    // Directory fsync is the POSIX idiom for making a rename durable, and is
+    // gated to unix exactly as the other two sites are: on Windows `File::open`
+    // of a DIRECTORY fails with ERROR_ACCESS_DENIED unless it is opened with
+    // FILE_FLAG_BACKUP_SEMANTICS, and a directory handle cannot be flushed
+    // anyway. NTFS orders the rename's metadata itself, so there is nothing to
+    // force here.
+    #[cfg(unix)]
     if let Some(parent) = reservation.status_path.parent() {
         if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
             return Err(dimacs_invalidation_error(
@@ -2542,7 +2634,7 @@ fn publish_reserved_dimacs_proof_status(
     Ok(publication)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn publish_reserved_dimacs_proof_status(
     _reservation: DimacsProofStatusReservation,
     _status: &str,
@@ -4654,7 +4746,7 @@ fn maybe_run_dense_clique_php_proof_route(
     unsat_authority.commit_after_verdict();
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    std::process::exit(20);
+    std::process::exit(crate::dimacs_verdict_exit_code(20));
 }
 
 fn cleanup_dense_clique_php_route_rejection_proof(
@@ -5426,8 +5518,48 @@ fn required_dimacs_proof_gate_error(proof_config: Option<&ProofConfig>) -> Optio
     None
 }
 
+/// Refuse the one configuration in which an UNSAT verdict is checked by nobody.
+///
+/// `AY_SAT_COMPOSITE_SYMMETRY` selects lex-leader symmetry breaking whose
+/// equal-prefix aux tower is not single-witness PR, so the steps it appends are
+/// not SR-checkable. Measured on `count_p2_M21`: AY reports `s UNSATISFIABLE`
+/// in 276 ms with an 11 378-line proof, and `dsr-trim` rejects it with
+/// `No UP contradiction for RAT clause 11670`.
+///
+/// Two of the three legs are individually fine. With proof re-checking ON, the
+/// internal checker fails closed and the bad certificate never escapes. With no
+/// proof requested, the answer is uncertified but nothing claims otherwise.
+/// It is the conjunction — route active, proof written, re-check off — that
+/// produces a confident wrong-looking artifact: a competition harness reads
+/// `s UNSATISFIABLE`, keeps the proof, and the stderr warning
+/// (`config_preprocess_symmetry.rs:254`) is never read. That is a disqualified
+/// submission rather than a visible failure, so this leg refuses instead of
+/// warning. The warning stays for the re-check-on case, where it is advisory.
+fn uncertifiable_symmetry_gate_error(proof_config: Option<&ProofConfig>) -> Option<String> {
+    if std::env::var_os("AY_SAT_COMPOSITE_SYMMETRY").is_none_or(|v| v != "1") {
+        return None;
+    }
+    proof_config?;
+    if super::VERIFY_PROOF_ENABLED.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(
+        "AY_SAT_COMPOSITE_SYMMETRY writes certificates that external checkers reject \
+         (its lex-leader aux tower is not single-witness PR), and proof re-checking is \
+         off, so nothing would catch it. Refusing rather than emitting an unverifiable \
+         UNSAT. Drop --no-verify-proof (and competition proof opt-outs) to let the \
+         internal checker gate the result, unset AY_SAT_COMPOSITE_SYMMETRY for a \
+         certifiable run, or drop --proof if you do not need a certificate."
+            .to_string(),
+    )
+}
+
 fn enforce_required_dimacs_proof_gate(proof_config: Option<&ProofConfig>) {
     if let Some(error) = required_dimacs_proof_gate_error(proof_config) {
+        safe_eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+    if let Some(error) = uncertifiable_symmetry_gate_error(proof_config) {
         safe_eprintln!("Error: {error}");
         std::process::exit(1);
     }
@@ -5654,10 +5786,11 @@ fn read_authenticated_dimacs_source(
             format!("DIMACS source '{path}' is not a regular file"),
         ));
     }
+    let identity_before = ProofFileIdentity::from_file(&file)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let after = file.metadata()?;
-    if ProofFileIdentity::from_metadata(&before) != ProofFileIdentity::from_metadata(&after)
+    if ProofFileIdentity::from_file(&file)? != identity_before
         || before.len() != after.len()
         || bytes.len() as u64 != before.len()
     {
@@ -6118,6 +6251,8 @@ fn run_dimacs_from_content_impl(
 
                     let sink_output = ProofOutput::lrat_text(io::sink(), num_original_clauses);
                     let mut solver = SatSolver::with_proof_output(formula.num_vars, sink_output);
+                    // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+                    solver.set_symmetry_oneshot(true);
                     variant_config.apply_to_solver(&mut solver);
                     for clause in formula.clauses {
                         solver.add_clause(clause);
@@ -6149,6 +6284,8 @@ fn run_dimacs_from_content_impl(
                     let lrat_output =
                         ProofOutput::lrat_text(Vec::<u8>::new(), num_original_clauses);
                     let mut solver = SatSolver::with_proof_output(formula.num_vars, lrat_output);
+                    // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+                    solver.set_symmetry_oneshot(true);
                     variant_config.apply_to_solver(&mut solver);
                     for clause in formula.clauses {
                         solver.add_clause(clause);
@@ -6203,6 +6340,8 @@ fn run_dimacs_from_content_impl(
                     ),
                 };
                 let mut solver = SatSolver::with_proof_output(formula.num_vars, output);
+                // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+                solver.set_symmetry_oneshot(true);
                 variant_config.apply_to_solver(&mut solver);
                 for clause in formula.clauses {
                     solver.add_clause(clause);
@@ -6241,6 +6380,8 @@ fn run_dimacs_from_content_impl(
                     );
 
                     let mut solver = SatSolver::new(formula.num_vars);
+                    // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+                    solver.set_symmetry_oneshot(true);
                     let xor_config = variant_profile_plan_for_dimacs_features(
                         sat_variant,
                         formula.num_vars,
@@ -6590,7 +6731,7 @@ pub(crate) fn run_dimacs_parallel(
                     emit_dimacs_sat_model(&model);
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    std::process::exit(10);
+                    std::process::exit(crate::dimacs_verdict_exit_code(10));
                 }
                 SatResult::Unsat(_) => {
                     let Some(authority) = &mut unsat_authority else {
@@ -6604,7 +6745,7 @@ pub(crate) fn run_dimacs_parallel(
                     authority.commit_after_verdict();
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    std::process::exit(20);
+                    std::process::exit(crate::dimacs_verdict_exit_code(20));
                 }
                 SatResult::Unknown => {
                     dimacs_exit_if_timed_out(None);
@@ -6840,7 +6981,7 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                     emit_dimacs_sat_model(&model);
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    std::process::exit(10);
+                    std::process::exit(crate::dimacs_verdict_exit_code(10));
                 }
                 SatResult::Unsat(_) => {
                     let Some(authority) = &mut unsat_authority else {
@@ -6854,7 +6995,7 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                     authority.commit_after_verdict();
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    std::process::exit(20);
+                    std::process::exit(crate::dimacs_verdict_exit_code(20));
                 }
                 SatResult::Unknown => {
                     dimacs_exit_if_timed_out(None);
@@ -7717,6 +7858,9 @@ fn finish_dimacs_solve_with_source(
 
     if stats_cfg.any() {
         let props = solver.num_propagations();
+        // Search-loop-only propagations: the figure comparable to Kissat's
+        // `search_propagations`. `props` also counts probe/vivify/sweep BCP.
+        let search_props = solver.num_search_propagations();
         let confs = solver.num_conflicts();
         let decs = solver.num_decisions();
         let restarts = solver.num_restarts();
@@ -7820,6 +7964,7 @@ fn finish_dimacs_solve_with_source(
             safe_eprintln!("c");
             safe_eprintln!("c --- AY statistics ---");
             safe_eprintln!("c propagations:    {props:>12}");
+            safe_eprintln!("c search props:    {search_props:>12}");
             safe_eprintln!("c conflicts:       {confs:>12}");
             safe_eprintln!("c decisions:       {decs:>12}");
             safe_eprintln!("c restarts:        {restarts:>12}");
@@ -8147,6 +8292,17 @@ fn finish_dimacs_solve_with_source(
             safe_eprintln!("c sweep_environs:  {val:>12}", val = ss.kitten_environments);
             safe_eprintln!("c sweep_backbone:  {val:>12}", val = ss.kitten_backbone);
             safe_eprintln!("c sweep_cls_rwt:   {val:>12}", val = ss.clauses_rewritten);
+            let sy = solver.symmetry_report();
+            safe_eprintln!("c symmetry_runs:   {val:>12}", val = sy.runs);
+            safe_eprintln!("c symmetry_pairs:  {val:>12}", val = sy.pairs_detected);
+            safe_eprintln!("c symmetry_groups: {val:>12}", val = sy.groups_nontrivial);
+            safe_eprintln!("c symmetry_grp_ob: {val:>12}", val = sy.groups_over_budget);
+            safe_eprintln!("c symmetry_grp_max:{val:>12}", val = sy.largest_group);
+            safe_eprintln!("c symmetry_sb_cls: {val:>12}", val = sy.sb_clauses_added);
+            safe_eprintln!(
+                "c symmetry_skip:   {val:>12}",
+                val = sy.skipped.unwrap_or("-")
+            );
             safe_eprintln!("c decomp_rounds:   {val:>12}", val = ds.rounds);
             safe_eprintln!("c decomp_subst:    {val:>12}", val = ds.substituted);
             safe_eprintln!("c transred_rounds: {val:>12}", val = ts.rounds);
@@ -8241,7 +8397,7 @@ fn finish_dimacs_solve_with_source(
                 solver.bve_stats().backward_subsumed
             );
             safe_eprintln!("c  otfs_subsmd:    {:>12}", solver.otfs_clause_subsumed());
-            safe_eprintln!("c  eager_subsmd:   {:>12}", solver.eager_subsumed());
+            safe_eprintln!("c  eager_subsmd:   {:>12}", solver.num_eager_subsumptions());
             {
                 let vs = solver.vivify_stats();
                 safe_eprintln!("c  viv_inline_s:   {:>12}", vs.inline_subsumed);
@@ -8264,8 +8420,21 @@ fn finish_dimacs_solve_with_source(
             safe_eprintln!("c flushes:         {flushes:>12}");
             safe_eprintln!("c reductions:      {reductions:>12}");
             safe_eprintln!("c arena_compacts:  {arena_compactions:>12}");
+            safe_eprintln!(
+                "c arena_cmp_skips: {:>12}",
+                solver.num_arena_compaction_skips()
+            );
+            let factor_skips = solver.factor_skip_breakdown();
+            if factor_skips.iter().any(|&(_, n)| n > 0) {
+                let rendered: Vec<String> = factor_skips
+                    .iter()
+                    .filter(|&&(_, n)| n > 0)
+                    .map(|(tag, n)| format!("{tag}={n}"))
+                    .collect();
+                safe_eprintln!("c factor_skips:    {}", rendered.join(" "));
+            }
             safe_eprintln!("c inprobe_phases:  {inprobe_phases:>12}");
-            safe_eprintln!("c eager_subsumed:  {:>12}", solver.eager_subsumed());
+            safe_eprintln!("c eager_subsumed:  {:>12}", solver.num_eager_subsumptions());
             // BCE stats (#8131)
             let bces = solver.bce_stats();
             safe_eprintln!("c --- BCE ---");
@@ -8373,6 +8542,8 @@ fn finish_dimacs_solve_with_source(
             // Memory stats (#8131)
             safe_eprintln!("c --- memory ---");
             safe_eprintln!("c arena_words:     {:>12}", solver.arena_words());
+            safe_eprintln!("c arena_dead:      {:>12}", solver.arena_dead_words());
+            safe_eprintln!("c arena_slots:     {:>12}", solver.arena_clause_slots());
             safe_eprintln!("c active_clauses:  {:>12}", solver.active_clause_count());
             safe_eprintln!("c");
         }
@@ -8393,6 +8564,7 @@ fn finish_dimacs_solve_with_source(
         run_stats.insert("conflicts", confs);
         run_stats.insert("decisions", decs);
         run_stats.insert("propagations", props);
+        run_stats.insert("search_propagations", search_props);
         run_stats.insert("restarts", restarts);
         run_stats.insert("sat.cold_restarts", cold_restarts);
         run_stats.insert("sat.chrono_bt", chrono);
@@ -9898,6 +10070,20 @@ fn finish_dimacs_solve_with_source(
             run_stats.insert("sat.sweep_clauses_rwt", ss.clauses_rewritten);
         }
         {
+            // Symmetry telemetry (SAT-COMP 2026 campaign): the winner's entire
+            // margin over plain Kissat came from symmetry breaking, so a run has
+            // to say whether the pass fired and, when it did not, which guard
+            // stopped it.
+            let sy = solver.symmetry_report();
+            run_stats.insert("sat.symmetry_runs", sy.runs);
+            run_stats.insert("sat.symmetry_candidate_pairs", sy.candidate_pairs);
+            run_stats.insert("sat.symmetry_pairs", sy.pairs_detected);
+            run_stats.insert("sat.symmetry_sb_clauses", sy.sb_clauses_added);
+            run_stats.insert("sat.symmetry_groups", sy.groups_nontrivial);
+            run_stats.insert("sat.symmetry_groups_over_budget", sy.groups_over_budget);
+            run_stats.insert("sat.symmetry_largest_group", sy.largest_group);
+        }
+        {
             let ds = solver.decompose_stats();
             run_stats.insert("sat.decomp_rounds", ds.rounds);
             run_stats.insert("sat.decomp_subst", ds.substituted);
@@ -9930,7 +10116,7 @@ fn finish_dimacs_solve_with_source(
             // Per-source breakdown (#8502)
             run_stats.insert("sat.bve_bw_subsumed", solver.bve_stats().backward_subsumed);
             run_stats.insert("sat.otfs_subsumed", solver.otfs_clause_subsumed());
-            run_stats.insert("sat.eager_subsumed", solver.eager_subsumed());
+            run_stats.insert("sat.eager_subsumed", solver.num_eager_subsumptions());
             run_stats.insert(
                 "sat.congruence_subsumed",
                 solver.congruence_stats().congruence_subsumed,
@@ -10063,6 +10249,8 @@ fn finish_dimacs_solve_with_source(
         );
         // Memory stats
         run_stats.insert("sat.arena_words", solver.arena_words() as u64);
+        run_stats.insert("sat.arena_dead_words", solver.arena_dead_words() as u64);
+        run_stats.insert("sat.arena_clause_slots", solver.arena_clause_slots() as u64);
         run_stats.insert("sat.active_clauses", solver.active_clause_count() as u64);
         // Backbone stats (#3274)
         run_stats.insert("sat.backbone_binary_units", solver.backbone_binary_units());
@@ -10193,7 +10381,7 @@ fn finish_dimacs_solve_with_source(
         // Stale BCP watch entry safety net (#8547)
         run_stats.insert("sat.stale_bcp_watch_skips", solver.stale_bcp_watch_skips());
         // Eager subsumption
-        run_stats.insert("sat.eager_subsumed", solver.eager_subsumed());
+        run_stats.insert("sat.eager_subsumed", solver.num_eager_subsumptions());
         // Lookahead stats (#8087)
         {
             let (la_rounds, la_failed, la_used) = solver.lookahead_stats();
@@ -10233,7 +10421,7 @@ fn finish_dimacs_solve_with_source(
             // Flush before process::exit which skips destructors (#3088).
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
-            std::process::exit(10);
+            std::process::exit(crate::dimacs_verdict_exit_code(10));
         }
         SatResult::Unsat(_) => {
             let Some(authority) = &mut unsat_authority else {
@@ -10248,7 +10436,7 @@ fn finish_dimacs_solve_with_source(
             // SAT Competition exit code 20 = UNSATISFIABLE.
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
-            std::process::exit(20);
+            std::process::exit(crate::dimacs_verdict_exit_code(20));
         }
         SatResult::Unknown => {
             // Check timeout before printing. SAT-COMP wrapper runs must use
@@ -10413,6 +10601,8 @@ fn run_finalize_rescue(
         }
     };
     solver.set_inprocessing_profile(&finalize_rescue_profile());
+    // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+    solver.set_symmetry_oneshot(true);
     for clause in formula.clauses {
         solver.add_clause(clause);
     }
@@ -10578,7 +10768,10 @@ fn run_proof_streaming_reader<R>(
                     });
                 }
                 num_vars = solver_num_vars;
-                solver = Some(SatSolver::with_proof_output(solver_num_vars, proof_output));
+                let mut fresh = SatSolver::with_proof_output(solver_num_vars, proof_output);
+                // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
+                fresh.set_symmetry_oneshot(true);
+                solver = Some(fresh);
                 features = Some(SatFeatureAccumulator::new(solver_num_vars));
                 if dense_clique_php_proof_route_requested
                     && dense_clique_php_route_header_candidate(header.num_vars, header.num_clauses)
@@ -10851,7 +11044,22 @@ fn run_streaming(content: &str, stats_cfg: stats_output::StatsConfig, variant: S
         std::process::exit(1);
     }
 
-    let mut solver = SatSolver::new(num_vars);
+    // The header is already parsed here, so size the clause arena from the real
+    // clause count instead of the `num_vars * 4` guess the bare constructor has
+    // to make.
+    let mut solver = SatSolver::with_clause_hint(num_vars, num_clauses_declared);
+    // This route emits no proof, keeps no clause or decision trace, and logs no
+    // ER definitions, so nothing will ever read the arena-offset-indexed clause
+    // ID table. It costs 8 bytes per arena WORD — twice the clause arena — and
+    // is fully resident: 760 MB of the 4.75 GB peak on the 18 M-clause SAT-COMP
+    // 2026 reference instance.
+    solver.set_clause_ids_disabled(true);
+    // One-shot DIMACS solve: no assumptions, no incremental reuse, so structural
+    // symmetry breaking (orbitopal fixing, the aux-free PHP refutation) is valid.
+    // Those routes remove models, which would be unsound for an embedder solving
+    // under assumptions, so the solver keeps them off unless a caller declares
+    // the solve one-shot.
+    solver.set_symmetry_oneshot(true);
     let mut streaming_config = variant.config(variant_input_for_dimacs(
         variant,
         num_vars,

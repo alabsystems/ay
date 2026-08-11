@@ -49,13 +49,14 @@ use num_rational::BigRational;
 use super::algebraic::ast_as_scalar;
 use super::model_params::model_value_to_term;
 use super::solver::{
+    apply_finite_set_decision_gate, assert_reachable_finite_set_axioms,
     auxiliary_query_acceptance_is_supported, solve_lbool_with_acceptance, DimacsEncoder,
 };
 use super::{
     cache_func_entry, cache_string, ensure_cross_context_translation_semantics,
     ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, record_ast_sort, require_term_ast,
-    require_term_ast_or_return, require_term_asts_or_return, term_to_ast,
+    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, finite_set_decision_gate, record_ast_sort,
+    require_term_ast, require_term_ast_or_return, require_term_asts_or_return, term_to_ast,
     transfer_cross_context_ffi_metadata, DatatypeOp, DecisionOwnerFamily, OptimizeHandle,
     ParamDescrsHandle, SoftRecord, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context, Z3_func_decl,
     Z3_func_interp, Z3_goal, Z3_model, Z3_optimize, Z3_param_descrs, Z3_solver, Z3_string,
@@ -351,6 +352,10 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
                 Z3_L_UNDEF
             );
             let n = term_vec.len();
+            let mut finite_set_roots = assertions.clone();
+            finite_set_roots.extend(tracked_lits.iter().copied());
+            finite_set_roots.extend(term_vec.iter().copied());
+            let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
 
             // Check-time expansion of recursive definitions (P1.1). This
             // auxiliary query has no residual-mode SAT demotion, so it is
@@ -427,6 +432,11 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
                 ctx.error_msg = Some(e);
                 return Z3_L_UNDEF;
             }
+            if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
+                ctx.last_error = super::Z3_EXCEPTION;
+                ctx.error_msg = Some(e);
+                return Z3_L_UNDEF;
+            }
 
             // Establish a publicly admitted SAT baseline before inferring
             // equivalence classes. In particular, an inconsistent baseline is
@@ -437,7 +447,14 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             } else {
                 ctx.solver.check_sat_assuming(&tracked_lits)
             };
-            match solve_lbool_with_acceptance(ctx, baseline) {
+            let baseline = solve_lbool_with_acceptance(ctx, baseline);
+            let baseline = apply_finite_set_decision_gate(
+                ctx,
+                baseline,
+                &finite_set_gate,
+                "Z3_get_implied_equalities",
+            );
+            match baseline {
                 Z3_L_TRUE => {}
                 Z3_L_FALSE => {
                     ctx.last_error = Z3_OK;
@@ -1145,6 +1162,8 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                         group,
                     })
                     .collect(),
+                parsed_soft_public_terms: Vec::new(),
+                public_objectives: Vec::new(),
                 last_model: None,
                 last_check_outcome: None,
                 tracked: new_tracked,

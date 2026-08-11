@@ -356,7 +356,11 @@ impl Solver {
                 let mut learned_lbd: u32 = 0;
                 self.analyze_and_backtrack_ic3(conflict_ref, |solver, learned_clause, bt_level| {
                     if (bt_level as usize) < num_assumptions {
-                        let conflict_core = solver.resolve_conflict_for_unsat_core(
+                        // `_incomplete` is expected: this harvest runs
+                        // pre-backtrack, so ordinary search decisions are still
+                        // on the trail. It only accumulates into
+                        // `failed_assumptions`, which over-approximates.
+                        let (conflict_core, _incomplete) = solver.resolve_conflict_for_unsat_core(
                             conflict_ref,
                             &solver.cold.ic3_is_assumption,
                             &solver.cold.ic3_assumption_lit,
@@ -439,11 +443,21 @@ impl Solver {
                             // subset of the assumptions (backward BFS in
                             // `minimize_unsat_core`).
                             let seed = vec![assump_lit.negated()];
-                            let mut core = self.minimize_unsat_core(
+                            let (mut core, incomplete) = self.minimize_unsat_core(
                                 &seed,
                                 &self.cold.ic3_is_assumption,
                                 &self.cold.ic3_assumption_lit,
                             );
+                            if incomplete {
+                                // #core-failsafe: the walk could not account
+                                // for a branch, so `core` is not a certified
+                                // unsatisfiable subset. Publish the full
+                                // assumption vector instead: for IC3/PDR a
+                                // larger core only weakens generalization,
+                                // whereas an under-approximated core is an
+                                // unsound certificate.
+                                core = assumptions.to_vec();
+                            }
 
                             // SOUNDNESS (#unsat-core): the walk keys its
                             // assumption lookup by VARIABLE, so it cannot

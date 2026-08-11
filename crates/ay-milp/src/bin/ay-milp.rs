@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ay_milp::cert_io;
-use ay_milp::{BabSession, ColKind, MpsProblem, Outcome, SolveOpts};
+use ay_milp::{BabSession, ColKind, MpsProblem, Outcome, SolveOpts, UnknownReason};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -41,8 +41,8 @@ ay-milp — MILP/LP engine with certified verdicts
 USAGE
   ay-milp solve <file.mps[.gz]> [options]
   ay-milp verify --model <file.mps> --cert <file.ayc> [--accept-replay] [--exit-zero]
-  ay-milp check-point --model <file.mps> --point <file.sol>
-  ay-milp diag <root-closure|lp-only|margin-row|cross-check|profile> <file.mps> [options]
+  ay-milp check-point --model <file.mps> --point <file.sol> [--repair-continuous]
+  ay-milp diag <root-closure|lp-only|dualfix|block-angular|margin-row|cross-check|profile> <file.mps> [--time-limit <sec>] [--memory-budget <bytes>]
   ay-milp knobs [--list] [--bucket <b>] [--audit] [--deprecated]
   ay-milp features --list
   ay-milp replay-claims
@@ -52,7 +52,7 @@ solve options
   --threads <n>                worker threads (>1 opts out of determinism)
   --seed <n>                   RNG seed
   --deterministic|--no-deterministic
-  --memory-budget <bytes>      open-node retention budget
+  --memory-budget <bytes>      open-node/SAT-ReLU logical memory budget
   --tree-cert-leaves <n>       tree-certificate leaf budget (default 256; 0 = off)
   --seed-solution <path>       reference incumbent, `name value` per line (advice only)
   --require <none|witness|full>   evidence posture (DEFAULT: witness)
@@ -63,11 +63,21 @@ solve options
   --witness-format <ay|sol|rational>   default: rational
   --format <line|json>         stdout shape (default line)
 
-verify exits:  0 VERIFIED   10 UNVERIFIED   20 REFUTED   30 MISMATCH
+verify exits:  0 VERIFIED   10 UNVERIFIED   11 PARTIAL   20 REFUTED   30 MISMATCH
 The word VERIFIED is reserved: a REPLAY claim never earns exit 0.
+PARTIAL (11) refines UNVERIFIED, never VERIFIED: some claim re-verified exactly
+and nothing was refuted, but a claim carries no checkable evidence. It is a
+non-zero exit. `verify` also prints a CLAIMS census line naming every claim by
+standing (verified / refuted / unbacked), so a consumer never has to infer which
+half of an `optimal` was proved from the aggregate word alone.
 ";
 
 fn main() -> ExitCode {
+    // FIRST statement of main: arm() re-execs this process under a kernel-held
+    // memory bound, so anything above it is discarded work, and it sets an env
+    // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print!("{USAGE}");
@@ -280,42 +290,44 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     };
     report_shape(&p);
 
-    // `--require full` MUST REFUSE, not silently return Unknown.
-    //
-    // Measured: on markshare1 / cd_m7_s1 / misc07 / pk1, `require_certificates:
-    // true` turns 4 of 4 OPTIMAL verdicts into `Unknown(CertificateUnavailable)`
-    // — markshare1's OPTIMAL 1, this project's flagship result, included. The
-    // cause is structural, not a budget miss: an `OptimalityCertificate` is an
-    // LP-duality object and cannot express "no INTEGER point beats v" when the
-    // LP bound is weaker than v, and there is no optimality analogue of the
-    // infeasibility lane's tree capture anywhere in the crate. Someone who turns
-    // this on without being told would watch the corpus collapse and file a
-    // regression, so it refuses with the reason instead.
-    if require == Require::Full && p.model.has_integrality() && p.model.has_objective() {
-        let nonzero_obj = (0..p.model.num_cols())
-            .filter_map(|j| p.model.col_at(j))
-            .any(|c| p.model.obj_coeff(c) != 0.0);
-        if nonzero_obj {
-            eprintln!(
-                "ay-milp: --require full REFUSED: no MILP optimality certificate exists in this \
-                 build. An OptimalityCertificate is an LP-duality object; it cannot express \"no \
-                 integer point beats v\" when the LP bound is weaker than v. Use `--require \
-                 witness` (the default) — the primal half IS succinctly checkable and this build \
-                 emits it."
-            );
-            return ExitCode::from(2);
-        }
-    }
+    // Full posture is adjudicated after solving, claim by claim.  In
+    // particular, an integral model with a nonzero objective may still be
+    // infeasible and carry a complete Farkas/tree/PB refutation.  Pre-refusing
+    // that model shape would discard a proof before learning which claim the
+    // solve actually needs to make.
 
     let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
     if require == Require::Full {
         opts = opts.with_require_certificates(true);
     }
-    if let Some(v) = flag_or_env(&flags, "tree-cert-leaves", "AY_MILP_TREE_CERT_LEAVES") {
+    let tree_cert_leaves_explicit =
+        flag_or_env(&flags, "tree-cert-leaves", "AY_MILP_TREE_CERT_LEAVES");
+    if let Some(v) = &tree_cert_leaves_explicit {
         match v.parse::<usize>() {
             Ok(n) => opts = opts.with_tree_cert_leaves(n),
             Err(_) => return die("--tree-cert-leaves needs an integer"),
         }
+    }
+    // A TREE CERTIFICATE WITH NO CONSUMER IS NOT BOUGHT.
+    //
+    // The artifact is paid for by a whole re-solve (`harvest_tree_cert_by_resolve`),
+    // and `--no-emit-cert` used to leave the leaf budget at its 256 default — so the
+    // re-solve ran on every infeasible verdict and the result was thrown away
+    // unwritten. Measured over 8 infeasible bench instances: 8.638 s -> 7.539 s
+    // (-1.099 s, 12.7%), worst case neos859080 1.131 -> 0.386 s (2.93x), at
+    // byte-identical verdicts.
+    //
+    // `--require full` is EXCLUDED because that posture must be able to refuse a
+    // verdict it cannot back: the evidence has to exist even when it is not written.
+    // An explicit `--tree-cert-leaves`/`AY_MILP_TREE_CERT_LEAVES` is also honoured —
+    // asking for a budget outright is a deliberate act, and silently zeroing it would
+    // make the knob lie.
+    //
+    // This is what makes a larger evidence-path budget affordable at all: the cost of
+    // proving is now charged only to callers who asked to be able to check.
+    if flags.has("no-emit-cert") && require != Require::Full && tree_cert_leaves_explicit.is_none()
+    {
+        opts = opts.with_tree_cert_leaves(0);
     }
     if let Some(v) = flag_or_env(&flags, "threads", "AY_MILP_THREADS") {
         match v.parse::<u32>() {
@@ -418,6 +430,26 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             obj_scale: &obj_scale,
             provenance: &provenance(),
             replay_claims: s.replay_claims(),
+            parity_infeasibility_certificate: s.parity_infeasibility_certificate(),
+            sat_relu_infeasibility_certificate: s.sat_relu_infeasibility_certificate(),
+            network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
+            network_design_optimality_certificate: s.network_design_optimality_certificate(),
+            block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
+            single_machine_scheduling_optimality_certificate: s
+                .single_machine_scheduling_optimality_certificate(),
+            single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
+            multi_row_bdd_infeasibility_certificate: s.multi_row_bdd_infeasibility_certificate(),
+            open_domain_single_row_dp_infeasibility_certificate: s
+                .open_domain_single_row_dp_infeasibility_certificate(),
+            open_domain_multi_row_bdd_infeasibility_certificate: s
+                .open_domain_multi_row_bdd_infeasibility_certificate(),
+            open_domain_hybrid_pb_lp_infeasibility_certificate: s
+                .open_domain_hybrid_pb_lp_infeasibility_certificate(),
+            open_domain_hybrid_integer_lift_infeasibility_certificate: s
+                .open_domain_hybrid_integer_lift_infeasibility_certificate(),
+            hybrid_pb_lp_infeasibility_certificate: s.hybrid_pb_lp_infeasibility_certificate(),
+            hybrid_integer_lift_infeasibility_certificate: s
+                .hybrid_integer_lift_infeasibility_certificate(),
             max_bytes,
         };
         let ayc = cert_io::emit(&ctx, &outcome);
@@ -476,7 +508,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     }
 
     let json = flags.get("format").map(String::as_str) == Some("json");
-    let line = verdict_line(&outcome, s.model(), &obj_scale, dt, nodes);
+    let (status, value, detail) = verdict_line(&outcome, s.model(), &obj_scale, dt, nodes);
     // THE RIGOROUS DUAL BOUND, WHICH THIS BINARY USED TO DROP ON THE FLOOR.
     //
     // `Outcome::Feasible` has always carried `dual_bound`, and `verdict_line`
@@ -519,17 +551,26 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     };
     if json {
         println!(
-            "{{\"status\":\"{}\",\"value\":{},\"dual_bound\":{},\"time\":{dt:.3},\"nodes\":{nodes},\"replay_claims\":{}}}",
-            line.0,
-            line.1.as_deref().unwrap_or("null"),
-            bound.as_deref().unwrap_or("null"),
-            s.replay_claims().len()
+            "{}",
+            solve_json_line(
+                &status,
+                value.as_deref(),
+                bound.as_deref(),
+                detail.as_deref(),
+                dt,
+                nodes,
+                s.replay_claims().len(),
+            )
         );
     } else {
+        // The line shape is FROZEN: the journal's measurement scripts read it.
+        // `status` and `detail` were one string before they were split for the
+        // JSON lane, and re-joining with a space here reproduces it byte for
+        // byte (`UNKNOWN SolverIncomplete { detail: "..." } - 12.102 1`).
         println!(
-            "{} {} {dt:.3} {nodes}{}",
-            line.0,
-            line.1.as_deref().unwrap_or("-"),
+            "{status}{} {} {dt:.3} {nodes}{}",
+            detail.map_or(String::new(), |d| format!(" {d}")),
+            value.as_deref().unwrap_or("-"),
             bound.map_or(String::new(), |b| format!(" bound={b}"))
         );
     }
@@ -538,6 +579,20 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             "replay claim: {} — NOT certified. Re-verification means re-running the solver; tcb {}",
             rc.claim, rc.tcb
         );
+    }
+    if require == Require::Full
+        && matches!(
+            outcome,
+            Outcome::Unknown {
+                reason: UnknownReason::CertificateUnavailable
+            }
+        )
+    {
+        eprintln!(
+            "ay-milp: --require full REFUSED this verdict: no complete independently checkable \
+             evidence was produced"
+        );
+        return ExitCode::from(2);
     }
     ExitCode::SUCCESS
 }
@@ -551,27 +606,104 @@ fn witness_of(o: &Outcome) -> Option<&[BigRational]> {
     }
 }
 
+/// The verdict as `(status, value, detail)`.
+///
+/// ⚠ `status` IS A BARE TOKEN AND MUST STAY ONE. It used to be
+/// `format!("UNKNOWN {reason:?}")` for `Unknown` and `format!("OTHER {other:?}")`
+/// for a future variant, and that string went into `--format json` as a JSON
+/// string body — so `UnknownReason::SolverIncomplete { detail: "..." }`, whose
+/// `Debug` embeds double quotes, closed the `"status"` literal early and the
+/// whole line stopped being JSON. A consumer therefore hit a parse error on
+/// exactly the runs where the solver had the least to say.
+///
+/// The `Debug` payload now rides in its own `detail`, which `solve_json_line`
+/// escapes. Splitting rather than escaping in place keeps `status` an
+/// ENUMERABLE discriminator, which is what the comment at the JSON call site
+/// already claimed it was; a consumer can match `"UNKNOWN"` instead of
+/// prefix-matching a `Debug` blob. Nothing in this repo or in ny (which links
+/// the crate in-process and never shells out) parses this line, and every
+/// status whose shape changes was unparseable before, so there is no consumer
+/// to break.
 fn verdict_line(
     o: &Outcome,
     model: &ay_milp::Model,
     obj_scale: &BigRational,
     _dt: f64,
     _nodes: u64,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     match o {
-        Outcome::Optimal { value, .. } => ("OPTIMAL".into(), Some(decimal(&(value / obj_scale)))),
+        Outcome::Optimal { value, .. } => {
+            ("OPTIMAL".into(), Some(decimal(&(value / obj_scale))), None)
+        }
         Outcome::Feasible { model_values, .. } => {
             let v = model.objective_value_at(model_values);
-            ("FEASIBLE".into(), Some(decimal(&(&v / obj_scale))))
+            ("FEASIBLE".into(), Some(decimal(&(&v / obj_scale))), None)
         }
-        Outcome::Infeasible { .. } => ("INFEASIBLE".into(), None),
-        Outcome::Unbounded => ("UNBOUNDED".into(), None),
-        Outcome::Bound { dual_bound, .. } => {
-            ("BOUND".into(), Some(decimal(&(dual_bound / obj_scale))))
-        }
-        Outcome::Unknown { reason } => (format!("UNKNOWN {reason:?}"), None),
-        other => (format!("OTHER {other:?}"), None),
+        Outcome::Infeasible { .. } => ("INFEASIBLE".into(), None, None),
+        Outcome::Unbounded => ("UNBOUNDED".into(), None, None),
+        Outcome::Bound { dual_bound, .. } => (
+            "BOUND".into(),
+            Some(decimal(&(dual_bound / obj_scale))),
+            None,
+        ),
+        // `Outcome` and `UnknownReason` are `#[non_exhaustive]`, so this binary
+        // is a different crate and cannot match them exhaustively; the payload
+        // arms below are the two that carry free text.
+        Outcome::Unknown { reason } => ("UNKNOWN".into(), None, Some(format!("{reason:?}"))),
+        other => ("OTHER".into(), None, Some(format!("{other:?}"))),
     }
+}
+
+/// The one `--format json` line, so the test exercises the real format string.
+///
+/// `value` and `dual_bound` are pre-rendered JSON numbers (or `None` → `null`);
+/// `status` and `detail` are free text and go through [`json_escape`].
+fn solve_json_line(
+    status: &str,
+    value: Option<&str>,
+    dual_bound: Option<&str>,
+    detail: Option<&str>,
+    dt: f64,
+    nodes: u64,
+    replay_claims: usize,
+) -> String {
+    format!(
+        "{{\"status\":\"{}\",\"value\":{},\"dual_bound\":{},\"detail\":{},\"time\":{dt:.3},\"nodes\":{nodes},\"replay_claims\":{replay_claims}}}",
+        json_escape(status),
+        value.unwrap_or("null"),
+        dual_bound.unwrap_or("null"),
+        detail.map_or_else(
+            || "null".to_owned(),
+            |d| format!("\"{}\"", json_escape(d))
+        ),
+    )
+}
+
+/// Escape a string for use inside a JSON string literal (RFC 8259 §7).
+///
+/// ⚠ EVERY MANDATORY ESCAPE, not just the one that bites today. The quote is
+/// what broke `SolverIncomplete`, but these fields carry `Debug` output over
+/// solver messages and MPS names: a backslash, a newline, or a stray control
+/// character would each reproduce the same defect with a smaller trigger. So:
+/// `"` and `\`, the five two-character forms, and `\u00XX` for every other
+/// character below U+0020. Non-ASCII UTF-8 is legal unescaped in JSON and is
+/// passed through unchanged.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn write_witness(
@@ -580,7 +712,11 @@ fn write_witness(
     names: &[String],
     fmt: &str,
 ) -> std::io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
+    // `File` is unbuffered: writing one exact-rational line per column used to
+    // issue thousands of tiny system calls on routed network models.  The
+    // witness bytes and exact checker contract are unchanged; only stage the
+    // complete stream through a bounded userspace buffer.
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     if fmt == "ay" {
         writeln!(f, "# ay-milp witness, {} columns, exact rationals", x.len())?;
     }
@@ -590,11 +726,19 @@ fn write_witness(
             // Historical `AY_DUMP_SOL` shape: what every other solver prints.
             // Lossy on purpose — a comparison script reads it, not a checker.
             "sol" => writeln!(f, "{name} {}", decimal(v))?,
-            "ay" => writeln!(f, "x {j} {name} {}", rat(v))?,
-            _ => writeln!(f, "{name} {}", rat(v))?,
+            "ay" => {
+                write!(f, "x {j} {name} ")?;
+                write_rat(&mut f, v)?;
+                writeln!(f)?;
+            }
+            _ => {
+                write!(f, "{name} ")?;
+                write_rat(&mut f, v)?;
+                writeln!(f)?;
+            }
         }
     }
-    Ok(())
+    f.flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +780,15 @@ fn cmd_verify(args: &[String]) -> ExitCode {
             c.detail
         );
     }
+    // THE CENSUS LINE, always printed, on every status. The aggregate word
+    // answers "is this verdict proven?"; it cannot answer "which of the things
+    // this certificate asserts did you re-derive?" — and on the downstream optimization consumer's captured W1
+    // corpus every one of 12 SAT verdicts carried an EXACTLY CHECKED primal
+    // witness under an `UNVERIFIED` word, because the dual half of an
+    // `optimal` has no object in this build. A consumer reading only the word
+    // threw that witness away. It now reads `CLAIMS verified=primal
+    // refuted=- unbacked=dual` and can act on it.
+    println!("{}", report.census());
     let replay = report
         .claims
         .iter()
@@ -645,12 +798,24 @@ fn cmd_verify(args: &[String]) -> ExitCode {
     // ACCEPTED-ON-TRUST and still exits non-zero unless `--exit-zero` is ALSO
     // passed. Deliberately two flags: a wrapper doing `ay-milp verify && echo
     // ok` must not be able to conflate trust with proof by accident.
-    if report.status == cert_io::CheckStatus::Unverified && replay && flags.has("accept-replay") {
+    //
+    // `Partial` is accepted here for the same reason `Unverified` is: it is the
+    // same aggregate ("nothing refuted; something has no object"), only more
+    // precisely reported. It still cannot reach exit 0 without BOTH flags.
+    if matches!(
+        report.status,
+        cert_io::CheckStatus::Unverified | cert_io::CheckStatus::Partial
+    ) && replay
+        && flags.has("accept-replay")
+    {
         println!("ACCEPTED-ON-TRUST (replay claims were NOT verified)");
         if flags.has("exit-zero") {
             return ExitCode::SUCCESS;
         }
-        return ExitCode::from(10);
+        // The status's OWN code, so trusting the replay half does not erase
+        // the fact that some other claim did or did not re-derive.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        return ExitCode::from(report.status.exit_code() as u8);
     }
     println!("{}", report.status.word());
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -662,7 +827,10 @@ fn cmd_verify(args: &[String]) -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_check_point(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &["model", "point"]) {
+    let flags = match Flags::parse(
+        args,
+        &["model", "point", "repair-time-limit", "memory-budget"],
+    ) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
@@ -686,6 +854,7 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
     };
     let idx = name_index(&p.col_names);
     let mut x = vec![BigRational::zero(); p.model.num_cols()];
+    let mut supplied = vec![None; p.model.num_cols()];
     let mut hits = 0usize;
     for line in point_text.lines() {
         let l = line.trim();
@@ -708,7 +877,8 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
             continue;
         };
         if let Some(&j) = idx.get(key) {
-            x[j] = v;
+            x[j] = v.clone();
+            supplied[j] = Some(v);
             hits += 1;
         }
     }
@@ -726,10 +896,239 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Err(v) if flags.has("repair-continuous") => {
+            let repair_time_limit = match flags
+                .get("repair-time-limit")
+                .map_or(Ok(10.0), |value| value.parse::<f64>())
+            {
+                Ok(value) if value.is_finite() && value > 0.0 => value,
+                _ => return die("--repair-time-limit needs a positive finite number"),
+            };
+            let memory_budget = match flags.get("memory-budget") {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(value) => Some(value),
+                    Err(_) => return die("--memory-budget needs an integer"),
+                },
+                None => None,
+            };
+            println!(
+                "point: decimal text failed exact checking ({v:?}); attempting continuous repair"
+            );
+            match repair_continuous_completion(
+                &p.model,
+                &supplied,
+                Duration::from_secs_f64(repair_time_limit),
+                memory_budget,
+            ) {
+                Ok(repaired) => {
+                    let value = p.model.objective_value_at(&repaired);
+                    println!(
+                        "FEASIBLE  objective {} (file frame; continuous values exactly repaired \
+                         with every integral column fixed)",
+                        rat(&(&value / &p.obj_scale))
+                    );
+                    println!(
+                        "  repaired point rechecked against every original row, column bound and \
+                         integrality constraint in exact rational arithmetic"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(detail) => {
+                    println!("INFEASIBLE  original={v:?}; repair={detail}");
+                    ExitCode::from(20)
+                }
+            }
+        }
         Err(v) => {
             println!("INFEASIBLE  {v:?}");
             ExitCode::from(20)
         }
+    }
+}
+
+/// Recover an exact continuous completion of an external solver's rounded
+/// point while preserving its entire integer assignment.
+///
+/// Text solution formats cannot, in general, print a rational LP vertex
+/// exactly: even `1/3` is necessarily rounded.  Treating the rounded decimal as
+/// the point would reject valid reference solutions; accepting it within a
+/// tolerance would weaken this command's exact-checking contract.  The safe
+/// bridge is to pin every integral column to the external solver's intended
+/// integer value, solve only the remaining continuous completion, and then
+/// check the returned rational point against the untouched source model.  The
+/// completion is checker work, not solver timing, and failure remains a hard
+/// rejection.
+fn repair_continuous_completion(
+    original: &ay_milp::Model,
+    supplied: &[Option<BigRational>],
+    time_limit: Duration,
+    memory_budget: Option<usize>,
+) -> Result<Vec<BigRational>, String> {
+    if supplied.len() != original.num_cols() {
+        return Err("point width does not match the model".to_owned());
+    }
+    let mut opts = SolveOpts::new()
+        .with_time_limit(time_limit)
+        .with_tree_cert_leaves(0);
+    if let Some(bytes) = memory_budget {
+        opts = opts.with_memory_budget(Some(bytes));
+    }
+    let mut session = BabSession::new(original.clone(), &opts)
+        .map_err(|error| format!("repair setup failed: {error:?}"))?;
+    let tolerance = BigRational::new(BigInt::from(1), BigInt::from(1_000_000));
+    for column in 0..original.num_cols() {
+        let handle = original
+            .col_at(column)
+            .ok_or_else(|| format!("column {column} disappeared during repair setup"))?;
+        if !original.col_kind(handle).is_integral() {
+            continue;
+        }
+        let value = supplied[column]
+            .as_ref()
+            .ok_or_else(|| format!("integral column {column} was not named in the point"))?;
+        let truncated = value.to_integer();
+        let remainder = value - BigRational::from_integer(truncated.clone());
+        let half = BigRational::new(BigInt::one(), BigInt::from(2));
+        let intended_integer = if remainder >= half {
+            truncated + BigInt::one()
+        } else if remainder <= -half {
+            truncated - BigInt::one()
+        } else {
+            truncated
+        };
+        let intended_exact = BigRational::from_integer(intended_integer.clone());
+        if (value - &intended_exact).abs() > tolerance {
+            return Err(format!(
+                "integral column {column} value {value} is not within 1e-6 of an integer"
+            ));
+        }
+        let intended = intended_integer.to_f64().ok_or_else(|| {
+            format!("integral column {column} is outside the numeric model range")
+        })?;
+        if BigRational::from_float(intended).as_ref() != Some(&intended_exact) {
+            return Err(format!(
+                "integral column {column} value {intended_integer} cannot be represented exactly \
+                 by the numeric model"
+            ));
+        }
+        session
+            .fix_col(handle, intended)
+            .map_err(|error| format!("cannot fix integral column {column}: {error:?}"))?;
+    }
+    let outcome = session
+        .check()
+        .map_err(|error| format!("continuous repair solve failed: {error:?}"))?;
+    let repaired = match outcome {
+        Outcome::Optimal { model_values, .. } | Outcome::Feasible { model_values, .. } => {
+            model_values
+        }
+        other => return Err(format!("continuous repair produced {other:?}")),
+    };
+    original
+        .check_point(&repaired)
+        .map_err(|violation| format!("repaired point failed source check: {violation:?}"))?;
+    Ok(repaired)
+}
+
+#[cfg(test)]
+mod point_repair_tests {
+    use super::*;
+    use ay_milp::{Model, Sense};
+
+    fn thirds_model() -> Model {
+        let mut model = Model::new();
+        let integer = model.add_int_col(0.0, 1.0);
+        let continuous = model.add_col(0.0, 1.0);
+        model.add_row(0.0, 0.0, &[(integer, -1.0), (continuous, 3.0)]);
+        model.set_objective(&[(continuous, 1.0)], Sense::Minimize);
+        model
+    }
+
+    #[test]
+    fn rounded_continuous_value_is_repaired_with_integer_assignment_fixed() {
+        let model = thirds_model();
+        let supplied = vec![
+            Some(BigRational::one()),
+            Some(BigRational::new(
+                BigInt::from(333_333_333_333_333_i64),
+                BigInt::from(1_000_000_000_000_000_i64),
+            )),
+        ];
+        assert!(model
+            .check_point(
+                &supplied
+                    .iter()
+                    .map(|value| value.clone().expect("complete point"))
+                    .collect::<Vec<_>>()
+            )
+            .is_err());
+
+        let repaired =
+            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
+                .expect("the exact LP completion exists");
+        assert_eq!(repaired[0], BigRational::one());
+        assert_eq!(
+            repaired[1],
+            BigRational::new(BigInt::from(1), BigInt::from(3))
+        );
+        assert!(model.check_point(&repaired).is_ok());
+    }
+
+    #[test]
+    fn repair_refuses_missing_or_fractional_integral_assignments() {
+        let model = thirds_model();
+        let missing = vec![None, Some(BigRational::zero())];
+        assert!(repair_continuous_completion(
+            &model,
+            &missing,
+            Duration::from_secs(2),
+            Some(64 << 20),
+        )
+        .is_err());
+
+        let fractional = vec![
+            Some(BigRational::new(BigInt::from(1), BigInt::from(2))),
+            Some(BigRational::zero()),
+        ];
+        assert!(repair_continuous_completion(
+            &model,
+            &fractional,
+            Duration::from_secs(2),
+            Some(64 << 20),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pure_lp_decimal_point_can_be_reconstructed_exactly() {
+        let mut model = Model::new();
+        let continuous = model.add_col(0.0, 1.0);
+        model.add_row(1.0, 1.0, &[(continuous, 3.0)]);
+        model.set_objective(&[(continuous, 1.0)], Sense::Minimize);
+        let supplied = vec![Some(BigRational::new(
+            BigInt::from(333_333_333_333_333_i64),
+            BigInt::from(1_000_000_000_000_000_i64),
+        ))];
+        let repaired =
+            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
+                .expect("the exact LP vertex exists");
+        assert_eq!(
+            repaired,
+            vec![BigRational::new(BigInt::from(1), BigInt::from(3))]
+        );
+    }
+
+    #[test]
+    fn repair_rejects_an_integer_the_numeric_model_cannot_represent() {
+        let mut model = Model::new();
+        model.add_int_col(f64::NEG_INFINITY, f64::INFINITY);
+        let supplied = vec![Some(BigRational::from_integer(BigInt::from(
+            9_007_199_254_740_993_u64,
+        )))];
+        let error =
+            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
+                .expect_err("2^53 + 1 is not exactly representable as f64");
+        assert!(error.contains("cannot be represented exactly"), "{error}");
     }
 }
 
@@ -738,12 +1137,13 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_diag(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &["time-limit", "row", "solution"]) {
+    let flags = match Flags::parse(args, &["time-limit", "memory-budget", "row", "solution"]) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
     let Some(mode) = flags.positional.first().cloned() else {
-        return die("diag needs a mode (root-closure|lp-only|margin-row|cross-check|profile)");
+        return die("diag needs a mode \
+             (root-closure|lp-only|dualfix|block-angular|margin-row|cross-check|profile)");
     };
     let Some(path) = flags.positional.get(1).cloned() else {
         return die("diag needs a model file");
@@ -785,6 +1185,27 @@ fn cmd_diag(args: &[String]) -> ExitCode {
         "lp-only" => {
             eprintln!("{}", ay_milp::diag_float_lp(&p.model, secs));
             print_profiles();
+            ExitCode::SUCCESS
+        }
+        // What DUAL FIXING does to this model, without solving it. `int_prop_only`
+        // is the `DualReductions=0` arm and `int_after` the default one, both
+        // measured on the same pass so the attribution needs no second run.
+        "dualfix" => {
+            println!("{}", ay_milp::diag_dualfix(&p.model, secs));
+            ExitCode::SUCCESS
+        }
+        "block-angular" => {
+            let memory_budget = match flags.get("memory-budget") {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(value) => Some(value),
+                    Err(_) => return die("--memory-budget needs an integer"),
+                },
+                None => None,
+            };
+            println!(
+                "{}",
+                ay_milp::diag_block_angular(&p.model, secs, memory_budget)
+            );
             ExitCode::SUCCESS
         }
         "margin-row" => {
@@ -993,6 +1414,106 @@ fn cmd_replay_claims() -> ExitCode {
          \x20                                      dressed up as proved.\n\
          \x20                                      tcb crates/ay-milp/src/lattice.rs"
     );
+    println!(
+        "  sat-relu-cnf-unsat       sat-relu      exact structural recovery plus CDCL refutes the\n\
+         \x20                                      encoded Boolean instance. The MILP-to-CNF\n\
+         \x20                                      equivalence is checked by the recognizer; normal\n\
+         \x20                                      completion exports SUCCINCT sat-relu-rup. This\n\
+         \x20                                      replay id now means the bounded proof path\n\
+         \x20                                      declined and ordinary CDCL supplied the verdict.\n\
+         \x20                                      tcb crates/ay-milp/src/sat_relu.rs +\n\
+         \x20                                      crates/ay-milp/src/sat_route.rs + ay-sat"
+    );
+    println!(
+        "  direct-cnf-unsat          direct-cnf    exact Boolean-domain and row-side recovery plus\n\
+         \x20                                      CDCL refutes the recovered CNF. Every true\n\
+         \x20                                      rational coefficient and bound is consumed, but\n\
+         \x20                                      the reduction is not yet an exportable proof.\n\
+         \x20                                      tcb crates/ay-milp/src/direct_cnf.rs +\n\
+         \x20                                      crates/ay-milp/src/sat_route.rs + ay-sat"
+    );
+    println!(
+        "  pb-projection-infeasible  single-row-dp exact rational bounded-integer projection plus\n\
+         \x20                                      redundant exact subset-sum passes prove the row\n\
+         \x20                                      infeasible. This replay id now means the bounded\n\
+         \x20                                      reachability artifact could not be exported; a\n\
+         \x20                                      normal completed artifact is SUCCINCT instead.\n\
+         \x20                                      tcb crates/ay-milp/src/pb_translate.rs +\n\
+         \x20                                      crates/ay-milp/src/pb_route.rs +\n\
+         \x20                                      ay-pb-core/src/single_row_dp.rs"
+    );
+    println!(
+        "  pb-projection-optimal     single-row-dp the same exact projection plus redundant exact\n\
+         \x20                                      knapsack passes proves no better encoded point\n\
+         \x20                                      exists; the primal remains succinctly checked.\n\
+         \x20                                      tcb crates/ay-milp/src/pb_translate.rs +\n\
+         \x20                                      crates/ay-milp/src/pb_route.rs +\n\
+         \x20                                      ay-pb-core/src/single_row_dp.rs"
+    );
+    println!(
+        "  pb-portfolio-projection-infeasible\n\
+         \x20                            pb-portfolio exact bounded-integer projection plus bounded\n\
+         \x20                                      exhaustion of AY's core PB portfolio. The\n\
+         \x20                                      reduction is replay-only.\n\
+         \x20                                      tcb crates/ay-milp/src/pb_translate.rs +\n\
+         \x20                                      crates/ay-milp/src/pb_route.rs + ay-pb-core"
+    );
+    println!(
+        "  pb-portfolio-projection-optimal\n\
+         \x20                            pb-portfolio the same exact projection proves the compact\n\
+         \x20                                      PB optimum; the primal remains succinctly checked.\n\
+         \x20                                      tcb crates/ay-milp/src/pb_translate.rs +\n\
+         \x20                                      crates/ay-milp/src/pb_route.rs + ay-pb-core"
+    );
+    println!(
+        "  network-design-projection-infeasible\n\
+         \x20                            network-pb  exact directed-incidence recognition plus\n\
+         \x20                                      Hoffman/TU projection and bounded PB exhaustion.\n\
+         \x20                                      The reduction is replay-only.\n\
+         \x20                                      tcb crates/ay-milp/src/network_design_pb.rs +\n\
+         \x20                                      crates/ay-milp/src/network_design_route.rs +\n\
+         \x20                                      ay-pb-core"
+    );
+    println!(
+        "  network-design-projection-optimal\n\
+         \x20                            network-pb  the same exact projection plus exact rational\n\
+         \x20                                      flow completion proves the original objective.\n\
+         \x20                                      tcb crates/ay-milp/src/network_design_pb.rs +\n\
+         \x20                                      crates/ay-milp/src/network_design_route.rs +\n\
+         \x20                                      ay-pb-core"
+    );
+    println!(
+        "  open-domain-projection-infeasible\n\
+         \x20                            open-domain exact monotone existential projection onto a\n\
+         \x20                                      bounded integer residual, followed by bounded\n\
+         \x20                                      exact exhaustion and source-model revalidation.\n\
+         \x20                                      tcb crates/ay-milp/src/open_domain.rs +\n\
+         \x20                                      crates/ay-milp/src/open_domain_route.rs +\n\
+         \x20                                      ay-pb-core"
+    );
+    println!(
+        "  open-domain-cap-optimal\n\
+         \x20                            open-domain a checked source incumbent induces an inclusive\n\
+         \x20                                      finite objective cap; exact bounded optimization\n\
+         \x20                                      and source-model replay prove the optimum.\n\
+         \x20                                      tcb crates/ay-milp/src/open_domain.rs +\n\
+         \x20                                      crates/ay-milp/src/open_domain_route.rs +\n\
+         \x20                                      ay-pb-core"
+    );
+    println!(
+        "  hybrid-pb-lp-infeasible  pb+lp         exact binary master exhaustion after every\n\
+         \x20                                      continuous subproblem conflict is licensed by an\n\
+         \x20                                      exactly rechecked Farkas/Benders row or no-good.\n\
+         \x20                                      tcb crates/ay-milp/src/hybrid_pb_lp.rs +\n\
+         \x20                                      crates/ay-milp/src/cert.rs + ay-pb-core"
+    );
+    println!(
+        "  hybrid-pb-lp-optimal     pb+lp         the same decomposition proves the compact master\n\
+         \x20                                      optimum and checks a continuous feasible lift at\n\
+         \x20                                      that objective; exhaustion remains replay-only.\n\
+         \x20                                      tcb crates/ay-milp/src/hybrid_pb_lp.rs +\n\
+         \x20                                      crates/ay-milp/src/cert.rs + ay-pb-core"
+    );
     ExitCode::SUCCESS
 }
 
@@ -1052,6 +1573,16 @@ fn rat(v: &BigRational) -> String {
     }
 }
 
+/// Stream a rational in the same canonical wire form as [`rat`] without
+/// allocating an intermediate `String` for every witness column.
+fn write_rat(out: &mut impl std::io::Write, v: &BigRational) -> std::io::Result<()> {
+    if v.denom().is_one() {
+        write!(out, "{}", v.numer())
+    } else {
+        write!(out, "{}/{}", v.numer(), v.denom())
+    }
+}
+
 /// Parse a decimal literal as an EXACT rational from its text.
 ///
 /// `0.9` is nine tenths. Reading it as the nearest `f64` and then reasoning
@@ -1105,4 +1636,231 @@ fn read_maybe_gz(path: &str) -> std::io::Result<String> {
         )));
     }
     String::from_utf8(out.stdout).map_err(std::io::Error::other)
+}
+
+// ---------------------------------------------------------------------------
+// `--format json` must actually be JSON
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod json_output_tests {
+    use super::*;
+    use ay_milp::{Model, UnknownReason};
+
+    /// The `--format json` line for an outcome, built exactly as `cmd_solve`
+    /// builds it: `verdict_line` then `solve_json_line`. Only the numbers are
+    /// stand-ins.
+    fn emit(o: &Outcome) -> String {
+        let mut m = Model::new();
+        m.add_col(0.0, 1.0);
+        let scale = BigRational::one();
+        let (status, value, detail) = verdict_line(o, &m, &scale, 1.5, 7);
+        solve_json_line(
+            &status,
+            value.as_deref(),
+            None,
+            detail.as_deref(),
+            1.5,
+            7,
+            0,
+        )
+    }
+
+    fn parse(line: &str) -> serde_json::Value {
+        serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("`--format json` emitted invalid JSON: {e}\n  {line}"))
+    }
+
+    fn point() -> Vec<BigRational> {
+        vec![BigRational::zero()]
+    }
+
+    /// EVERY `UnknownReason` in `outcome.rs`, in declaration order. `Outcome`
+    /// and `UnknownReason` are `#[non_exhaustive]`, so this crate cannot get a
+    /// compile-time exhaustiveness check on them — `outcome.rs`'s
+    /// `cli_json_coverage` test carries that check (it lives in the defining
+    /// crate, where the match IS exhaustive) and names this list.
+    fn every_unknown_reason() -> Vec<UnknownReason> {
+        vec![
+            UnknownReason::Timeout,
+            UnknownReason::Interrupted,
+            UnknownReason::IterationLimit,
+            UnknownReason::MemoryLimit,
+            UnknownReason::CertificateUnavailable,
+            UnknownReason::SolverIncomplete {
+                detail: "branch-and-bound could not settle every node".to_owned(),
+            },
+            UnknownReason::WitnessRejected {
+                detail: "the verdict's point is infeasible".to_owned(),
+            },
+        ]
+    }
+
+    /// EVERY `Outcome` in `outcome.rs`, in declaration order, paired with the
+    /// status token the CLI must print for it.
+    fn every_outcome() -> Vec<(&'static str, Outcome)> {
+        let mut v = vec![
+            (
+                "OPTIMAL",
+                Outcome::Optimal {
+                    value: BigRational::zero(),
+                    model_values: point(),
+                    cert: None,
+                },
+            ),
+            (
+                "FEASIBLE",
+                Outcome::Feasible {
+                    model_values: point(),
+                    incumbent_only: true,
+                    dual_bound: None,
+                },
+            ),
+            (
+                "INFEASIBLE",
+                Outcome::Infeasible {
+                    cert: None,
+                    tree_cert: None,
+                },
+            ),
+            ("UNBOUNDED", Outcome::Unbounded),
+            (
+                "BOUND",
+                Outcome::Bound {
+                    dual_bound: BigRational::zero(),
+                    rigorous: true,
+                },
+            ),
+        ];
+        v.extend(
+            every_unknown_reason()
+                .into_iter()
+                .map(|reason| ("UNKNOWN", Outcome::Unknown { reason })),
+        );
+        v
+    }
+
+    /// THE REGRESSION. Before the fix, `verdict_line` returned
+    /// `UNKNOWN SolverIncomplete { detail: "branch-and-bound could not settle
+    /// every node" }` as the whole status and it was interpolated raw into the
+    /// `"status"` literal, so the inner quotes terminated the string and a real
+    /// parser stopped at the `S` of `SolverIncomplete`.
+    #[test]
+    fn a_debug_payload_status_is_still_json() {
+        let line = emit(&Outcome::Unknown {
+            reason: UnknownReason::SolverIncomplete {
+                detail: "branch-and-bound could not settle every node".to_owned(),
+            },
+        });
+        let v = parse(&line);
+        assert_eq!(v["status"], "UNKNOWN");
+        assert_eq!(
+            v["detail"],
+            "SolverIncomplete { detail: \"branch-and-bound could not settle every node\" }",
+            "the payload must survive the round trip, not just parse"
+        );
+    }
+
+    /// Not just the observed one: every status the CLI can print. (`OTHER` is
+    /// covered separately — a future `#[non_exhaustive]` variant cannot be
+    /// constructed here to reach the arm that produces it.)
+    #[test]
+    fn every_status_emits_valid_json() {
+        for (want, o) in every_outcome() {
+            let line = emit(&o);
+            let v = parse(&line);
+            assert_eq!(v["status"], want, "wrong status token for {o:?}\n  {line}");
+            // The status is the discriminator, so it must stay a bare token —
+            // a `Debug` blob smuggled back in would parse but be unmatchable.
+            assert!(
+                v["status"]
+                    .as_str()
+                    .is_some_and(|s| s.chars().all(|c| c.is_ascii_uppercase() || c == '-')),
+                "status must be an enumerable token, got {:?}",
+                v["status"]
+            );
+            assert!(v["time"].is_number() && v["nodes"].is_number());
+        }
+    }
+
+    /// The `OTHER` arm carries a whole `Outcome`'s `Debug`, not a reason's, and
+    /// `#[non_exhaustive]` means no variant reaching it can be constructed from
+    /// this crate. Drive the emission path with exactly the string that arm
+    /// builds so the catch-all is not the one shape nobody ever parsed.
+    #[test]
+    fn the_non_exhaustive_catch_all_emits_valid_json() {
+        let blob = format!(
+            "{:?}",
+            Outcome::Unknown {
+                reason: UnknownReason::SolverIncomplete {
+                    detail: "a \"quoted\" payload".to_owned(),
+                },
+            }
+        );
+        let line = solve_json_line("OTHER", None, None, Some(&blob), 1.5, 7, 0);
+        let v = parse(&line);
+        assert_eq!(v["status"], "OTHER");
+        assert_eq!(v["detail"], blob);
+    }
+
+    /// ⚠ A partial escape is the same bug with a smaller trigger. The quote is
+    /// what broke today; a backslash, a newline, a tab or a bare control
+    /// character each break a quote-only escaper. `Debug` renders some of these
+    /// itself, so drive the escaper directly as well as through an outcome.
+    #[test]
+    fn escaping_covers_more_than_the_double_quote() {
+        let nasty = "quote \" backslash \\ newline \n cr \r tab \t bs \u{8} ff \u{c} nul \u{0} \
+                     unit-sep \u{1f} unicode ü▲";
+        let line = emit(&Outcome::Unknown {
+            reason: UnknownReason::WitnessRejected {
+                detail: nasty.to_owned(),
+            },
+        });
+        let v = parse(&line);
+        assert_eq!(v["status"], "UNKNOWN");
+        assert_eq!(
+            v["detail"],
+            format!(
+                "{:?}",
+                UnknownReason::WitnessRejected {
+                    detail: nasty.to_owned()
+                }
+            ),
+            "the escaped detail must decode back to the exact Debug string"
+        );
+
+        // And the escaper on its own, against a real parser's idea of a string.
+        let escaped = json_escape(nasty);
+        let round: serde_json::Value = serde_json::from_str(&format!("\"{escaped}\""))
+            .unwrap_or_else(|e| panic!("json_escape produced an unparseable literal: {e}"));
+        assert_eq!(round, nasty);
+        assert!(
+            !escaped.contains('\n') && !escaped.contains('\t'),
+            "raw control characters are not legal inside a JSON string: {escaped:?}"
+        );
+    }
+
+    /// The line (non-JSON) shape is frozen — the journal's measurement scripts
+    /// read it — so splitting status/detail must re-join byte for byte.
+    #[test]
+    fn the_line_format_is_unchanged_by_the_split() {
+        let mut m = Model::new();
+        m.add_col(0.0, 1.0);
+        let scale = BigRational::one();
+        let o = Outcome::Unknown {
+            reason: UnknownReason::SolverIncomplete {
+                detail: "branch-and-bound could not settle every node".to_owned(),
+            },
+        };
+        let (status, value, detail) = verdict_line(&o, &m, &scale, 1.5, 7);
+        let rejoined = format!(
+            "{status}{} {}",
+            detail.map_or(String::new(), |d| format!(" {d}")),
+            value.as_deref().unwrap_or("-")
+        );
+        assert_eq!(
+            rejoined,
+            "UNKNOWN SolverIncomplete { detail: \"branch-and-bound could not settle every node\" } -"
+        );
+    }
 }

@@ -17,14 +17,38 @@
 use std::alloc::{GlobalAlloc, Layout};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs;
+#[cfg(windows)]
+#[path = "fs_windows.rs"]
+pub mod fs;
+pub mod govern;
 #[cfg(unix)]
 pub mod supervisor;
 pub mod time;
+#[cfg(windows)]
+pub mod windows_fs;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// Process-wide memory limit in bytes. 0 = no limit.
 static PROCESS_MEMORY_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// Hard allocation ceiling in bytes. 0 = disabled.
+///
+/// Deliberately separate from [`PROCESS_MEMORY_LIMIT`]: that limit is
+/// *advisory* — every consumer that observes it decides for itself when to
+/// stop, which means a thread that never reaches a checkpoint never stops —
+/// while this one is enforced inside the global allocator and ends the
+/// process. Only the standalone `ay` binary arms it. An embedded solver must
+/// never kill its host, so [`set_process_memory_limit`] does not arm this.
+static HARD_MEMORY_CEILING: AtomicUsize = AtomicUsize::new(0);
+
+/// One-shot latch so concurrently allocating threads cannot interleave the
+/// verdict when the ceiling is breached.
+static HARD_MEMORY_CEILING_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// What to emit on breach; null until armed.
+static HARD_MEMORY_CEILING_ACTION: AtomicPtr<HardMemoryCeiling> =
+    AtomicPtr::new(std::ptr::null_mut());
 
 /// Live bytes currently allocated through [`CountingAllocator`], summed across
 /// all threads. 0 when no counting allocator is installed.
@@ -195,7 +219,17 @@ pub fn current_live_bytes() -> usize {
 #[doc(hidden)]
 #[inline]
 pub fn add_live_bytes(bytes: usize) {
-    LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    let live = LIVE_BYTES
+        .fetch_add(bytes, Ordering::Relaxed)
+        .saturating_add(bytes);
+    // The only synchronous point at which growth can be refused. Every
+    // observer-based signal (checkpoint polls, the watchdog thread) can only
+    // *request* a stop, and the heap keeps growing until that request is read
+    // — measured at 3-4x the budget on a bit-blasting burst. See
+    // [`arm_hard_memory_ceiling`].
+    if hard_memory_ceiling_breached(live) {
+        breach_hard_memory_ceiling();
+    }
 }
 
 /// Subtract from the live-bytes counter. Saturating: a counter underflow would
@@ -211,6 +245,101 @@ pub fn sub_live_bytes(bytes: usize) {
     if prev < bytes {
         // Underflowed past zero — restore to a non-negative floor.
         LIVE_BYTES.fetch_add(bytes - prev, Ordering::Relaxed);
+    }
+}
+
+/// What to emit when the hard allocation ceiling is breached.
+///
+/// The breach is detected *inside* the global allocator, so the exit path must
+/// not allocate, take a lock, or run a destructor that might: the bytes go out
+/// through a raw `write(2)` and the process leaves through `_exit(2)`. Callers
+/// therefore supply the verdict as `'static` bytes rather than anything
+/// formatted at breach time.
+#[derive(Debug, Clone, Copy)]
+pub struct HardMemoryCeiling {
+    /// Verdict line written to stdout (e.g. `b"unknown\n"`). Every competition
+    /// grammar requires a verdict on every run, including an aborted one.
+    pub stdout_line: &'static [u8],
+    /// Reason line written to stderr.
+    pub stderr_line: &'static [u8],
+    /// Status passed to `_exit`.
+    pub exit_code: i32,
+}
+
+/// Arm the hard allocation ceiling at `bytes`, emitting `action` on breach.
+///
+/// This is the only enforcement that can bound *peak* heap. The advisory
+/// signals behind [`process_memory_exceeded`] are all observations: a solver
+/// thread has to reach a cancellation checkpoint and ask, and between two
+/// checkpoints an allocation burst is unbounded. Set the ceiling above the
+/// advisory trip point (which fires at 95%) so a run that can stop gracefully
+/// still does; this catches only the growth that no checkpoint saw.
+///
+/// Pass 0 to disable. Intended to be called once, from the standalone binary's
+/// `main`, and never by a library consumer embedded in a longer-lived host.
+pub fn arm_hard_memory_ceiling(bytes: usize, action: &'static HardMemoryCeiling) {
+    // Publish the action first so a breach can never observe a live ceiling
+    // with no action to take.
+    HARD_MEMORY_CEILING_ACTION.store(std::ptr::from_ref(action).cast_mut(), Ordering::SeqCst);
+    HARD_MEMORY_CEILING.store(bytes, Ordering::SeqCst);
+}
+
+/// Whether `live` heap bytes breach the armed ceiling. Hot path: one relaxed
+/// load and a compare, on a branch that is never taken in a healthy run.
+#[inline]
+fn hard_memory_ceiling_breached(live: usize) -> bool {
+    let ceiling = HARD_MEMORY_CEILING.load(Ordering::Relaxed);
+    ceiling != 0 && live > ceiling
+}
+
+/// Emit the armed verdict and leave immediately.
+///
+/// Out of line and `#[cold]` so the hot allocation path keeps only the compare.
+#[cold]
+#[inline(never)]
+fn breach_hard_memory_ceiling() -> ! {
+    let action = HARD_MEMORY_CEILING_ACTION.load(Ordering::SeqCst);
+    // Armed action or not, the process must not continue growing.
+    let (stdout_line, stderr_line, exit_code) = if action.is_null() {
+        (&b"unknown\n"[..], &b"(:reason-unknown \"memout\")\n"[..], 1)
+    } else {
+        // SAFETY: `arm_hard_memory_ceiling` is the only writer and stores a
+        // `&'static HardMemoryCeiling`, published before the ceiling that makes
+        // this path reachable. The referent therefore outlives the process and
+        // is never mutated.
+        let action = unsafe { &*action };
+        (action.stdout_line, action.stderr_line, action.exit_code)
+    };
+    // Only the first thread to breach writes; a loser leaves with the same
+    // status so the two verdicts cannot interleave.
+    if !HARD_MEMORY_CEILING_FIRED.swap(true, Ordering::SeqCst) {
+        write_fd(libc::STDOUT_FILENO, stdout_line);
+        write_fd(libc::STDERR_FILENO, stderr_line);
+    }
+    // SAFETY: `_exit` performs no allocation and runs no atexit handler or
+    // destructor, which is required here — this runs inside the global
+    // allocator, where re-entering it would deadlock or recurse.
+    unsafe { libc::_exit(exit_code) }
+}
+
+/// Allocation-free, retry-on-partial write to a raw descriptor.
+fn write_fd(fd: libc::c_int, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        // SAFETY: `bytes` is a valid readable slice of `bytes.len()` bytes and
+        // `write` neither allocates nor retains the pointer.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        let Ok(written) = usize::try_from(written) else {
+            // Negative: EINTR is worth retrying, anything else is unrecoverable
+            // and must not spin.
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return;
+        };
+        if written == 0 {
+            return;
+        }
+        bytes = &bytes[written..];
     }
 }
 
@@ -257,7 +386,7 @@ impl<A> CountingAllocator<A> {
 /// One-time latch guarding the mimalloc `arena_reserve` peak-RSS trim so it runs on
 /// the FIRST allocation only.
 #[cfg(feature = "mimalloc-arena-trim")]
-static ARENA_TRIM_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ARENA_TRIM_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Counting allocator for a binary whose actual global allocator is mimalloc.
 ///
@@ -832,6 +961,14 @@ pub fn default_memory_limit() -> usize {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // Same rule as `default_standalone_memory_limit`: never promise more than
+        // the kernel will allow. This path matters MORE, not less -- `ay-pb` uses
+        // it and, unlike `ay`, does not re-exec, so the jetsam memlimit (L1) is
+        // genuinely in force there. Before this branch `ay-pb` self-granted the
+        // 64 GiB clamp against its own 8 GiB arm.
+        if let Some(kernel_bytes) = govern::active_budget_bytes() {
+            return standalone_limit_under_kernel_bound(kernel_bytes);
+        }
         default_memory_limit_from(physical_memory_bytes())
     }
 }
@@ -852,17 +989,127 @@ pub(crate) fn default_memory_limit_from(phys: usize) -> usize {
     (phys / 2).clamp(MIN_LIMIT.min(phys), MAX_LIMIT)
 }
 
-/// Default process memory ceiling for the STANDALONE `ay` binary in
-/// competition/benchmark use, where the solver is the machine's sole tenant:
-/// 85% of physical RAM (2 GB floor). The phys/2 [`default_memory_limit`]
+/// Default process memory ceiling for the STANDALONE `ay` binary.
+///
+/// Derived from the kernel-held govern budget when one is armed (the usual
+/// case); otherwise 85% of physical RAM (2 GB floor), the sole-tenant
+/// competition posture described next. The phys/2 [`default_memory_limit`]
 /// proved too tight for sole-tenant runs — on a 36 GiB host a 63M-clause
 /// main-track instance peaked at 12.6 GB RSS (65% of the 18 GiB phys/2
 /// limit) yet a transient allocator-ledger spike tripped the 95% gate and
 /// degraded a solvable SAT instance to Unknown (#sparse-gap Cluster A).
 /// Embedded/in-process users keep the tighter defaults.
+///
+/// # A cooperative limit above the kernel's is worse than none
+///
+/// That 85% figure is only meaningful when nothing else bounds the process.
+/// Once [`crate::govern`] arms a kernel-held cap, 85% of RAM is not a ceiling —
+/// it is a **lie the solver tells itself**: on a 128 GB box it promises 108.8 GiB
+/// while the kernel SIGKILLs at the govern budget (8 GiB by default). Every
+/// `global_memory_exceeded` check then reads far below its threshold right up
+/// until the process dies, so ay never takes its graceful path and the run comes
+/// back as a signal death instead of `unknown`. A harness cannot tell that apart
+/// from a crash.
+///
+/// So when a kernel bound is in force, derive from **it** rather than from RAM,
+/// leaving [`KERNEL_BUDGET_HEADROOM_PERCENT`] of headroom so the 95% soft gate
+/// fires — and ay degrades to `unknown` — before the kernel kills. Sole-tenant
+/// competition runs that genuinely want most of the machine should raise the
+/// kernel budget (`GOVERN_AY_MB`), which moves both bounds together, rather than
+/// re-opening the gap between them.
+///
+/// # What this does NOT buy, measured
+///
+/// It does **not** rescue an `RLIMIT_AS` (L2) memout into a graceful one.
+/// Measured 2026-08-04 on a 90-pigeon PHP with proofs, `GOVERN_AY_MB=192`:
+/// setting this limit — derived, or passed explicitly as `-memory:172` — makes
+/// no difference at all. Both runs end identically, in ~75 s, with
+///
+/// ```text
+/// memory allocation of 16777216 bytes failed
+/// c solve session aborted abnormally (fatal signal 6); failing closed to unknown
+/// ```
+///
+/// Two independent reasons, both structural. `RLIMIT_AS` fails **at the mmap
+/// syscall** — instantaneous, with no window for a sampled gate to observe
+/// anything — address space is only good for catching a single enormous mmap,
+/// which lands instantly at the syscall. And the gate keys on
+/// resident/footprint memory, not address space: that run reached 284 MB RSS
+/// while address space was what actually ran out, so the gate's own metric never
+/// crossed 164 MB.
+///
+/// # Which kernel layer is actually in force here
+///
+/// Not L1. Both call sites of this function run in a process that has **lost**
+/// the jetsam memlimit, for two different documented reasons:
+///
+/// - `ay solve` runs the solve in a **forked child**
+///   (`fork_supervised_solve_session` → `ForkSupervise::ChildContinue`), and
+///   [`crate::govern`] states that the memlimit is not inherited across `fork`
+///   and that such a child deliberately does not re-arm.
+/// - `ay pb` re-execs itself to raise `RUST_MIN_STACK`
+///   (`maybe_reexec_pb_with_large_stack`), and *any* later `execve` destroys the
+///   memlimit — measured 2026-07-15.
+///
+/// What survives both is **L2**, `RLIMIT_AS`, which is inherited across `fork`
+/// and `execve` alike. So the bound genuinely governing these processes is the
+/// address-space ceiling, and it is derived from the same budget — which is why
+/// keying this limit on the budget is still correct even though L1 is absent.
+///
+/// # It does convert the memout, via the hard ceiling — re-measured
+///
+/// The measurement above predates [`arm_hard_memory_ceiling`], which is armed
+/// from *this* function's result and is the only thing that can bound **peak**
+/// heap: the advisory signals are observations, so a burst between two
+/// cancellation checkpoints is unbounded. With it in place the same command
+/// (`GOVERN_AY_MB=192`, same 90-pigeon PHP) changes outcome completely:
+///
+/// ```text
+/// before:  75 s   memory allocation of 16777216 bytes failed
+///                 c solve session aborted abnormally (fatal signal 6)
+/// after:   33 s   unknown
+///                 (:reason-unknown "memout")            exit 124
+/// ```
+///
+/// Zero abort markers, a real verdict line, and ay's own
+/// `DEFAULT_TIMEOUT_EXIT_CODE` rather than a signal death. So a cooperative
+/// limit derived from the kernel budget *is* what turns a hard memout into a
+/// reportable one — but only because the hard ceiling gives it teeth. The
+/// address-space caveat above still holds for anything the ceiling does not
+/// catch first.
 #[must_use]
 pub fn default_standalone_memory_limit() -> usize {
+    if let Some(kernel_bytes) = govern::active_budget_bytes() {
+        return standalone_limit_under_kernel_bound(kernel_bytes);
+    }
     default_standalone_memory_limit_from(physical_memory_bytes())
+}
+
+/// Percentage of the kernel-held budget the cooperative limit is set to.
+///
+/// The soft gate fires at 95% of the cooperative limit, so 90% here means ay
+/// starts failing closed at ~85.5% of the kernel budget — enough margin for the
+/// graceful path to run before a SIGKILL that would discard the result.
+pub const KERNEL_BUDGET_HEADROOM_PERCENT: usize = 90;
+
+/// Pure core of the kernel-derived branch of [`default_standalone_memory_limit`].
+///
+/// Deliberately applies **no 2 GB floor**. The floor exists to stop a limit being
+/// set so low that the OS OOM-kills before the soft gate trips; under a kernel
+/// bound the constraint runs the other way, and raising the cooperative limit
+/// back above a small kernel budget would recreate the exact incoherence this
+/// function exists to remove. If the budget is tiny, the honest limit is tiny.
+#[must_use]
+pub(crate) fn standalone_limit_under_kernel_bound(kernel_bytes: usize) -> usize {
+    if kernel_bytes == 0 {
+        return 0;
+    }
+    // Saturating: kernel_bytes is attacker-free (our own env) but a pathological
+    // GOVERN_AY_MB should clamp rather than wrap into a tiny limit.
+    kernel_bytes
+        .saturating_div(100)
+        .saturating_mul(KERNEL_BUDGET_HEADROOM_PERCENT)
+        .max(1)
 }
 
 /// Pure core of [`default_standalone_memory_limit`]; see
@@ -895,7 +1142,21 @@ pub fn default_embedded_memory_limit() -> usize {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        default_embedded_memory_limit_from(physical_memory_bytes())
+        // Embedded callers are in-process inside a HOST (e.g. compiler_consumer), which is
+        // usually not armed -- `active_budget_bytes()` then returns None and this
+        // keeps the tighter phys/8 policy untouched. But when the host IS armed,
+        // promising it phys/8 (16 GiB here) against an 8 GiB kernel cap is the
+        // same lie, so take the smaller of the two rather than the RAM figure.
+        let by_ram = default_embedded_memory_limit_from(physical_memory_bytes());
+        if let Some(kernel_bytes) = govern::active_budget_bytes() {
+            let by_kernel = standalone_limit_under_kernel_bound(kernel_bytes);
+            return if by_ram == 0 {
+                by_kernel
+            } else {
+                by_ram.min(by_kernel)
+            };
+        }
+        by_ram
     }
 }
 

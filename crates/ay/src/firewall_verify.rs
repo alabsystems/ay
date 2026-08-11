@@ -82,7 +82,18 @@ const TOTAL_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(120);
 /// Diagnostic artifacts are attacker/input-amplifiable through proof size. Cap
 /// both their count and aggregate standalone Lean source before invoking Lean.
 pub(crate) const MAX_DIAGNOSTIC_FILES: usize = 64;
-pub(crate) const MAX_DIAGNOSTIC_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+/// The aggregate byte cap is meant to be the BACKSTOP, with
+/// [`MAX_DIAGNOSTIC_FILES`] the binding limit: every standalone artifact embeds
+/// the whole trusted base, so the aggregate is roughly
+/// `files x embedded-base-size` regardless of what the emitters produced.
+/// Embedding the FpUnderflow/FpErrorBound/FpBridge chain for the binary64 RNE
+/// dot-product emitter grew that base from ~104 KiB to ~189 KiB, which at 8 MiB
+/// would have made the BYTE cap bind first (at ~43 artifacts, below the 64-file
+/// limit) and silently cut diagnostic coverage on multi-artifact refutations.
+/// 16 MiB restores the original ordering: 64 files x ~189 KiB is ~12 MiB, still
+/// a hard ceiling and still trivially small next to the 4 GiB per-child memory
+/// limit.
+pub(crate) const MAX_DIAGNOSTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIAGNOSTIC_PROOF_STEPS: usize = 200_000;
 const MAX_DIAGNOSTIC_EMITTER_ITEMS: usize = 100_000;
 const MAX_DIAGNOSTIC_ASSERTIONS: usize = 10_000;
@@ -215,6 +226,22 @@ const REGEX_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/
 /// emitter quantifies over. Import-free (Lean core only), so it concatenates
 /// cleanly like the other embedded theory modules.
 const ORD_FIELD_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/OrdField.lean");
+/// The IEEE-754 binary64 bit decode (`decodeFin`) the `to_fp`/`fp.rem` emitters
+/// were written against, and which `FpBridge.isF64_representable` reuses as its
+/// INDEPENDENT representability oracle. Import-free.
+const FP_UNDERFLOW_SOURCE: &str =
+    include_str!("../../../verification/lean/AySoundness/FpUnderflow.lean");
+/// The fixed-grid rational half-ULP toolkit (`close`, `qround`, `nearestInt`,
+/// `mul_mag`, `half_ulp`). Its single `import Std` header is stripped below: the
+/// standalone concatenation is pure Lean core, and the module needs nothing from
+/// `Std` (the assembly test in this file kernel-checks that).
+const FP_ERROR_BOUND_SOURCE: &str =
+    include_str!("../../../verification/lean/AySoundness/FpErrorBound.lean");
+/// The IEEE-754 round-to-nearest SPECIFICATION bridge (`NearestF64`, `rne_step`,
+/// `guard_claim_no_model`) the binary64 RNE dot-product emitter grounds in.
+/// Depends on `FpErrorBound`, `FpUnderflow` and `Firewall`, so it concatenates
+/// after all three.
+const FP_BRIDGE_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/FpBridge.lean");
 const LAKEFILE_SOURCE: &str = include_str!("../../../verification/lean/lakefile.toml");
 const LEAN_TOOLCHAIN_SOURCE: &str = include_str!("../../../verification/lean/lean-toolchain");
 
@@ -592,6 +619,11 @@ struct StandaloneParts<'a> {
     /// `REGEX_SOURCE` with its `import AySoundness.StringThy` header stripped,
     /// so it concatenates after the embedded `STRING_SOURCE`.
     regex: &'static str,
+    /// `FP_ERROR_BOUND_SOURCE` with its `import Std` header stripped.
+    error_bound: &'static str,
+    /// `FP_BRIDGE_SOURCE` with its three-line `AySoundness` import header
+    /// stripped, so it concatenates after `FpErrorBound`/`FpUnderflow`.
+    bridge: &'static str,
     audit_at: usize,
 }
 
@@ -608,10 +640,18 @@ struct StandaloneParts<'a> {
 ///
 /// Modules whose emitters are still REJECTED here (their sources are not
 /// embedded, so accepting the import would let a working-directory module
-/// redefine the lemma): `AySoundness.SeqThy`, `AySoundness.SetThy`,
-/// `AySoundness.FpUnderflow`. Adding one means embedding its source below and
-/// concatenating it in dependency order — not just listing it here.
-const ALLOWED_EMITTED_IMPORTS: [&str; 7] = [
+/// redefine the lemma): `AySoundness.SeqThy`, `AySoundness.SetThy`. Adding one
+/// means embedding its source below and concatenating it in dependency order —
+/// not just listing it here.
+///
+/// `AySoundness.FpBridge` is LAST because the binary64 RNE dot-product emitter
+/// writes the pair `Firewall`/`FpBridge`, and the walk is ordered: any position
+/// before `OrdField` would still strip that pair, but keeping the list in one
+/// consistent "base first, leaf theories after" order is what makes the ordering
+/// contract readable. Its three transitive dependencies (`FpErrorBound`,
+/// `FpUnderflow`, `Firewall`) are embedded below but NOT allow-listed: an
+/// emitter has no reason to import them directly.
+const ALLOWED_EMITTED_IMPORTS: [&str; 8] = [
     "import AySoundness.Firewall\n",
     "import AySoundness.NiaProduct\n",
     "import AySoundness.FpThy\n",
@@ -619,6 +659,7 @@ const ALLOWED_EMITTED_IMPORTS: [&str; 7] = [
     "import AySoundness.StringThy\n",
     "import AySoundness.RegexThy\n",
     "import AySoundness.OrdField\n",
+    "import AySoundness.FpBridge\n",
 ];
 
 fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
@@ -638,6 +679,18 @@ fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
     let regex = REGEX_SOURCE
         .strip_prefix("import AySoundness.StringThy\n")
         .ok_or_else(|| "embedded RegexThy source has an unexpected import header".to_string())?;
+    let error_bound = FP_ERROR_BOUND_SOURCE
+        .strip_prefix("import Std\n")
+        .ok_or_else(|| {
+            "embedded FpErrorBound source has an unexpected import header".to_string()
+        })?;
+    let bridge = FP_BRIDGE_SOURCE
+        .strip_prefix(
+            "import AySoundness.FpErrorBound\n\
+             import AySoundness.FpUnderflow\n\
+             import AySoundness.Firewall\n",
+        )
+        .ok_or_else(|| "embedded FpBridge source has an unexpected import header".to_string())?;
     let theorem = body
         .find("theorem no_model")
         .ok_or_else(|| "emitter produced no no_model theorem".to_string())?;
@@ -649,6 +702,8 @@ fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
         body,
         firewall,
         regex,
+        error_bound,
+        bridge,
         audit_at: theorem + relative_end,
     })
 }
@@ -671,6 +726,12 @@ fn standalone_firewall_source_len(emitted: &str) -> Result<usize, String> {
         parts.regex.len(),
         1,
         ORD_FIELD_SOURCE.len(),
+        1,
+        FP_UNDERFLOW_SOURCE.len(),
+        1,
+        parts.error_bound.len(),
+        1,
+        parts.bridge.len(),
         1,
         parts.body.len(),
         AXIOM_AUDIT_PREFIX.len(),
@@ -708,6 +769,17 @@ fn standalone_firewall_source(emitted: &str) -> Result<String, String> {
     source.push_str(parts.regex);
     source.push('\n');
     source.push_str(ORD_FIELD_SOURCE);
+    source.push('\n');
+    // The floating-point bridge chain, in dependency order: FpUnderflow
+    // (import-free) supplies the `decodeFin` bit model, FpErrorBound (its
+    // `import Std` stripped — the concatenation is pure Lean core) supplies the
+    // half-ULP grid toolkit, and FpBridge (its three AySoundness imports
+    // stripped) composes them into the RNE nearest-value specification.
+    source.push_str(FP_UNDERFLOW_SOURCE);
+    source.push('\n');
+    source.push_str(parts.error_bound);
+    source.push('\n');
+    source.push_str(parts.bridge);
     source.push('\n');
     source.push_str(&parts.body[..parts.audit_at]);
     source.push_str(AXIOM_AUDIT_PREFIX);
@@ -1158,8 +1230,25 @@ fn axiom_audit_result(output: &str) -> Result<(), String> {
         (None, None) => return Err("missing #print axioms report".to_string()),
     };
     let line_start = report[..start].rfind('\n').map_or(0, |newline| newline + 1);
-    if !report[line_start..start].contains("no_model") {
+    let audited = &report[line_start..start];
+    if !audited.contains("no_model") {
         return Err("axiom report is not for no_model".to_string());
+    }
+    // ...and it must be the ARTIFACT'S OWN `no_model`, not a namesake from the
+    // trusted base concatenated ahead of it.
+    //
+    // The embedded sources carry their own `#print axioms` commands, and
+    // `AySoundness.FpBridge.guard_claim_no_model` reports a line that contains
+    // the substring `no_model` with an entirely allowed axiom set. Since this
+    // function takes the LAST report before the sentinel, that library line
+    // becomes a plausible-looking stand-in the moment the artifact's own audit
+    // line is absent — exactly the case where the audit must FAIL. Every
+    // emitter renders into `AySoundness.Emitted.<hash>`, and no embedded module
+    // does, so requiring that prefix distinguishes them.
+    if !audited.contains("AySoundness.Emitted.") {
+        return Err(
+            "axiom report is for a base-library theorem, not the emitted no_model".to_string(),
+        );
     }
     if Some(start) == no_axioms {
         return Ok(());
@@ -1576,6 +1665,82 @@ end AySoundness.Emitted.StrInReLen_e14609b60131ee43
         assert!(!ORD_FIELD_SOURCE.starts_with("import "));
     }
 
+    /// The binary64 RNE dot-product emitter writes `Firewall` then `FpBridge`,
+    /// and `FpBridge` is the only allow-listed module with THREE transitive
+    /// `AySoundness` dependencies. All four sources must land in the standalone
+    /// file, in dependency order, ahead of the emitted body — otherwise the
+    /// artifact would either lose `guard_claim_no_model` or resolve it against a
+    /// mutable project `.olean`, which is exactly the substitution the embedding
+    /// exists to prevent.
+    #[test]
+    fn standalone_source_embeds_the_fp_bridge_chain() {
+        let emitted = "import AySoundness.Firewall\n\
+                       import AySoundness.FpBridge\n\
+                       namespace X\n\
+                       theorem no_model : AySoundness.FpBridge.IsF64 0 := \
+                       AySoundness.FpBridge.isF64_zero\n\
+                       end X\n";
+        let source = standalone_firewall_source(emitted).expect("standalone source");
+        assert_eq!(
+            source.len(),
+            standalone_firewall_source_len(emitted).expect("standalone source length")
+        );
+        // Nothing is imported: every trusted module is inlined from this binary.
+        assert!(!source.lines().any(|line| line.starts_with("import ")));
+        assert!(source.contains("namespace AySoundness.FpUnderflow"));
+        assert!(source.contains("namespace AySoundness.FpErrorBound"));
+        assert!(source.contains("namespace AySoundness.FpBridge"));
+        assert!(source.contains("theorem guard_claim_no_model"));
+        assert!(source.contains("theorem isF64_representable"));
+        assert!(source.contains("theorem guard_claim_intermediates_finite"));
+
+        let underflow = source
+            .find("namespace AySoundness.FpUnderflow")
+            .expect("FpUnderflow in the embedded base");
+        let error_bound = source
+            .find("namespace AySoundness.FpErrorBound")
+            .expect("FpErrorBound in the embedded base");
+        let bridge = source
+            .find("namespace AySoundness.FpBridge")
+            .expect("FpBridge in the embedded base");
+        let body = source.find("namespace X").expect("emitted body");
+        // FpBridge opens both FpErrorBound and FpUnderflow, so both precede it.
+        assert!(underflow < bridge);
+        assert!(error_bound < bridge);
+        assert!(bridge < body);
+        assert!(source.contains(AXIOM_AUDIT_SENTINEL));
+    }
+
+    /// The embedded FP chain's import headers are stripped by exact
+    /// `strip_prefix`, so a module whose header moves silently loses its
+    /// dependencies. Pin the headers, and pin that nothing else in these
+    /// sources is an import (the concatenation has no way to hoist one).
+    #[test]
+    fn embedded_fp_chain_sources_have_the_expected_import_headers() {
+        assert!(FP_ERROR_BOUND_SOURCE.starts_with("import Std\n"));
+        assert!(FP_BRIDGE_SOURCE.starts_with(
+            "import AySoundness.FpErrorBound\n\
+             import AySoundness.FpUnderflow\n\
+             import AySoundness.Firewall\n"
+        ));
+        assert!(!FP_UNDERFLOW_SOURCE.starts_with("import "));
+        for source in [
+            FP_UNDERFLOW_SOURCE,
+            FP_ERROR_BOUND_SOURCE
+                .strip_prefix("import Std\n")
+                .expect("Std header"),
+            FP_BRIDGE_SOURCE
+                .strip_prefix(
+                    "import AySoundness.FpErrorBound\n\
+                     import AySoundness.FpUnderflow\n\
+                     import AySoundness.Firewall\n",
+                )
+                .expect("AySoundness header"),
+        ] {
+            assert!(!source.contains("\nimport "));
+        }
+    }
+
     #[test]
     fn standalone_source_rejects_unknown_import_or_missing_theorem() {
         assert!(standalone_firewall_source(
@@ -1731,10 +1896,13 @@ end AySoundness.Emitted.StrInReLen_e14609b60131ee43
 
     #[test]
     fn axiom_audit_accepts_only_the_documented_kernel_axioms() {
+        // Every emitter renders into `AySoundness.Emitted.<hash>`, and the audit
+        // now requires that prefix — see the base-library case at the end.
+        const EMITTED: &str = "AySoundness.Emitted.Demo_0123abcd.no_model";
         for report in [
-            format!("'Example.no_model' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n"),
+            format!("'{EMITTED}' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n"),
             format!(
-                "'Example.no_model' depends on axioms: [propext, Classical.choice, Quot.sound]\n\
+                "'{EMITTED}' depends on axioms: [propext, Classical.choice, Quot.sound]\n\
                  {AXIOM_AUDIT_SENTINEL}\n"
             ),
         ] {
@@ -1742,7 +1910,7 @@ end AySoundness.Emitted.StrInReLen_e14609b60131ee43
         }
 
         let forbidden = format!(
-            "'Example.no_model' depends on axioms: [propext, Bad.unsound]\n\
+            "'{EMITTED}' depends on axioms: [propext, Bad.unsound]\n\
              {AXIOM_AUDIT_SENTINEL}\n"
         );
         assert!(axiom_audit_result(&forbidden)
@@ -1750,12 +1918,30 @@ end AySoundness.Emitted.StrInReLen_e14609b60131ee43
             .contains("Bad.unsound"));
         assert!(axiom_audit_result(AXIOM_AUDIT_SENTINEL).is_err());
         let duplicate = format!(
-            "'Example.no_model' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n{AXIOM_AUDIT_SENTINEL}\n"
+            "'{EMITTED}' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n{AXIOM_AUDIT_SENTINEL}\n"
         );
         assert!(axiom_audit_result(&duplicate).is_err());
-        let unrelated =
-            format!("'Example.other' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n");
+        let unrelated = format!(
+            "'AySoundness.Emitted.Demo_0123abcd.other' does not depend on any axioms\n{AXIOM_AUDIT_SENTINEL}\n"
+        );
         assert!(axiom_audit_result(&unrelated).is_err());
+
+        // A NAMESAKE FROM THE TRUSTED BASE MUST NOT SATISFY THE AUDIT.
+        //
+        // The embedded sources carry their own `#print axioms` commands, and
+        // `AySoundness.FpBridge.guard_claim_no_model` prints a line containing
+        // the substring `no_model` with a fully allowed axiom set. Because the
+        // audit takes the LAST report before the sentinel, that line would have
+        // stood in for a MISSING artifact audit — precisely when the audit has
+        // to fail.
+        let base_library_namesake = format!(
+            "'AySoundness.FpBridge.guard_claim_no_model' depends on axioms: \
+             [propext, Classical.choice, Quot.sound]\n{AXIOM_AUDIT_SENTINEL}\n"
+        );
+        assert!(
+            axiom_audit_result(&base_library_namesake).is_err(),
+            "a base-library `no_model` namesake must not satisfy the artifact's audit"
+        );
     }
 
     #[test]

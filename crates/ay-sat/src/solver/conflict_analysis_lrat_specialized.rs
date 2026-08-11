@@ -33,6 +33,15 @@ impl Solver {
             conflict_ref.0
         );
 
+        // The bounded ResolutionDag route reconstructs the terminal proof
+        // postsolve. Do not eagerly clone the conflict clause, materialize
+        // unit proofs, build hint vectors, or allocate a trace HashSet here;
+        // those legacy structures have no caller-controlled envelope.
+        if self.cold.backward_proof_limits.is_some() {
+            self.mark_empty_clause_deferred_for_bounded_proof();
+            return;
+        }
+
         if self.cold.clause_trace.is_none() && !self.cold.lrat_enabled {
             self.has_empty_clause = true;
             if self.cold.empty_clause_scope_depth == 0 {

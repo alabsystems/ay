@@ -170,6 +170,12 @@ struct NormalizedConstraint {
 ///
 /// Checks non-negativity of all coefficients and ensures the annotation length
 /// matches the number of conflict literals.
+///
+/// This is the LITERAL-BLIND gate: it cannot tell an inequality row (where
+/// `λ >= 0` is a genuine precondition of Farkas' lemma) from an equality row
+/// (where the multiplier is sign-free). Callers that hold the conflict literals
+/// should use [`verify_farkas_signed_shape`] instead, which exempts equality
+/// rows; this function stays strict for callers that have only the annotation.
 pub fn verify_farkas_annotation_shape(
     farkas: &FarkasAnnotation,
     num_literals: usize,
@@ -190,6 +196,61 @@ pub fn verify_farkas_annotation_shape(
             coefficients: farkas.coefficients.len(),
             literals: num_literals,
         });
+    }
+
+    Ok(())
+}
+
+/// Literal-aware replacement for [`verify_farkas_annotation_shape`]'s
+/// non-negativity gate.
+///
+/// Farkas' lemma requires `λ >= 0` **only for inequality rows**: a negative
+/// multiplier there silently flips the constraint's direction, so it must stay
+/// rejected. An asserted EQUALITY `e = 0` contributes `μ·e` for an arbitrary
+/// real `μ`, so its multiplier is sign-free — a fact this module already relies
+/// on in [`equality_elimination_contradicts`], and which the orientation search
+/// makes concrete: an equality literal yields the two alternatives `e` and `-e`,
+/// so `{λ·e, λ·(-e)}` is the same set for `λ` and `-λ`. Rejecting a negative
+/// equality coefficient therefore refuses certificates the semantic check would
+/// accept, buying no soundness.
+///
+/// That mismatch was live: the QF_UFLRA congruence conflict
+/// `x = y ∧ f(x) > 0 ∧ f(y) < 0` is refuted with a SIGNED multiplier on the
+/// equality row, and the strict UNSAT funnel rejected it with
+/// "Farkas coefficients must be non-negative, but found: [(2, -1)]", degrading a
+/// correct refutation to `unknown`.
+///
+/// DISEQUALITY rows (`=` asserted false / `distinct` asserted true) stay strict.
+/// They are discharged by a two-branch case split whose branches must agree on
+/// coefficient magnitude, not by a signed multiplier.
+///
+/// # Errors
+///
+/// Returns [`FarkasValidationError::NegativeCoefficients`] listing every
+/// negative coefficient that sits on a non-equality row.
+pub fn verify_farkas_signed_shape(
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+) -> Result<(), FarkasValidationError> {
+    if farkas.coefficients.len() != conflict.len() {
+        // Length disagreement: defer to the literal-blind gate so a malformed
+        // annotation reports exactly what it always did.
+        return verify_farkas_annotation_shape(farkas, conflict.len());
+    }
+
+    let negative: Vec<_> = farkas
+        .coefficients
+        .iter()
+        .enumerate()
+        .filter(|(idx, c)| {
+            **c < Rational64::from(0)
+                && conflict_positive_equality(terms, &conflict[*idx]).is_none()
+        })
+        .map(|(idx, coeff)| (idx, *coeff))
+        .collect();
+    if !negative.is_empty() {
+        return Err(FarkasValidationError::NegativeCoefficients { negative });
     }
 
     Ok(())
@@ -243,7 +304,7 @@ fn verify_farkas_conflict_lits_impl(
     farkas: &FarkasAnnotation,
     use_congruence: bool,
 ) -> Result<(), FarkasValidationError> {
-    verify_farkas_annotation_shape(farkas, conflict.len())?;
+    verify_farkas_signed_shape(terms, conflict, farkas)?;
 
     let lambdas: Vec<BigRational> = farkas
         .coefficients

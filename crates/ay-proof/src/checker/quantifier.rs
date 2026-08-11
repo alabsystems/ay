@@ -61,67 +61,61 @@ fn matches_substitution(
     substitutions: &HashMap<&str, TermId>,
     work: &mut usize,
 ) -> Option<bool> {
-    let mut visited = HashSet::default();
-    let mut stack = vec![(pattern, instance)];
-    while let Some((expected, actual)) = stack.pop() {
-        if !visited.insert((expected, actual)) {
-            continue;
+    if *work >= SKOLEM_TERM_WORK_LIMIT {
+        return None;
+    }
+    *work += 1;
+    if terms.sort(pattern) != terms.sort(instance) {
+        return Some(false);
+    }
+    match terms.get(pattern) {
+        TermData::Var(name, _) => {
+            if let Some(&replacement) = substitutions.get(name.as_str()) {
+                Some(instance == replacement)
+            } else {
+                Some(pattern == instance)
+            }
         }
-        if *work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
+        TermData::Const(..) => Some(pattern == instance),
+        TermData::Not(inner) => {
+            let TermData::Not(actual_inner) = terms.get(instance) else {
+                return Some(false);
+            };
+            matches_substitution(terms, *inner, *actual_inner, substitutions, work)
         }
-        *work += 1;
-        if terms.sort(expected) != terms.sort(actual) {
-            return Some(false);
-        }
-        match terms.get(expected) {
-            TermData::Var(name, _) => {
-                if let Some(&replacement) = substitutions.get(name.as_str()) {
-                    if actual != replacement {
-                        return Some(false);
-                    }
-                } else if expected != actual {
+        TermData::Ite(condition, then_branch, else_branch) => {
+            let TermData::Ite(actual_condition, actual_then, actual_else) = terms.get(instance)
+            else {
+                return Some(false);
+            };
+            for (expected, actual) in [
+                (*condition, *actual_condition),
+                (*then_branch, *actual_then),
+                (*else_branch, *actual_else),
+            ] {
+                if !matches_substitution(terms, expected, actual, substitutions, work)? {
                     return Some(false);
                 }
             }
-            TermData::Const(..) => {
-                if expected != actual {
-                    return Some(false);
-                }
-            }
-            TermData::Not(inner) => {
-                let TermData::Not(actual_inner) = terms.get(actual) else {
-                    return Some(false);
-                };
-                stack.push((*inner, *actual_inner));
-            }
-            TermData::Ite(condition, then_branch, else_branch) => {
-                let TermData::Ite(actual_condition, actual_then, actual_else) = terms.get(actual)
-                else {
-                    return Some(false);
-                };
-                stack.extend([
-                    (*condition, *actual_condition),
-                    (*then_branch, *actual_then),
-                    (*else_branch, *actual_else),
-                ]);
-            }
-            TermData::App(symbol, args) => {
-                let TermData::App(actual_symbol, actual_args) = terms.get(actual) else {
-                    return Some(false);
-                };
-                if symbol != actual_symbol || args.len() != actual_args.len() {
-                    return Some(false);
-                }
-                stack.extend(args.iter().copied().zip(actual_args.iter().copied()));
-            }
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+            Some(true)
+        }
+        TermData::App(symbol, args) => {
+            let TermData::App(actual_symbol, actual_args) = terms.get(instance) else {
+                return Some(false);
+            };
+            if symbol != actual_symbol || args.len() != actual_args.len() {
                 return Some(false);
             }
-            _ => return Some(false),
+            for (expected, actual) in args.iter().copied().zip(actual_args.iter().copied()) {
+                if !matches_substitution(terms, expected, actual, substitutions, work)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
         }
+        TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => Some(false),
+        _ => Some(false),
     }
-    Some(true)
 }
 
 fn matches_single_substitution(
@@ -276,15 +270,196 @@ pub(crate) fn validate_forall_inst(
     }
     match matches_substitution(terms, *body, instance, &substitutions, &mut work) {
         Some(true) => Ok(()),
-        Some(false) => Err(invalid_forall_inst(
-            step,
-            "instance is not the exact simultaneous binder substitution",
-        )),
+        // The structural walk reports "not node-for-node identical". That is a
+        // DIFFERENT QUESTION from "not the substitution"
+        // (#forall-inst-canonical-subst).
+        //
+        // The emitter validates an instance with `ematching::subst_vars`, which
+        // rebuilds through `mk_app_simplified` — the store's CANONICALISING
+        // constructors. So the instance is whatever those constructors produce,
+        // and that is routinely not the literal textual replacement. Two measured
+        // examples, both correct instances the walk rejected:
+        //
+        //   (= (logic_add_one y) (+ y 1))  ->  (= (+ x 1) (logic_add_one x))
+        //   (or D (not p) (not q) ...)     ->  (=> (and p' q' ...) D')
+        //
+        // Rejecting those means AY computes a correct refutation and publishes
+        // `unknown`. Patching the walk per-canonicalisation (operand order, then
+        // implication folding, then De Morgan, ...) would widen the checker
+        // against an open-ended rewrite set, which is how a checker stops being
+        // one.
+        //
+        // Instead ask the emitter's question, using the same canonicalising
+        // machinery: rebuild `body[vars := args]` with `TermStore::substitute`,
+        // which routes rebuilt nodes through the simplifying `mk_*` constructors,
+        // and compare ids. On a hash-consed store the canonical form has exactly
+        // one id, so id equality IS term equality.
+        //
+        // This is an INDEPENDENT check, not trust in the proof: the obligation is
+        // `instance = body[vars := args]`, and the checker recomputes that
+        // function itself from the step's own binder list and arguments. It
+        // accepts exactly the instances the emitter can legitimately produce and
+        // no others — an instance that is not the substitution under either
+        // reading is still rejected.
+        //
+        // Runs on a scratch CLONE so proof checking can never add terms to the
+        // caller's arena, and only after the fast structural path has failed.
+        Some(false)
+            if canonical_substitution_matches(terms, *body, instance, &substitutions)
+                == Some(true) =>
+        {
+            Ok(())
+        }
+        Some(false) => {
+            if std::env::var_os("AY_DEBUG_FORALL_INST").is_some() {
+                fn dump(terms: &TermStore, t: TermId, depth: usize) -> String {
+                    let pad = "  ".repeat(depth);
+                    match terms.get(t) {
+                        TermData::Var(n, s) => format!("{pad}Var({n}:{s:?})"),
+                        TermData::Const(c) => format!("{pad}Const({c:?})"),
+                        TermData::Not(i) => {
+                            format!("{pad}Not\n{}", dump(terms, *i, depth + 1))
+                        }
+                        TermData::App(sym, args) => {
+                            let mut out = format!("{pad}App({})", sym.name());
+                            for a in args {
+                                out.push('\n');
+                                out.push_str(&dump(terms, *a, depth + 1));
+                            }
+                            out
+                        }
+                        other => format!("{pad}{other:?}"),
+                    }
+                }
+                eprintln!("AY_DEBUG_FORALL_INST step={step:?}");
+                eprintln!("  subs: {substitutions:?}");
+                eprintln!("  BODY:\n{}", dump(terms, *body, 2));
+                eprintln!("  INSTANCE:\n{}", dump(terms, instance, 2));
+            }
+            Err(invalid_forall_inst(
+                step,
+                "instance is not the exact simultaneous binder substitution",
+            ))
+        }
         None => Err(invalid_forall_inst(
             step,
             format!("substitution check exceeds {SKOLEM_TERM_WORK_LIMIT} distinct term pairs"),
         )),
     }
+}
+
+/// Recompute `body[vars := args]` the way the EMITTER does — through the store's
+/// canonicalising constructors — and compare it to `instance` by id.
+///
+/// [`matches_substitution`] asks whether `instance` is the literal textual
+/// replacement. This asks the question the emitter actually validated: whether
+/// `instance` is what the constructors PRODUCE for that replacement. The two
+/// differ whenever a constructor canonicalised (operand order in `=`, a clause
+/// rebuilt as an implication, constant folding), and in those cases the literal
+/// reading is the wrong one.
+///
+/// [`TermStore::substitute`] is the right primitive because it routes rebuilt
+/// nodes through the simplifying `mk_*` constructors — its own docs note that
+/// substituting `x -> 5` into `(+ x 1)` yields the same `TermId` as building
+/// `(+ 5 1)`, which folds to `6`. (`substitute_terms` is NOT: it re-`intern`s
+/// `App` nodes raw and so reproduces none of this.)
+///
+/// Operates on a scratch CLONE: proof checking must never add terms to the
+/// caller's arena.
+///
+/// `Some(true)` when the canonical substitution equals `instance`, `Some(false)`
+/// when it does not, `None` when the binder variables cannot be located — the
+/// caller then keeps the structural rejection, so an unlocatable binder fails
+/// closed.
+fn canonical_substitution_matches(
+    terms: &TermStore,
+    body: TermId,
+    instance: TermId,
+    substitutions: &HashMap<&str, TermId>,
+) -> Option<bool> {
+    // `substitutions` is keyed by binder NAME, but `substitute` replaces by id,
+    // so the bound `Var` ids have to be recovered from the body itself.
+    let mut from: Vec<TermId> = Vec::new();
+    let mut to: Vec<TermId> = Vec::new();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut stack = vec![body];
+    let mut budget = SKOLEM_TERM_WORK_LIMIT;
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if budget == 0 {
+            return None;
+        }
+        budget -= 1;
+        match terms.get(term) {
+            TermData::Var(name, _) => {
+                if let Some(&replacement) = substitutions.get(name.as_str()) {
+                    if !from.contains(&term) {
+                        from.push(term);
+                        to.push(replacement);
+                    }
+                }
+            }
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(condition, then_branch, else_branch) => {
+                stack.extend([*condition, *then_branch, *else_branch]);
+            }
+            TermData::Let(bindings, inner) => {
+                stack.extend(bindings.iter().map(|(_, value)| *value));
+                stack.push(*inner);
+            }
+            TermData::Forall(_, inner, triggers) | TermData::Exists(_, inner, triggers) => {
+                stack.push(*inner);
+                stack.extend(triggers.iter().flatten().copied());
+            }
+            TermData::Const(..) => {}
+            // A future `TermData` variant could hide binder occurrences from this
+            // walk, which would make the rebuilt substitution wrong. Fail closed.
+            _ => return None,
+        }
+    }
+    if from.is_empty() {
+        // No binder occurs in the body: the substitution is the identity, so the
+        // instance must be the body itself.
+        return Some(body == instance);
+    }
+    let mut scratch = terms.clone();
+    let rebuilt = scratch.substitute(body, &from, &to);
+    if rebuilt == instance {
+        return Some(true);
+    }
+
+    // The emitter and the checker rebuild through DIFFERENT simplification sets,
+    // so "the substitution" is not one term (#forall-inst-canonical-subst):
+    //
+    //   node       emitter (`ematching::mk_app_simplified`)  checker (`rebuild_app`)
+    //   (= a b)    mk_eq_coerce  — folds `(= 5 5)` to `true`  mk_eq_coerce — same
+    //   (or ...)   NO case; generic fallback, no folding      mk_or — folds `(or true X)`
+    //
+    // Dumped with `AY_DEBUG_FORALL_INST` on `auflia_verification_consumer_9185_reducers`: a
+    // body `(or (= pushed x) (contains s x))` instantiated with `pushed := 5,
+    // x := 5` gives `(or true (contains s 5))` from the emitter and `true` from
+    // the rebuild here. Both ARE the instance; the id comparison called it a
+    // forgery and the correct `unsat` was published as `unknown`.
+    //
+    // Patching in the emitter's exact rewrite set is the trap the comment above
+    // already names — it widens the checker against an open-ended list. Instead
+    // put BOTH sides through the SAME function. `TermStore::simplify`'s contract
+    // is that every rewrite it applies is semantics-preserving, so agreement
+    // after it means `instance` and `body[vars := args]` denote the same
+    // formula, which is more than `forall_inst` needs (the rule's obligation is
+    // that the instance FOLLOWS from the quantified premise).
+    //
+    // Still independent, still not trust: the checker computes the substitution
+    // itself from the step's own binder list and arguments, and an instance that
+    // is not that substitution under either normal form is still rejected — see
+    // the rejecting-direction cases in `forall_inst_normal_form_tests.rs`. Runs
+    // on the same scratch CLONE, and only after both faster paths have failed.
+    let rebuilt = scratch.simplify(rebuilt);
+    let instance = scratch.simplify(instance);
+    Some(rebuilt == instance)
 }
 
 fn term_contains(

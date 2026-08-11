@@ -965,3 +965,205 @@ fn test_nra_zero_divisor_inconsistent_pair_not_sat() {
         "(/ 0 0) < (/ 0 0) is false — Sat here is a wrong-SAT (#div0), got {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #nra-const-factor — SCALED products must never be registered as monomials
+//
+// P0 wrong-`unsat` (QF_NRA meti-tarski). `collect_nonlinear_terms` stripped the
+// constant factors of a flattened `*` node to build the monomial key but
+// registered the WHOLE node (constant included) as that monomial's `aux_var`,
+// breaking the `aux_var == product(vars)` invariant every consumer relies on.
+// `record_sign_constraint` then transferred the atom's sign VERBATIM onto the
+// bare monomial, so `-2*x^k <= 0` was recorded as `x^k <= 0` — the exact
+// NEGATION of what the atom says — and `check_sign_consistency` reported a
+// conflict against `x > 0`. That refuted satisfiable formulas.
+//
+// The tests below pin the COEFFICIENT SIGN, not merely the presence of a
+// coefficient: the negative-coefficient cases must not be Unsat, and the
+// genuinely unsat unscaled case must stay Unsat.
+// ---------------------------------------------------------------------------
+
+/// Drive the sign machinery directly on the asserted state and return whether
+/// it reports a conflict.
+///
+/// NOTE ON TEST DESIGN: asserting these tiny formulas and calling `check()` is
+/// NOT a valid pin. The exact pre-phases of `nra_check_loop_impl` (univariate
+/// Sturm/IVT, interval, SOS, linear substitution) decide such small queries
+/// `Sat` BEFORE `check_signs` ever runs, so `check()` returns Sat on the buggy
+/// code too and the test passes vacuously. That masking is exactly why the
+/// original bug reproducer needed three coupled cube equations. Calling
+/// `check_sign_consistency` directly reaches the false-inference site with no
+/// scaffolding.
+fn sign_machinery_reports_conflict(solver: &NraSolver<'_>) -> bool {
+    sign::check_sign_consistency(
+        &solver.monomials,
+        &solver.sign_constraints,
+        &solver.var_sign_constraints,
+        &solver.asserted,
+        false,
+    )
+    .is_some()
+}
+
+/// `(<= (* x x (- 2)) 0)` with `x > 0` is SATISFIABLE (every positive `x`
+/// works: `-2x^2 <= 0`). The sign machinery must not refute it.
+#[test]
+fn test_nra_negative_scaled_monomial_is_not_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let neg_two = terms.mk_rational(BigRational::from_integer(BigInt::from(-2)));
+    let scaled = terms.mk_mul(vec![x, x, neg_two]);
+    let le = terms.mk_le(scaled, zero);
+    let x_le_zero = terms.mk_le(x, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    solver.assert_literal(x_le_zero, false); // x > 0
+    assert!(
+        !sign_machinery_reports_conflict(&solver),
+        "#nra-const-factor: -2*x^2 <= 0 with x > 0 is SAT (any x > 0); a sign \
+         conflict here is a FALSE theory lemma"
+    );
+    assert!(
+        !matches!(solver.check(), TheoryResult::Unsat(_)),
+        "-2*x^2 <= 0 with x > 0 must not be refuted"
+    );
+}
+
+/// Degree 3, matching the reduced meti-tarski shape `(<= (* x x x (- 2)) 0)`.
+#[test]
+fn test_nra_negative_scaled_cubic_is_not_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let neg_two = terms.mk_rational(BigRational::from_integer(BigInt::from(-2)));
+    let scaled = terms.mk_mul(vec![x, x, x, neg_two]);
+    let le = terms.mk_le(scaled, zero);
+    let x_le_zero = terms.mk_le(x, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    solver.assert_literal(x_le_zero, false); // x > 0
+    assert!(
+        !sign_machinery_reports_conflict(&solver),
+        "#nra-const-factor: -2*x^3 <= 0 with x > 0 is SAT; a sign conflict here \
+         is a FALSE theory lemma"
+    );
+}
+
+/// The even-degree surface of the same defect: `(< (* (- 2) x x) 0)` is
+/// satisfiable (any `x != 0`). The even-degree branch of
+/// `check_sign_consistency` must not declare it a tautological conflict.
+#[test]
+fn test_nra_negative_scaled_even_degree_is_not_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let neg_two = terms.mk_rational(BigRational::from_integer(BigInt::from(-2)));
+    let scaled = terms.mk_mul(vec![neg_two, x, x]);
+    let lt = terms.mk_lt(scaled, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(lt, true);
+    assert!(
+        !sign_machinery_reports_conflict(&solver),
+        "#nra-const-factor: -2*x^2 < 0 is SAT (any x != 0); a sign conflict here \
+         is a FALSE theory lemma"
+    );
+}
+
+/// CONTROL: the UNSCALED `(<= (* x x) 0)` with `x > 0` is genuinely unsat and
+/// the sign lemma must still fire. Without this the "fix" could be "delete the
+/// sign check", which would be a pure completeness loss dressed up as a repair.
+#[test]
+fn test_nra_unscaled_monomial_sign_conflict_still_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let square = terms.mk_mul(vec![x, x]);
+    let le = terms.mk_le(square, zero);
+    let x_le_zero = terms.mk_le(x, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    solver.assert_literal(x_le_zero, false); // x > 0
+    assert!(
+        sign_machinery_reports_conflict(&solver),
+        "x^2 <= 0 with x > 0 IS unsat — the sign lemma must still fire"
+    );
+    assert!(
+        matches!(solver.check(), TheoryResult::Unsat(_)),
+        "x^2 <= 0 with x > 0 must still be refuted"
+    );
+}
+
+/// CONTROL for the POSITIVE coefficient: `(<= (* x x 2) 0)` with `x > 0` is
+/// genuinely unsat. It is currently given up on (the scaled product is left
+/// opaque), so this only asserts the answer is never WRONG. Pinning it as a
+/// non-`Unsat` would freeze in the completeness loss; pinning it as `Unsat`
+/// would be false once the coefficient-aware follow-up lands. Assert soundness.
+#[test]
+fn test_nra_positive_scaled_monomial_answer_is_sound() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let two = terms.mk_rational(BigRational::from_integer(BigInt::from(2)));
+    let scaled = terms.mk_mul(vec![x, x, two]);
+    let le = terms.mk_le(scaled, zero);
+    let x_le_zero = terms.mk_le(x, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    solver.assert_literal(x_le_zero, false); // x > 0
+    assert!(
+        !matches!(solver.check(), TheoryResult::Sat),
+        "2*x^2 <= 0 with x > 0 is UNSAT — Sat here would be a wrong-sat"
+    );
+}
+
+/// A scaled product must not appear in `monomials` / `aux_to_monomial` at all:
+/// the guard is at REGISTRATION, so every downstream consumer (McCormick,
+/// tangent, even-power non-negativity, `check_monomial_consistency`) is closed
+/// at once rather than one at a time.
+#[test]
+fn test_nra_scaled_product_is_not_registered_as_monomial() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let three = terms.mk_rational(BigRational::from_integer(BigInt::from(3)));
+    let scaled = terms.mk_mul(vec![x, y, three]);
+    let le = terms.mk_le(scaled, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    assert!(
+        solver.monomials.is_empty(),
+        "#nra-const-factor: 3*x*y must NOT be registered under the key [x, y] — \
+         its value is 3*x*y, not x*y; got {:?}",
+        solver.monomials.keys().collect::<Vec<_>>()
+    );
+    assert!(solver.aux_to_monomial.is_empty());
+}
+
+/// Unit-coefficient products are unaffected: `(* 1 x y)` still registers, so the
+/// guard does not cost reasoning power where the invariant genuinely holds.
+#[test]
+fn test_nra_unit_coefficient_product_still_registers() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(BigRational::from_integer(BigInt::from(1)));
+    let prod = terms.mk_mul(vec![one, x, y]);
+    let le = terms.mk_le(prod, zero);
+
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(le, true);
+    assert_eq!(
+        solver.monomials.len(),
+        1,
+        "a unit-coefficient product must still be tracked as x*y"
+    );
+}

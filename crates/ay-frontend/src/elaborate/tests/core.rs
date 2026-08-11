@@ -6,6 +6,611 @@ use super::*;
 use crate::Command;
 
 #[test]
+fn z3_debug_global_ast_store_roundtrips_without_solver_rewriting() {
+    let commands = parse("(dbg-set saved (and true false))(dbg-pp-var saved)")
+        .expect("debug AST fixture parses");
+    let mut context = Context::new();
+    assert_eq!(
+        context
+            .process_command(&commands[0])
+            .expect("dbg-set validates and stores the term"),
+        None
+    );
+    assert_eq!(
+        context
+            .process_command(&commands[1])
+            .expect("dbg-pp-var retrieves the stored term"),
+        Some(CommandResult::Display("(and true false)".to_string()))
+    );
+
+    let unknown = Command::DebugPpVar("missing".to_string());
+    let error = context
+        .process_command(&unknown)
+        .expect_err("unknown debug globals must be rejected");
+    assert!(error
+        .to_string()
+        .contains("unknown global variable missing"));
+}
+
+#[test]
+fn parsed_quantifier_metadata_is_validated_and_retained() {
+    let commands = parse(
+        "(declare-fun p (Int) Bool)\
+         (assert (forall ((x Int))\
+           (! (p x) :no-pattern (p x) :weight 7 :qid qid-1 :skolemid skid-1)))",
+    )
+    .expect("quantifier metadata fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("supported quantifier metadata elaborates");
+    }
+
+    let quantifier = context.assertions[0];
+    let body = match context.terms.get(quantifier) {
+        TermData::Forall(_, body, triggers) => {
+            assert!(triggers.is_empty());
+            *body
+        }
+        other => panic!("expected retained forall, got {other:?}"),
+    };
+    assert_eq!(context.terms.quantifier_weight(quantifier), 7);
+    assert_eq!(context.terms.quantifier_id(quantifier), Some("qid-1"));
+    assert_eq!(context.terms.skolem_id(quantifier), Some("skid-1"));
+    assert_eq!(context.terms.quantifier_no_patterns(quantifier), &[body]);
+}
+
+#[test]
+fn parsed_structurally_equal_quantifiers_keep_distinct_metadata() {
+    let commands = parse(
+        "(declare-fun p (Int) Bool)\
+         (assert (forall ((x Int)) (! (p x) :weight 2 :qid first)))\
+         (assert (forall ((x Int)) (! (p x) :weight 9 :qid second)))",
+    )
+    .expect("distinct metadata fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("distinct metadata fixture elaborates");
+    }
+
+    let first = context.assertions[0];
+    let second = context.assertions[1];
+    assert_ne!(
+        first, second,
+        "fresh binder identity must prevent metadata aliasing"
+    );
+    assert_eq!(context.terms.quantifier_weight(first), 2);
+    assert_eq!(context.terms.quantifier_id(first), Some("first"));
+    assert_eq!(context.terms.quantifier_weight(second), 9);
+    assert_eq!(context.terms.quantifier_id(second), Some("second"));
+}
+
+#[test]
+fn parsed_quantifier_metadata_rejects_z3_invalid_placements_and_values() {
+    for script in [
+        "(assert (! true :weight 2))",
+        "(assert (forall ((x Int)) (! true :weight nope)))",
+        "(assert (forall ((x Int)) (! true :qid 1)))",
+        "(assert (forall ((x Int)) (! true :skolemid 1)))",
+        "(simplify (! 1 :lblpos L))",
+        "(simplify (! true :lblneg 1))",
+        "(declare-fun p (Int) Bool)\
+         (assert (forall ((x Int)) (! (p x) :pattern ((p x)) :no-pattern (p x))))",
+    ] {
+        let commands = parse(script).expect("metadata rejection fixture parses");
+        let mut context = Context::new();
+        let error = commands
+            .iter()
+            .find_map(|command| context.process_command(command).err());
+        assert!(error.is_some(), "must reject {script}");
+    }
+}
+
+#[test]
+fn z3_label_attributes_validate_on_boolean_terms() {
+    for script in [
+        "(simplify (! true :lblpos positive-label))",
+        "(simplify (! false :lblneg negative-label))",
+    ] {
+        let commands = parse(script).expect("valid label fixture parses");
+        let mut context = Context::new();
+        for command in &commands {
+            context
+                .process_command(command)
+                .expect("valid label annotation elaborates");
+        }
+    }
+}
+
+#[test]
+fn legacy_z3_match_cases_follow_standard_match_semantics() {
+    let commands = parse(
+        "(set-logic ALL)\
+         (declare-datatype Bit ((zero) (one)))\
+         (declare-const b Bit)\
+         (assert (= (match b (case zero false) (case one false)) true))",
+    )
+    .expect("legacy case fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("legacy case fixture elaborates");
+    }
+    assert_eq!(context.assertions, vec![context.terms.false_term()]);
+}
+
+#[test]
+fn declare_sort_parameter_parses_with_exact_arity() {
+    let commands = parse("(declare-sort-parameter A)").expect("valid command parses");
+    assert_eq!(
+        commands,
+        vec![Command::DeclareSortParameter("A".to_string())]
+    );
+    for malformed in [
+        "(declare-sort-parameter)",
+        "(declare-sort-parameter A B)",
+        "(declare-sort-parameter 1)",
+    ] {
+        assert!(parse(malformed).is_err(), "must reject {malformed}");
+    }
+}
+
+#[test]
+fn declare_sort_parameter_rejects_duplicates_and_sort_conflicts() {
+    for script in [
+        "(declare-sort-parameter A)(declare-sort-parameter A)",
+        "(declare-sort A 0)(declare-sort-parameter A)",
+        "(declare-sort-parameter A)(declare-sort A 0)",
+        "(declare-sort-parameter Bool)",
+        "(declare-sort-parameter and)",
+        "(set-logic QF_LIA)(declare-sort-parameter Int)",
+        "(set-logic QF_LIA)(declare-sort-parameter +)",
+        "(declare-sort-parameter Int)(set-logic QF_LIA)",
+        "(declare-sort-parameter +)(set-logic QF_LIA)",
+        "(declare-sort-parameter Int)(set-logic ALL)",
+    ] {
+        let commands = parse(script).expect("fixture parses");
+        let mut context = Context::new();
+        let error = commands
+            .iter()
+            .find_map(|command| context.process_command(command).err());
+        assert!(
+            matches!(error, Some(ElaborateError::SortRedeclaration(_))),
+            "must reject conflicting sort parameter in {script}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn declare_sort_parameter_is_global_across_stack_and_assertion_reset() {
+    let commands = parse(
+        "(set-option :global-declarations false)\
+         (push 1)(declare-sort-parameter A)(pop 1)(reset-assertions)\
+         (declare-sort-parameter A)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands[..5] {
+        context
+            .process_command(command)
+            .expect("global parameter survives state commands");
+    }
+    assert!(matches!(
+        context.process_command(&commands[5]),
+        Err(ElaborateError::SortRedeclaration(name)) if name == "A"
+    ));
+}
+
+#[test]
+fn reset_clears_declared_sort_parameters() {
+    let commands = parse("(declare-sort-parameter A)(reset)(declare-sort-parameter A)")
+        .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("reset returns to the initial signature");
+    }
+}
+
+#[test]
+fn polymorphic_declaration_and_assertion_materialize_over_current_sorts() {
+    let commands = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter A)\
+         (declare-fun id (A) A)\
+         (assert (forall ((x A)) (= (id x) x)))\
+         (check-sat)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("valid schematic script elaborates");
+    }
+    assert!(context.polymorphic_instantiation_complete());
+    assert_eq!(
+        context.assertions.len(),
+        1,
+        "UF has exactly the Bool monomorphic instance"
+    );
+    assert!(context.has_symbol_with_signature("id", &[Sort::Bool], &Sort::Bool));
+}
+
+#[test]
+fn polymorphic_declaration_owns_its_function_name() {
+    let commands = parse(
+        "(set-logic UFLIA)\
+         (declare-sort-parameter A)\
+         (declare-fun f (A) A)\
+         (declare-fun f (Bool) Int)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands[..3] {
+        context
+            .process_command(command)
+            .expect("family declaration is valid");
+    }
+    assert!(matches!(
+        context.process_command(&commands[3]),
+        Err(ElaborateError::Redefinition(_))
+    ));
+}
+
+#[test]
+fn polymorphic_nullary_family_requires_and_accepts_result_qualification() {
+    let valid = parse(
+        "(set-logic UFLIA)\
+         (declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (= (as c X) (as c X)))\
+         (check-sat)",
+    )
+    .expect("qualified fixture parses");
+    let mut context = Context::new();
+    for command in &valid {
+        context
+            .process_command(command)
+            .expect("qualified polymorphic constant is well sorted");
+    }
+    assert_eq!(context.assertions.len(), 2, "Bool and Int instances");
+
+    let ambiguous = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (= c c))",
+    )
+    .expect("ambiguous fixture parses");
+    let mut context = Context::new();
+    for command in &ambiguous[..3] {
+        context
+            .process_command(command)
+            .expect("declarations are valid");
+    }
+    assert!(matches!(
+        context.process_command(&ambiguous[3]),
+        Err(ElaborateError::IllSorted(_))
+    ));
+}
+
+#[test]
+fn polymorphic_family_name_can_be_shadowed_by_term_binders() {
+    for script in [
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (forall ((c Bool)) c))",
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (exists ((c Bool)) c))",
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (select (lambda ((c Bool)) c) true))",
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (let ((c true)) c))",
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (declare-datatype Box ((box (value Bool))))\
+         (declare-const b Box)\
+         (assert (match b (((box c) c))))",
+    ] {
+        let commands = parse(script).expect("binder-shadowing fixture parses");
+        let mut context = Context::new();
+        for command in &commands {
+            context
+                .process_command(command)
+                .unwrap_or_else(|error| panic!("binder must shadow family in {script}: {error:?}"));
+        }
+    }
+}
+
+#[test]
+fn polymorphic_family_name_in_parallel_let_value_remains_ambiguous() {
+    let commands = parse(
+        "(declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (let ((c c)) true))",
+    )
+    .expect("parallel-let fixture parses");
+    let mut context = Context::new();
+    for command in &commands[..2] {
+        context
+            .process_command(command)
+            .expect("declarations are valid");
+    }
+    assert!(matches!(
+        context.process_command(&commands[2]),
+        Err(ElaborateError::IllSorted(_))
+    ));
+}
+
+#[test]
+fn concrete_composite_sort_in_term_instantiates_polymorphic_family_on_demand() {
+    let commands = parse(
+        "(set-logic QF_AX)\
+         (declare-sort-parameter X)\
+         (declare-const c X)\
+         (assert (= (as c (Array Bool Bool)) (as c (Array Bool Bool))))",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("qualified concrete family member elaborates on demand");
+    }
+    let array = Sort::array(Sort::Bool, Sort::Bool);
+    assert!(context.has_symbol_with_signature("c", &[], &array));
+    assert_eq!(context.assertions.len(), 1);
+}
+
+#[test]
+fn late_user_sort_supports_ground_family_use_without_schematic_assertion() {
+    let commands = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (declare-fun f (X) X)\
+         (check-sat)\
+         (declare-sort U 0)\
+         (declare-const u U)\
+         (assert (= (f u) u))\
+         (check-sat)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("late ground family member remains an ordinary assertion");
+    }
+    let user_sort = Sort::Uninterpreted("U".to_string());
+    assert!(context.has_symbol_with_signature("f", std::slice::from_ref(&user_sort), &user_sort));
+    assert_eq!(context.polymorphic_assertions.len(), 0);
+    assert_eq!(context.assertions.len(), 1);
+}
+
+#[test]
+fn polymorphic_define_fun_becomes_a_family_and_defining_assertion() {
+    let commands = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (define-fun id ((x X)) X x)\
+         (check-sat)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("polymorphic definition elaborates");
+    }
+    assert!(context.has_symbol_with_signature("id", &[Sort::Bool], &Sort::Bool));
+    assert_eq!(context.assertions.len(), 1, "the Bool definition instance");
+}
+
+#[test]
+fn polymorphic_recursive_definition_forms_are_supported() {
+    for script in [
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (define-fun-rec f ((x X)) X (f x))\
+         (check-sat)",
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (define-funs-rec ((f ((x X)) X) (g ((x X)) X))\
+                          ((g x) (f x)))\
+         (check-sat)",
+    ] {
+        let commands = parse(script).expect("fixture parses");
+        let mut context = Context::new();
+        for command in &commands {
+            context
+                .process_command(command)
+                .expect("recursive polymorphic definition elaborates");
+        }
+        assert!(context.polymorphic_instantiation_complete());
+        assert!(!context.assertions.is_empty());
+    }
+}
+
+#[test]
+fn polymorphic_definition_body_can_parameterize_a_monomorphic_rank() {
+    let commands = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (define-fun all_reflexive () Bool\
+           (forall ((x X)) (= x x)))\
+         (check-sat)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("body-only sort parameter elaborates");
+    }
+    assert!(context.has_symbol_with_signature("all_reflexive", &[], &Sort::Bool));
+    assert_eq!(context.assertions.len(), 1);
+}
+
+#[test]
+fn define_sort_rejects_global_parameter_but_allows_local_shadowing() {
+    let invalid = parse(
+        "(declare-sort-parameter X)\
+         (define-sort Bad () X)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    context
+        .process_command(&invalid[0])
+        .expect("parameter declaration succeeds");
+    assert!(matches!(
+        context.process_command(&invalid[1]),
+        Err(ElaborateError::Unsupported(_))
+    ));
+
+    let theory_shadow = parse("(define-sort Bad (Bool) Bool)").expect("fixture parses");
+    let mut context = Context::new();
+    assert!(matches!(
+        context.process_command(&theory_shadow[0]),
+        Err(ElaborateError::SortRedeclaration(name)) if name == "Bool"
+    ));
+
+    let shadowed = parse(
+        "(declare-sort-parameter X)\
+         (define-sort Alias (X) X)\
+         (declare-const b (Alias Bool))",
+    )
+    .expect("shadowing fixture parses");
+    let mut context = Context::new();
+    for command in &shadowed {
+        context
+            .process_command(command)
+            .expect("local define-sort parameter shadows the global one");
+    }
+}
+
+#[test]
+fn polymorphic_definition_scope_and_global_declarations_are_preserved() {
+    let local = parse(
+        "(set-logic UF)\
+         (declare-sort-parameter X)\
+         (push 1)\
+         (define-fun local_id ((x X)) X x)\
+         (pop 1)\
+         (assert (= (local_id true) true))",
+    )
+    .expect("local fixture parses");
+    let mut context = Context::new();
+    for command in &local[..5] {
+        context
+            .process_command(command)
+            .expect("local definition prefix elaborates");
+    }
+    assert!(matches!(
+        context.process_command(&local[5]),
+        Err(ElaborateError::UndefinedSymbol(_))
+    ));
+
+    let global = parse(
+        "(set-logic UF)\
+         (set-option :global-declarations true)\
+         (declare-sort-parameter X)\
+         (push 1)\
+         (define-fun global_id ((x X)) X x)\
+         (pop 1)\
+         (assert (= (global_id true) true))\
+         (check-sat)",
+    )
+    .expect("global fixture parses");
+    let mut context = Context::new();
+    for command in &global {
+        context
+            .process_command(command)
+            .expect("global definition survives pop");
+    }
+    assert_eq!(
+        context.assertions.len(),
+        2,
+        "user assertion plus definition"
+    );
+}
+
+#[test]
+fn polymorphic_assertions_see_sorts_declared_before_each_check() {
+    // SMT-LIB 2.7 Reference/concrete-syntax.tex:508-523: the assertion
+    // families are instantiated at check time, so A participates in the first
+    // check and a later B participates in the second one.
+    let commands = parse(
+        "(set-logic UFLIA)\
+         (declare-sort-parameter X)\
+         (declare-fun f (X) X)\
+         (assert (forall ((x X)) (not (= (f x) x))))\
+         (declare-sort A 0)\
+         (assert (forall ((x X)) (not (= (f (f x)) x))))\
+         (check-sat)\
+         (declare-sort B 0)\
+         (check-sat)",
+    )
+    .expect("normative fixture parses");
+    let mut context = Context::new();
+    for command in &commands[..6] {
+        context.process_command(command).expect("prefix elaborates");
+    }
+    context
+        .process_command(&commands[6])
+        .expect("first check materializes");
+    assert_eq!(
+        context.assertions.len(),
+        6,
+        "two assertions over Bool, Int, and A"
+    );
+    context
+        .process_command(&commands[7])
+        .expect("late sort declaration elaborates");
+    assert_eq!(context.assertions.len(), 0, "query-local instances retire");
+    context
+        .process_command(&commands[8])
+        .expect("second check materializes");
+    assert_eq!(
+        context.assertions.len(),
+        8,
+        "both assertions now also include B"
+    );
+}
+
+#[test]
+fn polymorphic_assertion_uses_check_time_sort_signature() {
+    let commands = parse(
+        "(set-logic UFLIA)\
+         (declare-sort-parameter A)\
+         (assert (forall ((x A) (y A) (z A))
+                   (or (= x y) (= x z) (= y z))))\
+         (check-sat)",
+    )
+    .expect("fixture parses");
+    let mut context = Context::new();
+    for command in &commands {
+        context
+            .process_command(command)
+            .expect("valid schematic script elaborates");
+    }
+    assert!(context.polymorphic_instantiation_complete());
+    assert_eq!(
+        context.assertions.len(),
+        2,
+        "UFLIA requires both Bool and Int instances"
+    );
+}
+
+#[test]
 fn test_elaborate_assert_soft_records_soft_constraint() {
     let input = r#"
             (declare-const a Bool)
@@ -623,24 +1228,42 @@ fn same_name_native_alias_is_an_exact_no_op() {
 }
 
 #[test]
-fn boolean_connectives_require_smtlib_arity_and_bool_operands() {
+fn boolean_connectives_match_z3_500_arity_and_require_bool_operands() {
     for input in [
-        "(assert (and true))",
-        "(assert (or true))",
+        "(assert (and))",
+        "(assert (or))",
+        "(assert (xor))",
+        "(assert (distinct))",
         "(assert (=> true))",
         "(assert (implies true))",
-        "(assert (xor true))",
     ] {
         let commands = parse(input).expect("malformed-arity term still parses");
         let mut ctx = Context::new();
         let error = commands
             .iter()
             .try_for_each(|command| ctx.process_command(command).map(|_| ()))
-            .expect_err("binary Boolean connective must reject fewer than two operands");
+            .expect_err("Z3-invalid arity must be rejected");
         assert!(
             matches!(error, ElaborateError::InvalidConstant(_)),
             "expected arity error for `{input}`, got {error:?}"
         );
+    }
+
+    // Z3 5.0.0 accepts a unary application of its associative Boolean
+    // connectives as the operand itself, and unary `distinct` as true.
+    for input in [
+        "(declare-const p Bool)(assert (= (and p) p))",
+        "(declare-const p Bool)(assert (= (or p) p))",
+        "(declare-const p Bool)(assert (= (xor p) p))",
+        "(declare-const p Bool)(assert (distinct p))",
+    ] {
+        let commands = parse(input).expect("Z3 unary fixture parses");
+        let mut ctx = Context::new();
+        for command in &commands {
+            ctx.process_command(command)
+                .expect("Z3 unary connective must elaborate");
+        }
+        assert!(ctx.terms.is_true(ctx.assertions[0]), "{input}");
     }
 
     for input in [
@@ -661,6 +1284,150 @@ fn boolean_connectives_require_smtlib_arity_and_bool_operands() {
             "expected Bool sort error for `{input}`, got {error:?}"
         );
     }
+}
+
+#[test]
+fn z3_500_no_logic_basic_aliases_have_builtin_semantics() {
+    for input in [
+        "(assert (&& true true))",
+        r"(assert (|\|\|| false true))",
+        "(assert (equals 1 1))",
+        "(assert (equiv true true))",
+        "(assert (iff 1 1))",
+        "(assert (implies false false))",
+        "(assert (if true true false))",
+        "(assert (if_then_else true true false))",
+    ] {
+        let commands = parse(input).expect("Z3 no-logic alias fixture parses");
+        let mut ctx = Context::new();
+        for command in &commands {
+            ctx.process_command(command)
+                .expect("Z3 no-logic alias must elaborate");
+        }
+        assert!(ctx.terms.is_true(ctx.assertions[0]), "{input}");
+    }
+}
+
+#[test]
+fn z3_500_user_friendly_aliases_disappear_after_set_logic() {
+    for (application, expected_name) in [
+        ("(&& true true)", "&&"),
+        (r"(|\|\|| true true)", "||"),
+        ("(equals true true)", "equals"),
+        ("(equiv true true)", "equiv"),
+        ("(iff true true)", "iff"),
+        ("(implies true true)", "implies"),
+        ("(if_then_else true true false)", "if_then_else"),
+    ] {
+        let script = format!("(set-logic ALL)(assert {application})");
+        let commands = parse(&script).expect("logic-gated alias fixture parses");
+        let mut ctx = Context::new();
+        ctx.process_command(&commands[0]).expect("set logic");
+        assert!(
+            matches!(
+                ctx.process_command(&commands[1]),
+                Err(ElaborateError::UndefinedSymbol(ref name))
+                    if name == expected_name
+            ),
+            "legacy alias remained active in {application}"
+        );
+    }
+
+    // `if` is in Z3's unconditional registry, unlike `if_then_else`.
+    let commands = parse("(set-logic ALL)(assert (if true true false))")
+        .expect("unconditional if fixture parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("if must remain available after set-logic");
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+}
+
+#[test]
+fn z3_500_basic_alias_declarations_shadow_builtins() {
+    for (script, expected_name) in [
+        (
+            "(declare-fun && (Bool Bool) Bool)(assert (&& true false))",
+            "&&",
+        ),
+        (
+            r"(declare-fun |\|\|| (Bool Bool) Bool)(assert (|\|\|| true false))",
+            "||",
+        ),
+        (
+            "(declare-fun equals (Bool Bool) Bool)(assert (equals true false))",
+            "equals",
+        ),
+        (
+            "(declare-fun if (Bool Bool Bool) Bool)(assert (if true true false))",
+            "if",
+        ),
+    ] {
+        let commands = parse(script).expect("alias-shadow fixture parses");
+        let mut ctx = Context::new();
+        for command in &commands {
+            ctx.process_command(command)
+                .expect("declared alias must shadow the builtin");
+        }
+        assert!(matches!(
+            ctx.terms.get(ctx.assertions[0]),
+            TermData::App(Symbol::Named(name), _) if name == expected_name
+        ));
+    }
+}
+
+#[test]
+fn z3_500_legacy_basic_sorts_are_no_logic_only() {
+    let commands =
+        parse("(declare-const b bool)(assert (= b b))").expect("lowercase bool fixture parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("no-logic lowercase bool must elaborate");
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+
+    let commands =
+        parse("(declare-const p Proof)(assert (= p p))").expect("Proof carrier fixture parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("no-logic Proof carrier must elaborate");
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+
+    for name in ["bool", "Proof"] {
+        let commands =
+            parse(&format!("(declare-sort {name} 0)")).expect("declaration fixture parses");
+        let mut no_logic = Context::new();
+        assert!(matches!(
+            no_logic.process_command(&commands[0]),
+            Err(ElaborateError::ReservedSymbol(ref rejected)) if rejected == name
+        ));
+    }
+
+    let commands =
+        parse("(set-logic ALL)(declare-sort bool 0)(declare-const b bool)(assert (= b b))")
+            .expect("user lowercase bool fixture parses");
+    let mut with_logic = Context::new();
+    for command in &commands {
+        with_logic
+            .process_command(command)
+            .expect("lowercase bool must be user-declarable after set-logic");
+    }
+    assert!(with_logic.terms.is_true(with_logic.assertions[0]));
+
+    let commands =
+        parse("(set-logic ALL)(declare-sort Proof 0)(declare-const p Proof)(assert (= p p))")
+            .expect("user Proof fixture parses");
+    let mut with_logic = Context::new();
+    for command in &commands {
+        with_logic
+            .process_command(command)
+            .expect("Proof must be user-declarable after set-logic");
+    }
+    assert!(with_logic.terms.is_true(with_logic.assertions[0]));
 }
 
 #[test]
@@ -2104,6 +2871,42 @@ fn rejected_to_real_declaration_does_not_set_sticky_shadow_state() {
 }
 
 #[test]
+fn z3_int_real_coercions_option_controls_implicit_mixed_sort_terms() {
+    let commands = parse(
+        "(set-option :int-real-coercions false)\n\
+         (assert (= 0 0.0))",
+    )
+    .expect("parse mixed arithmetic option probe");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("set int-real-coercions false");
+    let error = ctx
+        .process_command(&commands[1])
+        .expect_err("disabled implicit coercions must reject Int/Real equality");
+    assert!(matches!(error, ElaborateError::SortMismatch { .. }));
+
+    let commands = parse("(assert (= 0 0.0))").expect("parse default coercion probe");
+    Context::new()
+        .process_command(&commands[0])
+        .expect("implicit Int/Real coercions are enabled by default");
+}
+
+#[test]
+fn z3_numeral_as_real_changes_unconstrained_numeral_sort() {
+    let commands = parse(
+        "(set-option :int-real-coercions false)\n\
+         (set-option :numeral-as-real true)\n\
+         (assert (= 0 0.0))",
+    )
+    .expect("parse numeral-as-real probe");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("numeral-as-real makes both equality operands Real");
+    }
+}
+
+#[test]
 fn define_funs_rec_late_sort_error_is_atomic() {
     let commands = parse(
         "(define-funs-rec \
@@ -2178,9 +2981,10 @@ fn indexed_identifiers_do_not_alias_quoted_symbols() {
     for input in [
         // The quoted let-bound name is #x01; the structured literal is #x00.
         "(assert (let ((|(_ bv0 8)| #x01)) (distinct |(_ bv0 8)| (_ bv0 8))))",
-        // AY lowers both character literal spellings to their integer code point.
-        "(assert (let ((|(_ Char 65)| 66)) (distinct |(_ Char 65)| (_ Char 65))))",
-        "(assert (let ((|(_ char #x41)| 66)) (distinct |(_ char #x41)| (_ char #x41))))",
+        // Keep each quoted binding in the structured literal's Z3 5.0.0 sort:
+        // `Char` is a character, while lowercase `char` denotes a String.
+        "(assert (let ((|(_ Char 65)| (_ Char 66))) (distinct |(_ Char 65)| (_ Char 65))))",
+        "(assert (let ((|(_ char #x41)| (_ char #x42))) (distinct |(_ char #x41)| (_ char #x41))))",
         // Positive and negative zero are distinct FloatingPoint bit patterns.
         "(assert (let ((|(_ +zero 8 24)| (_ -zero 8 24))) \
              (distinct |(_ +zero 8 24)| (_ +zero 8 24))))",
@@ -2251,9 +3055,11 @@ fn qualified_indexed_identifier_does_not_alias_same_spelled_symbol() {
 #[test]
 fn character_literal_range_is_enforced() {
     let valid = parse(
-        "(assert (= (_ Char 0) 0)) \
-         (assert (= (_ Char 196607) 196607)) \
-         (assert (= (_ char #x2ffff) 196607))",
+        "(assert (= (char.to_int (_ Char 0)) 0)) \
+         (assert (= (char.to_int (_ Char 196607)) 196607)) \
+         (assert (= (_ Char #b1000001) (_ Char 65))) \
+         (assert (= (char.to_bv (_ Char 65)) (_ bv65 18))) \
+         (assert (= (char.from_bv (_ bv65 18)) (_ Char 65)))",
     )
     .expect("boundary literals parse");
     let mut ctx = Context::new();
@@ -2263,9 +3069,8 @@ fn character_literal_range_is_enforced() {
     }
 
     for input in [
-        "(assert (= (_ Char -1) 0))",
-        "(assert (= (_ Char 196608) 0))",
-        "(assert (= (_ char #x30000) 0))",
+        "(assert (= (char.to_int (_ Char -1)) 0))",
+        "(assert (= (char.to_int (_ Char 196608)) 0))",
     ] {
         let commands = parse(input).expect("out-of-range syntax parses");
         let mut ctx = Context::new();
@@ -2274,6 +3079,36 @@ fn character_literal_range_is_enforced() {
             "out-of-range Char literal elaborated: {input}"
         );
     }
+}
+
+#[test]
+fn character_public_sort_and_conversion_signatures_are_enforced() {
+    for input in [
+        "(assert (= (_ Char 65) 65))",
+        "(assert (char.<= (_ Char 65) 65))",
+        "(assert (= (char.to_int 65) 65))",
+        "(assert (= (char.from_bv (_ bv65 8)) (_ Char 65)))",
+    ] {
+        let commands = parse(input).expect("ill-sorted fixture parses");
+        let mut ctx = Context::new();
+        assert!(
+            ctx.process_command(&commands[0]).is_err(),
+            "ill-sorted character term elaborated: {input}"
+        );
+    }
+
+    let symbolic = parse(
+        "(declare-const b (_ BitVec 18)) \
+         (assert (= (char.from_bv b) (_ Char 65)))",
+    )
+    .expect("symbolic conversion fixture parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&symbolic[0])
+        .expect("bit-vector declaration is valid");
+    assert!(
+        ctx.process_command(&symbolic[1]).is_err(),
+        "symbolic char.from_bv must fail closed until its result is range-bounded"
+    );
 }
 
 #[test]
@@ -2750,6 +3585,28 @@ fn test_recursive_datatype_sort_is_in_scope_inside_its_own_declaration() {
     assert!(
         err.is_none(),
         "a recursive datatype must still elaborate: {err:?}"
+    );
+}
+
+#[test]
+fn z3_500_arrow_array_sort_alias_has_the_source_signature_boundary() {
+    for script in [
+        "(declare-const a (-> Int Bool)) (assert (= (select a 0) (select a 0)))",
+        "(set-logic ALL) (declare-const a (-> Int Bool)) \
+         (assert (= (select a 0) (select a 0)))",
+        "(set-logic HORN) (declare-const a (-> Int Bool)) \
+         (assert (= (select a 0) (select a 0)))",
+    ] {
+        assert!(
+            first_elaboration_error(script).is_none(),
+            "Z3 array-plugin alias must elaborate: {script}"
+        );
+    }
+
+    let error = first_elaboration_error("(set-logic QF_UF) (declare-const a (-> Int Bool))");
+    assert!(
+        error.is_some(),
+        "the array-plugin alias must not leak into an unrelated logic"
     );
 }
 

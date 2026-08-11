@@ -84,6 +84,63 @@ fn to_lp_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
     s
 }
 
+/// Serialize this generator's deliberately integral model as deterministic
+/// free-form MPS.  The closure harness feeds these exact bytes to both AY and
+/// Gurobi; neither solver gets an in-memory construction or a different parser
+/// lane.  This generator only creates integer coefficients and one-sided rows,
+/// so refusing any future shape drift is safer than rounding it silently.
+fn to_mps_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
+    fn integer(value: f64) -> i64 {
+        assert!(value.is_finite(), "dense-ladder MPS value must be finite");
+        assert_eq!(
+            value.fract(),
+            0.0,
+            "dense-ladder MPS value must be integral"
+        );
+        assert!(
+            value >= i64::MIN as f64 && value <= i64::MAX as f64,
+            "dense-ladder MPS value must fit i64"
+        );
+        value as i64
+    }
+
+    let mut s = String::from("NAME DENSE_LADDER\nOBJSENSE\n MAX\nROWS\n N obj\n");
+    for i in 0..rows.len() {
+        let _ = writeln!(s, " L c{i}");
+    }
+    s.push_str("COLUMNS\n");
+    for (j, &col) in cols.iter().enumerate() {
+        let objective = model.obj_coeff(col);
+        if objective != 0.0 {
+            let _ = writeln!(s, " x{j} obj {}", integer(objective));
+        }
+        for (i, &row) in rows.iter().enumerate() {
+            let (terms, lower, upper) = model.row(row);
+            assert!(
+                lower == f64::NEG_INFINITY && upper.is_finite(),
+                "dense-ladder MPS rows must be upper-bounded only"
+            );
+            if let Some((_, coefficient)) = terms
+                .iter()
+                .find(|(term_col, _)| *term_col as usize == col.index())
+            {
+                let _ = writeln!(s, " x{j} c{i} {}", integer(*coefficient));
+            }
+        }
+    }
+    s.push_str("RHS\n");
+    for (i, &row) in rows.iter().enumerate() {
+        let (_, _, upper) = model.row(row);
+        let _ = writeln!(s, " rhs c{i} {}", integer(upper));
+    }
+    s.push_str("BOUNDS\n");
+    for j in 0..cols.len() {
+        let _ = writeln!(s, " BV bounds x{j}");
+    }
+    s.push_str("ENDATA\n");
+    s
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30);
@@ -98,9 +155,23 @@ fn main() {
     };
     eprintln!("MILP: {n} binaries x {m} rows   lane: {lane}");
 
+    let mut dumped = false;
     if let Ok(path) = std::env::var("LP_DUMP") {
         std::fs::write(&path, to_lp_format(&model, &cols, &rows)).expect("write LP");
         eprintln!("wrote {path}");
+        dumped = true;
+    }
+    if let Ok(path) = std::env::var("MPS_DUMP") {
+        std::fs::write(&path, to_mps_format(&model, &cols, &rows)).expect("write MPS");
+        eprintln!("wrote {path}");
+        dumped = true;
+    }
+    if std::env::var_os("DUMP_ONLY").is_some() {
+        assert!(
+            dumped,
+            "DUMP_ONLY requires LP_DUMP=<path> or MPS_DUMP=<path>"
+        );
+        return;
     }
 
     // A time limit, so an unfinished solve reports its incumbent rather than grinding on
@@ -112,6 +183,24 @@ fn main() {
             opts = opts.with_time_limit(std::time::Duration::from_secs_f64(secs));
         }
     }
+    // Match the typed production contract used by `ay-milp solve --threads`.
+    // This example is the canonical dense-binary ladder generator, so silently
+    // ignoring the requested worker count here would make its 8T comparison a
+    // mislabeled 1T run.  Determinism remains the default at one thread; an
+    // explicit multi-worker request opts out exactly as the real CLI does.
+    if let Ok(raw) = std::env::var("AY_MILP_THREADS") {
+        let threads = raw
+            .parse::<u32>()
+            .expect("AY_MILP_THREADS must be a positive integer");
+        assert!(threads > 0, "AY_MILP_THREADS must be positive");
+        if threads > 1 {
+            opts = opts.with_threads(threads).with_determinism(false);
+        }
+    }
+    eprintln!(
+        "worker budget: {}   deterministic: {}",
+        opts.threads, opts.determinism
+    );
     let mut s = BabSession::new(model, &opts).expect("model");
     let t0 = Instant::now();
     let out = s.check().expect("solve");
@@ -160,6 +249,45 @@ fn main() {
         other => {
             println!("NO OPTIMUM: {other:?}");
             println!("time    = {:.3}s", dt.as_secs_f64());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build, to_mps_format};
+
+    #[test]
+    fn deterministic_mps_round_trips_the_generated_model_exactly() {
+        let (model, cols, rows) = build(12, 9, 7);
+        let text = to_mps_format(&model, &cols, &rows);
+        assert_eq!(text, to_mps_format(&model, &cols, &rows));
+
+        let parsed = ay_milp::read_mps(&text).expect("generated MPS must parse");
+        assert_eq!(parsed.name, "DENSE_LADDER");
+        assert_eq!(parsed.model.sense(), model.sense());
+        assert_eq!(parsed.model.num_cols(), model.num_cols());
+        assert_eq!(parsed.model.num_rows(), model.num_rows());
+        assert_eq!(parsed.col_names.len(), cols.len());
+        assert_eq!(parsed.row_names.len(), rows.len());
+
+        for (index, &source_col) in cols.iter().enumerate() {
+            let parsed_col = parsed.model.col_at(index).expect("parsed column");
+            assert_eq!(parsed.col_names[index], format!("x{index}"));
+            assert_eq!(parsed.model.col_kind(parsed_col), ay_milp::ColKind::Binary);
+            assert_eq!(
+                parsed.model.col_bounds(parsed_col),
+                model.col_bounds(source_col)
+            );
+            assert_eq!(
+                parsed.model.obj_coeff(parsed_col),
+                model.obj_coeff(source_col)
+            );
+        }
+        for (index, &source_row) in rows.iter().enumerate() {
+            let parsed_row = parsed.model.row_at(index).expect("parsed row");
+            assert_eq!(parsed.row_names[index], format!("c{index}"));
+            assert_eq!(parsed.model.row(parsed_row), model.row(source_row));
         }
     }
 }

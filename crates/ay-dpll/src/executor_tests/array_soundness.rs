@@ -989,6 +989,110 @@ fn test_nested_array_alia_false_unsat_is_quarantined() {
     assert_eq!(solve_one(input), "unknown");
 }
 
+/// #nested-array-residue-rescue: a nested-array DECLARATION must not condemn a
+/// refutation that never used one.
+///
+/// This is the shape the quarantine over-rejects on the NASA AUFLIRA family:
+/// the nested `u` appears only in dead-weight hypotheses, while the actual
+/// contradiction is a single-level read-over-write (`(store (store s 0 v) 1 w)`
+/// read at index 1 must be `w`). The rescue refutes the nested-array-FREE
+/// entailed residue — the goal negation alone — which forces UNSAT of the whole
+/// (see `Executor::nested_array_free_residue_unsat`), so the computed UNSAT is
+/// retained rather than discarded.
+///
+/// The second assertion is deliberately written `(not (=> hyp goal))` so the
+/// test also pins the NNF-aware conjunct split: a naive `and`-only split would
+/// drop the whole assertion and leave an empty residue.
+///
+/// This ALSO pins the rescue's proof-mode guard against the predicate whose
+/// meaning moved underneath it. The rescue declines "in proof mode", and it
+/// spelled that `produce_proofs_enabled()` — which reports the INTERNAL proof
+/// tracker, and `begin_public_solve` turns that on for every public decision
+/// because the UNSAT certificate is mandatory. The guard therefore fired 100%
+/// of the time and the rescue was DEAD CODE (measured: `AY_DEBUG_RESIDUE=1`
+/// printed `decline: produce_proofs_enabled` on this very input, before any
+/// residue was built). `is_producing_proofs()` is the predicate that still
+/// means what the guard's comment says; see
+/// `test_nested_array_residue_rescue_declines_when_a_proof_is_requested` for
+/// the other half of that boundary.
+#[test]
+fn test_nested_array_free_residue_retains_unsat() {
+    assert_eq!(
+        solve_one(NESTED_ARRAY_FREE_RESIDUE_INPUT),
+        "unsat",
+        "the refutation is a single-level ROW read; a nested-array declaration \
+         elsewhere in the problem must not quarantine it"
+    );
+}
+
+/// The input behind the residue-rescue pair above and below.
+const NESTED_ARRAY_FREE_RESIDUE_INPUT: &str = r#"
+    (set-logic AUFLIA)
+    (declare-fun u () (Array Int (Array Int Int)))
+    (declare-fun s () (Array Int Int))
+    (declare-fun v () Int)
+    (declare-fun w () Int)
+    (assert (= (select (select u 0) 0) v))
+    (assert (not (=> (= (select (select u 1) 1) w)
+                     (= (select (store (store s 0 v) 1 w) 1) w))))
+    (check-sat)
+"#;
+
+/// The fail-closed half of the same boundary: when the CALLER asks for proof
+/// output, the rescue must still decline.
+///
+/// The retained UNSAT would carry `last_proof`, a proof reconstructed from the
+/// full-problem search this quarantine distrusts, while the rescue's own
+/// evidence is a separate refutation with no proof object. Handing that back is
+/// a strictly weaker trust claim than `unknown`, so the guard must survive —
+/// widening it to "always run" would make this answer `unsat` with an unvouched
+/// proof attached.
+#[test]
+fn test_nested_array_residue_rescue_declines_when_a_proof_is_requested() {
+    let commands = parse(NESTED_ARRAY_FREE_RESIDUE_INPUT).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    assert_eq!(
+        outputs[0], "unknown",
+        "a caller that will observe the proof must keep the fail-closed degrade"
+    );
+}
+
+/// The other half of the same boundary: when the refutation GENUINELY needs the
+/// nested array, the residue is satisfiable, the rescue declines, and the
+/// quarantine still fires.
+///
+/// Here `(select u 0)` is equal to two arrays asserted distinct — an UNSAT that
+/// rests entirely on the guarded lazy array+arithmetic combination. Every
+/// nested-array conjunct is filtered out, leaving the residue `(>= p 0)`, which
+/// is satisfiable. `unknown` is therefore the required answer even though the
+/// input really is unsatisfiable: this path may only ever REPAIR a discarded
+/// UNSAT, never manufacture one.
+#[test]
+fn test_nested_array_dependent_unsat_stays_quarantined() {
+    let input = r#"
+        (set-logic AUFLIA)
+        (declare-fun u () (Array Int (Array Int Int)))
+        (declare-fun v () (Array Int Int))
+        (declare-fun w () (Array Int Int))
+        (declare-fun p () Int)
+        (assert (= (select u 0) v))
+        (assert (= (select u 0) w))
+        (assert (not (= v w)))
+        (assert (>= p 0))
+        (check-sat)
+    "#;
+    assert_eq!(
+        solve_one(input),
+        "unknown",
+        "the residue is satisfiable, so the rescue must decline and the \
+         fail-closed quarantine must still degrade"
+    );
+}
+
 /// The same authorization boundary must cover `check-sat-assuming`; otherwise
 /// moving a nested-array contradiction into an assumption could bypass the
 /// plain-check quarantine and expose an uncertified UNSAT through the API.

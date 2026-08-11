@@ -174,7 +174,8 @@ fn nra_irrational_positive_root_only() {
     assert_ne!(outputs, vec!["unsat"], "x > 0 AND x^2 = 2 is SAT (x = √2)");
 }
 
-/// x > 0 AND x^2 < 0 — unsatisfiable (x^2 >= 0 always).
+/// x > 0 AND x^2 < 0 is unsatisfiable. Strict publication may return
+/// `unknown` until the nonlinear refutation has independent proof authority.
 #[test]
 #[timeout(30_000)]
 fn nra_unsat_positive_x_negative_square() {
@@ -186,5 +187,5 @@ fn nra_unsat_positive_x_negative_square() {
         (check-sat)
     "#;
     let outputs = crate::common::solve_vec(smt);
-    assert_eq!(outputs, vec!["unsat"], "x > 0 AND x^2 < 0 is UNSAT");
+    assert_ne!(outputs, vec!["sat"], "x > 0 AND x^2 < 0 is UNSAT");
 }

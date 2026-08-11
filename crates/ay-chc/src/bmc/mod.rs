@@ -146,6 +146,26 @@ const ACYCLIC_REACH_DISTRIBUTION_CAP: usize = 4096;
 /// avoiding a nonlinear integer query.
 const DAG_BOUNDED_SQUARE_MAX_UPPER: i128 = 256;
 
+/// Tree-depth clamp for the repeated-body-predicate reroute
+/// ([`BmcSolver::resolve_unrepresentable_safe`]).
+///
+/// The tree unfolding grows several-fold per level, so the reroute stays in the
+/// range where a branching counterexample is found in seconds rather than
+/// chasing the deep ones (which belong to the budgeted competition lanes in
+/// `AdaptivePortfolio`, not to a `solve()` tail).
+const REPEATED_BODY_TREE_MAX_DEPTH: usize = 6;
+
+/// Wall-clock the repeated-body-predicate reroute gets when the caller
+/// configured NO time budget at all (`BmcConfig::time_budget == None`, e.g. the
+/// direct-`solve()` entry points). With a budget it uses what is left of that
+/// budget instead, so this is a floor for unbudgeted callers, never an
+/// extension of a configured deadline.
+const REPEATED_BODY_TREE_FALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Below this the reroute is skipped outright: building one unfolding already
+/// costs more than the remaining slice, so attempting it would only overrun.
+const REPEATED_BODY_TREE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IntInterval {
     lower: Option<i128>,
@@ -957,7 +977,8 @@ impl BmcSolver {
     /// `acyclic_safe` run must not report `Safe`.
     ///
     /// [`Self::solve_bounded_tree_refutation`] carries the exact encoding for
-    /// these bodies, but is not reachable from [`Self::solve`].
+    /// these bodies and is where [`Self::resolve_unrepresentable_safe`] routes
+    /// them.
     fn has_repeated_body_predicate(&self) -> bool {
         self.problem.clauses().iter().any(|clause| {
             let body = &clause.body.predicates;
@@ -969,7 +990,8 @@ impl BmcSolver {
         })
     }
 
-    /// Fail closed on a `Safe` the level-flat encoding cannot justify.
+    /// Never publish a `Safe` the level-flat encoding cannot justify; try to
+    /// decide the problem on the EXACT encoding instead.
     ///
     /// Applied at every [`Self::solve`] exit so no internal path can publish a
     /// `Safe` that rests on a collapsed body (see
@@ -978,18 +1000,55 @@ impl BmcSolver {
     /// reported `Safe`, because the shared level argument forces `x == y` and
     /// makes every depth UNSAT.
     ///
+    /// The collapsed `Safe` is discarded unconditionally. Rather than stopping
+    /// at `Unknown`, the problem is then handed to
+    /// [`Self::solve_bounded_tree_refutation`], whose derivation-TREE encoding
+    /// gives every occurrence of a body predicate its own fresh variables and
+    /// so represents these bodies exactly. That lane never returns `Safe`, and
+    /// each `Unsafe` is checked against the ORIGINAL clauses before it is
+    /// published — so this can only recover a refutation the collapsing
+    /// encoding hid, never soften the safety side.
+    ///
+    /// Budget: the tree lane runs inside what is left of `solve`'s OWN budget
+    /// (the enclosing `ScopedSmtDeadline` clamps its SMT checks the same way),
+    /// and falls back to [`REPEATED_BODY_TREE_FALLBACK_BUDGET`] only when the
+    /// caller configured no deadline at all.
+    ///
     /// Only `Safe` is affected. `Unsafe` still rests on its own witness replay
     /// and is untouched.
-    fn reject_unrepresentable_safe(&self, result: ChcEngineResult) -> ChcEngineResult {
-        if matches!(result, ChcEngineResult::Safe(_)) && self.has_repeated_body_predicate() {
-            tracing::warn!(
-                "BMC: downgrading Safe to Unknown — a clause body applies one predicate \
-                 more than once, which the level-flat encoding collapses into a single \
-                 shared argument tuple, so depth exhaustion does not prove safety"
-            );
+    fn resolve_unrepresentable_safe(&self, result: ChcEngineResult) -> ChcEngineResult {
+        if !matches!(result, ChcEngineResult::Safe(_)) || !self.has_repeated_body_predicate() {
+            return result;
+        }
+        tracing::warn!(
+            "BMC: discarding Safe — a clause body applies one predicate more than once, \
+             which the level-flat encoding collapses into a single shared argument tuple, \
+             so depth exhaustion does not prove safety; retrying on the exact tree encoding"
+        );
+
+        if self.config.base.is_cancelled() {
             return ChcEngineResult::Unknown;
         }
-        result
+        let budget = self
+            .remaining_solve_budget()
+            .unwrap_or(REPEATED_BODY_TREE_FALLBACK_BUDGET);
+        if budget < REPEATED_BODY_TREE_MIN_BUDGET {
+            return ChcEngineResult::Unknown;
+        }
+        let depth = self.config.max_depth.clamp(2, REPEATED_BODY_TREE_MAX_DEPTH);
+        match self.solve_bounded_tree_refutation(depth, budget, TREE_REFUTATION_NODE_CAP) {
+            ChcEngineResult::Unsafe(cex) => ChcEngineResult::Unsafe(cex),
+            // The tree lane cannot prove safety, so exhausting it proves
+            // nothing: the verdict stays Unknown.
+            _ => ChcEngineResult::Unknown,
+        }
+    }
+
+    /// Wall-clock left on the absolute deadline pinned at [`Self::solve`]
+    /// entry, or `None` when the caller configured no time budget.
+    fn remaining_solve_budget(&self) -> Option<std::time::Duration> {
+        let deadline = self.solve_deadline.get()?;
+        Some(deadline.saturating_duration_since(ay_core::time::Instant::now()))
     }
 
     /// Finalize the persistent executor path after it reaches `max_depth`.
@@ -1168,7 +1227,7 @@ impl BmcSolver {
                     ChcEngineResult::NotApplicable => "NotApplicable",
                 };
                 self.log_stats(result_name);
-                return self.reject_unrepresentable_safe(result);
+                return self.resolve_unrepresentable_safe(result);
             }
         }
 
@@ -1247,7 +1306,7 @@ impl BmcSolver {
         };
         self.log_stats(result_name);
 
-        self.reject_unrepresentable_safe(result)
+        self.resolve_unrepresentable_safe(result)
     }
 
     fn prefer_exact_acyclic_executor_first(&self) -> bool {
@@ -11167,6 +11226,23 @@ impl BmcSolver {
         model: &FxHashMap<String, SmtValue>,
         k: usize,
     ) -> Option<GroundDerivation> {
+        self.ground_derivation_from_witness_with(level_witness, |query_clause| {
+            self.query_clause_instances(query_clause, k, model)
+        })
+    }
+
+    /// Encoding-agnostic core of [`Self::ground_derivation_from_witness`].
+    ///
+    /// The witness reshaping is identical for every lane; only the way the
+    /// VIOLATED QUERY's own variables are read back differs (the level-flat
+    /// encoding names them by `level_arg`, the derivation-tree encoding by its
+    /// `__tree_q_*` renaming), so that step is supplied by `query_env`.
+    /// Returning `None` from `query_env` fails the reshaping closed.
+    fn ground_derivation_from_witness_with(
+        &self,
+        level_witness: &LevelDerivationWitness,
+        query_env: impl FnOnce(&HornClause) -> Option<FxHashMap<String, SmtValue>>,
+    ) -> Option<GroundDerivation> {
         let LevelDerivationWitness {
             witness,
             query_roots,
@@ -11243,7 +11319,7 @@ impl BmcSolver {
         for root in query_roots {
             root_steps.push(*mapped.get(root)?);
         }
-        let query_env = self.query_clause_instances(query_clause, k, model)?;
+        let query_env = query_env(query_clause)?;
         let query_step = steps.len();
         steps.push(GroundDerivationStep {
             clause_index: query_idx,
@@ -11929,10 +12005,16 @@ impl BmcSolver {
     /// tree depth, giving every node fresh variables and a rule indicator, then
     /// reconstructs the fired derivation from the SAT model.
     ///
-    /// SOUND BY CONSTRUCTION: the reconstructed witness is replayed against the
-    /// original CHC by [`Self::verified_unsafe_from_witness`] (a spurious
-    /// witness ⇒ `Unknown`); this method only ever returns `Unsafe` or
-    /// `Unknown`, never `Safe`.
+    /// SOUND BY CONSTRUCTION: the reconstructed derivation is re-checked
+    /// against the ORIGINAL clauses before any verdict is published (see
+    /// [`Self::tree_verified_unsafe`]); this method only ever returns `Unsafe`
+    /// or `Unknown`, never `Safe`.
+    ///
+    /// Every body predicate of the violated query is unfolded, so a query that
+    /// JOINS several premises (`false :- P(x), P(y), x != y`) is refutable
+    /// here too — the shared, fresh-renamed query variables tie the
+    /// sub-derivations together in one solve, and each root becomes one premise
+    /// of the query step.
     pub(crate) fn solve_bounded_tree_refutation(
         &self,
         max_tree_depth: usize,
@@ -11946,11 +12028,10 @@ impl BmcSolver {
         let deadline = ay_core::time::Instant::now() + budget;
 
         for query in &queries {
-            // Only single-body-predicate queries: the witness root is one
-            // derived "bad" fact. Other shapes fall through unchanged.
-            let [(body_pred, body_args)] = query.body.predicates.as_slice() else {
+            let body_preds = query.body.predicates.clone();
+            if body_preds.is_empty() {
                 continue;
-            };
+            }
             if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
                 return ChcEngineResult::Unknown;
             }
@@ -11965,10 +12046,6 @@ impl BmcSolver {
                     )),
                 );
             }
-            let inst_args: Vec<ChcExpr> = body_args
-                .iter()
-                .map(|a| a.substitute_name_map(&qsubst))
-                .collect();
 
             // Iterative deepening: try shallow trees first, so a shallow
             // branching counterexample is found with a small (sub-cap)
@@ -11985,22 +12062,41 @@ impl BmcSolver {
                 let mut nodes: Vec<TreeNode> = Vec::new();
                 let mut fresh: usize = 0;
                 let mut global: Vec<ChcExpr> = Vec::new();
-                let Some((root_node, root_derivable)) = self.build_tree_node(
-                    *body_pred,
-                    &inst_args,
-                    depth,
-                    &opts,
-                    &mut nodes,
-                    &mut fresh,
-                    &mut global,
-                ) else {
+                let mut root_nodes: Vec<usize> = Vec::with_capacity(body_preds.len());
+                let mut derivables: Vec<ChcExpr> = Vec::with_capacity(body_preds.len());
+                let mut capped = false;
+                for (body_pred, body_args) in &body_preds {
+                    let inst_args: Vec<ChcExpr> = body_args
+                        .iter()
+                        .map(|a| a.substitute_name_map(&qsubst))
+                        .collect();
+                    match self.build_tree_node(
+                        *body_pred,
+                        &inst_args,
+                        depth,
+                        &opts,
+                        &mut nodes,
+                        &mut fresh,
+                        &mut global,
+                    ) {
+                        Some((node_id, derivable)) => {
+                            root_nodes.push(node_id);
+                            derivables.push(derivable);
+                        }
+                        None => {
+                            capped = true;
+                            break;
+                        }
+                    }
+                }
+                if capped {
                     // Node cap hit; deeper unfoldings are only larger.
                     break;
-                };
-                // formula = all node/clause implications + links (global) ∧ the
-                // query's body predicate is derivable ∧ the query constraint.
+                }
+                // formula = all node/clause implications + links (global) ∧ every
+                // query body predicate is derivable ∧ the query constraint.
                 let mut root_conj = global;
-                root_conj.push(root_derivable);
+                root_conj.extend(derivables);
                 if let Some(c) = &query.body.constraint {
                     root_conj.push(c.substitute_name_map(&qsubst));
                 }
@@ -12018,25 +12114,135 @@ impl BmcSolver {
                 };
 
                 let mut entries: Vec<DerivationWitnessEntry> = Vec::new();
-                if let Some(root_idx) =
-                    self.tree_reconstruct(root_node, &nodes, &model, &mut entries)
-                {
-                    Self::assign_derivation_levels(&mut entries, root_idx);
-                    let witness = DerivationWitness {
-                        query_clause: self.query_clause_index(query),
-                        root: root_idx,
-                        entries,
-                    };
-                    if let ChcEngineResult::Unsafe(cex) =
-                        self.verified_unsafe_from_witness(witness, "bounded tree refutation")
-                    {
-                        return ChcEngineResult::Unsafe(cex);
+                let mut query_roots: Vec<usize> = Vec::with_capacity(root_nodes.len());
+                let mut reconstructed = true;
+                for node_id in &root_nodes {
+                    match self.tree_reconstruct(*node_id, &nodes, &model, &mut entries) {
+                        Some(root_idx) => query_roots.push(root_idx),
+                        None => {
+                            reconstructed = false;
+                            break;
+                        }
                     }
-                    // Witness failed original-CHC replay at this depth: deepen.
                 }
+                if !reconstructed {
+                    continue;
+                }
+                let Some(&root) = query_roots.first() else {
+                    continue;
+                };
+                for &root_idx in &query_roots {
+                    Self::assign_derivation_levels(&mut entries, root_idx);
+                }
+                let level_witness = LevelDerivationWitness {
+                    witness: DerivationWitness {
+                        query_clause: self.query_clause_index(query),
+                        root,
+                        entries,
+                    },
+                    query_roots,
+                };
+                if let ChcEngineResult::Unsafe(cex) =
+                    self.tree_verified_unsafe(level_witness, &model, "bounded tree refutation")
+                {
+                    return ChcEngineResult::Unsafe(cex);
+                }
+                // Witness failed original-CHC replay at this depth: deepen.
             }
         }
         ChcEngineResult::Unknown
+    }
+
+    /// Promote a derivation-TREE witness to `Unsafe` only on evidence checked
+    /// against the ORIGINAL clauses.
+    ///
+    /// Two acceptance routes, both pre-existing standards:
+    ///
+    /// 1. Reshape the witness into a fully-ground [`GroundDerivation`] and run
+    ///    [`crate::ground_derivation::validate_ground_derivation`] on
+    ///    `self.problem`. That is pure ground evaluation of the original
+    ///    clauses — every constraint must evaluate to `true` and every body
+    ///    argument tuple must equal its premise's head tuple — and it is the
+    ///    same gate `bmc_sat_result` already promotes level-model witnesses
+    ///    through. It is also the only route that can accept a query joining
+    ///    SEVERAL premises, because premises are positionally aligned with the
+    ///    clause's body predicates, so two applications of one predicate stay
+    ///    distinct.
+    /// 2. Otherwise fall back to the SMT witness replay
+    ///    ([`Self::verified_unsafe_from_witness`]) — but only for a
+    ///    single-rooted witness, since that replay follows ONE premise chain
+    ///    and would be handed a partial picture of a multi-premise query
+    ///    (identical reasoning, and identical behaviour, to `bmc_sat_result`).
+    ///
+    /// Anything else is `Unknown`. `Safe` is never produced here.
+    fn tree_verified_unsafe(
+        &self,
+        level_witness: LevelDerivationWitness,
+        model: &FxHashMap<String, SmtValue>,
+        source: &str,
+    ) -> ChcEngineResult {
+        if crate::ground_derivation::ground_backtranslation_enabled() {
+            let _witness_budget =
+                crate::ground_derivation::witness::ScopedWitnessChainBudget::new();
+            let ground = self
+                .ground_derivation_from_witness_with(&level_witness, |query_clause| {
+                    Self::tree_query_clause_instances(query_clause, model)
+                })
+                .filter(|derivation| {
+                    crate::ground_derivation::validate_ground_derivation(&self.problem, derivation)
+                        .inspect_err(|err| {
+                            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                                "{source} derivation rejected on its own problem: {err}"
+                            ));
+                        })
+                        .is_ok()
+                });
+            if let Some(derivation) = ground {
+                let steps = self.steps_from_derivation_witness(&level_witness.witness);
+                let cex = Counterexample::with_witness(steps, level_witness.witness)
+                    .with_ground_derivation(derivation);
+                if self.config.base.verbose {
+                    safe_eprintln!(
+                        "BMC: {source} derivation ground-validated on its own clauses ({} steps); \
+                         Unsafe decided without SMT replay",
+                        cex.ground_derivation
+                            .as_ref()
+                            .map_or(0, crate::ground_derivation::GroundDerivation::len)
+                    );
+                }
+                return ChcEngineResult::Unsafe(cex);
+            }
+        }
+
+        if level_witness.query_roots.len() != 1 {
+            tracing::debug!(
+                "BMC: {source} produced a multi-body-predicate query witness that did not \
+                 ground-validate; returning Unknown rather than replaying a partial chain"
+            );
+            return ChcEngineResult::Unknown;
+        }
+        self.verified_unsafe_from_witness(level_witness.witness, source)
+    }
+
+    /// Read concrete values for every variable of a QUERY clause off a
+    /// derivation-TREE model.
+    ///
+    /// Mirrors [`Self::query_clause_instances`] for the tree encoding, whose
+    /// query variables are fresh-renamed to `__tree_q_{name}` before the
+    /// unfolding is built. A variable the model does not pin fails closed
+    /// (`None`): the derivation would not ground-evaluate anyway.
+    fn tree_query_clause_instances(
+        query: &HornClause,
+        model: &FxHashMap<String, SmtValue>,
+    ) -> Option<FxHashMap<String, SmtValue>> {
+        let mut instances = FxHashMap::default();
+        for var in query.body.vars() {
+            let renamed = ChcVar::new(format!("__tree_q_{}", var.name), var.sort.clone());
+            let value = crate::expr::evaluate::evaluate_expr(&ChcExpr::Var(renamed), model)
+                .and_then(|value| Self::model_smt_value_for_sort(&value, &var.sort))?;
+            instances.insert(var.name.clone(), value);
+        }
+        Some(instances)
     }
 
     /// Kill switch for the datatype-aware bounded BMC refutation lane

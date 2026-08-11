@@ -576,7 +576,9 @@ fn test_tactic_get_help() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
-        let help = Z3_tactic_get_help(ctx);
+        let tactic = Z3_mk_tactic(ctx, c"simplify".as_ptr());
+        assert!(!tactic.is_null());
+        let help = Z3_tactic_get_help(ctx, tactic);
         assert!(!help.is_null());
         let s = CStr::from_ptr(help).to_string_lossy();
         assert!(s.contains("elim-and"), "help should name elim-and: {s}");

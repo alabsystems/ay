@@ -1139,3 +1139,98 @@ fn nra_algebraic_division_and_cross_variable_compounds() {
     );
     assert!(validated, "model validation must run and confirm");
 }
+
+// ============================================================================
+// Mandatory UNSAT-certificate funnel end-to-end (#nra-cert)
+// ============================================================================
+//
+// Under the mandatory publication funnel every published `unsat` requires a
+// strict certificate; a published "unsat" below therefore PROVES the pure-NRA
+// theory lemma was classified (`NraIntervalUnsat`/`NraUnivariateUnsat`) and
+// accepted by the independent checker kernel. Before #nra-cert these
+// conflicts carried `TheoryLemmaKind::Generic` and the funnel demoted the
+// answer to `unknown`.
+
+/// Miniature Sturm-MBO shape: positive-orthant atoms plus an all-positive-
+/// coefficient polynomial equated to zero, published as unsat THROUGH the
+/// strict funnel via the interval certificate.
+#[test]
+fn nra_funnel_publishes_unsat_mini_mbo() {
+    let results = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-const h1 Real)
+(declare-const h2 Real)
+(declare-const j2 Real)
+(assert (and (> h1 0.0) (> h2 0.0) (> j2 0.0)
+             (= (+ (* 2.0 h1 h1 j2) (* 3.0 h2 j2 j2) (* h1 h2)) 0.0)))
+(check-sat)
+"#,
+    );
+    assert_eq!(
+        results,
+        vec!["unsat"],
+        "mini-mbo must publish certified unsat"
+    );
+}
+
+/// Miniature hong shape: sum of squares < 1 with product > 1.
+#[test]
+fn nra_funnel_publishes_unsat_mini_hong() {
+    let results = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-const x Real)
+(declare-const y Real)
+(declare-const z Real)
+(assert (< (+ (* x x) (* y y) (* z z)) 1.0))
+(assert (> (* x (* y z)) 1.0))
+(check-sat)
+"#,
+    );
+    assert_eq!(
+        results,
+        vec!["unsat"],
+        "mini-hong must publish certified unsat"
+    );
+}
+
+/// hong_1 itself: univariate x^2 < 1 against x > 1.
+#[test]
+fn nra_funnel_publishes_unsat_univariate_hong_one() {
+    let results = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-const x Real)
+(assert (< (* x x) 1.0))
+(assert (> x 1.0))
+(check-sat)
+"#,
+    );
+    assert_eq!(
+        results,
+        vec!["unsat"],
+        "hong_1 shape must publish certified unsat"
+    );
+}
+
+/// Negative guard: a SATISFIABLE univariate system (satisfiable only at the
+/// irrational sqrt(2)) must never be claimed unsat — the sqrt(2) trap at the
+/// solver level.
+#[test]
+fn nra_funnel_never_claims_satisfiable_univariate() {
+    let results = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-const x Real)
+(assert (= (* x x) 2.0))
+(assert (> x 0.0))
+(check-sat)
+"#,
+    );
+    assert_eq!(results.len(), 1);
+    assert_ne!(
+        results[0], "unsat",
+        "satisfiable-at-sqrt(2) system must NEVER publish unsat"
+    );
+}

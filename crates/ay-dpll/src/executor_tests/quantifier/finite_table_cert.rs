@@ -43,6 +43,42 @@ fn finite_table_cert_grants_table_plus_default() {
     assert_eq!(verdict, "sat");
 }
 
+/// The certificate's proof object is the TOTAL table-plus-default
+/// interpretation. The public model and evaluator must retain both halves,
+/// including the default at a point absent from the ground snapshot.
+#[test]
+fn finite_table_cert_publishes_exact_table_plus_default_model() {
+    let commands = parse(
+        r#"
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (assert (forall ((x Int)) (>= (f x) 0)))
+        (assert (= (f 3) 5))
+        (check-sat)
+        (get-model)
+        (get-value ((f 3) (f 99)))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs[0], "sat");
+    assert!(
+        exec.finite_table_cert_grant_active,
+        "the CAP-1 certificate must own this quantified SAT"
+    );
+    assert!(
+        outputs[1].contains("(define-fun f ((x0 Int)) Int"),
+        "the certified function must be printable: {}",
+        outputs[1]
+    );
+    assert_eq!(
+        outputs[2], "(((f 3) 5) ((f 99) 0))",
+        "listed and default points must agree with the certified interpretation"
+    );
+}
+
 /// Two table symbols in one body: residual needs the JOINT default vector
 /// (d_f + d_g >= 0).
 #[test]

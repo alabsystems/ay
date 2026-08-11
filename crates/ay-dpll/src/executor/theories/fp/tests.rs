@@ -1233,6 +1233,48 @@ fn to_fp_unsigned_variable_one() {
     );
 }
 
+// The only bitvectors on which `to_fp` and `to_fp_unsigned` DIFFER are the
+// ones with the sign bit set: every smaller value reads the same either way,
+// so a suite built from 0 and 1 cannot tell the two operators apart. `#xffffffff`
+// is -1 signed and 4294967295 unsigned, which rounds to 2^32 = 0x4f800000.
+// z3 agrees on both conjuncts.
+#[test]
+#[timeout(30_000)]
+fn to_fp_signed_and_unsigned_differ_on_a_negative_bitvector() {
+    let results = run_script(
+        r#"
+(set-logic QF_BVFP)
+(declare-const x (_ BitVec 32))
+(assert (= x #xffffffff))
+(assert (fp.eq ((_ to_fp_unsigned 8 24) RNE x) ((_ to_fp 8 24) #x4f800000)))
+(assert (fp.eq ((_ to_fp 8 24) RNE x) ((_ to_fp 8 24) #xbf800000)))
+(check-sat)
+"#,
+    );
+    assert_eq!(
+        results,
+        vec!["sat"],
+        "signed reads -1.0f, unsigned reads 2^32; z3 = sat"
+    );
+}
+
+// ... and the two readings are not interchangeable: asserting they agree on
+// that same bitvector is UNSAT. z3 = unsat.
+#[test]
+#[timeout(30_000)]
+fn to_fp_signed_and_unsigned_are_not_interchangeable() {
+    let results = run_script(
+        r#"
+(set-logic QF_BVFP)
+(declare-const x (_ BitVec 32))
+(assert (= x #xffffffff))
+(assert (fp.eq ((_ to_fp_unsigned 8 24) RNE x) ((_ to_fp 8 24) RNE x)))
+(check-sat)
+"#,
+    );
+    assert_eq!(results, vec!["unsat"]);
+}
+
 // Variable unsigned BV-to-FP: x = 0, should yield +0.0
 #[test]
 #[timeout(30_000)]
@@ -1453,6 +1495,69 @@ fn fp_to_real_nan_can_match_real_constant() {
 "#,
     );
     assert_eq!(results, vec!["sat"]);
+}
+
+// END-TO-END SOUNDNESS CANARY for the test above. `fp.to_real` at a NaN is
+// SMT-LIB-free, but it is still a FUNCTION of the denoted element, and a
+// `(_ FloatingPoint 8 24)` has exactly ONE NaN element — so two NaNs cannot
+// carry two different reals. z3 says `unsat`.
+//
+// This shares every mechanism with `fp_to_real_nan_can_match_real_constant`
+// (the model gate resolves an SMT-LIB-free application from its asserted
+// definition), and is the case that mechanism would get WRONG if it adopted
+// each assertion's claim independently instead of keying by argument value.
+// The names differ from `fp_to_real_equal_inputs_share_undefined_value` below
+// in the load-bearing way: there is NO asserted `(= x y)` here, so congruence
+// has to come from the two NaNs evaluating to the same element.
+#[test]
+#[timeout(60_000)]
+fn fp_to_real_two_nans_cannot_carry_two_reals() {
+    let results = run_script(
+        r#"
+(set-logic QF_FPLRA)
+(declare-const x (_ FloatingPoint 8 24))
+(declare-const y (_ FloatingPoint 8 24))
+(assert (fp.isNaN x))
+(assert (fp.isNaN y))
+(assert (= (fp.to_real x) 5.0))
+(assert (= (fp.to_real y) 6.0))
+(check-sat)
+"#,
+    );
+    // One-sided on purpose, and this is the side that matters: `sat` is the
+    // WRONG answer and the only one this canary exists to catch. AY's FP
+    // refinement loop legitimately reports `unknown` when binade blocking
+    // exhausts the search space (see the congruence test below), so demanding
+    // `unsat` would pin solver completeness rather than the gate's soundness.
+    assert_ne!(
+        results,
+        vec!["sat"],
+        "two NaNs denote ONE element; two fp.to_real values for it is UNSAT",
+    );
+}
+
+// END-TO-END SOUNDNESS CANARY: at a FINITE operand `fp.to_real` is determined,
+// so an asserted value that disagrees must be refuted, never adopted. z3 says
+// `unsat`. This is the hazard that kept theory heads out of the gate's
+// definition fallback; the widening is confined to operands the FP evaluator
+// has positively established are NaN or infinite, and this pins that.
+#[test]
+#[timeout(60_000)]
+fn fp_to_real_finite_operand_rejects_disagreeing_assertion() {
+    let results = run_script(
+        r#"
+(set-logic QF_FPLRA)
+(declare-const x (_ FloatingPoint 8 24))
+(assert (= x ((_ to_fp 8 24) RNE 1.0)))
+(assert (= (fp.to_real x) 5.0))
+(check-sat)
+"#,
+    );
+    assert_ne!(
+        results,
+        vec!["sat"],
+        "fp.to_real(1.0) is 1, not 5; the assertion must be refuted",
+    );
 }
 
 // Equal FP inputs must produce equal fp.to_real outputs, even for NaN.

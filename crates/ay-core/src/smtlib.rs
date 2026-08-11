@@ -18,8 +18,8 @@
 /// - The symbol is a reserved word (`true`, `false`, keywords, etc.)
 /// - The symbol contains characters not allowed in simple symbols
 ///
-/// SMT-LIB quoted symbols cannot contain `|` or `\`. These characters are
-/// sanitized to `_` before quoting to ensure valid output (#1841).
+/// Z3 5.0.0 extends quoted symbols with backslash escapes for `|` and `\`.
+/// AY emits those lossless spellings instead of changing symbol identity.
 ///
 /// # Examples
 /// ```
@@ -33,9 +33,8 @@
 /// assert_eq!(quote_symbol("foo::bar"), "|foo::bar|");
 /// assert_eq!(quote_symbol("true"), "|true|");
 /// assert_eq!(quote_symbol("false"), "|false|");
-/// // Characters invalid in quoted symbols are sanitized
-/// assert_eq!(quote_symbol("a|b"), "|a_b|");
-/// assert_eq!(quote_symbol(r"a\b"), "|a_b|");
+/// assert_eq!(quote_symbol("a|b"), r"|a\|b|");
+/// assert_eq!(quote_symbol(r"a\b"), r"|a\\b|");
 /// ```
 pub fn quote_symbol(name: &str) -> String {
     // Reserved words in SMT-LIB that need quoting
@@ -70,6 +69,7 @@ pub fn quote_symbol(name: &str) -> String {
         "declare-datatypes",
         "declare-fun",
         "declare-sort",
+        "declare-sort-parameter",
         "define-fun",
         "define-fun-rec",
         "define-funs-rec",
@@ -100,13 +100,18 @@ pub fn quote_symbol(name: &str) -> String {
         || name.contains(|c: char| !is_symbol_char(c));
 
     if needs_quoting {
-        // SMT-LIB quoted symbols cannot contain '|' or '\' (#1841).
-        // Sanitize these characters to '_' before quoting.
-        let sanitized: String = name
-            .chars()
-            .map(|c| if c == '|' || c == '\\' { '_' } else { c })
-            .collect();
-        format!("|{sanitized}|")
+        // Z3 5.0.0 accepts `\|` and `\\` inside quoted symbols. Escaping is
+        // lossless; underscore substitution conflates distinct user symbols.
+        let mut quoted = String::with_capacity(name.len() + 2);
+        quoted.push('|');
+        for character in name.chars() {
+            if matches!(character, '|' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(character);
+        }
+        quoted.push('|');
+        quoted
     } else {
         name.to_string()
     }

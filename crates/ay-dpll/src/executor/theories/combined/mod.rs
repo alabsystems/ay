@@ -2846,11 +2846,50 @@ impl Executor {
                 .is_some_and(|dividend| dividend == lhs)
     }
 
-    fn zero_mod_dividend(&self, term: TermId, zero_terms: &HashSet<TermId>) -> Option<TermId> {
-        let TermData::App(sym, args) = self.ctx.terms.get(term) else {
-            return None;
-        };
-        (sym.name() == "mod" && args.len() == 2 && zero_terms.contains(&args[1])).then(|| args[0])
+    /// UNSOUND AS ORIGINALLY WRITTEN — kept only as a tombstone.
+    ///
+    /// This returned `Some(dividend)` for `(mod dividend d)` whenever `d` was
+    /// known to be zero, i.e. it asserted the identity
+    ///
+    /// ```text
+    /// (mod a 0) == a
+    /// ```
+    ///
+    /// **That identity does not hold in SMT-LIB.** `(mod a 0)` is
+    /// UNCONSTRAINED — it may take ANY integer value — which AY's own `mk_mod`
+    /// documents and deliberately protects (`#div0-soundness`, it refuses to
+    /// fold `x mod x`, `0 mod x` or a constant `mod` when the divisor may be 0).
+    /// This function contradicted that.
+    ///
+    /// The consequence was a WRONG UNSAT, reached through
+    /// `assertions_have_quantifier_consumer_restore_zero_divisor_contradiction`, which
+    /// returns `SolveResult::unsat()` OUTRIGHT when a positive
+    /// `v = restore(s, i)` meets a negative `v != restore(s, j)` and this
+    /// function claimed `i` and `j` were equal. Reproducer (z3 4.15.4 answers
+    /// `sat` and prints a witness):
+    ///
+    /// ```text
+    /// (assert (not (= list_current (__seq_index_restore_List view dividend))))
+    /// (assert (= list_current (__seq_index_restore_List view (mod dividend divisor))))
+    /// (assert (or (= 0 p48) (= 0 divisor) ...))
+    /// ```
+    ///
+    /// z3's model takes `divisor = 0`, `dividend = -1`, `mod(-1,0) = 0`, and
+    /// `restore(view,-1) = (cons 5 nil)` while `restore(view,0) = nil`. The two
+    /// restore calls have DIFFERENT indices, so there is no contradiction — the
+    /// detector manufactured one.
+    ///
+    /// It was invisible because the pinning test asserted `expect_not_sat`,
+    /// which ACCEPTS `unsat`: a one-sided assertion cannot catch a wrong answer
+    /// on the side it permits.
+    ///
+    /// There is no repair. Two restore indices are equal only if their VALUES
+    /// are equal, and `(mod a 0)` has no determined value, so no syntactic test
+    /// can establish it. Returning `None` unconditionally makes the detector
+    /// inert on this shape; a genuine contradiction with a non-zero divisor is
+    /// still found by the ordinary solver path.
+    fn zero_mod_dividend(&self, _term: TermId, _zero_terms: &HashSet<TermId>) -> Option<TermId> {
+        None
     }
 
     fn check_int_div_mod_divisors_supported(
@@ -3731,6 +3770,39 @@ impl Executor {
             self.quantifier_consumer_ground_assertion_supported_by_completion(assertion)
         });
         if features.has_int_div_mod {
+            // #symbolic-mod-uf-empty-model — never claim a SYMBOLIC-divisor
+            // window.
+            //
+            // The `Sat` below is granted on this function's admission
+            // certificate: `quantifier_consumer_ground_assertion_supported_by_completion`
+            // says model completion is FREE to choose values for the
+            // completable UF applications. It then installs a Model with EVERY
+            // field empty and never performs that completion. For a
+            // CONSTANT-divisor window the certificate is discharged downstream;
+            // for a symbolic divisor nothing can discharge it, because
+            // `preprocess_auflia_*` runs only
+            // `eliminate_int_mod_div_by_constant` and no solver ever runs on
+            // this route (measured on `(= (f k2) (mod (g k2) d))`:
+            // `:decisions 0`, `:num-vars 0`, term count 8 in and 8 out).
+            //
+            // So the certificate is unbacked and only the mandatory independent
+            // gate stood between it and a published wrong answer — the
+            // #quantifier_consumer-arith hazard `mbqi.rs` already names. Declining lets the
+            // window fall through to the honest `unsupported arithmetic` bail,
+            // where the NIA re-route can decide it for real.
+            //
+            // Tested on `preprocessed_assertions`, NOT `self.ctx.assertions`: a
+            // divisor that is symbolic in the source but constant-folds during
+            // preprocessing (`(= n 8)` … `(mod (g k) n)`) is eliminated here and
+            // must keep its current decision. Reading the pre-preprocessing
+            // window instead cost a sibling attempt a measured 3/3 `unsat` ->
+            // `unknown` regression on exactly that idiom.
+            if crate::executor::mod_div_elim::contains_symbolic_int_mod_div(
+                &self.ctx.terms,
+                &preprocessed_assertions,
+            ) {
+                return Ok(None);
+            }
             if features.has_seq_ops
                 || !all_assertions_supported
                 || self.has_forced_concrete_quantifier_consumer_mod_contradiction()
@@ -5144,6 +5216,22 @@ impl Executor {
                 // when in doubt we do NOT promote. The guard scans ALL BitVec
                 // occurrences across ALL roots (DAG walk, visited-bounded).
                 if all_bitvec_vars_are_bridge_only(&self.ctx.terms, &roots) {
+                    // WITNESS MATERIALIZATION FIRST (#9065 follow-up). Validating
+                    // against the OPAQUE `bv2nat(k)` LIA value is enough to know
+                    // the query is satisfiable, but it leaves `k` itself unpinned
+                    // in the published model. Downstream the independent model
+                    // gate re-evaluates `(= L (bv2nat k))` from the emitted
+                    // assignment, where `k` has been completed to a default (0)
+                    // that contradicts the pinned `L` — so a correct `sat` was
+                    // being thrown away as `unknown`. Materialize every BV leaf
+                    // from its companion (`k = int2bv_W(bv2nat(k))`) so the model
+                    // we publish carries the realizing witness, exactly the
+                    // `int2bv_w(v)` the bridge-only guard argues exists. Only a
+                    // model that passes `validate_model` promotes, so this can
+                    // only turn a MISSED sat into a checked sat.
+                    if self.bridge_sat_materialize_and_validate(&roots) {
+                        return Ok(SolveResult::Sat);
+                    }
                     if self.bridge_sat_model_validates(&roots) {
                         return Ok(SolveResult::Sat);
                     }
@@ -6562,6 +6650,7 @@ impl Executor {
         let saved_last_proof_rebuild_originals =
             std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
 
         // Give solve_nia the folded window without ever promoting folded terms
         // to authored premises. Unchanged originals retain their identity;
@@ -6611,6 +6700,7 @@ impl Executor {
                 self.proof_check_ok = false;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
+                self.ematching_proof_records = saved_ematching_proof_records;
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
                 // Mark this UNSAT as the trust-free array-free-residue reduction
                 // so the nested-array quarantine boundary accepts it.
@@ -6638,6 +6728,7 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
+                self.ematching_proof_records = saved_ematching_proof_records;
                 Ok(None)
             }
             Err(err) => {
@@ -6660,9 +6751,260 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
+                self.ematching_proof_records = saved_ematching_proof_records;
                 Err(err)
             }
         }
+    }
+
+    /// Whether `term` is AY's set-cardinality bridge axiom, `(<= 0 (set.card s))`.
+    ///
+    /// Recognized EXACTLY, mirroring the strict checker's schema
+    /// (`ay_proof::checker::set_axiom`): the bound must be the literal `0` on the
+    /// left and the bounded term a unary `set.card`. A looser match here would
+    /// promote some other injected assertion into a certified lemma, which is a
+    /// forging surface -- `(<= 5 (set.card s))` is false for the empty set.
+    /// Whether `term` is the membership cardinality lower bound,
+    /// `(ite (member x s) (<= 1 (set.card s)) (<= 0 (set.card s)))`.
+    ///
+    /// Mirrors the strict checker's schema exactly, including the identity of
+    /// the set under the membership test and under both cardinality bounds --
+    /// without it this would licence `x in s => |t| >= 1` for an unrelated `t`.
+    pub(in crate::executor) fn is_set_card_member_lower_bound_axiom(
+        terms: &ay_core::TermStore,
+        term: TermId,
+    ) -> bool {
+        use ay_core::{Constant, TermData};
+
+        fn membership_set(terms: &ay_core::TermStore, term: TermId) -> Option<TermId> {
+            let TermData::App(operator, args) = terms.get(term) else {
+                return None;
+            };
+            match (operator.name(), args.len()) {
+                ("select", 2) => Some(args[0]),
+                ("set.member", 2) => Some(args[1]),
+                _ => None,
+            }
+        }
+
+        fn card_bounded_by(terms: &ay_core::TermStore, term: TermId, bound: i64) -> Option<TermId> {
+            let TermData::App(comparison, comparison_args) = terms.get(term) else {
+                return None;
+            };
+            if comparison.name() != "<=" || comparison_args.len() != 2 {
+                return None;
+            }
+            match terms.get(comparison_args[0]) {
+                TermData::Const(Constant::Int(value)) if *value == bound.into() => {}
+                _ => return None,
+            }
+            let TermData::App(operator, operator_args) = terms.get(comparison_args[1]) else {
+                return None;
+            };
+            (operator.name() == "set.card" && operator_args.len() == 1).then(|| operator_args[0])
+        }
+
+        let TermData::Ite(condition, then_branch, else_branch) = terms.get(term) else {
+            return false;
+        };
+        let (Some(tested), Some(when_member), Some(otherwise)) = (
+            membership_set(terms, *condition),
+            card_bounded_by(terms, *then_branch, 1),
+            card_bounded_by(terms, *else_branch, 0),
+        ) else {
+            return false;
+        };
+        tested == when_member && tested == otherwise
+    }
+
+    /// Whether `term` is `(= (set.card e) 0)` for a SYNTACTICALLY empty `e`.
+    ///
+    /// Mirrors the strict checker's schema, including that a `const-array`
+    /// fill must be `false`: a `true` fill is the UNIVERSAL set, whose
+    /// cardinality is the index sort's size.
+    pub(in crate::executor) fn is_set_card_empty_axiom(
+        terms: &ay_core::TermStore,
+        term: TermId,
+    ) -> bool {
+        use ay_core::{Constant, TermData};
+
+        fn syntactically_empty(terms: &ay_core::TermStore, term: TermId) -> bool {
+            let TermData::App(operator, args) = terms.get(term) else {
+                return false;
+            };
+            match operator.name() {
+                "set.empty" => args.is_empty(),
+                "const-array" => matches!(
+                    args.as_slice(),
+                    [fill] if matches!(terms.get(*fill), TermData::Const(Constant::Bool(false)))
+                ),
+                _ => false,
+            }
+        }
+
+        let TermData::App(equality, equality_args) = terms.get(term) else {
+            return false;
+        };
+        if equality.name() != "=" || equality_args.len() != 2 {
+            return false;
+        }
+        if !matches!(
+            terms.get(equality_args[1]),
+            TermData::Const(Constant::Int(value)) if *value == 0.into()
+        ) {
+            return false;
+        }
+        let TermData::App(operator, operator_args) = terms.get(equality_args[0]) else {
+            return false;
+        };
+        operator.name() == "set.card"
+            && operator_args.len() == 1
+            && syntactically_empty(terms, operator_args[0])
+    }
+
+    /// Whether `term` is the counted-membership cardinality bound: an `ite`
+    /// tree over membership tests whose leaves bound `set.card` below by the
+    /// number of memberships holding on the path.
+    ///
+    /// Mirrors the strict checker's schema, INCLUDING that every index be a
+    /// distinct integer literal -- two variable indices could denote the same
+    /// element, so counting them separately would licence a bound the set does
+    /// not have.
+    pub(in crate::executor) fn is_set_card_member_count_axiom(
+        terms: &ay_core::TermStore,
+        term: TermId,
+    ) -> bool {
+        use ay_core::{Constant, TermData};
+
+        fn member_index(terms: &ay_core::TermStore, term: TermId) -> Option<(TermId, TermId)> {
+            let TermData::App(operator, args) = terms.get(term) else {
+                return None;
+            };
+            match (operator.name(), args.len()) {
+                ("select", 2) => Some((args[0], args[1])),
+                ("set.member", 2) => Some((args[1], args[0])),
+                _ => None,
+            }
+        }
+
+        fn leaf_bound(terms: &ay_core::TermStore, term: TermId, count: usize) -> Option<TermId> {
+            let TermData::App(comparison, comparison_args) = terms.get(term) else {
+                return None;
+            };
+            if comparison.name() != "<=" || comparison_args.len() != 2 {
+                return None;
+            }
+            if !matches!(
+                terms.get(comparison_args[0]),
+                TermData::Const(Constant::Int(v)) if *v == count.into()
+            ) {
+                return None;
+            }
+            let TermData::App(operator, operator_args) = terms.get(comparison_args[1]) else {
+                return None;
+            };
+            (operator.name() == "set.card" && operator_args.len() == 1)
+                .then_some(comparison_args[1])
+        }
+
+        fn walk(
+            terms: &ay_core::TermStore,
+            node: TermId,
+            set: TermId,
+            card: &mut Option<TermId>,
+            path: &mut Vec<num_bigint::BigInt>,
+        ) -> bool {
+            let TermData::Ite(condition, then_branch, else_branch) = terms.get(node) else {
+                let Some(bounded) = leaf_bound(terms, node, path.len()) else {
+                    return false;
+                };
+                return *card.get_or_insert(bounded) == bounded;
+            };
+            let Some((tested, index)) = member_index(terms, *condition) else {
+                return false;
+            };
+            if tested != set {
+                return false;
+            }
+            let TermData::Const(Constant::Int(value)) = terms.get(index) else {
+                return false;
+            };
+            if path.contains(value) {
+                return false;
+            }
+            path.push(value.clone());
+            let then_ok = walk(terms, *then_branch, set, card, path);
+            path.pop();
+            then_ok && walk(terms, *else_branch, set, card, path)
+        }
+
+        let TermData::Ite(condition, ..) = terms.get(term) else {
+            return false;
+        };
+        let Some((set, _)) = member_index(terms, *condition) else {
+            return false;
+        };
+        let mut card = None;
+        let mut path = Vec::new();
+        walk(terms, term, set, &mut card, &mut path)
+            && card.is_some_and(|c| {
+                matches!(terms.get(c), TermData::App(op, a)
+                    if op.name() == "set.card" && a.len() == 1 && a[0] == set)
+            })
+    }
+
+    /// Whether `term` is `(= (set.card s) 0)` for ANY set term `s`.
+    ///
+    /// Deliberately shape-only. Whether the problem actually forces `s` empty
+    /// is the CHECKER's business, decided against a registry built from the
+    /// problem's top-level asserted equalities; classifying here merely routes
+    /// the step to that check instead of leaving it an unexaminable `Trust`.
+    pub(in crate::executor) fn is_set_card_zero_axiom(
+        terms: &ay_core::TermStore,
+        term: TermId,
+    ) -> bool {
+        use ay_core::{Constant, TermData};
+
+        let TermData::App(equality, equality_args) = terms.get(term) else {
+            return false;
+        };
+        if equality.name() != "=" || equality_args.len() != 2 {
+            return false;
+        }
+        if !matches!(
+            terms.get(equality_args[1]),
+            TermData::Const(Constant::Int(value)) if *value == 0.into()
+        ) {
+            return false;
+        }
+        matches!(
+            terms.get(equality_args[0]),
+            TermData::App(operator, args) if operator.name() == "set.card" && args.len() == 1
+        )
+    }
+
+    pub(in crate::executor) fn is_set_card_non_negative_axiom(
+        terms: &ay_core::TermStore,
+        term: TermId,
+    ) -> bool {
+        use ay_core::{Constant, Symbol, TermData};
+
+        let TermData::App(Symbol::Named(comparison), comparison_args) = terms.get(term) else {
+            return false;
+        };
+        if comparison != "<=" || comparison_args.len() != 2 {
+            return false;
+        }
+        let (bound, cardinality) = (comparison_args[0], comparison_args[1]);
+        if !matches!(terms.get(bound), TermData::Const(Constant::Int(value)) if *value == 0.into())
+        {
+            return false;
+        }
+        matches!(
+            terms.get(cardinality),
+            TermData::App(Symbol::Named(operator), operator_args)
+                if operator == "set.card" && operator_args.len() == 1
+        )
     }
 
     /// Re-scope a store-flat auxiliary refutation to the caller's authored
@@ -6681,6 +7023,25 @@ impl Executor {
 
         for step in &mut proof.steps {
             match step {
+                // A solver-injected bridge axiom is not an authored premise, so
+                // it cannot stay an `Assume` -- but when its schema is
+                // independently checkable it need not become a `hole` either.
+                // `(<= 0 (set.card s))` holds for every set, and demoting it
+                // left EVERY `set.card` refutation externally uncheckable
+                // although the rest of the proof (`la_generic`, `ite_pos2`,
+                // resolution) already checked.
+                ProofStep::Assume(term)
+                    if !problem_set.contains(term)
+                        && Self::is_set_card_non_negative_axiom(&self.ctx.terms, *term) =>
+                {
+                    *step = ProofStep::TheoryLemma {
+                        theory: "sets".to_string(),
+                        clause: vec![*term],
+                        farkas: None,
+                        kind: TheoryLemmaKind::SetCardNonNegative,
+                        lia: None,
+                    };
+                }
                 ProofStep::Assume(term) if !problem_set.contains(term) => {
                     *step = ProofStep::Step {
                         rule: AletheRule::Hole,
@@ -6834,6 +7195,72 @@ impl Executor {
             }
             if let Some(result) = self.try_sat_via_quantifier_consumer_completion_preprocess()? {
                 return Ok(result);
+            }
+            // #symbolic-mod-uf-empty-model — LAST RESORT, on the bail only.
+            //
+            // Everything above has declined and the next statement publishes
+            // `unknown (unsupported arithmetic)`. A symbolic-divisor window is
+            // decidable, just not on this route: `preprocess_auflia_*` runs only
+            // `eliminate_int_mod_div_by_constant`, whereas `solve_uf_nia` runs
+            // `eliminate_int_mod_div` with `symbolic_divisors = true` — the
+            // guarded Euclidean axioms, exact SMT-LIB with `d = 0` left
+            // unconstrained — and extracts a real EUF+LIA model. `solve_uf_lia`
+            // already routes this case to NIA; AUFLIA simply lacked the branch.
+            // Measured on the byte-identical formula under `(set-logic
+            // QF_UFNIA)`: `sat` with full `f`/`g` interpretations and
+            // `:model_check_gate.result "confirmed-sat"`.
+            //
+            // PLACED HERE, AFTER EVERY RUNG, ON PURPOSE. Re-routing earlier
+            // pre-empts `try_unsat_via_mod_free_subset`, which is what refutes
+            // `(> d 0) /\ (= (f k2) (mod (g k2) d)) /\ (>= (f k2) d)` by
+            // injecting the remainder bound axioms. Losing that would turn a
+            // correct `unsat` into a `sat` — a wrong answer, not a slower one.
+            // Reaching this point means the alternative is `unknown`, so the
+            // only verdicts at risk are ones nothing else could produce.
+            //
+            // THEORY GUARD IS LOAD-BEARING. `solve_uf_nia` carries EUF+NIA and
+            // NOTHING else, while `solve_auf_lia` is reachable with arrays,
+            // reals, BV, strings, Seq and FP. Handing it any of those would let
+            // them be abstracted to opaque literals — a wrong-SAT mechanism. So
+            // the guard is `has_only_uf_lia_theories` in every dimension EXCEPT
+            // the div/mod flag that sent us here; `!has_arrays` alone is not
+            // enough (a sibling attempt guarded that way and its probe fired
+            // with `strings` and `bv` live).
+            //
+            // SAT ONLY. An `unsat` from this lane would be a NEW refutation
+            // resting on the symbolic division axioms; that deserves its own
+            // measured campaign, so it falls through to today's `unknown`.
+            // The `Sat` still faces the unmodified mandatory gate.
+            let nia_routable = !post_preprocess_features.has_arrays
+                && !post_preprocess_features.has_real
+                && !post_preprocess_features.has_bv
+                && !post_preprocess_features.has_strings
+                && !post_preprocess_features.has_seq_ops
+                && !post_preprocess_features.has_fpa
+                && !original_features.has_arrays;
+            if nia_routable
+                && self.mod_div_or_branch_rescue_depth == 0
+                && crate::executor::mod_div_elim::contains_symbolic_int_mod_div(
+                    &self.ctx.terms,
+                    &preprocessed_assertions,
+                )
+            {
+                let saved_assertions = self.ctx.assertions.clone();
+                let saved_model = self.last_model.clone();
+                let saved_model_validated = self.last_model_validated;
+                let saved_unknown_reason = self.last_unknown_reason;
+                let saved_result = self.last_result.clone();
+                self.mod_div_or_branch_rescue_depth += 1;
+                let nia = self.solve_uf_nia();
+                self.mod_div_or_branch_rescue_depth -= 1;
+                if matches!(nia, Ok(ref r) if r.is_sat()) {
+                    return Ok(SolveResult::Sat);
+                }
+                self.ctx.assertions = saved_assertions;
+                self.last_model = saved_model;
+                self.last_model_validated = saved_model_validated;
+                self.last_unknown_reason = saved_unknown_reason;
+                self.last_result = saved_result;
             }
             self.record_arithmetic_unsupported_fragment_diagnostics();
             self.last_unknown_reason = Some(UnknownReason::UnsupportedArithmetic);

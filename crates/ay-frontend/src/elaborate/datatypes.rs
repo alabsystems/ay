@@ -203,6 +203,11 @@ impl Context {
                     term: ctor_term,
                     sort: dt_sort.clone(),
                     arg_sorts: selector_sorts.clone(),
+                    public_sort: super::PublicSort::from_engine(&dt_sort),
+                    public_arg_sorts: selector_sorts
+                        .iter()
+                        .map(super::PublicSort::from_engine)
+                        .collect(),
                     internal_name: mctor.clone(),
                 },
             );
@@ -220,6 +225,8 @@ impl Context {
                         term: None,
                         sort: sel_sort.clone(),
                         arg_sorts: vec![dt_sort.clone()],
+                        public_sort: super::PublicSort::from_engine(sel_sort),
+                        public_arg_sorts: vec![super::PublicSort::from_engine(&dt_sort)],
                         internal_name: instance.map(|_| sel_internal.clone()),
                     },
                 );
@@ -233,6 +240,8 @@ impl Context {
                     term: None,
                     sort: Sort::Bool,
                     arg_sorts: vec![dt_sort.clone()],
+                    public_sort: super::PublicSort::Core(Sort::Bool),
+                    public_arg_sorts: vec![super::PublicSort::from_engine(&dt_sort)],
                     internal_name: instance.map(|_| format!("is-{ctor_internal}")),
                 },
             );
@@ -318,6 +327,7 @@ impl Context {
             || self.parametric_sort_defs.contains_key(name)
             || self.datatypes.contains_key(name)
             || self.parametric_datatypes.contains_key(name)
+            || self.sort_parameters.contains(name)
         {
             return Err(ElaborateError::SortRedeclaration(name.to_string()));
         }
@@ -344,12 +354,28 @@ impl Context {
         Ok(())
     }
 
+    fn reject_finite_set_datatype_fields(&self, dec: &command::DatatypeDec) -> Result<()> {
+        if let Some(selector) = dec
+            .constructors
+            .iter()
+            .flat_map(|constructor| constructor.selectors.iter())
+            .find(|selector| self.parsed_sort_contains_finite_set(&selector.sort))
+        {
+            return Err(ElaborateError::Unsupported(format!(
+                "datatype selector '{}' has a FiniteSet-bearing sort; datatype member public sort identity is not representable",
+                selector.name
+            )));
+        }
+        Ok(())
+    }
+
     /// Build the narrow context needed to preflight selector sorts. This copies
     /// only sort aliases/templates, not the term store, assertions, symbols, or
     /// scopes that dominate a live solver context.
     pub(super) fn datatype_sort_preflight_context(&self) -> Self {
         let mut context = Self::new();
         context.sort_defs = self.sort_defs.clone();
+        context.public_sort_defs = self.public_sort_defs.clone();
         context.parametric_sort_defs = self.parametric_sort_defs.clone();
         context.parametric_datatypes = self.parametric_datatypes.clone();
         // The scratch context must accept exactly what the LIVE one will, or it
@@ -359,6 +385,7 @@ impl Context {
         // `elaborate_sort_dispatch`); without this the preflight would reject
         // every embedder datatype over such a sort.
         context.native_global_declaration = self.native_global_declaration;
+        context.finite_set_typing_mode = self.finite_set_typing_mode;
         context
     }
 
@@ -380,6 +407,7 @@ impl Context {
     ) -> Result<()> {
         // Validate datatype name and all constructor/selector names
         Self::validate_datatype_names(Some(name), datatype_dec)?;
+        self.reject_finite_set_datatype_fields(datatype_dec)?;
         // IDEMPOTENT re-declaration: adopt an EXACTLY-identical datatype
         // re-declaration as a no-op, mirroring `try_declare_fun`'s adopt-identical
         // embedder contract (an embedder that sets up its datatypes once and then
@@ -502,6 +530,7 @@ impl Context {
         }
         for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
             Self::validate_datatype_names(None, datatype_dec)?;
+            self.reject_finite_set_datatype_fields(datatype_dec)?;
             if sort_dec.arity == 0 && !datatype_dec.type_params.is_empty() {
                 return Err(ElaborateError::Unsupported(format!(
                     "datatype '{}' declares type parameters but arity 0",

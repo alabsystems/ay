@@ -122,6 +122,31 @@ impl fmt::Display for TermId {
     }
 }
 
+/// What a Skolem CONSTANT minted for a single-binder quantifier denotes: the
+/// Hilbert choice term `(choice ((binder sort)) body)`.
+///
+/// Skolemization replaces `∃x. B` by `B[x := sk]`. Read as "sk is some fresh
+/// constant" that is only equisatisfiable, and an external proof checker is
+/// right to reject it: nothing licenses a fresh constant satisfying `B`. Read
+/// as "sk is `εx. B`" it is an EQUIVALENCE — `∃x. B ⟺ B[x := εx. B]` is the
+/// epsilon axiom — which is why Alethe's `sko_ex`/`sko_forall` rules are stated
+/// over `choice` terms. The same holds for the negative universal case
+/// (`¬∀x. B ≡ ∃x. ¬B`), where `body` is the already-negated body.
+///
+/// `body` is captured at the substitution site with every OUTER Skolem already
+/// substituted in, so a witness minted later can mention one minted earlier and
+/// the pair is renderable in mint (i.e. `TermId`) order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkolemChoice {
+    /// Bound variable of the source quantifier (the `choice` binder).
+    pub binder: String,
+    /// Sort of the bound variable — also the witness's own sort.
+    pub sort: Sort,
+    /// `choice` body: the quantifier body this witness was chosen to satisfy,
+    /// still mentioning `binder` free.
+    pub body: TermId,
+}
+
 /// Internal term representation with pre-computed hash
 #[derive(Debug, Clone)]
 struct TermEntry {
@@ -380,6 +405,16 @@ pub struct TermStore {
     /// is append-only for the TermStore lifetime (push/pop and repeated
     /// `process_quantifiers` runs only ever ADD freshly-named symbols).
     skolem_symbols: crate::kani_compat::KaniHashSet<String>,
+    /// Hilbert-choice provenance of a Skolem CONSTANT, keyed by its witness
+    /// `TermId`. See [`SkolemChoice`]. Recorded at the single creation site
+    /// (`skolemize_quantifier_body`) so the value is what the substitution
+    /// actually used, not a name-derived reconstruction. Consumed ONLY by the
+    /// Alethe printer, which DEFINES `sk!x` as the `choice` term it denotes.
+    /// A `(declare-fun ...)` is not an option: an Alethe proof document admits
+    /// no declaration command at all, so a witness with no entry here makes the
+    /// exporter DECLINE. Never read by the solver, so a missing or stale entry
+    /// can only cost a printable proof, never change a verdict.
+    skolem_choice: KaniHashMap<TermId, SkolemChoice>,
     /// TermStore length at the start of the FIRST quantifier-instantiation pass
     /// (`process_quantifiers`), i.e. the count of ORIGINAL problem terms before
     /// any MBQI/CEGQI model-value witness is synthesized. Set ONCE (outside the
@@ -404,6 +439,17 @@ pub struct TermStore {
     /// `TermId`. Same mechanism/semantics as [`Self::quantifier_id`]; read back
     /// by `Z3_get_quantifier_skolem_id`.
     skolem_id: KaniHashMap<TermId, String>,
+    /// SMT-LIB/Z3 quantifier priority (`:weight`), keyed by quantifier term.
+    /// Missing entries have Z3's parser default weight `1`. The E-matching cost
+    /// gate consumes this value as `weight + generation`; keeping it in a side
+    /// map preserves the existing public `TermData` shape while making the
+    /// annotation operational instead of silently discarding it.
+    quantifier_weight: KaniHashMap<TermId, u32>,
+    /// Negative auto-trigger candidates from SMT-LIB `:no-pattern`
+    /// annotations, keyed by quantifier term. These are heuristic metadata (not
+    /// logical children) and are filtered only from automatic pattern
+    /// inference, matching Z3's `pattern_inference_cfg::add_candidate` rule.
+    quantifier_no_patterns: KaniHashMap<TermId, Vec<TermId>>,
     /// Per-store identity for affine speculative rollback checkpoints.
     /// `RollbackIdentity::clone` deliberately mints a fresh identity, so a
     /// checkpoint from a cloned store cannot truncate this store.
@@ -438,9 +484,12 @@ impl Clone for TermStore {
             true_memory_cache_at: std::cell::Cell::new(0),
             no_mbqi: self.no_mbqi.clone(),
             skolem_symbols: self.skolem_symbols.clone(),
+            skolem_choice: self.skolem_choice.clone(),
             synthesis_watermark: self.synthesis_watermark,
             quantifier_id: self.quantifier_id.clone(),
             skolem_id: self.skolem_id.clone(),
+            quantifier_weight: self.quantifier_weight.clone(),
+            quantifier_no_patterns: self.quantifier_no_patterns.clone(),
             rollback_identity: self.rollback_identity.clone(),
             rollback_generation: self.rollback_generation,
         };
@@ -559,15 +608,28 @@ impl TermStore {
             true_memory_cache_at: std::cell::Cell::new(0),
             no_mbqi: crate::kani_compat::KaniHashSet::default(),
             skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
             skolem_id: KaniHashMap::default(),
+            quantifier_weight: KaniHashMap::default(),
+            quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
         };
         // Pre-create true and false
         store.true_term = Some(store.mk_bool(true));
-        store.false_term = Some(store.mk_bool(false));
+        let false_term = store.mk_bool(false);
+        // `PREALLOCATED_FALSE` lets store-free callers (proof-shape recognizers
+        // that receive only a `Proof`) name the `false` constant. Check the
+        // alignment here — once per store, one integer compare — so the constant
+        // cannot silently drift from the constructor that establishes it.
+        assert_eq!(
+            false_term,
+            Self::PREALLOCATED_FALSE,
+            "TermStore::new must intern `false` at its documented position"
+        );
+        store.false_term = Some(false_term);
         store
     }
 
@@ -596,9 +658,12 @@ impl TermStore {
             true_memory_cache_at: std::cell::Cell::new(0),
             no_mbqi: crate::kani_compat::KaniHashSet::default(),
             skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
             skolem_id: KaniHashMap::default(),
+            quantifier_weight: KaniHashMap::default(),
+            quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
         }
@@ -648,6 +713,102 @@ impl TermStore {
         self.skolem_id.get(&id).map(String::as_str)
     }
 
+    /// Attach the SMT-LIB/Z3 `:weight` priority to a quantifier.
+    pub fn set_quantifier_weight(&mut self, id: TermId, weight: u32) {
+        if matches!(self.get(id), TermData::Forall(..) | TermData::Exists(..)) {
+            self.quantifier_weight.insert(id, weight);
+        }
+    }
+
+    /// Return a quantifier's SMT-LIB/Z3 priority, defaulting to `1`.
+    #[must_use]
+    pub fn quantifier_weight(&self, id: TermId) -> u32 {
+        self.quantifier_weight.get(&id).copied().unwrap_or(1)
+    }
+
+    /// Return an explicitly attached priority, distinguishing parser-default
+    /// `:weight 1` from quantifiers created by APIs that use the solver config.
+    #[must_use]
+    pub fn explicit_quantifier_weight(&self, id: TermId) -> Option<u32> {
+        self.quantifier_weight.get(&id).copied()
+    }
+
+    /// Attach exact `:no-pattern` terms to a quantifier.
+    pub fn set_quantifier_no_patterns(&mut self, id: TermId, no_patterns: Vec<TermId>) {
+        if matches!(self.get(id), TermData::Forall(..) | TermData::Exists(..)) {
+            if no_patterns.is_empty() {
+                self.quantifier_no_patterns.remove(&id);
+            } else {
+                self.quantifier_no_patterns.insert(id, no_patterns);
+            }
+        }
+    }
+
+    /// Return the exact `:no-pattern` terms attached to a quantifier.
+    #[must_use]
+    pub fn quantifier_no_patterns(&self, id: TermId) -> &[TermId] {
+        self.quantifier_no_patterns
+            .get(&id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Copy parser-level quantifier metadata when a logically equivalent
+    /// quantifier is rebuilt (for example by the NNF `not exists` collector).
+    /// This metadata changes instantiation policy and rendering, never formula
+    /// truth, so copying it is sound and avoids silently losing user intent.
+    pub fn copy_quantifier_metadata(&mut self, source: TermId, target: TermId) {
+        let target_is_forall = matches!(self.get(target), TermData::Forall(..));
+        if !target_is_forall && !matches!(self.get(target), TermData::Exists(..)) {
+            return;
+        }
+
+        // Snapshot first: source and target may be the same interned term.
+        let no_mbqi = self.no_mbqi.contains(&source);
+        let qid = self.quantifier_id.get(&source).cloned();
+        let skid = self.skolem_id.get(&source).cloned();
+        let weight = self.quantifier_weight.get(&source).copied();
+        let no_patterns = self.quantifier_no_patterns(source).to_vec();
+
+        // Mirror the source exactly. A rebuilt term can already be interned and
+        // carry metadata from an earlier construction, so only inserting
+        // present fields would leave stale annotations behind.
+        if no_mbqi && target_is_forall {
+            self.no_mbqi.insert(target);
+        } else {
+            self.no_mbqi.remove(&target);
+        }
+
+        match qid {
+            Some(qid) => {
+                self.quantifier_id.insert(target, qid);
+            }
+            None => {
+                self.quantifier_id.remove(&target);
+            }
+        }
+        match skid {
+            Some(skid) => {
+                self.skolem_id.insert(target, skid);
+            }
+            None => {
+                self.skolem_id.remove(&target);
+            }
+        }
+        match weight {
+            Some(weight) => {
+                self.quantifier_weight.insert(target, weight);
+            }
+            None => {
+                self.quantifier_weight.remove(&target);
+            }
+        }
+        if no_patterns.is_empty() {
+            self.quantifier_no_patterns.remove(&target);
+        } else {
+            self.quantifier_no_patterns.insert(target, no_patterns);
+        }
+    }
+
     /// Register an authenticated Skolem symbol name (constant or function). See
     /// the `skolem_symbols` field docs: call only from the Skolem creation site,
     /// or while restoring an offline certificate after independently checking
@@ -661,6 +822,37 @@ impl TermStore {
     #[must_use]
     pub fn is_skolem_symbol(&self, name: &str) -> bool {
         self.skolem_symbols.contains(name)
+    }
+
+    /// Record the Hilbert-choice term a Skolem CONSTANT denotes (see
+    /// [`SkolemChoice`]). Call only from the Skolem creation site, with the
+    /// binder/body the substitution actually used. No-op unless `witness` is a
+    /// `Var` — a Skolem FUNCTION application has no single choice term and must
+    /// stay unregistered so the printer fails closed.
+    pub fn register_skolem_choice(&mut self, witness: TermId, choice: SkolemChoice) {
+        if matches!(self.get(witness), TermData::Var(..)) {
+            self.skolem_choice.insert(witness, choice);
+        }
+    }
+
+    /// The Hilbert-choice provenance of `witness`, if it was registered by
+    /// [`Self::register_skolem_choice`].
+    #[must_use]
+    pub fn skolem_choice(&self, witness: TermId) -> Option<&SkolemChoice> {
+        self.skolem_choice.get(&witness)
+    }
+
+    /// Every registered Skolem-constant choice, in ascending witness `TermId`
+    /// order — i.e. mint order, so a witness precedes every witness whose body
+    /// can mention it.
+    pub fn skolem_choices(&self) -> impl Iterator<Item = (TermId, &SkolemChoice)> {
+        let mut entries: Vec<(TermId, &SkolemChoice)> = self
+            .skolem_choice
+            .iter()
+            .map(|(id, choice)| (*id, choice))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries.into_iter()
     }
 
     /// Whether `name` is already interned as a variable/declared-constant in the
@@ -781,6 +973,13 @@ impl TermStore {
         self.no_mbqi.retain(keep);
         self.quantifier_id.retain(|k, _| keep(k));
         self.skolem_id.retain(|k, _| keep(k));
+        self.quantifier_weight.retain(|k, _| keep(k));
+        self.quantifier_no_patterns
+            .retain(|k, patterns| keep(k) && patterns.iter().all(&keep));
+        // Drop a witness whose OWN id or whose choice body was truncated away:
+        // rendering it would spell a term this store no longer holds.
+        self.skolem_choice
+            .retain(|k, choice| keep(k) && keep(&choice.body));
         if self.synthesis_watermark.is_some_and(|w| w > len) {
             self.synthesis_watermark = Some(len);
         }
@@ -976,6 +1175,21 @@ impl TermStore {
             .expect("TermStore: false_term accessed before initialization")
     }
 
+    /// Interning position of the preallocated `false` constant.
+    ///
+    /// [`TermStore::new`] interns `true` and then `false` into an empty store
+    /// before any other term, so `false` occupies the same `TermId` in every
+    /// store the solver builds — cloning preserves ids, and
+    /// [`TermStore::rollback_to`] refuses to truncate below that Boolean floor.
+    /// The constructor asserts the alignment, so this constant cannot drift
+    /// away from [`Self::false_term`].
+    ///
+    /// This exists for the few callers that must recognize the `false` constant
+    /// with NO store in hand — specifically the store-free proof-shape
+    /// recognizers, which take only a `Proof`. Anything holding a store must
+    /// use [`Self::false_term`].
+    pub const PREALLOCATED_FALSE: TermId = TermId(1);
+
     /// Record that a USER declaration shadows the builtin `to_real` symbol
     /// (declarable as a `(_ map f)` target). Disables the to_real-integrality
     /// rewrites in comparison/equality constructors — rewriting a user's
@@ -1074,9 +1288,12 @@ impl TermStore {
             not_cache: KaniHashMap::default(),
             no_mbqi: crate::kani_compat::KaniHashSet::default(),
             skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
             skolem_id: KaniHashMap::default(),
+            quantifier_weight: KaniHashMap::default(),
+            quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
         }

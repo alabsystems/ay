@@ -362,6 +362,12 @@ impl DimacsFormula {
         // declared count); only the solver's dense allocation tracks real content.
         let solver_vars = max_variable_count(&self.clauses);
         let mut solver = Solver::new(solver_vars);
+        // A DIMACS formula becomes a ONE-SHOT solve: no assumptions, no
+        // incremental reuse. That licenses structural symmetry breaking
+        // (orbitopal fixing, the aux-free PHP refutation), which removes models
+        // and would be unsound under assumptions. Embedders that build a Solver
+        // directly never take this path, so they stay safe by default.
+        solver.set_symmetry_oneshot(true);
 
         // Extract features first so an in-band Default input can be auto-routed
         // to Probe or Aggressive before the config is resolved (the same

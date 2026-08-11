@@ -417,7 +417,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             // Too many splits
             let _ = solver.pop();
             if $self.last_unknown_reason.is_none() {
-                $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
+                $self.record_unknown_from_origin($crate::UnknownOrigin::TheorySplitBudget);
             }
             $self.last_result = Some(SolveResult::Unknown);
             Ok(SolveResult::Unknown)

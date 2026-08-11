@@ -218,10 +218,12 @@ impl Solver {
             self.cold.next_clause_id += 1;
             id
         };
-        if idx >= self.cold.clause_ids.len() {
-            self.cold.clause_ids.resize(idx + 1, 0);
+        if !self.cold.clause_ids_disabled {
+            if idx >= self.cold.clause_ids.len() {
+                self.cold.clause_ids.resize(idx + 1, 0);
+            }
+            self.cold.clause_ids[idx] = clause_id;
         }
-        self.cold.clause_ids[idx] = clause_id;
         if learned && self.cold.bcp_learned_1963_identity_profile {
             if idx >= self.cold.bcp_learned_clause_birth_conflicts.len() {
                 self.cold

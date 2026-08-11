@@ -731,6 +731,9 @@ impl Solver {
             // remains valid and no compaction/truncation is needed.
             if let Some(conflict_ref) = binary_conflict {
                 self.flush_bcp_ticks::<MODE>(ticks);
+                if MODE == bcp_mode::SEARCH {
+                    self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                }
                 return Some(self.unsafe_conflict_finalize(conflict_ref, qhead_start));
             }
 
@@ -1826,6 +1829,9 @@ impl Solver {
                         }
                     }
                     self.flush_bcp_ticks::<MODE>(ticks);
+                    if MODE == bcp_mode::SEARCH {
+                        self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                    }
                     return Some(self.unsafe_conflict_finalize(clause_ref, qhead_start));
                 }
 
@@ -1891,6 +1897,9 @@ impl Solver {
         }
 
         self.num_propagations += (self.qhead - qhead_start) as u64;
+        if MODE == bcp_mode::SEARCH {
+            self.num_search_propagations += (self.qhead - qhead_start) as u64;
+        }
         self.flush_bcp_ticks::<MODE>(ticks);
         // Reason marks maintained incrementally by enqueue_bcp (#8100).
         self.no_conflict_until = self.trail.len();

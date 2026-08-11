@@ -10,7 +10,7 @@
 //! under-specified in SMT-LIB on the given inputs (e.g. `seq.nth` out of range)
 //! return `Err` (unevaluable), never a fabricated value.
 
-use crate::{value_eq, ModelValue};
+use crate::{array_select, value_eq, ArrayValue, ModelValue};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
@@ -106,7 +106,61 @@ pub(crate) fn eval(name: &str, args: &[ModelValue]) -> Result<ModelValue, String
             let dst = as_seq(arg(args, 2)?)?;
             Ok(ModelValue::Seq(replace_all(s, src, dst)?))
         }
-        // Everything else (seq.map, seq.fold_left, ...) is intentionally left
+        // Higher-order combinators. The function operand is a
+        // FUNCTION-AS-ARRAY, curried exactly as `Z3_mk_seq_map` /
+        // `Z3_mk_seq_foldl` build it (see `ay-ffi`'s `mk_ext.rs` and the
+        // solver-side `ho_unfold.rs`): `seq.map f : (Array E R)`,
+        // `seq.mapi f : (Array Int (Array E R))` with the index outermost,
+        // `seq.foldl f : (Array A (Array E A))` with the ACCUMULATOR outermost,
+        // and `seq.foldli f : (Array Int (Array A (Array E A)))`. Everything is
+        // computed from the operand VALUES here; a non-array function operand,
+        // a non-sequence sequence operand or an unevaluable element comparison
+        // inside `array_select` still fails closed.
+        "seq.map" => {
+            let f = as_array(arg(args, 0)?)?;
+            let s = as_seq(arg(args, 1)?)?;
+            let mut out = Vec::with_capacity(s.len());
+            for element in s {
+                out.push(array_select(f, element)?);
+            }
+            Ok(ModelValue::Seq(out))
+        }
+        "seq.mapi" => {
+            let f = as_array(arg(args, 0)?)?;
+            let base = as_int(arg(args, 1)?)?;
+            let s = as_seq(arg(args, 2)?)?;
+            let mut out = Vec::with_capacity(s.len());
+            for (offset, element) in s.iter().enumerate() {
+                let index = ModelValue::Int(&base + BigInt::from(offset));
+                let curried = as_array(&array_select(f, &index)?)?.clone();
+                out.push(array_select(&curried, element)?);
+            }
+            Ok(ModelValue::Seq(out))
+        }
+        "seq.foldl" => {
+            let f = as_array(arg(args, 0)?)?;
+            let mut accumulator = arg(args, 1)?.clone();
+            let s = as_seq(arg(args, 2)?)?;
+            for element in s {
+                let curried = as_array(&array_select(f, &accumulator)?)?.clone();
+                accumulator = array_select(&curried, element)?;
+            }
+            Ok(accumulator)
+        }
+        "seq.foldli" => {
+            let f = as_array(arg(args, 0)?)?;
+            let base = as_int(arg(args, 1)?)?;
+            let mut accumulator = arg(args, 2)?.clone();
+            let s = as_seq(arg(args, 3)?)?;
+            for (offset, element) in s.iter().enumerate() {
+                let index = ModelValue::Int(&base + BigInt::from(offset));
+                let at_index = as_array(&array_select(f, &index)?)?.clone();
+                let curried = as_array(&array_select(&at_index, &accumulator)?)?.clone();
+                accumulator = array_select(&curried, element)?;
+            }
+            Ok(accumulator)
+        }
+        // Everything else (seq.to_re, seq.in_re, ...) is intentionally left
         // unimplemented ⇒ unevaluable (fail closed).
         _ => Err(format!("unsupported sequence operator {name}")),
     }
@@ -267,6 +321,15 @@ fn as_seq(v: &ModelValue) -> Result<&[ModelValue], String> {
     match v {
         ModelValue::Seq(xs) => Ok(xs),
         _ => Err("expected a sequence operand".to_string()),
+    }
+}
+
+/// The function-as-array operand of a higher-order combinator. Anything else
+/// (including a model that left the function uninterpreted) is unevaluable.
+fn as_array(v: &ModelValue) -> Result<&ArrayValue, String> {
+    match v {
+        ModelValue::Array(arr) => Ok(arr),
+        _ => Err("expected a function-as-array operand".to_string()),
     }
 }
 

@@ -95,6 +95,69 @@ fn test_extract_patterns_falls_back_when_user_triggers_yield_no_patterns() {
 }
 
 #[test]
+fn test_no_pattern_excludes_only_the_exact_auto_trigger_candidate() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let p_f_x = terms.mk_app(Symbol::named("P"), vec![f_x], Sort::Bool);
+    let q_x = terms.mk_app(Symbol::named("Q"), vec![x], Sort::Bool);
+    let body = terms.mk_and(vec![p_f_x, q_x]);
+    let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
+    let default_groups = extract_patterns(&terms, forall);
+    assert!(
+        default_groups.iter().any(|group| group
+            .patterns
+            .iter()
+            .any(|pattern| pattern.symbol.name() == "P")),
+        "P(f(x)) is an auto-trigger candidate before :no-pattern"
+    );
+
+    terms.set_quantifier_no_patterns(forall, vec![p_f_x]);
+
+    let groups = extract_patterns(&terms, forall);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|group| group.patterns.iter().map(|pattern| pattern.symbol.name()))
+        .collect();
+    assert!(
+        !symbols.contains(&"P"),
+        "exact P(f(x)) candidate must be excluded"
+    );
+    assert!(
+        symbols.iter().any(|symbol| matches!(*symbol, "f" | "Q")),
+        "children and sibling candidates must still be visited: {symbols:?}"
+    );
+}
+
+#[test]
+fn test_explicit_quantifier_weight_controls_instantiation_cost() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let p_x = terms.mk_app(Symbol::named("P"), vec![x], Sort::Bool);
+    let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], p_x);
+
+    let a = terms.mk_var("a", Sort::Int);
+    let p_a = terms.mk_app(Symbol::named("P"), vec![a], Sort::Bool);
+    let not_p_a = terms.mk_not(p_a);
+
+    terms.set_quantifier_weight(forall, 1);
+    let low_weight = perform_ematching(&mut terms, &[forall, not_p_a]);
+    assert!(
+        low_weight.instantiations.contains(&p_a),
+        "the same generation-zero match must pass at weight 1"
+    );
+
+    terms.set_quantifier_weight(forall, 21);
+    let result = perform_ematching(&mut terms, &[forall, not_p_a]);
+
+    assert!(
+        result.instantiations.is_empty(),
+        "weight 21 exceeds the default lazy threshold and must block the match"
+    );
+    assert!(result.has_uninstantiated);
+}
+
+#[test]
 fn test_ematching_uses_auto_fallback_when_user_trigger_has_no_ground_match() {
     let mut terms = TermStore::new();
 
@@ -1768,12 +1831,21 @@ fn test_ematching_tags_only_unconditional_forall_instances() {
     }
 }
 
-/// Companion to the above: an `or`-nested Forall is instantiated by e-matching
-/// (via `collect_quantifiers`, which flattens `or`) but its instance is NOT
-/// tagged into `unconditional_forall_roots`, because `collect_unconditional_
-/// foralls` stops at `or`. This is the load-bearing soundness case.
+/// Companion to the above, and the load-bearing soundness case: an `or`-nested
+/// Forall is NOT ENTAILED, so e-matching must neither instantiate it nor tag
+/// anything into `unconditional_forall_roots`.
+///
+/// This test used to assert the WEAKER invariant — that the instance IS
+/// produced but merely goes untagged. That was not enough. Callers append
+/// `result.instantiations` to `ctx.assertions` as top-level conjuncts
+/// REGARDLESS of the support tag (`add_ematching_instances`, `dispatch.rs`,
+/// `run_post_cegqi_ematching`), so producing the instance at all fabricates a
+/// ground fact from a formula the problem does not entail — the
+/// `#auflia-disjunct-forall-false-unsat` wrong REFUTATION. The tag only ever
+/// controlled conflict-verification provenance, never whether the literal
+/// reached the ground solver. Both halves are asserted below.
 #[test]
-fn test_ematching_does_not_tag_or_nested_forall_instances() {
+fn test_ematching_does_not_instantiate_or_nested_forall() {
     let mut terms = TermStore::new();
     let seq = Sort::Uninterpreted("Seq".to_string());
     let seq_len = Symbol::named("seq_len");
@@ -1798,19 +1870,150 @@ fn test_ematching_does_not_tag_or_nested_forall_instances() {
     let ground = terms.mk_not(ground_eq);
 
     let result = perform_ematching(&mut terms, &[disj, ground]);
-    // The or-nested Forall is still e-matched (collect_quantifiers flattens or)...
+    // THE guard: the instance is never built. `ground_eq` contradicts the
+    // asserted `(not ground_eq)`, so conjoining it refutes a problem that is
+    // satisfied by `p := true`.
     assert!(
-        result.instantiations.contains(&ground_eq),
-        "collect_quantifiers flattens `or`, so the nested Forall is instantiated"
+        !result.instantiations.contains(&ground_eq),
+        "an `or`-nested Forall is NOT entailed, so e-matching must not build \
+         its instance — every caller conjoins `instantiations` as top-level \
+         assertions, which would fabricate `{ground_eq:?}` and refute a \
+         satisfiable problem"
     );
-    // ...but its instance is NOT sound support (the Forall is not entailed).
+    // Nothing at all is instantiated here: the disjunct is the only quantifier.
     assert!(
-        !result.unconditional_forall_roots.contains(&ground_eq),
-        "an instance of an `or`-nested Forall MUST NOT be tagged as support — \
-         it is not entailed and could launder a spurious conflict"
+        result.instantiations.is_empty(),
+        "the only quantifier in this problem is the non-entailed disjunct; got \
+         {:?}",
+        result.instantiations
     );
+    // FAIL-CLOSED IN THE OTHER DIRECTION: the skipped quantifier must stay
+    // VISIBLE as uninstantiated, so the SAT certificates it feeds cannot grant
+    // on a universal that was never discharged.
+    assert!(
+        result.has_uninstantiated,
+        "a withheld non-entailed Forall must set `has_uninstantiated`, which is \
+         what blocks the `full_ematching_coverage` SAT certificate"
+    );
+    assert!(
+        result.uninstantiated_quantifiers.contains(&forall_inner),
+        "the withheld Forall itself must be recorded in \
+         `uninstantiated_quantifiers`"
+    );
+    // ...and it is of course not tagged as sound conflict-verification support.
     assert!(
         result.unconditional_forall_roots.is_empty(),
         "no unconditional-Forall instances exist in this problem"
+    );
+}
+
+/// SOUNDNESS invariant (#auflia-exists-eq-false-unsat): E-matching must never
+/// build an instance of an `Exists`, and the `Exists` must nonetheless stay
+/// VISIBLE to the coverage bookkeeping.
+///
+/// Universal instantiation is sound (`∀x.P(x) ⊨ P(t)`); existential
+/// instantiation is not (`∃x.P(x) ⊭ P(t)` — it pins an arbitrary term as the
+/// witness). Every caller appends these instances to `ctx.assertions` as
+/// top-level CONJUNCTS, so an existential instance silently strengthens the
+/// problem. That produced a wrong REFUTATION on satisfiable quantified AUFLIA
+/// (`20170829-Rodin smt4579745768945200905`, `conflicts=0 decisions=0`), and is
+/// refused in `perform_ematching_with_generations`.
+///
+/// The second half is the part that is easy to break while "improving" the
+/// first. It is tempting to cut the existential earlier, in
+/// [`collect_quantifiers`], since nothing may instantiate it anyway. That is a
+/// WRONG-`sat` channel: the skipped quantifier is supposed to land in
+/// `uninstantiated_quantifiers`, and that is one of the conjuncts blocking the
+/// `full_ematching_coverage` SAT certificate. It also feeds
+/// `ematching_has_exists` and the `setup_cegqi_for_unhandled` routing. Silence
+/// it at the collector and a positive-position existential becomes invisible
+/// rather than unhandled, letting a ground `sat` be returned as authoritative
+/// with the existential never discharged. So this test pins BOTH directions:
+/// surfaced, never instantiated.
+#[test]
+fn exists_is_surfaced_but_never_instantiated() {
+    let mut terms = TermStore::new();
+    let sort_s = Sort::Uninterpreted("S".to_string());
+    let tab_sym = Symbol::named("tab");
+
+    // exists j. tab(j) — a bare, positive-position existential.
+    let j = terms.mk_var("j", sort_s.clone());
+    let tab_j = terms.mk_app(tab_sym.clone(), vec![j], Sort::Bool);
+    let ex = terms.mk_exists(vec![("j".to_string(), sort_s.clone())], tab_j);
+
+    // A ground term of the right sort, so a trigger match is actually available
+    // — otherwise "no instantiation" would hold vacuously.
+    let sk = terms.mk_app(Symbol::named("sk"), vec![], sort_s.clone());
+    let tab_sk = terms.mk_app(tab_sym, vec![sk], Sort::Bool);
+
+    // HALF 1: the collector still surfaces it. This is the bookkeeping the
+    // downstream SAT-certificate gates depend on.
+    let mut surfaced = Vec::new();
+    collect_quantifiers(&mut terms, ex, &mut surfaced);
+    assert!(
+        surfaced
+            .iter()
+            .any(|t| matches!(terms.get(*t), TermData::Exists(..))),
+        "the Exists must stay VISIBLE to coverage bookkeeping — dropping it here \
+         silences has_uninstantiated / ematching_has_exists / CEGQI routing at \
+         once, which is a wrong-`sat` channel; got {surfaced:?}"
+    );
+
+    // HALF 2: E-matching builds no instance of it, and records it as
+    // uninstantiated so the coverage gates see the gap.
+    let assertions = vec![ex, tab_sk];
+    let config = EMatchingConfig::default();
+    let mut state = PersistentMatchState::new();
+    let result = perform_ematching_with_generations(
+        &mut terms,
+        &assertions,
+        &config,
+        GenerationTracker::new(),
+        None,
+        &|| false,
+        &mut state,
+        None,
+    );
+    assert!(
+        result.instantiations.is_empty() && result.deferred.is_empty(),
+        "no instance of a bare Exists may be built (existential instantiation is \
+         unsound and the instances are conjoined as facts); got {} eager, {} \
+         deferred",
+        result.instantiations.len(),
+        result.deferred.len()
+    );
+    assert!(
+        !result.instantiated_quantifiers.contains(&ex),
+        "an Exists skipped by E-matching must have no instantiation provenance"
+    );
+    assert!(
+        result.uninstantiated_quantifiers.contains(&ex) && result.has_uninstantiated,
+        "the skipped Exists must be RECORDED as uninstantiated — that flag is a \
+         conjunct of `full_ematching_coverage`, so losing it lets a ground `sat` \
+         be certified with the existential never discharged"
+    );
+}
+
+/// The sound NNF dual is unaffected: `¬∃x. φ` is surfaced as `∀x. ¬φ`, a genuine
+/// universal, and stays instantiable. The fix above must not cost this.
+#[test]
+fn negated_exists_is_still_surfaced_as_its_forall_dual() {
+    let mut terms = TermStore::new();
+    let sort_s = Sort::Uninterpreted("S".to_string());
+    let j = terms.mk_var("j", sort_s.clone());
+    let tab_j = terms.mk_app(Symbol::named("tab"), vec![j], Sort::Bool);
+    let ex = terms.mk_exists(vec![("j".to_string(), sort_s)], tab_j);
+    let neg_ex = terms.mk_not(ex);
+
+    let mut surfaced = Vec::new();
+    collect_quantifiers(&mut terms, neg_ex, &mut surfaced);
+    assert_eq!(
+        surfaced.len(),
+        1,
+        "not(exists) must still be surfaced; got {surfaced:?}"
+    );
+    assert!(
+        matches!(terms.get(surfaced[0]), TermData::Forall(..)),
+        "not(exists x. phi) must be surfaced as the universal forall x. not(phi)"
     );
 }

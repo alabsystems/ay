@@ -150,8 +150,28 @@ pub unsafe extern "C" fn Z3_func_decl_to_string(c: Z3_context, d: Z3_func_decl) 
             if d.is_null() {
                 return cache_string(ctx, "(null)".to_string());
             }
-            let decl = &(*d).decl;
-            let rendered = super::ffi_surface_text(ctx, &format!("{decl}"));
+            let handle = &*d;
+            let decl = &handle.decl;
+            let display_name = handle
+                .symbol
+                .as_ref()
+                .map(super::SymbolKey::display_name)
+                .unwrap_or_else(|| decl.name().to_string());
+            let (domain, range) = ctx
+                .finite_set_decl_signatures
+                .get(decl.name())
+                .cloned()
+                .unwrap_or_else(|| (decl.domain().to_vec(), decl.range().clone()));
+            let domain = domain
+                .iter()
+                .map(|sort| super::render_public_sort(ctx, sort))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let rendered = format!(
+                "(declare-fun {} ({domain}) {})",
+                ay_core::quote_symbol(&display_name),
+                super::render_public_sort(ctx, &range)
+            );
             cache_string(ctx, rendered)
         })
     }
@@ -231,7 +251,9 @@ pub unsafe extern "C" fn Z3_get_sort_name(c: Z3_context, s: Z3_sort) -> Z3_symbo
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let sort = &(*s).sort;
-            if let Some(symbol) = ctx.ffi_sort_symbols.get(sort).cloned() {
+            if super::finite_set_basis(ctx, sort).is_some() {
+                cache_symbol(ctx, "FiniteSet".to_string())
+            } else if let Some(symbol) = ctx.ffi_sort_symbols.get(sort).cloned() {
                 cache_symbol_key(ctx, symbol)
             } else {
                 cache_symbol(ctx, format!("{sort}"))

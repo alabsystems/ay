@@ -306,8 +306,10 @@ fn is_follow_up_query(command: &Command) -> bool {
             | Command::GetAssignment
             | Command::GetInfo(_)
             | Command::GetOption(_)
+            | Command::Labels
             | Command::Exit
             | Command::Echo(_)
+            | Command::Display(..)
             | Command::Simplify(_)
             | Command::GetAbduct(_, _)
     )
@@ -329,8 +331,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetAssignment => "get-assignment",
         Command::GetInfo(_) => "get-info",
         Command::GetOption(_) => "get-option",
+        Command::Labels => "labels",
         Command::Exit => "exit",
         Command::Echo(_) => "echo",
+        Command::Display(..) => "display",
         Command::Simplify(_) => "simplify",
         Command::GetAbduct(_, _) => "get-abduct",
         _ => "unsupported-query",

@@ -19,3 +19,9 @@ mimalloc-arena-trim = []
 
 [dependencies]
 libc.workspace = true
+
+# File identity (volume serial + file index) and hard-link counts are only
+# reachable through GetFileInformationByHandle; the std accessors for them are
+# permanently unstable (rust-lang/rust#63010).
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

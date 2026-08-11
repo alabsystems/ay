@@ -69,6 +69,34 @@ pub(crate) struct PhaseHintExtension<'a, T: TheorySolver> {
     theory_decision_call_count: Cell<u64>,
 }
 
+/// Restores the pre-epoch-skip phase seeding (`AY_DISABLE_PHASE_EPOCH_SKIP`).
+///
+/// # Why an arm that was deleted is being put back
+///
+/// The two epoch-skip sites carried the note *"Former `AY_DISABLE_PHASE_EPOCH_SKIP`
+/// A/B fallback removed; the skip is permanent."* Removing the arm removes the
+/// ability to re-derive the result that justified the skip, and this repo's stated
+/// rule is the opposite — `knobs.rs`:
+///
+/// > the negative results are only RE-CHECKABLE while their arms still exist.
+/// > Losing the ability to re-derive a negative result is how a project pays twice
+/// > for the same work.
+///
+/// The skip is almost certainly right: an unchanged epoch means every
+/// `suggest_phase(atom)` returns what it returned last time, so the re-seed is
+/// provably redundant, and phase hints bias branch order rather than the verdict.
+/// That is an argument for the DEFAULT, not for deleting the control. A skip whose
+/// premise is "the epoch is a sound cache key" is exactly the kind of claim that
+/// stops holding when a theory changes what its epoch counts, and without an arm
+/// there is no cheap way to find out.
+///
+/// Default OFF, so this is behaviour-identical; setting it restores the
+/// unconditional O(atoms) re-seed byte-for-byte.
+pub(crate) fn phase_epoch_skip_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("AY_DISABLE_PHASE_EPOCH_SKIP").is_some())
+}
+
 impl<'a, T: TheorySolver> PhaseHintExtension<'a, T> {
     pub(crate) fn new(
         theory: &'a T,
@@ -220,13 +248,16 @@ impl<T: TheorySolver> Extension for PhaseHintExtension<'_, T> {
         // are a heuristic (they bias branch order, never the sat/unsat result),
         // so even where a phase array was overwritten by phase-saving between
         // seeds, leaving it as-is only changes search order, not correctness.
-        // (Former `AY_DISABLE_PHASE_EPOCH_SKIP` A/B fallback removed; the
-        // skip is permanent.)
-        if let Some(epoch) = self.theory.phase_hint_epoch() {
-            if self.last_seed_epoch.get() == Some(epoch) {
-                return;
+        // The A/B arm is `AY_DISABLE_PHASE_EPOCH_SKIP` (see
+        // `phase_epoch_skip_disabled`): default off, and setting it restores the
+        // unconditional re-seed byte-for-byte.
+        if !phase_epoch_skip_disabled() {
+            if let Some(epoch) = self.theory.phase_hint_epoch() {
+                if self.last_seed_epoch.get() == Some(epoch) {
+                    return;
+                }
+                self.last_seed_epoch.set(Some(epoch));
             }
-            self.last_seed_epoch.set(Some(epoch));
         }
         // Single pass over the dense index, writing BOTH arrays with one
         // suggest_phase query per atom. Equivalent to calling seed_phase_hints

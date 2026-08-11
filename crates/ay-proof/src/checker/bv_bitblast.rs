@@ -18,31 +18,99 @@
 //!   with no BV content is not a bit-blast product.
 //! - Annotated same-width gate lemmas must reference the declared operator at
 //!   the declared bit-width.
-//! - The clause must be fully evaluable by the bounded Bool/BV checker, and
-//!   every bounded assignment must satisfy it. If the checker cannot prove the
-//!   clause under the configured bounds, strict mode rejects it.
+//! - The clause must be fully evaluable by either the bounded Bool/BV checker
+//!   or the proof-producing bit-blast checker. The former enumerates every
+//!   small assignment; the latter bit-blasts a bounded-width symbolic clause,
+//!   requires an LRAT-derived resolution refutation, and replays every emitted
+//!   gate and resolution step.
 //!
-//! Full truth-table verification (mirroring CVC5's `proof_bitblaster.cpp`) is
-//! still future work tracked by #8071. Until then, strict mode is fail-closed:
-//! unsupported or too-wide bit-blast lemmas are rejected instead of being
-//! accepted by shape alone.
+//! Unsupported operators, widths above the proof producer's bound, malformed
+//! terms, SAT negations, and unsurfaceable refutations are all rejected.
 
-use ay_core::{BvGateType, Constant, ProofId, Sort, Symbol, TermData, TermId, TermStore};
+use ay_core::{
+    time::Instant, BvGateType, Constant, Proof, ProofId, ProofStep, Sort, Symbol, TermData, TermId,
+    TermStore, TheoryLemmaKind,
+};
+use ay_sat::ResolutionProofLimits;
 use num_traits::ToPrimitive;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use super::ProofCheckError;
+use crate::{
+    bv_blast_export::BvBlastValidateLimits,
+    bv_blast_solver::{export_bv_blast_proof_expr_with_limits, BvExprProofLimits},
+    BvExpr,
+};
 
 /// Recognize whether `clause` is a strict-checkable (ungated) bit-blast lemma —
 /// i.e. whether [`validate_bv_bitblast`] with no gate annotation would accept it.
 ///
-/// This is the exact inverse of the validator's bounded-semantics check: the
+/// This is the exact inverse of the validator's semantic checks: the
 /// proof classifier (`ay-dpll`) calls it to upgrade a `Generic`/trust lemma into
 /// the strict-checkable `BvBitBlast` kind ONLY when strict mode will
-/// independently re-validate it by exhaustive bounded evaluation — so classifier
-/// and checker cannot drift. A non-tautological or too-wide clause is rejected.
+/// independently re-validate it by exhaustive evaluation or a checked
+/// bit-blast/LRAT refutation — so classifier and checker cannot drift. A
+/// non-tautological, unsupported, or too-wide clause is rejected.
 #[must_use]
 pub fn recognize_bv_bitblast(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_bv_bitblast(terms, ProofId(0), clause, None).is_ok()
+}
+
+/// Maximum number of lemmas in one proof that may invoke the proof-producing
+/// bit-blast/LRAT fallback.  The fallback has a finite per-lemma deadline; this
+/// whole-proof cap prevents an untrusted proof from multiplying that deadline
+/// by an arbitrary number of individually bounded lemmas.
+pub const MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF: usize = 8;
+
+/// Whether validating `clause` can require the proof-producing fallback.
+///
+/// This is a cheap structural classification only: clauses covered by the
+/// exhaustive <=8-assignment-bit evaluator return `false`; wider or otherwise
+/// unsupported bounded-evaluator shapes with BV content return `true`.  It does
+/// not claim the clause is valid.
+#[must_use]
+pub fn bv_bitblast_requires_proof_producer(terms: &TermStore, clause: &[TermId]) -> bool {
+    if !clause_mentions_bv(terms, clause) {
+        return false;
+    }
+    match collect_bounded_vars(terms, clause) {
+        Some(vars) => vars.iter().map(|var| var.bits).sum::<u32>() > MAX_BOUNDED_ASSIGNMENT_BITS,
+        None => true,
+    }
+}
+
+/// Reject a strict proof whose tagged BV lemmas can multiply the bounded
+/// proof-producing fallback beyond the whole-proof resource budget.
+pub(crate) fn validate_proof_producing_bv_budget(
+    proof: &Proof,
+    terms: &TermStore,
+) -> Result<(), ProofCheckError> {
+    let mut count = 0_usize;
+    for (index, step) in proof.steps.iter().enumerate() {
+        let ProofStep::TheoryLemma { clause, kind, .. } = step else {
+            continue;
+        };
+        if !matches!(
+            kind,
+            TheoryLemmaKind::BvBitBlast | TheoryLemmaKind::BvBitBlastGate { .. }
+        ) || !bv_bitblast_requires_proof_producer(terms, clause)
+        {
+            continue;
+        }
+        count += 1;
+        if count > MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF {
+            return Err(ProofCheckError::InvalidTheoryLemma {
+                step: ProofId(index as u32),
+                reason: format!(
+                    "proof contains more than {} lemmas requiring the bounded \
+                     proof-producing BV checker",
+                    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Recognize the deliberately narrow `evaluate` fragment used to certify a
@@ -261,6 +329,44 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
             _ => {}
         }
     }
+    // The two DUAL shapes, where the gate term occurs POSITIVELY in the packed
+    // unit — Alethe `and_neg` and `or_neg`:
+    //
+    //   (or (and t1 .. tn) (not t1) .. (not tn))   -- and_neg
+    //   (or (or  t1 .. tn) (not ti))               -- or_neg
+    //
+    // Tautology by the same one-line case split as the negated shapes above.
+    // `and_neg`: either every `ti` holds, so the conjunction disjunct is true,
+    // or some `ti` fails, and ITS negation is one of the disjuncts. `or_neg`:
+    // either `ti` holds, so the disjunction disjunct is true, or it fails and
+    // `(not ti)` is a disjunct. Both are exact — the members' theory semantics
+    // are irrelevant, exactly as for `and_pos`/`or_pos`.
+    //
+    // Without `and_neg` the Tseitin definition clause of a top-level `(and ..)`
+    // over non-Bool-bounded atoms (e.g. an EUF equality) reached the strict
+    // checker as a bare `assume` and a correct QF_UF refutation under
+    // `:produce-unsat-cores` was rejected as "assumes term outside the supplied
+    // problem obligation", publishing `unknown` where z3 says `unsat`
+    // (#uc-and-neg-packed-tautology).
+    for &positive in disjuncts {
+        let TermData::App(join_symbol, members) = terms.get(positive) else {
+            continue;
+        };
+        if members.is_empty() || members.iter().any(|&m| terms.sort(m) != &Sort::Bool) {
+            continue;
+        }
+        let negation_present = |member: TermId| {
+            disjuncts.iter().any(|&other| {
+                other != positive
+                    && matches!(terms.get(other), TermData::Not(inner) if *inner == member)
+            })
+        };
+        match join_symbol.name() {
+            "and" if members.iter().all(|&m| negation_present(m)) => return true,
+            "or" if members.iter().any(|&m| negation_present(m)) => return true,
+            _ => {}
+        }
+    }
     false
 }
 
@@ -334,8 +440,17 @@ pub(crate) fn validate_bv_bitblast(
         }
     }
 
-    validate_bounded_clause_semantics(terms, step_id, clause)?;
-    Ok(())
+    match validate_bounded_clause_semantics(terms, step_id, clause) {
+        Ok(()) => Ok(()),
+        Err(bounded_error) => validate_proof_producing_clause_semantics(terms, step_id, clause)
+            .map_err(|proof_error| ProofCheckError::InvalidTheoryLemma {
+                step: step_id,
+                reason: format!(
+                    "bv_bitblast semantic checks failed: bounded checker: {bounded_error}; \
+                     proof-producing checker: {proof_error}"
+                ),
+            }),
+    }
 }
 
 /// Return the SMT-LIB operator name that must appear somewhere in the clause
@@ -515,6 +630,437 @@ struct EvalVar {
 enum EvalVarKind {
     Bool,
     BitVec,
+}
+
+const MAX_PROOF_PRODUCING_CLAUSE_LITERALS: usize = 64;
+const MAX_PROOF_PRODUCING_TERM_NODES: usize = 4096;
+const MAX_PROOF_PRODUCING_EXPR_NODES: usize = 4096;
+const MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES: usize = 100_000;
+const MAX_PROOF_PRODUCING_EXPR_DEPTH: usize = 256;
+const MAX_PROOF_PRODUCING_GATE_WORK: usize = 100_000;
+const MAX_PROOF_PRODUCING_RESOLUTION_STEPS: usize = 250_000;
+const PROOF_PRODUCING_DEADLINE: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+enum ProofProducingExpr {
+    Bool(BvExpr),
+    BitVec(BvExpr, u32),
+}
+
+fn proof_producing_expr_nodes(expr: &ProofProducingExpr) -> Result<usize, String> {
+    let root = match expr {
+        ProofProducingExpr::Bool(expr) | ProofProducingExpr::BitVec(expr, _) => expr,
+    };
+    let mut stack = vec![root];
+    let mut nodes = 0_usize;
+    while let Some(expr) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_PROOF_PRODUCING_EXPR_NODES {
+            return Err(format!(
+                "lowered BvExpr exceeds {MAX_PROOF_PRODUCING_EXPR_NODES} nodes"
+            ));
+        }
+        match expr {
+            BvExpr::Leaf { .. } | BvExpr::Const { .. } => {}
+            BvExpr::ZeroExt(inner, _)
+            | BvExpr::Extract { inner, .. }
+            | BvExpr::SignExt(inner, _)
+            | BvExpr::Not(inner) => stack.push(inner),
+            BvExpr::CarryOut { lhs, rhs, .. }
+            | BvExpr::Add(lhs, rhs)
+            | BvExpr::Sub(lhs, rhs)
+            | BvExpr::Or(lhs, rhs)
+            | BvExpr::And(lhs, rhs)
+            | BvExpr::Xor(lhs, rhs)
+            | BvExpr::Shl(lhs, rhs)
+            | BvExpr::Lshr(lhs, rhs)
+            | BvExpr::Ashr(lhs, rhs)
+            | BvExpr::Eq(lhs, rhs)
+            | BvExpr::Mul(lhs, rhs) => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+/// Prove a symbolic Bool/BV clause by bit-blasting it to CNF, asking the SAT
+/// engine for an LRAT-derived resolution DAG, and replaying the resulting
+/// [`crate::BvBlastProof`]. This is the scalable complement to exhaustive
+/// assignment enumeration: no solver verdict is accepted without the surfaced
+/// gate provenance and resolution refutation validating end to end.
+///
+/// SOURCE BINDING. This strict-checker path accepts no serialized
+/// `BvBlastProof`. It lowers the exact live `TermStore` clause into `BvExpr`,
+/// constructs the graph from that expression, and bounded-replays the freshly
+/// returned object in this same call. Thus there is no artifact-substitution
+/// boundary at which `asserted_smt` or `obligation` metadata could replace the
+/// checked clause. External stored-proof consumers must instead re-derive and
+/// compare the graph before granting authority; `BvBlastProof::validate` alone
+/// is deliberately only an internal graph/CNF replay.
+fn validate_proof_producing_clause_semantics(
+    terms: &TermStore,
+    _step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), String> {
+    if clause.is_empty() || clause.len() > MAX_PROOF_PRODUCING_CLAUSE_LITERALS {
+        return Err(format!(
+            "clause has {} literals (supported: 1..={MAX_PROOF_PRODUCING_CLAUSE_LITERALS})",
+            clause.len()
+        ));
+    }
+
+    let mut lowerer = ProofProducingLowerer::new(terms);
+    let mut disjunction = BvExpr::const_val(0, 1);
+    for &literal in clause {
+        let literal = lowerer.lower_bool(literal)?;
+        disjunction = BvExpr::or(disjunction, literal);
+    }
+    let truth = BvExpr::const_val(1, 1);
+    let limits = proof_producing_limits();
+    let proof = export_bv_blast_proof_expr_with_limits(&disjunction, &truth, &limits)
+        .map_err(|error| format!("negated clause did not yield a refutation: {error}"))?;
+    let replay_limits = BvBlastValidateLimits {
+        deadline: limits
+            .resolution
+            .validation
+            .deadline
+            .or(limits.resolution.deadline),
+        max_vars: limits.resolution.max_num_vars,
+        max_bit_lemmas: limits.max_estimated_gate_work,
+        max_clauses: limits.resolution.max_input_clauses,
+        max_clause_literals: limits.resolution.max_input_clause_literals,
+        max_original_literals: limits.resolution.max_input_literals,
+        max_resolution_steps: limits.max_resolution_steps,
+        max_derived_literals: limits.resolution.max_derived_literals,
+        max_work: limits.resolution.validation.max_work,
+    };
+    proof
+        .validate_with_limits(&replay_limits)
+        .map_err(|error| format!("surfaced bit-blast refutation failed replay: {error}"))?;
+    Ok(())
+}
+
+fn proof_producing_limits() -> BvExprProofLimits {
+    let deadline = Instant::now() + PROOF_PRODUCING_DEADLINE;
+    let mut resolution = ResolutionProofLimits::default();
+    resolution.deadline = Some(deadline);
+    resolution.max_num_vars = 150_000;
+    resolution.max_input_clauses = 700_000;
+    resolution.max_input_literals = 3_000_000;
+    resolution.max_input_clause_literals = 64;
+    resolution.max_input_bytes = 64 * 1024 * 1024;
+    resolution.max_conflicts = Some(250_000);
+    resolution.max_decisions = Some(2_000_000);
+    resolution.solver_clause_db_reduction_threshold_bytes = 64 * 1024 * 1024;
+    resolution.max_proof_output_bytes = 64 * 1024 * 1024;
+    resolution.max_derived_steps = MAX_PROOF_PRODUCING_RESOLUTION_STEPS;
+    resolution.max_derived_literals = 2_000_000;
+    resolution.max_hints = 4_000_000;
+    resolution.max_pending_deletions = 250_000;
+    resolution.max_codec_bytes = 192 * 1024 * 1024;
+    resolution.max_backward_reconstruction_bytes = 64 * 1024 * 1024;
+    resolution.validation.deadline = Some(deadline);
+    resolution.validation.max_original_clauses = resolution.max_input_clauses;
+    resolution.validation.max_original_literals = resolution.max_input_literals;
+    resolution.validation.max_derived_steps = resolution.max_derived_steps;
+    resolution.validation.max_derived_literals = resolution.max_derived_literals;
+    resolution.validation.max_hints = resolution.max_hints;
+    resolution.validation.max_work = 50_000_000;
+    resolution.validation.max_bytes = 128 * 1024 * 1024;
+    BvExprProofLimits {
+        max_expr_nodes: MAX_PROOF_PRODUCING_EXPR_NODES,
+        max_expr_depth: MAX_PROOF_PRODUCING_EXPR_DEPTH,
+        max_estimated_gate_work: MAX_PROOF_PRODUCING_GATE_WORK,
+        max_resolution_steps: MAX_PROOF_PRODUCING_RESOLUTION_STEPS,
+        resolution,
+    }
+}
+
+struct ProofProducingLowerer<'a> {
+    terms: &'a TermStore,
+    memo: HashMap<TermId, ProofProducingExpr>,
+    memo_node_counts: HashMap<TermId, usize>,
+    active: HashSet<TermId>,
+    visited_nodes: usize,
+    constructed_expr_nodes: usize,
+}
+
+impl<'a> ProofProducingLowerer<'a> {
+    fn new(terms: &'a TermStore) -> Self {
+        Self {
+            terms,
+            memo: HashMap::new(),
+            memo_node_counts: HashMap::new(),
+            active: HashSet::new(),
+            visited_nodes: 0,
+            constructed_expr_nodes: 0,
+        }
+    }
+
+    fn lower_bool(&mut self, term: TermId) -> Result<BvExpr, String> {
+        match self.lower(term)? {
+            ProofProducingExpr::Bool(expr) => Ok(expr),
+            ProofProducingExpr::BitVec(_, width) => Err(format!(
+                "term {} is BitVec({width}), not Bool",
+                term.index()
+            )),
+        }
+    }
+
+    fn lower_bv(&mut self, term: TermId) -> Result<(BvExpr, u32), String> {
+        match self.lower(term)? {
+            ProofProducingExpr::BitVec(expr, width) => Ok((expr, width)),
+            ProofProducingExpr::Bool(_) => {
+                Err(format!("term {} is Bool, not BitVec", term.index()))
+            }
+        }
+    }
+
+    fn lower(&mut self, term: TermId) -> Result<ProofProducingExpr, String> {
+        if self.memo.contains_key(&term) {
+            let nodes = self.memo_node_counts[&term];
+            self.charge_constructed_expr_nodes(nodes)?;
+            return Ok(self.memo[&term].clone());
+        }
+        self.visited_nodes += 1;
+        if self.visited_nodes > MAX_PROOF_PRODUCING_TERM_NODES {
+            return Err(format!(
+                "term DAG exceeds {MAX_PROOF_PRODUCING_TERM_NODES} nodes"
+            ));
+        }
+        if !self.active.insert(term) {
+            return Err("cyclic term DAG".to_string());
+        }
+        let sort = self.terms.sort(term).clone();
+        let data = self.terms.get(term).clone();
+        let result = match sort {
+            Sort::Bool => self.lower_bool_node(term, data),
+            Sort::BitVec(width) if width.width > 0 && width.width <= 64 => {
+                self.lower_bv_node(term, width.width, data)
+            }
+            Sort::BitVec(width) => Err(format!(
+                "BitVec width {} is outside proof-producing range 1..=64",
+                width.width
+            )),
+            other => Err(format!("unsupported sort {other:?} in Bool/BV clause")),
+        };
+        self.active.remove(&term);
+        let result = result?;
+        let expr_nodes = proof_producing_expr_nodes(&result)?;
+        self.charge_constructed_expr_nodes(expr_nodes)?;
+        self.memo_node_counts.insert(term, expr_nodes);
+        self.memo.insert(term, result.clone());
+        Ok(result)
+    }
+
+    fn charge_constructed_expr_nodes(&mut self, nodes: usize) -> Result<(), String> {
+        let actual = self
+            .constructed_expr_nodes
+            .checked_add(nodes)
+            .unwrap_or(usize::MAX);
+        if actual > MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES {
+            return Err(format!(
+                "lowered BvExpr construction exceeds {MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES} nodes"
+            ));
+        }
+        self.constructed_expr_nodes = actual;
+        Ok(())
+    }
+
+    fn lower_bool_node(
+        &mut self,
+        term: TermId,
+        data: TermData,
+    ) -> Result<ProofProducingExpr, String> {
+        let expr = match data {
+            TermData::Const(Constant::Bool(value)) => BvExpr::const_val(u128::from(value), 1),
+            TermData::Var(_, _) => BvExpr::leaf(&format!("proof_bool_{}", term.index()), 1),
+            TermData::Not(inner) => BvExpr::not(self.lower_bool(inner)?),
+            TermData::App(symbol, args) => self.lower_bool_app(&symbol, &args)?,
+            TermData::Ite(..) => {
+                return Err("Bool ite is outside the proof-producing fragment".to_string())
+            }
+            other => return Err(format!("unsupported Bool node {other:?}")),
+        };
+        Ok(ProofProducingExpr::Bool(expr))
+    }
+
+    fn lower_bool_app(&mut self, symbol: &Symbol, args: &[TermId]) -> Result<BvExpr, String> {
+        let name = symbol.name();
+        match name {
+            "and" => {
+                let mut out = BvExpr::const_val(1, 1);
+                for &arg in args {
+                    out = BvExpr::and(out, self.lower_bool(arg)?);
+                }
+                Ok(out)
+            }
+            "or" => {
+                let mut out = BvExpr::const_val(0, 1);
+                for &arg in args {
+                    out = BvExpr::or(out, self.lower_bool(arg)?);
+                }
+                Ok(out)
+            }
+            "not" if args.len() == 1 => Ok(BvExpr::not(self.lower_bool(args[0])?)),
+            "=" if args.len() == 2 => match self.terms.sort(args[0]) {
+                Sort::Bool => Ok(BvExpr::eq(
+                    self.lower_bool(args[0])?,
+                    self.lower_bool(args[1])?,
+                )),
+                Sort::BitVec(_) => {
+                    let (lhs, lhs_width) = self.lower_bv(args[0])?;
+                    let (rhs, rhs_width) = self.lower_bv(args[1])?;
+                    Self::require_same_width(name, lhs_width, rhs_width)?;
+                    Ok(BvExpr::eq(lhs, rhs))
+                }
+                sort => Err(format!("equality over unsupported sort {sort:?}")),
+            },
+            "bvult" | "bvule" | "bvugt" | "bvuge" if args.len() == 2 => {
+                let (lhs, lhs_width) = self.lower_bv(args[0])?;
+                let (rhs, rhs_width) = self.lower_bv(args[1])?;
+                Self::require_same_width(name, lhs_width, rhs_width)?;
+                let ult = |a: BvExpr, b: BvExpr| BvExpr::not(BvExpr::carry_out_sub(a, b));
+                Ok(match name {
+                    "bvult" => ult(lhs, rhs),
+                    "bvule" => BvExpr::not(ult(rhs, lhs)),
+                    "bvugt" => ult(rhs, lhs),
+                    "bvuge" => BvExpr::not(ult(lhs, rhs)),
+                    _ => unreachable!("guarded comparison"),
+                })
+            }
+            _ => Err(format!("unsupported Bool/BV predicate `{symbol}`")),
+        }
+    }
+
+    fn lower_bv_node(
+        &mut self,
+        term: TermId,
+        expected_width: u32,
+        data: TermData,
+    ) -> Result<ProofProducingExpr, String> {
+        let (expr, width) = match data {
+            TermData::Const(Constant::BitVec { value, width }) => {
+                let value = value.to_u128().ok_or_else(|| {
+                    "BitVec constant does not fit the 64-bit proof range".to_string()
+                })?;
+                (BvExpr::const_val(value, width), width)
+            }
+            TermData::Var(_, _) => (
+                BvExpr::leaf(&format!("proof_bv_{}", term.index()), expected_width),
+                expected_width,
+            ),
+            TermData::App(symbol, args) => self.lower_bv_app(&symbol, &args)?,
+            TermData::Ite(..) => {
+                return Err("BitVec ite is outside the proof-producing fragment".to_string())
+            }
+            other => return Err(format!("unsupported BitVec node {other:?}")),
+        };
+        if width != expected_width {
+            return Err(format!(
+                "term {} lowers to width {width}, expected {expected_width}",
+                term.index()
+            ));
+        }
+        Ok(ProofProducingExpr::BitVec(expr, width))
+    }
+
+    fn lower_bv_app(&mut self, symbol: &Symbol, args: &[TermId]) -> Result<(BvExpr, u32), String> {
+        if let Symbol::Indexed(name, indices) = symbol {
+            if args.is_empty() {
+                if let (Some(value), [width]) = (name.strip_prefix("bv"), indices.as_slice()) {
+                    let value = value
+                        .parse::<u128>()
+                        .map_err(|_| format!("malformed indexed BV constant `{symbol}`"))?;
+                    return Ok((BvExpr::const_val(value, *width), *width));
+                }
+            }
+            let [arg] = args else {
+                return Err(format!("indexed operator `{symbol}` requires one argument"));
+            };
+            return match (name.as_str(), indices.as_slice()) {
+                ("zero_extend", [added]) => {
+                    let (inner, width) = self.lower_bv(*arg)?;
+                    let out = width
+                        .checked_add(*added)
+                        .ok_or_else(|| "zero_extend width overflow".to_string())?;
+                    Ok((BvExpr::zero_ext(inner, *added), out))
+                }
+                ("sign_extend", [added]) => {
+                    let (inner, width) = self.lower_bv(*arg)?;
+                    let out = width
+                        .checked_add(*added)
+                        .ok_or_else(|| "sign_extend width overflow".to_string())?;
+                    Ok((BvExpr::sign_ext(inner, *added), out))
+                }
+                ("extract", [high, low]) if high >= low => {
+                    let (inner, width) = self.lower_bv(*arg)?;
+                    if *high >= width {
+                        return Err(format!("extract high bit {high} exceeds width {width}"));
+                    }
+                    Ok((BvExpr::extract(inner, *high, *low), high - low + 1))
+                }
+                _ => Err(format!("unsupported indexed BitVec operator `{symbol}`")),
+            };
+        }
+
+        let name = symbol.name();
+        if name == "bvnot" || name == "bvneg" {
+            let [arg] = args else {
+                return Err(format!("`{name}` requires one argument"));
+            };
+            let (inner, width) = self.lower_bv(*arg)?;
+            return Ok((
+                if name == "bvnot" {
+                    BvExpr::not(inner)
+                } else {
+                    BvExpr::sub(BvExpr::const_val(0, width), inner)
+                },
+                width,
+            ));
+        }
+        let [lhs_term, rhs_term] = args else {
+            return Err(format!("`{name}` requires two arguments"));
+        };
+        let (lhs, lhs_width) = self.lower_bv(*lhs_term)?;
+        let (rhs, rhs_width) = self.lower_bv(*rhs_term)?;
+        if name == "concat" {
+            let width = lhs_width
+                .checked_add(rhs_width)
+                .ok_or_else(|| "concat width overflow".to_string())?;
+            let high = BvExpr::zero_ext(lhs, rhs_width);
+            let low = BvExpr::zero_ext(rhs, lhs_width);
+            let shifted = BvExpr::shl(high, BvExpr::const_val(u128::from(rhs_width), width));
+            return Ok((BvExpr::or(shifted, low), width));
+        }
+        Self::require_same_width(name, lhs_width, rhs_width)?;
+        let expr = match name {
+            "bvadd" => BvExpr::add(lhs, rhs),
+            "bvsub" => BvExpr::sub(lhs, rhs),
+            "bvmul" => BvExpr::mul(lhs, rhs),
+            "bvand" => BvExpr::and(lhs, rhs),
+            "bvor" => BvExpr::or(lhs, rhs),
+            "bvxor" => BvExpr::xor(lhs, rhs),
+            "bvnand" => BvExpr::not(BvExpr::and(lhs, rhs)),
+            "bvnor" => BvExpr::not(BvExpr::or(lhs, rhs)),
+            "bvxnor" => BvExpr::not(BvExpr::xor(lhs, rhs)),
+            "bvshl" => BvExpr::shl(lhs, rhs),
+            "bvlshr" => BvExpr::lshr(lhs, rhs),
+            "bvashr" => BvExpr::ashr(lhs, rhs),
+            _ => return Err(format!("unsupported BitVec operator `{symbol}`")),
+        };
+        Ok((expr, lhs_width))
+    }
+
+    fn require_same_width(name: &str, lhs: u32, rhs: u32) -> Result<(), String> {
+        if lhs == rhs {
+            Ok(())
+        } else {
+            Err(format!("`{name}` width mismatch: {lhs} vs {rhs}"))
+        }
+    }
 }
 
 fn validate_bounded_clause_semantics(

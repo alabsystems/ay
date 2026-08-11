@@ -76,6 +76,7 @@ mod cmd_simplify_printer;
 mod cmd_submission;
 mod cmd_tool;
 mod cmd_tutorial;
+mod cmd_unknown_policy_probe;
 mod cmd_verifier_audit;
 mod cmd_z3_audit;
 mod competition_jit_gate;
@@ -88,12 +89,17 @@ mod explain_reason;
 mod features;
 mod firewall_verify;
 mod lean_verify;
+mod maxsat_cert;
+mod maxsat_proof;
 mod milp_fastpath;
 mod proof_artifact;
 mod proof_verify;
 mod run;
 mod stats_output;
 mod tracing_setup;
+mod z3_catalog;
+mod z3_catalog_markdown;
+mod z3_parameter_help;
 mod z3_params;
 
 // Keep format classifiers in this module's scope for both CLI preflight and
@@ -101,19 +107,34 @@ mod z3_params;
 pub(crate) use run::{is_fixedpoint_format, is_horn_logic};
 
 const DEFAULT_TIMEOUT_EXIT_CODE: i32 = 124;
+const Z3_COMMAND_LINE_ERROR_EXIT_CODE: i32 = 109;
+const Z3_INPUT_ERROR_EXIT_CODE: i32 = 110;
 const SAT_COMPETITION_UNKNOWN_EXIT_CODE: i32 = 0;
 const SAT_COMPETITION_WRAPPER_ENV: &str = "AY_INTERNAL_SATCOMP_WRAPPER";
-const SAT_COMPETITION_WRAPPER_TOKENS: &[&str] = &[
-    "main-regular-default-lrat-v1",
-    "main-ai-tuned-aggressive-lrat-v1",
-    "parallel-parallel-default-lrat-v1",
-    "cloud-cloud-default-lrat-v1",
-    "experimental-experimental-probe-lrat-v1",
-    "satcomp-variant-default-lrat-v1",
-    "satcomp-variant-aggressive-lrat-v1",
-    "satcomp-variant-minimal-lrat-v1",
-    "satcomp-variant-probe-lrat-v1",
+/// Submission routes, as `<track>-<ai_class>-<variant>`.
+///
+/// `competition/prepare_sat26_submission.sh` composes the wrapper token as
+/// `"$track-$ai_class-$variant-$proof_format-v1"`, so the route and the proof
+/// format are INDEPENDENT axes. Spelling out the products by hand encoded only
+/// the `lrat` half, which meant the script's own default (`PROOF_FORMAT="drat"`)
+/// produced `main-regular-default-drat-v1` -- a token this predicate rejected,
+/// costing the shipped submission its competition timeout code on every
+/// instance that timed out. Keep these two lists as lists.
+const SAT_COMPETITION_WRAPPER_ROUTES: &[&str] = &[
+    "main-regular-default",
+    "main-ai-tuned-aggressive",
+    "parallel-parallel-default",
+    "cloud-cloud-default",
+    "experimental-experimental-probe",
+    "satcomp-variant-default",
+    "satcomp-variant-aggressive",
+    "satcomp-variant-minimal",
+    "satcomp-variant-probe",
 ];
+
+/// Proof formats the submission script accepts; `drat` is its DEFAULT.
+/// Mirrors the `case "$PROOF_FORMAT" in drat|lrat)` guard in that script.
+const SAT_COMPETITION_WRAPPER_PROOF_FORMATS: &[&str] = &["drat", "lrat"];
 
 /// Global timeout in milliseconds (0 = no timeout)
 pub(crate) static GLOBAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +150,31 @@ static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 /// sound `unsat` printed by the solve path can never be followed by a
 /// contradictory `unknown` (contradictory verdict streams are disqualifying).
 static VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
+/// Whether the verdict already on stdout is DECISIVE (`sat`/`unsat`) rather
+/// than `unknown`. [`VERDICT_PRINTED`] alone cannot tell those apart, and the
+/// timeout path needs to: a deadline that fires during teardown, AFTER a sound
+/// decisive answer has been published, must not describe that answer as
+/// unknown-because-timeout nor report the run as failed.
+///
+/// Measured (2026-08-02, build.6432, `QF_BV/…RWS__Example_11.txt.smt2`, a file
+/// AY decides in 30-90 s):
+/// ```text
+/// $ ay --z3-mode -T:10 < file
+/// stdout: sat                          <- correct; declared :status sat, z3 and cvc5 agree
+/// stderr: (:reason-unknown "timeout")  <- contradicts the verdict on stdout
+/// exit:   124                          <- a correct answer reported as a failure
+/// ```
+/// z3 given the same budget prints `unknown` and exits 0; AY produced a BETTER
+/// answer and reported it as a failure. Six files in the 2026-08-02 corpus
+/// sweep carry this signature, and it is what makes the sweep's
+/// `DEFINITE_BUT_UNDECIDED` rule fire. The `sat` itself is sound — the
+/// [`VERDICT_PRINTED`] latch correctly suppresses the second verdict — so this
+/// is a reporting defect, not a wrong-answer channel.
+///
+/// FAIL-SAFE: solve paths that do not set this latch keep the previous
+/// behaviour exactly (stderr note + timeout exit code). Setting it can only
+/// suppress a note that contradicts a published decisive answer.
+static DECISIVE_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
 /// Shared interrupt handle for ay-dpll executor integration.
 /// Set by the watchdog thread alongside TIMED_OUT.
 pub(crate) static INTERRUPT_HANDLE: std::sync::OnceLock<Arc<AtomicBool>> =
@@ -213,6 +259,23 @@ pub(crate) static QUIET_ENABLED: AtomicBool = AtomicBool::new(false);
 /// AY stderr-commentary emission site so the suppression is centralized.
 pub(crate) fn quiet_enabled() -> bool {
     QUIET_ENABLED.load(Ordering::Relaxed)
+}
+
+/// True when DIMACS verdicts must use Z3's exit-code convention (0 for SAT and
+/// UNSAT alike) instead of the SAT Competition's 10/20. See [`SatExitCodes`].
+pub(crate) static DIMACS_Z3_EXIT_CODES: AtomicBool = AtomicBool::new(false);
+
+/// Map a SAT Competition verdict exit code to the convention in force.
+///
+/// Every DIMACS verdict exit routes through here, so the two conventions can
+/// never drift apart across the eight `s SATISFIABLE`/`s UNSATISFIABLE` exit
+/// sites. Only the code changes: stdout is already byte-identical to Z3's.
+pub(crate) fn dimacs_verdict_exit_code(competition_code: i32) -> i32 {
+    if DIMACS_Z3_EXIT_CODES.load(Ordering::Relaxed) {
+        0
+    } else {
+        competition_code
+    }
 }
 /// JSONL progress file path (#8155 subtask 7b).
 /// Set by `--progress-json` CLI flag. Read by executor and DIMACS path to
@@ -657,9 +720,14 @@ Z3-compatible options (preprocessed before parsing):\n  \
   -st                 Print statistics\n  \
   -nw                 Disable warnings (accepted, dropped)\n  \
   -v:N                Verbosity level (accepted, dropped)\n  \
-  -p, -pd             List ay-supported Z3-style parameters\n  \
-  -pm[:NAME]          List ay-supported Z3-style module parameters\n  \
-  -pp:NAME            Describe a supported Z3-style parameter\n  \
+  -p, -pd             List all Z3 5.0.0 parameters\n  \
+  -pm[:NAME]          List Z3 5.0.0 modules or one module's parameters\n  \
+  -pmmd[:NAME]        List modules or one module's parameters as Markdown\n  \
+  -pp:NAME            Describe any Z3 5.0.0 parameter\n  \
+  -tactics[:NAME]     List Z3 5.0.0 tactics or one tactic's parameters\n  \
+  -tacticsmd:NAME     Describe one Z3 5.0.0 tactic as Markdown\n  \
+  -simplifiers[:NAME] List Z3 5.0.0 simplifiers or one simplifier's parameters\n  \
+  -probes             List Z3 5.0.0 probes\n  \
   --z3-mode           Suppress AY transcript provenance for Z3 comparisons\n  \
   --                  End option parsing; useful for files named '-...'\n  \
   timeout=N           Timeout in milliseconds\n  \
@@ -681,8 +749,7 @@ Z3-compatible options (preprocessed before parsing):\n  \
   fp.engine=spacer    CHC engine (accepted, dropped)\n  \
   -?, -version        Help/version aliases\n\n\
 Unsupported Z3 options are rejected explicitly instead of emulated:\n  \
-  -dl, -wcnf, -opb, -lp, -log\n  \
-  -tactics[:NAME], -simplifiers[:NAME], -probes, -pmmd:NAME",
+  -dl, -opb, -log",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -766,6 +833,23 @@ enum Command {
     /// Discover, run, and gate the repo's indexed scripts
     #[command(subcommand, long_about = cmd_scripts::GROUP_LONG_ABOUT, hide = true)]
     Scripts(cmd_scripts::ScriptsCommand),
+    /// Exercise the closed Unknown-reason and stale-artifact contract
+    #[command(name = "unknown-policy-probe", hide = true)]
+    UnknownPolicyProbe(cmd_unknown_policy_probe::UnknownPolicyProbeArgs),
+}
+
+/// Exit-code convention for a DIMACS verdict.
+///
+/// The SAT Competition reserves 10 for SATISFIABLE and 20 for UNSATISFIABLE.
+/// Z3 does not: it exits 0 for both, reporting the verdict on stdout only. A
+/// drop-in `z3` install therefore has to follow Z3, or every caller that tests
+/// `$?` sees a nonzero status and reads it as failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SatExitCodes {
+    /// Exit 0 for SAT and UNSAT alike, as Z3 does.
+    Z3,
+    /// Exit 10 for SAT and 20 for UNSAT, as the SAT Competition requires.
+    Competition,
 }
 
 /// Arguments for `ay solve` (the default subcommand).
@@ -807,6 +891,15 @@ struct SolveArgs {
     #[arg(long = "z3-mode")]
     z3_mode: bool,
 
+    /// Exit-code convention for DIMACS verdicts (`z3` or `competition`).
+    ///
+    /// Defaults to `competition` (10 = SAT, 20 = UNSAT), except when the Z3
+    /// compatibility surface is active -- an explicit `--z3-mode`, or an
+    /// `argv[0]` of `z3` from a drop-in install -- where it defaults to `z3`
+    /// (0 for both). An explicit value here overrides both.
+    #[arg(long = "sat-exit-codes", value_enum)]
+    sat_exit_codes: Option<SatExitCodes>,
+
     /// Internal compatibility carrier for unsupported Z3 `key=value` params.
     #[arg(long = "unsupported-z3-param", hide = true)]
     unsupported_z3_param: Vec<String>,
@@ -816,21 +909,17 @@ struct SolveArgs {
     #[arg(long = "ignored-z3-param", hide = true)]
     ignored_z3_param: Vec<String>,
 
-    /// Internal compatibility flag for Z3 `-p`.
-    #[arg(long = "z3-print-params", hide = true)]
-    z3_print_params: bool,
+    /// Internal compatibility carrier for terminal Z3 parameter/help requests.
+    #[arg(long = "z3-parameter-request", hide = true, allow_hyphen_values = true)]
+    z3_parameter_request: Option<String>,
 
-    /// Internal compatibility flag for Z3 `-pd`.
-    #[arg(long = "z3-print-param-descriptions", hide = true)]
-    z3_print_param_descriptions: bool,
+    /// Internal compatibility carrier for Z3 tactic/probe/simplifier listings.
+    #[arg(long = "z3-catalog-request", hide = true, allow_hyphen_values = true)]
+    z3_catalog_request: Vec<String>,
 
-    /// Internal compatibility flag for Z3 `-pm[:name]`.
-    #[arg(long = "z3-print-param-module", hide = true, value_name = "NAME")]
-    z3_print_param_module: Option<String>,
-
-    /// Internal compatibility flag for Z3 `-pp:name`.
-    #[arg(long = "z3-print-param-description", hide = true, value_name = "NAME")]
-    z3_print_param_description: Option<String>,
+    /// Internal compatibility carrier for Z3's non-SMT optimization parsers.
+    #[arg(long = "z3-input-mode", hide = true, value_enum)]
+    z3_input_mode: Option<Z3InputMode>,
 
     /// Internal compatibility carrier for unsupported Z3 CLI options.
     #[arg(
@@ -1496,11 +1585,30 @@ pub(crate) fn sat_competition_wrapper_timeout_policy() -> bool {
         .is_ok_and(|value| is_sat_competition_wrapper_token(&value))
 }
 
+/// Whether `value` is a wrapper token the submission script can compose:
+/// `<route>-<proof-format>-v1`, over every route x format pair.
 pub(crate) fn is_sat_competition_wrapper_token(value: &str) -> bool {
     let value = value.trim();
-    SAT_COMPETITION_WRAPPER_TOKENS
-        .iter()
-        .any(|token| value.eq_ignore_ascii_case(token))
+    let Some(route) = value
+        .len()
+        .checked_sub("-v1".len())
+        .filter(|_| value.ends_with("-v1") || value.to_ascii_lowercase().ends_with("-v1"))
+        .map(|end| &value[..end])
+    else {
+        return false;
+    };
+
+    SAT_COMPETITION_WRAPPER_PROOF_FORMATS.iter().any(|format| {
+        route
+            .len()
+            .checked_sub(format.len() + 1)
+            .filter(|&split| route[split..].eq_ignore_ascii_case(&format!("-{format}")))
+            .is_some_and(|split| {
+                SAT_COMPETITION_WRAPPER_ROUTES
+                    .iter()
+                    .any(|known| route[..split].eq_ignore_ascii_case(known))
+            })
+    })
 }
 
 pub(crate) fn timeout_exit_code_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> i32 {
@@ -1527,6 +1635,41 @@ fn timeout_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper: bool
     }
 }
 
+/// What a fired deadline should report: the stderr note (if any) and the exit
+/// code. Pure, so the policy is pinned by a test rather than living inline in
+/// two `process::exit` paths that cannot be exercised in-process.
+///
+/// The load-bearing case is `decisive_verdict_published`. A deadline that fires
+/// AFTER a sound `sat`/`unsat` reached stdout is a teardown overrun — proof
+/// materialization, model emission, cleanup — not a failure to decide. Saying
+/// `(:reason-unknown "timeout")` there contradicts the verdict (that field
+/// describes an `unknown`), and exiting 124 reports a correct answer as a
+/// failed run. See [`DECISIVE_VERDICT_PRINTED`] for the measurement.
+fn timeout_exit_policy(
+    decisive_verdict_published: bool,
+    sat_competition_wrapper: bool,
+    export_abandoned: bool,
+) -> (Option<&'static [u8]>, i32) {
+    let timeout_code = timeout_exit_code_for_sat_competition_wrapper(sat_competition_wrapper);
+    if export_abandoned {
+        // The export path already emitted its own `(error ...)`; adding a
+        // timeout note on top would be a second, conflicting explanation.
+        return (None, timeout_code);
+    }
+    if decisive_verdict_published {
+        return (
+            Some(b"c timeout after the verdict was published; verdict stands\n"),
+            0,
+        );
+    }
+    (
+        Some(timeout_stderr_line_for_sat_competition_wrapper(
+            sat_competition_wrapper,
+        )),
+        timeout_code,
+    )
+}
+
 fn abandon_unfinished_bv_cnf_export(reason: &str) -> bool {
     if VERDICT_PRINTED.load(Ordering::SeqCst) {
         return false;
@@ -1551,16 +1694,153 @@ fn hard_timeout_fallback_exit() -> ! {
         );
         let _ = Write::flush(&mut io::stdout());
     }
+    let (note, code) = timeout_exit_policy(
+        decisive_verdict_already_published(),
+        sat_competition_wrapper,
+        export_abandoned,
+    );
+    if let Some(line) = note {
+        let _ = Write::write_all(&mut io::stderr(), line);
+    }
+    let _ = Write::flush(&mut io::stderr());
+    std::process::exit(code);
+}
+
+/// Poll interval for the memory watchdog: one footprint read per tick, taken
+/// off the solver threads.
+const MEMORY_WATCHDOG_POLL: Duration = Duration::from_millis(100);
+
+/// Grace given to the cooperative stop before the memory watchdog hard-exits.
+/// Matches the global-timeout watchdog's 2 s, for the same reason: a thread in
+/// non-interruptible computation can otherwise prevent exit indefinitely.
+const MEMORY_WATCHDOG_GRACE: Duration = Duration::from_secs(2);
+
+const MEMOUT_STDOUT_SMTLIB: &[u8] = b"unknown\n";
+const MEMOUT_STDOUT_SAT_COMPETITION: &[u8] = b"s UNKNOWN\n";
+const MEMOUT_STDERR_SMTLIB: &[u8] = b"(:reason-unknown \"memout\")\n";
+const MEMOUT_STDERR_SAT_COMPETITION: &[u8] = b"c memout\n";
+
+/// Verdict emitted when the allocator's hard ceiling refuses growth, per output
+/// grammar. These are `static` because the breach happens inside the global
+/// allocator, which can only reach `'static` bytes — nothing may be formatted
+/// there.
+static HARD_CEILING_SMTLIB: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
+    stdout_line: MEMOUT_STDOUT_SMTLIB,
+    stderr_line: MEMOUT_STDERR_SMTLIB,
+    exit_code: DEFAULT_TIMEOUT_EXIT_CODE,
+};
+static HARD_CEILING_SAT_COMPETITION: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
+    stdout_line: MEMOUT_STDOUT_SAT_COMPETITION,
+    stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
+    exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
+};
+
+fn memory_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> &'static [u8] {
+    if sat_competition_wrapper {
+        MEMOUT_STDOUT_SAT_COMPETITION
+    } else {
+        MEMOUT_STDOUT_SMTLIB
+    }
+}
+
+fn memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> &'static [u8] {
+    if sat_competition_wrapper {
+        MEMOUT_STDERR_SAT_COMPETITION
+    } else {
+        MEMOUT_STDERR_SMTLIB
+    }
+}
+
+/// Arm the allocator's hard ceiling at the full `--memory` budget.
+///
+/// The layering matters: the advisory signals trip at 95%, so a run that can
+/// reach a cancellation checkpoint still stops gracefully and returns `unknown`
+/// through the normal path with its statistics and proof intact. This ceiling
+/// refuses only the growth that no checkpoint ever saw — a burst between two
+/// checkpoints, measured at 3-4x the budget on bit-blasting workloads, which no
+/// observer-based signal can bound because they can only request a stop.
+fn arm_hard_memory_ceiling(limit_bytes: usize) {
+    let action = if sat_competition_wrapper_timeout_policy() {
+        &HARD_CEILING_SAT_COMPETITION
+    } else {
+        &HARD_CEILING_SMTLIB
+    };
+    ay_sys::arm_hard_memory_ceiling(limit_bytes, action);
+}
+
+/// Emit the `unknown` verdict for a breached `--memory` budget, then exit.
+///
+/// Mirrors [`hard_timeout_fallback_exit`]: the verdict grammar is identical
+/// (SMT-LIB 2.6 and SAT-COMP both require one of sat/unsat/unknown on every
+/// run) and the exit code is the same resource-exhaustion code, so only the
+/// `:reason-unknown` payload distinguishes a memout from a timeout.
+fn hard_memory_fallback_exit() -> ! {
+    let sat_competition_wrapper = sat_competition_wrapper_timeout_policy();
+    let export_abandoned = abandon_unfinished_bv_cnf_export("memory limit exceeded");
+    if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
+        let _ = Write::write_all(
+            &mut io::stdout(),
+            memory_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper),
+        );
+        let _ = Write::flush(&mut io::stdout());
+    }
     if !export_abandoned {
         let _ = Write::write_all(
             &mut io::stderr(),
-            timeout_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper),
+            memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper),
         );
     }
     let _ = Write::flush(&mut io::stderr());
     std::process::exit(timeout_exit_code_for_sat_competition_wrapper(
         sat_competition_wrapper,
     ));
+}
+
+/// Escalation policy of the memory watchdog, split out of the thread so it is
+/// testable without allocating: poll `over_budget` every `poll`, and on the
+/// first breach run `on_breach` (the cooperative stop) and then wait out
+/// `grace`. Returns only when the caller should hard-exit.
+fn run_memory_watchdog(
+    mut over_budget: impl FnMut() -> bool,
+    poll: Duration,
+    grace: Duration,
+    on_breach: impl FnOnce(),
+    mut sleep: impl FnMut(Duration),
+) {
+    while !over_budget() {
+        sleep(poll);
+    }
+    on_breach();
+    sleep(grace);
+}
+
+/// Arm the memory watchdog for a run that carries a positive `--memory` budget.
+///
+/// Without it the budget is enforced only where a solver thread reaches a
+/// cancellation checkpoint and calls `ay_sys::process_memory_exceeded`. A
+/// thread blocked in the kernel waiting for pages never reaches one, so the
+/// process keeps growing and the OS — not the solver — ends the run: on
+/// 2026-07-30 nine `ay` solves, each carrying an 8.4 GB budget, grew past
+/// 50 GB of footprint apiece and panicked a 24 GB host through the userspace
+/// watchdog, with every thread parked in an uninterruptible VM wait.
+///
+/// `RLIMIT_AS` is not an alternative here: Darwin aliases it to `RLIMIT_RSS`
+/// and rejects `setrlimit` on both with `EINVAL`, so the only enforcement
+/// available in-process is to observe the footprint and act on it. Time
+/// already has this safety net in [`set_global_timeout`]; this is its memory
+/// twin, and it is what makes `--memory` a limit rather than a hint.
+fn arm_memory_watchdog() {
+    let handle = Arc::clone(INTERRUPT_HANDLE.get_or_init(|| Arc::new(AtomicBool::new(false))));
+    std::thread::spawn(move || {
+        run_memory_watchdog(
+            ay_sys::process_memory_exceeded,
+            MEMORY_WATCHDOG_POLL,
+            MEMORY_WATCHDOG_GRACE,
+            move || handle.store(true, Ordering::SeqCst),
+            std::thread::sleep,
+        );
+        hard_memory_fallback_exit();
+    });
 }
 
 /// Set global timeout in milliseconds
@@ -1627,24 +1907,36 @@ pub(crate) fn exit_if_timed_out() {
                 safe_println!("unknown");
             }
         }
-        if !export_abandoned {
-            if sat_competition_wrapper {
-                safe_eprintln!("c timeout");
-            } else {
-                safe_eprintln!("(:reason-unknown \"timeout\")");
-            }
+        let (note, code) = timeout_exit_policy(
+            decisive_verdict_already_published(),
+            sat_competition_wrapper,
+            export_abandoned,
+        );
+        if let Some(line) = note {
+            let _ = Write::write_all(&mut io::stderr(), line);
         }
         // Flush buffered I/O before process::exit skips destructors.
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
-        std::process::exit(timeout_exit_code_for_sat_competition_wrapper(
-            sat_competition_wrapper,
-        ));
+        std::process::exit(code);
     }
 }
 
 pub(crate) fn mark_verdict_printed() -> bool {
     VERDICT_PRINTED.swap(true, Ordering::SeqCst)
+}
+
+/// Record that the verdict published to stdout was DECISIVE (`sat`/`unsat`).
+/// Call alongside [`mark_verdict_printed`] on paths that know their verdict.
+/// See [`DECISIVE_VERDICT_PRINTED`].
+pub(crate) fn mark_decisive_verdict_printed() {
+    DECISIVE_VERDICT_PRINTED.store(true, Ordering::SeqCst);
+}
+
+/// True when a decisive verdict is already on stdout, so a timeout firing
+/// afterwards must not contradict it.
+fn decisive_verdict_already_published() -> bool {
+    DECISIVE_VERDICT_PRINTED.load(Ordering::SeqCst)
 }
 
 /// Returns true when the global watchdog timeout has fired.
@@ -2116,319 +2408,12 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "submission",
     "verifier-audit",
     "scripts",
+    "unknown-policy-probe",
     "help",
 ];
 
 /// Internal env var used by the solve-session provenance wrapper.
 const SESSION_PROVENANCE_CHILD_ENV: &str = "AY_INTERNAL_PROVENANCE_CHILD";
-
-struct Z3CompatModuleInfo {
-    name: &'static str,
-    description: &'static str,
-}
-
-struct Z3CompatParamInfo {
-    module: Option<&'static str>,
-    name: &'static str,
-    ty: &'static str,
-    default: &'static str,
-    description: &'static str,
-}
-
-const Z3_COMPAT_MODULES: &[Z3CompatModuleInfo] = &[
-    Z3CompatModuleInfo {
-        name: "fp",
-        description: "fixedpoint and CHC compatibility parameters",
-    },
-    Z3CompatModuleInfo {
-        name: "nlsat",
-        description: "nonlinear arithmetic compatibility parameters",
-    },
-    Z3CompatModuleInfo {
-        name: "sat",
-        description: "SAT compatibility parameters",
-    },
-    Z3CompatModuleInfo {
-        name: "smt",
-        description: "SMT compatibility parameters",
-    },
-];
-
-const Z3_COMPAT_PARAMS: &[Z3CompatParamInfo] = &[
-    Z3CompatParamInfo {
-        module: None,
-        name: "auto_config",
-        ty: "bool",
-        default: "true",
-        description: "accepted for Z3 command-line compatibility; ay configures solvers automatically",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "ctrl_c",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op; ay uses its own interrupt handling",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op; use -model to print a satisfiable SMT model",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "dump_models",
-        ty: "bool",
-        default: "false",
-        description: "print a model after satisfiable SMT-LIB checks when set to true",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "dump-models",
-        ty: "bool",
-        default: "false",
-        description: "alias for dump_models; print a model after satisfiable SMT-LIB checks when set to true",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "memory_max_size",
-        ty: "unsigned int",
-        default: "0",
-        description: "memory limit in megabytes; 0 means no limit",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model_validate",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay model validation is controlled by --validate",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model.v2",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op; ay uses its native model printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model.compact",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native model printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model.completion",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native model printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "model.partial",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native model printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.decimal",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.decimal_precision",
-        ty: "unsigned int",
-        default: "10",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.single-line",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.bv-literals",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op; ay uses its native bit-vector printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.fixed-indent",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.max-depth",
-        ty: "unsigned int",
-        default: "5",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "pp.max-ribbon",
-        ty: "unsigned int",
-        default: "80",
-        description: "accepted as a compatibility no-op; ay uses its native pretty-printer",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "proof",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; use --proof FILE for proof output",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "random_seed",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op; ay search is deterministic for this CLI path",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "rlimit",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op; use -t:N or timeout=N for time limits",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "smtlib2_compliant",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay parses SMT-LIB2 input by default",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "stats",
-        ty: "bool",
-        default: "false",
-        description: "print ay statistics when set to true",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "timeout",
-        ty: "unsigned int",
-        default: "0",
-        description: "timeout in milliseconds; 0 means no timeout",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "trace",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay does not emit Z3 VCC trace logs",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "trace_file_name",
-        ty: "string",
-        default: "z3.log",
-        description: "accepted as a compatibility no-op for Z3 trace file wrappers",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "type_check",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "type-check",
-        ty: "bool",
-        default: "true",
-        description: "alias for type_check; accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "unsat_core",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op; ay does not expose Z3 unsat-core output through this flag",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "debug-ref-count",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "verbose",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted for wrapper compatibility; use --verbose for ay tracing",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "warning",
-        ty: "bool",
-        default: "true",
-        description: "accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "well_sorted_check",
-        ty: "bool",
-        default: "false",
-        description: "accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: None,
-        name: "well-sorted-check",
-        ty: "bool",
-        default: "false",
-        description: "alias for well_sorted_check; accepted as a compatibility no-op",
-    },
-    Z3CompatParamInfo {
-        module: Some("fp"),
-        name: "engine",
-        ty: "symbol",
-        default: "spacer",
-        description: "accepted CHC engine selector values: spacer, auto-config, datalog, bmc",
-    },
-    Z3CompatParamInfo {
-        module: Some("fp"),
-        name: "spacer.random_seed",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op for Spacer random seed settings",
-    },
-    Z3CompatParamInfo {
-        module: Some("nlsat"),
-        name: "seed",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op for nonlinear arithmetic seed settings",
-    },
-    Z3CompatParamInfo {
-        module: Some("sat"),
-        name: "random_seed",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op for SAT random seed settings",
-    },
-    Z3CompatParamInfo {
-        module: Some("smt"),
-        name: "random_seed",
-        ty: "unsigned int",
-        default: "0",
-        description: "accepted as a compatibility no-op for SMT random seed settings",
-    },
-];
 
 fn is_help_or_version_flag(arg: &str) -> bool {
     is_help_flag(arg) || is_version_flag(arg)
@@ -2446,6 +2431,69 @@ fn is_solve_full_help_flag(arg: &str) -> bool {
     matches!(arg, "--help=full" | "--full-help")
 }
 
+/// Emit stock Z3 help/version behavior only when the caller explicitly asks
+/// for Z3 transcript mode (or invokes an `ay` symlink named `z3`). Ordinary AY
+/// help and version output remain unchanged.
+fn maybe_print_explicit_z3_meta(raw: &[String]) -> bool {
+    let explicit_mode = raw
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--z3-mode");
+    if !explicit_mode && !argv0_is_z3(raw) {
+        return false;
+    }
+
+    let mut prior_catalogs = Vec::new();
+    for arg in raw.iter().skip(1).take_while(|arg| arg.as_str() != "--") {
+        if arg == "--z3-mode" {
+            continue;
+        }
+        // These options terminate Z3's left-to-right argument parser. Let the
+        // normal preprocessor retain them and discard every later argument.
+        if is_z3_terminal_parameter_option(arg) {
+            return false;
+        }
+        if is_z3_catalog_option(arg) {
+            prior_catalogs.push(arg.as_str());
+            continue;
+        }
+        match arg.as_str() {
+            "-h" | "-?" | "--help" => {
+                for request in prior_catalogs {
+                    z3_catalog::print_request(request);
+                }
+                z3_parameter_help::print_z3_help();
+                return true;
+            }
+            "-version" | "--version" => {
+                for request in prior_catalogs {
+                    z3_catalog::print_request(request);
+                }
+                z3_parameter_help::print_z3_version();
+                return true;
+            }
+            "-v" => {
+                for request in prior_catalogs {
+                    z3_catalog::print_request(request);
+                }
+                z3_parameter_help::print_missing_verbosity_error();
+                std::process::exit(Z3_COMMAND_LINE_ERROR_EXIT_CODE);
+            }
+            "-V" => {
+                for request in prior_catalogs {
+                    z3_catalog::print_request(request);
+                }
+                safe_eprintln!("Error: invalid command line option: -V");
+                safe_eprintln!("For usage information: z3 -h");
+                std::process::exit(Z3_COMMAND_LINE_ERROR_EXIT_CODE);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// True when a `solve` invocation carries `-q`/`--quiet` before any `--`.
 ///
 /// Consulted in `main()` before the session supervisor forks so the pre-fork
@@ -2460,6 +2508,26 @@ fn solve_quiet_requested(processed: &[String]) -> bool {
         .skip(2)
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| matches!(arg.as_str(), "-q" | "--quiet"))
+}
+
+/// Whether `--z3-mode` is active for this `solve` invocation.
+///
+/// Mirrors [`solve_quiet_requested`] and exists for the same reason: the flag
+/// must be known in `main()` *before* the session supervisor forks, so the
+/// pre-fork `c ay.session.start` marker is suppressed too. `run_solve` re-affirms
+/// `Z3_MODE_ENABLED` from the parsed args for the in-process solve path.
+///
+/// Reads the PREPROCESSED args so that a `--z3-mode` injected from an argv[0] of
+/// `z3` (see `inject_z3_mode_from_argv0`) counts exactly like an explicit flag.
+fn solve_z3_mode_requested(processed: &[String]) -> bool {
+    if !matches!(processed.get(1).map(String::as_str), Some("solve")) {
+        return false;
+    }
+    processed
+        .iter()
+        .skip(2)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg.as_str() == "--z3-mode")
 }
 
 fn maybe_print_solve_full_help(processed: &[String]) -> bool {
@@ -2486,173 +2554,24 @@ fn maybe_print_solve_full_help(processed: &[String]) -> bool {
     true
 }
 
-fn print_z3_compat_param_line(param: &Z3CompatParamInfo, descriptions: bool) {
-    if descriptions {
-        safe_println!(
-            "    {} ({}) {} (default: {})",
-            param.name,
-            param.ty,
-            param.description,
-            param.default
-        );
-    } else {
-        safe_println!(
-            "    {} ({}) (default: {})",
-            param.name,
-            param.ty,
-            param.default
-        );
-    }
-}
-
-fn print_z3_compat_global_params(descriptions: bool) {
-    safe_println!("Global parameters");
-    for param in Z3_COMPAT_PARAMS
-        .iter()
-        .filter(|param| param.module.is_none())
-    {
-        print_z3_compat_param_line(param, descriptions);
-    }
-}
-
-fn print_z3_compat_module_header(module: &Z3CompatModuleInfo) {
-    safe_println!(
-        "[module] {}, description: {}",
-        module.name,
-        module.description
-    );
-}
-
-fn print_z3_compat_module_params(module_name: &str, descriptions: bool) -> bool {
-    let Some(module) = Z3_COMPAT_MODULES
-        .iter()
-        .find(|module| module.name == module_name)
-    else {
-        return false;
-    };
-
-    print_z3_compat_module_header(module);
-    for param in Z3_COMPAT_PARAMS
-        .iter()
-        .filter(|param| param.module == Some(module_name))
-    {
-        print_z3_compat_param_line(param, descriptions);
-    }
-    true
-}
-
-fn print_z3_compat_module_list() {
-    for module in Z3_COMPAT_MODULES {
-        print_z3_compat_module_header(module);
-    }
-}
-
-fn print_z3_compatible_params(descriptions: bool) {
-    print_z3_compat_global_params(descriptions);
-    safe_println!();
-    safe_println!("To set a module parameter, use <module-name>.<parameter-name>=value");
-    safe_println!("Example: fp.engine=spacer");
-    safe_println!();
-    for module in Z3_COMPAT_MODULES {
-        print_z3_compat_module_params(module.name, descriptions);
-    }
-    safe_println!();
-    safe_println!(
-        "Note: ay lists the Z3-compatible parameters it accepts, not Z3's full parameter database."
-    );
-}
-
-fn print_unknown_z3_module_and_exit(module_name: &str) -> ! {
-    safe_eprintln!("ERROR: unknown module '{module_name}'");
-    safe_eprintln!("Legal modules are:");
-    for module in Z3_COMPAT_MODULES {
-        safe_eprintln!("  {}", module.name);
-    }
-    std::process::exit(110);
-}
-
-fn z3_compat_param_key(param: &Z3CompatParamInfo) -> String {
-    match param.module {
-        Some(module) => format!("{module}.{}", param.name),
-        None => param.name.to_string(),
-    }
-}
-
-fn find_z3_compat_param(name: &str) -> Option<&'static Z3CompatParamInfo> {
-    Z3_COMPAT_PARAMS.iter().find(|param| {
-        if param.name == name {
-            return true;
-        }
-
-        let Some(module) = param.module else {
-            return false;
-        };
-        let Some(rest) = name.strip_prefix(module) else {
-            return false;
-        };
-        rest.strip_prefix('.') == Some(param.name)
-    })
-}
-
-fn print_z3_compat_param_description_or_exit(name: &str) {
-    let Some(param) = find_z3_compat_param(name) else {
-        safe_eprintln!("ERROR: unknown parameter '{name}'");
-        safe_eprintln!("Legal parameters are:");
-        for param in Z3_COMPAT_PARAMS {
-            safe_eprintln!(
-                "  {} ({}) (default: {})",
-                z3_compat_param_key(param),
-                param.ty,
-                param.default
-            );
-        }
-        std::process::exit(110);
-    };
-
-    safe_println!("{}  {}", z3_compat_param_key(param), param.description);
-}
-
 fn print_unsupported_z3_option(option: &str) {
+    if option == "-opb" {
+        // The authenticated Z3 5.0.0 Homebrew binary advertises -opb in
+        // `-h`, but this build rejects it in the command-line parser.
+        safe_eprintln!("Error: invalid command line option: -opb");
+        safe_eprintln!("For usage information: z3 -h");
+        return;
+    }
     safe_eprintln!("Error: unsupported Z3 option '{option}'");
     match option {
-        opt if opt == "-tactics" || opt.starts_with("-tactics:") => {
-            safe_eprintln!("       ay does not expose Z3's tactic catalog.");
-            safe_eprintln!("       Use `ay simplify` for ay's SMT-LIB simplifier command.");
-        }
-        opt if opt == "-simplifiers" || opt.starts_with("-simplifiers:") => {
-            safe_eprintln!("       ay does not expose Z3's simplifier catalog.");
-            safe_eprintln!("       Use `ay simplify` for ay's SMT-LIB simplifier command.");
-        }
-        "-probes" => {
-            safe_eprintln!("       ay does not implement Z3 probes.");
-        }
         "-dl" => {
             safe_eprintln!("       Datalog input is not supported by the ay solve path.");
-        }
-        "-wcnf" => {
-            safe_eprintln!("       Weighted CNF DIMACS is not supported by `ay solve`.");
-            safe_eprintln!("       For OPB/WBO pseudo-Boolean input, use `ay pb solve FILE`.");
-        }
-        "-opb" => {
-            safe_eprintln!("       Flag-style OPB parsing is not supported.");
-            safe_eprintln!("       Use `ay pb solve FILE`.");
-        }
-        "-lp" => {
-            safe_eprintln!("       Flag-style CPLEX LP parsing is not supported.");
-            safe_eprintln!("       Use `ay lp solve FILE`.");
         }
         "-log" => {
             safe_eprintln!("       Z3 log input is not supported.");
         }
-        "-pp" => {
-            safe_eprintln!("       option argument (-pp:name) is missing.");
-        }
         opt if opt.starts_with("-v:") => {
             safe_eprintln!("       invalid verbosity level; expected an unsigned integer.");
-        }
-        opt if opt.starts_with("-pmmd:") => {
-            safe_eprintln!("       Markdown Z3 parameter listings are not supported.");
-            safe_eprintln!("       Use -pm:name for ay's text compatibility subset.");
         }
         _ => {
             safe_eprintln!("       ay does not implement this Z3 CLI surface.");
@@ -2661,14 +2580,38 @@ fn print_unsupported_z3_option(option: &str) {
 }
 
 fn is_unsupported_z3_option(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-dl" | "-wcnf" | "-opb" | "-lp" | "-log" | "-probes" | "-pp"
-    ) || arg.starts_with("-tactics:")
-        || arg == "-tactics"
-        || arg.starts_with("-simplifiers:")
+    matches!(arg, "-dl" | "-opb" | "-log")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Z3InputMode {
+    Wcnf,
+    Opb,
+    Lp,
+}
+
+fn is_z3_catalog_option(arg: &str) -> bool {
+    arg == "-tactics"
+        || arg.starts_with("-tactics:")
         || arg == "-simplifiers"
+        || arg.starts_with("-simplifiers:")
+        || arg == "-probes"
+        || arg.starts_with("-probes:")
+        || arg.starts_with("-tacticsmd:")
+}
+
+fn is_z3_terminal_parameter_option(arg: &str) -> bool {
+    arg == "-p"
+        || arg.starts_with("-p:")
+        || arg == "-pd"
+        || arg.starts_with("-pd:")
+        || arg == "-pm"
+        || arg.starts_with("-pm:")
+        || arg == "-pmmd"
         || arg.starts_with("-pmmd:")
+        || arg == "-pp"
+        || arg.starts_with("-pp:")
+        || arg == "-tacticsmd"
 }
 
 /// Preprocess raw CLI args for Z3 backward compatibility and subcommand injection.
@@ -2685,7 +2628,8 @@ fn is_unsupported_z3_option(arg: &str) -> bool {
 /// - `-st` -> `--stats`
 /// - `-nw` -> (dropped)
 /// - `-v:N` -> (dropped)
-/// - `-p`, `-pd`, `-pm[:name]`, `-pp:name` -> Z3-style parameter listings
+/// - `-p`, `-pd`, `-pm[md][:name]`, `-pp:name` -> exact Z3 5.0 parameter help
+/// - `-tactics[md][:name]`, `-simplifiers[:name]`, `-probes` -> exact catalogs
 /// - `timeout=N` -> `--timeout N`
 /// - `memory_max_size=N` -> `--memory N`
 /// - `stats=true` -> `--stats`
@@ -2705,6 +2649,12 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
     }
 
     let mut processed = Vec::with_capacity(raw.len() + 1);
+    let explicit_input_format = raw.iter().skip(1).any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-smt2" | "-dimacs" | "-dl" | "-wcnf" | "-opb" | "-pbo" | "-lp" | "-log"
+        )
+    });
 
     // Always keep argv[0]
     if let Some(prog) = raw.first() {
@@ -2755,6 +2705,12 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
         } else if arg == "-model" {
             // Z3: -model asks for a model after a satisfiable SMT query.
             processed.push("--z3-model".to_string());
+        } else if arg == "-wcnf" {
+            processed.push("--z3-input-mode=wcnf".to_string());
+        } else if arg == "-pbo" {
+            processed.push("--z3-input-mode=opb".to_string());
+        } else if arg == "-lp" {
+            processed.push("--z3-input-mode=lp".to_string());
         } else if arg == "--visualize"
             && raw
                 .get(i + 1)
@@ -2774,25 +2730,17 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
                 processed.push("--unsupported-z3-option".to_string());
                 processed.push(arg.clone());
             }
-        } else if arg == "-p" {
-            // Z3: -p lists global and module parameters. ay prints the
-            // Z3-style parameter subset this CLI actually accepts.
-            processed.push("--z3-print-params".to_string());
-        } else if arg == "-pd" {
-            // Z3: -pd lists parameter descriptions.
-            processed.push("--z3-print-param-descriptions".to_string());
-        } else if arg == "-pm" {
-            // Z3: -pm lists module names.
-            processed.push("--z3-print-param-module".to_string());
-            processed.push(String::new());
-        } else if let Some(module_name) = arg.strip_prefix("-pm:") {
-            // Z3: -pm:name lists one module's parameters.
-            processed.push("--z3-print-param-module".to_string());
-            processed.push(module_name.to_string());
-        } else if let Some(param_name) = arg.strip_prefix("-pp:") {
-            // Z3: -pp:name prints one parameter description.
-            processed.push("--z3-print-param-description".to_string());
-            processed.push(param_name.to_string());
+        } else if is_z3_terminal_parameter_option(arg) {
+            // Z3 exits immediately after these discovery/error requests. Drop
+            // all later argv exactly as its left-to-right parser does.
+            processed.push("--z3-parameter-request".to_string());
+            processed.push(arg.clone());
+            break;
+        } else if is_z3_catalog_option(arg) {
+            // Unlike -p/-pm, these Z3 listings do not terminate option
+            // processing: Z3 prints them and then reads the selected input.
+            processed.push("--z3-catalog-request".to_string());
+            processed.push(arg.clone());
         } else if is_unsupported_z3_option(arg) {
             processed.push("--unsupported-z3-option".to_string());
             processed.push(arg.clone());
@@ -2823,10 +2771,40 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
                 processed.push(arg.clone());
             }
         } else {
+            if !explicit_input_format
+                && !processed
+                    .iter()
+                    .any(|value| value.starts_with("--z3-input-mode="))
+            {
+                if let Some(mode) = z3_input_mode_from_extension(arg) {
+                    processed.push(format!("--z3-input-mode={mode}"));
+                }
+            }
             processed.push(arg.clone());
         }
 
         i += 1;
+    }
+
+    // `-file:PATH` and filenames containing `=` take specialized branches
+    // above. Preserve Z3's extension-based parser selection for those forms
+    // too, without overriding an explicit input-format switch.
+    if !explicit_input_format
+        && !processed
+            .iter()
+            .any(|value| value.starts_with("--z3-input-mode="))
+    {
+        if let Some(mode) = processed
+            .iter()
+            .skip(1)
+            .find_map(|argument| z3_input_mode_from_extension(argument))
+        {
+            let insert_at = usize::from(matches!(
+                processed.get(1).map(String::as_str),
+                Some("solve")
+            )) + 1;
+            processed.insert(insert_at, format!("--z3-input-mode={mode}"));
+        }
     }
 
     // Subcommand injection: if the first non-flag arg after argv[0] is not a
@@ -2835,6 +2813,19 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
     inject_z3_mode_from_argv0(&raw, &mut processed);
 
     processed
+}
+
+fn z3_input_mode_from_extension(argument: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(argument)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "wcnf" => Some("wcnf"),
+        "opb" => Some("opb"),
+        "lp" => Some("lp"),
+        _ => None,
+    }
 }
 
 fn inject_z3_mode_from_argv0(raw: &[String], processed: &mut Vec<String>) {
@@ -3292,18 +3283,18 @@ fn solve_session_needs_wrapper(processed: &[String]) -> bool {
             // generation after an abort, so it must not synthesize Unknown.
             return false;
         }
-        if arg == "--z3-mode" {
-            return false;
-        }
+        // `--z3-mode` is deliberately NOT excluded here. Its stderr contract is
+        // honored by suppressing the session markers (see
+        // `eprint_session_marker`), not by dropping supervision — the
+        // Z3-compatible path is the one every benchmark harness runs, and it was
+        // the only path where a crashing solve produced no verdict at all.
         // Preserve machine-readable stderr contracts.
         if matches!(
             arg.as_str(),
             "--features"
                 | "--stats-json"
-                | "--z3-print-params"
-                | "--z3-print-param-descriptions"
-                | "--z3-print-param-module"
-                | "--z3-print-param-description"
+                | "--z3-parameter-request"
+                | "--z3-catalog-request"
                 | "--unsupported-z3-option"
         ) {
             return false;
@@ -3498,11 +3489,19 @@ fn solve_session_crash_description(status: &std::process::ExitStatus) -> Option<
 }
 
 /// Emit a session provenance marker (`c ay.session.start` / `c ay.session.end`)
-/// to stderr, unless `-q`/`--quiet` is active. Centralizes the commentary gate
-/// for every supervisor emission site; stdout/proof/exit-code paths are never
-/// touched.
+/// to stderr, unless `-q`/`--quiet` or `--z3-mode` is active. Centralizes the
+/// commentary gate for every supervisor emission site; stdout/proof/exit-code
+/// paths are never touched.
+///
+/// `--z3-mode` suppresses the marker rather than skipping supervision. z3 writes
+/// nothing to stderr on a normal run, and these markers are precisely the AY
+/// provenance that [`Z3_MODE_ENABLED`] exists to hide — so dropping them keeps
+/// the transcript byte-identical while the solve stays supervised. Skipping the
+/// supervisor instead (as this path used to) bought the same clean stderr at the
+/// cost of turning every crash on the Z3-compatible path into a lost answer,
+/// which is the path every benchmark harness actually runs.
 fn eprint_session_marker(marker: String) {
-    if !quiet_enabled() {
+    if !quiet_enabled() && !Z3_MODE_ENABLED.load(Ordering::Relaxed) {
         safe_eprintln!("{marker}");
     }
 }
@@ -3991,11 +3990,21 @@ fn certificate_paths_may_alias(left: &FsPath, right: &FsPath) -> io::Result<bool
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        return Ok(left_metadata.volume_serial_number().is_some()
-            && left_metadata.volume_serial_number() == right_metadata.volume_serial_number()
-            && left_metadata.file_index().is_some()
-            && left_metadata.file_index() == right_metadata.file_index());
+        // `std::fs::metadata` above follows reparse points, so the identity
+        // query must too. A failure to read either identity is reported as
+        // "not provably the same file" rather than an error, matching the
+        // previous `is_some()` guards.
+        let _ = (&left_metadata, &right_metadata);
+        let (Ok(left_info), Ok(right_info)) = (
+            ay_sys::windows_fs::file_info_follow(left),
+            ay_sys::windows_fs::file_info_follow(right),
+        ) else {
+            return Ok(false);
+        };
+        return Ok(
+            left_info.volume_serial_number == right_info.volume_serial_number
+                && left_info.file_index == right_info.file_index,
+        );
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -4475,6 +4484,18 @@ fn run_solve(args: &SolveArgs) {
     if args.z3_mode {
         Z3_MODE_ENABLED.store(true, Ordering::SeqCst);
     }
+    // Z3 exits 0 for both SAT and UNSAT, so a drop-in `z3` install must too --
+    // `args.z3_mode` is already true for an `argv[0]` of `z3` (see
+    // `inject_z3_mode_from_argv0`). Competition harnesses run the binary under
+    // its own name and keep 10/20. `--sat-exit-codes` overrides either default.
+    DIMACS_Z3_EXIT_CODES.store(
+        match args.sat_exit_codes {
+            Some(SatExitCodes::Z3) => true,
+            Some(SatExitCodes::Competition) => false,
+            None => args.z3_mode,
+        },
+        Ordering::SeqCst,
+    );
     if args.z3_model {
         Z3_MODEL_ENABLED.store(true, Ordering::SeqCst);
     }
@@ -4485,6 +4506,103 @@ fn run_solve(args: &SolveArgs) {
     // in-process solve path. Never touches stdout/proof/exit-code contracts.
     if args.quiet {
         QUIET_ENABLED.store(true, Ordering::SeqCst);
+    }
+
+    // A parameter dump returns without ever running a check-sat, so a requested
+    // BV CNF export cannot be produced. Reject it and invalidate any stale
+    // artifact, exactly as the other non-solve early modes do further down --
+    // otherwise `ay -p` with an export requested exited 0 and left a PREVIOUS
+    // run's file in place, where a consumer reads it as this run's export.
+    //
+    // The catalog requests are deliberately NOT covered: unlike `-p` they are
+    // not terminal, so a solve may still follow and produce the export.
+    if args.z3_parameter_request.is_some() {
+        let requested_dump = args
+            .dump_bv_cnf
+            .clone()
+            .or_else(|| ay_core::bv_cnf_dump_path_from_env().map(PathBuf::from));
+        if let Some(path) = requested_dump.as_deref() {
+            let _ = std::fs::remove_file(path);
+            safe_eprintln!(
+                "Error: BV CNF export is incompatible with parameter reporting; \
+                 no check-sat query was executed"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Z3 prints these during command-line processing and then continues into
+    // the selected input mode. In particular, they are not terminal help
+    // flags: `z3 -tactics -in` lists the catalog and then reads commands.
+    for request in &args.z3_catalog_request {
+        z3_catalog::print_request(request);
+    }
+    if let Some(request) = &args.z3_parameter_request {
+        let code = z3_parameter_help::print_request(request);
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return;
+    }
+    if !args.z3_catalog_request.is_empty()
+        && !args.stdin
+        && !args.incremental
+        && args.file.is_none()
+    {
+        let _ = io::stdout().flush();
+        safe_eprintln!("Error: input file was not specified.");
+        safe_eprintln!("For usage information: z3 -h");
+        std::process::exit(Z3_COMMAND_LINE_ERROR_EXIT_CODE);
+    }
+
+    if let Some(mode) = args.z3_input_mode {
+        if args.file.is_some() && (args.stdin || args.incremental) {
+            safe_eprintln!("ERROR: using standard input to read formula.");
+            std::process::exit(Z3_INPUT_ERROR_EXIT_CODE);
+        }
+        if args.file.is_none() && !args.stdin && !args.incremental {
+            safe_eprintln!("Error: input file was not specified.");
+            safe_eprintln!("For usage information: z3 -h");
+            std::process::exit(Z3_COMMAND_LINE_ERROR_EXIT_CODE);
+        }
+        let result = match mode {
+            Z3InputMode::Wcnf => cmd_maxsat::run_z3_compat(
+                args.file.as_deref(),
+                args.stdin || args.incremental,
+                args.z3_model,
+                args.stats,
+                args.timeout,
+            ),
+            Z3InputMode::Opb => cmd_pb::run_z3_compat(
+                args.file.as_deref(),
+                args.stdin || args.incremental,
+                args.z3_model,
+                args.stats,
+                args.timeout,
+            ),
+            Z3InputMode::Lp => cmd_lp::run_z3_compat(
+                args.file.as_deref(),
+                args.stdin || args.incremental,
+                args.z3_model,
+                args.stats,
+            ),
+        };
+        match result {
+            Ok(code) => {
+                let _ = io::stdout().flush();
+                let _ = io::stderr().flush();
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return;
+            }
+            Err(error) => {
+                safe_eprintln!("ERROR: {error:#}");
+                std::process::exit(Z3_INPUT_ERROR_EXIT_CODE);
+            }
+        }
     }
 
     let dump_bv_cnf_path = args
@@ -4582,13 +4700,7 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
-    let incompatible_non_solve_mode = if args.z3_print_params || args.z3_print_param_descriptions {
-        Some("Z3 parameter listing")
-    } else if args.z3_print_param_module.is_some() {
-        Some("Z3 parameter-module listing")
-    } else if args.z3_print_param_description.is_some() {
-        Some("Z3 parameter description")
-    } else if args.features {
+    let incompatible_non_solve_mode = if args.features {
         Some("feature reporting")
     } else if args.chc || args.portfolio {
         Some("forced CHC/portfolio solving")
@@ -4608,30 +4720,25 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
-    if args.z3_print_params || args.z3_print_param_descriptions {
-        print_z3_compatible_params(args.z3_print_param_descriptions);
-        return;
-    }
-
-    if let Some(module_name) = &args.z3_print_param_module {
-        if module_name.is_empty() {
-            print_z3_compat_module_list();
-        } else if !print_z3_compat_module_params(module_name, args.z3_print_param_descriptions) {
-            print_unknown_z3_module_and_exit(module_name);
-        }
-        return;
-    }
-
-    if let Some(param_name) = &args.z3_print_param_description {
-        print_z3_compat_param_description_or_exit(param_name);
-        return;
-    }
-
     if !args.unsupported_z3_option.is_empty() {
         for option in &args.unsupported_z3_option {
             print_unsupported_z3_option(option);
         }
-        std::process::exit(1);
+        // `-opb` is not AY declining an option -- it is Z3 5.0.0's own
+        // command-line parser rejecting a flag its `-h` still advertises, and
+        // that rejection exits 109. AY reproduces the message verbatim, so it
+        // must reproduce the status too. Everything else here is AY declining
+        // an option it does not implement, which stays 1.
+        let code = if args
+            .unsupported_z3_option
+            .iter()
+            .any(|option| option == "-opb")
+        {
+            109
+        } else {
+            1
+        };
+        std::process::exit(code);
     }
 
     if !args.unsupported_z3_param.is_empty() {
@@ -4859,9 +4966,18 @@ fn run_solve(args: &SolveArgs) {
     //
     // Without a limit, all `global_memory_exceeded()` and `process_memory_exceeded()`
     // checks throughout the codebase are dead code, and the process OOMs instead of
-    // gracefully returning Unknown. The auto-detected default (half of physical RAM,
-    // clamped to [2GB, 64GB]) provides OOM protection while using all available
-    // resources. Pass `--memory 0` to explicitly disable.
+    // gracefully returning Unknown.
+    //
+    // The auto-detected default is `default_standalone_memory_limit()`, which is
+    // NOT the phys/2-clamped-to-[2GB,64GB] figure this comment used to claim --
+    // that describes `default_memory_limit`, a different function. Standalone ay
+    // takes 85% of RAM when unbounded, or 90% of the kernel-held govern budget
+    // when `ay_sys::govern` has armed one (the usual case). Deriving from the
+    // kernel bound is what keeps the soft gate BELOW the hard cap, so a memout
+    // reports `unknown` instead of dying to SIGKILL.
+    //
+    // Pass `--memory 0` to explicitly disable, or raise `GOVERN_AY_MB` to move
+    // both bounds together for a sole-tenant run.
     let memory_limit_bytes = if let Some(mb) = args.memory {
         if mb == 0 {
             0
@@ -4878,15 +4994,20 @@ fn run_solve(args: &SolveArgs) {
             bytes
         }
     } else {
-        // Auto-detect for the standalone binary: 85% of physical RAM
-        // (sole-tenant competition posture; #sparse-gap Cluster A — the
-        // phys/2 default plus a transient allocator spike degraded solvable
-        // main-track instances to Unknown). Returns 0 if physical memory
-        // detection fails (limit disabled).
+        // Auto-detect for the standalone binary. 85% of physical RAM ONLY when
+        // nothing else bounds the process (sole-tenant competition posture;
+        // #sparse-gap Cluster A — the phys/2 default plus a transient allocator
+        // spike degraded solvable main-track instances to Unknown). When
+        // `ay_sys::govern` has armed a kernel-held budget — the usual case — this
+        // derives from that budget instead, so the cooperative ceiling cannot sit
+        // above the cap the kernel will actually enforce.
+        // Returns 0 if physical memory detection fails (limit disabled).
         ay_sys::default_standalone_memory_limit()
     };
     if memory_limit_bytes > 0 {
         ay_sys::set_process_memory_limit(memory_limit_bytes);
+        arm_memory_watchdog();
+        arm_hard_memory_ceiling(memory_limit_bytes);
     }
 
     // Tracing
@@ -5508,6 +5629,15 @@ static GLOBAL: ay_sys::MimallocCountingAllocator<mimalloc::MiMalloc> =
     ay_sys::MimallocCountingAllocator::new(mimalloc::MiMalloc);
 
 fn main() {
+    // FIRST statement, before any allocation or thread spawn: this re-execs the
+    // process under a kernel-held memory bound, so anything done above it is
+    // discarded work, and it sets an env var (which requires single-threadedness).
+    //
+    // Copies of this binary under other names are exactly what panicked the
+    // machine on 2026-08-02 (`ay-base` 137.9 GB + `ay-fixed` 134.4 GB), so the
+    // bound is armed by the image rather than by a shim on some path.
+    ay_sys::govern::arm();
+
     let provenance_args = env::args_os().collect::<Vec<_>>();
     if matches!(provenance_args.as_slice(), [_, flag] if flag == "--provenance") {
         safe_println!("{}", build_info::exact_provenance_json());
@@ -5531,6 +5661,9 @@ fn main() {
     maybe_reexec_pb_with_large_stack();
 
     let raw_args: Vec<String> = env::args().collect();
+    if maybe_print_explicit_z3_meta(&raw_args) {
+        return;
+    }
     let processed = preprocess_args(raw_args.clone());
 
     if maybe_print_solve_full_help(&processed) {
@@ -5542,6 +5675,12 @@ fn main() {
     // same flag from the parsed args for the in-process solve path.
     if solve_quiet_requested(&processed) {
         QUIET_ENABLED.store(true, Ordering::SeqCst);
+    }
+    // Same timing, same reason, for `--z3-mode`: the markers are AY provenance
+    // and a Z3-compatible transcript has an empty stderr. Suppressing them here
+    // is what allows the Z3-compatible path to stay supervised below.
+    if solve_z3_mode_requested(&processed) {
+        Z3_MODE_ENABLED.store(true, Ordering::SeqCst);
     }
 
     if solve_session_needs_wrapper(&processed) {
@@ -5612,6 +5751,18 @@ fn main() {
             }
         },
         Some(Command::Scripts(cmd)) => match cmd_scripts::run(cmd) {
+            Ok(0) => {}
+            Ok(code) => {
+                let _ = io::stdout().flush();
+                let _ = io::stderr().flush();
+                std::process::exit(code);
+            }
+            Err(e) => {
+                safe_eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        },
+        Some(Command::UnknownPolicyProbe(args)) => match cmd_unknown_policy_probe::run(args) {
             Ok(0) => {}
             Ok(code) => {
                 let _ = io::stdout().flush();
@@ -5857,9 +6008,19 @@ fn maybe_reexec_pb_with_large_stack() {
     };
     // `exec` replaces the current process image (same PID/fds/cwd) and only returns
     // on failure; the re-exec'd process sees `RUST_MIN_STACK` already set and proceeds.
+    //
+    // Clearing AY_GOVERN_ARMED is load-bearing, not hygiene. `taskpolicy`'s jetsam
+    // memlimit binds ONLY the exact image it exec'd, and ANY later `execve`
+    // destroys it (measured 2026-07-15). This `exec` is exactly
+    // such a later execve, so without clearing the marker the re-exec'd image would
+    // see itself as already armed, skip re-arming, and run `pb` with L1 GONE --
+    // silently, since RLIMIT_AS survives and everything still looks bounded.
+    // Dropping the marker makes the new image arm itself again under taskpolicy.
+    // Any future deliberate self-exec must do the same.
     let _ = std::process::Command::new(exe)
         .args(args.iter().skip(1))
         .env("RUST_MIN_STACK", PB_WORKER_STACK_BYTES.to_string())
+        .env_remove(ay_sys::govern::ARMED_ENV)
         .exec();
 }
 

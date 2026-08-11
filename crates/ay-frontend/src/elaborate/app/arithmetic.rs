@@ -17,46 +17,111 @@ impl Context {
     ) -> Result<Option<TermId>> {
         match name {
             "+" => {
-                self.maybe_promote_numeric_args(arg_ids)?;
+                if arg_ids.is_empty() {
+                    return Err(ElaborateError::InvalidConstant(
+                        "+ requires at least 1 argument, got 0".to_string(),
+                    ));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 Ok(Some(self.terms.mk_add(arg_ids.to_vec())))
             }
             "-" => {
-                self.maybe_promote_numeric_args(arg_ids)?;
+                if arg_ids.is_empty() {
+                    return Err(ElaborateError::InvalidConstant(
+                        "- requires at least 1 argument, got 0".to_string(),
+                    ));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 Ok(Some(self.terms.mk_sub(arg_ids.to_vec())))
             }
+            // Z3 5.0.0 registers `~` as the unary-minus spelling. Unlike
+            // left-associative `-`, it accepts exactly one operand.
+            "~" => {
+                if arg_ids.len() != 1 {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "~ requires 1 argument, got {}",
+                        arg_ids.len()
+                    )));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                if !matches!(self.terms.sort(arg_ids[0]), Sort::Int | Sort::Real) {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "Int or Real".to_string(),
+                        actual: self.terms.sort(arg_ids[0]).to_string(),
+                    });
+                }
+                Ok(Some(self.terms.mk_neg(arg_ids[0])))
+            }
             "*" => {
-                self.maybe_promote_numeric_args(arg_ids)?;
+                if arg_ids.is_empty() {
+                    return Err(ElaborateError::InvalidConstant(
+                        "* requires at least 1 argument, got 0".to_string(),
+                    ));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 Ok(Some(self.terms.mk_mul(arg_ids.to_vec())))
             }
             "^" => Ok(Some(self.elaborate_power(arg_ids)?)),
-            // SMT-LIB 2.6 theory `Reals` / `Reals_Ints` declare
-            // `(/ Real Real Real :left-assoc)`, so `(/ a b c)` abbreviates
-            // `(/ (/ a b) c)`. Only two-or-more is well-sorted.
+            "**" => Ok(Some(self.elaborate_integer_power(arg_ids)?)),
+            // Z3 5.0.0's null-logic registry exposes `/` through its binary
+            // left-associative declaration, whose AST application treats one
+            // Real operand as the identity. The extension logics HORN and ALL
+            // retain that registry behavior. Standard SMT-LIB logics instead
+            // keep their theory arity: `(/ Real Real Real :left-assoc)` means
+            // two-or-more operands.
             "/" => {
-                self.promote_int_consts_to_real(arg_ids)?;
+                if arg_ids.len() == 1 && matches!(self.logic(), None | Some("HORN") | Some("ALL")) {
+                    let argument = arg_ids[0];
+                    let actual = self.terms.sort(argument);
+                    if actual != &Sort::Real {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: Sort::Real.to_string(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                    return Ok(Some(argument));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                if self.int_real_coercions() {
+                    self.promote_int_consts_to_real(arg_ids)?;
+                }
                 if arg_ids.len() < 2 {
                     return Err(ElaborateError::InvalidConstant(format!(
                         "/ requires at least 2 arguments, got {}",
                         arg_ids.len()
                     )));
                 }
+                self.expect_all_args_sort(arg_ids, &Sort::Real)?;
                 let mut acc = arg_ids[0];
                 for &rhs in &arg_ids[1..] {
                     acc = self.terms.mk_div(acc, rhs);
                 }
                 Ok(Some(acc))
             }
-            // SMT-LIB 2.6 theory `Ints` declares `(div Int Int Int :left-assoc)`,
-            // so `(div a b c)` abbreviates `(div (div a b) c)`. Note that `mod`,
-            // `rem` and `abs` in the same theory are NOT `:left-assoc` — they are
-            // fixed-arity and must stay so (see the arms below).
+            // The same Z3 5.0.0 null-logic/HORN/ALL left-associative behavior
+            // makes unary `div` an Int identity. Standard SMT-LIB logics still
+            // use the two-or-more `Ints` theory signature. Note that `mod`,
+            // `rem` and `abs` are fixed-arity and must stay so.
             "div" => {
+                if arg_ids.len() == 1 && matches!(self.logic(), None | Some("HORN") | Some("ALL")) {
+                    let argument = arg_ids[0];
+                    let actual = self.terms.sort(argument);
+                    if actual != &Sort::Int {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: Sort::Int.to_string(),
+                            actual: actual.to_string(),
+                        });
+                    }
+                    return Ok(Some(argument));
+                }
                 if arg_ids.len() < 2 {
                     return Err(ElaborateError::InvalidConstant(format!(
                         "div requires at least 2 arguments, got {}",
                         arg_ids.len()
                     )));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                self.expect_all_args_sort(arg_ids, &Sort::Int)?;
                 let mut acc = arg_ids[0];
                 for &rhs in &arg_ids[1..] {
                     acc = self.terms.mk_intdiv(acc, rhs);
@@ -70,6 +135,8 @@ impl Context {
                         arg_ids.len()
                     )));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                self.expect_all_args_sort(arg_ids, &Sort::Int)?;
                 Ok(Some(self.terms.mk_mod(arg_ids[0], arg_ids[1])))
             }
             "rem" => {
@@ -79,6 +146,8 @@ impl Context {
                         arg_ids.len()
                     )));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                self.expect_all_args_sort(arg_ids, &Sort::Int)?;
                 Ok(Some(self.terms.mk_rem(arg_ids[0], arg_ids[1])))
             }
             "abs" => {
@@ -86,6 +155,13 @@ impl Context {
                     return Err(ElaborateError::InvalidConstant(
                         "abs requires 1 argument".to_string(),
                     ));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                if !matches!(self.terms.sort(arg_ids[0]), Sort::Int | Sort::Real) {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "Int or Real".to_string(),
+                        actual: self.terms.sort(arg_ids[0]).to_string(),
+                    });
                 }
                 Ok(Some(self.terms.mk_abs(arg_ids[0])))
             }
@@ -107,7 +183,7 @@ impl Context {
                         "{name} requires at least 2 arguments"
                     )));
                 }
-                self.maybe_promote_numeric_args(arg_ids)?;
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 if arg_ids.len() == 2 {
                     return Ok(Some(match name {
                         "<" => self.terms.mk_lt(arg_ids[0], arg_ids[1]),
@@ -144,11 +220,10 @@ impl Context {
     ///   uninterpreted constant captures the SMT-LIB under-specification
     ///   for `0^n` when `n < 0`.
     ///
-    /// When `exp` is not a literal integer (e.g., symbolic or fractional),
-    /// `^` is kept as an uninterpreted application with the base's sort so
-    /// downstream theories can treat it opaquely. This mirrors how Z3
-    /// surfaces `^` under logics that do not enable the polynomial
-    /// arithmetic engine.
+    /// Symbolic and non-integral exponents are rejected until AY has a theory
+    /// implementation for them. Treating a surviving `^` application as an
+    /// uninterpreted function is unsound: constraints on the exponent can make
+    /// Z3 prove facts that EUF alone cannot see.
     #[allow(clippy::too_many_lines)]
     fn elaborate_power(&mut self, arg_ids: &[TermId]) -> Result<TermId> {
         if arg_ids.len() != 2 {
@@ -174,12 +249,65 @@ impl Context {
             return Ok(self.unfold_integer_power(base, &base_sort, &n));
         }
 
-        // Non-literal exponent: keep `^` as an uninterpreted application,
-        // preserving the base's arithmetic sort so equality/arithmetic
-        // constraints can still mention the result.
-        Ok(self
-            .terms
-            .mk_app(Symbol::named("^"), vec![base, exp], base_sort))
+        Err(ElaborateError::Unsupported(
+            "symbolic or non-integral exponentiation with `^` is not supported".to_string(),
+        ))
+    }
+
+    /// Elaborate SMT-LIB 2.7 integer exponentiation `(** base exponent)`.
+    ///
+    /// The `Ints` theory gives `**` the rank `Int Int -> Int`. AY can lower a
+    /// concrete integer exponent exactly into its existing integer arithmetic:
+    /// non-negative powers become products, while a negative power is
+    /// `(div 1 (base^(-exponent)))`. This is the defining equation in the
+    /// pinned `Ints` theory, including its deliberately under-specified
+    /// `(div 1 0)` value when the base is zero.
+    ///
+    /// A symbolic exponent remains a valid QF_EIA term. Preserve it as a typed
+    /// built-in application; the executor detects that surviving application
+    /// before theory dispatch and returns `unknown`, so AY accepts the standard
+    /// syntax without treating exponentiation as an unconstrained function.
+    fn elaborate_integer_power(&mut self, arg_ids: &[TermId]) -> Result<TermId> {
+        if arg_ids.len() != 2 {
+            return Err(ElaborateError::InvalidConstant(format!(
+                "** requires 2 arguments, got {}",
+                arg_ids.len()
+            )));
+        }
+
+        for &arg in arg_ids {
+            let actual = self.terms.sort(arg);
+            if actual != &Sort::Int {
+                return Err(ElaborateError::SortMismatch {
+                    expected: Sort::Int.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+        }
+
+        if let Some(exponent) = self.terms.extract_integer_constant(arg_ids[1]) {
+            Ok(self.unfold_smtlib_integer_power(arg_ids[0], &exponent))
+        } else {
+            Ok(self
+                .terms
+                .mk_app(Symbol::named("**"), vec![arg_ids[0], arg_ids[1]], Sort::Int))
+        }
+    }
+
+    /// Lower `(** base exponent)` for a concrete integer exponent.
+    fn unfold_smtlib_integer_power(&mut self, base: TermId, exponent: &BigInt) -> TermId {
+        if exponent.is_zero() {
+            // Required by SMT-LIB Ints, including (** 0 0) = 1.
+            return self.terms.mk_int(BigInt::one());
+        }
+
+        let positive_power = self.repeated_product(base, &exponent.abs());
+        if !exponent.is_negative() {
+            return positive_power;
+        }
+
+        let one = self.terms.mk_int(BigInt::one());
+        self.terms.mk_intdiv(one, positive_power)
     }
 
     /// Unfold `(^ base n)` where `n` is a concrete integer.

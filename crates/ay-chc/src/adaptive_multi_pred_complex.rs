@@ -1379,6 +1379,109 @@ impl AdaptivePortfolio {
                 > crate::adaptive_bv_dual_lane::BVTOBOOL_EXPANDED_SKIP_THRESHOLD
     }
 
+    /// Bounded derivation-TREE refutation for ARRAY problems (#wp1-array-tree).
+    ///
+    /// `solve_bounded_tree_refutation` is generic, but its only production call
+    /// site is [`Self::try_bv_shallow_bmc_refutation`], whose gate *requires*
+    /// `has_bv_sorts()` and *excludes* `has_array_sorts()`. So for every
+    /// LIA-Arrays instance the occurrence-fresh tree lane returns before doing
+    /// anything, and the only reachable BMC encoding is the level-flat one —
+    /// which names a body argument `P#(level-1)_i` and therefore collapses every
+    /// occurrence of one predicate in one body onto the same variable tuple.
+    /// On the CHC-COMP-25 Solidity slice family that forces contradictions like
+    /// `5 = 0`, so the flat encoding is provably unable to refute those clauses
+    /// at ANY depth (confirmed: adding the collapse equalities to the source
+    /// turns 11 of the 18 `sat` under z3). This lane is what makes the
+    /// branching-counterexample encoding reachable for them at all.
+    ///
+    /// Soundness: `solve_bounded_tree_refutation` returns only `Unsafe`/`Unknown`
+    /// — never `Safe` — and each candidate witness is replayed against the
+    /// ORIGINAL clauses before acceptance, so this cannot produce a wrong answer.
+    /// The real risk is budget theft from the downstream safety stages, which is
+    /// why the slice is a minority share and the lane is opt-in for now.
+    ///
+    /// Default OFF (`AY_CHC_ARRAY_TREE_REFUTATION=1` to arm): the first
+    /// measurement must not be able to regress the standing score by taking
+    /// budget from lanes that currently win.
+    pub(crate) fn try_array_bounded_tree_refutation(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<PortfolioResult> {
+        if !std::env::var("AY_CHC_ARRAY_TREE_REFUTATION").is_ok_and(|v| v != "0") {
+            return None;
+        }
+        if !self.problem.has_array_sorts()
+            || self.problem.has_real_sorts()
+            || self.problem.has_datatype_sorts()
+            || self.budget_exhausted(deadline)
+        {
+            return None;
+        }
+        let remaining = self.remaining_budget(deadline)?;
+        if remaining < Duration::from_secs(3) {
+            return None;
+        }
+        // Minority share only. Encoding is not interruptible (#5877), so an
+        // oversized tree jams the lane past its slice; keep depth and node cap
+        // where the encoding stays tractable. Depth 20 because the measured
+        // minimum for a slice-family counterexample is 16 (z3 on hand-built
+        // unfoldings: depth 15 unsat, depth 16 sat), and the node count there
+        // is 1400-3200 — inside the 6 k cap.
+        let tree_budget = (remaining / 6).min(Duration::from_secs(30));
+        let bmc = crate::bmc::BmcSolver::new(
+            self.problem.clone(),
+            BmcConfig {
+                base: ChcEngineConfig {
+                    verbose: self.config.verbose,
+                    ..ChcEngineConfig::default()
+                },
+                max_depth: 20,
+                acyclic_safe: false,
+                prefer_exact_acyclic_first: false,
+                per_depth_timeout: Some(tree_budget),
+                time_budget: Some(tree_budget),
+                enable_k_induction: false,
+                enable_adaptive_stepping: false,
+                proof_cross_check: false,
+                ts_probe_clamp: None,
+                sweep_past_spurious_sat: true,
+            },
+        );
+        if self.config.verbose {
+            safe_eprintln!(
+                "Adaptive: array bounded-tree refutation ARMED (depth 20, budget {:.1}s, cap 6000)",
+                tree_budget.as_secs_f64()
+            );
+        }
+        let tree_start = Instant::now();
+        let tree_result = bmc.solve_bounded_tree_refutation(20, tree_budget, 6_000);
+        if self.config.verbose {
+            safe_eprintln!(
+                "Adaptive: array bounded-tree refutation finished in {:.2}s -> {}",
+                tree_start.elapsed().as_secs_f64(),
+                match &tree_result {
+                    PortfolioResult::Unsafe(_) => "unsafe",
+                    PortfolioResult::Safe(_) => "safe(ignored)",
+                    _ => "unknown",
+                }
+            );
+        }
+        if let PortfolioResult::Unsafe(cex) = tree_result {
+            self.decision_log.log_decision(DecisionEntry {
+                stage: "array_bounded_tree_refutation",
+                gate_result: true,
+                gate_reason: "branching-tree array counterexample".to_string(),
+                budget_secs: tree_budget.as_secs_f64(),
+                elapsed_secs: tree_start.elapsed().as_secs_f64(),
+                result: "unsafe",
+                lemmas_learned: 0,
+                max_frame: 0,
+            });
+            return Some(PortfolioResult::Unsafe(cex));
+        }
+        None
+    }
+
     pub(crate) fn try_bv_shallow_bmc_refutation(
         &self,
         deadline: Option<Instant>,
@@ -1587,6 +1690,16 @@ impl AdaptivePortfolio {
         if let Some(result) = self.try_bv_shallow_bmc_refutation(deadline) {
             if self.config.verbose {
                 safe_eprintln!("Adaptive: MultiPredComplex early BV shallow-BMC found Unsafe");
+            }
+            return result;
+        }
+
+        // Stage 0.16: the same bounded derivation-TREE probe, for ARRAY problems
+        // (#wp1-array-tree). Opt-in; see `try_array_bounded_tree_refutation` for
+        // why the level-flat encoding cannot refute the slice family at any depth.
+        if let Some(result) = self.try_array_bounded_tree_refutation(deadline) {
+            if self.config.verbose {
+                safe_eprintln!("Adaptive: MultiPredComplex array bounded-tree found Unsafe");
             }
             return result;
         }

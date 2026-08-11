@@ -1,3 +1,4 @@
+import Std
 /-
   FORMAL FIXED-GRID RATIONAL RESEARCH MODELS motivated by the QF_FPLRA
   `guard_claim_guard2` and `guard_claim_signed_distance` benchmarks
@@ -74,7 +75,6 @@
   provided BOTH as the Classical-free `iround_half_ulp` (Int grid) and as the
   symbolic `Rat` `half_ulp`; the propagation/conflict use the `Rat` layer.
 -/
-import Std
 namespace AySoundness.FpErrorBound
 
 /-! ## Derived Rat linear-arithmetic toolkit (core `Rat` API lacks linarith/ring). -/

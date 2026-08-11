@@ -452,6 +452,7 @@ fn extract_prelude(content: &str) -> String {
                     | Some("declare-const")
                     | Some("declare-fun")
                     | Some("declare-sort")
+                    | Some("declare-sort-parameter")
                     | Some("declare-datatype")
                     | Some("declare-datatypes")
                     | Some("define-fun")

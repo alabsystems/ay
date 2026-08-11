@@ -1514,51 +1514,6 @@ impl Executor {
         r
     }
 
-    /// A sort that (recursively through arrays and datatype fields) carries a
-    /// declared datatype with an ARRAY-sorted constructor field — the
-    /// `Slice{ptr,len,data}` shape. Rendering such a value into a committed
-    /// array CELL forces the renderer to spell out the nested array field, and
-    /// the per-term spelling cannot see cells observed through a CONGRUENT
-    /// field term (`(dat (select A i))` vs `(dat (select A j))` under `i = j`),
-    /// so the cell fabricates a collapsed const-default field the strict
-    /// arrays oracle then correctly rejects (#dt-array-model-census). Callers
-    /// use this to leave such arrays to the observation-based census instead
-    /// of materializing unfaithful cells.
-    pub(super) fn sort_carries_array_field_datatype(&self, sort: &Sort) -> bool {
-        fn walk(exec: &Executor, sort: &Sort, visited: &mut Vec<String>) -> bool {
-            let dt_name = match sort {
-                Sort::Array(a) => {
-                    return walk(exec, &a.index_sort, visited)
-                        || walk(exec, &a.element_sort, visited);
-                }
-                Sort::Datatype(dt) => dt.name.clone(),
-                Sort::Uninterpreted(n) => n.clone(),
-                _ => return false,
-            };
-            let Some((_, ctors)) = exec.ctx.datatype_iter().find(|(n, _)| *n == dt_name) else {
-                return false;
-            };
-            if visited.iter().any(|v| v == &dt_name) {
-                return false;
-            }
-            visited.push(dt_name);
-            let ctors: Vec<String> = ctors.to_vec();
-            let hit = ctors.iter().any(|ctor| {
-                exec.ctx
-                    .constructor_selector_info(ctor)
-                    .is_some_and(|fields| {
-                        fields.iter().any(|(_, fsort)| {
-                            matches!(fsort, Sort::Array(_)) || walk(exec, fsort, visited)
-                        })
-                    })
-            });
-            visited.pop();
-            hit
-        }
-        let mut visited = Vec::new();
-        walk(self, sort, &mut visited)
-    }
-
     /// A sort that (recursively through arrays) carries a declared datatype.
     fn census_sort_carries_dt(sort: &Sort, dts: &HashSet<String>) -> bool {
         match sort {

@@ -15,6 +15,13 @@
 //! `(> x 0)` to a definitive `true`. Anything that cannot be computed exactly
 //! evaluates to `Unknown` (fail closed), never to an approximation.
 //!
+//! The one case that is READ BACK rather than computed is integer division and
+//! remainder at a ZERO divisor, which SMT-LIB leaves unconstrained: there is
+//! nothing to compute, so the value the SOLVE chose is recovered from the
+//! witness variable `mod_div_elim` left standing for it (see
+//! [`Executor::zero_divisor_value`]). That is a read, not an approximation, and
+//! it still fails closed when no witness is found.
+//!
 //! Extracted from `mod.rs` to reduce file size (#5970 code-health splits).
 //! All methods are `impl Executor` — they share the same method namespace.
 
@@ -44,7 +51,170 @@ fn from_scalar(s: RealScalar) -> EvalValue {
     }
 }
 
+/// Parse the operand term ids `mod_div_elim` encoded in a witness variable's
+/// name, given the name with its family prefix already stripped.
+///
+/// The literal-zero-divisor form is keyed by the dividend alone
+/// (`_ay_zerodiv_{op}_{dividend}`); the symbolic form is keyed by BOTH operands
+/// (`…_{dividend}_{divisor}`), because the pair is what identifies the
+/// application. A name that does not parse is not one of ours and is skipped.
+fn parse_witness_operands(rest: &str, keyed_by_divisor: bool) -> Option<(u32, Option<u32>)> {
+    if keyed_by_divisor {
+        let (dividend, divisor) = rest.split_once('_')?;
+        Some((
+            dividend.parse::<u32>().ok()?,
+            Some(divisor.parse::<u32>().ok()?),
+        ))
+    } else {
+        Some((rest.parse::<u32>().ok()?, None))
+    }
+}
+
 impl Executor {
+    /// The value the solve CHOSE for `(div a 0)` or `(mod a 0)`.
+    ///
+    /// SMT-LIB makes integer division and remainder TOTAL but constrains them
+    /// only for a nonzero divisor: at zero they denote a single consistent but
+    /// unspecified integer. `mod_div_elim` therefore replaces each such term
+    /// with an unconstrained variable and emits congruence constraints tying
+    /// equal operands together, so the SOLVE picks a value. Recomputing one
+    /// here is impossible — there is nothing to compute — and returning
+    /// `Unknown` published a model that did not interpret its own term, which
+    /// the mandatory independent gate then could not confirm: a correct `sat`
+    /// came out as `unknown` (`(assert (< 0 (div 1 0)))` is `sat` in z3 and was
+    /// `unknown` here), for EVERY model mentioning a zero divisor.
+    ///
+    /// Two witness spellings exist, and both are searched:
+    ///
+    /// * LITERAL zero divisor — `zero_divisor_var` mints
+    ///   `_ay_zerodiv_{op}_{dividend}`. `div`/`mod`/`rem` keep separate names so
+    ///   the three stay independent (matching z3) (#div0).
+    /// * SYMBOLIC divisor that turned out to be zero — the case the literal path
+    ///   never sees, since it fires only on a syntactic `0`. The symbolic
+    ///   rewrite's result variables used to be `mk_fresh_var("_div_q", …)`,
+    ///   whose name is a bare counter, so nothing outside the pass could map the
+    ///   application back to the variable holding its value
+    ///   (#symbolic-div0-unpinned). They are now interned under a name derived
+    ///   from the two operand term ids, and `div` reads the quotient variable,
+    ///   `mod` the remainder one.
+    ///
+    /// FAIL CLOSED: a miss stays `Unknown`, costing completeness only.
+    ///
+    /// SOUNDNESS — why the match is on the operands' VALUES, not their term ids.
+    /// An O(1) `find_var` on `_ay_zerodiv_{op}_{args[0].index()}` is tempting and
+    /// is strictly worse on both counts:
+    ///
+    /// * It is LESS COMPLETE. The name encodes the REWRITTEN dividend, while the
+    ///   gate evaluates the ORIGINAL assertion. Those agree only when the
+    ///   rewrite was the identity on the dividend, which it usually but not
+    ///   always is — `(div (div a 0) 0)` already breaks it, because the outer
+    ///   term's dividend was itself replaced by a witness variable.
+    /// * It is LESS SOUND. `emit_zero_divisor_congruence` and its two siblings
+    ///   are capped at 64 terms and emit NOTHING above the cap. Past the cap an
+    ///   id-keyed read is free to report DIFFERENT values for `(div a 0)` and
+    ///   `(div b 0)` when `a` and `b` evaluate equal — i.e. to confirm a model in
+    ///   which `div` is not a function, a wrong SAT. Keying on the value makes
+    ///   the evaluator itself a function of the dividend's value, so the
+    ///   interpretation it reports is always one SMT-LIB actually admits, and a
+    ///   non-functional model is caught by the gate instead of confirmed.
+    ///
+    /// The value keying is also exactly what the congruence constraints assert
+    /// when they ARE emitted: `(op a 0)` is a function of the dividend's value,
+    /// so any witness whose dividend evaluates equal carries this term's value
+    /// too. Below the cap the two readings therefore coincide; above it, only
+    /// this one is safe.
+    fn zero_divisor_value(&self, model: &Model, op: &str, dividend: &BigRational) -> EvalValue {
+        // A LITERAL zero divisor: `mod_div_elim::zero_divisor_var` replaced the
+        // term with `_ay_zerodiv_{op}_{dividend}`.
+        let literal =
+            self.zero_divisor_witness(model, &format!("_ay_zerodiv_{op}_"), false, dividend);
+        if !matches!(literal, EvalValue::Unknown) {
+            return literal;
+        }
+
+        // A SYMBOLIC divisor that turned out to be zero. `div` is the quotient
+        // variable of the `x = q*y + r` constraint system, `mod` the remainder.
+        //
+        // Two spellings are accepted because the symbolic-witness interning
+        // landed twice, independently, under different names: `_ay_symdivmod_`
+        // keys by `(op, kind, dividend, divisor)`, `_ay_symdiv_` by
+        // `(kind, dividend, divisor)` with `div`/`mod` sharing one `(q, r)`
+        // pair. Both denote the same unconstrained result variable and both are
+        // sound to read; accepting both keeps this evaluator correct whichever
+        // spelling `mod_div_elim` ends up minting, and the unused arm costs one
+        // failed `strip_prefix` per term. Drop the other once that pass settles.
+        let kind = if op == "div" { "q" } else { "r" };
+        for prefix in [
+            format!("_ay_symdivmod_{op}_{kind}_"),
+            format!("_ay_symdiv_{kind}_"),
+        ] {
+            let symbolic = self.zero_divisor_witness(model, &prefix, true, dividend);
+            if !matches!(symbolic, EvalValue::Unknown) {
+                return symbolic;
+            }
+        }
+        EvalValue::Unknown
+    }
+
+    /// Find the variable the elimination pass left standing for an
+    /// under-specified `(op a 0)` in one witness family, and read back the value
+    /// the solve gave it. `keyed_by_divisor` says whether this family's names
+    /// encode the divisor as well as the dividend.
+    ///
+    /// See [`Self::zero_divisor_value`] for why matching is on the operands'
+    /// VALUES rather than their term ids. The scan is linear in the term store
+    /// and only runs on the zero-divisor path, which is rare; the per-term work
+    /// is a `strip_prefix` that almost always fails immediately.
+    fn zero_divisor_witness(
+        &self,
+        model: &Model,
+        prefix: &str,
+        keyed_by_divisor: bool,
+        dividend: &BigRational,
+    ) -> EvalValue {
+        let want_dividend = EvalValue::Rational(dividend.clone());
+        for idx in 0..self.ctx.terms.len() {
+            let candidate = TermId::new(idx as u32);
+            let ay_core::term::TermData::Var(name, _) = self.ctx.terms.get(candidate) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some((dividend_idx, divisor_idx)) = parse_witness_operands(rest, keyed_by_divisor)
+            else {
+                continue;
+            };
+            if dividend_idx as usize >= self.ctx.terms.len() {
+                continue;
+            }
+            if self.evaluate_term(model, TermId::new(dividend_idx)) != want_dividend {
+                continue;
+            }
+            // For the symbolic form the DIVISOR is part of the key, and it has
+            // to be zero here as well — a witness for a different divisor is
+            // constrained by `x = q*y + r` and carries a different value.
+            if let Some(v) = divisor_idx {
+                if v as usize >= self.ctx.terms.len() {
+                    continue;
+                }
+                match self.evaluate_term(model, TermId::new(v)) {
+                    EvalValue::Rational(d) if d.is_zero() => {}
+                    _ => continue,
+                }
+            }
+            // The witness is Int-sorted by construction, so no input can make
+            // this fail; it is here because the cost of being wrong is a
+            // non-integer standing in for an integer division, which would be
+            // confirmed as readily as a correct one.
+            let value = self.evaluate_term(model, candidate);
+            if matches!(&value, EvalValue::Rational(v) if v.is_integer()) {
+                return value;
+            }
+        }
+        EvalValue::Unknown
+    }
+
     /// Evaluate an arithmetic operator application.
     ///
     /// Caller must only pass recognized arithmetic operator names.
@@ -160,8 +330,16 @@ impl Executor {
                 let rhs = self.evaluate_term(model, args[1]);
                 match (lhs, rhs) {
                     (EvalValue::Rational(n), EvalValue::Rational(d)) => {
-                        if d.is_zero() || !n.is_integer() || !d.is_integer() {
+                        // Integrality is checked BEFORE the zero-divisor
+                        // readback, not after: `div` is Int × Int → Int, so a
+                        // non-integer operand means the model is already
+                        // ill-sorted and no witness variable denotes it. Pinning
+                        // a value there would dress a broken model as a
+                        // plausible one.
+                        if !n.is_integer() || !d.is_integer() {
                             EvalValue::Unknown
+                        } else if d.is_zero() {
+                            self.zero_divisor_value(model, "div", &n)
                         } else {
                             let ni = n.numer().clone();
                             let di = d.numer().clone();
@@ -183,8 +361,12 @@ impl Executor {
                 let rhs = self.evaluate_term(model, args[1]);
                 match (lhs, rhs) {
                     (EvalValue::Rational(n), EvalValue::Rational(d)) => {
-                        if d.is_zero() || !n.is_integer() || !d.is_integer() {
+                        // See `div`: integrality first, zero-divisor readback
+                        // only for a well-sorted integer dividend.
+                        if !n.is_integer() || !d.is_integer() {
                             EvalValue::Unknown
+                        } else if d.is_zero() {
+                            self.zero_divisor_value(model, "mod", &n)
                         } else {
                             let ni = n.numer().clone();
                             let di = d.numer().clone();
@@ -202,6 +384,11 @@ impl Executor {
             //            = -(mod t1 t2)  when t2 < 0
             // Under-specified when t2 = 0 (Z3 #9140: kept distinct from `mod`),
             // so a zero divisor evaluates to Unknown rather than a pinned value.
+            // `rewrite_rem` DOES mint an `_ay_zerodiv_rem_*` witness, so the same
+            // readback would work here; it is deliberately not done, because
+            // `rem` also deliberately declines the #div0 validation bypass so
+            // that ordinary model validation keeps gating a symbolic
+            // `(rem x y)` (#nia-symbolic-rem-bypass).
             "rem" => {
                 if args.len() != 2 {
                     return EvalValue::Unknown;

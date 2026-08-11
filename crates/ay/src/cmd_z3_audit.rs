@@ -1554,7 +1554,7 @@ fn cli_subset_surface(launch_rows: &[MatrixRow], checks: &[AuditCheck]) -> Audit
     let smoke_ids = [
         "basic_smt_transcript",
         "z3_param_discovery_smoke",
-        "unsupported_z3_option_smoke",
+        "z3_tactic_catalog_smoke",
     ];
     let smoke_passed = smoke_ids
         .iter()
@@ -5388,7 +5388,7 @@ fn run_builtin_smokes(
             reference_cache_path,
         ),
         check_ay_param_discovery(ay),
-        check_ay_unsupported_option(ay),
+        check_ay_tactic_catalog(ay),
     ]
 }
 
@@ -5476,11 +5476,12 @@ fn check_ay_param_discovery(ay: &Path) -> AuditCheck {
             if output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("Global parameters")
                 && String::from_utf8_lossy(&output.stdout).contains("timeout (unsigned int)")
+                && String::from_utf8_lossy(&output.stdout).lines().count() == 704
                 && output.stderr.is_empty() =>
         {
             AuditCheck::pass(
                 "z3_param_discovery_smoke",
-                "ay -p exposes the scoped Z3-style parameter subset without stderr noise",
+                "ay -p exposes the complete Z3 5.0.0 parameter database without stderr noise",
             )
             .with_command(command)
         }
@@ -5502,22 +5503,23 @@ fn check_ay_param_discovery(ay: &Path) -> AuditCheck {
     }
 }
 
-fn check_ay_unsupported_option(ay: &Path) -> AuditCheck {
-    let command = format!("{} -tactics", ay.display());
-    match ProcessCommand::new(ay).arg("-tactics").output() {
+fn check_ay_tactic_catalog(ay: &Path) -> AuditCheck {
+    let command = format!("{} -tactics -in", ay.display());
+    match run_program_stdin(ay.as_os_str(), &["-tactics", "-in"], "") {
         Ok(output)
-            if !output.status.success()
-                && String::from_utf8_lossy(&output.stderr)
-                    .contains("unsupported Z3 option '-tactics'") =>
+            if output.status.success()
+                && output.stderr.is_empty()
+                && String::from_utf8_lossy(&output.stdout).lines().count() == 118
+                && String::from_utf8_lossy(&output.stdout).contains("- ctx-solver-simplify ") =>
         {
             AuditCheck::pass(
-                "unsupported_z3_option_smoke",
-                "unsupported Z3 tactic catalog flag fails explicitly",
+                "z3_tactic_catalog_smoke",
+                "ay exposes the closed 118-entry Z3 5.0.0 tactic catalog",
             )
             .with_command(command)
         }
         Ok(output) => AuditCheck::fail(
-            "unsupported_z3_option_smoke",
+            "z3_tactic_catalog_smoke",
             format!(
                 "unexpected -tactics result: status={:?} stdout={:?} stderr={:?}",
                 output.status.code(),
@@ -5527,7 +5529,7 @@ fn check_ay_unsupported_option(ay: &Path) -> AuditCheck {
         )
         .with_command(command),
         Err(error) => AuditCheck::fail(
-            "unsupported_z3_option_smoke",
+            "z3_tactic_catalog_smoke",
             format!("failed to run ay -tactics: {error}"),
         )
         .with_command(command),

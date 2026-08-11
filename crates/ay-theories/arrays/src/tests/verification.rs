@@ -1335,3 +1335,63 @@ fn test_old_atom_assignment_with_pending_terms_stays_incremental() {
     );
     assert!(solver.get_equiv_class(x0).contains(&x2));
 }
+
+/// (#uf-array-app-default) An array-sorted UF APPLICATION asserted EQUAL to a
+/// store over a const-array must inherit that base's `else` value.
+///
+/// `(seq_array (seq_singleton v))` reaches neither `const_array_cache` nor
+/// `default_cache`, so it collected its select-derived cells and was published
+/// with `default: None`. The renderer then had to invent an else-value, and
+/// inventing it from the one store value collapsed the array to a CONSTANT: for
+/// `(= (seq_array (seq_singleton v)) (store ((as const ..) 0) 0 v))` with
+/// `v = 42` AY printed `((as const (Array Int Int)) 42)` — which disagrees with
+/// the asserted `store((as const ..) 0, 0, 42)` at every index but 0. AY
+/// published a `sat` whose own `(get-value)` then reported those two arrays as
+/// equal, and z3 replayed the published model as `unsat`.
+///
+/// The class is exactly the arrays the solver asserted equal, so taking the
+/// default from a member that HAS one invents nothing.
+#[test]
+fn test_extract_model_uf_application_inherits_class_default() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    let zero = store.mk_int(BigInt::from(0));
+    let forty_two = store.mk_int(BigInt::from(42));
+    let base = store.mk_const_array(Sort::Int, zero);
+    let stored = store.mk_store(base, zero, forty_two);
+
+    // The array-sorted UF application: no store chain, no const-array base.
+    let seq = store.mk_var("s", Sort::Uninterpreted("Seq".to_string()));
+    let uf_array = store.mk_app(Symbol::named("seq_array"), vec![seq], arr_sort);
+    // The asserted read that gives the UF application its select-derived cell
+    // — this is what leaves it with stores but no default.
+    let read = store.mk_select(uf_array, zero);
+    let eq = store.mk_eq(uf_array, stored);
+
+    let mut solver = ArraySolver::new(&store);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    solver.assert_literal(eq, true);
+
+    let term_values = HashMap::from_iter([
+        (zero, "0".to_string()),
+        (forty_two, "42".to_string()),
+        (read, "42".to_string()),
+    ]);
+    let model = solver.extract_model(&term_values);
+
+    let interp = model
+        .array_values
+        .get(&uf_array)
+        .expect("the UF-application array must get an interpretation");
+    assert_eq!(
+        interp.default.as_deref(),
+        Some("0"),
+        "the UF application is asserted EQUAL to store(const 0, 0, 42), so its \
+         else-value is that base's 0; leaving it None makes the renderer invent \
+         a constant array that contradicts the very equality that produced it. \
+         Got default={:?} stores={:?}",
+        interp.default,
+        interp.stores
+    );
+}

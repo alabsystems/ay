@@ -1042,6 +1042,16 @@ impl Solver {
             if self.vsids.vmtf_is_deferred() {
                 self.vsids.rebuild_vmtf_from_bump_order(&self.vals);
             }
+            // `reduce_db` runs at the tail of conflict analysis, which has just
+            // enqueued the learned clause's asserting literal — so BCP always
+            // has pending work here and `compact_arena_locality` always hit its
+            // quiescence guard and returned without doing anything. Measured on
+            // `mexam_17_15_2` (510 vars, 19 652 clauses): 104 reductions, 102
+            // compaction attempts, 102 skips, 0 compactions, an arena grown to
+            // 107 M words of which 98 M are dead, and 2.44 GB RSS on a 0.2 MB
+            // instance. Defer instead: the search loop compacts at its next
+            // post-BCP scheduling point, where the solver really is quiescent.
+            self.cold.arena_compaction_pending = true;
             self.compact_arena_locality();
         }
 

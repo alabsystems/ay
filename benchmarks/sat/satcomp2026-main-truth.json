@@ -1,0 +1,3461 @@
+{
+ "captured_utc": "2026-07-30T03:47:00Z",
+ "field": [
+  {
+   "par2_mean": 3647.02,
+   "par2_sum": 1458807.87,
+   "sat": 127,
+   "solved": 276,
+   "solver": "anders_satsuma-iter-kissat[main]",
+   "unsat": 149
+  },
+  {
+   "par2_mean": 3686.17,
+   "par2_sum": 1474469.23,
+   "sat": 130,
+   "solved": 130,
+   "solver": "zhenwei_kissat-sup[exp]",
+   "unsat": 0
+  },
+  {
+   "par2_mean": 3696.84,
+   "par2_sum": 1478737.2,
+   "sat": 136,
+   "solved": 269,
+   "solver": "anders_satsuma-iter-ae-kissat-mab[main]",
+   "unsat": 133
+  },
+  {
+   "par2_mean": 3996.29,
+   "par2_sum": 1598517.37,
+   "sat": 134,
+   "solved": 255,
+   "solver": "zheng_kissat-mab-hypre[main]",
+   "unsat": 121
+  },
+  {
+   "par2_mean": 3997.28,
+   "par2_sum": 1598910.48,
+   "sat": 134,
+   "solved": 255,
+   "solver": "zheng_kissat-mab-hypre-v2[main]",
+   "unsat": 121
+  },
+  {
+   "par2_mean": 4009.7,
+   "par2_sum": 1603880.03,
+   "sat": 135,
+   "solved": 255,
+   "solver": "zheng_kissat-mab-hypre-evolve[main-ai]",
+   "unsat": 120
+  },
+  {
+   "par2_mean": 4066.84,
+   "par2_sum": 1626736.13,
+   "sat": 133,
+   "solved": 253,
+   "solver": "zheng_kissat-mab-hypre-satlution[main-ai]",
+   "unsat": 120
+  },
+  {
+   "par2_mean": 4176.9,
+   "par2_sum": 1670759.52,
+   "sat": 146,
+   "solved": 251,
+   "solver": "green_lymphosat[main-ai]",
+   "unsat": 105
+  },
+  {
+   "par2_mean": 4279.58,
+   "par2_sum": 1711833.4,
+   "sat": 125,
+   "solved": 249,
+   "solver": "oertel_satsuma-lex-kissat[main]",
+   "unsat": 124
+  },
+  {
+   "par2_mean": 4385.81,
+   "par2_sum": 1754323.39,
+   "sat": 133,
+   "solved": 245,
+   "solver": "zhenwei_mergesat-l[main-ai]",
+   "unsat": 112
+  },
+  {
+   "par2_mean": 4435.89,
+   "par2_sum": 1774357.04,
+   "sat": 129,
+   "solved": 239,
+   "solver": "oertel_satsuma-lex-ae-kissat-mab[main]",
+   "unsat": 110
+  },
+  {
+   "par2_mean": 4469.34,
+   "par2_sum": 1787735.7,
+   "sat": 131,
+   "solved": 240,
+   "solver": "yalun_kissat-eda-2[main]",
+   "unsat": 109
+  },
+  {
+   "par2_mean": 4469.35,
+   "par2_sum": 1787738.99,
+   "sat": 129,
+   "solved": 236,
+   "solver": "yalun_kissat-eda-4[main]",
+   "unsat": 107
+  },
+  {
+   "par2_mean": 4470.64,
+   "par2_sum": 1788257.55,
+   "sat": 131,
+   "solved": 242,
+   "solver": "yalun_kissat-eda-3[main]",
+   "unsat": 111
+  },
+  {
+   "par2_mean": 4528.4,
+   "par2_sum": 1811359.86,
+   "sat": 130,
+   "solved": 238,
+   "solver": "zhenwei_mergesat[main]",
+   "unsat": 108
+  },
+  {
+   "par2_mean": 4570.29,
+   "par2_sum": 1828117.98,
+   "sat": 127,
+   "solved": 239,
+   "solver": "yalun_kissat-eda-1[main]",
+   "unsat": 112
+  },
+  {
+   "par2_mean": 4611.54,
+   "par2_sum": 1844617.42,
+   "sat": 129,
+   "solved": 238,
+   "solver": "biere_kissat-biere[main]",
+   "unsat": 109
+  },
+  {
+   "par2_mean": 4640.38,
+   "par2_sum": 1856150.43,
+   "sat": 135,
+   "solved": 236,
+   "solver": "liang_kissat-mab-da[main]",
+   "unsat": 101
+  },
+  {
+   "par2_mean": 4709.94,
+   "par2_sum": 1883974.26,
+   "sat": 136,
+   "solved": 228,
+   "solver": "ding_kissat-mab-eae1[main-ai]",
+   "unsat": 92
+  },
+  {
+   "par2_mean": 4726.0,
+   "par2_sum": 1890401.92,
+   "sat": 136,
+   "solved": 228,
+   "solver": "gopalan_kissat-evolve-rb[main-ai]",
+   "unsat": 92
+  },
+  {
+   "par2_mean": 4754.68,
+   "par2_sum": 1901873.84,
+   "sat": 136,
+   "solved": 227,
+   "solver": "gopalan_kissat-evolve-r1[main-ai]",
+   "unsat": 91
+  },
+  {
+   "par2_mean": 4780.59,
+   "par2_sum": 1912235.46,
+   "sat": 136,
+   "solved": 227,
+   "solver": "gopalan_kissat-evolve[main-ai]",
+   "unsat": 91
+  },
+  {
+   "par2_mean": 4848.37,
+   "par2_sum": 1939347.04,
+   "sat": 131,
+   "solved": 222,
+   "solver": "gopalan_kissat-evolve-b2[main-ai]",
+   "unsat": 91
+  },
+  {
+   "par2_mean": 4860.12,
+   "par2_sum": 1944047.06,
+   "sat": 129,
+   "solved": 221,
+   "solver": "ding_kissat-mab-eae2[main-ai]",
+   "unsat": 92
+  },
+  {
+   "par2_mean": 4868.88,
+   "par2_sum": 1947553.5,
+   "sat": 121,
+   "solved": 221,
+   "solver": "liang_kissat-lr-ds[main]",
+   "unsat": 100
+  },
+  {
+   "par2_mean": 4891.32,
+   "par2_sum": 1956528.22,
+   "sat": 128,
+   "solved": 219,
+   "solver": "ding_kissat-mab-eae3[main-ai]",
+   "unsat": 91
+  },
+  {
+   "par2_mean": 4980.54,
+   "par2_sum": 1992214.27,
+   "sat": 118,
+   "solved": 221,
+   "solver": "reeves_cadical-xlc-freeze[main]",
+   "unsat": 103
+  },
+  {
+   "par2_mean": 5260.21,
+   "par2_sum": 2104082.59,
+   "sat": 115,
+   "solved": 205,
+   "solver": "biere_cadical3[main]",
+   "unsat": 90
+  },
+  {
+   "par2_mean": 6572.78,
+   "par2_sum": 2629113.65,
+   "sat": 146,
+   "solved": 146,
+   "solver": "green_lymphosat-verified[main-ai]",
+   "unsat": 0
+  },
+  {
+   "par2_mean": 7185.5,
+   "par2_sum": 2874200.5,
+   "sat": 75,
+   "solved": 124,
+   "solver": "biere_isasat[main]",
+   "unsat": 49
+  },
+  {
+   "par2_mean": 9652.42,
+   "par2_sum": 3860967.64,
+   "sat": 13,
+   "solved": 13,
+   "solver": "faraja_llmg[exp-ai]",
+   "unsat": 0
+  }
+ ],
+ "instances": 400,
+ "instances_by_hash": {
+  "011984fd82d62d609e776fbf5de75440": {
+   "n_solved": 28,
+   "name": "arles_thres20_p10_r7533",
+   "truth": "unsat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.02
+  },
+  "01d6fa8efd18ebfecd06af408958477b": {
+   "n_solved": 26,
+   "name": "lightsout_sat_25_unbounded_direct_planted250_4_sat",
+   "truth": "sat",
+   "vbs_time": 146.27,
+   "winner_solved": true,
+   "winner_time": 713.55
+  },
+  "02a46668243d6dabab4cf74d3811f6b6": {
+   "n_solved": 19,
+   "name": "1x1x13_1x3x6_pair_4_2_0_2_5_0",
+   "truth": "sat",
+   "vbs_time": 358.19,
+   "winner_solved": true,
+   "winner_time": 2216.57
+  },
+  "0359596347daa117da50950748bc06d1": {
+   "n_solved": 0,
+   "name": "j3037_9_rggt_bm1",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "03e49a528251af9a7b7e1ca03c33b162": {
+   "n_solved": 0,
+   "name": "schooltt-5-5-8-2-4-5-10-0.1-0.2-seed2",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "042cdc726a92bf0a2195b3b426f35bce": {
+   "n_solved": 0,
+   "name": "reconf20_50_grid10_1_6141",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "043c91001968a1fbd1ef419540fcb396": {
+   "n_solved": 2,
+   "name": "miles1500.72",
+   "truth": "unsat",
+   "vbs_time": 0.74,
+   "winner_solved": true,
+   "winner_time": 0.74
+  },
+  "04d0ae28e10d4a35ebab62f42f0200e8": {
+   "n_solved": 0,
+   "name": "168.smt2",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.25
+  },
+  "0757e47d262b75171c0040987e6d20ce": {
+   "n_solved": 0,
+   "name": "vdwb_k6_n400",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "07df5e6f674201e2bf31bcaa8866ba75": {
+   "n_solved": 0,
+   "name": "cabp-V-nos6.mtx.rnd-k331",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "08cf53ca00dce11f5bfc02121c9bcd33": {
+   "n_solved": 27,
+   "name": "GreenTao_2-3-5_528",
+   "truth": "unsat",
+   "vbs_time": 144.91,
+   "winner_solved": true,
+   "winner_time": 256.0
+  },
+  "0922feab75c35d04d9b8df69013a6df0": {
+   "n_solved": 30,
+   "name": "toughsat_22bits_0",
+   "truth": "sat",
+   "vbs_time": 19.35,
+   "winner_solved": true,
+   "winner_time": 27.02
+  },
+  "09637d3bd641b4d733666a862e8918ea": {
+   "n_solved": 30,
+   "name": "mrpp_8x8#20_14",
+   "truth": "sat",
+   "vbs_time": 9.71,
+   "winner_solved": true,
+   "winner_time": 14.66
+  },
+  "09e0775d2b51c49ec1ec4d214ee7c8c8": {
+   "n_solved": 26,
+   "name": "ntil-90d-37",
+   "truth": "sat",
+   "vbs_time": 73.9,
+   "winner_solved": true,
+   "winner_time": 3990.99
+  },
+  "0aea4286a11d91ee8fa356d5db046373": {
+   "n_solved": 28,
+   "name": "gus-md5-08",
+   "truth": "unsat",
+   "vbs_time": 50.16,
+   "winner_solved": true,
+   "winner_time": 73.25
+  },
+  "0be1e12a8e7282d1a4e389bb90f6dbc7": {
+   "n_solved": 27,
+   "name": "or_randxor_k3_n600_m600",
+   "truth": "unsat",
+   "vbs_time": 0.02,
+   "winner_solved": true,
+   "winner_time": 23.54
+  },
+  "0c9da400944b002f90fd385d4fdab385": {
+   "n_solved": 30,
+   "name": "DivS_568_11.cnf",
+   "truth": "sat",
+   "vbs_time": 3.35,
+   "winner_solved": true,
+   "winner_time": 21.7
+  },
+  "0cab9100cdd8505069301d658d085899": {
+   "n_solved": 27,
+   "name": "AProVE07-01",
+   "truth": "unsat",
+   "vbs_time": 1011.08,
+   "winner_solved": true,
+   "winner_time": 2312.5
+  },
+  "0d082b8fa36f662217bee5524cd24d3a": {
+   "n_solved": 6,
+   "name": "mexam_23_20_2",
+   "truth": "unsat",
+   "vbs_time": 0.1,
+   "winner_solved": true,
+   "winner_time": 5.37
+  },
+  "0d0fabe0fbca67a8740ebe8b8621d465": {
+   "n_solved": 6,
+   "name": "as-p147-l51-o0-rot-rfl-68-i",
+   "truth": "sat",
+   "vbs_time": 2571.25,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "0e06895600b5cd0b6fadb87e17bf8145": {
+   "n_solved": 13,
+   "name": "ntil-90d-39",
+   "truth": "sat",
+   "vbs_time": 204.38,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "0ec6bf97a96b9840ae84f1d1da4c4dcd": {
+   "n_solved": 4,
+   "name": "count_p3_M19",
+   "truth": "unsat",
+   "vbs_time": 0.43,
+   "winner_solved": true,
+   "winner_time": 0.43
+  },
+  "0efcbd10294eb001b16b4d126923372f": {
+   "n_solved": 26,
+   "name": "lightsout_sat_23_unbounded_direct_random50_2_unsat",
+   "truth": "unsat",
+   "vbs_time": 1052.44,
+   "winner_solved": true,
+   "winner_time": 2183.87
+  },
+  "0f1070ba60b55aa62d3a98798a14700e": {
+   "n_solved": 2,
+   "name": "mulsol.i.2.30",
+   "truth": "unsat",
+   "vbs_time": 0.18,
+   "winner_solved": true,
+   "winner_time": 0.18
+  },
+  "117b99ffa16d21cb4ccb1c66829b0c7e": {
+   "n_solved": 1,
+   "name": "adv_gc_n50_k14_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 51.56,
+   "winner_solved": false,
+   "winner_time": 5000.35
+  },
+  "1236c1406a2749b8022b5196e93de589": {
+   "n_solved": 30,
+   "name": "ntil-90d-33",
+   "truth": "sat",
+   "vbs_time": 10.94,
+   "winner_solved": true,
+   "winner_time": 442.09
+  },
+  "123c397f55eeae78c45e8d973b8e9dce": {
+   "n_solved": 27,
+   "name": "rpoc_xits_09_UNSAT",
+   "truth": "unsat",
+   "vbs_time": 10.28,
+   "winner_solved": true,
+   "winner_time": 11.88
+  },
+  "12535b3264a9c88bac14522171b497ef": {
+   "n_solved": 6,
+   "name": "sbdp4_138",
+   "truth": "unsat",
+   "vbs_time": 1658.43,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "129162378e8ad29b5485a9c53feee4b7": {
+   "n_solved": 30,
+   "name": "hantzsche_wendt_unit_93",
+   "truth": "sat",
+   "vbs_time": 0.11,
+   "winner_solved": true,
+   "winner_time": 534.67
+  },
+  "12ac1c71ff0405cc150c2a2db6c4a255": {
+   "n_solved": 6,
+   "name": "exam_75_65",
+   "truth": "unsat",
+   "vbs_time": 0.31,
+   "winner_solved": true,
+   "winner_time": 0.32
+  },
+  "12cd0c3196589ac8105653cbfe613fc6": {
+   "n_solved": 28,
+   "name": "4pipe",
+   "truth": "unsat",
+   "vbs_time": 3.97,
+   "winner_solved": true,
+   "winner_time": 3.97
+  },
+  "1397d1d4d8d831069a2cdf911321da07": {
+   "n_solved": 28,
+   "name": "adv_gc_n300_k10_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 0.97,
+   "winner_solved": true,
+   "winner_time": 2.45
+  },
+  "147ae051ca727d5b2af87223b2299fbe": {
+   "n_solved": 22,
+   "name": "1x1x13_1x3x6_pair_0_0_0_2_2_1",
+   "truth": "sat",
+   "vbs_time": 262.33,
+   "winner_solved": true,
+   "winner_time": 461.96
+  },
+  "15456f0d13b26f0b4b21525ef7d0d711": {
+   "n_solved": 27,
+   "name": "clique_n5_k10",
+   "truth": "unsat",
+   "vbs_time": 0.04,
+   "winner_solved": true,
+   "winner_time": 2.63
+  },
+  "15e666a42158e3304fc3979de28a5e44": {
+   "n_solved": 27,
+   "name": "adv_gc_n200_k12_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 6.33,
+   "winner_solved": true,
+   "winner_time": 31.24
+  },
+  "166e1e5a9f63fcf94ddae8533fa2a090": {
+   "n_solved": 27,
+   "name": "mp1-squ_any_s09x07_c27_abix_UNS",
+   "truth": "unsat",
+   "vbs_time": 283.36,
+   "winner_solved": true,
+   "winner_time": 477.94
+  },
+  "1680176921bab3f01c4f7c33791c8c23": {
+   "n_solved": 0,
+   "name": "schooltt-5-5-9-2-4-5-10-0.1-0.2-seed2",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "16ca57f2cdffd5b0260fc771017e1f04": {
+   "n_solved": 0,
+   "name": "mdp-36-10-unsat",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.2
+  },
+  "16f8b291c8cdedb5ca7210fa0eeb34d9": {
+   "n_solved": 5,
+   "name": "zeroin.i.3.29",
+   "truth": "unsat",
+   "vbs_time": 0.17,
+   "winner_solved": true,
+   "winner_time": 0.17
+  },
+  "1707c4c24e66b2cfe6c03955b638bebf": {
+   "n_solved": 3,
+   "name": "xorshift_r16_119",
+   "truth": "sat",
+   "vbs_time": 636.97,
+   "winner_solved": false,
+   "winner_time": 5000.26
+  },
+  "180e6d8b61fe6bab26126b78591e324e": {
+   "n_solved": 30,
+   "name": "baseballcover11with22_and2positions",
+   "truth": "sat",
+   "vbs_time": 226.55,
+   "winner_solved": true,
+   "winner_time": 321.9
+  },
+  "1890f49a43a94b97828528b68c32b78e": {
+   "n_solved": 28,
+   "name": "homer11.shuffled",
+   "truth": "unsat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.01
+  },
+  "1a3bef9e03bab1ed4e9e34506d72a451": {
+   "n_solved": 2,
+   "name": "le450_25b.col.25",
+   "truth": "unsat",
+   "vbs_time": 0.3,
+   "winner_solved": true,
+   "winner_time": 0.31
+  },
+  "1b9c308123cb2b48d1894fc6d1848f1e": {
+   "n_solved": 29,
+   "name": "cabp-M-bcsstk06.mtx.rnd-k33",
+   "truth": "sat",
+   "vbs_time": 45.34,
+   "winner_solved": true,
+   "winner_time": 450.35
+  },
+  "1bb9fe12b4fb50e98903ee87a51d6472": {
+   "n_solved": 28,
+   "name": "goldb-heqc-k2mul",
+   "truth": "unsat",
+   "vbs_time": 16.6,
+   "winner_solved": true,
+   "winner_time": 20.54
+  },
+  "1c0fe2ac410f3942e374ea72ec005d76": {
+   "n_solved": 29,
+   "name": "SDP_120_17_1675",
+   "truth": "sat",
+   "vbs_time": 61.49,
+   "winner_solved": true,
+   "winner_time": 181.71
+  },
+  "1eea3d913d346b900252d77fc0cb25c8": {
+   "n_solved": 7,
+   "name": "par32-4.shuffled",
+   "truth": "sat",
+   "vbs_time": 729.77,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "1f81f7e009f501014cb23a8c2d41836f": {
+   "n_solved": 30,
+   "name": "ACG-20-10p1",
+   "truth": "sat",
+   "vbs_time": 106.2,
+   "winner_solved": true,
+   "winner_time": 168.25
+  },
+  "1fac905143027e3bf0932c09f427aa15": {
+   "n_solved": 28,
+   "name": "adv_gc_n100_k10_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 0.57,
+   "winner_solved": true,
+   "winner_time": 1.51
+  },
+  "1fb646d2657b6dd5f0106dbec9fd6c27": {
+   "n_solved": 8,
+   "name": "chnl-040x041",
+   "truth": "unsat",
+   "vbs_time": 0.1,
+   "winner_solved": true,
+   "winner_time": 0.1
+  },
+  "2027301e88cb029e4b47b747da8a180a": {
+   "n_solved": 8,
+   "name": "chnl-050x051",
+   "truth": "unsat",
+   "vbs_time": 0.17,
+   "winner_solved": true,
+   "winner_time": 0.18
+  },
+  "20ae1404784ed226a1e3e4c9b2d61a41": {
+   "n_solved": 10,
+   "name": "bwoadm_28_5",
+   "truth": "unsat",
+   "vbs_time": 1514.73,
+   "winner_solved": false,
+   "winner_time": 5000.03
+  },
+  "211b0708454f7901054f5f92f525972e": {
+   "n_solved": 7,
+   "name": "sbdp4_65",
+   "truth": "unsat",
+   "vbs_time": 2740.99,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "218f0eccbff400e06c9736bd759c1d3a": {
+   "n_solved": 30,
+   "name": "scc_9630_26_0.3_0.1_17.af_76",
+   "truth": "sat",
+   "vbs_time": 0.8,
+   "winner_solved": true,
+   "winner_time": 4.41
+  },
+  "22465e251284b8f3e48bf9a06a94855c": {
+   "n_solved": 4,
+   "name": "as-p81-l27-o6-rot-568",
+   "truth": "sat",
+   "vbs_time": 1316.18,
+   "winner_solved": false,
+   "winner_time": 5000.76
+  },
+  "22c8d6aa86d51e15ef5ab37479eda22b": {
+   "n_solved": 22,
+   "name": "xor_op_n40_d3",
+   "truth": "unsat",
+   "vbs_time": 3.19,
+   "winner_solved": true,
+   "winner_time": 141.15
+  },
+  "231f3a169120d3cda9f8feea88a20d85": {
+   "n_solved": 1,
+   "name": "xorshift_r14_42",
+   "truth": "sat",
+   "vbs_time": 712.55,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "23daec2c71ce3c1e346e6042f3dc42eb": {
+   "n_solved": 0,
+   "name": "mdp-32-14-unsat",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "247e42e46495f1c4b8707e497af8c93e": {
+   "n_solved": 2,
+   "name": "16",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "2563ea83d8508d635cc034d80014cd72": {
+   "n_solved": 13,
+   "name": "1x1x13_1x3x6_pair_2_1_1_4_2_0",
+   "truth": "sat",
+   "vbs_time": 64.48,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "262a226a47330987f038128579967405": {
+   "n_solved": 28,
+   "name": "ais8.cnf.mis-97.debugged",
+   "truth": "unsat",
+   "vbs_time": 2.59,
+   "winner_solved": true,
+   "winner_time": 2.96
+  },
+  "266e890b706cf336378bf148bbda1aff": {
+   "n_solved": 27,
+   "name": "mexam_15_12_2",
+   "truth": "unsat",
+   "vbs_time": 0.07,
+   "winner_solved": true,
+   "winner_time": 0.49
+  },
+  "27495ba0093076d2e39a9b218e521ee2": {
+   "n_solved": 8,
+   "name": "sbdp4_61_2",
+   "truth": "unsat",
+   "vbs_time": 1901.81,
+   "winner_solved": true,
+   "winner_time": 4591.88
+  },
+  "276c46723eeb15ec37be224fbbd67574": {
+   "n_solved": 13,
+   "name": "sha1__zeroOut_18__freeIn_22__seed_0",
+   "truth": "sat",
+   "vbs_time": 1511.73,
+   "winner_solved": true,
+   "winner_time": 3025.47
+  },
+  "284dec9d0d0404c8b80d8bd8064e4c68": {
+   "n_solved": 27,
+   "name": "gensys-ukn004.shuffled-as.sat05-3844",
+   "truth": "unsat",
+   "vbs_time": 464.61,
+   "winner_solved": true,
+   "winner_time": 769.62
+  },
+  "28dcc4119e1bbb5fbd3fdd8f4140f28d": {
+   "n_solved": 29,
+   "name": "lightsout_sat_25_unbounded_totalizer_planted150_3_sat",
+   "truth": "sat",
+   "vbs_time": 26.96,
+   "winner_solved": true,
+   "winner_time": 31.82
+  },
+  "29a27e97790bda6c34808f631dd0418e": {
+   "n_solved": 27,
+   "name": "linvrinv5.shuffled-as.sat05-564",
+   "truth": "unsat",
+   "vbs_time": 675.65,
+   "winner_solved": true,
+   "winner_time": 1783.86
+  },
+  "2a38c5d48846ee1c35c4c40938082a16": {
+   "n_solved": 9,
+   "name": "sbdp4_138_2",
+   "truth": "unsat",
+   "vbs_time": 1620.28,
+   "winner_solved": true,
+   "winner_time": 4612.95
+  },
+  "2ae678a4f0b8097615160a440efbe08e": {
+   "n_solved": 30,
+   "name": "as-p111-l36-o3-rot-II-5680-i",
+   "truth": "sat",
+   "vbs_time": 574.63,
+   "winner_solved": true,
+   "winner_time": 745.79
+  },
+  "2b35377a7b95f24449a3b607b61fff05": {
+   "n_solved": 30,
+   "name": "bench_1277.smt2",
+   "truth": "sat",
+   "vbs_time": 14.64,
+   "winner_solved": true,
+   "winner_time": 136.43
+  },
+  "2b7e863462991fd008f9898eca63ebf4": {
+   "n_solved": 29,
+   "name": "SC23_Timetable_C_481_E_50_Cl_32_D_6_T_50",
+   "truth": "sat",
+   "vbs_time": 20.21,
+   "winner_solved": true,
+   "winner_time": 21.41
+  },
+  "2b8cac8e1f5cad04696004e7fbf5cf2e": {
+   "n_solved": 30,
+   "name": "ntil-90d-34",
+   "truth": "sat",
+   "vbs_time": 6.45,
+   "winner_solved": true,
+   "winner_time": 73.22
+  },
+  "2bb63853a9b8b9b9327a142210a9f437": {
+   "n_solved": 31,
+   "name": "Medium-result_b30.af_61",
+   "truth": "sat",
+   "vbs_time": 0.32,
+   "winner_solved": true,
+   "winner_time": 122.95
+  },
+  "2bbc3327d89b59591b89b5d5a486f037": {
+   "n_solved": 25,
+   "name": "001",
+   "truth": "sat",
+   "vbs_time": 105.51,
+   "winner_solved": true,
+   "winner_time": 2245.62
+  },
+  "2c4491c50d4df86e7c1838083cedc703": {
+   "n_solved": 20,
+   "name": "1x1x14_1x2x9_pair_4_3_0_2_3_1",
+   "truth": "sat",
+   "vbs_time": 145.63,
+   "winner_solved": true,
+   "winner_time": 3445.49
+  },
+  "2c458ef30d7b670f143d6c6e175e3ee9": {
+   "n_solved": 25,
+   "name": "oddball_70_5_tto_zp.normalised",
+   "truth": "sat",
+   "vbs_time": 4.31,
+   "winner_solved": false,
+   "winner_time": 5000.02
+  },
+  "2ca47af4ab7a817725138b8b66e9af7f": {
+   "n_solved": 11,
+   "name": "st_540_25_12_12_9.af",
+   "truth": "sat",
+   "vbs_time": 63.83,
+   "winner_solved": false,
+   "winner_time": 5000.14
+  },
+  "2d261a19d2754d92da3ddff04fda23c8": {
+   "n_solved": 1,
+   "name": "ntil-90d-44",
+   "truth": "sat",
+   "vbs_time": 2478.13,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "2d89fda1bd6a761ca5e2f4bb89202681": {
+   "n_solved": 2,
+   "name": "2",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "2fcd8533eba981967292f1b6e41f7433": {
+   "n_solved": 30,
+   "name": "simon-r20-0",
+   "truth": "sat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.03
+  },
+  "3005623c4df6f5056a41a26d0f173e70": {
+   "n_solved": 7,
+   "name": "DLTM_twitter634_77_13",
+   "truth": "unsat",
+   "vbs_time": 3559.69,
+   "winner_solved": true,
+   "winner_time": 4482.69
+  },
+  "306a29e966fa6293d407bc7ebbc3ecb1": {
+   "n_solved": 6,
+   "name": "lattice-25.24",
+   "truth": "unsat",
+   "vbs_time": 0.32,
+   "winner_solved": true,
+   "winner_time": 13.76
+  },
+  "30c6fa5c4f5910029b782b712844c93a": {
+   "n_solved": 2,
+   "name": "6",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "30e8b47741a4104c01eeea1d00bbce9e": {
+   "n_solved": 28,
+   "name": "aes_equiv_encry_3_rounds.debugged",
+   "truth": "unsat",
+   "vbs_time": 329.7,
+   "winner_solved": true,
+   "winner_time": 498.0
+  },
+  "31fa00368fc99b15c33c04eb6b257deb": {
+   "n_solved": 28,
+   "name": "cabp-P-can__445.mtx.rnd-k96",
+   "truth": "sat",
+   "vbs_time": 136.08,
+   "winner_solved": true,
+   "winner_time": 212.47
+  },
+  "324b2441c6f1fa9d5f3cf3a4c8447fc7": {
+   "n_solved": 0,
+   "name": "SC21_Timetable_C_512_E_66_Cl_34_S_35",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "32e344a5ab3af245f982678d2b751c6d": {
+   "n_solved": 7,
+   "name": "lightsout_sat_24_unbounded_totalizer_corner_0_unsat",
+   "truth": "unsat",
+   "vbs_time": 838.25,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "3367ba4c01fe07b385980a14211f250e": {
+   "n_solved": 0,
+   "name": "shuffling-2-s158913847-of-bench-sat04-306.used-as.sat04-610",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.4
+  },
+  "337ee3de87f824f99508e65faa6e1a0b": {
+   "n_solved": 0,
+   "name": "SocialGolfers-6-6-7-cp_c18",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "33c8aca6a52d10e040da959439834d6a": {
+   "n_solved": 30,
+   "name": "SDP_96_14_3612",
+   "truth": "sat",
+   "vbs_time": 19.69,
+   "winner_solved": true,
+   "winner_time": 62.59
+  },
+  "34360a677fc854189c982294853e6891": {
+   "n_solved": 31,
+   "name": "Large-result_b23.af_303",
+   "truth": "sat",
+   "vbs_time": 1.09,
+   "winner_solved": true,
+   "winner_time": 1041.81
+  },
+  "3598c10125496ad7218852effc5c711f": {
+   "n_solved": 4,
+   "name": "SGI_30_70_22_70_7-dir.shuffled-as.sat03-154",
+   "truth": "unsat",
+   "vbs_time": 4089.14,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "35e0b5a19c88961d98dd806e805759f4": {
+   "n_solved": 8,
+   "name": "count_p2_M33",
+   "truth": "unsat",
+   "vbs_time": 0.06,
+   "winner_solved": true,
+   "winner_time": 0.51
+  },
+  "365a02a7d781d655bb2a64d2273a2d0c": {
+   "n_solved": 30,
+   "name": "Medium-result_b10.af_252",
+   "truth": "sat",
+   "vbs_time": 0.63,
+   "winner_solved": true,
+   "winner_time": 72.64
+  },
+  "372021735d9e46002b862aa2a038a818": {
+   "n_solved": 27,
+   "name": "j3045_4_rggt_bm1",
+   "truth": "unsat",
+   "vbs_time": 365.38,
+   "winner_solved": true,
+   "winner_time": 441.71
+  },
+  "3732b6ac50b1c3f28d72247de89b00e8": {
+   "n_solved": 30,
+   "name": "as-p123-l39-o0-rot-II-4680-i",
+   "truth": "sat",
+   "vbs_time": 1669.96,
+   "winner_solved": true,
+   "winner_time": 2830.98
+  },
+  "37c88155822f1934a190dd6f4614f0ce": {
+   "n_solved": 27,
+   "name": "atco_enc1_opt2_20_12",
+   "truth": "unsat",
+   "vbs_time": 791.3,
+   "winner_solved": true,
+   "winner_time": 1273.76
+  },
+  "37fa67bd34cc613f3fc6954cdee943c1": {
+   "n_solved": 29,
+   "name": "SDP_106_15_2616",
+   "truth": "sat",
+   "vbs_time": 17.98,
+   "winner_solved": true,
+   "winner_time": 525.75
+  },
+  "3a8409393cc1ebae1444a079d216f221": {
+   "n_solved": 0,
+   "name": "x2_64.shuffled-as.sat03-1603.cnf.mis-125.debugged",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "3a9dfcbcb56689f1118fd7a2150c3c0c": {
+   "n_solved": 15,
+   "name": "ntil-90d-40",
+   "truth": "sat",
+   "vbs_time": 156.66,
+   "winner_solved": false,
+   "winner_time": 5000.21
+  },
+  "3b0eeddcabf36da8642c5774ac67680c": {
+   "n_solved": 28,
+   "name": "as-p153-l57-o0-rot-rfl-II-68-i",
+   "truth": "sat",
+   "vbs_time": 929.97,
+   "winner_solved": true,
+   "winner_time": 4224.04
+  },
+  "3b560b9eafce79a4ac3c1062a9e72028": {
+   "n_solved": 27,
+   "name": "cabp-X-can__715.mtx.rnd-k108",
+   "truth": "sat",
+   "vbs_time": 302.5,
+   "winner_solved": true,
+   "winner_time": 831.09
+  },
+  "3b608084b3caae2e9517a2d58cdcd275": {
+   "n_solved": 31,
+   "name": "Medium-result_b9.af_268",
+   "truth": "sat",
+   "vbs_time": 0.46,
+   "winner_solved": true,
+   "winner_time": 61.76
+  },
+  "3c4ac805726d78a869ff8116ee3533db": {
+   "n_solved": 28,
+   "name": "homer18.shuffled",
+   "truth": "unsat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.01
+  },
+  "3c51a565526faa922fb298a2658440e9": {
+   "n_solved": 0,
+   "name": "fastlec_cep_14_T27_58",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "3e44926d72e94f5ceccbb69de24033b2": {
+   "n_solved": 28,
+   "name": "newpol23-4",
+   "truth": "unsat",
+   "vbs_time": 70.34,
+   "winner_solved": true,
+   "winner_time": 96.75
+  },
+  "3e7d8073c795d263ed862db64cf9f0fb": {
+   "n_solved": 11,
+   "name": "bdmbwm_28_94",
+   "truth": "unsat",
+   "vbs_time": 1302.24,
+   "winner_solved": true,
+   "winner_time": 3856.54
+  },
+  "3e912cd2a499b8f956246b866e2f9f64": {
+   "n_solved": 28,
+   "name": "grain-53-80-0s0-seed-125-4-init-35",
+   "truth": "unsat",
+   "vbs_time": 208.24,
+   "winner_solved": true,
+   "winner_time": 294.31
+  },
+  "3ed56242f55e3653dbceeb4a70221787": {
+   "n_solved": 30,
+   "name": "rbsat-v945c61409gyes9-sc2009",
+   "truth": "sat",
+   "vbs_time": 15.91,
+   "winner_solved": true,
+   "winner_time": 107.55
+  },
+  "40ae60a61929b6bfa2ac99ab4b9a0f7e": {
+   "n_solved": 5,
+   "name": "grs-96-192",
+   "truth": "unsat",
+   "vbs_time": 2212.03,
+   "winner_solved": true,
+   "winner_time": 3735.38
+  },
+  "416e33a8463911546e4cd87d282a7e1e": {
+   "n_solved": 29,
+   "name": "case10",
+   "truth": "sat",
+   "vbs_time": 17.14,
+   "winner_solved": true,
+   "winner_time": 878.14
+  },
+  "425c81fc3af7f5124b6282583d80df11": {
+   "n_solved": 0,
+   "name": "mdp-32-12-unsat",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.15
+  },
+  "43c298c756cac6d547a0457c2da7e468": {
+   "n_solved": 1,
+   "name": "xorshift_r14_31",
+   "truth": "sat",
+   "vbs_time": 191.73,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "43d40ced32b5be08814ef24f97379654": {
+   "n_solved": 11,
+   "name": "php_sudoku_p15_h14",
+   "truth": "unsat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.01
+  },
+  "44196693d2cfdb787ba578eef4272f74": {
+   "n_solved": 30,
+   "name": "crusti_g2io_350_0.5_255_12.af_290",
+   "truth": "sat",
+   "vbs_time": 5.03,
+   "winner_solved": true,
+   "winner_time": 15.23
+  },
+  "4430d3502b0b5e6f4ed473437519e609": {
+   "n_solved": 30,
+   "name": "as-p123-l39-o0-rot-II-4682-i",
+   "truth": "sat",
+   "vbs_time": 1054.86,
+   "winner_solved": true,
+   "winner_time": 1898.1
+  },
+  "44452f4bac1e77157bbc900c5cc0756d": {
+   "n_solved": 14,
+   "name": "1x1x13_1x3x6_pair_4_1_0_2_3_0",
+   "truth": "sat",
+   "vbs_time": 61.73,
+   "winner_solved": true,
+   "winner_time": 61.73
+  },
+  "44b7d2c8d08574002ac959e6d1ef30ae": {
+   "n_solved": 10,
+   "name": "1x1x14_1x2x9_pair_4_2_0_2_3_0",
+   "truth": "sat",
+   "vbs_time": 721.83,
+   "winner_solved": false,
+   "winner_time": 5000.03
+  },
+  "4551c996fc6f5fbe62b43076abb25077": {
+   "n_solved": 22,
+   "name": "knight_18",
+   "truth": "sat",
+   "vbs_time": 1.94,
+   "winner_solved": true,
+   "winner_time": 181.5
+  },
+  "45a09efb026036ff4b8d19024a7563a9": {
+   "n_solved": 3,
+   "name": "fermat-931960058139995587",
+   "truth": "sat",
+   "vbs_time": 0.13,
+   "winner_solved": false,
+   "winner_time": 5000.18
+  },
+  "46dc5e955b1fb541678d0634389353ac": {
+   "n_solved": 1,
+   "name": "ntil-90d-45",
+   "truth": "sat",
+   "vbs_time": 4605.49,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "47173e8ab499159d3aa301b0101fe170": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-9-2-4-5-10-0.1-0.1-seed3",
+   "truth": "unsat",
+   "vbs_time": 41.44,
+   "winner_solved": true,
+   "winner_time": 57.38
+  },
+  "48432767076e402d2accbf2da7260885": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-8-2-4-5-10-0.1-0.2-seed2",
+   "truth": "unsat",
+   "vbs_time": 67.7,
+   "winner_solved": true,
+   "winner_time": 175.27
+  },
+  "49644428681a87666a68fc9380dce072": {
+   "n_solved": 19,
+   "name": "cabp-X-can__715.mtx.rnd-k116",
+   "truth": "sat",
+   "vbs_time": 704.47,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "4989239fbeb6eb40fc0b664d9ba92636": {
+   "n_solved": 28,
+   "name": "asconhashv12_opt64_H7_M2-K1zfAs8_m0_3_U5.c",
+   "truth": "unsat",
+   "vbs_time": 9.51,
+   "winner_solved": true,
+   "winner_time": 153.21
+  },
+  "4aab4f954196d3277d9ca7b17c52acca": {
+   "n_solved": 9,
+   "name": "clqcl_25_8_7.normalised",
+   "truth": "unsat",
+   "vbs_time": 0.07,
+   "winner_solved": true,
+   "winner_time": 0.07
+  },
+  "4ae685a11b5cecca76dc3d463481ce92": {
+   "n_solved": 30,
+   "name": "x9-10032.sat",
+   "truth": "sat",
+   "vbs_time": 13.22,
+   "winner_solved": true,
+   "winner_time": 99.15
+  },
+  "4d6bd7b2c674fb67b271127586914b74": {
+   "n_solved": 19,
+   "name": "vdw_4_8_n145",
+   "truth": "sat",
+   "vbs_time": 379.97,
+   "winner_solved": true,
+   "winner_time": 2631.21
+  },
+  "4d84e818a5ab324dde37429dd2455551": {
+   "n_solved": 2,
+   "name": "4",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "4de5b7b3c8bf44b2e8c549128bc936a3": {
+   "n_solved": 30,
+   "name": "as-p141-l39-o0-rot-rfl-680-i",
+   "truth": "sat",
+   "vbs_time": 1173.25,
+   "winner_solved": true,
+   "winner_time": 2261.12
+  },
+  "4e0de894799790b06e8d6c3efd109ade": {
+   "n_solved": 30,
+   "name": "9.xz",
+   "truth": "sat",
+   "vbs_time": 13.29,
+   "winner_solved": true,
+   "winner_time": 30.16
+  },
+  "4e64ffc14db014d5591f40865376c32a": {
+   "n_solved": 28,
+   "name": "satcoin-genesis-UNSAT-7200",
+   "truth": "unsat",
+   "vbs_time": 0.86,
+   "winner_solved": true,
+   "winner_time": 430.57
+  },
+  "4f09ef861ee74e50dc101765e1ce27fb": {
+   "n_solved": 28,
+   "name": "BubbleVsPancakeSort_6_7",
+   "truth": "unsat",
+   "vbs_time": 68.79,
+   "winner_solved": true,
+   "winner_time": 78.4
+  },
+  "510df610f94d5d57073a2c3b694dac4c": {
+   "n_solved": 30,
+   "name": "51-136961",
+   "truth": "sat",
+   "vbs_time": 27.89,
+   "winner_solved": true,
+   "winner_time": 282.79
+  },
+  "511f1794698a8620c18a7cc32cfc7776": {
+   "n_solved": 2,
+   "name": "14",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "515511be3905018ae7e6eb7ba7064d72": {
+   "n_solved": 4,
+   "name": "SDP_134_18_4334",
+   "truth": "sat",
+   "vbs_time": 915.03,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "5220b0e01fb49440531004bebbafbc44": {
+   "n_solved": 22,
+   "name": "\"5220b0e01fb49440531004bebbafbc44-coreMQTT:MQTT_ProcessLoop.dimacs.cnf.xz\"",
+   "truth": "unsat",
+   "vbs_time": 63.08,
+   "winner_solved": true,
+   "winner_time": 155.09
+  },
+  "5314fd6ccb53b6f6af49a594ea68a273": {
+   "n_solved": 28,
+   "name": "oski15a01b15s_opt",
+   "truth": "unsat",
+   "vbs_time": 422.49,
+   "winner_solved": true,
+   "winner_time": 775.28
+  },
+  "53d23b2b464a5c041114eb1f00cc4b81": {
+   "n_solved": 26,
+   "name": "puzzle32_sat",
+   "truth": "sat",
+   "vbs_time": 0.15,
+   "winner_solved": true,
+   "winner_time": 3605.41
+  },
+  "53e8a231196dfdf1baebfa2f29646f14": {
+   "n_solved": 0,
+   "name": "shuffling-2-s504782760-of-bench-sat04-312.used-as.sat04-604",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "543e67dd5abc272c37775b1b742a1d9a": {
+   "n_solved": 30,
+   "name": "qwh.60.1728.shuffled-as.sat03-1659",
+   "truth": "sat",
+   "vbs_time": 31.4,
+   "winner_solved": true,
+   "winner_time": 59.05
+  },
+  "546a73eef02dda3719018050b09e9392": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-8-2-4-5-10-0.1-0.2-seed1",
+   "truth": "unsat",
+   "vbs_time": 104.52,
+   "winner_solved": true,
+   "winner_time": 244.25
+  },
+  "553b056f2651fdc182ca74174aa8ea10": {
+   "n_solved": 0,
+   "name": "ntil-90d-46",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "5553fec254b32349e0e48c7ee1e2d6c7": {
+   "n_solved": 28,
+   "name": "post-cbmc-aes-ee-r2",
+   "truth": "unsat",
+   "vbs_time": 97.65,
+   "winner_solved": true,
+   "winner_time": 143.34
+  },
+  "57f6bbfc8be5a981322fe9991209aa33": {
+   "n_solved": 30,
+   "name": "3.xz",
+   "truth": "sat",
+   "vbs_time": 6.88,
+   "winner_solved": true,
+   "winner_time": 37.01
+  },
+  "58eaf62034046ed4fc52562869569b44": {
+   "n_solved": 8,
+   "name": "count_p2_M41",
+   "truth": "unsat",
+   "vbs_time": 0.08,
+   "winner_solved": true,
+   "winner_time": 1.37
+  },
+  "59b585a33d30e6b7a476ed52a3f0384d": {
+   "n_solved": 28,
+   "name": "T92.2.0",
+   "truth": "unsat",
+   "vbs_time": 307.45,
+   "winner_solved": true,
+   "winner_time": 316.46
+  },
+  "5ab5ac8d66c7e375037f12a536baf721": {
+   "n_solved": 7,
+   "name": "sbdp4_136_2",
+   "truth": "unsat",
+   "vbs_time": 1771.52,
+   "winner_solved": true,
+   "winner_time": 4324.06
+  },
+  "5babccd4bf9b270acf0568bba32313bd": {
+   "n_solved": 30,
+   "name": "8.xz",
+   "truth": "sat",
+   "vbs_time": 12.52,
+   "winner_solved": true,
+   "winner_time": 27.71
+  },
+  "5cae5c0629ce1c724746af890410cfc1": {
+   "n_solved": 30,
+   "name": "jkkk-one-one-11-38-sat",
+   "truth": "sat",
+   "vbs_time": 6.16,
+   "winner_solved": true,
+   "winner_time": 179.04
+  },
+  "5ce7d137442bd97a321a883c425e4634": {
+   "n_solved": 30,
+   "name": "56-126575",
+   "truth": "sat",
+   "vbs_time": 27.1,
+   "winner_solved": true,
+   "winner_time": 481.36
+  },
+  "5d02aa18eac7304c705577f1cce07784": {
+   "n_solved": 30,
+   "name": "as-p41-l15-o10-567",
+   "truth": "sat",
+   "vbs_time": 41.65,
+   "winner_solved": true,
+   "winner_time": 41.65
+  },
+  "5d06225b27017e9a703f10cb577cf3bf": {
+   "n_solved": 9,
+   "name": "clqcl_25_7_6.normalised",
+   "truth": "unsat",
+   "vbs_time": 0.06,
+   "winner_solved": true,
+   "winner_time": 0.06
+  },
+  "5d8b47745dba3fe50f9c8712be389cd5": {
+   "n_solved": 6,
+   "name": "mexam_25_20_2",
+   "truth": "unsat",
+   "vbs_time": 0.11,
+   "winner_solved": true,
+   "winner_time": 6.26
+  },
+  "5de866bc7ff4dfde3cd682b5aca75894": {
+   "n_solved": 31,
+   "name": "n320p5q2_n.af_239",
+   "truth": "sat",
+   "vbs_time": 0.11,
+   "winner_solved": true,
+   "winner_time": 2.12
+  },
+  "5e1f1759de9bf931a8e26dbe7dd5b212": {
+   "n_solved": 28,
+   "name": "cabp-V-nos6.mtx.rnd-k290",
+   "truth": "sat",
+   "vbs_time": 136.24,
+   "winner_solved": true,
+   "winner_time": 656.05
+  },
+  "5ee05ef0bcb42cb12bd698978c05178c": {
+   "n_solved": 27,
+   "name": "mp1-bsat201-707",
+   "truth": "unsat",
+   "vbs_time": 222.99,
+   "winner_solved": true,
+   "winner_time": 505.02
+  },
+  "5f65b4cceeb01c56e037df144309b29e": {
+   "n_solved": 0,
+   "name": "SGI_30_70_21_70_7-log.shuffled-as.sat03-153",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.13
+  },
+  "5f729f069a233fa88dfb470bbee7c924": {
+   "n_solved": 13,
+   "name": "1x1x14_1x2x9_pair_2_4_0_2_2_0",
+   "truth": "sat",
+   "vbs_time": 1956.5,
+   "winner_solved": true,
+   "winner_time": 3242.68
+  },
+  "5f81a94799858590a2bc96db917bf894": {
+   "n_solved": 8,
+   "name": "bdobwm_28_54",
+   "truth": "unsat",
+   "vbs_time": 1584.44,
+   "winner_solved": true,
+   "winner_time": 4604.05
+  },
+  "5f9d0127b390a4686171311d38f3fbf8": {
+   "n_solved": 1,
+   "name": "cabp-M-bcsstk06.mtx.rnd-k37",
+   "truth": "unsat",
+   "vbs_time": 814.02,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "5faba478cb08194407b5ec957ab08599": {
+   "n_solved": 29,
+   "name": "schooltt-5-7-11-2-4-1.4-2.6-0.8-0.9-seed2",
+   "truth": "sat",
+   "vbs_time": 11.85,
+   "winner_solved": true,
+   "winner_time": 40.85
+  },
+  "5fb5e437292532efe687ac6f74a9cb76": {
+   "n_solved": 7,
+   "name": "SDP_126_17_1585",
+   "truth": "sat",
+   "vbs_time": 1708.54,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "61fee64c8fc7f05b97a2bc14c0c2bf41": {
+   "n_solved": 5,
+   "name": "par32-4-c.shuffled",
+   "truth": "sat",
+   "vbs_time": 946.44,
+   "winner_solved": false,
+   "winner_time": 5000.25
+  },
+  "62060247cd0ad566a828c30571c2c774": {
+   "n_solved": 27,
+   "name": "marijn-philips",
+   "truth": "unsat",
+   "vbs_time": 27.88,
+   "winner_solved": true,
+   "winner_time": 166.87
+  },
+  "626c368587dd880086afc7b3fa1e6f27": {
+   "n_solved": 18,
+   "name": "snw_16_9_CCSpre",
+   "truth": "sat",
+   "vbs_time": 78.49,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "62eae28dcf3170b1547fb5db73e6a295": {
+   "n_solved": 29,
+   "name": "stable-400-0.1-7-9876543214007",
+   "truth": "sat",
+   "vbs_time": 99.81,
+   "winner_solved": true,
+   "winner_time": 1267.54
+  },
+  "654241eda3e1283f4b139192d1db055a": {
+   "n_solved": 13,
+   "name": "SDP_140_19_8786",
+   "truth": "sat",
+   "vbs_time": 396.83,
+   "winner_solved": true,
+   "winner_time": 2594.71
+  },
+  "65bf849f3e86ab275e339934f4d140a0": {
+   "n_solved": 2,
+   "name": "DSC125.9.30",
+   "truth": "unsat",
+   "vbs_time": 1.29,
+   "winner_solved": true,
+   "winner_time": 1.29
+  },
+  "65ee6b49612eccb7d213e4d950f23677": {
+   "n_solved": 30,
+   "name": "lightsout_sat_22_unbounded_direct_planted150_4_sat",
+   "truth": "sat",
+   "vbs_time": 12.45,
+   "winner_solved": true,
+   "winner_time": 160.7
+  },
+  "66204949278cdd9d81e102eace6d4669": {
+   "n_solved": 27,
+   "name": "vdw_4_7_n109",
+   "truth": "unsat",
+   "vbs_time": 132.62,
+   "winner_solved": true,
+   "winner_time": 365.02
+  },
+  "667341ee8c1dea3db613db317e2b2c33": {
+   "n_solved": 27,
+   "name": "lightsout_sat_23_unbounded_totalizer_corner_0_unsat",
+   "truth": "unsat",
+   "vbs_time": 202.48,
+   "winner_solved": true,
+   "winner_time": 431.13
+  },
+  "67133027ab55906e3b757148ca7011dd": {
+   "n_solved": 15,
+   "name": "snw_16_9_Encpre",
+   "truth": "sat",
+   "vbs_time": 52.83,
+   "winner_solved": false,
+   "winner_time": 5000.45
+  },
+  "6793abe982f9d5f9646f6657e13ecc39": {
+   "n_solved": 14,
+   "name": "55-140792",
+   "truth": "sat",
+   "vbs_time": 471.34,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "68ef4b1ed6a28c75defea64bb7d53e06": {
+   "n_solved": 1,
+   "name": "vdwb_k6_n350",
+   "truth": "sat",
+   "vbs_time": 2144.55,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "6ad453d6174581d982c4e75e37a38d79": {
+   "n_solved": 13,
+   "name": "dobdm_14_1",
+   "truth": "unsat",
+   "vbs_time": 1988.95,
+   "winner_solved": true,
+   "winner_time": 3627.76
+  },
+  "6add7e416c1126607afeb2666af330ac": {
+   "n_solved": 28,
+   "name": "constraints_16_0.5_1",
+   "truth": "unsat",
+   "vbs_time": 83.6,
+   "winner_solved": true,
+   "winner_time": 96.81
+  },
+  "6cd46641ebd4c840b8f116d14ca17dfd": {
+   "n_solved": 31,
+   "name": "sembuster_7500.af_74",
+   "truth": "sat",
+   "vbs_time": 0.65,
+   "winner_solved": true,
+   "winner_time": 2.14
+  },
+  "6cfd9ef85d9f6e62dcbb9a4fd9334c90": {
+   "n_solved": 0,
+   "name": "GreenTao_2-4-5_4231",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "6d815089fb4095208754622b4c44a8f7": {
+   "n_solved": 30,
+   "name": "Carry_Bits_Fast_12.cnf",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": true,
+   "winner_time": 7.56
+  },
+  "6db4b3f59a1e530ca5309d8a7544f5c3": {
+   "n_solved": 0,
+   "name": "color-19-4.shuffled-as.sat05-444",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "6ddda96839bb24cd7389d5556d3ab16d": {
+   "n_solved": 2,
+   "name": "inithx.i.2.30",
+   "truth": "unsat",
+   "vbs_time": 0.72,
+   "winner_solved": true,
+   "winner_time": 0.72
+  },
+  "6e297bdb1c3f957f6333c37804805ecb": {
+   "n_solved": 27,
+   "name": "spg_200_301",
+   "truth": "unsat",
+   "vbs_time": 17.55,
+   "winner_solved": true,
+   "winner_time": 625.9
+  },
+  "6e8dba16e06c793a2daca1fa440eeb4f": {
+   "n_solved": 28,
+   "name": "newpol32-4",
+   "truth": "unsat",
+   "vbs_time": 166.42,
+   "winner_solved": true,
+   "winner_time": 330.22
+  },
+  "6f1b15ebd0ac13c05fb052e5b0453f64": {
+   "n_solved": 30,
+   "name": "as-p93-l27-o6-rot-rfl-5682-i",
+   "truth": "sat",
+   "vbs_time": 70.47,
+   "winner_solved": true,
+   "winner_time": 236.77
+  },
+  "71849248b47db583f56e77f55f31e525": {
+   "n_solved": 6,
+   "name": "exam_85_70",
+   "truth": "unsat",
+   "vbs_time": 0.42,
+   "winner_solved": true,
+   "winner_time": 0.43
+  },
+  "727ebce936c010888c7f71f00885e643": {
+   "n_solved": 8,
+   "name": "count_p2_M25",
+   "truth": "unsat",
+   "vbs_time": 0.04,
+   "winner_solved": true,
+   "winner_time": 0.16
+  },
+  "7372171e2e794a98cda6540676608f32": {
+   "n_solved": 8,
+   "name": "DSC125.9.25",
+   "truth": "unsat",
+   "vbs_time": 0.2,
+   "winner_solved": true,
+   "winner_time": 0.2
+  },
+  "744238c5aadea40f8e05db49429da576": {
+   "n_solved": 2,
+   "name": "10",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.21
+  },
+  "74931e82fd208ed949fa44bccd80df6b": {
+   "n_solved": 30,
+   "name": "DivS_862_11.cnf",
+   "truth": "sat",
+   "vbs_time": 5.59,
+   "winner_solved": true,
+   "winner_time": 22.3
+  },
+  "75429ff7acb5acb597abe01aa745c2a6": {
+   "n_solved": 30,
+   "name": "mod2-rand3bip-sat-250-3.shuffled-as.sat05-2220",
+   "truth": "sat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 200.84
+  },
+  "757d64688ac60cba697a980dfbbf5075": {
+   "n_solved": 8,
+   "name": "chnl-030x091",
+   "truth": "unsat",
+   "vbs_time": 0.22,
+   "winner_solved": true,
+   "winner_time": 0.22
+  },
+  "75b23436a531bbc4004f43009cb4546e": {
+   "n_solved": 2,
+   "name": "ntil-90d-43",
+   "truth": "sat",
+   "vbs_time": 1238.46,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "776ff89b72b0f6290d69af6f95e13182": {
+   "n_solved": 30,
+   "name": "as-p43-l16-o9-567",
+   "truth": "sat",
+   "vbs_time": 377.02,
+   "winner_solved": true,
+   "winner_time": 540.63
+  },
+  "77bfac6b280653e63013f77d0991484e": {
+   "n_solved": 30,
+   "name": "case19.normalised",
+   "truth": "sat",
+   "vbs_time": 4.47,
+   "winner_solved": true,
+   "winner_time": 46.08
+  },
+  "782b29d2d691fdc94e0ec5b899390e10": {
+   "n_solved": 19,
+   "name": "vdwb_k6_n300",
+   "truth": "sat",
+   "vbs_time": 131.91,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "7a13ffe9546cc7dfabdedebb64700e8a": {
+   "n_solved": 27,
+   "name": "w19-20.0",
+   "truth": "unsat",
+   "vbs_time": 111.61,
+   "winner_solved": true,
+   "winner_time": 151.91
+  },
+  "7ac164a9d153f0a2d9bf54a98d429636": {
+   "n_solved": 12,
+   "name": "bwoawm_28_5",
+   "truth": "unsat",
+   "vbs_time": 1450.99,
+   "winner_solved": true,
+   "winner_time": 3969.63
+  },
+  "7b40e39148de4d5f8d9384d6937c287e": {
+   "n_solved": 20,
+   "name": "stable-400-0.1-12-98765432140012",
+   "truth": "sat",
+   "vbs_time": 30.67,
+   "winner_solved": false,
+   "winner_time": 5000.43
+  },
+  "7b9620b5d7da55bda43595fe37867acd": {
+   "n_solved": 6,
+   "name": "exam_90_80",
+   "truth": "unsat",
+   "vbs_time": 0.55,
+   "winner_solved": true,
+   "winner_time": 0.55
+  },
+  "7cbc3ce2052ba7c5b501f75af58ab3c4": {
+   "n_solved": 30,
+   "name": "simon-r22-1",
+   "truth": "sat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.03
+  },
+  "7cd6b940be001c46c6294d7cac9aa610": {
+   "n_solved": 0,
+   "name": "vdw_4_8_n147",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "7d311f620f4ebc4adf8f4079899750eb": {
+   "n_solved": 29,
+   "name": "x9-11033.sat",
+   "truth": "sat",
+   "vbs_time": 21.8,
+   "winner_solved": true,
+   "winner_time": 542.02
+  },
+  "7db30d12cb06f0dc2f30abff80d96d6a": {
+   "n_solved": 2,
+   "name": "two-trees-1023v",
+   "truth": "sat",
+   "vbs_time": 0.03,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "7e21850936d6127540157afaaf912c02": {
+   "n_solved": 0,
+   "name": "marg6x6.shuffled-as.sat03-1456.cnf.mis-119.debugged",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "7efc1b160fb755fb1e8b6bcc70bbeb90": {
+   "n_solved": 7,
+   "name": "SDP_132_18_9892",
+   "truth": "sat",
+   "vbs_time": 978.39,
+   "winner_solved": false,
+   "winner_time": 5000.34
+  },
+  "7fa502dfce37c37c1cafd50b3fba263f": {
+   "n_solved": 30,
+   "name": "SDP_104_15_107",
+   "truth": "sat",
+   "vbs_time": 5.65,
+   "winner_solved": true,
+   "winner_time": 26.79
+  },
+  "7fe153ced2c966dcdeb42b6714b4d6b7": {
+   "n_solved": 26,
+   "name": "sudoku-N30-11",
+   "truth": "unsat",
+   "vbs_time": 1047.53,
+   "winner_solved": true,
+   "winner_time": 2894.94
+  },
+  "805a742eb8b4e0df3561ca8e0670670b": {
+   "n_solved": 28,
+   "name": "homer20.shuffled",
+   "truth": "unsat",
+   "vbs_time": 0.02,
+   "winner_solved": true,
+   "winner_time": 0.02
+  },
+  "808d66b11c602eb1d5728f3f8e90aaef": {
+   "n_solved": 29,
+   "name": "1x1x14_1x2x9_pair_2_0_0_2_1_1",
+   "truth": "sat",
+   "vbs_time": 204.15,
+   "winner_solved": true,
+   "winner_time": 204.15
+  },
+  "80b163b706e0a16702173ec27f3d1331": {
+   "n_solved": 1,
+   "name": "lightsout_sat_24_unbounded_direct_corner_0_unsat",
+   "truth": "unsat",
+   "vbs_time": 3285.7,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "80bb5209e88def5643bf5593320b104f": {
+   "n_solved": 31,
+   "name": "Large-result_b24.af_2238",
+   "truth": "sat",
+   "vbs_time": 2.84,
+   "winner_solved": true,
+   "winner_time": 495.86
+  },
+  "8117a2ac08e1acf52f660663efe2a5ca": {
+   "n_solved": 29,
+   "name": "170225812",
+   "truth": "sat",
+   "vbs_time": 0.39,
+   "winner_solved": true,
+   "winner_time": 9.66
+  },
+  "81c36c1f55a6ee8e180f53f140ce05a3": {
+   "n_solved": 29,
+   "name": "01-integer-programming-20-30-40",
+   "truth": "sat",
+   "vbs_time": 71.65,
+   "winner_solved": true,
+   "winner_time": 915.47
+  },
+  "824cd6f379c23cc863e501e397092cb9": {
+   "n_solved": 28,
+   "name": "BubbleVsPancakeSort_7_7",
+   "truth": "unsat",
+   "vbs_time": 520.11,
+   "winner_solved": true,
+   "winner_time": 624.12
+  },
+  "826a01aaab9f98e8fb6d3fbbf349078b": {
+   "n_solved": 25,
+   "name": "adv_gc_n300_k13_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 33.04,
+   "winner_solved": true,
+   "winner_time": 1242.13
+  },
+  "82cad197a0b7919f1f51ec51f7267e6f": {
+   "n_solved": 27,
+   "name": "ex095_8",
+   "truth": "unsat",
+   "vbs_time": 2100.75,
+   "winner_solved": true,
+   "winner_time": 3635.37
+  },
+  "8390dca257561c53bf4eb6e158a2285f": {
+   "n_solved": 30,
+   "name": "mp1-klieber2017s-0490-024-t12",
+   "truth": "sat",
+   "vbs_time": 19.24,
+   "winner_solved": true,
+   "winner_time": 141.26
+  },
+  "83ced7d9ee8058c52c9a68ded7fad0a5": {
+   "n_solved": 6,
+   "name": "p160_1",
+   "truth": "sat",
+   "vbs_time": 397.04,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "8456155de4cd22425ec479f75af089c2": {
+   "n_solved": 5,
+   "name": "cabp-X-can__715.mtx.rnd-k118",
+   "truth": "sat",
+   "vbs_time": 1917.38,
+   "winner_solved": false,
+   "winner_time": 5000.24
+  },
+  "860788f93fb766e83e00a29de84180e7": {
+   "n_solved": 7,
+   "name": "mexam_17_15_2",
+   "truth": "unsat",
+   "vbs_time": 0.08,
+   "winner_solved": true,
+   "winner_time": 1.04
+  },
+  "878bcc11e1e243680f7946bcf428f465": {
+   "n_solved": 28,
+   "name": "linked_list_swap_contents_safety_unwind45",
+   "truth": "unsat",
+   "vbs_time": 10.14,
+   "winner_solved": true,
+   "winner_time": 62.66
+  },
+  "87dbc3302b82c09e19c55059fb943191": {
+   "n_solved": 29,
+   "name": "ntil-90d-38",
+   "truth": "sat",
+   "vbs_time": 47.4,
+   "winner_solved": true,
+   "winner_time": 1537.19
+  },
+  "8990b3506e948e87b005d103d1ce6eb8": {
+   "n_solved": 26,
+   "name": "BubbleVsPancakeSort_8_5",
+   "truth": "unsat",
+   "vbs_time": 1337.55,
+   "winner_solved": true,
+   "winner_time": 2041.54
+  },
+  "8aa9ffb211d1cba850be2ee9d173b7e1": {
+   "n_solved": 26,
+   "name": "adv_gc_n300_k12_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 4.34,
+   "winner_solved": true,
+   "winner_time": 558.82
+  },
+  "8caa9b4b72b5f1782fe4554980978cbc": {
+   "n_solved": 29,
+   "name": "1x1x14_1x2x9_pair_4_1_0_2_1_0",
+   "truth": "sat",
+   "vbs_time": 87.43,
+   "winner_solved": true,
+   "winner_time": 1526.55
+  },
+  "8d0d8518a438d93428257d9a38863c3c": {
+   "n_solved": 30,
+   "name": "as-p31-l12-o9-56",
+   "truth": "sat",
+   "vbs_time": 8.51,
+   "winner_solved": true,
+   "winner_time": 18.97
+  },
+  "8d2b018a5f8855b6ba1868a3ffff9d2f": {
+   "n_solved": 1,
+   "name": "xorshift_r15_113",
+   "truth": "sat",
+   "vbs_time": 1235.19,
+   "winner_solved": false,
+   "winner_time": 5000.29
+  },
+  "8d2dfc50c1759dc11a6564d5c368c6df": {
+   "n_solved": 3,
+   "name": "FmlaImplyChain_3_7_8",
+   "truth": "unsat",
+   "vbs_time": 471.69,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "8da88a43b4ac226f614dd82d4519d8c6": {
+   "n_solved": 2,
+   "name": "toughsat_factoring_inf",
+   "truth": "sat",
+   "vbs_time": 2102.1,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "8db998d5fd64f85a1847115208f73873": {
+   "n_solved": 31,
+   "name": "Medium-result_b14.af_285",
+   "truth": "sat",
+   "vbs_time": 0.79,
+   "winner_solved": true,
+   "winner_time": 98.58
+  },
+  "8e1cdc28bad48753110be5bd578cb934": {
+   "n_solved": 2,
+   "name": "15",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "8e5da99e8323af36e983a99b4df03b92": {
+   "n_solved": 9,
+   "name": "bwobdm_28_56",
+   "truth": "unsat",
+   "vbs_time": 1420.11,
+   "winner_solved": true,
+   "winner_time": 4715.34
+  },
+  "8f5bca645bd8738eb74c2e1dc284774a": {
+   "n_solved": 4,
+   "name": "sgp_7-4-6.shuffled-as.sat05-2671",
+   "truth": "sat",
+   "vbs_time": 157.9,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "8fcde459f828e0df9672933e68fa1af2": {
+   "n_solved": 8,
+   "name": "chnl-020x061",
+   "truth": "unsat",
+   "vbs_time": 0.07,
+   "winner_solved": true,
+   "winner_time": 0.07
+  },
+  "9078ea73ff67edf2b6dcd007c9696ca0": {
+   "n_solved": 2,
+   "name": "13",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.02
+  },
+  "90937ed75ba0560158d8fe45f303868a": {
+   "n_solved": 0,
+   "name": "mp1-Nb7T08",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "91860f79f079fede859034c7d76a98a2": {
+   "n_solved": 30,
+   "name": "41-119494",
+   "truth": "sat",
+   "vbs_time": 6.31,
+   "winner_solved": true,
+   "winner_time": 75.42
+  },
+  "91e0db01b254eb78f6643328045bfeb9": {
+   "n_solved": 3,
+   "name": "sted5_0x1e3-20",
+   "truth": "sat",
+   "vbs_time": 0.12,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "920bbe559da4ea37fd636605316a791c": {
+   "n_solved": 28,
+   "name": "SCPC-500-19",
+   "truth": "unsat",
+   "vbs_time": 26.01,
+   "winner_solved": true,
+   "winner_time": 32.81
+  },
+  "92b22042a950db2a9841f08d169d1bb5": {
+   "n_solved": 6,
+   "name": "exam_90_70",
+   "truth": "unsat",
+   "vbs_time": 0.43,
+   "winner_solved": true,
+   "winner_time": 0.43
+  },
+  "932e2329dd1efeafe7151a0ebf3a343f": {
+   "n_solved": 8,
+   "name": "bdodo_28_6",
+   "truth": "unsat",
+   "vbs_time": 1618.88,
+   "winner_solved": true,
+   "winner_time": 4918.35
+  },
+  "9376a4be372c14aa68235831712ff3f9": {
+   "n_solved": 29,
+   "name": "cabp-X-can__715.mtx.rnd-k102",
+   "truth": "sat",
+   "vbs_time": 47.28,
+   "winner_solved": true,
+   "winner_time": 474.54
+  },
+  "93983a1211a506a87907c7e2ffa4e818": {
+   "n_solved": 0,
+   "name": "shuffling-1-s1719683924-of-bench-sat04-310.used-as.sat04-467",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "9541d12f3e3d9201085c13f25145d2f7": {
+   "n_solved": 29,
+   "name": "cabp-V-nos6.mtx.rnd-k275",
+   "truth": "sat",
+   "vbs_time": 83.75,
+   "winner_solved": true,
+   "winner_time": 737.92
+  },
+  "958fd8bd1936e5bad8cbccae492edd81": {
+   "n_solved": 28,
+   "name": "crusti_g2io_200_0.1_127_14.af_151",
+   "truth": "unsat",
+   "vbs_time": 33.03,
+   "winner_solved": true,
+   "winner_time": 62.84
+  },
+  "95f346a183b890307596310fd33b4836": {
+   "n_solved": 0,
+   "name": "quad_res_r30_m35",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.39
+  },
+  "965ca988015c9aee5a1a7b2136c1fe5d": {
+   "n_solved": 27,
+   "name": "os_fwalk_12",
+   "truth": "unsat",
+   "vbs_time": 0.02,
+   "winner_solved": true,
+   "winner_time": 0.02
+  },
+  "97af3e49faef7cf67794928b6690b67c": {
+   "n_solved": 31,
+   "name": "Medium-result_b29.af_78",
+   "truth": "sat",
+   "vbs_time": 0.08,
+   "winner_solved": true,
+   "winner_time": 53.23
+  },
+  "981b0e855eed536df112bf2e4ff98807": {
+   "n_solved": 26,
+   "name": "adv_gc_n50_k12_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 3.66,
+   "winner_solved": true,
+   "winner_time": 178.86
+  },
+  "991aec61a2751602d6d7b3e838035610": {
+   "n_solved": 12,
+   "name": "bwodo_28_7",
+   "truth": "unsat",
+   "vbs_time": 1326.74,
+   "winner_solved": true,
+   "winner_time": 4156.77
+  },
+  "996bd6326ca560055b6fe916708dfdaa": {
+   "n_solved": 27,
+   "name": "vdw_3_13_n160",
+   "truth": "unsat",
+   "vbs_time": 320.6,
+   "winner_solved": true,
+   "winner_time": 837.58
+  },
+  "997491c0cbc3e558a3e3266e2a142215": {
+   "n_solved": 2,
+   "name": "mulsol.i.4.30",
+   "truth": "unsat",
+   "vbs_time": 0.18,
+   "winner_solved": true,
+   "winner_time": 0.18
+  },
+  "9a4671d8bb658361162976c0f06cc47e": {
+   "n_solved": 30,
+   "name": "10.xz",
+   "truth": "sat",
+   "vbs_time": 14.22,
+   "winner_solved": true,
+   "winner_time": 32.65
+  },
+  "9a4837429c656a71283b8d5bb41c05a7": {
+   "n_solved": 10,
+   "name": "1x1x14_1x2x9_pair_2_4_0_3_2_0",
+   "truth": "sat",
+   "vbs_time": 1142.77,
+   "winner_solved": true,
+   "winner_time": 1142.77
+  },
+  "9aa85c5c114245c182ed6afbe3d8daed": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-8-2-4-5-10-0.1-0.2-seed4",
+   "truth": "unsat",
+   "vbs_time": 70.92,
+   "winner_solved": true,
+   "winner_time": 170.34
+  },
+  "9ba8145e0d02318dea5507fc3ba03472": {
+   "n_solved": 3,
+   "name": "latin_square_10.15",
+   "truth": "unsat",
+   "vbs_time": 17.65,
+   "winner_solved": true,
+   "winner_time": 17.65
+  },
+  "9c5dd2eb0a40a150c686459a118c720a": {
+   "n_solved": 30,
+   "name": "1.xz",
+   "truth": "sat",
+   "vbs_time": 4.85,
+   "winner_solved": true,
+   "winner_time": 26.38
+  },
+  "9d20bb1bd01838d70177ffd3aa284aeb": {
+   "n_solved": 29,
+   "name": "ak128modbtbg2msisc",
+   "truth": "sat",
+   "vbs_time": 0.27,
+   "winner_solved": true,
+   "winner_time": 1.35
+  },
+  "9ef9243ff051b32795890fccd6c3f6b2": {
+   "n_solved": 29,
+   "name": "sum_of_3_cubes_50_bits_91",
+   "truth": "sat",
+   "vbs_time": 0.75,
+   "winner_solved": true,
+   "winner_time": 2.52
+  },
+  "9fbe200523c648000d71b2c739093aa2": {
+   "n_solved": 1,
+   "name": "adv_gc_n100_k13_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 14.92,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "a08c17f9a3888841cf7bbc75a807ff7e": {
+   "n_solved": 1,
+   "name": "xorshift_r14_110",
+   "truth": "sat",
+   "vbs_time": 262.79,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "a08d0fcc98fe0ce9c53b2fd0c69ccc4b": {
+   "n_solved": 12,
+   "name": "bwmdm_28_2",
+   "truth": "unsat",
+   "vbs_time": 1186.74,
+   "winner_solved": true,
+   "winner_time": 3635.21
+  },
+  "a110c13186ef5785df8da4bfa2ce9a6d": {
+   "n_solved": 3,
+   "name": "xorshift_r14_7",
+   "truth": "sat",
+   "vbs_time": 309.72,
+   "winner_solved": false,
+   "winner_time": 5000.12
+  },
+  "a20f076f7fce54172e823c63ea7948f7": {
+   "n_solved": 28,
+   "name": "vdwb_k5_n260",
+   "truth": "unsat",
+   "vbs_time": 19.14,
+   "winner_solved": true,
+   "winner_time": 34.85
+  },
+  "a2fdd0935df1379c67cf1bb93ef2cfad": {
+   "n_solved": 0,
+   "name": "54-138766",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "a42230be4432b010789b6f97b090343c": {
+   "n_solved": 0,
+   "name": "soelberg_unit_223",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "a45aefde8bb26edb9634004146d0de89": {
+   "n_solved": 13,
+   "name": "Circuit_multiplier36",
+   "truth": "sat",
+   "vbs_time": 87.59,
+   "winner_solved": false,
+   "winner_time": 5000.07
+  },
+  "a4eec7a5fef59547129822f6b513d54c": {
+   "n_solved": 4,
+   "name": "1x1x13_1x3x6_pair_2_2_1_3_2_0",
+   "truth": "sat",
+   "vbs_time": 1979.77,
+   "winner_solved": true,
+   "winner_time": 4903.43
+  },
+  "a4f816482e853dfad9a685ac1459e66d": {
+   "n_solved": 12,
+   "name": "bwodm_28_5",
+   "truth": "unsat",
+   "vbs_time": 1348.03,
+   "winner_solved": true,
+   "winner_time": 4306.13
+  },
+  "a5dc08b83ff806ac2c2c8cc23053fb07": {
+   "n_solved": 13,
+   "name": "SDP_118_16_5515",
+   "truth": "sat",
+   "vbs_time": 337.82,
+   "winner_solved": false,
+   "winner_time": 5000.3
+  },
+  "a60a138325ac9c88ab293ec0c801a95c": {
+   "n_solved": 1,
+   "name": "xorshift_r15_191",
+   "truth": "sat",
+   "vbs_time": 1088.34,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "a78606fdfd6cf6ee8358bd35fa833be6": {
+   "n_solved": 3,
+   "name": "as-p61-l22-o8-II-568",
+   "truth": "sat",
+   "vbs_time": 1125.24,
+   "winner_solved": false,
+   "winner_time": 5000.59
+  },
+  "a789d0722f1aa0d44c5a38b374719c69": {
+   "n_solved": 30,
+   "name": "13.normalised",
+   "truth": "sat",
+   "vbs_time": 4.57,
+   "winner_solved": true,
+   "winner_time": 52.52
+  },
+  "a7e5d03892a17e51e22b688f51cf0aab": {
+   "n_solved": 6,
+   "name": "mexam_20_18_2",
+   "truth": "unsat",
+   "vbs_time": 0.09,
+   "winner_solved": true,
+   "winner_time": 2.51
+  },
+  "a80a252b748882980d9a80ddea8c5cff": {
+   "n_solved": 11,
+   "name": "bdmdm_28_1",
+   "truth": "unsat",
+   "vbs_time": 1426.02,
+   "winner_solved": true,
+   "winner_time": 4356.2
+  },
+  "a8dcaf436bda091dad9ca1ff58de7287": {
+   "n_solved": 28,
+   "name": "asconhashv12_opt64_H10_M2-BPHqhzNzqi_m5_6_U14.c",
+   "truth": "unsat",
+   "vbs_time": 20.22,
+   "winner_solved": true,
+   "winner_time": 374.36
+  },
+  "a957fdb07df865bb4fd24a00ceb49fdb": {
+   "n_solved": 28,
+   "name": "T90.2.0",
+   "truth": "unsat",
+   "vbs_time": 319.62,
+   "winner_solved": true,
+   "winner_time": 364.5
+  },
+  "a95f0373ebf724f474fcc9ccd7197bd9": {
+   "n_solved": 8,
+   "name": "chnl-030x061",
+   "truth": "unsat",
+   "vbs_time": 0.12,
+   "winner_solved": true,
+   "winner_time": 0.12
+  },
+  "a9856534b6ca67123d58dd5fd9c9a1b2": {
+   "n_solved": 29,
+   "name": "SDP_98_14_7360",
+   "truth": "sat",
+   "vbs_time": 22.31,
+   "winner_solved": true,
+   "winner_time": 207.86
+  },
+  "aa0eadb6c4935468fd6954e23a550504": {
+   "n_solved": 27,
+   "name": "1x1x13_1x3x6_pair_4_2_0_2_0_0",
+   "truth": "sat",
+   "vbs_time": 435.11,
+   "winner_solved": true,
+   "winner_time": 3153.52
+  },
+  "aa2e02360b19c83da68e39e39c530923": {
+   "n_solved": 0,
+   "name": "cabp-V-nos6.mtx.rnd-k333",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.13
+  },
+  "aa4e80476e6a6ea1034e303e6b2e46dc": {
+   "n_solved": 6,
+   "name": "exam_75_70",
+   "truth": "unsat",
+   "vbs_time": 0.35,
+   "winner_solved": true,
+   "winner_time": 0.35
+  },
+  "aa62e8cb5d38ac1b2d9eeeb8394eadeb": {
+   "n_solved": 30,
+   "name": "as-p87-l30-o6-rot-II-5678-i",
+   "truth": "sat",
+   "vbs_time": 210.43,
+   "winner_solved": true,
+   "winner_time": 445.94
+  },
+  "ab17eed90e4da47767f72f518e3b4a26": {
+   "n_solved": 29,
+   "name": "vdwb_k6_n250",
+   "truth": "sat",
+   "vbs_time": 92.41,
+   "winner_solved": true,
+   "winner_time": 1227.36
+  },
+  "ab2ab3a0651f0f35ba319ad976b1b6fd": {
+   "n_solved": 2,
+   "name": "1",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "ac3e3bb744e258282990aa4307c08cb8": {
+   "n_solved": 26,
+   "name": "E00X23",
+   "truth": "unsat",
+   "vbs_time": 1107.48,
+   "winner_solved": true,
+   "winner_time": 1578.82
+  },
+  "ac6256657058fe65dc7ddaf773ab83bf": {
+   "n_solved": 29,
+   "name": "SC21_Timetable_C_527_E_71_Cl_35_S_35",
+   "truth": "sat",
+   "vbs_time": 39.45,
+   "winner_solved": true,
+   "winner_time": 84.99
+  },
+  "aca9f4faabeb57a57c678d55f5bbd2f4": {
+   "n_solved": 2,
+   "name": "12",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "ad2247443454da1fbd4543dd1fa5b57c": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-9-2-4-5-10-0.1-0.2-seed3",
+   "truth": "unsat",
+   "vbs_time": 105.76,
+   "winner_solved": true,
+   "winner_time": 127.31
+  },
+  "ad5b80bb4d1b60bee12163df25846801": {
+   "n_solved": 1,
+   "name": "xorshift_r15_104",
+   "truth": "sat",
+   "vbs_time": 547.36,
+   "winner_solved": false,
+   "winner_time": 5000.41
+  },
+  "ad6bc2d583c43ff9ef00faad7e29a9c2": {
+   "n_solved": 30,
+   "name": "as-p99-l33-o6-rot-rfl-568-i",
+   "truth": "sat",
+   "vbs_time": 116.6,
+   "winner_solved": true,
+   "winner_time": 175.69
+  },
+  "ae48df6541d190c096b1e5ba22d1b534": {
+   "n_solved": 28,
+   "name": "korf-17",
+   "truth": "unsat",
+   "vbs_time": 59.63,
+   "winner_solved": true,
+   "winner_time": 59.63
+  },
+  "af8248aa34c4803bfc0add954cf2e620": {
+   "n_solved": 31,
+   "name": "sembuster_4200.af_72",
+   "truth": "sat",
+   "vbs_time": 0.44,
+   "winner_solved": true,
+   "winner_time": 2.45
+  },
+  "af9c2fb7046eb845f185c64cd9dd1006": {
+   "n_solved": 0,
+   "name": "cabp-T-dwt__592.mtx.rnd-k145",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.25
+  },
+  "b0142b06940fb02e2b4ddb7a2101a3d6": {
+   "n_solved": 9,
+   "name": "count_p2_M21",
+   "truth": "unsat",
+   "vbs_time": 0.03,
+   "winner_solved": true,
+   "winner_time": 0.08
+  },
+  "b023ea0eb9adbd9182c01d7e2d443289": {
+   "n_solved": 28,
+   "name": "mp1-tri_ali_s11_c35_bail_UNS",
+   "truth": "unsat",
+   "vbs_time": 43.89,
+   "winner_solved": true,
+   "winner_time": 51.47
+  },
+  "b0abaa97c4663edc2048d86de3e2b226": {
+   "n_solved": 27,
+   "name": "schooltt-5-3-9-2-4-5-10-0.1-0.2-seed4",
+   "truth": "unsat",
+   "vbs_time": 96.88,
+   "winner_solved": true,
+   "winner_time": 96.88
+  },
+  "b13ba48e09e575d6a628c02200ac23f7": {
+   "n_solved": 26,
+   "name": "adv_gc_n100_k14_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 62.91,
+   "winner_solved": true,
+   "winner_time": 933.84
+  },
+  "b1c44904cf06682f973b60c8282f45e8": {
+   "n_solved": 30,
+   "name": "mp1-squ_ali_s10x10_c39_bail_SAT",
+   "truth": "sat",
+   "vbs_time": 0.31,
+   "winner_solved": true,
+   "winner_time": 0.31
+  },
+  "b2047f327e213b5f14adb8c75ee514fb": {
+   "n_solved": 12,
+   "name": "60-135969",
+   "truth": "sat",
+   "vbs_time": 1363.1,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "b358bf7111086fd6d60b11c2f01465b8": {
+   "n_solved": 2,
+   "name": "crn_40_1521_s",
+   "truth": "sat",
+   "vbs_time": 0.16,
+   "winner_solved": false,
+   "winner_time": 5000.28
+  },
+  "b3c587501567db72e6e66c6930cf15ed": {
+   "n_solved": 7,
+   "name": "StConn_7_128",
+   "truth": "unsat",
+   "vbs_time": 25.88,
+   "winner_solved": false,
+   "winner_time": 5000.03
+  },
+  "b438fa464c20a19fdb7788a3f0016f32": {
+   "n_solved": 29,
+   "name": "size_5_5_5_i116_r12",
+   "truth": "sat",
+   "vbs_time": 6.04,
+   "winner_solved": true,
+   "winner_time": 100.21
+  },
+  "b54b26f38d40a687b6277c49cf85de69": {
+   "n_solved": 30,
+   "name": "baseballcover11with25_and6positions",
+   "truth": "sat",
+   "vbs_time": 169.7,
+   "winner_solved": true,
+   "winner_time": 327.2
+  },
+  "b69132879ed9ea0c8af1bc1e478d6ec3": {
+   "n_solved": 0,
+   "name": "128.smt2",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "b697738cefe9cb2dd62f24653a13b341": {
+   "n_solved": 0,
+   "name": "EDP3-60000",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "b6de3c794e223fe515682f52e5d81272": {
+   "n_solved": 28,
+   "name": "ER_500_50_1.af",
+   "truth": "unsat",
+   "vbs_time": 390.0,
+   "winner_solved": true,
+   "winner_time": 1038.11
+  },
+  "b76b9699c2deb74dd9b4a99a05179acd": {
+   "n_solved": 27,
+   "name": "hitag2-8-60-0-0xdcdbc8bf368ee73-37",
+   "truth": "unsat",
+   "vbs_time": 529.34,
+   "winner_solved": true,
+   "winner_time": 1148.91
+  },
+  "b9a626da76f235aab854c6ef516b9240": {
+   "n_solved": 0,
+   "name": "AProVE07-26-sc2007",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.1
+  },
+  "ba14be209c2fc064726025f017cef17a": {
+   "n_solved": 29,
+   "name": "schooltt-5-7-12-2-4-1.4-2.6-0.8-0.9-seed2",
+   "truth": "sat",
+   "vbs_time": 13.02,
+   "winner_solved": true,
+   "winner_time": 36.36
+  },
+  "ba7732774961fdf7508a998a41bd5366": {
+   "n_solved": 28,
+   "name": "factorize-1022117",
+   "truth": "unsat",
+   "vbs_time": 30.29,
+   "winner_solved": true,
+   "winner_time": 34.22
+  },
+  "bb8db7af8ede49391a66d4442d91c10b": {
+   "n_solved": 30,
+   "name": "7.xz",
+   "truth": "sat",
+   "vbs_time": 11.0,
+   "winner_solved": true,
+   "winner_time": 25.62
+  },
+  "bbcfd33f07cbf6fefa950d8254aa34ce": {
+   "n_solved": 30,
+   "name": "5.xz",
+   "truth": "sat",
+   "vbs_time": 8.86,
+   "winner_solved": true,
+   "winner_time": 46.86
+  },
+  "bcdc894819cf050e57849fe84a1e8cc4": {
+   "n_solved": 9,
+   "name": "chnl-020x101",
+   "truth": "unsat",
+   "vbs_time": 0.15,
+   "winner_solved": true,
+   "winner_time": 0.16
+  },
+  "bd0b055b890a9ace598a0c4aba40de30": {
+   "n_solved": 28,
+   "name": "sat-bench-trig-bhaskara",
+   "truth": "unsat",
+   "vbs_time": 456.55,
+   "winner_solved": true,
+   "winner_time": 575.99
+  },
+  "bf8c8761003704e761ce36db6665f741": {
+   "n_solved": 28,
+   "name": "scc_6087_19_0.3_0.1_20.af_130",
+   "truth": "unsat",
+   "vbs_time": 11.5,
+   "winner_solved": true,
+   "winner_time": 12.27
+  },
+  "bfc825d1eb0670fd90805c546fea5c6b": {
+   "n_solved": 0,
+   "name": "snw_17_9_CCSpreOptEncpre",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.45
+  },
+  "c14f0c610d59a9d5e8cec328485b916f": {
+   "n_solved": 27,
+   "name": "vdw_3_13_n161",
+   "truth": "unsat",
+   "vbs_time": 394.85,
+   "winner_solved": true,
+   "winner_time": 824.71
+  },
+  "c15b09b9a7ceff4d4c8fe705958f92ba": {
+   "n_solved": 30,
+   "name": "snw_16_9_preOpt_pre",
+   "truth": "sat",
+   "vbs_time": 2.66,
+   "winner_solved": true,
+   "winner_time": 104.6
+  },
+  "c261941bfec8b89d75fee1a66a839169": {
+   "n_solved": 28,
+   "name": "manthey_single-ordered-initialized-w48-b9",
+   "truth": "unsat",
+   "vbs_time": 791.77,
+   "winner_solved": true,
+   "winner_time": 842.11
+  },
+  "c300445f0f756c8f5d6571ebf0bb6edc": {
+   "n_solved": 1,
+   "name": "cabp-M-bcsstk06.mtx.rnd-k36",
+   "truth": "unsat",
+   "vbs_time": 3438.59,
+   "winner_solved": false,
+   "winner_time": 5000.24
+  },
+  "c3bc9b01e5f804723b74715508941bf2": {
+   "n_solved": 30,
+   "name": "2.xz",
+   "truth": "sat",
+   "vbs_time": 5.86,
+   "winner_solved": true,
+   "winner_time": 31.65
+  },
+  "c44762c4b177ac64fd0919f37de8382e": {
+   "n_solved": 9,
+   "name": "mexam_14_12_2",
+   "truth": "unsat",
+   "vbs_time": 0.08,
+   "winner_solved": true,
+   "winner_time": 0.37
+  },
+  "c557ad9cb79983b9d429c219e3cecbb8": {
+   "n_solved": 28,
+   "name": "scc_7216_12_0.5_0.2_11.af_463",
+   "truth": "unsat",
+   "vbs_time": 10.65,
+   "winner_solved": true,
+   "winner_time": 11.27
+  },
+  "c615d49f357813514966186ab834be28": {
+   "n_solved": 0,
+   "name": "preimage_80r_486m_160h_seed_306",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.15
+  },
+  "c62a1855a4db8ae0b4bd625455332a4c": {
+   "n_solved": 21,
+   "name": "1x1x14_1x2x9_pair_2_2_0_3_2_1",
+   "truth": "sat",
+   "vbs_time": 418.82,
+   "winner_solved": true,
+   "winner_time": 4231.75
+  },
+  "c6487f6dfcc1438eccca1876a33d9a9c": {
+   "n_solved": 0,
+   "name": "genurq7Sat.shuffled-as.sat03-1513.cnf.mis-135.debugged",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "c7449e5bc5ef75a69f8a454c13d371de": {
+   "n_solved": 9,
+   "name": "bdoawm_28_4",
+   "truth": "unsat",
+   "vbs_time": 1539.1,
+   "winner_solved": true,
+   "winner_time": 4291.18
+  },
+  "c8cde50f32ca3f78a4c74a173c63449b": {
+   "n_solved": 28,
+   "name": "bp5_CSO.normalised",
+   "truth": "sat",
+   "vbs_time": 122.9,
+   "winner_solved": true,
+   "winner_time": 348.56
+  },
+  "ca18feb7d2bb6bee7a8ab28673fe1d62": {
+   "n_solved": 1,
+   "name": "as-p75-l27-o6-rot-4568",
+   "truth": "sat",
+   "vbs_time": 4769.45,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "ca7f7824a958b98512a0c96d73251f8b": {
+   "n_solved": 1,
+   "name": "xorshift_r16_180",
+   "truth": "sat",
+   "vbs_time": 760.58,
+   "winner_solved": false,
+   "winner_time": 5000.37
+  },
+  "cb2e8b7fada420c5046f587ea754d052": {
+   "n_solved": 28,
+   "name": "clique_n2_k10",
+   "truth": "unsat",
+   "vbs_time": 0.02,
+   "winner_solved": true,
+   "winner_time": 0.09
+  },
+  "cc42cc7a8022820cbd0e98595126d07e": {
+   "n_solved": 26,
+   "name": "g2-T97.2.1",
+   "truth": "unsat",
+   "vbs_time": 1512.25,
+   "winner_solved": true,
+   "winner_time": 3426.47
+  },
+  "cc436db9fe0278663ce376e068069815": {
+   "n_solved": 27,
+   "name": "minandmaxor128",
+   "truth": "unsat",
+   "vbs_time": 362.11,
+   "winner_solved": true,
+   "winner_time": 702.3
+  },
+  "d0b5d1dc96a5bf33d2c65106c3b179a8": {
+   "n_solved": 28,
+   "name": "connm-ue-csp-sat-n600-d0.04-s1793042357.used-as.sat04-975",
+   "truth": "unsat",
+   "vbs_time": 30.42,
+   "winner_solved": true,
+   "winner_time": 33.68
+  },
+  "d10b8bcd1bb5977c5ffe2d1859e4335f": {
+   "n_solved": 1,
+   "name": "xorshift_r15_175",
+   "truth": "sat",
+   "vbs_time": 1580.73,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "d1335d8a6a98a1988b54e1f481a64fcf": {
+   "n_solved": 2,
+   "name": "mulsol.i.1.48",
+   "truth": "unsat",
+   "vbs_time": 0.31,
+   "winner_solved": true,
+   "winner_time": 0.31
+  },
+  "d27f76623aed2fce608c092b2aafafc5": {
+   "n_solved": 6,
+   "name": "exam_95_70",
+   "truth": "unsat",
+   "vbs_time": 0.5,
+   "winner_solved": true,
+   "winner_time": 0.52
+  },
+  "d418605014fdeb1236bfa720ac460c62": {
+   "n_solved": 1,
+   "name": "xorshift_r14_85",
+   "truth": "sat",
+   "vbs_time": 390.65,
+   "winner_solved": false,
+   "winner_time": 5000.52
+  },
+  "d4a6b1a299c7a8ad6ea9769abcc60507": {
+   "n_solved": 0,
+   "name": "GreenTao_2-3-7_13850",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "d5949f26c5c5128ef2d4ac4d3b432cc2": {
+   "n_solved": 21,
+   "name": "as-p51-l19-o8-II-568",
+   "truth": "sat",
+   "vbs_time": 168.09,
+   "winner_solved": true,
+   "winner_time": 4451.65
+  },
+  "d699355595398f0765c5f51c9d0ad852": {
+   "n_solved": 30,
+   "name": "crusti_g2io_350_0.5_255_21.af_299",
+   "truth": "sat",
+   "vbs_time": 5.0,
+   "winner_solved": true,
+   "winner_time": 15.2
+  },
+  "d737aeb8e2eb9baed7f007056b3874af": {
+   "n_solved": 30,
+   "name": "scc_7216_12_0.5_0.2_11.af",
+   "truth": "sat",
+   "vbs_time": 0.98,
+   "winner_solved": true,
+   "winner_time": 5.55
+  },
+  "d8225a58e2ca7c2fb93c533f406c02d5": {
+   "n_solved": 20,
+   "name": "abw-K-dwt__234.mtx-w50",
+   "truth": "sat",
+   "vbs_time": 56.94,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "d9fe50de72fb34ea94518c32d8f3077c": {
+   "n_solved": 27,
+   "name": "hitag2-7-60-0-0xe8fa35372ed37e2-80",
+   "truth": "unsat",
+   "vbs_time": 622.87,
+   "winner_solved": true,
+   "winner_time": 1599.7
+  },
+  "da34db9ea6b524f13708357f38432bb6": {
+   "n_solved": 29,
+   "name": "cabp-V-nos6.mtx.rnd-k274",
+   "truth": "sat",
+   "vbs_time": 215.09,
+   "winner_solved": true,
+   "winner_time": 718.07
+  },
+  "da6fae94ae1b1cedcced7169df02a762": {
+   "n_solved": 16,
+   "name": "1x1x13_1x3x6_pair_2_2_1_3_4_0",
+   "truth": "sat",
+   "vbs_time": 985.9,
+   "winner_solved": true,
+   "winner_time": 4254.22
+  },
+  "db099269d468029b70419bf4a49e99a1": {
+   "n_solved": 27,
+   "name": "stable-400-0.1-2-9876543214002",
+   "truth": "sat",
+   "vbs_time": 117.61,
+   "winner_solved": true,
+   "winner_time": 241.26
+  },
+  "db15a85651e0d941a11bf8640625edd8": {
+   "n_solved": 2,
+   "name": "mdp-32-11-sat",
+   "truth": "sat",
+   "vbs_time": 0.31,
+   "winner_solved": false,
+   "winner_time": 5000.15
+  },
+  "dbbcaa7797145dfddfa4fe73ce91fdec": {
+   "n_solved": 13,
+   "name": "cabp-M-bcsstk06.mtx.rnd-k39",
+   "truth": "unsat",
+   "vbs_time": 96.05,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "dc3ac89f98e9c3fc43450e256dce1154": {
+   "n_solved": 27,
+   "name": "vdw_4_7_n110",
+   "truth": "unsat",
+   "vbs_time": 132.95,
+   "winner_solved": true,
+   "winner_time": 353.84
+  },
+  "dc691557cfebca28aefe7360768389e5": {
+   "n_solved": 2,
+   "name": "ntil-90d-48",
+   "truth": "sat",
+   "vbs_time": 71.69,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "dc7817dfa2817916b266c1cfacd2ee66": {
+   "n_solved": 28,
+   "name": "constraints_25_4_5_12_12_0_0_0",
+   "truth": "unsat",
+   "vbs_time": 129.59,
+   "winner_solved": true,
+   "winner_time": 160.46
+  },
+  "dd062c307e10ebbb0d5641709ff26a7e": {
+   "n_solved": 24,
+   "name": "SDP_108_15_6925",
+   "truth": "sat",
+   "vbs_time": 210.15,
+   "winner_solved": true,
+   "winner_time": 1509.05
+  },
+  "dd5d530ac8bf0019412d023488b075eb": {
+   "n_solved": 28,
+   "name": "arles_thres20_p20_r4109",
+   "truth": "unsat",
+   "vbs_time": 0.01,
+   "winner_solved": true,
+   "winner_time": 0.03
+  },
+  "ddf6fff9ebbbe9ec2a02f70b3316db6d": {
+   "n_solved": 30,
+   "name": "QuasiGroup-4-12_c18",
+   "truth": "sat",
+   "vbs_time": 69.69,
+   "winner_solved": true,
+   "winner_time": 1289.05
+  },
+  "de3440b67769e7af00e58ec9cce9847b": {
+   "n_solved": 0,
+   "name": "SDP_136_18_712",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "de8c42d50f1dbf43a731f1916dc6bf01": {
+   "n_solved": 20,
+   "name": "16_16_booth_dadda_mapped_and_and_wallace_origin_bit28",
+   "truth": "unsat",
+   "vbs_time": 674.75,
+   "winner_solved": true,
+   "winner_time": 1497.82
+  },
+  "e1292f8d651e022362630d34fef69312": {
+   "n_solved": 31,
+   "name": "Medium-result_b30.af_80",
+   "truth": "sat",
+   "vbs_time": 0.18,
+   "winner_solved": true,
+   "winner_time": 75.65
+  },
+  "e2b819680a045a8af67f82fa2f3d945a": {
+   "n_solved": 0,
+   "name": "59-134241",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.05
+  },
+  "e305def35c314eec8266087e89a9ab46": {
+   "n_solved": 29,
+   "name": "ntil-90d-35",
+   "truth": "sat",
+   "vbs_time": 57.22,
+   "winner_solved": true,
+   "winner_time": 735.15
+  },
+  "e3a132ecb8108f7d8a46b6686e686b60": {
+   "n_solved": 2,
+   "name": "9",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.08
+  },
+  "e430acf720b63044e5c825a00a76b0eb": {
+   "n_solved": 9,
+   "name": "rphp_p25_r25",
+   "truth": "unsat",
+   "vbs_time": 0.06,
+   "winner_solved": true,
+   "winner_time": 0.06
+  },
+  "e4d1892db27b721b88e5ee7e5987649f": {
+   "n_solved": 0,
+   "name": "quad_res_r33_m36",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  },
+  "e5066e18b03451d92863160ed8166bdf": {
+   "n_solved": 14,
+   "name": "1x1x14_1x2x9_pair_2_4_0_3_1_0",
+   "truth": "sat",
+   "vbs_time": 266.97,
+   "winner_solved": true,
+   "winner_time": 4458.84
+  },
+  "e55a49d8065d65650f24c0f3ecef30b6": {
+   "n_solved": 28,
+   "name": "af-synthesis_stb_50_120_4_unsat",
+   "truth": "unsat",
+   "vbs_time": 432.04,
+   "winner_solved": true,
+   "winner_time": 573.87
+  },
+  "e5787bb4c8c29aa39b14a5e11387999d": {
+   "n_solved": 2,
+   "name": "fpsol2.i.2.29",
+   "truth": "unsat",
+   "vbs_time": 0.36,
+   "winner_solved": true,
+   "winner_time": 0.36
+  },
+  "e67d733d9938c565d6359002333611ff": {
+   "n_solved": 30,
+   "name": "WS_500_16_70_10.apx_2_DS-ST",
+   "truth": "sat",
+   "vbs_time": 17.99,
+   "winner_solved": true,
+   "winner_time": 134.54
+  },
+  "e685a5d96e1ee9e051f191eca84b0d88": {
+   "n_solved": 11,
+   "name": "sbdp4_140_2",
+   "truth": "unsat",
+   "vbs_time": 1689.79,
+   "winner_solved": true,
+   "winner_time": 4424.66
+  },
+  "e85fb114c33f450dc2622c78bc6fa019": {
+   "n_solved": 28,
+   "name": "lru_7",
+   "truth": "sat",
+   "vbs_time": 25.06,
+   "winner_solved": true,
+   "winner_time": 56.26
+  },
+  "e8ccbfaa2762cd0fc22b0ab05bacf529": {
+   "n_solved": 30,
+   "name": "ntil-90d-36",
+   "truth": "sat",
+   "vbs_time": 22.43,
+   "winner_solved": true,
+   "winner_time": 159.96
+  },
+  "e91253303b915493090c1f4b59d9e969": {
+   "n_solved": 6,
+   "name": "lattice-20.19",
+   "truth": "unsat",
+   "vbs_time": 0.17,
+   "winner_solved": true,
+   "winner_time": 4.27
+  },
+  "ebc40cf47836100655aea44ef1ed46da": {
+   "n_solved": 0,
+   "name": "MM-23-2-2-3-B",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "ee44c3f464238366729bf2cb16eb412a": {
+   "n_solved": 31,
+   "name": "n384p5q2_vh.af_138",
+   "truth": "sat",
+   "vbs_time": 1.47,
+   "winner_solved": true,
+   "winner_time": 4.22
+  },
+  "ee8c86d39745aea1c1731d4f34bcaed7": {
+   "n_solved": 30,
+   "name": "6.xz",
+   "truth": "sat",
+   "vbs_time": 10.09,
+   "winner_solved": true,
+   "winner_time": 53.7
+  },
+  "ef063cf2e17dd6472f514ab549a5eed5": {
+   "n_solved": 25,
+   "name": "cabp-V-nos6.mtx.rnd-k297",
+   "truth": "sat",
+   "vbs_time": 348.54,
+   "winner_solved": true,
+   "winner_time": 2830.05
+  },
+  "f15a3ce898e0c66f309bf07d73744adf": {
+   "n_solved": 30,
+   "name": "crusti_g2io_350_0.5_255_42.af_264",
+   "truth": "sat",
+   "vbs_time": 5.05,
+   "winner_solved": true,
+   "winner_time": 15.82
+  },
+  "f1d1a4fee20e2907c33465a88d1e24f2": {
+   "n_solved": 0,
+   "name": "openstacks-sequencedstrips-nonadl-nonnegated-os-sequencedstrips-p30_1.035-NOTKNOWN",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.03
+  },
+  "f2c6d035d0aa58cc06927af6be7a821f": {
+   "n_solved": 28,
+   "name": "scc_9630_26_0.3_0.1_17.af_516",
+   "truth": "unsat",
+   "vbs_time": 24.98,
+   "winner_solved": true,
+   "winner_time": 54.79
+  },
+  "f497bda3018958d7ba2d1cd99da3982e": {
+   "n_solved": 26,
+   "name": "adv_gc_n100_k12_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 3.62,
+   "winner_solved": true,
+   "winner_time": 83.0
+  },
+  "f52a349677a5b5b5315b5954b3181fe3": {
+   "n_solved": 29,
+   "name": "schooltt-5-7-12-2-4-1.4-2.6-0.2-0.9-seed2",
+   "truth": "sat",
+   "vbs_time": 12.47,
+   "winner_solved": true,
+   "winner_time": 31.49
+  },
+  "f554b55356a5e0ed39dbf8c1030ebce0": {
+   "n_solved": 30,
+   "name": "4.xz",
+   "truth": "sat",
+   "vbs_time": 7.93,
+   "winner_solved": true,
+   "winner_time": 42.51
+  },
+  "f5bb000a2fb23f3a5c19df2b6613cf77": {
+   "n_solved": 0,
+   "name": "ntil-90d-47",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "f604f43d1f5525f3dab4090190adbc66": {
+   "n_solved": 7,
+   "name": "1x1x14_1x2x9_pair_2_4_0_3_3_0",
+   "truth": "sat",
+   "vbs_time": 800.05,
+   "winner_solved": false,
+   "winner_time": 5000.06
+  },
+  "f83424f869b61931d720f93e5a12df3c": {
+   "n_solved": 8,
+   "name": "php_sudoku_p20_h19",
+   "truth": "unsat",
+   "vbs_time": 0.02,
+   "winner_solved": true,
+   "winner_time": 0.02
+  },
+  "f8443057c188f6c9cfb711ff3d4aa6ff": {
+   "n_solved": 28,
+   "name": "constraints_17_0.5_2",
+   "truth": "unsat",
+   "vbs_time": 70.45,
+   "winner_solved": true,
+   "winner_time": 76.28
+  },
+  "f8a3fae231fe11905d91db3fb6c42449": {
+   "n_solved": 0,
+   "name": "289-unsat-13x32",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "fa3e27fb7209620b792d5c75a75d669b": {
+   "n_solved": 0,
+   "name": "schooltt-5-5-10-2-4-5-10-0.1-0.2-seed5",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.18
+  },
+  "fac2035ba83ac2d0c2d67509d3f82b94": {
+   "n_solved": 27,
+   "name": "16_16_booth_dadda_origin_and_default_mapped_ultra_bit29",
+   "truth": "unsat",
+   "vbs_time": 283.57,
+   "winner_solved": true,
+   "winner_time": 638.14
+  },
+  "faf4561dc9f61c71b926d7d0aec7fb4a": {
+   "n_solved": 0,
+   "name": "smulo128",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.04
+  },
+  "fbbfbee9e6cba8bca18fbcfc23dcfcb6": {
+   "n_solved": 28,
+   "name": "adv_gc_n100_k11_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 1.48,
+   "winner_solved": true,
+   "winner_time": 30.23
+  },
+  "fbd9968f5067604694f11f14c07c5527": {
+   "n_solved": 8,
+   "name": "count_p2_M45",
+   "truth": "unsat",
+   "vbs_time": 0.1,
+   "winner_solved": true,
+   "winner_time": 2.14
+  },
+  "fbf3b9f8a03a1efedae3da04622fe96e": {
+   "n_solved": 27,
+   "name": "sqrt-mitern168",
+   "truth": "unsat",
+   "vbs_time": 611.34,
+   "winner_solved": true,
+   "winner_time": 1215.83
+  },
+  "fca71c20202ef404349136c3a00465eb": {
+   "n_solved": 29,
+   "name": "em_8_4_5_fbc",
+   "truth": "sat",
+   "vbs_time": 0.1,
+   "winner_solved": true,
+   "winner_time": 341.12
+  },
+  "fd1e0ce3662b9b25d23eb01c6e53a425": {
+   "n_solved": 9,
+   "name": "ntil-90d-42",
+   "truth": "sat",
+   "vbs_time": 333.59,
+   "winner_solved": true,
+   "winner_time": 3177.49
+  },
+  "fe776dd02d74e0d68a3e3fc3f9d934de": {
+   "n_solved": 0,
+   "name": "vdwb_k7_n3703",
+   "truth": "unknown",
+   "vbs_time": null,
+   "winner_solved": false,
+   "winner_time": 5000.03
+  },
+  "fed1f1b55b33c7e0f8356832d571b0bf": {
+   "n_solved": 1,
+   "name": "ntil-90d-41",
+   "truth": "sat",
+   "vbs_time": 3503.7,
+   "winner_solved": false,
+   "winner_time": 5000.11
+  },
+  "fed3f8d39738c2e935e8ed13ddeb6967": {
+   "n_solved": 2,
+   "name": "8",
+   "truth": "sat",
+   "vbs_time": 0.04,
+   "winner_solved": false,
+   "winner_time": 5000.33
+  },
+  "ff706804d01ac07e8b8502de6331f2de": {
+   "n_solved": 1,
+   "name": "adv_gc_n200_k15_UNSAT_s42",
+   "truth": "unsat",
+   "vbs_time": 252.43,
+   "winner_solved": false,
+   "winner_time": 5000.09
+  }
+ },
+ "note": "Per-instance ground truth and official field results for the SAT-COMP 2026 Main Track. `truth` is the verified verdict agreed by every solver that solved the instance; `unknown` means nobody solved it. Instance files download from https://benchmark-database.de/file/<hash>.",
+ "schema_version": 1,
+ "source": "https://satcompetition.github.io/2026/downloads/scores.csv",
+ "timeout_s": 5000,
+ "track": "satcomp-2026-main"
+}

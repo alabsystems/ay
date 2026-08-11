@@ -926,20 +926,147 @@ pub(crate) fn fmt_ms(d: Duration) -> String {
 // Certificate metadata helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a benchmark's own `(set-info :status sat|unsat|unknown)` annotation.
-/// For disagreements this is ground truth independent of BOTH solvers.
-fn parse_declared_status(text: &str) -> Option<&str> {
-    let idx = text.find(":status")?;
-    text[idx + ":status".len()..]
-        .split(|c: char| c.is_whitespace() || c == ')')
-        .find(|t| !t.is_empty())
-        .filter(|t| matches!(*t, "sat" | "unsat" | "unknown"))
+/// A benchmark's OWN `(set-info :status ...)` annotation — ground truth that
+/// depends on neither solver.
+///
+/// This is the only oracle available when the reference solver fails to decide
+/// a file, so it is what keeps a z3 timeout from laundering a wrong AY answer
+/// into an unchallenged "beyond z3" win.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeclaredStatus {
+    Sat,
+    Unsat,
+    /// The file declares `unknown`, or declares two DIFFERENT statuses (a
+    /// self-contradicting benchmark is no oracle either). Declared, but
+    /// unusable as ground truth.
+    Unknown,
+    /// No `(set-info :status ...)` at all — deliberately distinct from a
+    /// declared `unknown`, because "nobody stated an answer" and "the author
+    /// stated they do not know" are different pieces of evidence.
+    Absent,
 }
 
-/// Declared `:status` of a benchmark file, if annotated.
+impl DeclaredStatus {
+    /// The JSON / table token. All four states are distinguishable.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DeclaredStatus::Sat => "sat",
+            DeclaredStatus::Unsat => "unsat",
+            DeclaredStatus::Unknown => "unknown",
+            DeclaredStatus::Absent => "absent",
+        }
+    }
+
+    /// The oracle verdict this file supplies, if it supplies one at all.
+    pub(crate) fn decided(self) -> Option<Verdict> {
+        match self {
+            DeclaredStatus::Sat => Some(Verdict::Sat),
+            DeclaredStatus::Unsat => Some(Verdict::Unsat),
+            DeclaredStatus::Unknown | DeclaredStatus::Absent => None,
+        }
+    }
+}
+
+/// Can `c` continue an SMT-LIB simple symbol (and therefore a keyword)? Used to
+/// require that a `:status` keyword ENDS where it is found, so `:status-bits`
+/// is never read as `:status`.
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "~!@$%^&*_-+=<>.?/".contains(c)
+}
+
+/// Parse a benchmark's own `(set-info :status sat|unsat|unknown)` annotation.
+///
+/// Lexer-accurate rather than a substring search: `;` comments, `|quoted
+/// symbols|`, and `"string literals"` are skipped. SMT-LIB benchmarks routinely
+/// carry a `(set-info :source | ... |)` blob of prose, and taking the FIRST
+/// `:status` in the raw bytes reads such prose as the answer. Every real
+/// annotation is collected; if two of them disagree the file declares nothing
+/// usable ([`DeclaredStatus::Unknown`]) rather than accusing a solver on a coin
+/// flip.
+pub(crate) fn parse_declared_status(text: &str) -> DeclaredStatus {
+    const KEYWORD: &str = ":status";
+    let bytes = text.as_bytes();
+    let mut found: Option<DeclaredStatus> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Comment: skip to end of line.
+            b';' => {
+                i += bytes[i..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .unwrap_or(bytes.len() - i);
+            }
+            // |quoted symbol| — the shape of a (set-info :source | ... |) blob.
+            b'|' => {
+                i += 1;
+                i += bytes[i..]
+                    .iter()
+                    .position(|b| *b == b'|')
+                    .map_or(bytes.len() - i, |n| n + 1);
+            }
+            // "string literal", in which "" is an escaped quote (SMT-LIB 2.6).
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        if bytes.get(i) != Some(&b'"') {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            // `:` is ASCII, so `text[i..]` is always on a char boundary here.
+            b':' if text[i..].starts_with(KEYWORD) => {
+                i += KEYWORD.len();
+                let rest = &text[i..];
+                if rest.starts_with(is_symbol_char) {
+                    continue; // a longer keyword, e.g. `:status-bits`
+                }
+                let token = rest
+                    .trim_start()
+                    .split(|c: char| c.is_whitespace() || "()|\";".contains(c))
+                    .next()
+                    .unwrap_or_default();
+                let declared = match token {
+                    "sat" => Some(DeclaredStatus::Sat),
+                    "unsat" => Some(DeclaredStatus::Unsat),
+                    "unknown" => Some(DeclaredStatus::Unknown),
+                    // Not a status we can read; contribute no judgement.
+                    _ => None,
+                };
+                if let Some(d) = declared {
+                    found = Some(match found {
+                        None => d,
+                        Some(prev) if prev == d => d,
+                        Some(_) => DeclaredStatus::Unknown,
+                    });
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    found.unwrap_or(DeclaredStatus::Absent)
+}
+
+/// Declared `:status` of a benchmark file. An unreadable file declares nothing;
+/// invalid UTF-8 is read lossily rather than discarded, so one stray byte deep
+/// in a benchmark cannot hide its `:status` header.
+pub(crate) fn declared_status_of_file(file: &Path) -> DeclaredStatus {
+    match std::fs::read(file) {
+        Ok(bytes) => parse_declared_status(&String::from_utf8_lossy(&bytes)),
+        Err(_) => DeclaredStatus::Absent,
+    }
+}
+
+/// Declared `:status` token of a benchmark file, `None` when unannotated.
 pub(crate) fn declared_status(file: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
-    parse_declared_status(&text).map(str::to_string)
+    match declared_status_of_file(file) {
+        DeclaredStatus::Absent => None,
+        declared => Some(declared.as_str().to_string()),
+    }
 }
 
 /// SHA-256 of a file via the system `shasum`/`sha256sum` tool — re-runnable
@@ -2297,15 +2424,135 @@ mod tests {
     fn declared_status_parsing() {
         assert_eq!(
             parse_declared_status("(set-info :status unsat)\n(check-sat)"),
-            Some("unsat")
+            DeclaredStatus::Unsat
         );
-        assert_eq!(parse_declared_status("(set-info :status sat)"), Some("sat"));
+        assert_eq!(
+            parse_declared_status("(set-info :status sat)"),
+            DeclaredStatus::Sat
+        );
         assert_eq!(
             parse_declared_status("(set-info :status unknown)"),
-            Some("unknown")
+            DeclaredStatus::Unknown
         );
-        assert_eq!(parse_declared_status("(set-logic QF_AX)"), None);
-        assert_eq!(parse_declared_status("(set-info :status bogus)"), None);
+        assert_eq!(
+            parse_declared_status("(set-logic QF_AX)"),
+            DeclaredStatus::Absent
+        );
+        assert_eq!(
+            parse_declared_status("(set-info :status bogus)"),
+            DeclaredStatus::Absent
+        );
+    }
+
+    /// A missing annotation, a declared `unknown`, and a declared `sat`/`unsat`
+    /// are three DIFFERENT pieces of evidence and must never collapse: `absent`
+    /// means nobody stated an answer, `unknown` means the author stated they do
+    /// not know, and only `sat`/`unsat` is an oracle a solver can be judged on.
+    #[test]
+    fn declared_status_distinguishes_absent_from_unknown() {
+        assert_eq!(parse_declared_status(""), DeclaredStatus::Absent);
+        assert_eq!(
+            parse_declared_status("(set-logic UFBV)\n(check-sat)\n(exit)\n"),
+            DeclaredStatus::Absent
+        );
+        assert_eq!(DeclaredStatus::Absent.as_str(), "absent");
+        assert_eq!(DeclaredStatus::Unknown.as_str(), "unknown");
+        assert_eq!(DeclaredStatus::Absent.decided(), None);
+        assert_eq!(DeclaredStatus::Unknown.decided(), None);
+        assert_eq!(DeclaredStatus::Sat.decided(), Some(Verdict::Sat));
+        assert_eq!(DeclaredStatus::Unsat.decided(), Some(Verdict::Unsat));
+    }
+
+    /// The real shape of an SMT-LIB header: several `set-info` commands, the
+    /// status among them, and — the trap — a `(set-info :source | ... |)` blob
+    /// of prose that MENTIONS `:status`. A substring search for the first
+    /// `:status` reads the prose as the answer; the real annotation must win.
+    #[test]
+    fn declared_status_ignores_quoted_source_blocks_and_comments() {
+        let file = "\
+(set-info :smt-lib-version 2.6)
+(set-logic UFBV)
+(set-info :source |
+Hardware fixpoint check problems. Generated with :status sat by a script that
+also emits (set-info :status sat) for the companion family.
+|)
+(set-info :category \"industrial\")
+(set-info :status unsat)
+(check-sat)
+";
+        assert_eq!(parse_declared_status(file), DeclaredStatus::Unsat);
+
+        // Same trap in a string literal, and in a line comment.
+        assert_eq!(
+            parse_declared_status(
+                "(set-info :notes \":status sat\")\n; was (set-info :status sat)\n(set-info :status unsat)\n"
+            ),
+            DeclaredStatus::Unsat
+        );
+        // The trap ALONE (no real annotation) declares nothing.
+        assert_eq!(
+            parse_declared_status("(set-info :source |see :status sat|)\n(check-sat)\n"),
+            DeclaredStatus::Absent
+        );
+        // A longer keyword is not `:status`.
+        assert_eq!(
+            parse_declared_status("(set-info :status-bits sat)\n"),
+            DeclaredStatus::Absent
+        );
+    }
+
+    /// Multiple `set-info` commands are normal. Repeating the SAME status is
+    /// still that status; two DIFFERENT statuses make the benchmark
+    /// self-contradicting, and a self-contradicting file is no oracle — it must
+    /// degrade to `unknown`, never pick one and accuse a solver on a coin flip.
+    #[test]
+    fn declared_status_over_multiple_set_info_lines() {
+        assert_eq!(
+            parse_declared_status(
+                "(set-info :smt-lib-version 2.6)\n(set-info :category \"crafted\")\n\
+                 (set-info :status unsat)\n(set-info :license \"CC0\")\n"
+            ),
+            DeclaredStatus::Unsat
+        );
+        assert_eq!(
+            parse_declared_status("(set-info :status sat)\n(set-info :status sat)\n"),
+            DeclaredStatus::Sat
+        );
+        assert_eq!(
+            parse_declared_status("(set-info :status sat)\n(set-info :status unsat)\n"),
+            DeclaredStatus::Unknown
+        );
+        assert_eq!(
+            parse_declared_status("(set-info :status unsat)\n(set-info :status unknown)\n"),
+            DeclaredStatus::Unknown
+        );
+    }
+
+    /// The file-level entry point the scoreboard actually calls: it must reach
+    /// the annotation through the same traps, and an unreadable path declares
+    /// nothing rather than failing the run.
+    #[test]
+    fn declared_status_of_file_reads_the_real_annotation() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-z3-parity-declared-{}-{}",
+            std::process::id(),
+            utc_now_iso().replace([':', '-'], "")
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("b.smt2");
+        std::fs::write(
+            &path,
+            "(set-info :source |generated for :status sat|)\n(set-info :status unsat)\n(check-sat)\n",
+        )
+        .expect("write");
+        assert_eq!(declared_status_of_file(&path), DeclaredStatus::Unsat);
+        assert_eq!(declared_status(&path).as_deref(), Some("unsat"));
+
+        let missing = dir.join("nope.smt2");
+        assert_eq!(declared_status_of_file(&missing), DeclaredStatus::Absent);
+        assert_eq!(declared_status(&missing), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

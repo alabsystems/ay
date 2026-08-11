@@ -297,9 +297,13 @@ fn replay_proof_script(
     }
 
     // Parse asserts via the ay-dpll frontend, convert back to ChcExpr with
-    // the production converter.
-    let mut solver = Solver::try_new(Logic::QfLia).expect("solver");
-    let asserts = solver.parse_smtlib2(text).expect("parseable dump");
+    // the production converter. The dump carries its own `(set-logic …)`, and
+    // `Solver::try_new` dispatches one, so the dump's would be a second
+    // `set-logic` — which the elaborator rejects (z3 parity). Take the dump's
+    // declared logic and strip the command, exactly as the production path does.
+    let (logic, text) = crate::smt::executor_adapter::split_leading_set_logic(text, Logic::QfLia);
+    let mut solver = Solver::try_new(logic).expect("solver");
+    let asserts = solver.parse_smtlib2(&text).expect("parseable dump");
     assert!(a_count < asserts.len(), "split must leave a non-empty B");
     let mut exprs: Vec<ChcExpr> = Vec::with_capacity(asserts.len());
     for &t in &asserts {

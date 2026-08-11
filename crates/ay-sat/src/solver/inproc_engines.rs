@@ -101,6 +101,46 @@ pub(crate) struct InprocessingEngines {
 impl InprocessingEngines {
     /// Create all inprocessing engines for `num_vars` variables.
     pub(crate) fn new(num_vars: usize) -> Self {
+        // `AY_SAT_MEM_PROBE=1`: per-engine construction footprint. This
+        // constructor is 685 of the ~849 resident bytes per variable AY commits
+        // before reading a clause, so the breakdown decides what to make lazy.
+        if std::env::var_os("AY_SAT_MEM_PROBE").is_some() {
+            let mut last = ay_sys::current_footprint_bytes();
+            macro_rules! probe {
+                ($label:literal, $e:expr) => {{
+                    let v = $e;
+                    let now = ay_sys::current_footprint_bytes();
+                    let d = now.saturating_sub(last);
+                    eprintln!(
+                        "c mem_probe   engine {:<20} {:>9.1} MB {:>7.1} B/var",
+                        $label,
+                        d as f64 / 1e6,
+                        d as f64 / num_vars.max(1) as f64
+                    );
+                    last = now;
+                    v
+                }};
+            }
+            let probes = (
+                probe!("subsumer", Subsumer::new(num_vars)),
+                probe!("prober", crate::probe::Prober::new(num_vars)),
+                probe!("bve", BVE::new(num_vars)),
+                probe!("bce", BCE::new(num_vars)),
+                probe!("cce", Cce::new(num_vars)),
+                probe!("conditioning", Conditioning::new(num_vars)),
+                probe!("decompose", Decompose::new(num_vars)),
+                probe!("factor", Factor::new(num_vars)),
+                probe!("sbva", Sbva::new(num_vars)),
+                probe!("transred", TransRed::new(num_vars)),
+                probe!("htr", HTR::new(num_vars)),
+                probe!("gate_extractor", GateExtractor::new(num_vars)),
+            );
+            let more = (
+                probe!("congruence", CongruenceClosure::new(num_vars)),
+                probe!("sweeper", Sweeper::new(num_vars)),
+            );
+            drop((probes, more));
+        }
         let mut definition_kitten = Kitten::new();
         definition_kitten.enable_antecedent_tracking();
         Self {

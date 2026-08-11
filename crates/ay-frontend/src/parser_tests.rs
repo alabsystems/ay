@@ -29,6 +29,24 @@ fn test_parse_simple_problem() {
 }
 
 #[test]
+fn test_parse_qf_eia_integer_power() {
+    let commands = parse("(set-logic QF_EIA) (assert (= (** 2 10) 1024))").unwrap();
+    assert!(matches!(
+        &commands[0],
+        Command::SetLogic(logic) if logic == "QF_EIA"
+    ));
+    let Command::Assert(Term::App(eq, equality_args)) = &commands[1] else {
+        panic!("expected equality assertion");
+    };
+    assert_eq!(eq, "=");
+    let Term::App(power, power_args) = &equality_args[0] else {
+        panic!("expected integer-power application");
+    };
+    assert_eq!(power, "**");
+    assert_eq!(power_args.len(), 2);
+}
+
+#[test]
 fn test_parse_bitvector_problem() {
     let input = r#"
         (set-logic QF_BV)

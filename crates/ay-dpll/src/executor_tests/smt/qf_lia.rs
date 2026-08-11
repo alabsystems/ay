@@ -163,6 +163,81 @@ fn test_mod_by_zero_value_is_free_not_pinned_to_dividend() {
     );
 }
 
+/// DISTINCT dividends get INDEPENDENT values at a zero divisor — `(div a 0)`
+/// is a function of `a`, so `(div 1 0)` and `(div 2 0)` may differ. z3 = sat.
+///
+/// This is the case that separates "read back the value the solve chose for
+/// THIS term" from "read back some zero-divisor value": a witness lookup that
+/// ignores the dividend confirms one of these two assertions against the
+/// other's value.
+#[test]
+fn test_div_by_zero_distinct_dividends_are_independent() {
+    assert_eq!(
+        solve_one("(set-logic QF_NIA)(assert (= (div 1 0) 5))(assert (= (div 2 0) 7))(check-sat)"),
+        "sat"
+    );
+    assert_eq!(
+        solve_one("(set-logic QF_NIA)(assert (= (mod 1 0) 5))(assert (= (mod 2 0) 7))(check-sat)"),
+        "sat"
+    );
+}
+
+/// `div` and `mod` at a zero divisor are independent of EACH OTHER too, even
+/// on the same dividend. z3 = sat.
+#[test]
+fn test_div_and_mod_by_zero_are_independent_of_each_other() {
+    assert_eq!(
+        solve_one("(set-logic QF_NIA)(assert (and (= (div 1 0) 5) (= (mod 1 0) 7)))(check-sat)"),
+        "sat"
+    );
+}
+
+/// A SYMBOLIC divisor that is zero must not pick up the value of a site whose
+/// divisor is nonzero — that one is fully determined by Euclidean division and
+/// has nothing to do with the under-specified case. z3 = sat.
+#[test]
+fn test_symbolic_zero_divisor_does_not_borrow_a_nonzero_site() {
+    // The two sites deliberately share a DIVIDEND (`x`) and differ only in the
+    // divisor, so a lookup keyed on the dividend alone finds the wrong one: it
+    // would answer `(div x y)` with `6 div 2 = 3` instead of the unconstrained
+    // `9`. A CONSTANT divisor would not exercise this — that takes the literal
+    // elimination path and never creates a symbolic witness at all.
+    // Both orders: the NONZERO site first is the one that matters, since a
+    // lookup that ignores the divisor takes whichever witness it reaches first
+    // and the sites are scanned in term order.
+    for (first, second) in [
+        ("(assert (= (div x z) 3))", "(assert (= (div x y) 9))"),
+        ("(assert (= (div x y) 9))", "(assert (= (div x z) 3))"),
+    ] {
+        assert_eq!(
+            solve_one(&format!(
+                "(set-logic QF_NIA)\
+                 (declare-const x Int)(declare-const y Int)(declare-const z Int)\
+                 (assert (= x 6))(assert (= y 0))(assert (= z 2)){first}{second}(check-sat)"
+            )),
+            "sat",
+            "with {first} before {second}"
+        );
+    }
+    assert_eq!(
+        solve_one(concat!(
+            "(set-logic QF_NIA)",
+            "(declare-const x Int)(declare-const y Int)(declare-const z Int)",
+            "(assert (= x 6))(assert (= y 0))(assert (= z 2))",
+            "(assert (= (mod x y) 9))(assert (= (mod x z) 0))(check-sat)"
+        )),
+        "sat"
+    );
+    // A constant divisor alongside the under-specified site, for good measure.
+    assert_eq!(
+        solve_one(concat!(
+            "(set-logic QF_NIA)(declare-const x Int)(declare-const y Int)",
+            "(assert (= y 0))(assert (= (div x y) 9))(assert (= (div 3 2) 1))(check-sat)"
+        )),
+        "sat"
+    );
+}
+
 #[test]
 fn test_div_by_zero_is_single_consistent_value() {
     // `(div 1 0)` is ONE value, so it cannot be both 0 and 1: z3 = unsat.

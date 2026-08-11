@@ -21,12 +21,18 @@ smt = ["dep:ay-dpll"]
 
 [dependencies]
 ay-dpll = { workspace = true, optional = true }
+ay-pb-core.workspace = true
+ay-sat.workspace = true
 ay-lra.workspace = true
+ay-sys.workspace = true
 num-rational.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

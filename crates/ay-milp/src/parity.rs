@@ -59,11 +59,135 @@
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, Zero};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use crate::model::{exact, Col, Model, Row, Sense};
 use crate::outcome::{Outcome, UnknownReason};
+
+/// A source-model GF(2) contradiction.
+///
+/// Adding the named equality rows gives an even coefficient for every model
+/// column and an odd right-hand side.  Since every column is integral, the
+/// resulting equality would equate an even integer with an odd integer.  The
+/// row list is deliberately the whole artifact: the independent checker
+/// re-reads every coefficient and the column kinds from the source model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParityInfeasibilityCertificate {
+    rows: Vec<u32>,
+}
+
+impl ParityInfeasibilityCertificate {
+    pub(crate) fn from_rows(rows: Vec<u32>) -> Self {
+        Self { rows }
+    }
+
+    pub(crate) fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+}
+
+thread_local! {
+    /// Typed evidence produced below the public branch-and-bound return type.
+    /// Like the replay ledger, this is thread-local and is drained by the
+    /// session that owns the solve, so one solve cannot lend evidence to the
+    /// next one.
+    static PENDING_INFEASIBILITY_CERTIFICATE:
+        RefCell<Option<ParityInfeasibilityCertificate>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn clear_pending_infeasibility_certificate() {
+    PENDING_INFEASIBILITY_CERTIFICATE.with(|pending| {
+        pending.borrow_mut().take();
+    });
+}
+
+pub(crate) fn take_pending_infeasibility_certificate() -> Option<ParityInfeasibilityCertificate> {
+    PENDING_INFEASIBILITY_CERTIFICATE.with(|pending| pending.borrow_mut().take())
+}
+
+fn publish_infeasibility_certificate(certificate: ParityInfeasibilityCertificate) {
+    PENDING_INFEASIBILITY_CERTIFICATE.with(|pending| {
+        *pending.borrow_mut() = Some(certificate);
+    });
+}
+
+/// Independently replay a parity contradiction against the source model.
+///
+/// This verifier intentionally does not call the lights-out recognizer or the
+/// Gaussian eliminator.  It checks the smaller mathematical fact carried by
+/// the artifact: a subset of exact integer equalities sums to even column
+/// coefficients and an odd right-hand side.
+///
+/// # Errors
+/// Returns a descriptive error when the row list is non-canonical, a selected
+/// fact is not an exact integer equality, a participating column is not
+/// integral, or the claimed parity contradiction does not hold.
+pub fn verify_parity_infeasibility_certificate(
+    model: &Model,
+    certificate: &ParityInfeasibilityCertificate,
+) -> Result<(), String> {
+    if certificate.rows.is_empty() {
+        return Err("parity certificate selects no source rows".to_owned());
+    }
+    let mut previous = None;
+    let mut coefficient_parity = vec![false; model.num_cols()];
+    let mut rhs_parity = false;
+
+    for &row_u32 in &certificate.rows {
+        let row_index = row_u32 as usize;
+        if previous.is_some_and(|prior| prior >= row_u32) {
+            return Err("parity certificate rows are not strictly increasing".to_owned());
+        }
+        previous = Some(row_u32);
+        if row_index >= model.num_rows() {
+            return Err(format!(
+                "parity certificate row {row_index} is out of range for {} rows",
+                model.num_rows()
+            ));
+        }
+        let row = Row(row_u32);
+        let (coefficients, lower_float, upper_float) = model.row(row);
+        let lower = model.row_lb_exact(row_index, lower_float).ok_or_else(|| {
+            format!("parity certificate row {row_index} has no finite lower side")
+        })?;
+        let upper = model.row_ub_exact(row_index, upper_float).ok_or_else(|| {
+            format!("parity certificate row {row_index} has no finite upper side")
+        })?;
+        if lower != upper || !lower.is_integer() {
+            return Err(format!(
+                "parity certificate row {row_index} is not an exact integer equality"
+            ));
+        }
+        rhs_parity ^= lower.to_integer().bit(0);
+
+        for &(column, coefficient_float) in coefficients {
+            let column_index = column as usize;
+            if !model.col_kind(Col(column)).is_integral() {
+                return Err(format!(
+                    "parity certificate row {row_index} uses non-integral column {column_index}"
+                ));
+            }
+            let coefficient = model.row_coeff_exact(row_index, column, coefficient_float);
+            if !coefficient.is_integer() {
+                return Err(format!(
+                    "parity certificate row {row_index} has non-integer coefficient at column {column_index}"
+                ));
+            }
+            coefficient_parity[column_index] ^= coefficient.to_integer().bit(0);
+        }
+    }
+
+    if coefficient_parity.iter().any(|&odd| odd) {
+        return Err(
+            "selected parity rows do not sum to even coefficients for every column".to_owned(),
+        );
+    }
+    if !rhs_parity {
+        return Err("selected parity rows do not sum to an odd right-hand side".to_owned());
+    }
+    Ok(())
+}
 
 /// Size cap: the family is small (enlight_hard is 100×100). Anything wider is
 /// out of the family and pays one comparison.
@@ -198,6 +322,19 @@ impl Bits {
     fn first_set_from(&self, from: usize) -> Option<usize> {
         let n = self.w.len() * 64;
         (from..n).find(|&i| self.get(i))
+    }
+
+    fn set_indices(&self, limit: usize) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let mut next = self.first_set_from(0);
+        while let Some(index) = next {
+            if index >= limit {
+                break;
+            }
+            indices.push(index);
+            next = self.first_set_from(index + 1);
+        }
+        indices
     }
 }
 
@@ -355,25 +492,26 @@ fn detect(model: &Model, deadline: Deadline<'_>) -> ParityResult<Parity> {
     })
 }
 
-/// Reduced row-echelon form over GF(2). Returns `(pivots, inconsistent)` where
+/// Reduced row-echelon form over GF(2). Returns `(pivots, inconsistency)` where
 /// `pivots[r] = (pivot_col, row_bits, rhs)` is the reduced system, or reports the
-/// system inconsistent (a `0 = 1` row).
+/// source-row combination that produced a `0 = 1` row.
 struct Rref {
     /// One entry per pivot: `(pivot column, reduced row, reduced rhs)`.
     piv: Vec<(usize, Bits, bool)>,
-    /// True when a `0 = 1` row appeared (no solution).
-    inconsistent: bool,
+    /// Source rows whose XOR is `0 = 1`, when the system is inconsistent.
+    inconsistency: Option<Bits>,
 }
 
 fn rref(p: &Parity, deadline: Deadline<'_>) -> ParityResult<Rref> {
     deadline.check()?;
-    let mut rows: Vec<(Bits, bool)> = Vec::with_capacity(p.m);
+    let mut rows: Vec<(Bits, bool, Bits)> = Vec::with_capacity(p.m);
     for (i, (a, &b)) in p.a2.iter().zip(&p.b2).enumerate() {
         deadline.check_every(i, 31)?;
-        rows.push((a.clone(), b));
+        let mut source_rows = Bits::zero(p.m);
+        source_rows.set(i, true);
+        rows.push((a.clone(), b, source_rows));
     }
     let mut piv: Vec<(usize, Bits, bool)> = Vec::new();
-    let mut inconsistent = false;
     let mut r0 = 0usize;
     for col in 0..p.n {
         deadline.check()?;
@@ -389,30 +527,32 @@ fn rref(p: &Parity, deadline: Deadline<'_>) -> ParityResult<Rref> {
         let Some(sel) = sel else { continue };
         rows.swap(r0, sel);
         // Eliminate this column from every other row.
-        let (pivrow, pivrhs) = {
-            let (a, b) = &rows[r0];
-            (a.clone(), *b)
+        let (pivrow, pivrhs, pivsource) = {
+            let (a, b, source) = &rows[r0];
+            (a.clone(), *b, source.clone())
         };
         for r in 0..rows.len() {
             deadline.check_every(r, 31)?;
             if r != r0 && rows[r].0.get(col) {
                 rows[r].0.xor_assign(&pivrow);
                 rows[r].1 ^= pivrhs;
+                rows[r].2.xor_assign(&pivsource);
             }
         }
         piv.push((col, pivrow, pivrhs));
         r0 += 1;
     }
     // Any all-zero row with rhs 1 is inconsistent.
-    for (i, (a, b)) in rows.iter().enumerate() {
+    let mut inconsistency = None;
+    for (i, (a, b, source)) in rows.iter().enumerate() {
         deadline.check_every(i, 63)?;
         if *b && !a.any() {
-            inconsistent = true;
+            inconsistency = Some(source.clone());
             break;
         }
     }
     deadline.check()?;
-    Ok(Rref { piv, inconsistent })
+    Ok(Rref { piv, inconsistency })
 }
 
 /// Complete a solution from values assigned only at the free columns.
@@ -500,6 +640,7 @@ fn enumerate_remaining(
 
 /// Public entry: decide the enlight-class instance exactly, or `None`.
 pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<Outcome> {
+    clear_pending_infeasibility_certificate();
     if std::env::var_os("AY_MILP_NO_PARITY").is_some() {
         return None;
     }
@@ -531,9 +672,17 @@ fn try_solve_with_deadline(model: &Model, deadline: Deadline<'_>) -> Option<Outc
     }
 }
 
+/// Cached trace predicate. `tests/env_ledger.rs` counts a bare `env::var_os` on
+/// the solve path as a LIVE read — a fresh `getenv` a concurrent `set_var` can
+/// race — and that ratchet may only move DOWN.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+}
+
 fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcome> {
     deadline.check()?;
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+    let trace = trace_enabled();
     let p = detect(model, deadline)?;
     if trace {
         eprintln!(
@@ -543,11 +692,20 @@ fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcom
     }
     deadline.check()?;
     let rr = rref(&p, deadline)?;
-    if rr.inconsistent {
+    if let Some(source_rows) = &rr.inconsistency {
         if trace {
             eprintln!("AY_MILP_TRACE parity: GF(2) system INCONSISTENT — INFEASIBLE");
         }
+        let rows = source_rows
+            .set_indices(p.m)
+            .into_iter()
+            .map(|row| u32::try_from(row).map_err(|_| ParityAbort::Declined))
+            .collect::<ParityResult<Vec<_>>>()?;
+        let certificate = ParityInfeasibilityCertificate::from_rows(rows);
+        verify_parity_infeasibility_certificate(model, &certificate)
+            .map_err(|_| ParityAbort::Declined)?;
         deadline.check()?;
+        publish_infeasibility_certificate(certificate);
         return Ok(Outcome::Infeasible {
             cert: None,
             tree_cert: None,
@@ -821,10 +979,39 @@ mod tests {
     fn inconsistent_system_proves_infeasible() {
         // x0 ≡ 0 AND x0 ≡ 1: no binary x ⟹ INFEASIBLE.
         let m = parity_model(&[vec![1], vec![1]], &[0, -1]);
+        clear_pending_infeasibility_certificate();
         assert!(matches!(
             try_solve_enabled(&m, deadline()),
             Some(Outcome::Infeasible { .. })
         ));
+        let certificate = take_pending_infeasibility_certificate()
+            .expect("inconsistent parity solve must publish its row combination");
+        assert_eq!(certificate.rows(), &[0, 1]);
+        verify_parity_infeasibility_certificate(&m, &certificate)
+            .expect("freshly generated GF(2) contradiction must replay");
+    }
+
+    #[test]
+    fn parity_certificate_tampering_is_rejected() {
+        let model = parity_model(&[vec![1], vec![1]], &[0, -1]);
+        let missing_row = ParityInfeasibilityCertificate::from_rows(vec![0]);
+        assert!(verify_parity_infeasibility_certificate(&model, &missing_row).is_err());
+
+        let duplicate_row = ParityInfeasibilityCertificate::from_rows(vec![0, 0, 1]);
+        assert!(verify_parity_infeasibility_certificate(&model, &duplicate_row).is_err());
+
+        let out_of_range = ParityInfeasibilityCertificate::from_rows(vec![0, 2]);
+        assert!(verify_parity_infeasibility_certificate(&model, &out_of_range).is_err());
+    }
+
+    #[test]
+    fn parity_certificate_rejects_a_nonintegral_source_column() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.add_row(0.0, 0.0, &[(x, 1.0)]);
+        model.add_row(1.0, 1.0, &[(x, 1.0)]);
+        let certificate = ParityInfeasibilityCertificate::from_rows(vec![0, 1]);
+        assert!(verify_parity_infeasibility_certificate(&model, &certificate).is_err());
     }
 
     #[test]
@@ -985,4 +1172,11 @@ mod tests {
         m2.set_objective(&[(a, 1.0)], Sense::Minimize);
         assert!(try_solve(&m2, deadline()).is_none());
     }
+}
+
+/// Force this module's cached env accessor at solve entry, so a consumer that
+/// rewrites its environment between window solves cannot race it. Called from
+/// `bab::prime_env_all`.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
 }

@@ -178,10 +178,10 @@ impl Executor {
         // GATED to quantifier-free problems (`!original_problem_had_quantifiers`):
         // in a QF problem a SAT verdict rests entirely on ground reasoning, so a
         // faithful ground function-table read is exactly the completeness this
-        // needs. In a QUANTIFIED problem the verdict can rest on the fail-OPEN
-        // quantifier model gate (`cannot-confirm` keeps SAT), and resolving an
+        // needs. In a QUANTIFIED problem the independent evaluator may report
+        // `cannot-confirm`, and resolving an
         // arg-key for an MBQI-instantiated term — e.g. `(+ (f 3) 1)` from a
-        // `forall x. .. f(x+1) ..` body — would let that fail-open path validate
+        // `forall x. .. f(x+1) ..` body — would let an incomplete path validate
         // ground instances of a quantifier shape ay does NOT certify complete
         // (the finite-table certificate deliberately fails closed on shifted
         // arguments). Keeping the conservative `@?id` fail-safe there preserves
@@ -478,6 +478,19 @@ impl Executor {
     ) -> EvalValue {
         let context_dependent =
             super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id);
+        // Equality-only Seq carriers are solved through EUF, whose raw
+        // `term_values` entry is an opaque class label rather than a sequence.
+        // Completion materializes that class as a concrete `EvalValue::Seq` in
+        // the common completion slot. Read the concrete witness before any
+        // function-table/EUF fallback so UF applications, validation, and
+        // get-value share the same interpretation. Context-dependent terms are
+        // excluded: a TermId-keyed ambient value cannot represent a lambda
+        // body's distinct beta instances.
+        if !context_dependent && matches!(sort, Sort::Seq(_)) {
+            if let Some(value @ EvalValue::Seq(_)) = model.completed_values.get(&term_id) {
+                return value.clone();
+            }
+        }
         // DT constructor recognition: nullary constructors like `Green`
         // or `Nothing` are 0-arity applications that should evaluate to
         // their constructor name, not Unknown. This is needed for pure

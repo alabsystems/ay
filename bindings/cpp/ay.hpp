@@ -124,11 +124,15 @@ class context {
   // Throw an ay::exception if the C API recorded an error, clearing nothing
   // (the C API keeps the last code). Used by fallible constructors.
   void check_error() const {
-    unsigned code = Z3_get_error_code(ctx_);
+    // Keep the enum type: C++ has no implicit integer -> enum conversion, so
+    // storing this in an `unsigned` makes the Z3_get_error_msg() call below
+    // ill-formed (-fpermissive / -Werror).
+    Z3_error_code code = Z3_get_error_code(ctx_);
     if (code != Z3_OK) {
       Z3_string msg = Z3_get_error_msg(ctx_, code);
       throw exception(msg ? std::string(msg)
-                          : ("AY error code " + std::to_string(code)));
+                          : ("AY error code " +
+                             std::to_string(static_cast<unsigned>(code))));
     }
   }
 

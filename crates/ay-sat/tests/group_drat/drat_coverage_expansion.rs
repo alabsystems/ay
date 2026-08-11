@@ -67,9 +67,17 @@ fn solve_and_verify_drat(cnf_relative_path: &str, label: &str) -> bool {
 }
 
 /// Solve an absolute-path benchmark file with DRAT proof and verify.
+///
+/// The only caller reads from `reference/creusat`, an OPTIONAL external
+/// checkout (no `.gitmodules` entry, not shipped with the repository), so a
+/// missing corpus skips loudly instead of failing — the same contract the
+/// `creusat_drat_test!` macro in `drat_exhaustive_coverage.rs` already uses.
+/// Every assertion below is unchanged and still runs whenever the checkout is
+/// present.
 fn solve_and_verify_drat_abs(cnf_path: &str, label: &str) {
-    let cnf_text =
-        std::fs::read_to_string(cnf_path).unwrap_or_else(|e| panic!("{label}: read error: {e}"));
+    let Some(cnf_text) = super::common::load_optional_benchmark(cnf_path) else {
+        return;
+    };
     let formula = parse_dimacs(&cnf_text).unwrap_or_else(|e| panic!("{label}: parse error: {e}"));
 
     let proof_writer = ProofOutput::drat_text(Vec::<u8>::new());

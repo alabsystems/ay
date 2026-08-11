@@ -205,6 +205,13 @@ impl CondenseSuperpass {
         if self.mean_node_gate > 0 {
             let mean = Self::capped_mean_constraint_nodes(current, self.mean_node_gate);
             if mean > self.mean_node_gate {
+                // FORGONE COST. Inverted relative to the other audited gates: this
+                // one refuses ABOVE a ceiling, so what it forgoes is the condensation
+                // of the LARGEST problems -- exactly the ones a superpass would help
+                // most, if it helps. The gate's claim is that condense costs more than
+                // it returns up here; charging the mean makes that claim checkable
+                // instead of assumed. Listed as unaudited in SIZE_GATE_ANTIPATTERN.md.
+                ay_core::forgone::charge(ay_core::forgone::CHC_CONDENSE, mean as u64);
                 return Some(format!(
                     "mean constraint size {} nodes > gate {}",
                     mean, self.mean_node_gate

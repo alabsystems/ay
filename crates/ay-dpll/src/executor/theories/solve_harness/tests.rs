@@ -310,36 +310,64 @@ const EQ_DIFFVAR_GUARDED_SCRIPT: &str = r#"
     (check-sat)
 "#;
 
-/// Inc-18: `(set-option :ay-eq-diffvar false)` disables the EqDiffVar pass
-/// for THIS executor only — the diff-var statistic must be absent, and the
-/// verdict must be unchanged (the pass is a pure reduction).
+/// Inc-18 / #eq-diffvar-uncertifiable: `:ay-eq-diffvar` selects the EqDiffVar
+/// pass for THIS executor only, and the default is OFF.
+///
+/// The arms drive `preprocess_lia_artifacts` DIRECTLY rather than through
+/// `(check-sat)`: that isolates the option from solve-time routing, so this
+/// test pins the option's meaning and nothing else. The published-verdict
+/// consequence is pinned separately by
+/// `eq_diffvar_must_not_break_mandatory_unsat_certification`.
 #[test]
-fn set_option_ay_eq_diffvar_false_disables_pass_per_run() {
-    // Default run (no option): pass fires, statistic present.
-    let on_script = EQ_DIFFVAR_GUARDED_SCRIPT.replace("{OPT}", "");
-    let commands = parse(&on_script).expect("parse");
-    let mut exec = Executor::new();
-    let out = exec.execute_all(&commands).expect("exec");
-    assert_eq!(out, vec!["sat"]);
+fn set_option_ay_eq_diffvar_selects_pass_per_run() {
+    /// Load the declares/asserts (no `(check-sat)`, so no public solve begins),
+    /// then run LIA preprocessing directly.
+    fn preprocess_only(opt: &str) -> Executor {
+        let script = EQ_DIFFVAR_GUARDED_SCRIPT
+            .replace("{OPT}", opt)
+            .replace("(check-sat)", "");
+        let commands = parse(&script).expect("parse");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("exec");
+        let _ = exec.preprocess_lia_artifacts();
+        exec
+    }
+
+    // Default: OFF. The reduction is opt-in because it costs correct `unsat`
+    // verdicts — see `Executor::eq_diffvar_pass_enabled`.
+    let exec = preprocess_only("");
+    assert!(!exec.eq_diffvar_pass_enabled());
+    assert_eq!(
+        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
+        None,
+        "the EqDiffVar reduction must be opt-in"
+    );
+
+    // Explicit opt-in still runs the pass, unchanged.
+    let exec = preprocess_only("(set-option :ay-eq-diffvar true)");
+    assert!(exec.eq_diffvar_pass_enabled());
     assert!(
         exec.statistics()
             .get_int("preprocess.eq_diffvar.diff_vars")
             .is_some_and(|n| n > 0),
-        "pass should fire on the guarded equality network by default"
+        "(set-option :ay-eq-diffvar true) must still enable the pass"
     );
 
-    // Option run: pass disabled per-run, same verdict.
-    let off_script =
-        EQ_DIFFVAR_GUARDED_SCRIPT.replace("{OPT}", "(set-option :ay-eq-diffvar false)");
-    let commands = parse(&off_script).expect("parse");
-    let mut exec = Executor::new();
-    let out = exec.execute_all(&commands).expect("exec");
-    assert_eq!(out, vec!["sat"]);
-    assert_eq!(
-        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
-        None,
-        "(set-option :ay-eq-diffvar false) must disable the pass for this run"
-    );
+    // Explicit opt-out is honoured too (ay-chc's retry writes it literally).
+    let exec = preprocess_only("(set-option :ay-eq-diffvar false)");
+    assert!(!exec.eq_diffvar_pass_enabled());
+
+    // The verdict is the same in every mode: the pass is a pure reduction.
+    for opt in [
+        "",
+        "(set-option :ay-eq-diffvar true)",
+        "(set-option :ay-eq-diffvar false)",
+    ] {
+        let script = EQ_DIFFVAR_GUARDED_SCRIPT.replace("{OPT}", opt);
+        let commands = parse(&script).expect("parse");
+        let mut exec = Executor::new();
+        assert_eq!(exec.execute_all(&commands).expect("exec"), vec!["sat"]);
+    }
 }
 
 /// Inc-21: a script where top-level unit-clause propagation (inc-13) fires —
@@ -386,5 +414,88 @@ fn set_option_ay_unit_prop_false_disables_pass_per_run() {
             .get_int("preprocess.unit_prop.rewritten_assertions"),
         None,
         "(set-option :ay-unit-prop false) must disable the pass for this run"
+    );
+}
+
+/// #eq-diffvar-uncertifiable: the difference-variable reduction must not run
+/// on a DEFAULT-mode public solve.
+///
+/// The pass asserts a fresh `d` via the definitional pair `(<= d lin)` /
+/// `(>= d lin)`. Those assertions are solver-invented, so the reconstructed
+/// refutation's leaves for them carry no `assume` authority and are demoted
+/// to unit `trust` — which the MANDATORY UNSAT certification rejects, turning
+/// a correct `unsat` into `unknown`. The certification's rescue re-solve is
+/// no way out either: that executor inherits `ctx`, so it inherits the pass,
+/// and on the guarded shape the pass is what makes it miss its 2000ms budget.
+///
+/// This pins the PUBLISHED VERDICT, not the pass wiring — the point is the
+/// answer, and both queries below published `unknown` while the pass defaulted
+/// on. z3 agrees `unsat` on both. `preprocess.eq_diffvar.diff_vars` is asserted
+/// absent only as the attribution: it says WHY the verdict came back, so a
+/// future change that re-enables the pass fails here loudly instead of
+/// silently trading the verdict away again.
+#[test]
+fn eq_diffvar_must_not_break_mandatory_unsat_certification() {
+    // (a) Unguarded: `distinct` over three ints in a two-value range. Three
+    // disequality atoms, three difference variables, no sharing at all.
+    let pigeon = r#"
+        (set-logic QF_LIA)
+        (declare-const p1 Int)
+        (declare-const p2 Int)
+        (declare-const p3 Int)
+        (assert (>= p1 1))
+        (assert (<= p1 2))
+        (assert (>= p2 1))
+        (assert (<= p2 2))
+        (assert (>= p3 1))
+        (assert (<= p3 2))
+        (assert (distinct p1 p2 p3))
+        (check-sat)
+    "#;
+    let commands = parse(pigeon).expect("parse");
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).expect("exec"),
+        vec!["unsat"],
+        "3 pigeons / 2 holes is UNSAT (z3 agrees); a preprocessing pass that \
+         costs the mandatory UNSAT certificate must not run here"
+    );
+    assert_eq!(
+        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
+        None,
+        "the verdict must come from the plain pipeline, not from a run that \
+         happened to certify despite the reduction"
+    );
+
+    // (b) Guarded var-var equality chain — the pass's own target shape.
+    let guarded = r#"
+        (set-logic QF_LIA)
+        (declare-const g1 Bool)
+        (declare-const g2 Bool)
+        (declare-const x Int)
+        (declare-const y Int)
+        (declare-const a Int)
+        (declare-const b Int)
+        (assert (or (not g1) (= a x)))
+        (assert (or (not g1) (= b y)))
+        (assert (or g1 (= a y)))
+        (assert (or g1 (= b x)))
+        (assert (or (not g2) (= (+ x y) 1)))
+        (assert (or g2 (= (+ a b) 1)))
+        (assert (not (= (+ x y) 1)))
+        (check-sat)
+    "#;
+    let commands = parse(guarded).expect("parse");
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).expect("exec"),
+        vec!["unsat"],
+        "the guarded conservation network is UNSAT and must certify"
+    );
+    assert_eq!(
+        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
+        None,
+        "the verdict must come from the plain pipeline, not from a run that \
+         happened to certify despite the reduction"
     );
 }

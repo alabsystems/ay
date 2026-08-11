@@ -39,6 +39,8 @@ mod array_model_store_chain_witness;
 mod array_soundness_4304;
 #[path = "group_arrays/const_array_card1_soundness.rs"]
 mod const_array_card1_soundness;
+#[path = "group_arrays/default_lambda_wrong_sat.rs"]
+mod default_lambda_wrong_sat;
 #[path = "group_arrays/qf_aufnia_nested_array_row_wrong_sat.rs"]
 mod qf_aufnia_nested_array_row_wrong_sat;
 #[path = "group_arrays/qf_ax_benchmark_suite.rs"]

@@ -41,6 +41,7 @@
 
 pub(crate) mod alethe;
 pub mod debug_channel;
+pub mod forgone;
 pub mod kani_compat;
 pub(crate) mod math;
 pub mod memory_pressure;
@@ -72,15 +73,16 @@ pub use memory_pressure::{
     UnknownReason,
 };
 pub use proof::{
-    AletheRule, BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, Proof,
-    ProofId, ProofStep, TheoryLemmaKind, TheoryLemmaProof,
+    is_checkable_alethe_rule, wire_rule_name, AletheRule, BvGateType, CuttingPlaneAnnotation,
+    FarkasAnnotation, FpOp, LiaAnnotation, Proof, ProofId, ProofStep, TheoryLemmaKind,
+    TheoryLemmaProof, CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 pub use smtlib::{
     escape_string_contents, quote_symbol, string_literal, unescape_string_contents,
     StringDecodeError, SMTLIB_MAX_CODE_POINT,
 };
 pub use sort::{ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
-pub use term::{Constant, RationalWrapper, Symbol, TermData, TermId, TermStore};
+pub use term::{Constant, RationalWrapper, SkolemChoice, Symbol, TermData, TermId, TermStore};
 pub use theory::{
     assert_conflict_soundness, BoundRefinementRequest, DiscoveredDisequality, DiscoveredEquality,
     DisequalitySplitRequest, EqualityPropagationResult, ExpressionSplitRequest,

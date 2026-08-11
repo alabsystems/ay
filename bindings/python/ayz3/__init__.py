@@ -39,6 +39,10 @@
 #     datatypes, but MUTUALLY RECURSIVE datatype groups are unsupported:
 #     `CreateDatatypes` raises an honest NotImplementedError rather than
 #     mis-encoding the cross-references.
+#   * Exact z3py 5.0 has Python naming bugs in its finite-set `SetAdd`,
+#     `SetDel`, `IsMember`, and `IsSubset` dispatch branches (each raises
+#     NameError). AY intentionally implements the operations those branches
+#     were meant to call instead of reproducing those wrapper-only failures.
 #
 # CONTEXT MODEL (important divergence from a naive single-context binding):
 #   In AY's C ABI every `Z3_solver` owns its OWN assertion stack (independent
@@ -108,8 +112,9 @@ class Context:
         self._rebuild_cache = {}
         # Array-combinator registries for the cross-context rebuild (keyed by
         # ast handle; AY hash-conses, so handles are stable within a context):
-        #   _map_meta: map_ast     -> (FuncDeclRef f, (ArrayRef, ...) args)
-        #   _ext_meta: witness_ast -> (ArrayRef a, ArrayRef b)
+        #   _map_meta:      map_ast     -> (FuncDeclRef f, (ArrayRef, ...) args)
+        #   _ext_meta:      witness_ast -> (ArrayRef a, ArrayRef b)
+        #   _as_array_meta: array_ast   -> FuncDeclRef f
         # SOUNDNESS: a Map/Ext term must NEVER be rebuilt through the generic
         # const/UF paths (registering the Ext witness in _const_meta would
         # rebuild it as a bare const and DROP the extensionality background
@@ -121,6 +126,7 @@ class Context:
         # witness + background axiom.
         self._map_meta = {}
         self._ext_meta = {}
+        self._as_array_meta = {}
         # Algebraic-datatype registries (B-6), keyed by name so a datatype is
         # declared once per context and re-declared on demand when an expression
         # is rebuilt into another context:
@@ -321,12 +327,16 @@ class SortRef:
         if self.kind == "Seq":
             # z3py renders SeqSort(Int) as `Seq(Int)`.
             return f"Seq({self.basis_sort})"
+        if self.kind == "FiniteSet":
+            return f"FiniteSet({self.basis_sort})"
         return self.kind
 
     def name(self):
         """The sort's constructor name (z3py SortRef.name())."""
         if self.kind == "Seq":
             return "Seq"
+        if self.kind == "FiniteSet":
+            return "FiniteSet"
         return self.kind
 
     def sexpr(self):
@@ -457,6 +467,40 @@ def ReSort(basis=None):
     return _re_sort(basis)
 
 
+class FiniteSetSortRef(SortRef):
+    """Z3 5.0.0's distinct finite-set sort."""
+
+    def __init__(self, handle, elem_sort, ctx):
+        super().__init__(handle, "FiniteSet", ctx, basis=elem_sort)
+
+    def element_sort(self):
+        return self.basis_sort
+
+    def cast(self, value):
+        if isinstance(value, FiniteSetRef):
+            if _sorts_equal(self, value.sort_ref):
+                return value
+            raise AyZ3Exception("Cannot cast between different finite-set sorts")
+        if isinstance(value, set):
+            result = FiniteSetEmpty(self)
+            for element in value:
+                result = FiniteSetUnion(
+                    result, Singleton(_coerce(element, self.basis_sort, self.ctx))
+                )
+            return result
+        raise AyZ3Exception(f"Cannot cast {value!r} to {self}")
+
+
+def FiniteSetSort(elem_sort):
+    """Create the distinct Z3 5.0.0 finite-set sort over `elem_sort`."""
+    if not isinstance(elem_sort, SortRef):
+        raise AyZ3Exception("FiniteSetSort expects an element SortRef")
+    handle = lib.Z3_mk_finite_set_sort(elem_sort.ctx.ref, elem_sort.handle)
+    if not handle:
+        elem_sort.ctx.check_error("FiniteSetSort")
+    return FiniteSetSortRef(handle, elem_sort, elem_sort.ctx)
+
+
 # ---------------------------------------------------------------------------
 # AST nodes
 # ---------------------------------------------------------------------------
@@ -475,6 +519,33 @@ def _as_ast_array(asts):
     n = len(asts)
     arr = (_lib.Z3_ast * n)(*[a.ast for a in asts])
     return n, arr
+
+
+_SMT2_SIMPLE_SYMBOL_RE = re.compile(
+    r"[A-Za-z~!@$%^&*_\-+=<>.?/][A-Za-z0-9~!@$%^&*_\-+=<>.?/]*\Z"
+)
+
+
+def _smt2_symbol(name):
+    """Render a string symbol the way Z3's SMT-LIB printer does."""
+    if not name:
+        # Z3's empty string symbol is printed as the conventional `null`.
+        return "null"
+    if _SMT2_SIMPLE_SYMBOL_RE.fullmatch(name):
+        return name
+    escaped = name.replace("\\", "\\\\").replace("|", "\\|")
+    return f"|{escaped}|"
+
+
+def _canonicalize_as_array_text(text, ctx):
+    """Replace AY-private as-array identities with their public Z3 spelling."""
+    for ast, fd in ctx._as_array_meta.items():
+        raw = lib.Z3_ast_to_string(ctx.ref, ast)
+        if raw:
+            text = text.replace(
+                raw.decode(), f"(_ as-array {_smt2_symbol(fd._name)})"
+            )
+    return text
 
 
 class AstRef:
@@ -521,18 +592,29 @@ class AstRef:
         AY's internal opaque handle form.
         """
         if self._is_model_value:
-            return _render_model_value(self)
+            return _canonicalize_as_array_text(_render_model_value(self), self.ctx)
         s = lib.Z3_ast_to_string(self.ctx.ref, self.ast)
-        return s.decode() if s else f"<ast {self.ast}>"
+        if not s:
+            return f"<ast {self.ast}>"
+        return _canonicalize_as_array_text(s.decode(), self.ctx)
 
     def __repr__(self):
         if self._is_model_value:
-            return _render_model_value(self)
+            return _canonicalize_as_array_text(_render_model_value(self), self.ctx)
         s = lib.Z3_ast_to_string(self.ctx.ref, self.ast)
-        return s.decode() if s else f"<ast {self.ast}>"
+        if not s:
+            return f"<ast {self.ast}>"
+        return _canonicalize_as_array_text(s.decode(), self.ctx)
 
     def __eq__(self, other):
         other = _coerce(other, self.sort_ref, self.ctx)
+        if (
+            self.sort_ref.kind == "FiniteSet"
+            or other.sort_ref.kind == "FiniteSet"
+        ) and not _sorts_equal(self.sort_ref, other.sort_ref):
+            raise AyZ3Exception(
+                f"sort mismatch: cannot compare {self.sort_ref} and {other.sort_ref}"
+            )
         ctx = _same_ctx(self, other)
         lhs, rhs = _promote_arith(self, other, ctx)
         return BoolRef(
@@ -541,6 +623,13 @@ class AstRef:
 
     def __ne__(self, other):
         other = _coerce(other, self.sort_ref, self.ctx)
+        if (
+            self.sort_ref.kind == "FiniteSet"
+            or other.sort_ref.kind == "FiniteSet"
+        ) and not _sorts_equal(self.sort_ref, other.sort_ref):
+            raise AyZ3Exception(
+                f"sort mismatch: cannot compare {self.sort_ref} and {other.sort_ref}"
+            )
         ctx = _same_ctx(self, other)
         lhs, rhs = _promote_arith(self, other, ctx)
         n, arr = _as_ast_array([lhs, rhs])
@@ -562,6 +651,8 @@ def _wrap(ast, sort, ctx):
         return BitVecRef(ast, sort, ctx)
     if sort.kind == "Array":
         return ArrayRef(ast, sort, ctx)
+    if sort.kind == "FiniteSet":
+        return FiniteSetRef(ast, sort, ctx)
     if sort.kind == "String":
         return SeqRef(ast, sort, ctx)
     if sort.kind == "RegLan":
@@ -1023,6 +1114,19 @@ class ReRef(AstRef):
         return Union(self, other)
 
 
+class FiniteSetRef(AstRef):
+    """An expression in Z3 5.0.0's distinct finite-set theory."""
+
+    def __or__(self, other):
+        return FiniteSetUnion(self, other)
+
+    def __and__(self, other):
+        return FiniteSetIntersect(self, other)
+
+    def __sub__(self, other):
+        return FiniteSetDifference(self, other)
+
+
 class DatatypeRef(AstRef):
     """An algebraic-datatype expression (z3py DatatypeRef).
 
@@ -1142,6 +1246,8 @@ def _sort_signature(sort):
     if sort.kind == "Array":
         return ("Array", _sort_signature(sort.domain_sort),
                 _sort_signature(sort.range_sort))
+    if sort.kind == "FiniteSet":
+        return ("FiniteSet", _sort_signature(sort.basis_sort))
     if sort.kind == "Datatype":
         # Distinguish datatypes by name: two different datatypes are different
         # sorts even though both report kind "Datatype".
@@ -1914,6 +2020,10 @@ def BVSDivNoOverflow(a, b):
 
 def Select(a, i):
     """Read the value of array `a` at index `i` (z3py Select; also a[i])."""
+    if isinstance(a, FiniteSetRef):
+        raise AyZ3Exception(
+            "sort mismatch: Select expects a legacy Array, not a FiniteSet"
+        )
     if not isinstance(a, ArrayRef):
         raise NotImplementedError("Select expects an Array as its first argument")
     i = _coerce(i, a.sort_ref.domain_sort, a.ctx)
@@ -1996,6 +2106,8 @@ def _sorts_equal(s1, s2):
             s1.range_sort, s2.range_sort
         )
     if s1.kind == "Seq":
+        return _sorts_equal(s1.basis_sort, s2.basis_sort)
+    if s1.kind == "FiniteSet":
         return _sorts_equal(s1.basis_sort, s2.basis_sort)
     # Same-kind scalar sorts (Bool/Int/Real/String/...) are equal; named sorts
     # (Datatype/Uninterpreted subclasses) compare by name when available.
@@ -2181,6 +2293,20 @@ def Function(name, *sig):
     # Record so applications of this UF can be rebuilt in another context.
     _register_funcdecl(fd)
     return fd
+
+
+def AsArray(f):
+    """Convert a unary function declaration to its array representation."""
+    if not isinstance(f, FuncDeclRef) or len(f.domain_sorts) != 1:
+        raise AyZ3Exception("AsArray expects a unary FuncDeclRef")
+    sort = _array_sort(f.domain_sorts[0], f.range_sort, f.ctx)
+    out = _wrap(lib.Z3_mk_as_array(f.ctx.ref, f.handle), sort, f.ctx)
+    # AY's AST inspection surface cannot recover the function declaration from
+    # an as-array term. Retain it explicitly so translating a finite-set
+    # map/filter rebuilds `(as-array f)` with the corresponding declaration in
+    # the destination context instead of treating it as an opaque nullary UF.
+    f.ctx._as_array_meta[out.ast] = f
+    return out
 
 
 def RecFunction(name, *sig):
@@ -2743,6 +2869,9 @@ def AllChar(regex_sort, ctx=None):
 
 def _sort_from_handle(sh, ctx):
     """Build a SortRef from a raw Z3_sort handle, recursing into arrays."""
+    if lib.Z3_is_finite_set_sort(ctx.ref, sh):
+        basis = lib.Z3_get_finite_set_sort_basis(ctx.ref, sh)
+        return FiniteSetSortRef(sh, _sort_from_handle(basis, ctx), ctx)
     kind = lib.Z3_get_sort_kind(ctx.ref, sh)
     if kind == _lib.Z3_BOOL_SORT:
         return SortRef(sh, "Bool", ctx)
@@ -3062,6 +3191,8 @@ def _rebuild_sort_in_ctx(sort, dctx):
             _rebuild_sort_in_ctx(sort.range_sort, dctx),
             dctx,
         )
+    if k == "FiniteSet":
+        return FiniteSetSort(_rebuild_sort_in_ctx(sort.basis_sort, dctx))
     if k == "String":
         return _string_sort(dctx)
     if k == "Datatype":
@@ -3148,13 +3279,18 @@ def _rebuild_app(src_ast, src_ctx, dctx, cache):
     sym = lib.Z3_get_decl_name(src_ctx.ref, decl)
     name = lib.Z3_get_symbol_string(src_ctx.ref, sym)
     name = name.decode() if name else ""
+    decl_kind = lib.Z3_get_decl_kind(src_ctx.ref, decl)
     # DEFENSE IN DEPTH: an array-combinator term (map application / Ext
     # witness) that somehow missed its registry must fail closed here — the
     # generic paths below would rebuild it as a plain UF / bare const,
     # silently dropping the select rewrite resp. the extensionality axiom (a
     # wrong-verdict channel). Registered terms never reach this point
     # (`_rebuild_ast` consults the registries first).
-    if name.startswith("map[") or name.startswith("!ay.array-ext!"):
+    if (
+        name.startswith("map[")
+        or name.startswith("!ay.array-ext!")
+        or name.startswith("as-array[")
+    ):
         raise NotImplementedError(
             f"cross-context rebuild: internal array-combinator term {name!r} "
             "is not in this context's Map/Ext registry; rebuilding it "
@@ -3165,6 +3301,45 @@ def _rebuild_app(src_ast, src_ctx, dctx, cache):
         _rebuild_ast(lib.Z3_get_app_arg(src_ctx.ref, src_ast, i), src_ctx, dctx, cache)
         for i in range(nargs)
     ]
+    if decl_kind == _lib.Z3_OP_FINITE_SET_EMPTY:
+        src_sort = _value_sort_from_ast(src_ast, src_ctx)
+        dst_sort = _rebuild_sort_in_ctx(src_sort, dctx)
+        return lib.Z3_mk_finite_set_empty(dctx.ref, dst_sort.handle)
+    finite_set_builders = {
+        _lib.Z3_OP_FINITE_SET_SINGLETON: lambda: lib.Z3_mk_finite_set_singleton(
+            dctx.ref, args[0]
+        ),
+        _lib.Z3_OP_FINITE_SET_UNION: lambda: lib.Z3_mk_finite_set_union(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_INTERSECT: lambda: lib.Z3_mk_finite_set_intersect(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_DIFFERENCE: lambda: lib.Z3_mk_finite_set_difference(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_IN: lambda: lib.Z3_mk_finite_set_member(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_SIZE: lambda: lib.Z3_mk_finite_set_size(
+            dctx.ref, args[0]
+        ),
+        _lib.Z3_OP_FINITE_SET_SUBSET: lambda: lib.Z3_mk_finite_set_subset(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_MAP: lambda: lib.Z3_mk_finite_set_map(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_FILTER: lambda: lib.Z3_mk_finite_set_filter(
+            dctx.ref, args[0], args[1]
+        ),
+        _lib.Z3_OP_FINITE_SET_RANGE: lambda: lib.Z3_mk_finite_set_range(
+            dctx.ref, args[0], args[1]
+        ),
+    }
+    finite_set_builder = finite_set_builders.get(decl_kind)
+    if finite_set_builder is not None:
+        return finite_set_builder()
     # re.loop is an indexed operator: its repetition bounds live in the decl's
     # integer parameters, not the argument list. Recover them from the source
     # decl and rebuild via the indexed builder in dctx.
@@ -3228,7 +3403,7 @@ def _rebuild_app(src_ast, src_ctx, dctx, cache):
     # work when the fresh Solver owns a different context. Guard on
     # Z3_OP_UNINTERPRETED so a builtin nullary (pi, seq.empty, re.none, …) is
     # never misread as a fresh uninterpreted const — that would be a WRONG term.
-    if nargs == 0 and lib.Z3_get_decl_kind(src_ctx.ref, decl) == _lib.Z3_OP_UNINTERPRETED:
+    if nargs == 0 and decl_kind == _lib.Z3_OP_UNINTERPRETED:
         # A 0-ary RECURSIVE function's application (RecFunction with no
         # parameters) is exactly the nullary-app shape the declared-constant
         # path below would capture — which would rebuild it as a plain const
@@ -3470,6 +3645,19 @@ def _rebuild_ast(src_ast, src_ctx, dctx, cache):
     # dispatch: the Ext witness reads as a declared const and the Map term as
     # an app, and both generic paths would either raise or — worse — silently
     # drop the combinator's semantics.
+    as_array = src_ctx._as_array_meta.get(src_ast)
+    if as_array is not None:
+        dfd = _rebuild_funcdecl_in_ctx(as_array, dctx)
+        dast = lib.Z3_mk_as_array(dctx.ref, dfd.handle)
+        dctx.check_error("cross-context AsArray rebuild")
+        if dast == 0:
+            raise NotImplementedError(
+                "cross-context rebuild: AsArray produced a null term"
+            )
+        # Preserve the declaration metadata across rebuild chains.
+        dctx._as_array_meta[dast] = dfd
+        cache[src_ast] = dast
+        return dast
     ext = src_ctx._ext_meta.get(src_ast)
     if ext is not None:
         ea, eb = ext
@@ -4734,7 +4922,7 @@ class Solver:
         an equisatisfiable solver.
         """
         s = lib.Z3_solver_to_string(self.ctx.ref, self.handle)
-        return s.decode() if s else ""
+        return _canonicalize_as_array_text(s.decode(), self.ctx) if s else ""
 
     def to_smt2(self):
         """Self-contained SMT-LIB2 script for this solver (z3py Solver.to_smt2()).
@@ -4782,7 +4970,11 @@ class Solver:
 
     def __repr__(self):
         s = lib.Z3_solver_to_string(self.ctx.ref, self.handle)
-        return s.decode() if s else "<solver>"
+        return (
+            _canonicalize_as_array_text(s.decode(), self.ctx)
+            if s
+            else "<solver>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5207,11 +5399,15 @@ class Optimize:
         """SMT-LIB2 form of this Optimize's assertions + objectives (z3py
         Optimize.sexpr())."""
         s = lib.Z3_optimize_to_string(self.ctx.ref, self.handle)
-        return s.decode() if s else ""
+        return _canonicalize_as_array_text(s.decode(), self.ctx) if s else ""
 
     def __repr__(self):
         s = lib.Z3_optimize_to_string(self.ctx.ref, self.handle)
-        return s.decode() if s else "<optimize>"
+        return (
+            _canonicalize_as_array_text(s.decode(), self.ctx)
+            if s
+            else "<optimize>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -6538,7 +6734,153 @@ def reset_params():
 
 
 # ---------------------------------------------------------------------------
-# Finite sets (sets-as-arrays)
+# Z3 5.0.0 finite sets (distinct FiniteSet theory)
+# ---------------------------------------------------------------------------
+
+
+def is_finite_set(value):
+    return isinstance(value, FiniteSetRef)
+
+
+def is_finite_set_sort(value):
+    return isinstance(value, FiniteSetSortRef)
+
+
+def FiniteSetEmpty(set_sort):
+    if not isinstance(set_sort, FiniteSetSortRef):
+        raise AyZ3Exception("FiniteSetEmpty expects a FiniteSetSort")
+    ast = lib.Z3_mk_finite_set_empty(set_sort.ctx.ref, set_sort.handle)
+    return _wrap(ast, set_sort, set_sort.ctx)
+
+
+def Singleton(elem):
+    if not isinstance(elem, AstRef):
+        raise AyZ3Exception("Singleton expects an expression")
+    sort = FiniteSetSort(elem.sort_ref)
+    return _wrap(
+        lib.Z3_mk_finite_set_singleton(elem.ctx.ref, elem.ast), sort, elem.ctx
+    )
+
+
+def _finite_set_pair(s1, s2, operation):
+    if not isinstance(s1, FiniteSetRef) or not isinstance(s2, FiniteSetRef):
+        raise AyZ3Exception(f"{operation} expects two finite-set expressions")
+    if s1.ctx is not s2.ctx or not _sorts_equal(s1.sort_ref, s2.sort_ref):
+        raise AyZ3Exception(f"{operation} expects equal finite-set sorts in one context")
+    return s1.ctx
+
+
+def FiniteSetUnion(s1, s2):
+    ctx = _finite_set_pair(s1, s2, "FiniteSetUnion")
+    return _wrap(
+        lib.Z3_mk_finite_set_union(ctx.ref, s1.ast, s2.ast), s1.sort_ref, ctx
+    )
+
+
+def FiniteSetIntersect(s1, s2):
+    ctx = _finite_set_pair(s1, s2, "FiniteSetIntersect")
+    return _wrap(
+        lib.Z3_mk_finite_set_intersect(ctx.ref, s1.ast, s2.ast),
+        s1.sort_ref,
+        ctx,
+    )
+
+
+def FiniteSetDifference(s1, s2):
+    ctx = _finite_set_pair(s1, s2, "FiniteSetDifference")
+    return _wrap(
+        lib.Z3_mk_finite_set_difference(ctx.ref, s1.ast, s2.ast),
+        s1.sort_ref,
+        ctx,
+    )
+
+
+def FiniteSetMember(elem, finite_set):
+    if not isinstance(finite_set, FiniteSetRef):
+        raise AyZ3Exception("FiniteSetMember expects a finite-set expression")
+    elem = _coerce(elem, finite_set.sort_ref.element_sort(), finite_set.ctx)
+    _same_ctx(elem, finite_set)
+    return BoolRef(
+        lib.Z3_mk_finite_set_member(finite_set.ctx.ref, elem.ast, finite_set.ast),
+        _bool_sort(finite_set.ctx),
+        finite_set.ctx,
+    )
+
+
+def In(elem, finite_set):
+    """Alias for `FiniteSetMember`, matching z3py 5.0.0."""
+    return FiniteSetMember(elem, finite_set)
+
+
+def FiniteSetSize(finite_set):
+    if not isinstance(finite_set, FiniteSetRef):
+        raise AyZ3Exception("FiniteSetSize expects a finite-set expression")
+    return _wrap(
+        lib.Z3_mk_finite_set_size(finite_set.ctx.ref, finite_set.ast),
+        _int_sort(finite_set.ctx),
+        finite_set.ctx,
+    )
+
+
+def FiniteSetSubset(s1, s2):
+    ctx = _finite_set_pair(s1, s2, "FiniteSetSubset")
+    return BoolRef(
+        lib.Z3_mk_finite_set_subset(ctx.ref, s1.ast, s2.ast),
+        _bool_sort(ctx),
+        ctx,
+    )
+
+
+def FiniteSetMap(f, finite_set):
+    if isinstance(f, FuncDeclRef):
+        f = AsArray(f)
+    if not isinstance(f, ArrayRef) or not isinstance(finite_set, FiniteSetRef):
+        raise AyZ3Exception("FiniteSetMap expects an array/function and a finite set")
+    if not _sorts_equal(f.sort_ref.domain_sort, finite_set.sort_ref.element_sort()):
+        raise AyZ3Exception("FiniteSetMap function domain differs from set element sort")
+    _same_ctx(f, finite_set)
+    output_sort = FiniteSetSort(f.sort_ref.range_sort)
+    return _wrap(
+        lib.Z3_mk_finite_set_map(f.ctx.ref, f.ast, finite_set.ast),
+        output_sort,
+        f.ctx,
+    )
+
+
+def FiniteSetFilter(predicate, finite_set):
+    if isinstance(predicate, FuncDeclRef):
+        predicate = AsArray(predicate)
+    if not isinstance(predicate, ArrayRef) or not isinstance(finite_set, FiniteSetRef):
+        raise AyZ3Exception(
+            "FiniteSetFilter expects a predicate array/function and a finite set"
+        )
+    if predicate.sort_ref.range_sort.kind != "Bool" or not _sorts_equal(
+        predicate.sort_ref.domain_sort, finite_set.sort_ref.element_sort()
+    ):
+        raise AyZ3Exception("FiniteSetFilter expects an element-to-Bool predicate")
+    _same_ctx(predicate, finite_set)
+    return _wrap(
+        lib.Z3_mk_finite_set_filter(
+            predicate.ctx.ref, predicate.ast, finite_set.ast
+        ),
+        finite_set.sort_ref,
+        predicate.ctx,
+    )
+
+
+def FiniteSetRange(low, high):
+    ctx = _ctx_of([low, high])
+    low = _coerce(low, _int_sort(ctx), ctx)
+    high = _coerce(high, _int_sort(ctx), ctx)
+    _same_ctx(low, high)
+    output_sort = FiniteSetSort(_int_sort(ctx))
+    return _wrap(
+        lib.Z3_mk_finite_set_range(ctx.ref, low.ast, high.ast), output_sort, ctx
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy sets (sets-as-arrays)
 # ---------------------------------------------------------------------------
 #
 # z3py models a Set over element sort E as `Array(E, Bool)` (SetSort), with
@@ -6627,9 +6969,15 @@ def _set_member_bool(s, e, ctx):
 
 
 def EmptySet(elem):
-    """The empty set over element sort `elem` (z3py: K(elem, False))."""
+    """Create an empty legacy set, or an empty distinct finite set.
+
+    Z3 5.0 dispatches ``EmptySet(FiniteSetSort(E))`` to the finite-set
+    constructor; other element sorts retain z3py's array-backed set encoding.
+    """
     if not isinstance(elem, SortRef):
         raise NotImplementedError("EmptySet expects an element SortRef")
+    if isinstance(elem, FiniteSetSortRef):
+        return FiniteSetEmpty(elem)
     return K(elem, BoolVal(False, elem.ctx))
 
 
@@ -6642,6 +6990,9 @@ def FullSet(elem):
 
 def SetAdd(s, e):
     """Add element `e` to set `s` (z3py: Store(s, e, True))."""
+    if isinstance(s, FiniteSetRef):
+        e = _coerce(e, s.sort_ref.element_sort(), s.ctx)
+        return FiniteSetUnion(Singleton(e), s)
     if not isinstance(s, ArrayRef):
         raise NotImplementedError(
             "SetAdd requires a backed array-set (from EmptySet/FullSet/SetAdd/"
@@ -6652,6 +7003,9 @@ def SetAdd(s, e):
 
 def SetDel(s, e):
     """Remove element `e` from set `s` (z3py: Store(s, e, False))."""
+    if isinstance(s, FiniteSetRef):
+        e = _coerce(e, s.sort_ref.element_sort(), s.ctx)
+        return FiniteSetDifference(s, Singleton(e))
     if not isinstance(s, ArrayRef):
         raise NotImplementedError(
             "SetDel requires a backed array-set (from EmptySet/FullSet/SetAdd/"
@@ -6665,6 +7019,8 @@ def IsMember(e, s):
 
     Works for both backed array-sets (Select) and lazy algebra SetRefs
     (pointwise And/Or/Not expansion)."""
+    if isinstance(s, FiniteSetRef):
+        return FiniteSetMember(e, s)
     ctx = s.ctx if isinstance(s, (ArrayRef, SetRef)) else _current_ctx()
     return _set_member_bool(s, e, ctx)
 
@@ -6674,6 +7030,11 @@ def SetUnion(*args):
     args = _flatten(args)
     if not args:
         raise NotImplementedError("SetUnion needs at least one set")
+    if isinstance(args[0], FiniteSetRef):
+        result = args[0]
+        for arg in args[1:]:
+            result = FiniteSetUnion(result, arg)
+        return result
     elem = _elem_sort_of(args[0])
     ctx = args[0].ctx
     return SetRef("union", list(args), elem, ctx)
@@ -6684,6 +7045,11 @@ def SetIntersect(*args):
     args = _flatten(args)
     if not args:
         raise NotImplementedError("SetIntersect needs at least one set")
+    if isinstance(args[0], FiniteSetRef):
+        result = args[0]
+        for arg in args[1:]:
+            result = FiniteSetIntersect(result, arg)
+        return result
     elem = _elem_sort_of(args[0])
     ctx = args[0].ctx
     return SetRef("intersect", list(args), elem, ctx)
@@ -6691,6 +7057,8 @@ def SetIntersect(*args):
 
 def SetDifference(a, b):
     """Set difference a \\ b (lazy; membership-reducible)."""
+    if isinstance(a, FiniteSetRef):
+        return FiniteSetDifference(a, b)
     elem = _elem_sort_of(a)
     return SetRef("difference", [a, b], elem, a.ctx)
 
@@ -6705,6 +7073,8 @@ def IsSubset(a, b):
     """DEFERRED: subset needs quantified array reasoning (forall x. a[x]=>b[x]),
     which AY does not soundly decide (returns unknown; the FFI quantifier path
     can yield an UNSOUND unsat). Raises rather than risk an unsound result."""
+    if isinstance(a, FiniteSetRef):
+        return FiniteSetSubset(a, b)
     raise NotImplementedError(
         "IsSubset is not soundly backed by AY: it requires quantified array "
         "reasoning (forall x. a[x] => b[x]); AY returns `unknown` via the SMT "
@@ -6824,7 +7194,7 @@ __all__ = [
     "BVSDivNoOverflow",
     # Arrays
     "Array", "ArraySort", "Select", "Store", "K", "Update", "Map", "Ext",
-    "ArrayRef",
+    "ArrayRef", "AsArray",
     # Uninterpreted functions
     "Function", "FuncDeclRef", "RecFunction", "RecAddDefinition",
     # Quantifiers
@@ -6870,6 +7240,11 @@ __all__ = [
     "SetSort", "EmptySet", "FullSet", "SetAdd", "SetDel", "IsMember",
     "SetUnion", "SetIntersect", "SetDifference", "SetComplement",
     "IsSubset", "SetRef",
+    # Z3 5.0.0 distinct finite-set theory
+    "FiniteSetSort", "FiniteSetSortRef", "FiniteSetRef", "FiniteSetEmpty",
+    "Singleton", "FiniteSetUnion", "FiniteSetIntersect", "FiniteSetDifference",
+    "FiniteSetMember", "In", "FiniteSetSize", "FiniteSetSubset", "FiniteSetMap",
+    "FiniteSetFilter", "FiniteSetRange", "is_finite_set", "is_finite_set_sort",
     # Floating point (native Z3_mk_fpa_* handles; re-exported from ayz3.fp)
     "FPSort", "Float16", "FloatHalf", "Float32", "FloatSingle",
     "Float64", "FloatDouble", "Float128", "FloatQuadruple",
@@ -6962,7 +7337,11 @@ from .fixedpoint import Fixedpoint  # noqa: E402
 import sys as _sys  # noqa: E402
 from . import introspect as _introspect  # noqa: E402
 
+_public_ast_sexpr = AstRef.sexpr
 _introspect.install(_sys.modules[__name__])
+# Introspection supplies a generic raw-AST `sexpr`; retain the public rendering
+# above so as-array terms never expose AY's private function identities.
+AstRef.sexpr = _public_ast_sexpr
 
 
 # ---------------------------------------------------------------------------
@@ -6975,6 +7354,23 @@ _introspect.install(_sys.modules[__name__])
 from . import printer as _printer  # noqa: E402
 
 _printer.install(_sys.modules[__name__])
+_infix_ast_repr = AstRef.__repr__
+
+
+def _as_array_aware_ast_repr(self):
+    """Keep the infix printer except where it would leak a private as-array."""
+    if not getattr(self, "_is_model_value", False):
+        raw = lib.Z3_ast_to_string(self.ctx.ref, self.ast)
+        if raw:
+            text = raw.decode()
+            public = _canonicalize_as_array_text(text, self.ctx)
+            if public != text:
+                return public
+    return _infix_ast_repr(self)
+
+
+AstRef.__repr__ = _as_array_aware_ast_repr
+AstRef.__str__ = _as_array_aware_ast_repr
 
 
 # ---------------------------------------------------------------------------

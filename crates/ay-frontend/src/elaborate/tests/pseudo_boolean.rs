@@ -167,3 +167,96 @@ fn test_pble_rejects_wrong_coefficient_count() {
         "pble with mismatched coefficient count must error, got {err:?}"
     );
 }
+
+#[test]
+fn z3_500_pb_operators_reject_missing_arguments() {
+    for input in [
+        "(assert ((_ at-most 0)))",
+        "(assert ((_ at-least 0)))",
+        "(assert ((_ pble 0)))",
+        "(assert ((_ pbge 0)))",
+        "(assert ((_ pbeq 0)))",
+    ] {
+        let error = parse(input).expect_err("PB operator without a literal must be rejected");
+        assert_eq!(
+            error.message, "invalid function application, arguments missing",
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn z3_500_pb_plugin_source_owners_have_closed_semantics() {
+    for predicate in [
+        "((_ at-least 2) true true false)",
+        "((_ at-most 1) true false false)",
+        "((_ pbeq 0.5 0.25 0.25) true true)",
+        "((_ pbge -0.5 -0.25) true)",
+        "((_ pble 0.5 0.25) true)",
+    ] {
+        let (ctx, assertion) = elaborate_one(&format!("(assert {predicate})"));
+        assert!(ctx.terms.is_true(assertion), "{predicate}");
+    }
+}
+
+#[test]
+fn z3_500_pb_plugin_is_available_only_in_its_registered_logics() {
+    for logic in ["QF_FD", "ALL", "HORN"] {
+        let script = format!("(set-logic {logic})(assert ((_ at-most 1) true))");
+        let (ctx, assertion) = elaborate_one(&script);
+        assert!(ctx.terms.is_true(assertion), "{logic}");
+    }
+    let (ctx, assertion) = elaborate_one("(assert ((_ at-most 1) true))");
+    assert!(ctx.terms.is_true(assertion));
+
+    for logic in ["QF_LIA", "QF_UF"] {
+        let script = format!("(set-logic {logic})(assert ((_ at-most 1) true))");
+        let commands = parse(&script).unwrap();
+        let mut ctx = Context::new();
+        ctx.process_command(&commands[0]).unwrap();
+        assert!(matches!(
+            ctx.process_command(&commands[1]),
+            Err(ElaborateError::UndefinedSymbol(ref name)) if name == "at-most"
+        ));
+    }
+}
+
+#[test]
+fn z3_500_cardinality_bound_is_a_nonnegative_machine_int() {
+    for invalid in [
+        "(assert ((_ at-most -1) true))",
+        "(assert ((_ at-least 1.0) true))",
+        "(assert ((_ at-most 2147483648) true))",
+        "(assert ((_ at-least #x80000000) true))",
+    ] {
+        let commands = parse(invalid).unwrap();
+        let mut ctx = Context::new();
+        assert!(ctx.process_command(&commands[0]).is_err(), "{invalid}");
+    }
+
+    for valid in [
+        "(assert ((_ at-most 2147483647) true))",
+        "(assert ((_ at-least #x00000001) true))",
+    ] {
+        let (ctx, assertion) = elaborate_one(valid);
+        assert!(ctx.terms.is_true(assertion), "{valid}");
+    }
+}
+
+#[test]
+fn z3_500_pb_rationals_and_unsigned_parameter_wrap_are_exact() {
+    for predicate in [
+        "((_ pble 0.5 0.25) true)",
+        "((_ pbge -0.5 -0.25) true)",
+        "((_ pbeq 0.5 0.25 0.25) true true)",
+        // Z3 5.0.0's indexed parser stores an unsigned-fitting numeral in a
+        // signed parameter: 2^32-1 therefore denotes -1 in this exact build.
+        "((_ pble 0 4294967295) true)",
+        // Values above u32 remain rational parameters and do not wrap.
+        "(not ((_ pble 0 4294967296) true))",
+        "((_ pble #x01 #b1) true)",
+    ] {
+        let (ctx, assertion) = elaborate_one(&format!("(assert {predicate})"));
+        assert!(ctx.terms.is_true(assertion), "{predicate}");
+    }
+}

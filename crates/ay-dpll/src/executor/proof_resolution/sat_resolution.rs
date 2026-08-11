@@ -30,6 +30,7 @@ fn extract_theory_lemma_proofs(proof: &Proof) -> HashMap<Vec<TermId>, TheoryLemm
             normalized.sort_unstable();
             normalized.dedup();
             map.entry(normalized).or_insert_with(|| TheoryLemmaProof {
+                clause: clause.clone(),
                 kind: *kind,
                 farkas: farkas.clone(),
                 lia: lia.clone(),
@@ -497,6 +498,65 @@ impl Executor {
                  proof contains unverified steps"
             );
         }
+        // Proof-reconstruction introspection (`AY_PROOF_INTROSPECT=<path>`).
+        //
+        // Trust fallbacks are the reason a computed UNSAT can be rejected by the
+        // strict publication gate, but the CAUSE lives back in conflict analysis:
+        // a level-0 literal whose reason has no stable clause ID contributes no
+        // resolution hint, so replay cannot resolve it away and the derived clause
+        // ends up a strict superclause of its target. This report joins both ends
+        // so the chain is visible without a rebuild. Writes to a FILE because
+        // consumers (e.g. model-checker-consumer's driver) capture and discard the solver's
+        // stderr, and ay's own `c` markers go to stdout.
+        if let Some(path) = std::env::var_os("AY_PROOF_INTROSPECT") {
+            use std::io::Write as _;
+            let stats = trace.hint_omission_stats();
+            // Hint-CAPTURE coverage: a learned clause recorded with an empty hint
+            // list gives replay nothing to resolve with, which is the other way a
+            // reconstruction can end up short of its target.
+            let (mut learned, mut learned_no_hints, mut originals) = (0usize, 0usize, 0usize);
+            for entry in trace.entries() {
+                if entry.is_original {
+                    originals += 1;
+                } else {
+                    learned += 1;
+                    if entry.resolution_hints.is_empty() {
+                        learned_no_hints += 1;
+                    }
+                }
+            }
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                // Format first, then ONE `write_all`: several solver threads may
+                // append concurrently, and a multi-call `writeln!` interleaves
+                // their output into unparseable lines.
+                let line = format!(
+                    "PROOF_INTROSPECT trust_fallbacks={} hint_queries={} hint_resolved={} omitted_total={} omitted_not_clause_reason={} omitted_lazy_theory_reason={} omitted_zero_clause_id={} trace_entries={} trace_truncated={} proof_work_exhausted={} \
+learned={} learned_no_hints={} originals={} untranslatable_entries={} unmapped_min={:?} unmapped_max={:?} mapped_vars={}\n",
+                    trust_count,
+                    stats.queries,
+                    stats.resolved,
+                    stats.omitted_total(),
+                    stats.omitted_not_clause_reason,
+                    stats.omitted_lazy_theory_reason,
+                    stats.omitted_zero_clause_id,
+                    trace.len(),
+                    trace.is_truncated(),
+                    trace.proof_work_exhausted(),
+                    learned,
+                    learned_no_hints,
+                    originals,
+                    manager.untranslatable_entries(),
+                    manager.unmapped_var_range().0,
+                    manager.unmapped_var_range().1,
+                    manager.unmapped_var_range().2,
+                );
+                let _ = fh.write_all(line.as_bytes());
+            }
+        }
         result.is_some_and(|empty_id| {
             let step = proof.get_step(empty_id);
             matches!(
@@ -505,5 +565,43 @@ impl Executor {
                     if clause.is_empty()
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ay_core::{FarkasAnnotation, Proof, ProofStep, TermId, TheoryLemmaKind};
+    use num_rational::Rational64;
+
+    use super::extract_theory_lemma_proofs;
+
+    #[test]
+    fn extracted_theory_map_keeps_positional_source_clause() {
+        let p = TermId(8);
+        let q = TermId(3);
+        let mut proof = Proof::new();
+        proof.add_step(ProofStep::TheoryLemma {
+            theory: "LRA".to_string(),
+            clause: vec![p, q, p],
+            farkas: Some(FarkasAnnotation::new(vec![
+                Rational64::new(1, 2),
+                Rational64::from(1),
+                Rational64::new(1, 2),
+            ])),
+            kind: TheoryLemmaKind::LraFarkas,
+            lia: None,
+        });
+
+        let map = extract_theory_lemma_proofs(&proof);
+        let annotation = map.get(&vec![q, p]).expect("normalized clause key");
+        assert_eq!(annotation.clause, vec![p, q, p]);
+        assert_eq!(
+            annotation.farkas.as_ref().expect("Farkas").coefficients,
+            vec![
+                Rational64::new(1, 2),
+                Rational64::from(1),
+                Rational64::new(1, 2),
+            ]
+        );
     }
 }

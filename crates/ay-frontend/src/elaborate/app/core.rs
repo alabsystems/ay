@@ -57,25 +57,44 @@ impl Context {
         name: &str,
         arg_ids: &mut [TermId],
     ) -> Result<Option<TermId>> {
-        match name {
+        // Z3 5.0.0 installs these user-friendly aliases only while no logic
+        // has been selected.  `if` is different: it is an unconditional
+        // spelling of `ite`.  User declarations are resolved before this
+        // builtin path, so an explicitly declared alias still shadows it just
+        // as it does in Z3.
+        let canonical_name = match name {
+            "if" => "ite",
+            "implies" if self.logic.is_none() => "=>",
+            "if_then_else" if self.logic.is_none() => "ite",
+            "&&" if self.logic.is_none() => "and",
+            "||" if self.logic.is_none() => "or",
+            "equals" | "equiv" | "iff" if self.logic.is_none() => "=",
+            _ => name,
+        };
+
+        match canonical_name {
             "to_real" => {
                 if arg_ids.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(
                         "to_real requires 1 argument".to_string(),
                     ));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 let arg_sort = self.terms.sort(arg_ids[0]).clone();
-                if arg_sort != Sort::Int {
-                    return Err(ElaborateError::SortMismatch {
+                match arg_sort {
+                    Sort::Int => Ok(Some(self.terms.mk_app(
+                        Symbol::named("to_real"),
+                        &arg_ids,
+                        Sort::Real,
+                    ))),
+                    // Z3 treats an already-Real coercion application as the
+                    // identity, even when :int-real-coercions is false.
+                    Sort::Real => Ok(Some(arg_ids[0])),
+                    actual => Err(ElaborateError::SortMismatch {
                         expected: Sort::Int.to_string(),
-                        actual: arg_sort.to_string(),
-                    });
+                        actual: actual.to_string(),
+                    }),
                 }
-                Ok(Some(self.terms.mk_app(
-                    Symbol::named("to_real"),
-                    &arg_ids,
-                    Sort::Real,
-                )))
             }
             "to_int" => {
                 if arg_ids.len() != 1 {
@@ -83,14 +102,18 @@ impl Context {
                         "to_int requires 1 argument".to_string(),
                     ));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 let arg_sort = self.terms.sort(arg_ids[0]).clone();
-                if arg_sort != Sort::Real {
-                    return Err(ElaborateError::SortMismatch {
+                match arg_sort {
+                    // Z3 treats an already-Int coercion application as the
+                    // identity, independently of :int-real-coercions.
+                    Sort::Int => Ok(Some(arg_ids[0])),
+                    Sort::Real => Ok(Some(self.terms.mk_to_int(arg_ids[0]))),
+                    actual => Err(ElaborateError::SortMismatch {
                         expected: Sort::Real.to_string(),
-                        actual: arg_sort.to_string(),
-                    });
+                        actual: actual.to_string(),
+                    }),
                 }
-                Ok(Some(self.terms.mk_to_int(arg_ids[0])))
             }
             "is_int" => {
                 if arg_ids.len() != 1 {
@@ -98,14 +121,19 @@ impl Context {
                         "is_int requires 1 argument".to_string(),
                     ));
                 }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
                 let arg_sort = self.terms.sort(arg_ids[0]).clone();
-                if arg_sort != Sort::Real {
-                    return Err(ElaborateError::SortMismatch {
+                match arg_sort {
+                    Sort::Real => Ok(Some(self.terms.mk_is_int(arg_ids[0]))),
+                    // Unlike the identity overloads above, Z3 admits Int here
+                    // only while arithmetic coercions are enabled. A Bool was
+                    // converted to Int by the same option-controlled path.
+                    Sort::Int if self.int_real_coercions() => Ok(Some(self.terms.mk_bool(true))),
+                    actual => Err(ElaborateError::SortMismatch {
                         expected: Sort::Real.to_string(),
-                        actual: arg_sort.to_string(),
-                    });
+                        actual: actual.to_string(),
+                    }),
                 }
-                Ok(Some(self.terms.mk_is_int(arg_ids[0])))
             }
             "not" => {
                 if arg_ids.len() != 1 {
@@ -127,20 +155,24 @@ impl Context {
                 Ok(Some(self.terms.mk_not(arg_ids[0])))
             }
             "and" => {
-                self.expect_min_arity("and", arg_ids, 2)?;
+                // Z3's associative basic declarations accept a unary
+                // application as the identity rewrite, but reject zero args.
+                self.expect_min_arity("and", arg_ids, 1)?;
                 self.expect_bool_operands("and", arg_ids)?;
                 Ok(Some(self.terms.mk_and(arg_ids.to_vec())))
             }
             "or" => {
-                self.expect_min_arity("or", arg_ids, 2)?;
+                self.expect_min_arity("or", arg_ids, 1)?;
                 self.expect_bool_operands("or", arg_ids)?;
                 Ok(Some(self.terms.mk_or(arg_ids.to_vec())))
             }
-            "=>" | "implies" => {
-                self.expect_min_arity(name, arg_ids, 2)?;
-                self.expect_bool_operands(name, arg_ids)?;
+            "=>" => {
+                self.expect_min_arity(canonical_name, arg_ids, 2)?;
+                self.expect_bool_operands(canonical_name, arg_ids)?;
                 let (last, prefix) = arg_ids.split_last().ok_or_else(|| {
-                    ElaborateError::InvalidConstant(format!("{name} requires at least 2 arguments"))
+                    ElaborateError::InvalidConstant(format!(
+                        "{canonical_name} requires at least 2 arguments"
+                    ))
                 })?;
                 let mut result = *last;
                 for &arg in prefix.iter().rev() {
@@ -149,8 +181,11 @@ impl Context {
                 Ok(Some(result))
             }
             "xor" => {
-                self.expect_min_arity("xor", arg_ids, 2)?;
+                self.expect_min_arity("xor", arg_ids, 1)?;
                 self.expect_bool_operands("xor", arg_ids)?;
+                if arg_ids.len() == 1 {
+                    return Ok(Some(arg_ids[0]));
+                }
                 let mut result = self.terms.mk_xor(arg_ids[0], arg_ids[1]);
                 for &arg in &arg_ids[2..] {
                     result = self.terms.mk_xor(result, arg);
@@ -246,6 +281,9 @@ impl Context {
                 }
             }
             "distinct" => {
+                // Unlike `=`, Z3 5.0.0 accepts unary `distinct` (true).  Its
+                // SMT2 parser still rejects an application with no operands.
+                self.expect_min_arity("distinct", arg_ids, 1)?;
                 // z3 4.15.4 parity: same sort-checking as "=" (see above).
                 if !self.lenient_sort_coercions() {
                     self.check_chain_sorts(arg_ids)?;

@@ -1,0 +1,12 @@
+# Frozen held-out split for scripts/milp_joint_search.py.
+#
+# The search score never reads these cases.  Only the single winner selected on
+# the training split is admitted here, and acceptance requires per-case
+# non-regression plus a strict held-out gain.  Names are intentionally
+# outcome-free.
+p2m2p1m1p0n100
+rout
+timtab1CUTS
+ej
+pk1
+p0201

@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use crate::api::{
     DatatypeConstructor, DatatypeField, DatatypeSort, Logic, NativeReplayArtifact,
-    NativeReplayEventKind, NativeReplayMetadata, SolveResult, Solver, SolverError, Sort, Term,
+    NativeReplayEventKind, NativeReplayMetadata, ProofAcceptanceMode, SolveResult, Solver,
+    SolverError, Sort, StrictProofVerdict, Term,
 };
 use ay_core::term::{Symbol, TermData};
 use ay_core::TermId;
@@ -67,6 +68,107 @@ fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
     );
 }
 
+#[cfg(feature = "proof-checker")]
+#[test]
+fn native_replay_with_checked_proof_returns_the_same_strict_artifact() {
+    let artifact = boolean_unsat_native_replay_artifact();
+    let (replay, proof) =
+        Solver::replay_native_replay_artifact_with_checked_proof(&artifact, Duration::from_secs(5))
+            .expect("strict replay and retained proof artifact");
+    let proof = proof.expect("accepted UNSAT replay must return its proof artifact");
+
+    assert!(replay.result.is_unsat());
+    proof
+        .accept_for_consumer(ProofAcceptanceMode::Strict)
+        .expect("returned artifact must carry strict consumer authority");
+    let strict_quality = match &proof.strict_verdict {
+        StrictProofVerdict::Verified(quality) => quality,
+        StrictProofVerdict::Rejected(reason) => {
+            panic!("strict replay returned a rejected proof artifact: {reason}")
+        }
+    };
+    assert_eq!(strict_quality.trust_count, 0);
+    assert_eq!(strict_quality.hole_count, 0);
+    assert_eq!(
+        Some(u64::from(strict_quality.total_steps)),
+        replay.statistics.get_int("proof_checker_total_steps"),
+        "SolveDetails and UnsatProofArtifact must describe the same replay"
+    );
+    assert!(proof.alethe.contains("(cl)"));
+    assert!(!proof.alethe.contains(":rule trust"));
+    assert!(!proof.alethe.contains(":rule hole"));
+}
+
+#[cfg(feature = "proof-checker")]
+#[test]
+fn native_replay_with_proofs_checks_lia_equality_against_negated_bound() {
+    let mut solver = Solver::try_new(Logic::QfLia).expect("solver");
+    solver.set_produce_proofs(true);
+    solver
+        .try_set_option(":check-proofs-strict", "true")
+        .expect("strict proof checking");
+    let x = solver.declare_const("x", Sort::Int);
+    let zero = solver.int_const(0);
+    let one = solver.int_const(1);
+    let x_eq_one = solver.try_eq(x, one).expect("x = 1");
+    let x_gt_zero = solver.try_gt(x, zero).expect("x > 0");
+    let not_x_gt_zero = solver.try_not(x_gt_zero).expect("not (x > 0)");
+    solver
+        .try_assert_named(x_eq_one, "__verification_consumer_precondition_0")
+        .expect("assert x = 1");
+    solver
+        .try_assert_term(not_x_gt_zero)
+        .expect("assert not (x > 0)");
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.is_unsat());
+    let direct_proof = solver
+        .export_last_unsat_artifact()
+        .expect("named native assertion must retain its checked proof");
+    assert!(matches!(
+        direct_proof.strict_verdict,
+        StrictProofVerdict::Verified(ref quality) if quality.trust_count == 0
+    ));
+    assert!(!direct_proof.alethe.contains(":rule trust"));
+    assert!(
+        !direct_proof.farkas_certificates.is_empty(),
+        "the LIA conflict must be discharged by a checked Farkas certificate"
+    );
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    assert_eq!(
+        artifact.assertions[0].name.as_deref(),
+        Some("__verification_consumer_precondition_0"),
+        "the proof fix must not erase native unsat-core attribution"
+    );
+    let replay =
+        Solver::replay_native_replay_artifact_with_proofs(&artifact, Duration::from_secs(5))
+            .expect("the exact LIA contradiction must have strict proof authority");
+
+    assert!(replay.result.is_unsat());
+    assert!(replay.verification_level.has_proof_checking());
+    assert!(replay.verification.unsat_proof_available);
+    assert_eq!(replay.verification.unsat_proof_checker_failures, 0);
+    assert!(replay.statistics.proof_complete);
+    assert_eq!(replay.statistics.get_int("proof_trust"), Some(0));
+    assert_eq!(
+        replay
+            .statistics
+            .get_int("proof_checker_skipped_hole_steps"),
+        Some(0)
+    );
+    let checked = replay
+        .statistics
+        .get_int("proof_checker_checked_steps")
+        .expect("checked step count");
+    let total = replay
+        .statistics
+        .get_int("proof_checker_total_steps")
+        .expect("total step count");
+    assert!(total > 0);
+    assert_eq!(checked, total);
+}
+
 #[test]
 fn ordinary_native_replay_remains_proofless() {
     let artifact = boolean_unsat_native_replay_artifact();
@@ -78,7 +180,10 @@ fn ordinary_native_replay_remains_proofless() {
         "the existing replay API must not silently enable proof production"
     );
     assert!(!replay.verification.unsat_proof_available);
-    assert_eq!(replay.statistics.get_int("proof_checker_failures"), None);
+    // The mandatory publication firewall may check an internal refutation and
+    // retain its zero-failure counter even when this API did not request or
+    // expose a proof.  Authority is carried by the two assertions above, not
+    // by absence of diagnostic counters.
 }
 
 #[test]
@@ -783,19 +888,29 @@ fn native_replay_artifact_carries_checked_replay_proof_model_status() {
 }
 
 #[test]
-fn native_replay_verification_consumer_hashmap_get_restore_bridge_replays_sat() {
+fn native_replay_verification_consumer_hashmap_get_restore_bridge_fails_closed() {
     let artifact = NativeReplayArtifact::from_json_str(include_str!(
         "../../../tests/fixtures/verification_consumer_9185/hashmap_get_init_native_min.json"
     ))
     .expect("parse verification-consumer hashmap get native replay fixture");
     let replay = Solver::replay_native_replay_artifact(&artifact).expect("native replay");
-    assert_eq!(
-        *replay.result.result(),
-        SolveResult::Sat,
-        "unknown_reason={:?} diagnostic={:?}",
-        replay.unknown_reason,
-        replay.unknown_diagnostic,
+    assert!(
+        replay.result.is_unknown(),
+        "an unconfirmed quantified model must not be published as SAT: {replay:?}"
     );
+    assert_eq!(
+        replay.unknown_reason,
+        Some(crate::UnknownReason::Incomplete)
+    );
+    assert!(replay
+        .unknown_diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| {
+            diagnostic
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("failing closed"))
+        }));
 }
 
 #[test]

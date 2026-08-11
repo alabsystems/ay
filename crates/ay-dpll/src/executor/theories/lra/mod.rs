@@ -178,11 +178,11 @@ impl Executor {
                         .get_or_init(|| !std::env::var("AY_LRA_INC_ENGINE").is_ok_and(|v| v == "0"))
                 }
             };
-            if inc_engine_on && !self.produce_proofs_enabled() {
+            if inc_engine_on && !self.is_producing_proofs() {
                 return self.solve_lra_inc_engine();
             }
-            let eager_routing = self.lra_incremental_eager_override.unwrap_or(true)
-                && !self.produce_proofs_enabled();
+            let eager_routing =
+                self.lra_incremental_eager_override.unwrap_or(true) && !self.is_producing_proofs();
             if eager_routing {
                 return self.solve_lra_standalone_incremental();
             }
@@ -294,7 +294,7 @@ impl Executor {
             // so no proof stream ever has to justify an unguarded lemma
             // surviving its birth scope (debug-asserted below).
             debug_assert!(
-                !self.produce_proofs_enabled(),
+                !self.is_producing_proofs(),
                 "#lra-inc-engine lane must exclude proof sessions (routing guard in solve_lra)"
             );
             sat.set_unguarded_theory_conflict_lemmas(inc_engine_unguarded_lemmas_on());

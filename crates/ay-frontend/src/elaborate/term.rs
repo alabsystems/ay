@@ -13,6 +13,26 @@ use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
 use super::{Context, ElaborateError, Result};
 
+struct ElaboratedQuantifierAttributes {
+    triggers: Vec<Vec<TermId>>,
+    no_patterns: Vec<TermId>,
+    weight: u32,
+    qid: Option<String>,
+    skolem_id: Option<String>,
+}
+
+impl Default for ElaboratedQuantifierAttributes {
+    fn default() -> Self {
+        Self {
+            triggers: Vec::new(),
+            no_patterns: Vec::new(),
+            weight: 1,
+            qid: None,
+            skolem_id: None,
+        }
+    }
+}
+
 /// Whether `s` is in z3's arithmetic-coercible set for `=`/`distinct`/`ite`
 /// operand mixing: exactly {Bool, Int, Real} (Bool coerces to `(ite b 1 0)`,
 /// Int to Real). No other sort coerces — a differing pair outside this set is a
@@ -134,7 +154,10 @@ impl Context {
                         if actual == result_sort {
                             return Ok(term);
                         }
-                        if actual == Sort::Int && result_sort == Sort::Real {
+                        if self.int_real_coercions()
+                            && actual == Sort::Int
+                            && result_sort == Sort::Real
+                        {
                             return Ok(self.coerce_int_to_real(term));
                         }
                         return Err(ElaborateError::SortMismatch {
@@ -375,9 +398,15 @@ impl Context {
                     };
                     vars.push((fresh_name, sort));
                 }
-                let (body_id, triggers) =
-                    self.elaborate_quantifier_body_with_triggers(body, &new_env)?;
-                Ok(self.terms.mk_forall_with_triggers(vars, body_id, triggers))
+                let (body_id, mut attributes) =
+                    self.elaborate_quantifier_body_with_attributes(body, &new_env)?;
+                let quantifier = self.terms.mk_forall_with_triggers(
+                    vars,
+                    body_id,
+                    std::mem::take(&mut attributes.triggers),
+                );
+                self.attach_quantifier_attributes(quantifier, attributes);
+                Ok(quantifier)
             }
             ParsedTerm::Exists(bindings, body) => {
                 // Elaborate quantifier bindings and body
@@ -397,9 +426,15 @@ impl Context {
                     };
                     vars.push((fresh_name, sort));
                 }
-                let (body_id, triggers) =
-                    self.elaborate_quantifier_body_with_triggers(body, &new_env)?;
-                Ok(self.terms.mk_exists_with_triggers(vars, body_id, triggers))
+                let (body_id, mut attributes) =
+                    self.elaborate_quantifier_body_with_attributes(body, &new_env)?;
+                let quantifier = self.terms.mk_exists_with_triggers(
+                    vars,
+                    body_id,
+                    std::mem::take(&mut attributes.triggers),
+                );
+                self.attach_quantifier_attributes(quantifier, attributes);
+                Ok(quantifier)
             }
             ParsedTerm::Lambda(bindings, body) => {
                 // Elaborate lambda array: (lambda ((x Int)) body)
@@ -472,7 +507,7 @@ impl Context {
                 // Elaborate the inner term
                 let term_id = self.elaborate_term(inner, env)?;
 
-                self.process_term_annotations(term_id, annotations);
+                self.process_term_annotations(term_id, annotations)?;
 
                 Ok(term_id)
             }
@@ -682,36 +717,146 @@ impl Context {
         &mut self,
         term_id: TermId,
         annotations: &[(String, crate::sexp::SExpr)],
-    ) {
-        // Track :named for get-assignment and get-unsat-core.
+    ) -> Result<()> {
         for (keyword, value) in annotations {
-            if keyword != ":named" {
-                continue;
+            if keyword == ":named" {
+                self.record_named_term(term_id, value);
+            } else if matches!(keyword.as_str(), ":lblpos" | ":lblneg") {
+                self.validate_label_annotation(term_id, keyword, value)?;
+            } else if matches!(
+                keyword.as_str(),
+                ":weight" | ":no-pattern" | ":qid" | ":skolemid" | ":pattern"
+            ) {
+                return Err(ElaborateError::Unsupported(format!(
+                    "quantifier attribute {keyword} is not directly in the scope of a quantifier"
+                )));
             }
+        }
+        Ok(())
+    }
 
-            if let crate::sexp::SExpr::Symbol(name) = value {
-                self.named_terms.insert(name.clone(), term_id);
-                // Track in current scope for proper cleanup on pop.
-                if let Some(scope) = self.scopes.last_mut() {
-                    scope.named_terms.push(name.clone());
-                }
+    fn validate_label_annotation(
+        &self,
+        term_id: TermId,
+        keyword: &str,
+        value: &crate::sexp::SExpr,
+    ) -> Result<()> {
+        if !matches!(value, crate::sexp::SExpr::Symbol(_)) {
+            return Err(ElaborateError::Unsupported(format!(
+                "{keyword} expects a symbol"
+            )));
+        }
+        if self.terms.sort(term_id) != &Sort::Bool {
+            return Err(ElaborateError::Unsupported(format!(
+                "{keyword} expects a Boolean expression"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_named_term(&mut self, term_id: TermId, value: &crate::sexp::SExpr) {
+        if let crate::sexp::SExpr::Symbol(name) = value {
+            self.named_terms.insert(name.clone(), term_id);
+            // Track in current scope for proper cleanup on pop.
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.named_terms.push(name.clone());
             }
         }
     }
 
-    fn elaborate_quantifier_body_with_triggers(
+    fn elaborate_quantifier_body_with_attributes(
         &mut self,
         body: &ParsedTerm,
         env: &HashMap<String, TermId>,
-    ) -> Result<(TermId, Vec<Vec<TermId>>)> {
+    ) -> Result<(TermId, ElaboratedQuantifierAttributes)> {
         let ParsedTerm::Annotated(inner, annotations) = body else {
-            return Ok((self.elaborate_term(body, env)?, Vec::new()));
+            return Ok((
+                self.elaborate_term(body, env)?,
+                ElaboratedQuantifierAttributes::default(),
+            ));
         };
 
-        let triggers = self.elaborate_user_triggers_from_annotations(annotations, env)?;
+        let mut attributes = ElaboratedQuantifierAttributes {
+            triggers: self.elaborate_user_triggers_from_annotations(annotations, env)?,
+            ..ElaboratedQuantifierAttributes::default()
+        };
+
+        for (keyword, value) in annotations {
+            match keyword.as_str() {
+                ":no-pattern" => {
+                    let term = ParsedTerm::from_sexp(value).map_err(|error| {
+                        ElaborateError::Unsupported(format!("invalid :no-pattern term: {error}"))
+                    })?;
+                    attributes
+                        .no_patterns
+                        .push(self.elaborate_term(&term, env)?);
+                }
+                ":weight" => {
+                    let crate::sexp::SExpr::Numeral(value) = value else {
+                        return Err(ElaborateError::Unsupported(
+                            ":weight expects an unsigned integer".to_string(),
+                        ));
+                    };
+                    attributes.weight = value.parse::<u32>().map_err(|_| {
+                        ElaborateError::Unsupported(
+                            ":weight must fit in an unsigned 32-bit integer".to_string(),
+                        )
+                    })?;
+                }
+                ":qid" => {
+                    let crate::sexp::SExpr::Symbol(value) = value else {
+                        return Err(ElaborateError::Unsupported(
+                            ":qid expects a symbol".to_string(),
+                        ));
+                    };
+                    attributes.qid = Some(value.clone());
+                }
+                ":skolemid" => {
+                    let crate::sexp::SExpr::Symbol(value) = value else {
+                        return Err(ElaborateError::Unsupported(
+                            ":skolemid expects a symbol".to_string(),
+                        ));
+                    };
+                    attributes.skolem_id = Some(value.clone());
+                }
+                ":pattern" | ":named" | ":lblpos" | ":lblneg" => {}
+                _ => {}
+            }
+        }
+
+        if !attributes.triggers.is_empty() && !attributes.no_patterns.is_empty() {
+            return Err(ElaborateError::Unsupported(
+                "simultaneous :pattern and :no-pattern attributes are not supported by Z3"
+                    .to_string(),
+            ));
+        }
+
         let body_id = self.elaborate_term(inner, env)?;
-        self.process_term_annotations(body_id, annotations);
-        Ok((body_id, triggers))
+        for (keyword, value) in annotations {
+            if keyword == ":named" {
+                self.record_named_term(body_id, value);
+            } else if matches!(keyword.as_str(), ":lblpos" | ":lblneg") {
+                self.validate_label_annotation(body_id, keyword, value)?;
+            }
+        }
+        Ok((body_id, attributes))
+    }
+
+    fn attach_quantifier_attributes(
+        &mut self,
+        quantifier: TermId,
+        attributes: ElaboratedQuantifierAttributes,
+    ) {
+        self.terms
+            .set_quantifier_weight(quantifier, attributes.weight);
+        self.terms
+            .set_quantifier_no_patterns(quantifier, attributes.no_patterns);
+        if let Some(qid) = attributes.qid {
+            self.terms.set_quantifier_id(quantifier, qid);
+        }
+        if let Some(skolem_id) = attributes.skolem_id {
+            self.terms.set_skolem_id(quantifier, skolem_id);
+        }
     }
 
     fn elaborate_user_triggers_from_annotations(
@@ -760,7 +905,11 @@ impl Context {
                 let value: BigInt = s
                     .parse()
                     .map_err(|_| ElaborateError::InvalidConstant(s.clone()))?;
-                Ok(self.terms.mk_int(value))
+                if self.numeral_as_real() {
+                    Ok(self.terms.mk_rational(BigRational::from(value)))
+                } else {
+                    Ok(self.terms.mk_int(value))
+                }
             }
             ParsedConstant::Decimal(s) => {
                 // Parse as rational
@@ -840,7 +989,52 @@ impl Context {
         }
     }
 
+    /// Apply Z3's arithmetic-only Bool-to-Int coercion before the shared
+    /// Int/Real promotion pass.
+    ///
+    /// [`Self::maybe_promote_numeric_args`] is also used by polymorphic core
+    /// operators such as `=` and `distinct`. Those operators must preserve a
+    /// homogeneous Bool argument list as Bool (#8481), while arithmetic
+    /// applications in Z3 5.0.0 interpret each Bool as `(ite b 1 0)`. Keeping
+    /// that distinction at the call site prevents arithmetic's coercion rule
+    /// from changing the sort of ordinary Boolean equality.
+    pub(super) fn maybe_promote_arithmetic_args(&mut self, args: &mut [TermId]) -> Result<()> {
+        for arg in args.iter_mut() {
+            if self.terms.sort(*arg) != &Sort::Bool {
+                continue;
+            }
+            if !self.int_real_coercions() || !self.logic_allows_bool_to_int_coercion() {
+                return Err(ElaborateError::SortMismatch {
+                    expected: "Int or Real".to_string(),
+                    actual: Sort::Bool.to_string(),
+                });
+            }
+            let one = self.terms.mk_int(BigInt::from(1));
+            let zero = self.terms.mk_int(BigInt::from(0));
+            *arg = self.terms.mk_ite(*arg, one, zero);
+        }
+        self.maybe_promote_numeric_args(args)
+    }
+
     pub(super) fn maybe_promote_numeric_args(&mut self, args: &mut [TermId]) -> Result<()> {
+        if !self.int_real_coercions() {
+            if let Some(first) = args.first() {
+                let expected = self.terms.sort(*first).clone();
+                if let Some(actual) = args
+                    .iter()
+                    .skip(1)
+                    .map(|arg| self.terms.sort(*arg))
+                    .find(|actual| *actual != &expected)
+                {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: expected.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
         // #7126: BV-to-Int abstraction can produce Bool and BV args in numeric
         // context. Coerce non-numeric args to Int before other promotions.
         //
@@ -941,7 +1135,7 @@ impl Context {
                 // same-width BitVec, FloatingPoint, String, ...).
                 continue;
             }
-            if arith_coercible(&acc) && arith_coercible(ns) {
+            if self.int_real_coercions() && arith_coercible(&acc) && arith_coercible(ns) {
                 // Running join over the {Bool, Int, Real} chain (Real > Int > Bool).
                 if arith_rank(ns) > arith_rank(&acc) {
                     acc = ns.clone();

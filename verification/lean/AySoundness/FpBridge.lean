@@ -1,32 +1,41 @@
+import AySoundness.FpErrorBound
+import AySoundness.FpUnderflow
+import AySoundness.Firewall
 /-
   THE SEMANTIC BRIDGE for the QF_FPLRA `guard_claim_*` benchmarks: from
   IEEE-754 binary64 round-to-nearest to the abstract half-ULP (`close` /
   `qround`) model of `AySoundness/FpErrorBound.lean`.
 
   ###########################################################################
-  READ THIS FIRST — WHAT THIS FILE DOES **NOT** ESTABLISH.
+  READ THIS FIRST — WHAT IS QUANTIFIED OVER WHAT.
 
-  This module proves the RATIONAL side of the `guard_claim_*` argument in full,
-  and nothing else. There remains exactly ONE step between it and the SMT-LIB
-  formula, and that step is NOT a theorem:
+  Every theorem below is stated for an ARBITRARY rounding RELATION satisfying
+  the IEEE-754 round-to-nearest SPECIFICATION, never for a rounding function and
+  never for ay's bit-blaster. `NearestF64 r x` is a Prop, not a definition of
+  `r`: "if `|x|` is under the overflow guard, `r` is at least as close to `x` as
+  ANY representable value". `guard_claim_no_model` universally quantifies over
+  all thirteen rationals whose six links satisfy it. Consequences:
 
-      the identification of SMT-LIB `fp.mul RNE` / `fp.add RNE`, read through
-      `fp.to_real`, with the `NearestF64` specification defined below.
+  * the theorem does not assume rounding is deterministic (it is relational),
+    and it is tie-rule agnostic (ties-to-even is *a* nearest value, so `RNA`
+    satisfies it too);
+  * a certificate built on it is INDEPENDENT of ay's floating-point
+    implementation. If ay's bit-blaster is buggy, the certificate is unaffected
+    — it never mentions the blaster.
 
-  That identification is HAND-ARGUED and lives OUTSIDE the Lean kernel. It is
-  categorically larger than the `Int`↔`Int` identifications the other
-  `lean_firewall.rs` emitters make, because ay's floating-point verdicts come
-  from a BIT-BLASTER, not from a nearest-value definition — so a certificate
-  resting on it would be checking the solver against a restatement of the
-  semantics the solver itself implements, which is precisely what a firewall
-  exists NOT to do.
+  The one step between this module and the SMT-LIB formula is therefore a
+  SPECIFICATION READING, not an implementation assumption:
 
-  Consequently `emit_fp_dot_error_bound_firewall_lean_from_parsed`
-  (`crates/ay-dpll/src/executor/lean_firewall.rs`) is DELIBERATELY FAIL-CLOSED
-  and emits nothing. This module is the discharged prerequisite, not a shipped
-  proof pipeline. Do not read `guard_claim_no_model` as certifying
-  `benchmarks/smt/QF_FPLRA/guard_claim_guard2.smt2`; it certifies the rational
-  model of that benchmark.
+      SMT-LIB defines `fp.mul RNE` / `fp.add RNE` as the exact real
+      product/sum rounded to the format's nearest representable value.
+
+  That reading is stated in full, with its four companion readings and with the
+  argument a reviewer should attack, in the doc comment of
+  `emit_fp_dot_error_bound_firewall_lean_from_parsed`
+  (`crates/ay-dpll/src/executor/lean_firewall.rs`), which is the emitter this
+  module now grounds. The half of the reading that CAN be mechanized — that the
+  `IsF64` set the spec quantifies over really is a subset of the representable
+  binary64 values — is mechanized here, as `isF64_representable`.
   ###########################################################################
 
   WHAT IS PROVED HERE (nothing is axiomatized):
@@ -77,12 +86,12 @@
     six-operation RNE evaluation, and the refuted claim
     `rf − exact_dot ≥ tnum/tden`.  Certified accumulated bound: `17/64`.
 
-  Pure Lean 4 core + `Std` (`grind`, `omega`, `simp`, `decide`); no Mathlib,
-  no `Real`, no `native_decide`, no `sorry`.
+  Pure Lean 4 core (`grind`, `omega`, `simp`, `decide`); no Mathlib, no `Real`,
+  no `native_decide`, no `sorry`.  The `import Std` inherited from
+  `FpErrorBound` is stripped when `crates/ay/src/firewall_verify.rs` embeds this
+  chain into a standalone artifact, and that assembly kernel-checks — so nothing
+  here actually depends on `Std`.
 -/
-import AySoundness.FpErrorBound
-import AySoundness.FpUnderflow
-import AySoundness.Firewall
 
 namespace AySoundness.FpBridge
 
@@ -726,143 +735,3 @@ theorem guard_claim_intermediates_finite
 #print axioms hypotheses_satisfiable
 
 end AySoundness.FpBridge
-
-/-! ###########################################################################
-     THE SHAPE THE EMITTER **WOULD** RENDER — NOT EMITTED, NOT AUTHORITATIVE.
-
-     Deliberately NOT in the `AySoundness.Emitted.*` namespace, because nothing
-     emits it: `emit_fp_dot_error_bound_firewall_lean_from_parsed` is
-     fail-closed. It is kept here as evidence that the composed conflict has the
-     same firewall shape as every shipped emission (a `Val` model, a Bool-valued
-     `atomVal`, the input clauses, ONE theory-lemma clause discharged by the
-     verified bridge, and `firewall_combined_unsat`), so that if the residual
-     `fp.mul RNE`/`NearestF64` identification is ever discharged, what remains
-     is rendering, not mathematics.
-
-     Rendered for `benchmarks/smt/QF_FPLRA/guard_claim_signed_distance.smt2`
-     (threshold `0.3` ⇒ `tnum = 3`, `tden = 10`).
-     ###########################################################################  -/
-
-namespace AySoundness.FpBridge.WouldEmitShape
-
-open AySoundness
-open AySoundness.FpBridge
-
-attribute [local instance] Classical.propDecidable
-
-/-- The model: the `fp.to_real` values of the seven inputs and of the six
-    rounded intermediates. -/
-structure Val where
-  nx : Rat
-  ny : Rat
-  nz : Rat
-  px : Rat
-  py : Rat
-  pz : Rat
-  d : Rat
-  t1 : Rat
-  t2 : Rat
-  t3 : Rat
-  s1 : Rat
-  s2 : Rat
-  rf : Rat
-
-/-- Atoms 1–7: the asserted magnitude bounds (the `fp.isNormal` conjunct is
-    DROPPED — sound, a refutation of a weaker set refutes the original).
-    Atoms 8–13: the IEEE-754 RNE rounding links of the six recognized ops —
-    THE UNPROVEN IDENTIFICATION, see the file header.
-    Atom 14: the refuted claim `(>= (- (fp.to_real rf) rreal) 0.3)`, scaled to
-    `3 ≤ 10·(rf − rreal)`. -/
-noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
-  match n with
-  | 1 => decide (AbsLe m.nx 1)
-  | 2 => decide (AbsLe m.ny 1)
-  | 3 => decide (AbsLe m.nz 1)
-  | 4 => decide (AbsLe m.px B48)
-  | 5 => decide (AbsLe m.py B48)
-  | 6 => decide (AbsLe m.pz B48)
-  | 7 => decide (AbsLe m.d B48)
-  | 8 => decide (NearestF64 m.t1 (m.nx * m.px))
-  | 9 => decide (NearestF64 m.t2 (m.ny * m.py))
-  | 10 => decide (NearestF64 m.t3 (m.nz * m.pz))
-  | 11 => decide (NearestF64 m.s1 (m.t1 + m.t2))
-  | 12 => decide (NearestF64 m.s2 (m.s1 + m.t3))
-  | 13 => decide (NearestF64 m.rf (m.s2 + m.d))
-  | 14 => decide ((3 : Rat) ≤ (10 : Rat) *
-            (m.rf - (((m.nx * m.px + m.ny * m.py) + m.nz * m.pz) + m.d)))
-  | _ => false
-
-def original : List (Cid × Clause) :=
-  [(1, [1]), (2, [2]), (3, [3]), (4, [4]), (5, [5]), (6, [6]), (7, [7]),
-   (8, [8]), (9, [9]), (10, [10]), (11, [11]), (12, [12]), (13, [13]), (14, [14])]
-
-def lemmas : List (Cid × Clause) :=
-  [(15, [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14])]
-
-def proof : List (Cid × Clause × List Int) :=
-  [(16, [], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])]
-
-theorem lemma_valid (m : Val) :
-    clauseSat (atomVal m) [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14] = true := by
-  by_cases h1 : AbsLe m.nx 1
-  · by_cases h2 : AbsLe m.ny 1
-    · by_cases h3 : AbsLe m.nz 1
-      · by_cases h4 : AbsLe m.px B48
-        · by_cases h5 : AbsLe m.py B48
-          · by_cases h6 : AbsLe m.pz B48
-            · by_cases h7 : AbsLe m.d B48
-              · by_cases h8 : NearestF64 m.t1 (m.nx * m.px)
-                · by_cases h9 : NearestF64 m.t2 (m.ny * m.py)
-                  · by_cases h10 : NearestF64 m.t3 (m.nz * m.pz)
-                    · by_cases h11 : NearestF64 m.s1 (m.t1 + m.t2)
-                      · by_cases h12 : NearestF64 m.s2 (m.s1 + m.t3)
-                        · by_cases h13 : NearestF64 m.rf (m.s2 + m.d)
-                          · by_cases h14 : (3 : Rat) ≤ (10 : Rat) *
-                                (m.rf - (((m.nx * m.px + m.ny * m.py) + m.nz * m.pz) + m.d))
-                            · exact absurd
-                                (guard_claim_no_model m.nx m.ny m.nz m.px m.py m.pz m.d
-                                  m.t1 m.t2 m.t3 m.s1 m.s2 m.rf
-                                  ((1 : Rat) / ((32 : Int) : Rat))
-                                  ((1 : Rat) / ((16 : Int) : Rat))
-                                  ((1 : Rat) / ((8 : Int) : Rat))
-                                  ((1 : Rat) / ((4 : Int) : Rat))
-                                  (Rat.div_mul_cancel (by decide))
-                                  (Rat.div_mul_cancel (by decide))
-                                  (Rat.div_mul_cancel (by decide))
-                                  (Rat.div_mul_cancel (by decide))
-                                  h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12 h13
-                                  3 10 (by decide) (by decide) (by simpa using h14))
-                                (by simp)
-                            · simp [clauseSat, litSat, atomVal, h14]
-                          · simp [clauseSat, litSat, atomVal, h13]
-                        · simp [clauseSat, litSat, atomVal, h12]
-                      · simp [clauseSat, litSat, atomVal, h11]
-                    · simp [clauseSat, litSat, atomVal, h10]
-                  · simp [clauseSat, litSat, atomVal, h9]
-                · simp [clauseSat, litSat, atomVal, h8]
-              · simp [clauseSat, litSat, atomVal, h7]
-            · simp [clauseSat, litSat, atomVal, h6]
-          · simp [clauseSat, litSat, atomVal, h5]
-        · simp [clauseSat, litSat, atomVal, h4]
-      · simp [clauseSat, litSat, atomVal, h3]
-    · simp [clauseSat, litSat, atomVal, h2]
-  · simp [clauseSat, litSat, atomVal, h1]
-
-theorem lemmas_valid :
-    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
-  intro cl hcl m
-  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
-    List.not_mem_nil, or_false] at hcl
-  subst hcl
-  exact lemma_valid m
-
-/-- The RATIONAL MODEL of the `guard_claim_signed_distance` assertion set has no
-    model — via the firewall.  NOT a certificate for the SMT-LIB benchmark: see
-    the file header for the one identification that is still hand-argued. -/
-theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
-  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
-    atomVal (by decide) (by decide) lemmas_valid (by decide)
-
-#print axioms no_model
-
-end AySoundness.FpBridge.WouldEmitShape

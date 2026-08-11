@@ -36,6 +36,10 @@ mod patch;
 pub mod rcf_api;
 mod sign;
 mod sos;
+// Fraction-free subresultant / PSC-chain substrate for CAD projection.
+// Deliberately not wired into a solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod subresultant;
 mod tangent;
 mod theory_impl;
 mod univariate;
@@ -56,7 +60,43 @@ use ay_core::{TheoryLit, TheoryPropagation, TheoryResult, TheorySolver};
 
 use feasible_set::FeasibleSet;
 use monomial::Monomial;
+use num_traits::One;
 use sign::SignConstraint;
+
+/// The rational value of `term` if it is a numeric literal, else `None`.
+///
+/// Handles `Int` literals, `Rational` literals, and unary negation of either —
+/// SMT-LIB writes negative literals as `(- 2)`, which is an `App`, not a `Const`.
+/// Used by `#nra-const-factor` to separate the constant factors of a flattened
+/// product from its variable factors.
+fn constant_value_of(terms: &TermStore, term: TermId) -> Option<BigRational> {
+    match terms.get(term) {
+        TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
+        TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
+        TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
+            constant_value_of(terms, args[0]).map(|c| -c)
+        }
+        _ => None,
+    }
+}
+
+/// The product of the constant factors of `term` when it is a `*` application,
+/// else `1`. `#nra-const-factor` invariant helper: a term that may be used as a
+/// monomial `aux_var` must have a constant factor of exactly 1.
+fn constant_factor_of(terms: &TermStore, term: TermId) -> BigRational {
+    match terms.get(term) {
+        TermData::App(Symbol::Named(name), args) if name == "*" => {
+            let mut product = BigRational::one();
+            for &arg in args {
+                if let Some(c) = constant_value_of(terms, arg) {
+                    product *= c;
+                }
+            }
+            product
+        }
+        _ => BigRational::one(),
+    }
+}
 
 /// A purified division: `(/ num denom)` → fresh LRA variable `div_term`,
 /// with side constraint `denom * div_term = num`.
@@ -87,6 +127,12 @@ fn maybe_grow_nra_stack<R>(f: impl FnOnce() -> R) -> R {
 
 pub use algebraic::{RealAlgebraic, RealAlgebraicValue, RealScalar};
 pub use ay_lra::LraModel;
+/// Measurement harness for the fraction-free subresultant substrate; see
+/// [`subresultant::diag_subresultant_incumbent_versus_fraction_free`]. Exposed
+/// for `examples/subresultant_measurement.rs` so the measurement is a runnable
+/// target rather than an `#[ignore]`d test that never runs.
+#[doc(hidden)]
+pub use subresultant::diag_subresultant_incumbent_versus_fraction_free;
 
 /// Trail entry for sign constraint push/pop (#8626).
 /// Records which map received an addition so it can be undone on pop.
@@ -210,6 +256,42 @@ pub struct NraSolver<'a> {
     /// start of every check. Any stored certificate has already passed the
     /// independent checker.
     pub(crate) last_unsat_certificate: Option<sos::SosCertificate>,
+
+    /// SOLVE-WIDE node budget for the ICP dyadic grid search
+    /// ([`NraSolver::dyadic_grid_search`]), decremented across every `check()`
+    /// **of this solver instance**.
+    ///
+    /// # This is NOT a solve-wide cap, despite the intent
+    ///
+    /// An earlier revision of this comment claimed the budget bounded the whole
+    /// solve ("once the whole solve has spent it, the phase declines"). That is
+    /// **false**, and the code cannot deliver it as written:
+    /// `solve_nra` (`ay-dpll/src/executor/theories/nra/mod.rs`) drives
+    /// `solve_incremental_theory_pipeline!`, whose body is
+    /// `loop { … let mut theory = $create_theory; … }` — a **fresh `NraSolver`
+    /// per DPLL(T) refinement**. Each new instance resets this field to
+    /// [`GRID_SOLVE_NODES`](crate::icp::GRID_SOLVE_NODES), so on the
+    /// boolean-heavy instances the cap was meant to protect it is re-granted
+    /// exactly as often as the cost is re-paid.
+    ///
+    /// The effective bound is therefore
+    /// [`GRID_MAX_NODES`](crate::icp::GRID_MAX_NODES) **per `check()`**, times
+    /// the number of refinements — precisely the situation this field was added
+    /// to prevent. It is cost-only, never soundness: exhausting the budget
+    /// declines the phase and leaves the verdict at the `unknown` it would
+    /// otherwise have been.
+    ///
+    /// Measured: no pool exercised so far is bitten by this (worst observed
+    /// slowdowns are 21.3→34.3 s and 192.2→204.3 s, both well inside a 300 s
+    /// cap), which is why the field is kept rather than deleted — it does bound
+    /// a single instance's grid work. **Making it genuinely solve-wide requires
+    /// threading the counter through the pipeline macro; do that before relying
+    /// on it for anything, and do not re-add a solve-wide claim to this comment
+    /// until the plumbing exists.**
+    ///
+    /// A [`Cell`](std::cell::Cell) because `check()`'s exact procedures take
+    /// `&self`.
+    pub(crate) grid_budget: std::cell::Cell<usize>,
 }
 
 impl<'a> NraSolver<'a> {
@@ -248,6 +330,7 @@ impl<'a> NraSolver<'a> {
             asserted_atom_set: HashSet::default(),
             algebraic_model: Vec::new(),
             last_unsat_certificate: None,
+            grid_budget: std::cell::Cell::new(icp::GRID_SOLVE_NODES),
         }
     }
 
@@ -290,7 +373,22 @@ impl<'a> NraSolver<'a> {
     }
 
     /// Register a monomial
+    ///
+    /// INVARIANT (`#nra-const-factor`): `aux_var` must denote EXACTLY
+    /// `product(vars)`, with no residual constant factor. Every consumer of a
+    /// registered monomial (sign lemmas, McCormick/tangent cuts, even-power
+    /// non-negativity, `check_monomial_consistency`, `propagate_monomial_signs`)
+    /// relies on that equality; registering `c * product(vars)` under the key
+    /// `vars` makes them enforce a FALSE relation and can yield a wrong `unsat`.
     fn register_monomial(&mut self, vars: Vec<TermId>, aux_var: TermId) {
+        debug_assert!(
+            constant_factor_of(self.terms, aux_var).is_one(),
+            "#nra-const-factor: register_monomial called with a SCALED aux term \
+             {aux_var:?} (constant factor {:?} != 1); aux_var must equal \
+             product(vars) exactly or every monomial consumer enforces a false \
+             relation (wrong-unsat)",
+            constant_factor_of(self.terms, aux_var)
+        );
         if self.debug {
             tracing::debug!(
                 "[NRA] register_monomial: vars={:?}, aux_var={:?}",
@@ -309,23 +407,56 @@ impl<'a> NraSolver<'a> {
             TermData::App(Symbol::Named(name), args) => {
                 match name.as_str() {
                     "*" => {
+                        // SOUNDNESS (`#nra-const-factor`, sibling of
+                        // `#nia-const-factor` in nia/src/tangent_add.rs).
+                        //
+                        // The frontend flattens nested products, so
+                        // `(* x (* y (- 2)))` arrives here as the single n-ary
+                        // node `(* x y (- 2))`. Splitting the args into
+                        // constants and variables and then registering the WHOLE
+                        // node as the aux var of the monomial `[x, y]` asserts
+                        // `aux_var == x*y` for a term whose value is `-2*x*y`.
+                        // Every consumer then reasons with that false equality:
+                        //   * `record_sign_constraint` files the atom's sign
+                        //     verbatim on the bare monomial, so `-2*x*y <= 0`
+                        //     becomes `x*y <= 0` — the OPPOSITE of what was
+                        //     asserted — and `check_sign_consistency` reports a
+                        //     conflict against `x > 0, y > 0`. That is a wrong
+                        //     `unsat` (a false theorem), the P0 meti-tarski bug.
+                        //   * McCormick/tangent cuts (tangent.rs) and
+                        //     `add_even_power_nonneg` inject linear bounds that
+                        //     are false for the scaled term.
+                        //   * `check_monomial_consistency` (check_loop.rs)
+                        //     enforces `c*prod == prod`.
+                        //
+                        // Track the product of the constant factors and only
+                        // register when it is exactly 1, so the invariant
+                        // `aux_var == product(vars)` holds. Otherwise leave the
+                        // term as an opaque LRA variable: LRA over-approximates
+                        // it (any value), which is sound — it can cost
+                        // completeness (`unknown` instead of a verdict) but can
+                        // never produce a wrong answer.
                         let mut var_args = Vec::new();
+                        let mut const_product = BigRational::one();
                         for &arg in args {
-                            let is_const = self.terms.extract_integer_constant(arg).is_some()
-                                || matches!(
-                                    self.terms.get(arg),
-                                    TermData::Const(Constant::Rational(_))
-                                );
-                            if !is_const {
-                                var_args.push(arg);
+                            match constant_value_of(self.terms, arg) {
+                                Some(c) => const_product *= c,
+                                None => var_args.push(arg),
                             }
                         }
 
-                        if var_args.len() >= 2 {
+                        if var_args.len() >= 2 && const_product.is_one() {
                             var_args.sort_by_key(|t| t.0);
                             if !self.monomials.contains_key(&var_args) {
                                 self.register_monomial(var_args, term);
                             }
+                        } else if var_args.len() >= 2 && self.debug {
+                            tracing::debug!(
+                                "[NRA] Skipping scaled monomial {:?} (const factor {:?} != 1) \
+                                 to preserve aux==product(vars) invariant",
+                                term,
+                                const_product
+                            );
                         }
                     }
                     "/" if args.len() == 2 => {

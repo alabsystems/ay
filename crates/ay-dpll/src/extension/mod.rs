@@ -599,14 +599,18 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         // re-seed writes identical values for the atoms it touches — skip the
         // whole O(atoms) scan. Phase hints are a heuristic (branch-order bias,
         // never the sat/unsat result), so leaving the phase arrays as-is across
-        // a skip can only change search order, not correctness. (Former
-        // `AY_DISABLE_PHASE_EPOCH_SKIP` A/B fallback removed; the skip is
-        // permanent.)
-        if let Some(epoch) = self.theory.phase_hint_epoch() {
-            if self.last_seed_epoch.get() == Some(epoch) {
-                return;
+        // a skip can only change search order, not correctness. The A/B arm is
+        // `AY_DISABLE_PHASE_EPOCH_SKIP` (see
+        // `phase_hint::phase_epoch_skip_disabled`): default off, and setting it
+        // restores the unconditional re-seed byte-for-byte. It was deleted once;
+        // an optimisation without a control cannot have its premise re-checked.
+        if !phase_hint::phase_epoch_skip_disabled() {
+            if let Some(epoch) = self.theory.phase_hint_epoch() {
+                if self.last_seed_epoch.get() == Some(epoch) {
+                    return;
+                }
+                self.last_seed_epoch.set(Some(epoch));
             }
-            self.last_seed_epoch.set(Some(epoch));
         }
         for &(sat_var_id, atom) in &self.seed_index {
             let idx = sat_var_id as usize;

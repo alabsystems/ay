@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::TermData;
 use ay_core::{quote_symbol, string_literal, Sort, TermId};
+use num_bigint::BigInt;
 
 use crate::executor_format::{
     format_bigint, format_bitvec, format_default_value, format_model_atom, format_rational,
@@ -117,6 +118,94 @@ fn format_newest_first_store_chain(mut base: String, stores: &[(String, String)]
 }
 
 impl Executor {
+    /// Replace opaque EUF cells in Seq-typed function-table positions with
+    /// placeholders for the aligned source application's actual terms. The
+    /// ordinary placeholder resolver can then read the concrete sequence
+    /// witness from `Model::completed_values`.
+    ///
+    /// `function_tables` and `function_table_terms` are positionally aligned by
+    /// extraction and model combination. Missing/misaligned provenance is not
+    /// enough authority to reinterpret an opaque class as a public sequence,
+    /// so every such case fails closed.
+    pub(super) fn sequence_table_provenance_placeholders(
+        &self,
+        expected_symbol: &str,
+        arg_sorts: &[Sort],
+        result_sort: &Sort,
+        table: &[(Vec<String>, String)],
+        source_terms: Option<&[TermId]>,
+    ) -> Result<Vec<(Vec<String>, String)>, String> {
+        let has_sequence_position = arg_sorts.iter().any(|sort| matches!(sort, Sort::Seq(_)))
+            || matches!(result_sort, Sort::Seq(_));
+        if !has_sequence_position {
+            return Ok(table.to_vec());
+        }
+        let sources = source_terms.ok_or_else(|| {
+            "sequence-typed function table has no aligned source-term provenance".to_string()
+        })?;
+        if sources.len() != table.len() {
+            return Err(format!(
+                "sequence-typed function table/source length mismatch: {} rows, {} sources",
+                table.len(),
+                sources.len()
+            ));
+        }
+
+        let mut out = Vec::with_capacity(table.len());
+        for ((row_args, row_result), &source) in table.iter().zip(sources) {
+            let TermData::App(source_symbol, source_args) = self.ctx.terms.get(source) else {
+                return Err(format!(
+                    "sequence-typed function-table source t{} is not an application",
+                    source.0
+                ));
+            };
+            if source_symbol.name() != expected_symbol {
+                return Err(format!(
+                    "sequence-typed function-table source t{} belongs to {}, not {}",
+                    source.0,
+                    source_symbol.name(),
+                    expected_symbol
+                ));
+            }
+            if source_args.len() != row_args.len() || source_args.len() != arg_sorts.len() {
+                return Err(format!(
+                    "sequence-typed function-table source t{} has inconsistent arity",
+                    source.0
+                ));
+            }
+            if self.ctx.terms.sort(source) != result_sort
+                || source_args
+                    .iter()
+                    .zip(arg_sorts)
+                    .any(|(&term, sort)| self.ctx.terms.sort(term) != sort)
+            {
+                return Err(format!(
+                    "sequence-typed function-table source t{} has inconsistent signature",
+                    source.0
+                ));
+            }
+            let args = row_args
+                .iter()
+                .zip(source_args)
+                .zip(arg_sorts)
+                .map(|((raw, &term), sort)| {
+                    if matches!(sort, Sort::Seq(_)) {
+                        format!("@?{}", term.0)
+                    } else {
+                        raw.clone()
+                    }
+                })
+                .collect();
+            let result = if matches!(result_sort, Sort::Seq(_)) {
+                format!("@?{}", source.0)
+            } else {
+                row_result.clone()
+            };
+            out.push((args, result));
+        }
+        Ok(out)
+    }
+
     /// Format a function table as an SMT-LIB define-fun.
     ///
     /// Resolves `@?N` placeholder values (from EUF model extraction) to concrete
@@ -295,6 +384,11 @@ impl Executor {
             }
         }
         if raw.starts_with('@') {
+            if matches!(sort, Sort::Seq(_)) {
+                return Err(format!(
+                    "opaque internal equality-class value {raw} is not a concrete sequence"
+                ));
+            }
             // Abstract element token (`@Sort!n`) of an uninterpreted sort:
             // sort-ascribe it exactly like every other printed occurrence
             // (#mv-abstract-value-ascription). Scalar sorts pass through
@@ -802,10 +896,48 @@ impl Executor {
                     }
                     self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
                 }
-                // Lambda/as-array/map and future array constructors need their
-                // own exact interpreter.  Treating an unsupported constrained
-                // RHS as a free base and assigning the element default changes
-                // the definition instead of completing it.
+                // An APPLICATION of a user-declared function whose result sort
+                // is an array is a free array LEAF, exactly like the `Var` arm
+                // above -- not an array CONSTRUCTOR. The exclusion below was
+                // written for lambda / as-array / map, where treating a
+                // constrained RHS as a free base would change the definition
+                // rather than complete it. A declared `f : S -> (Array I E)`
+                // constrains nothing: `(seq_array current)` is as free as a
+                // declared `(Array I E)` constant.
+                //
+                // Excluding it cost real verdicts. In `CompleteDefault` mode this
+                // returned `None`, so completion produced no candidate, so the
+                // array got no `default`, so `array_witness_base_interp` returned
+                // `None` in Strict mode, so the gate's `array_from_model` bailed
+                // at `interp.default.as_ref()?`, so `uf_app_value` was `None` and
+                // the assertion came back `Unevaluable`:
+                //
+                //   cannot_confirm_reason "model commits no value for this
+                //                          application of `seq_array`"
+                //
+                // Isolated by controlled variant, not by reading: the same
+                // formula with a DECLARED `(Array Int Int)` constant answers
+                // `sat` with a full store-chain model; reached through
+                // `(seq_array current)` it answers `unknown`; and adding
+                // `(= (seq_array current) ((as const (Array Int Int)) 0))` makes
+                // it `sat` again -- so the sole missing ingredient is `default`.
+                //
+                // It also let a `sat` escape that could not be RENDERED at all:
+                // `(select (seq_array current) (+ (seq_offset current) 1)) = 0`
+                // publishes `sat` and then `(error "model value for function
+                // seq_array is not available")`, because the `select` path
+                // resolves through `array_select_value` so the gate confirms
+                // while the printer cannot build the witness.
+                //
+                // Restricted to a USER-DECLARED symbol head so lambda,
+                // as-array, map and every future array constructor keep the
+                // original exclusion.
+                TermData::App(sym, _)
+                    if mode.completes_missing_default()
+                        && self.ctx.symbol_info_by_identity(sym.name()).is_some() =>
+                {
+                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
+                }
                 _ if mode.completes_missing_default() => None,
                 _ => {
                     self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
@@ -1353,6 +1485,11 @@ impl Executor {
             EvalValue::Bool(false) => Ok("false".to_string()),
             EvalValue::Element(elem) => {
                 let sort = self.ctx.terms.sort(term_id);
+                if matches!(sort, Sort::Seq(_)) {
+                    return Err(format!(
+                        "opaque internal equality-class value {elem} is not a concrete sequence"
+                    ));
+                }
                 Ok(format_model_atom(sort, elem))
             }
             EvalValue::Rational(r) => {
@@ -1478,9 +1615,46 @@ impl Executor {
             } else {
                 "false".to_string()
             }),
+            // Printing a root object in z3's `(root-obj p k)` form needs the
+            // ROOT INDEX, which this representation stores as an isolating
+            // interval instead. Declining to print is fail-closed: a caller
+            // gets no value rather than a wrong one. Converting the interval
+            // to an index is part of the ordering work (see the A1 TODO in
+            // `ay-model-check::algebraic`).
+            MV::Algebraic(_) => None,
             MV::Int(i) => Some(format_bigint(i)),
             MV::Real(r) => Some(format_rational(r)),
             MV::BitVec { width, value } => Some(format_bitvec(value, *width)),
+            MV::FloatingPoint {
+                sign,
+                exponent,
+                significand,
+                exponent_bits,
+                significand_bits,
+            } => {
+                let Sort::FloatingPoint(sort_eb, sort_sb) = sort else {
+                    return None;
+                };
+                if exponent_bits != sort_eb
+                    || significand_bits != sort_sb
+                    || !(2..64).contains(exponent_bits)
+                    || !(2..=64).contains(significand_bits)
+                {
+                    return None;
+                }
+                let stored_bits = *significand_bits - 1;
+                let max_exponent = (1u64 << *exponent_bits) - 1;
+                let significand_limit = 1u64 << stored_bits;
+                if *exponent > max_exponent || *significand >= significand_limit {
+                    return None;
+                }
+                Some(format!(
+                    "(fp {} {} {})",
+                    format_bitvec(&BigInt::from(u8::from(*sign)), 1),
+                    format_bitvec(&BigInt::from(*exponent), *exponent_bits),
+                    format_bitvec(&BigInt::from(*significand), stored_bits)
+                ))
+            }
             MV::Str(s) => Some(string_literal(s)),
             MV::Uninterpreted(tok) => {
                 // An INTERNAL representative token (`@Sort!n`) or an
@@ -1692,6 +1866,162 @@ mod array_store_order_tests {
         assert_eq!(
             rendered,
             "(store (store ((as const (Array Int Int)) 0) 7 1) 7 2)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gate_fp_format_tests {
+    use ay_core::Sort;
+    use ay_model_check::ModelValue;
+
+    use super::Executor;
+
+    #[test]
+    fn exact_fp_gate_value_round_trips_as_an_smt_fp_literal() {
+        let exec = Executor::new();
+        let value = ModelValue::FloatingPoint {
+            sign: false,
+            exponent: 16,
+            significand: 256,
+            exponent_bits: 5,
+            significand_bits: 11,
+        };
+        assert_eq!(
+            exec.format_gate_model_value(&value, &Sort::FloatingPoint(5, 11)),
+            Some("(fp #b0 #b10000 #b0100000000)".to_string())
+        );
+        assert_eq!(
+            exec.format_gate_model_value(&value, &Sort::FloatingPoint(8, 24)),
+            None,
+            "a mismatched carrier sort must fail closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sequence_table_provenance_tests {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use ay_frontend::parse;
+
+    use super::{Executor, Model};
+    use crate::executor_types::SolveResult;
+
+    #[test]
+    fn seq_argument_and_result_cells_use_aligned_source_terms() {
+        let mut exec = Executor::new();
+        let seq = Sort::Seq(Box::new(Sort::Int));
+        let arg = exec.ctx.terms.mk_var("seq-table-arg", seq.clone());
+        let app = exec.ctx.terms.mk_app(
+            Symbol::Named("seq_table_f".to_string()),
+            vec![arg],
+            seq.clone(),
+        );
+        let table = vec![(
+            vec!["@ay-seq!arg".to_string()],
+            "@ay-seq!result".to_string(),
+        )];
+
+        let rewritten = exec
+            .sequence_table_provenance_placeholders(
+                "seq_table_f",
+                std::slice::from_ref(&seq),
+                &seq,
+                &table,
+                Some(std::slice::from_ref(&app)),
+            )
+            .expect("aligned provenance rewrites");
+        assert_eq!(rewritten[0].0, vec![format!("@?{}", arg.0)]);
+        assert_eq!(rewritten[0].1, format!("@?{}", app.0));
+    }
+
+    #[test]
+    fn missing_misaligned_or_wrong_source_provenance_fails_closed() {
+        let mut exec = Executor::new();
+        let seq = Sort::Seq(Box::new(Sort::Int));
+        let arg = exec.ctx.terms.mk_var("seq-table-bad-arg", seq.clone());
+        let wrong_app = exec.ctx.terms.mk_app(
+            Symbol::Named("other_seq_table_f".to_string()),
+            vec![arg],
+            seq.clone(),
+        );
+        let table = vec![(vec!["opaque".to_string()], "opaque".to_string())];
+
+        assert!(exec
+            .sequence_table_provenance_placeholders(
+                "seq_table_f",
+                std::slice::from_ref(&seq),
+                &seq,
+                &table,
+                None,
+            )
+            .is_err());
+        assert!(exec
+            .sequence_table_provenance_placeholders(
+                "seq_table_f",
+                std::slice::from_ref(&seq),
+                &seq,
+                &table,
+                Some(&[]),
+            )
+            .is_err());
+        assert!(exec
+            .sequence_table_provenance_placeholders(
+                "seq_table_f",
+                std::slice::from_ref(&seq),
+                &seq,
+                &table,
+                Some(std::slice::from_ref(&wrong_app)),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn get_model_with_missing_sequence_table_provenance_errors_without_opaque_output() {
+        let commands = parse(
+            "(set-logic ALL)\n\
+             (declare-fun f ((Seq Int)) (Seq Int))",
+        )
+        .expect("valid declaration");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("declaration executes");
+
+        let mut euf = ay_euf::EufModel::default();
+        euf.function_tables.insert(
+            "f".to_string(),
+            vec![(
+                vec!["@ay-seq!arg".to_string()],
+                "@ay-seq!result".to_string(),
+            )],
+        );
+        // Deliberately omit function_table_terms: no source application means
+        // no authority to reinterpret either opaque class as a concrete Seq.
+        exec.last_result = Some(SolveResult::Sat);
+        exec.last_model = Some(Model {
+            sat_model: Vec::new(),
+            term_to_var: DetHashMap::default(),
+            bool_overrides: DetHashMap::default(),
+            euf_model: Some(euf),
+            array_model: None,
+            lra_model: None,
+            lia_model: None,
+            bv_model: None,
+            fp_model: None,
+            string_model: None,
+            seq_model: None,
+            completed_values: DetHashMap::default(),
+            dt_ground: DetHashMap::default(),
+            dt_pins: DetHashMap::default(),
+        });
+
+        let output = exec.model();
+        assert!(output.starts_with("(error \"model value for function f is not available:"));
+        assert!(output.contains("no aligned source-term provenance"));
+        assert!(
+            !output.contains("@ay-seq"),
+            "an error must not echo an opaque sequence token: {output}"
         );
     }
 }

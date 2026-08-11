@@ -681,6 +681,28 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
         return;
     }
 
+    // #trust-lemma-dup-assume — the SAME term can be collected more than once
+    // (the identical assertion asserted twice, or an `Assume` that a unit
+    // `Trust` step restates). Every occurrence contributes ONE literal to
+    // `negated_clause`, but the `retain` below removes ALL copies of a literal
+    // at once, so the first resolution against a repeated term empties the
+    // literal and every LATER one resolves against a premise that has no
+    // complement left: `clause == premises[0]`'s clause, premise 2 unused.
+    //
+    // That is not a resolution, and the strict checker correctly rejects it
+    // ("invalid th_resolution derivation"). Measured on `ay-chc --lib`: 6178
+    // such no-op steps, all from this loop, and they were the single largest
+    // source of `deferred-trust discharge rejected a NON-trust step`.
+    //
+    // Distinct terms have distinct negations (`mk_not_raw` is injective, and
+    // `(not x)` maps to `x` while `x` maps to `(not x)`), so deduplicating by
+    // term makes every literal in `negated_clause` unique and every step below
+    // an exact binary resolution.
+    {
+        let mut seen_terms: HashMap<TermId, ()> = HashMap::default();
+        assumptions.retain(|&(_, term)| seen_terms.insert(term, ()).is_none());
+    }
+
     let mut negation_map: HashMap<TermId, TermId> = HashMap::default();
     let negated_clause: Vec<TermId> = assumptions
         .iter()

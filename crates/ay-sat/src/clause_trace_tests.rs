@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use super::{HintOmission, HintOmissionStats};
 use crate::literal::Variable;
 
 #[test]
@@ -139,4 +140,30 @@ fn test_clause_trace_budget_empty_clause_always_recorded() {
     assert_eq!(trace.len(), 1);
     assert!(trace.has_empty_clause());
     assert_eq!(trace.entries()[0].id, 2);
+}
+
+#[test]
+fn hint_omission_stats_count_each_cause_separately() {
+    let trace = ClauseTrace::new();
+    assert_eq!(trace.hint_omission_stats(), HintOmissionStats::default());
+
+    trace.record_hint_lookup(None);
+    trace.record_hint_lookup(None);
+    trace.record_hint_lookup(Some(HintOmission::NotClauseReason));
+    trace.record_hint_lookup(Some(HintOmission::LazyTheoryReason));
+    trace.record_hint_lookup(Some(HintOmission::LazyTheoryReason));
+    trace.record_hint_lookup(Some(HintOmission::ZeroClauseId));
+
+    let stats = trace.hint_omission_stats();
+    assert_eq!(stats.queries, 6, "every lookup is counted");
+    assert_eq!(stats.resolved, 2);
+    assert_eq!(stats.omitted_not_clause_reason, 1);
+    assert_eq!(stats.omitted_lazy_theory_reason, 2);
+    assert_eq!(stats.omitted_zero_clause_id, 1);
+    assert_eq!(stats.omitted_total(), 4);
+    assert_eq!(
+        stats.resolved + stats.omitted_total(),
+        stats.queries,
+        "resolved + omitted must account for every query"
+    );
 }

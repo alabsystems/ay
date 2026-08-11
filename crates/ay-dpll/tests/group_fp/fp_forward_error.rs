@@ -16,6 +16,9 @@
 //! bound are refuted (unsat) while claims at or below it must be left to the
 //! (incomplete) bit-precise lane — a sound unknown, never a wrong unsat.
 
+use ay_core::{ProofStep, TheoryLemmaKind};
+use ay_dpll::Executor;
+use ay_frontend::parse;
 use ntest::timeout;
 use std::path::PathBuf;
 
@@ -148,6 +151,93 @@ fn guard_claim_mirror_mismatch_not_unsat() {
     );
     let outputs = crate::common::solve_vec(&smt);
     assert_ne!(outputs, vec!["unsat"]);
+}
+
+/// Solve one guard-claim instance with proofs + fail-closed self-check
+/// enabled, returning the executor for proof inspection.
+fn solve_self_checked_unsat(smt: &str) -> Executor {
+    let commands = parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"));
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    exec.set_self_check(true);
+    let outputs = exec
+        .execute_all(&commands)
+        .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"));
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "forward-error UNSAT must survive --self-check (self-certified proof)"
+    );
+    exec
+}
+
+/// STRICT PROOF SUBSET: the forward-error UNSATs close through the
+/// independently checked `FpForwardError` lemma kind, not internal trust — so the
+/// proof is trust-free on the empty-clause path (the exact predicate the
+/// `--strict-proofs` CLI gate applies via `terminal_trust_report`), passes
+/// the strict checker with zero trust steps, and the verdict stays `unsat`
+/// under `--self-check`.
+#[test]
+#[timeout(60_000)]
+fn guard_claim_unsat_is_trust_free_and_self_check_certified() {
+    for claim in [
+        "(assert (>= (- (fp.to_real rf) rreal) 0.3))",
+        "(assert (>= (- (fp.to_real rf) rreal) 2.0))",
+        "(assert (<= (- rreal (fp.to_real rf)) (- 0.3)))",
+        "(assert (> (- (fp.to_real rf) rreal) (/ 13.0 64.0)))",
+    ] {
+        let exec = solve_self_checked_unsat(&guard_claim_smt(claim));
+        let proof = exec.last_proof().expect("proof after UNSAT");
+
+        // Zero trust steps on the empty-clause path (the --strict-proofs gate).
+        let report = ay_proof::terminal_trust_report(proof);
+        assert!(
+            report.is_trust_free(),
+            "{claim}: empty-clause path must be trust-free, got {report:?}"
+        );
+        assert!(!report.has_terminal_trust(), "{claim}");
+
+        // The whole proof passes the strict checker: the promoted
+        // `FpForwardError` lemma is independently re-validated by the
+        // analytic checker, and no unvalidated trust/hole step remains in the
+        // internal proof IR.
+        match ay_proof::check_proof_strict(proof, exec.terms()) {
+            Ok(quality) => assert_eq!(
+                quality.trust_count, 0,
+                "{claim}: strict check must count zero trust steps"
+            ),
+            Err(e) => panic!("{claim}: proof must pass strict check, got {e:?}"),
+        }
+
+        assert!(
+            proof.steps.iter().any(|step| matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::FpForwardError,
+                    ..
+                }
+            )),
+            "{claim}: proof IR must carry the checked FpForwardError kind"
+        );
+
+        // `fp_forward_error` is AY's internal checked kind, not a rule in the
+        // shipped Alethe checker. The wire format must therefore use an honest
+        // `hole`, not emit an unknown rule (which would make the document
+        // invalid) and never regress to AY's internal `trust` fallback.
+        let text = ay_proof::export_alethe(proof, exec.terms());
+        assert!(
+            text.contains(":rule hole"),
+            "{claim}: Alethe wire proof must expose the custom lemma as a hole; got:\n{text}"
+        );
+        assert!(
+            !text.contains("fp_forward_error"),
+            "{claim}: must not emit a rule the external checker does not implement; got:\n{text}"
+        );
+        assert!(
+            !text.contains(":rule trust"),
+            "{claim}: proof must not fall back to :rule trust; got:\n{text}"
+        );
+    }
 }
 
 /// The checked-in benchmark files agree with their :status annotations

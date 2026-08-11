@@ -135,8 +135,41 @@ fn test_rejects_premise_pointing_to_anchor() {
     );
 }
 
+// SHAPE CHANGED (#dt-premise-binding): arity != 2 is no longer a blanket
+// rejection. Alethe resolution is n-ary, and rejecting it forced emitters to
+// spell chains out as one binary step per premise — each printing its whole
+// remaining clause, i.e. TRIANGULAR text. Measured on
+// QF_DT/20210312-Bouvier/vlsat3_b14.smt2 (2,986 premises) that shape rendered a
+// 105.6 MB .alethe, which blew the 64 MiB emission work budget, so the default
+// path emitted NO PROOF AT ALL. The same refutation as one n-ary step is
+// 193 KB. `UnsupportedResolutionArity` now means only 0 or 1 premises.
 #[test]
-fn test_rejects_unsupported_resolution_arity() {
+fn test_rejects_resolution_arity_below_two() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Bool);
+
+    let mut proof = Proof::new();
+    let p0 = proof.add_assume(x, None);
+    // One premise cannot denote a resolution at any arity.
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![p0], vec![]);
+
+    let err = check_proof(&proof, &terms).expect_err("unary resolution must be rejected");
+    assert_eq!(
+        err,
+        ProofCheckError::UnsupportedResolutionArity {
+            step: ProofId(1),
+            rule: "resolution".to_string(),
+            premise_count: 1,
+        }
+    );
+}
+
+// AY's chain fold is deliberately STRICTER than carcara 1.1.0: carcara absorbs
+// premises once the accumulator is empty (it accepts this very proof), but the
+// true resolvent of {x}, {¬x}, {y} is {y}, not ⊥. Absorbing surplus premises
+// would let a step claim more than it derives, so AY rejects it.
+#[test]
+fn test_rejects_chain_resolution_with_absorbed_premise() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Bool);
     let not_x = terms.mk_not(x);
@@ -146,16 +179,64 @@ fn test_rejects_unsupported_resolution_arity() {
     let p0 = proof.add_assume(x, None);
     let p1 = proof.add_assume(not_x, None);
     let p2 = proof.add_assume(y, None);
-    // Resolution with 3 premises — only binary supported.
     proof.add_rule_step(AletheRule::Resolution, vec![], vec![p0, p1, p2], vec![]);
 
-    let err = check_proof(&proof, &terms).expect_err("ternary resolution must be rejected");
+    let err = check_proof(&proof, &terms).expect_err("non-resolving premise must be rejected");
     assert_eq!(
         err,
-        ProofCheckError::UnsupportedResolutionArity {
+        ProofCheckError::InvalidResolution {
             step: ProofId(3),
             rule: "resolution".to_string(),
-            premise_count: 3,
+        }
+    );
+}
+
+// The shape the premise-binding rebuild now emits: one wide clause, then one
+// n-ary step consuming every unit at once.
+#[test]
+fn test_accepts_nary_chain_resolution() {
+    let mut terms = TermStore::new();
+    let vars: Vec<_> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| terms.mk_var(*n, Sort::Bool))
+        .collect();
+    let negated: Vec<_> = vars.iter().map(|&v| terms.mk_not(v)).collect();
+
+    let mut proof = Proof::new();
+    let units: Vec<ProofId> = vars.iter().map(|&v| proof.add_assume(v, None)).collect();
+    let wide = proof.add_rule_step(AletheRule::Trust, negated, vec![], vec![]);
+
+    let mut premises = vec![wide];
+    premises.extend(units);
+    proof.add_rule_step(AletheRule::ThResolution, vec![], premises, vec![]);
+
+    check_proof(&proof, &terms).expect("n-ary chain resolution to the empty clause must check");
+}
+
+// A chain that stops short of the clause it declares must fail: the fold's
+// result is compared to the declared clause as a set.
+#[test]
+fn test_rejects_chain_resolution_with_wrong_conclusion() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let not_a = terms.mk_not(a);
+    let not_b = terms.mk_not(b);
+
+    let mut proof = Proof::new();
+    let ua = proof.add_assume(a, None);
+    let ub = proof.add_assume(b, None);
+    // (cl (not a) (not b) c) resolved with a and b leaves {c}, not {}.
+    let wide = proof.add_rule_step(AletheRule::Trust, vec![not_a, not_b, c], vec![], vec![]);
+    proof.add_rule_step(AletheRule::ThResolution, vec![], vec![wide, ua, ub], vec![]);
+
+    let err = check_proof(&proof, &terms).expect_err("under-resolved chain must be rejected");
+    assert_eq!(
+        err,
+        ProofCheckError::InvalidResolution {
+            step: ProofId(3),
+            rule: "th_resolution".to_string(),
         }
     );
 }

@@ -233,9 +233,47 @@ fn apply_congruence_bridged_derivation(
                     terms.mk_not_raw(assume_term)
                 };
 
+                // The unit this bridge must derive is the COMPLEMENT of
+                // `lemma_lit`, because the final resolution below removes
+                // `lemma_lit` from `current_clause` (#eq-cong-pred-polarity).
+                //
+                // `find_direct_resolution_assumption` returns the assumption
+                // that is the complement of the substituted literal, so with
+                // `lemma_lit = P(x)` we hold `assume_term = ¬P(y)` for
+                // `y = x[from := to]`, and `neg_assume = P(y)`. Congruence then
+                // gives `from = to ∧ ¬P(y) ⟹ ¬P(x)`, i.e. the clause
+                // `¬(from = to) ∨ P(y) ∨ ¬P(x)` — note the LAST literal is the
+                // complement of `lemma_lit`, not `lemma_lit`.
+                //
+                // Emitting `lemma_lit` here instead produced
+                // `¬(A = B) ∨ (0 ≤ A) ∨ (0 ≤ B)`, which is falsified by
+                // `A = B = -1`: an INVALID theory lemma, and a resolution that
+                // "removed" a literal against a unit of the same polarity. It
+                // went unnoticed while UNSAT publication did not require a
+                // checked proof; the mandatory certification gate rejects it,
+                // which is what surfaced this.
+                let neg_lemma_lit = match terms.get(lemma_lit) {
+                    TermData::Not(inner) => *inner,
+                    _ => terms.mk_not_raw(lemma_lit),
+                };
+
+                // `eq_congruent_pred` is checked positionally: the negated
+                // predicate must be second-to-last and the positive one last
+                // (`ay-proof/src/checker/euf.rs` validate_euf_congruent_pred).
+                // Which of the two predicate literals carries the negation
+                // depends on `lemma_lit`'s polarity, so order them by polarity
+                // rather than by role. A clause is a set of literals, so this
+                // reordering is presentational only — it changes nothing about
+                // which literals the resolutions below consume.
+                let (pred_neg, pred_pos) = if matches!(terms.get(neg_assume), TermData::Not(_)) {
+                    (neg_assume, neg_lemma_lit)
+                } else {
+                    (neg_lemma_lit, neg_assume)
+                };
+
                 let cong_id = proof.add_step(ProofStep::TheoryLemma {
                     theory: "eq_congruent_pred".to_string(),
-                    clause: vec![neg_eq, neg_assume, lemma_lit],
+                    clause: vec![neg_eq, pred_neg, pred_pos],
                     farkas: None,
                     kind: TheoryLemmaKind::EufCongruentPred,
                     lia: None,
@@ -243,14 +281,14 @@ fn apply_congruence_bridged_derivation(
 
                 let after_eq_id = proof.add_step(ProofStep::Step {
                     rule: AletheRule::ThResolution,
-                    clause: vec![neg_assume, lemma_lit],
+                    clause: vec![neg_assume, neg_lemma_lit],
                     premises: vec![cong_id, *eq_pid],
                     args: vec![],
                 });
 
                 let unit_id = proof.add_step(ProofStep::Step {
                     rule: AletheRule::ThResolution,
-                    clause: vec![lemma_lit],
+                    clause: vec![neg_lemma_lit],
                     premises: vec![after_eq_id, assume_id],
                     args: vec![],
                 });

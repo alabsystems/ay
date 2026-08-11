@@ -72,6 +72,53 @@ def _host_physical_ram_mb():
         return 0
 
 
+def host_available_ram_mb():
+    """Currently reclaimable host memory in MiB, or 0 when it cannot be read.
+
+    This is a LIVE reading, not a capacity, and it is the signal
+    :func:`plan_solver_resources` was missing. That planner reserves
+    ``headroom_mb`` out of TOTAL RAM, which describes an otherwise-idle host —
+    precisely the assumption that fails when a second campaign, an agent, or an
+    editor is already resident. Two passes that each plan that way commit twice
+    the machine, which is how nine solver children were live on 2026-07-30 under
+    plans that each admitted two.
+
+    Returns 0 for "unknown", which leaves the static plan untouched. A counter we
+    cannot read must not refuse every run on that platform — the static budget is
+    still applied, so this can only ever make a plan smaller, never larger.
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(["vm_stat"], text=True,
+                                          stderr=subprocess.DEVNULL)
+        except Exception:
+            return 0
+        page_size = 4096
+        header = re.search(r"page size of (\d+) bytes", out)
+        if header:
+            page_size = int(header.group(1))
+        pages = 0
+        found = False
+        # Free plus the reclaimable classes. Anonymous `active` pages are NOT
+        # reclaimable and are excluded on purpose; counting them would restore
+        # the very "host is empty" assumption this exists to remove.
+        for key in ("Pages free", "Pages inactive", "Pages speculative",
+                    "Pages purgeable"):
+            row = re.search(rf"^{key}:\s+(\d+)\.", out, re.MULTILINE)
+            if row:
+                pages += int(row.group(1))
+                found = True
+        return (pages * page_size) // (1024 * 1024) if found else 0
+    try:  # Linux
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return 0
+    return 0
+
+
 CgroupMemory = collections.namedtuple("CgroupMemory", ["limit_mb", "current_mb"])
 
 
@@ -490,13 +537,15 @@ def acquire_harness_lease(label="harness", _lock_path=None):
 
 def plan_solver_resources(jobs, ram_mb=None, cores=None, headroom_mb=None,
                           mem_floor_mb=1024, label="harness",
-                          acquire_lease=None):
+                          acquire_lease=None, available_mb=None):
     """Plan (jobs, memlimit_mb_per_job, nbcore_per_job) for a parallel harness.
 
-    Pure given explicit `ram_mb`/`cores` (injectable for tests); otherwise they
-    are detected. Policy:
+    Pure given explicit `ram_mb`/`cores`/`available_mb` (injectable for tests);
+    otherwise they are detected. Policy:
       * reserve `headroom_mb` (default: max(16 GiB, RAM/3)) for the OS,
         agents, and a possible concurrent cargo build;
+      * clamp to memory that is actually free RIGHT NOW (`available_mb`), so a
+        plan can never hand out capacity another tenant already holds;
       * split the remaining budget evenly across jobs as a per-child MEMLIMIT
         (MiB), never below `mem_floor_mb` — jobs are REDUCED rather than
         starving each child below the floor;
@@ -505,6 +554,15 @@ def plan_solver_resources(jobs, ram_mb=None, cores=None, headroom_mb=None,
     Solver context: without MEMLIMIT each ay-pb child self-limits at phys/2,
     and the main `ay` binary at 85% of RAM — both sibling-blind, so N parallel
     children multiply them (the 2026-06-19 / 2026-07-11 panic arithmetic).
+
+    The live clamp is what makes the plan composable. `ram_mb - headroom_mb`
+    describes an idle host, so two campaigns planning independently each commit
+    the whole machine; on 2026-07-30 that put nine solver children on a 24 GB
+    host under plans that each admitted two, and the userspace watchdog panicked
+    it. The exclusive lease below cannot close that on its own — it dies with the
+    process that holds it, so a chain that plans once per phase leaves a gap
+    between phases, and children wedged in the VM outlive the harness that
+    planned them. Measuring what is free sees both.
 
     Unknown or insufficient RAM fails closed; a zero-memory plan is never a
     valid execution envelope.
@@ -526,6 +584,12 @@ def plan_solver_resources(jobs, ram_mb=None, cores=None, headroom_mb=None,
     if detected_ram:
         ram_mb = physical_ram_mb()
         cgroup = cgroup_memory_mb()
+        if available_mb is None:
+            available_mb = host_available_ram_mb()
+    if available_mb is not None:
+        available_mb = int(available_mb)
+        if available_mb < 0:
+            raise ValueError("available_mb must be non-negative")
     if cores is None:
         cores = physical_core_count()
     cores = int(cores)
@@ -552,6 +616,19 @@ def plan_solver_resources(jobs, ram_mb=None, cores=None, headroom_mb=None,
     if cgroup is not None:
         cgroup_remaining = cgroup.limit_mb - cgroup.current_mb
         budget = min(budget, cgroup_remaining - headroom_mb)
+    # Memory another tenant already holds is not ours to hand out. Keep one
+    # child's worth of the free pool unallocated so the trimmed plan still
+    # leaves the machine room to breathe rather than filling it exactly.
+    if available_mb:
+        live_budget = available_mb - mem_floor_mb
+        if live_budget < budget:
+            print(
+                f"[oom-guard] {label}: {available_mb}MB free now, not the "
+                f"{ram_mb}MB an idle host would offer; trimming budget "
+                f"{budget}MB -> {max(0, live_budget)}MB.",
+                file=sys.stderr, flush=True,
+            )
+            budget = live_budget
     # A detected controller with less than one minimum child left must fail
     # closed. Native and shell harnesses reject this zero plan before spawning.
     if budget < mem_floor_mb:

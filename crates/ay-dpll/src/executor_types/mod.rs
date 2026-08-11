@@ -93,7 +93,7 @@ pub enum ExecutorError {
         ALL, AUFDT, AUFDTLIA, AUFDTLIRA, AUFLIA, AUFLIRA, AUFLRA, \
         LIA, LIRA, LRA, NIA, NIRA, NRA, \
         QF_ABV, QF_AUFBV, QF_AUFLIA, QF_AUFLIRA, QF_AUFLRA, QF_AX, \
-        QF_BV, QF_BVFP, QF_DT, QF_FP, QF_LIA, QF_LIRA, QF_LRA, \
+        QF_BV, QF_BVFP, QF_DT, QF_EIA, QF_FP, QF_LIA, QF_LIRA, QF_LRA, \
         QF_NIA, QF_NIRA, QF_NRA, QF_S, QF_SEQ, QF_SLIA, QF_SNIA, \
         QF_UF, QF_UFBV, QF_UFLIA, QF_UFLRA, QF_UFNIA, QF_UFNIRA, QF_UFNRA, \
         UF, UFDT, UFDTLIA, UFDTLIRA, UFDTLRA, UFDTNIA, UFDTNIRA, UFDTNRA, \
@@ -176,19 +176,237 @@ pub enum UnknownReason {
     /// Internal executor error (e.g., model validation failure).
     /// Use `Solver::get_executor_error()` for the detail message.
     InternalError,
-    /// Strict-proof mode downgraded UNSAT to Unknown because the proof chain
-    /// to the empty clause contains one or more unverified `trust` steps
-    /// (either `AletheRule::Trust` or `TheoryLemmaKind::Generic`).
-    ///
-    /// This is the soundness gate described in #8759: when the user requests
-    /// `--strict-proofs` (or sets `AY_STRICT_PROOFS=1`), an UNSAT verdict is
-    /// only accepted if the proof's terminal derivation chain is trust-free.
-    ProofTrusted,
     /// No specific reason available
     Unknown,
 }
 
+/// Authoritative production origin for a public [`UnknownReason`].
+///
+/// This is deliberately a one-to-one taxonomy rather than a free-form label.
+/// A producer publishes `Unknown` through an origin, and the origin determines
+/// the reason.  That prevents a diagnostic or conformance hook from claiming a
+/// reason that does not belong to the exercised production boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnknownOrigin {
+    /// The wall-clock solve deadline expired.
+    SolveDeadline,
+    /// The deterministic resource budget was exhausted.
+    DeterministicResourceBudget,
+    /// The configured memory budget was exhausted.
+    MemoryBudget,
+    /// The caller's interrupt flag was observed.
+    InterruptFlag,
+    /// A selected solver lane could not decide the input.
+    IncompleteSolverLane,
+    /// Mandatory verdict certification could not confirm the result.
+    VerdictCertification,
+    /// The E-matching round budget was exhausted.
+    EmatchingRoundBudget,
+    /// Required quantifier instantiation was deferred.
+    DeferredInstantiation,
+    /// A quantifier shape has no complete handler.
+    UnhandledQuantifier,
+    /// CEGQI could not complete its refinement.
+    CegqiRefinement,
+    /// Existential E-matching could not complete.
+    ExistentialEmatching,
+    /// A theory split exhausted its budget.
+    TheorySplitBudget,
+    /// An expression could not be split soundly by the selected lane.
+    UnsupportedExpressionSplit,
+    /// The input uses an unsupported feature.
+    UnsupportedFeature,
+    /// The input uses an unsupported arithmetic fragment.
+    UnsupportedArithmeticFragment,
+    /// The input uses an unsupported mixed collection fragment.
+    UnsupportedMixedCollection,
+    /// The executor encountered an internal failure.
+    ExecutorFailure,
+    /// A legacy unknown path had no more specific origin.
+    UntaggedSolverUnknown,
+}
+
+impl UnknownOrigin {
+    /// Closed origin inventory. Its order is identical to
+    /// [`UnknownReason::ALL`], making the bijection mechanically checkable.
+    pub const ALL: [Self; 18] = [
+        Self::SolveDeadline,
+        Self::DeterministicResourceBudget,
+        Self::MemoryBudget,
+        Self::InterruptFlag,
+        Self::IncompleteSolverLane,
+        Self::VerdictCertification,
+        Self::EmatchingRoundBudget,
+        Self::DeferredInstantiation,
+        Self::UnhandledQuantifier,
+        Self::CegqiRefinement,
+        Self::ExistentialEmatching,
+        Self::TheorySplitBudget,
+        Self::UnsupportedExpressionSplit,
+        Self::UnsupportedFeature,
+        Self::UnsupportedArithmeticFragment,
+        Self::UnsupportedMixedCollection,
+        Self::ExecutorFailure,
+        Self::UntaggedSolverUnknown,
+    ];
+
+    /// Stable evidence code for this exact production origin.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SolveDeadline => "solve_deadline",
+            Self::DeterministicResourceBudget => "deterministic_resource_budget",
+            Self::MemoryBudget => "memory_budget",
+            Self::InterruptFlag => "interrupt_flag",
+            Self::IncompleteSolverLane => "incomplete_solver_lane",
+            Self::VerdictCertification => "verdict_certification",
+            Self::EmatchingRoundBudget => "ematching_round_budget",
+            Self::DeferredInstantiation => "deferred_instantiation",
+            Self::UnhandledQuantifier => "unhandled_quantifier",
+            Self::CegqiRefinement => "cegqi_refinement",
+            Self::ExistentialEmatching => "existential_ematching",
+            Self::TheorySplitBudget => "theory_split_budget",
+            Self::UnsupportedExpressionSplit => "unsupported_expression_split",
+            Self::UnsupportedFeature => "unsupported_feature",
+            Self::UnsupportedArithmeticFragment => "unsupported_arithmetic_fragment",
+            Self::UnsupportedMixedCollection => "unsupported_mixed_collection",
+            Self::ExecutorFailure => "executor_failure",
+            Self::UntaggedSolverUnknown => "untagged_solver_unknown",
+        }
+    }
+
+    /// The only reason this origin is authorized to publish.
+    pub const fn reason(self) -> UnknownReason {
+        match self {
+            Self::SolveDeadline => UnknownReason::Timeout,
+            Self::DeterministicResourceBudget => UnknownReason::ResourceLimit,
+            Self::MemoryBudget => UnknownReason::MemoryLimit,
+            Self::InterruptFlag => UnknownReason::Interrupted,
+            Self::IncompleteSolverLane => UnknownReason::Incomplete,
+            Self::VerdictCertification => UnknownReason::SelfCheckRejected,
+            Self::EmatchingRoundBudget => UnknownReason::QuantifierRoundLimit,
+            Self::DeferredInstantiation => UnknownReason::QuantifierDeferred,
+            Self::UnhandledQuantifier => UnknownReason::QuantifierUnhandled,
+            Self::CegqiRefinement => UnknownReason::QuantifierCegqiIncomplete,
+            Self::ExistentialEmatching => UnknownReason::QuantifierEmatchingExistsIncomplete,
+            Self::TheorySplitBudget => UnknownReason::SplitLimit,
+            Self::UnsupportedExpressionSplit => UnknownReason::ExpressionSplit,
+            Self::UnsupportedFeature => UnknownReason::Unsupported,
+            Self::UnsupportedArithmeticFragment => UnknownReason::UnsupportedArithmetic,
+            Self::UnsupportedMixedCollection => UnknownReason::UnsupportedMixedCollection,
+            Self::ExecutorFailure => UnknownReason::InternalError,
+            Self::UntaggedSolverUnknown => UnknownReason::Unknown,
+        }
+    }
+
+    /// Stable source-level producer family audited for this origin.
+    ///
+    /// The conformance probe reports this value alongside whether it exercised
+    /// a deterministic public query or the explicit origin fault path. These
+    /// are production chokepoints, not test module locations.
+    pub const fn production_chokepoint(self) -> &'static str {
+        match self {
+            Self::SolveDeadline => "executor/check_sat.rs::should_abort_theory_loop",
+            Self::DeterministicResourceBudget => {
+                "executor/theories/model_helpers.rs::record_sat_unknown_reason"
+            }
+            Self::MemoryBudget => "executor/check_sat.rs::should_abort_theory_loop",
+            Self::InterruptFlag => "executor/check_sat.rs::should_abort_theory_loop",
+            Self::IncompleteSolverLane => "executor/check_sat.rs::check_sat_guarded",
+            Self::VerdictCertification => {
+                "executor/unsat_cert.rs::reject_uncertified_verdict_for_publication"
+            }
+            Self::EmatchingRoundBudget
+            | Self::DeferredInstantiation
+            | Self::UnhandledQuantifier
+            | Self::ExistentialEmatching => {
+                "executor/quantifier_loop/result_mapping.rs::map_quantifier_result"
+            }
+            Self::CegqiRefinement => {
+                "executor/quantifier_loop/cegqi_refinement.rs::try_cegqi_arith_refinement"
+            }
+            Self::TheorySplitBudget => "pipeline_incremental_split_assume_macros.rs::split_loop",
+            Self::UnsupportedExpressionSplit => {
+                "pipeline_incremental_split_eager_shared_macros.rs::create_expression_split_atoms"
+            }
+            Self::UnsupportedFeature => "executor.rs::execute_stack_guarded",
+            Self::UnsupportedArithmeticFragment => {
+                "executor/check_sat.rs::contains_symbolic_integer_power"
+            }
+            Self::UnsupportedMixedCollection => "executor/theories/seq.rs::solve_seq_auflia",
+            Self::ExecutorFailure => "api/solving/check.rs::record_executor_failure_unknown",
+            Self::UntaggedSolverUnknown => "executor/lifecycle.rs::finalize_unknown_publication",
+        }
+    }
+}
+
 impl UnknownReason {
+    /// Closed registry of every currently public Unknown reason.
+    ///
+    /// The order is a stable, append-only evidence contract: downstream
+    /// consumers may persist the associated [`code`](Self::code), but must not
+    /// infer semantics from an array index. A new enum variant must be appended
+    /// here and assigned a new, unique code.
+    ///
+    /// Every registered reason has the same public-result lifecycle. Installing
+    /// an `Unknown` through
+    /// [`Executor::replace_last_result_with_unknown`](crate::Executor::replace_last_result_with_unknown)
+    /// retains only the `Unknown` decision and its reason:
+    ///
+    /// | Prior result artifact | After any registered `Unknown` |
+    /// | --- | --- |
+    /// | SAT model, SAT acceptance certificate, model-validation provenance | Revoked |
+    /// | UNSAT proof, proof quality/provenance, LRAT/clause trace | Revoked |
+    /// | Unsat assumptions, named core, core-name provenance | Revoked |
+    /// | Optimization values, soft-cost witness, objective certificates | Revoked |
+    /// | Solver configuration and reusable incremental search state | Retained (not a result artifact) |
+    ///
+    /// This uniform policy prevents the reason taxonomy from accidentally
+    /// granting authority to stale artifacts from an earlier decision.
+    pub const ALL: [Self; 18] = [
+        Self::Timeout,
+        Self::ResourceLimit,
+        Self::MemoryLimit,
+        Self::Interrupted,
+        Self::Incomplete,
+        Self::SelfCheckRejected,
+        Self::QuantifierRoundLimit,
+        Self::QuantifierDeferred,
+        Self::QuantifierUnhandled,
+        Self::QuantifierCegqiIncomplete,
+        Self::QuantifierEmatchingExistsIncomplete,
+        Self::SplitLimit,
+        Self::ExpressionSplit,
+        Self::Unsupported,
+        Self::UnsupportedArithmetic,
+        Self::UnsupportedMixedCollection,
+        Self::InternalError,
+        Self::Unknown,
+    ];
+
+    /// The single production origin authorized to publish this reason.
+    pub const fn origin(self) -> UnknownOrigin {
+        match self {
+            Self::Timeout => UnknownOrigin::SolveDeadline,
+            Self::ResourceLimit => UnknownOrigin::DeterministicResourceBudget,
+            Self::MemoryLimit => UnknownOrigin::MemoryBudget,
+            Self::Interrupted => UnknownOrigin::InterruptFlag,
+            Self::Incomplete => UnknownOrigin::IncompleteSolverLane,
+            Self::SelfCheckRejected => UnknownOrigin::VerdictCertification,
+            Self::QuantifierRoundLimit => UnknownOrigin::EmatchingRoundBudget,
+            Self::QuantifierDeferred => UnknownOrigin::DeferredInstantiation,
+            Self::QuantifierUnhandled => UnknownOrigin::UnhandledQuantifier,
+            Self::QuantifierCegqiIncomplete => UnknownOrigin::CegqiRefinement,
+            Self::QuantifierEmatchingExistsIncomplete => UnknownOrigin::ExistentialEmatching,
+            Self::SplitLimit => UnknownOrigin::TheorySplitBudget,
+            Self::ExpressionSplit => UnknownOrigin::UnsupportedExpressionSplit,
+            Self::Unsupported => UnknownOrigin::UnsupportedFeature,
+            Self::UnsupportedArithmetic => UnknownOrigin::UnsupportedArithmeticFragment,
+            Self::UnsupportedMixedCollection => UnknownOrigin::UnsupportedMixedCollection,
+            Self::InternalError => UnknownOrigin::ExecutorFailure,
+            Self::Unknown => UnknownOrigin::UntaggedSolverUnknown,
+        }
+    }
+
     /// Stable snake_case machine code for evidence and routing consumers.
     ///
     /// This is intentionally separate from [`Display`](std::fmt::Display):
@@ -213,7 +431,6 @@ impl UnknownReason {
             Self::UnsupportedArithmetic => "unsupported_arithmetic",
             Self::UnsupportedMixedCollection => "unsupported_mixed_collection",
             Self::InternalError => "internal_error",
-            Self::ProofTrusted => "proof_trusted",
             Self::Unknown => "unknown",
         }
     }
@@ -238,7 +455,6 @@ impl UnknownReason {
             Self::UnsupportedArithmetic => "Unsupported arithmetic",
             Self::UnsupportedMixedCollection => "Unsupported mixed collection",
             Self::InternalError => "Internal error",
-            Self::ProofTrusted => "Proof trusted",
             Self::Unknown => "Unknown",
         }
     }
@@ -282,7 +498,6 @@ impl std::fmt::Display for UnknownReason {
             Self::UnsupportedArithmetic => write!(f, "(unsupported arithmetic)"),
             Self::UnsupportedMixedCollection => write!(f, "(unsupported mixed-collection)"),
             Self::InternalError => write!(f, "internal-error"),
-            Self::ProofTrusted => write!(f, "(incomplete proof-trusted)"),
             Self::Unknown => write!(f, "unknown"),
         }
     }

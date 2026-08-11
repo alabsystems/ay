@@ -56,6 +56,7 @@ ureq = { workspace = true, optional = true }
 wait-timeout = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [features]
 default = ["raw-pointer-bcp", "jit"]
@@ -74,6 +75,7 @@ cli = [
     "dep:tracing-subscriber",
     "dep:wait-timeout",
     "dep:tar",
+    "dep:tempfile",
     "dep:zip",
     "dep:ay-bisect",
     "dep:ay-drat-check",

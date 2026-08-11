@@ -18,6 +18,11 @@
 //! - `card(s) ≥ 0` for **every** `set.card` term (the sound card↔LIA bridge —
 //!   asserted for every card, never selectively).
 //! - `card((as set.empty (Set T))) = 0`.
+//! - the definitional recurrence over an empty-rooted (covered) store chain.
+//! - for any other carrier — a bare set variable, or a chain rooted at one —
+//!   the **membership lower bound** `card(s) ≥ #{distinct probed members of s}`.
+//!   Without it membership and cardinality were decoupled and
+//!   `(set.member 1 s) ∧ (= 0 (set.card s))` was wrongly SAT.
 //!
 //! ## Fail-closed contract
 //!
@@ -93,6 +98,12 @@ impl Executor {
         // structural insert/remove recurrence for empty-rooted store chains).
         let card_axioms = self.collect_set_card_axioms();
         if !card_axioms.is_empty() {
+            // The card axioms carry `ite(member, .., ..)` in ARITHMETIC position
+            // (the store-chain recurrence and the membership lower bound). The
+            // whole-assertion lift above ran before this injection, so lift the
+            // axioms too — otherwise the `ite` never reaches LIA and a formula
+            // the bound refutes comes back `unknown` instead of `unsat`.
+            let card_axioms = self.ctx.terms.lift_arithmetic_ite_all(&card_axioms);
             let mut seen: HashSet<_> = self.ctx.assertions.iter().copied().collect();
             self.ctx
                 .assertions
@@ -856,8 +867,12 @@ impl Executor {
     }
 
     fn collect_set_card_axioms(&mut self) -> Vec<TermId> {
-        // Discover (card_term, set_arg) pairs over the term DAG.
+        // Discover (card_term, set_arg) pairs over the term DAG, plus every
+        // `select(array, index)` — the membership probes the lower bound below
+        // needs. Collected in this ONE walk so the cost stays linear in the DAG
+        // rather than re-walking it per card term.
         let mut card_pairs: Vec<(TermId, TermId)> = Vec::new();
+        let mut selects: Vec<(TermId, TermId)> = Vec::new();
         let mut named_empty_terms: HashSet<TermId> = HashSet::default();
         let mut stack: Vec<TermId> = self.ctx.assertions.clone();
         let mut visited: HashSet<TermId> = HashSet::default();
@@ -871,6 +886,8 @@ impl Executor {
                         card_pairs.push((term, args[0]));
                     } else if name == OP_EMPTY && args.is_empty() {
                         named_empty_terms.insert(term);
+                    } else if name == "select" && args.len() == 2 {
+                        selects.push((args[0], args[1]));
                     }
                     for arg in args.clone() {
                         stack.push(arg);
@@ -927,9 +944,93 @@ impl Executor {
                 // array solver (so inserting a present element does not grow the
                 // count; removing an absent element does not shrink it).
                 self.emit_store_chain_card_axioms(card_term, set_arg, &mut axioms);
+            } else {
+                // UNDER-CONSTRAINED (#set-card-wrong-sat): a bare set variable or
+                // an uncovered store chain. Before this branch existed the only
+                // axiom for such a set was `card >= 0`, which leaves membership
+                // and cardinality completely decoupled — so
+                //   `(set.member 1 s) ∧ (= 0 (set.card s))`
+                // was wrongly SAT (with a model that even falsified its own second
+                // assertion). Tie the two together with the membership lower bound.
+                self.emit_membership_card_lower_bound(
+                    card_term,
+                    set_arg,
+                    &aliases,
+                    &selects,
+                    &mut axioms,
+                );
             }
         }
         axioms
+    }
+
+    /// Sound membership → cardinality lower bound for a set whose structure the
+    /// store-chain recurrence does not cover (a bare set variable, or a chain
+    /// rooted at one rather than at the empty carrier).
+    ///
+    /// Let `E = [e_0 .. e_{k-1}]` be the elements probed for membership in this
+    /// same set anywhere in the assertions — the entries of `selects` (collected
+    /// by the caller's single DAG walk) whose array resolves to `set_arg`. Then
+    ///
+    /// ```text
+    ///   card(s) >= Σ_i ite(member(s, e_i) ∧ ⋀_{j<i} e_i ≠ e_j, 1, 0)
+    /// ```
+    ///
+    /// The `⋀_{j<i} e_i ≠ e_j` guard makes each *value* contribute at most once:
+    /// a repeated element is counted only at its first index, so the sum is a
+    /// count of DISTINCT members and can never exceed the true cardinality. That
+    /// keeps the bound sound even when the probed indices are symbolic and not
+    /// provably distinct — the case a naive `Σ ite(member, 1, 0)` gets wrong.
+    ///
+    /// This is a lower bound only, so it is deliberately incomplete: it refutes
+    /// `1 ∈ s ∧ |s| = 0` and `1 ∈ s ∧ 2 ∈ s ∧ |s| = 1`, but says nothing about
+    /// an upper bound, so `|s| = 0 ∧ s ≠ ∅` stays `unknown` rather than becoming
+    /// unsat. Incomplete is sound; wrong-SAT is not.
+    fn emit_membership_card_lower_bound(
+        &mut self,
+        card_term: TermId,
+        set_arg: TermId,
+        aliases: &[(TermId, TermId)],
+        selects: &[(TermId, TermId)],
+        axioms: &mut Vec<TermId>,
+    ) {
+        // Keep the probes against THIS set, de-duplicated by index term.
+        let mut elems: Vec<TermId> = Vec::new();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        for &(array, index) in selects {
+            if self.resolve_set_alias(array, aliases) == set_arg && seen.insert(index) {
+                elems.push(index);
+            }
+        }
+        if elems.is_empty() {
+            return;
+        }
+
+        let zero = self.ctx.terms.mk_int(BigInt::zero());
+        let one = self.ctx.terms.mk_int(BigInt::from(1));
+        let mut contributions: Vec<TermId> = Vec::with_capacity(elems.len());
+        for i in 0..elems.len() {
+            let elem = elems[i];
+            // Guard: `elem` is in the set AND is not a repeat of an earlier probe.
+            let mut guard = vec![self.ctx.terms.mk_select(set_arg, elem)];
+            for j in 0..i {
+                let same = self.ctx.terms.mk_eq(elem, elems[j]);
+                let distinct = self.ctx.terms.mk_not(same);
+                guard.push(distinct);
+            }
+            let cond = if guard.len() == 1 {
+                guard[0]
+            } else {
+                self.ctx.terms.mk_and(guard)
+            };
+            contributions.push(self.ctx.terms.mk_ite(cond, one, zero));
+        }
+        let lower_bound = if contributions.len() == 1 {
+            contributions[0]
+        } else {
+            self.ctx.terms.mk_add(contributions)
+        };
+        axioms.push(self.ctx.terms.mk_ge(card_term, lower_bound));
     }
 
     /// Emit the definitional cardinality recurrence for a covered (empty-rooted)

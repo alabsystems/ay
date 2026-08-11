@@ -117,6 +117,7 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
                     $self.last_clause_trace = _pmc_clause_trace;
                     $self.last_clausification_proofs = Some(_pmc_clausification_proofs);
                     $self.last_original_clause_theory_proofs = Some(_pmc_theory_proofs);
+                    $crate::pipeline_fns::record_var_map_provenance("split_handler", &$solver, _pmc_vtm.len());
                     $self.last_var_to_term = Some(_pmc_vtm);
                     $self.last_negations = Some(_pmc_neg);
                     $self.build_unsat_proof();

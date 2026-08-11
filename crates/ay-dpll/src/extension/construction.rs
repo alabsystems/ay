@@ -290,6 +290,9 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             theory_conflict_count: 0,
             theory_propagation_count: 0,
             partial_clause_count: 0,
+            minted_term_to_var: HashMap::default(),
+            minted_var_to_term: HashMap::default(),
+            minted_var_count: 0,
             pending_split: None,
             pending_bound_refinements: Vec::new(),
             level_trail_positions: Vec::new(),
@@ -519,7 +522,10 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
                             TheoryResult::UnsatWithFarkas(conflict) => {
                                 valid_clauses.push(pending_axiom_clauses[i].clone());
                                 valid_terms.push((t1, p1, t2, p2));
-                                valid_farkas.push(conflict.farkas);
+                                valid_farkas.push(crate::pipeline_fns::rebind_bound_axiom_farkas(
+                                    conflict,
+                                    &[(t1, !p1), (t2, !p2)],
+                                ));
                             }
                             TheoryResult::Unsat(_) => {
                                 valid_clauses.push(pending_axiom_clauses[i].clone());
@@ -878,6 +884,9 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             theory_conflict_count: 0,
             theory_propagation_count: 0,
             partial_clause_count: 0,
+            minted_term_to_var: HashMap::default(),
+            minted_var_to_term: HashMap::default(),
+            minted_var_count: 0,
             pending_split: None,
             pending_bound_refinements: Vec::new(),
             level_trail_positions: Vec::new(),

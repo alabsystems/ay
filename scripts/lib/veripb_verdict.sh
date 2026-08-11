@@ -323,3 +323,82 @@ veripb_require_self_test() {
     fi
     exit 3
 }
+
+# ------------------------------------------------------------------ hashing
+
+# sha256_file <path>
+#
+# Hex sha256 of a file, or non-zero when no hasher is available. Shared so the
+# checker PIN can be enforced identically by every gate that reads it.
+sha256_file() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+# ------------------------------------------------------- soundness fixtures
+
+# veripb_soundness_probe <checker> <soundness-dir>
+#
+# The self-test battery above proves a binary BEHAVES like a proof checker. It
+# does not prove the binary is a CORRECT one, and that gap is not theoretical:
+# published VeriPB 3.0.2 passes all six self-test probes while answering
+# `s VERIFIED UNSATISFIABLE` for satisfiable formulas (fixtures 03 and 04) and
+# `s VERIFIED SATISFIABLE` for unsatisfiable ones (05 and 06). That is why
+# ci/veripb.pin pins a COMMIT AND A PATCH rather than a version number.
+#
+# This probe faces the checker with the six formula/proof pairs whose verdicts
+# are known to contradict the truth. A checker AY is willing to certify against
+# must refuse all six. Rejection here means "printed no accepting `s ...` line
+# at any guarantee level" — `s VERIFIED NO CONCLUSION` is a rejection, and so is
+# a parse error with no `s` line.
+#
+# <soundness-dir> is VERIPB_SOUNDNESS_DIR from ci/veripb.pin, relative to the
+# repo root. Returns 0 only when every fixture is refused.
+veripb_soundness_probe() {
+    _vg_checker=$1
+    _vg_dir=$2
+    _vg_expected="$_vg_dir/expected.tsv"
+    [ -r "$_vg_expected" ] || {
+        echo "ERROR: soundness fixture manifest missing: $_vg_expected" >&2
+        return 1
+    }
+    _vg_bad=0
+    _vg_seen=0
+    # POSIX read loop over the manifest; '#' and blank lines are comments.
+    while IFS='	' read -r _vg_name _vg_flag _vg_formula _vg_proof _vg_truth _vg_wrong; do
+        case "$_vg_name" in ''|'#'*) continue ;; esac
+        _vg_seen=$((_vg_seen + 1))
+        veripb_require_rejected "$_vg_checker" "$_vg_flag" \
+            "$_vg_dir/$_vg_name/$_vg_formula" "$_vg_dir/$_vg_name/$_vg_proof" \
+            "checker-soundness/$_vg_name" || {
+            echo "       truth is '$_vg_truth'; an unfixed checker answers '$_vg_wrong'" >&2
+            _vg_bad=1
+        }
+    done < "$_vg_expected"
+    # A manifest that parsed to nothing would make this gate vacuous, which is
+    # the exact failure mode it exists to prevent.
+    if [ "$_vg_seen" -eq 0 ]; then
+        echo "ERROR: soundness manifest $_vg_expected yielded no fixtures" >&2
+        return 1
+    fi
+    [ "$_vg_bad" -eq 0 ] || return 1
+    echo "   checker soundness: PASSED ($_vg_seen/$_vg_seen wrong-verdict fixtures refused)"
+    return 0
+}
+
+# veripb_require_soundness <checker> <soundness-dir>
+#
+# Soundness fixtures or die. A gate that skips this can certify AY's answers
+# against a checker that calls satisfiable formulas unsatisfiable.
+veripb_require_soundness() {
+    veripb_soundness_probe "$1" "$2" && return 0
+    echo "ERROR: the resolved checker gave a verdict contradicting known truth." >&2
+    echo "       Refusing to certify against it. Build the pinned checker per" >&2
+    echo "       ci/veripb.pin (commit + reviewed patch), not an unpinned clone." >&2
+    exit 3
+}

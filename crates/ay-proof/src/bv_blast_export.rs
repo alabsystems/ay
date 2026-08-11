@@ -2,12 +2,12 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Structured, replayable bit-blast proof export for the external-codegen slice fragment.
+//! Structured, replayable bit-blast proof export for the JIT-backend QF_BV slice fragment.
 //!
 //! # What this module is (C1 producer, design §9 verified-codegen loop)
 //!
 //! This is the **producer** half of the verified-codegen loop. It emits, for the
-//! narrow QF_BV fragment the external-codegen slice needs, a fully structured bit-blast
+//! narrow QF_BV fragment the downstream JIT slice needs, a fully structured bit-blast
 //! refutation that a **separate, later-built consumer** (`proof-replay-consumer`) can replay
 //! into a kernel `Expr` proof of type `(...) -> False` with **zero opaque `trust`
 //! steps**.
@@ -79,6 +79,24 @@
 //! ([`crate::bv_blast_solver::export_bv_blast_proof_solved`] for operand-swapped
 //! commutativity obligations, [`crate::bv_blast_solver::export_bv_blast_proof_expr`]
 //! for arbitrary expression-tree equalities) cover those shapes.
+//!
+//! # Source-binding boundary
+//!
+//! [`BvBlastProof::validate`] certifies the Boolean gate graph, its exact
+//! Tseitin CNF, and the resolution refutation carried by the object. It does
+//! **not**, by itself, authenticate that a serialized object came from a
+//! caller's live source formula. In particular, [`BvBlastProof::asserted_smt`]
+//! is descriptive text, and the expression-tree exporter uses
+//! [`BvBlastProof::obligation`] only as width/lineage metadata.
+//!
+//! An authority-granting consumer must bind the graph to its source at the
+//! consumption boundary. It can either construct the proof locally from the
+//! exact live expression and replay it without accepting an injected
+//! `BvBlastProof` (the AY strict Bool/BV checker does this), or independently
+//! re-derive the canonical `vars`/`bit_lemmas`/`clauses` from the authenticated
+//! source goal and require exact equality before replay (the stored-certificate
+//! downstream compiler adapter does this). Merely comparing `asserted_smt` or calling
+//! `validate()` on externally supplied JSON is not source binding.
 //!
 //! # ════════════════════════════════════════════════════════════════════════
 //! # THE CONTRACT (what the separate proof consumer builds against)
@@ -175,8 +193,9 @@
 //! [`crate::bv_blast_solver`] (operand-swap and expression-tree paths) already
 //! carry that genuinely CDCL-derived chain through this same [`BvBlastProof`]
 //! format (route (b) of the verified-codegen loop; the route-b CNF entry point
-//! consumed by external-codegen is `ay-sat`'s feature-gated `prove_cnf_unsat_dimacs`).
+//! consumed by the JIT backend is `ay-sat`'s feature-gated `prove_cnf_unsat_dimacs`).
 
+use ay_core::time::Instant;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -557,16 +576,21 @@ pub struct Refutation {
     pub steps: Vec<ResolutionStep>,
 }
 
-/// A complete, zero-trust, replayable bit-blast refutation for a slice obligation.
+/// A complete, zero-trust, replayable refutation of its carried Boolean CNF.
 ///
-/// See the module-level docs for the full contract. Use [`BvBlastProof::validate`]
-/// to confirm well-formedness (every clause has a derivation, the resolution chain
-/// is locally sound and ends in the empty clause, no opaque step exists).
+/// See the module-level source-binding boundary: [`BvBlastProof::validate`]
+/// confirms internal well-formedness, but a consumer of a serialized proof must
+/// additionally bind this graph to the authenticated source goal before it
+/// grants authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BvBlastProof {
     /// Format version (bump on breaking changes to the contract).
     pub format_version: u32,
-    /// The obligation this proof refutes.
+    /// Structured lineage and equality-width metadata.
+    ///
+    /// Native replay uses `width` to check the exact `BitEq` layout. It does not
+    /// independently prove that the remaining metadata denotes the source
+    /// formula claimed by an external caller.
     pub obligation: SliceObligation,
     /// SMT-LIB rendering of the asserted (negated) formula, for human/debug use.
     pub asserted_smt: String,
@@ -607,6 +631,28 @@ pub enum BvBlastExportError {
 /// Errors from [`BvBlastProof::validate`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BvBlastValidateError {
+    /// A bounded replay exceeded a deterministic certificate resource cap.
+    #[error("proof replay resource `{resource}` exceeds limit {limit} (actual {actual})")]
+    ResourceLimit {
+        /// Stable resource name.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: u64,
+        /// Observed amount.
+        actual: u64,
+    },
+    /// The absolute bounded-replay deadline expired.
+    #[error("proof replay deadline expired")]
+    DeadlineExceeded,
+    /// The serialized certificate contract version is not the one this
+    /// validator implements.
+    #[error("unsupported bit-blast proof format version {got} (expected {expected})")]
+    UnsupportedFormatVersion {
+        /// Version found in the proof.
+        got: u32,
+        /// Current supported version.
+        expected: u32,
+    },
     /// A variable id referenced somewhere is not in the [`VarTable`].
     #[error("variable id {0} out of range")]
     UndefinedVar(u32),
@@ -621,6 +667,60 @@ pub enum BvBlastValidateError {
         expected: usize,
         /// Actual arity.
         got: usize,
+    },
+    /// A bit lemma id is not its dense canonical vector position.
+    #[error("bit lemma at index {index} has non-canonical id {id}")]
+    NonCanonicalBitLemmaId {
+        /// Position in `bit_lemmas`.
+        index: usize,
+        /// Recorded id.
+        id: u32,
+    },
+    /// Two definitional lemmas attempt to define the same Boolean variable.
+    #[error("bit lemmas {first} and {second} both define variable {var}")]
+    DuplicateGateOutput {
+        /// Re-defined output variable.
+        var: u32,
+        /// First defining lemma.
+        first: u32,
+        /// Second defining lemma.
+        second: u32,
+    },
+    /// A lemma output uses a role reserved for unconstrained input variables.
+    #[error("bit lemma {lemma} defines input-role variable {var}")]
+    GateDefinesInput {
+        /// Lemma id.
+        lemma: u32,
+        /// Output variable.
+        var: u32,
+    },
+    /// A lemma reads a gate output before that output is defined. Requiring
+    /// topological order makes cycles and forward references fail closed.
+    #[error("bit lemma {lemma} reads undefined/non-topological variable {var}")]
+    GateInputNotDefined {
+        /// Lemma id.
+        lemma: u32,
+        /// Input variable.
+        var: u32,
+    },
+    /// A non-input variable has no gate definition.
+    #[error("non-input variable {var} has no gate definition")]
+    MissingGateDefinition {
+        /// Undefined variable.
+        var: u32,
+    },
+    /// `BitEq` roles or their XNOR definitions do not match the equality width.
+    #[error("malformed BitEq layout: {reason}")]
+    MalformedBitEqLayout {
+        /// Exact failed side condition.
+        reason: String,
+    },
+    /// Disequality provenance is not the single exact clause over all BitEq
+    /// variables required by the certificate contract.
+    #[error("malformed disequality clause: {reason}")]
+    MalformedDisequality {
+        /// Exact failed side condition.
+        reason: String,
     },
     /// A clause cites a bit lemma index that does not exist.
     #[error("clause {clause} cites missing bit lemma {lemma}")]
@@ -654,6 +754,16 @@ pub enum BvBlastValidateError {
         /// Recorded id.
         id: u32,
     },
+    /// A resolution-step id is not its canonical namespace position.
+    #[error("resolution step at index {index} has non-canonical id {id} (expected {expected})")]
+    NonCanonicalResolutionStepId {
+        /// Position in `refutation.steps`.
+        index: usize,
+        /// Recorded id.
+        id: u32,
+        /// `clauses.len() + index`.
+        expected: u32,
+    },
     /// A resolution step references a premise id that names nothing.
     #[error("step {step} references unknown premise {premise}")]
     UnknownPremise {
@@ -676,8 +786,98 @@ pub enum BvBlastValidateError {
     EmptyRefutation,
 }
 
+/// Explicit finite limits for authority-grade [`BvBlastProof`] replay.
+#[derive(Clone, Copy, Debug)]
+pub struct BvBlastValidateLimits {
+    /// Absolute deadline shared with proof search/materialization.
+    pub deadline: Option<Instant>,
+    /// Maximum Boolean variables.
+    pub max_vars: usize,
+    /// Maximum definitional bit lemmas.
+    pub max_bit_lemmas: usize,
+    /// Maximum original CNF clauses.
+    pub max_clauses: usize,
+    /// Maximum literals in one original clause.
+    pub max_clause_literals: usize,
+    /// Maximum literals across original clauses.
+    pub max_original_literals: usize,
+    /// Maximum binary resolution steps.
+    pub max_resolution_steps: usize,
+    /// Maximum literals stored across derived clauses.
+    pub max_derived_literals: usize,
+    /// Maximum deterministic literal/work units, including every referenced
+    /// premise scan, resolvent construction, and clause comparison.
+    pub max_work: u64,
+}
+
+impl BvBlastValidateLimits {
+    fn unbounded() -> Self {
+        Self {
+            deadline: None,
+            max_vars: usize::MAX,
+            max_bit_lemmas: usize::MAX,
+            max_clauses: usize::MAX,
+            max_clause_literals: usize::MAX,
+            max_original_literals: usize::MAX,
+            max_resolution_steps: usize::MAX,
+            max_derived_literals: usize::MAX,
+            max_work: u64::MAX,
+        }
+    }
+}
+
+struct ReplayBudget<'a> {
+    limits: &'a BvBlastValidateLimits,
+    work: u64,
+}
+
+impl ReplayBudget<'_> {
+    fn deadline(&self) -> Result<(), BvBlastValidateError> {
+        if self
+            .limits
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Err(BvBlastValidateError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn count(
+        &self,
+        resource: &'static str,
+        actual: usize,
+        limit: usize,
+    ) -> Result<(), BvBlastValidateError> {
+        if actual <= limit {
+            Ok(())
+        } else {
+            Err(BvBlastValidateError::ResourceLimit {
+                resource,
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                actual: u64::try_from(actual).unwrap_or(u64::MAX),
+            })
+        }
+    }
+
+    fn add_work(&mut self, units: usize) -> Result<(), BvBlastValidateError> {
+        let units = u64::try_from(units).unwrap_or(u64::MAX);
+        self.work = self.work.checked_add(units).unwrap_or(u64::MAX);
+        if self.work > self.limits.max_work {
+            return Err(BvBlastValidateError::ResourceLimit {
+                resource: "validation work",
+                limit: self.limits.max_work,
+                actual: self.work,
+            });
+        }
+        self.deadline()
+    }
+}
+
 impl BvBlastProof {
-    /// Validate well-formedness against the contract.
+    /// Validate internal graph/CNF/refutation well-formedness against the
+    /// contract.
     ///
     /// Checks: all referenced var ids exist; every bit lemma has correct arity;
     /// every clause has a real provenance (an existing bit lemma, or the
@@ -686,9 +886,56 @@ impl BvBlastProof {
     /// the pivot; and the final derived clause is empty. No step may be opaque
     /// (the [`ResRule`] enum cannot express one).
     ///
+    /// This method does not authenticate `asserted_smt` or bind a serialized
+    /// proof to a caller's live source formula. Authority-granting external
+    /// consumers must perform the source-binding check described in the module
+    /// documentation in addition to this replay.
+    ///
     /// # Errors
     /// Returns the first [`BvBlastValidateError`] encountered.
     pub fn validate(&self) -> Result<(), BvBlastValidateError> {
+        self.validate_with_limits(&BvBlastValidateLimits::unbounded())
+    }
+
+    /// Validate with explicit certificate-size, replay-work, and deadline
+    /// limits. This is the resource-safe internal replay entry point for
+    /// untrusted surfaced proofs: every vector is bounded before traversal and
+    /// every referenced premise scan/resolution is charged before it is
+    /// performed. Source binding remains a separate consumer obligation.
+    ///
+    /// # Errors
+    /// Returns the first semantic or resource error encountered.
+    pub fn validate_with_limits(
+        &self,
+        limits: &BvBlastValidateLimits,
+    ) -> Result<(), BvBlastValidateError> {
+        let mut budget = ReplayBudget { limits, work: 0 };
+        budget.deadline()?;
+        if self.format_version != FORMAT_VERSION {
+            return Err(BvBlastValidateError::UnsupportedFormatVersion {
+                got: self.format_version,
+                expected: FORMAT_VERSION,
+            });
+        }
+        let equality_width = self.obligation.width;
+        if equality_width == 0 || equality_width > MAX_WIDTH {
+            return Err(BvBlastValidateError::MalformedBitEqLayout {
+                reason: format!("equality width {equality_width} is outside 1..={MAX_WIDTH}"),
+            });
+        }
+        budget.count("variables", self.vars.len(), limits.max_vars)?;
+        budget.count("bit lemmas", self.bit_lemmas.len(), limits.max_bit_lemmas)?;
+        budget.count("clauses", self.clauses.len(), limits.max_clauses)?;
+        budget.count(
+            "resolution steps",
+            self.refutation.steps.len(),
+            limits.max_resolution_steps,
+        )?;
+        // Every certificate id is a u32. Refuse impossible/truncating id spaces
+        // even for callers of the compatibility `validate()` entry point.
+        budget.count("variables", self.vars.len(), u32::MAX as usize)?;
+        budget.count("clauses", self.clauses.len(), u32::MAX as usize)?;
+
         let nvars = self.vars.len() as u32;
         let check_var = |v: u32| -> Result<(), BvBlastValidateError> {
             if v < nvars {
@@ -698,8 +945,23 @@ impl BvBlastProof {
             }
         };
 
-        // 1. Bit lemmas: arity + var references.
-        for lem in &self.bit_lemmas {
+        // 1. Bit lemmas: canonical ids, arity, unique definitions, and a
+        // topological/inhabitable gate graph. Input-role variables are the only
+        // unconstrained leaves; every other variable must be defined exactly
+        // once by a total Boolean gate.
+        let is_input_role = |role: &VarRole| {
+            matches!(
+                role,
+                VarRole::InputA { .. } | VarRole::InputB { .. } | VarRole::InputLeaf { .. }
+            )
+        };
+        let mut available: Vec<bool> = self.vars.roles.iter().map(is_input_role).collect();
+        let mut defined_by: Vec<Option<u32>> = vec![None; self.vars.len()];
+        for (index, lem) in self.bit_lemmas.iter().enumerate() {
+            budget.add_work(lem.ins.len().saturating_add(1))?;
+            if lem.id as usize != index {
+                return Err(BvBlastValidateError::NonCanonicalBitLemmaId { index, id: lem.id });
+            }
             let expected = lem.kind.arity();
             if lem.ins.len() != expected {
                 return Err(BvBlastValidateError::BadLemmaArity {
@@ -710,13 +972,122 @@ impl BvBlastProof {
                 });
             }
             check_var(lem.out)?;
+            if is_input_role(&self.vars.roles[lem.out as usize]) {
+                return Err(BvBlastValidateError::GateDefinesInput {
+                    lemma: lem.id,
+                    var: lem.out,
+                });
+            }
+            if let Some(first) = defined_by[lem.out as usize] {
+                return Err(BvBlastValidateError::DuplicateGateOutput {
+                    var: lem.out,
+                    first,
+                    second: lem.id,
+                });
+            }
             for &i in &lem.ins {
                 check_var(i)?;
+                if !available[i as usize] {
+                    return Err(BvBlastValidateError::GateInputNotDefined {
+                        lemma: lem.id,
+                        var: i,
+                    });
+                }
             }
+            defined_by[lem.out as usize] = Some(lem.id);
+            available[lem.out as usize] = true;
+        }
+
+        let mut bit_eq_vars: Vec<Option<u32>> = vec![None; equality_width as usize];
+        for (var, role) in self.vars.roles.iter().enumerate() {
+            budget.add_work(1)?;
+            if !is_input_role(role) && defined_by[var].is_none() {
+                return Err(BvBlastValidateError::MissingGateDefinition { var: var as u32 });
+            }
+            let VarRole::BitEq { bit } = *role else {
+                continue;
+            };
+            let Some(slot) = bit_eq_vars.get_mut(bit as usize) else {
+                return Err(BvBlastValidateError::MalformedBitEqLayout {
+                    reason: format!(
+                        "variable {var} names out-of-range bit {bit} for width {equality_width}"
+                    ),
+                });
+            };
+            if let Some(previous) = slot.replace(var as u32) {
+                return Err(BvBlastValidateError::MalformedBitEqLayout {
+                    reason: format!("bit {bit} is assigned to both variables {previous} and {var}"),
+                });
+            }
+            let lemma_id = defined_by[var].expect("non-input definition checked above");
+            let lemma = &self.bit_lemmas[lemma_id as usize];
+            if lemma.kind != BitLemmaKind::XnorEq || lemma.out != var as u32 {
+                return Err(BvBlastValidateError::MalformedBitEqLayout {
+                    reason: format!(
+                        "variable {var} for bit {bit} is not defined by its own XnorEq lemma"
+                    ),
+                });
+            }
+        }
+        if let Some((bit, _)) = bit_eq_vars
+            .iter()
+            .enumerate()
+            .find(|(_, variable)| variable.is_none())
+        {
+            return Err(BvBlastValidateError::MalformedBitEqLayout {
+                reason: format!("missing BitEq variable for bit {bit}"),
+            });
+        }
+
+        // The only non-gate axiom is one exact encoding of `not(lhs = rhs)`:
+        // one negative literal for every BitEq variable and nothing else.
+        let disequalities: Vec<&Clause> = self
+            .clauses
+            .iter()
+            .filter(|clause| matches!(clause.provenance, ClauseProvenance::Disequality))
+            .collect();
+        if disequalities.len() != 1 {
+            return Err(BvBlastValidateError::MalformedDisequality {
+                reason: format!(
+                    "expected exactly one disequality clause, found {}",
+                    disequalities.len()
+                ),
+            });
+        }
+        let disequality = disequalities[0];
+        budget.add_work(disequality.lits.len().saturating_add(bit_eq_vars.len()))?;
+        let expected_disequality: BTreeSet<Lit> = bit_eq_vars
+            .iter()
+            .map(|variable| Lit::neg(variable.expect("all BitEq slots checked above")))
+            .collect();
+        let actual_disequality: BTreeSet<Lit> = disequality.lits.iter().copied().collect();
+        if disequality.lits.len() != expected_disequality.len()
+            || actual_disequality != expected_disequality
+        {
+            return Err(BvBlastValidateError::MalformedDisequality {
+                reason: "literals must be exactly the negative BitEq variables, once each"
+                    .to_string(),
+            });
         }
 
         // 2. Clauses: canonical ids, provenance resolves, var references.
+        let mut original_literals = 0_usize;
         for (idx, cl) in self.clauses.iter().enumerate() {
+            budget.deadline()?;
+            budget.count(
+                "original clause literals",
+                cl.lits.len(),
+                limits.max_clause_literals,
+            )?;
+            original_literals = original_literals
+                .checked_add(cl.lits.len())
+                .unwrap_or(usize::MAX);
+            budget.count(
+                "original literals",
+                original_literals,
+                limits.max_original_literals,
+            )?;
+            budget.add_work(cl.lits.len().saturating_add(1))?;
             if cl.id as usize != idx {
                 return Err(BvBlastValidateError::NonCanonicalClauseId {
                     index: idx,
@@ -740,6 +1111,10 @@ impl BvBlastProof {
                     // tag is verified, not believed. A clause with arbitrary literals
                     // that merely cites an in-range lemma is rejected here.
                     let generated = tseitin_clauses(lem.kind, lem.out, &lem.ins);
+                    let comparison_work = generated.iter().fold(0_usize, |work, candidate| {
+                        work.saturating_add(candidate.len().saturating_add(cl.lits.len()))
+                    });
+                    budget.add_work(comparison_work)?;
                     if !generated.iter().any(|g| clause_set_eq(g, &cl.lits)) {
                         return Err(BvBlastValidateError::ClauseNotEntailed {
                             clause: cl.id,
@@ -758,31 +1133,63 @@ impl BvBlastProof {
         if self.refutation.steps.is_empty() {
             return Err(BvBlastValidateError::EmptyRefutation);
         }
-        let lookup = |id: u32, upto_step: usize| -> Option<Vec<Lit>> {
+        let lookup = |id: u32, upto_step: usize| -> Option<&[Lit]> {
             if id < nclauses {
-                return Some(self.clauses[id as usize].lits.clone());
+                return Some(self.clauses[id as usize].lits.as_slice());
             }
             let step_idx = (id - nclauses) as usize;
             if step_idx < upto_step {
-                Some(self.refutation.steps[step_idx].clause.clone())
+                Some(self.refutation.steps[step_idx].clause.as_slice())
             } else {
                 None
             }
         };
 
+        let mut derived_literals = 0_usize;
         for (i, step) in self.refutation.steps.iter().enumerate() {
-            for &p in &step.premises {
-                if lookup(p, i).is_none() {
-                    return Err(BvBlastValidateError::UnknownPremise {
-                        step: step.id,
-                        premise: p,
-                    });
-                }
+            budget.deadline()?;
+            let expected_id = nclauses
+                .checked_add(u32::try_from(i).unwrap_or(u32::MAX))
+                .unwrap_or(u32::MAX);
+            if step.id != expected_id {
+                return Err(BvBlastValidateError::NonCanonicalResolutionStepId {
+                    index: i,
+                    id: step.id,
+                    expected: expected_id,
+                });
             }
+            derived_literals = derived_literals
+                .checked_add(step.clause.len())
+                .unwrap_or(usize::MAX);
+            budget.count(
+                "derived literals",
+                derived_literals,
+                limits.max_derived_literals,
+            )?;
+            let Some(a) = lookup(step.premises[0], i) else {
+                return Err(BvBlastValidateError::UnknownPremise {
+                    step: step.id,
+                    premise: step.premises[0],
+                });
+            };
+            let Some(b) = lookup(step.premises[1], i) else {
+                return Err(BvBlastValidateError::UnknownPremise {
+                    step: step.id,
+                    premise: step.premises[1],
+                });
+            };
+            let local_work = a
+                .len()
+                .saturating_add(b.len())
+                .saturating_add(step.clause.len())
+                .saturating_mul(4)
+                .saturating_add(1);
+            budget.add_work(local_work)?;
             check_var(step.pivot)?;
-            let a = lookup(step.premises[0], i).expect("checked above");
-            let b = lookup(step.premises[1], i).expect("checked above");
-            let got = resolve(&a, &b, step.pivot);
+            for literal in &step.clause {
+                check_var(literal.var)?;
+            }
+            let got = resolve(a, b, step.pivot);
             match got {
                 Some(resolvent) if clause_set_eq(&resolvent, &step.clause) => {}
                 _ => return Err(BvBlastValidateError::ResolutionMismatch { step: step.id }),
@@ -797,6 +1204,7 @@ impl BvBlastProof {
         if !last.clause.is_empty() {
             return Err(BvBlastValidateError::NotEmptyClause(last.clause.len()));
         }
+        budget.deadline()?;
         Ok(())
     }
 }

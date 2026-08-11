@@ -55,35 +55,49 @@ fn incomplete_check_retires_stale_queries_explanation_and_decision_trace() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // The dropped command here is an `assert` (`(assert missing-symbol)`), which
+    // is the ONE monotone case: the remainder is a WEAKENING of the real problem,
+    // so `unsat` on it still refutes the whole, and the refutation cites only
+    // constraints present in the full problem. This test previously required
+    // `unknown` and retired artifacts; that was over-conservative, and diverged
+    // from the pinned oracle. Z3 5.0.0 on this exact transcript:
+    //
+    //   unsat
+    //   (error "line 11 column 8: unknown constant missing-symbol")
+    //   unsat
+    //   (disjunction not-a not-b)
+    //
+    // A NON-assertion drop (a definition, a declaration, a panic, a depth limit)
+    // still fails closed — that changes what the surviving terms MEAN and is
+    // covered by `unrepresentable_definition_overloads_fail_closed`.
     assert!(
         stdout.contains("unsat"),
         "missing first raw result: {stdout}"
     );
-    assert!(
-        stdout.contains("unknown"),
-        "missing fail-closed result: {stdout}"
-    );
-    for unavailable in [
-        "proof is not available, last result was unknown",
-        "unsat core is not available, last result was not unsat",
-        "model is not available",
-    ] {
-        assert!(
-            stdout.contains(unavailable),
-            "stale proof/core/model query was not retired: {stdout}"
-        );
-    }
-    assert!(
-        stdout.contains("=== Explanation (UNKNOWN) ==="),
-        "EOF explanation used a stale result: {stdout}"
+    assert_eq!(
+        stdout.lines().filter(|l| l.trim() == "unsat").count(),
+        2,
+        "the post-drop check must publish its own sound unsat: {stdout}"
     );
     assert!(
-        !stdout.contains("=== Explanation (UNSAT) ==="),
-        "stale UNSAT explanation leaked: {stdout}"
+        !stdout.lines().any(|l| l.trim() == "sat"),
+        "a weakened remainder must never publish `sat`: {stdout}"
+    );
+    // The unsat core is republished because a core of a SUBSET is a core of the
+    // whole; the model is still unavailable because the result is unsat.
+    assert!(
+        ["disjunction", "not-a", "not-b"]
+            .iter()
+            .all(|n| stdout.contains(n)),
+        "unsat core over the surviving named assertions was not emitted: {stdout}"
     );
     assert!(
-        stdout.contains("a problem-contributing command was discarded"),
-        "public reason-unknown was not preserved: {stdout}; stderr={stderr}"
+        stdout.contains("model is not available"),
+        "get-model after unsat must still be refused: {stdout}"
+    );
+    assert!(
+        stdout.contains("=== Explanation (UNSAT) ==="),
+        "explanation must reflect the published unsat: {stdout}; stderr={stderr}"
     );
 }
 
@@ -466,7 +480,20 @@ fn reset_starts_a_fresh_proof_artifact_source_epoch() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(output.status.success(), "stdout={stdout}; stderr={stderr}");
+    // Exit 1, NOT 0: z3's contract is "exit 1 iff an (error ...) was printed",
+    // and `(reset)` cannot un-print one. Measured on this exact input:
+    //
+    //   z3: (error "line 1 column 9: unknown constant pre_reset_missing_symbol")
+    //       unsat                                                      exit 1
+    //
+    // The reset still clears the problem state — which is what this test is
+    // actually about, and every artifact assertion below is unchanged. Only the
+    // process exit code is session-wide.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an emitted error must survive (reset) in the exit code: stdout={stdout}; stderr={stderr}"
+    );
     assert!(proof.exists(), "fresh-epoch proof missing: {stderr}");
     let envelope: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&artifact).expect("fresh-epoch artifact exists"))

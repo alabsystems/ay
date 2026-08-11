@@ -110,12 +110,22 @@ impl Solver {
         }
         // #8467: lazy theory reasons are table indexes, not arena offsets.
         let reason_raw = self.var_data[var_index].reason;
-        if is_clause_reason(reason_raw) && !self.var_data[var_index].is_lazy_theory_reason() {
+        let omission = if !is_clause_reason(reason_raw) {
+            Some(crate::HintOmission::NotClauseReason)
+        } else if self.var_data[var_index].is_lazy_theory_reason() {
+            Some(crate::HintOmission::LazyTheoryReason)
+        } else {
             let id = self.clause_id(ClauseRef(reason_raw));
             if id != 0 {
+                self.record_hint_lookup(None);
                 return Some(id);
             }
-        }
+            Some(crate::HintOmission::ZeroClauseId)
+        };
+        // Introspection: an unhinted literal cannot be resolved away downstream,
+        // which is what turns a reconstructed clause into a strict superclause
+        // of its target and forces the `trust` fallback.
+        self.record_hint_lookup(omission);
         None
     }
 
@@ -130,13 +140,32 @@ impl Solver {
         }
         // #8467: lazy theory reasons are table indexes, not arena offsets.
         let reason_raw = self.var_data[var_index].reason;
-        if is_clause_reason(reason_raw) && !self.var_data[var_index].is_lazy_theory_reason() {
+        let omission = if !is_clause_reason(reason_raw) {
+            Some(crate::HintOmission::NotClauseReason)
+        } else if self.var_data[var_index].is_lazy_theory_reason() {
+            Some(crate::HintOmission::LazyTheoryReason)
+        } else {
             let id = self.clause_id(ClauseRef(reason_raw));
             if id != 0 {
+                self.record_hint_lookup(None);
                 return Some(id);
             }
-        }
+            Some(crate::HintOmission::ZeroClauseId)
+        };
+        // Introspection: an unhinted literal cannot be resolved away downstream,
+        // which is what turns a reconstructed clause into a strict superclause
+        // of its target and forces the `trust` fallback.
+        self.record_hint_lookup(omission);
         None
+    }
+
+    /// Forward a level-0 hint-lookup outcome to the clause trace, when tracing
+    /// is enabled. No-op (and no cost beyond an `Option` check) otherwise.
+    #[inline]
+    pub(super) fn record_hint_lookup(&self, omission: Option<crate::HintOmission>) {
+        if let Some(trace) = self.cold.clause_trace.as_ref() {
+            trace.record_hint_lookup(omission);
+        }
     }
 
     /// Charge `units` of search-time proof bookkeeping work against the #A2b
@@ -360,8 +389,20 @@ impl Solver {
     /// Uses `level0_unit_chain_proof_id` which does NOT fall back to
     /// multi-literal reason clause IDs in LRAT mode (#7108).
     pub(super) fn materialize_level0_unit_proofs(&mut self) {
+        let _ = self.materialize_level0_unit_proofs_impl(false);
+    }
+
+    /// Interruptible form for callers that can atomically decline the pending
+    /// clause mutation.  Other proof-building callers retain the original
+    /// all-or-complete behavior so a deadline cannot silently leave their
+    /// proof row half prepared.
+    pub(super) fn materialize_level0_unit_proofs_interruptible(&mut self) -> bool {
+        self.materialize_level0_unit_proofs_impl(true)
+    }
+
+    fn materialize_level0_unit_proofs_impl(&mut self, honor_stop: bool) -> bool {
         if !self.cold.lrat_enabled {
-            return;
+            return true;
         }
 
         let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
@@ -376,13 +417,28 @@ impl Solver {
         // no-proof search entirely.
         if self.cold.proof_bookkeeping_budget == Some(0) {
             self.degrade_proof_bookkeeping_after_exhaustion();
-            return;
+            return true;
         }
         self.stats.lrat_materialize_calls += 1;
         self.stats.lrat_materialize_root_trail_entries += (level0_end - start) as u64;
         let mut hints = std::mem::take(&mut self.cold.lrat_materialize_hints_buf);
         let mut next_cursor = level0_end;
+        let mut deadline_truncated = false;
         for i in start..level0_end {
+            // This routine is reached from incremental level-0 garbage
+            // collection before the CDCL loop can poll `should_stop`. A long
+            // LRAT trail used to overrun the forwarded whole-solve deadline by
+            // minutes while repeatedly reconstructing unit chains. Stop only
+            // between proof rows, retain the cursor at the unfinished entry,
+            // and let the surrounding solve publish Unknown.
+            if honor_stop
+                && (i - start).is_multiple_of(64)
+                && (self.solve_deadline_expired() || self.is_interrupted())
+            {
+                next_cursor = next_cursor.min(i);
+                deadline_truncated = true;
+                break;
+            }
             let unit_lit = self.trail[i];
             let var_idx = unit_lit.variable().index();
             if var_idx >= self.num_vars
@@ -433,6 +489,15 @@ impl Solver {
             }
             let mut complete = true;
             for j in 0..clause_len {
+                if honor_stop
+                    && j.is_multiple_of(64)
+                    && (self.solve_deadline_expired() || self.is_interrupted())
+                {
+                    next_cursor = next_cursor.min(i);
+                    deadline_truncated = true;
+                    complete = false;
+                    break;
+                }
                 let other_lit = self.arena.literal(clause_idx, j);
                 let other_var = other_lit.variable().index();
                 if other_var == var_idx {
@@ -447,6 +512,9 @@ impl Solver {
                 }
             }
 
+            if deadline_truncated {
+                break;
+            }
             if !complete {
                 let hidden_already_materialized = self
                     .cold
@@ -509,9 +577,10 @@ impl Solver {
         self.cold.lrat_level0_unit_materialize_cursor = next_cursor;
         // #A2b: charge only wasted (cursor-pinned) rescan work; see
         // `materialize_level0_minimize_unit_proofs`.
-        if next_cursor <= start && level0_end > start {
+        if !deadline_truncated && next_cursor <= start && level0_end > start {
             self.charge_proof_bookkeeping((level0_end - start) as u64);
         }
+        !deadline_truncated
     }
 
     /// DFS post-order traversal through reason graph for removed literals.

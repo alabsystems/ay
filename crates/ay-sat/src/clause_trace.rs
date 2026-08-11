@@ -14,6 +14,7 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use std::cell::Cell;
 use std::mem::size_of;
 
 use crate::literal::Literal;
@@ -61,6 +62,73 @@ impl ClauseTraceEntry {
 /// this allows ~1.1M entries before truncation.
 const DEFAULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Why a level-0 minimize-chain hint could not be recorded.
+///
+/// A conflict-analysis literal whose reason cannot be named by a stable clause
+/// ID contributes NO resolution hint, so downstream proof reconstruction cannot
+/// resolve that literal away. The derived clause then keeps extra literals and
+/// `SatProofManager` falls back to an unverifiable `trust` step. These counters
+/// make that loss observable instead of silent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HintOmissionStats {
+    /// Total level-0 minimize-chain hint lookups.
+    pub queries: u64,
+    /// Lookups that produced a usable clause ID.
+    pub resolved: u64,
+    /// Omitted: the variable's reason is not a clause reason at all.
+    pub omitted_not_clause_reason: u64,
+    /// Omitted: the reason is a lazy theory reason (a table index, not an
+    /// arena offset — see #8467), so it has no stable clause ID.
+    pub omitted_lazy_theory_reason: u64,
+    /// Omitted: the reason is a clause but its stable ID is 0 (untracked).
+    pub omitted_zero_clause_id: u64,
+}
+
+impl HintOmissionStats {
+    /// Total omissions across all causes.
+    #[must_use]
+    pub fn omitted_total(&self) -> u64 {
+        self.omitted_not_clause_reason
+            .saturating_add(self.omitted_lazy_theory_reason)
+            .saturating_add(self.omitted_zero_clause_id)
+    }
+}
+
+/// Cause of a single hint omission, reported by the solver's lookup paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HintOmission {
+    /// The variable's reason is not a clause reason.
+    NotClauseReason,
+    /// The reason is a lazy theory reason (no stable clause ID).
+    LazyTheoryReason,
+    /// The reason is a clause whose stable ID is 0.
+    ZeroClauseId,
+}
+
+/// Interior-mutable counters so the `&self` hint-lookup paths can record.
+#[derive(Debug, Default)]
+struct HintOmissionCounters {
+    queries: Cell<u64>,
+    resolved: Cell<u64>,
+    not_clause_reason: Cell<u64>,
+    lazy_theory_reason: Cell<u64>,
+    zero_clause_id: Cell<u64>,
+}
+
+impl Clone for HintOmissionCounters {
+    fn clone(&self) -> Self {
+        Self {
+            queries: Cell::new(self.queries.get()),
+            resolved: Cell::new(self.resolved.get()),
+            not_clause_reason: Cell::new(self.not_clause_reason.get()),
+            lazy_theory_reason: Cell::new(self.lazy_theory_reason.get()),
+            zero_clause_id: Cell::new(self.zero_clause_id.get()),
+        }
+    }
+}
+
 /// In-memory clause trace for proof reconstruction
 ///
 /// Records all clause additions in order, enabling the SMT layer to emit
@@ -88,6 +156,8 @@ pub struct ClauseTrace {
     is_truncated: bool,
     /// True if search-time proof bookkeeping exhausted its work budget (#A2b)
     proof_work_exhausted: bool,
+    /// Why level-0 minimize-chain hints were dropped (introspection).
+    hint_omissions: HintOmissionCounters,
 }
 
 impl Default for ClauseTrace {
@@ -106,6 +176,7 @@ impl ClauseTrace {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             is_truncated: false,
             proof_work_exhausted: false,
+            hint_omissions: HintOmissionCounters::default(),
         }
     }
 
@@ -118,6 +189,7 @@ impl ClauseTrace {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             is_truncated: false,
             proof_work_exhausted: false,
+            hint_omissions: HintOmissionCounters::default(),
         }
     }
 
@@ -127,6 +199,39 @@ impl ClauseTrace {
         // plus heap allocations for clause and hints vectors.
         const ENTRY_OVERHEAD: usize = 64;
         ENTRY_OVERHEAD + clause_len * size_of::<Literal>() + hints_len * size_of::<u64>()
+    }
+
+    /// Record the outcome of a level-0 minimize-chain hint lookup.
+    ///
+    /// Takes `&self` because the solver's lookup paths are `&self`; the
+    /// counters are `Cell`-based and the solver instance is single-threaded.
+    pub fn record_hint_lookup(&self, omission: Option<HintOmission>) {
+        self.hint_omissions
+            .queries
+            .set(self.hint_omissions.queries.get().saturating_add(1));
+        let counter = match omission {
+            None => &self.hint_omissions.resolved,
+            Some(HintOmission::NotClauseReason) => &self.hint_omissions.not_clause_reason,
+            Some(HintOmission::LazyTheoryReason) => &self.hint_omissions.lazy_theory_reason,
+            Some(HintOmission::ZeroClauseId) => &self.hint_omissions.zero_clause_id,
+        };
+        counter.set(counter.get().saturating_add(1));
+    }
+
+    /// Snapshot of why level-0 minimize-chain hints were dropped.
+    ///
+    /// A non-zero `omitted_total()` is the direct cause of `FinalClauseMismatch`
+    /// during proof reconstruction: the unhinted literals cannot be resolved
+    /// away, so the derived clause is a strict superclause of its target.
+    #[must_use]
+    pub fn hint_omission_stats(&self) -> HintOmissionStats {
+        HintOmissionStats {
+            queries: self.hint_omissions.queries.get(),
+            resolved: self.hint_omissions.resolved.get(),
+            omitted_not_clause_reason: self.hint_omissions.not_clause_reason.get(),
+            omitted_lazy_theory_reason: self.hint_omissions.lazy_theory_reason.get(),
+            omitted_zero_clause_id: self.hint_omissions.zero_clause_id.get(),
+        }
     }
 
     /// Record a clause addition.

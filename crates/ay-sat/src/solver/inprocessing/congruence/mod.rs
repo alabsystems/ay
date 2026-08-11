@@ -575,7 +575,7 @@ impl Solver {
                     .as_deref()
                     .unwrap_or(&result.equivalence_edges),
             );
-            let count = indices.len() as u64;
+            let mut count = 0u64;
             for idx in indices {
                 let cid = if idx < self.cold.clause_ids.len() {
                     self.cold.clause_ids[idx]
@@ -587,7 +587,9 @@ impl Solver {
                 // level-0 unit proof that references this clause's ID BEFORE
                 // emitting the delete — otherwise later LRAT chains cite a
                 // deleted premise and the checker rejects the proof.
-                self.lrat_rederive_units_referencing_clause(idx, cid);
+                if !self.lrat_rederive_units_referencing_clause(idx, cid) {
+                    break;
+                }
                 let _ = self.proof_emit_delete_arena(idx, cid);
                 // Clear the clause ID after emitting the proof deletion (#8488).
                 // mark_garbage_keep_data keeps the clause data intact (for proof
@@ -603,6 +605,7 @@ impl Solver {
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(idx);
                 self.arena.mark_garbage_keep_data(idx);
+                count += 1;
             }
             count
         } else {

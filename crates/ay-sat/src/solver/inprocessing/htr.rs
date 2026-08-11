@@ -30,6 +30,9 @@ impl Solver {
         if !self.enter_inprocessing() {
             return false;
         }
+        // See the BCE entry point: size the occurrence list on first use
+        // rather than paying 128 B/var at solver construction.
+        self.inproc.htr.ensure_num_vars(self.num_vars);
         // LRAT override handled centrally by InprocessingControls::with_proof_overrides().
 
         // Scale HTR resolvent limit with active variables.

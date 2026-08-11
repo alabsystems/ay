@@ -10,7 +10,7 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{ClausificationProof, Proof, TheoryLemmaProof};
-use ay_core::{TermId, TermStore};
+use ay_core::{Sort, TermId, TermStore};
 use ay_frontend::{Command, CommandResult, Context, OptionValue};
 use ay_sat::{ClauseTrace, SatUnknownReason};
 use std::cell::Cell;
@@ -21,7 +21,9 @@ use crate::incremental_state::IncrementalSubsystem;
 
 use ay_proof::PartialProofCheck;
 
-use crate::executor_types::{ExecutorError, Result, SolveResult, Statistics, UnknownReason};
+use crate::executor_types::{
+    ExecutorError, Result, SolveResult, Statistics, UnknownOrigin, UnknownReason,
+};
 use crate::quantifier_manager::QuantifierManager;
 use crate::VerificationLevel;
 
@@ -69,6 +71,13 @@ const MAX_EMATCHING_ROUND_CEILING: usize = 128;
 /// excessive overhead on already-converged formulas.
 const MAX_INTERLEAVED_EMATCHING_ROUNDS: usize = 4;
 
+/// Parsed-assertion sentinel for constraints authored through the native API.
+///
+/// Native assertions have no SMT-LIB surface term to re-elaborate during proof
+/// reconstruction.  Both anonymous and named assertions must therefore carry
+/// the same sentinel: the optional name is unsat-core metadata, not syntax.
+pub(crate) const NATIVE_API_ASSERTION_PLACEHOLDER: &str = "__ay_api_assertion__";
+
 mod assumption_solving;
 mod bv_mbqi;
 mod check_sat;
@@ -109,12 +118,14 @@ mod solve_deadline;
 mod stats_contract;
 pub(crate) mod theories;
 mod uflia_model_repair;
+mod unsat_cert;
 use model::Model;
 // Re-export the SAT-emission witness token so the API boundary
 // (`api::types::results`) can name it while its constructor stays private to
 // the `sat_emit` module (mintable only inside `emit_sat_verdict`) (#sat-chokepoint).
 pub(crate) use model::sat_emit::SatCertificate;
 pub(crate) use solve_deadline::SolveDeadlineCell;
+pub(crate) use unsat_cert::UnsatCertificate;
 
 /// Red zone for `stacker::maybe_grow` at the executor entry points
 /// ([`Executor::new`], [`Executor::execute`], the check-sat pipeline, and
@@ -241,6 +252,28 @@ pub(crate) struct QuantExpansionRecord {
     /// folded instance term as merged into `expanded` (kept in sync with the
     /// same rewrites).
     pub(crate) instances: Vec<(Vec<TermId>, TermId)>,
+}
+
+/// Authenticated proof provenance for one direct E-matching instance.
+///
+/// Unlike [`QuantExpansionRecord`], E-matching does not replace the authored
+/// `forall` on the assertion stack.  The record is retained only after the
+/// proof tracker has independently replayed the exact substitution from a
+/// direct problem assertion.  Trust-leaf surgery may then use the same
+/// source/binding/instance triple to reconstruct a checked `forall_inst`
+/// consequence instead of exporting a `Generic` lemma.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmatchingProofRecord {
+    /// Position of the direct authored `forall` in the immutable assertion
+    /// stack (and therefore in `assertions_parsed()`).
+    pub(crate) assertion_index: usize,
+    /// Canonical source term seen by the E-matcher.  Retained so repair can
+    /// match a folded `not(forall)` leaf before rebuilding the source term.
+    pub(crate) quantifier: TermId,
+    /// Positional binder values independently checked by the proof tracker.
+    pub(crate) binding: Vec<TermId>,
+    /// Exact ground body produced by simultaneous substitution.
+    pub(crate) instance: TermId,
 }
 
 /// SMT executor that coordinates frontend parsing with theory solving
@@ -537,6 +570,10 @@ pub struct Executor {
     /// external checker can match. Cleared per check-sat alongside
     /// `proof_problem_assertion_provenance`.
     pub(crate) quant_expansion_records: Vec<QuantExpansionRecord>,
+    /// Direct, independently authenticated E-matching instantiations for the
+    /// current check-sat.  Cleared and nested-solve scoped alongside
+    /// `quant_expansion_records`; no record outlives its authored authority.
+    pub(crate) ematching_proof_records: Vec<EmatchingProofRecord>,
     /// Re-elaborated or raw-reconstructed ORIGINAL problem-assertion terms
     /// captured by the last proof rebuild.
     ///
@@ -554,6 +591,11 @@ pub struct Executor {
     last_proof_quality: Option<ay_proof::ProofQuality>,
     /// Reason for last Unknown result (for get-info :reason-unknown)
     last_unknown_reason: Option<UnknownReason>,
+    /// Exact production boundary that published the last Unknown result.
+    ///
+    /// Internal solver lanes may tentatively classify an Unknown by reason;
+    /// this field is installed only at the public publication chokepoint.
+    last_unknown_origin: Option<UnknownOrigin>,
     /// Statistics from last check-sat call
     last_statistics: Statistics,
     /// Debug flag for QF_UFBV solving
@@ -634,6 +676,9 @@ pub struct Executor {
     counterexample_style: crate::CounterexampleStyle,
     /// Proof tracker for collecting proof steps during solving
     proof_tracker: crate::proof_tracker::ProofTracker,
+    /// Explicit proof-output request, separate from mandatory internal proof
+    /// tracking used to certify every public UNSAT verdict.
+    proof_output_requested: bool,
     /// Deterministic step budget for post-UNSAT SAT-proof reconstruction
     /// (RUP replay clause scans). `None` = unlimited (explicit `--proof`,
     /// `--strict-proofs`, `:produce-proofs` scripts). `Some(n)` = best-effort:
@@ -693,6 +738,87 @@ pub struct Executor {
     /// incomplete candidate. Ground assertions still pass through the strict
     /// pre-skip oracle before this flag matters. Cleared at check-sat entry.
     pub(crate) dt_cert_grant_active: bool,
+    /// Sibling of [`Self::dt_cert_grant_active`] for the FINITE-TABLE SAT
+    /// certificate, set on the route where CEGQI has already classified the
+    /// ground remainder `Sat`.
+    ///
+    /// On that route `final_result` is `Sat`, so the phase-2.5 / phase-3.5 grant
+    /// arms — which fire only on `Unknown` and are what record certificate
+    /// authority — never run. The certificate is instead reached by the
+    /// restoration-branch recompute, which computed `explicit_certificate`
+    /// purely to SUPPRESS a downgrade and recorded nothing. The public emission
+    /// funnel then re-checked the model against universals the certificate had
+    /// already verified, could not ground-evaluate a `forall` over an infinite
+    /// domain, and failed closed — turning a certified `Sat` into `unknown`.
+    ///
+    /// Set ONLY after `try_finite_table_sat_certificate` succeeds, which
+    /// re-verifies EVERY snapshot assertion under an explicitly constructed
+    /// interpretation. That is the precondition the gate documents for these
+    /// markers: evidence composition, never a skip — the ground siblings are
+    /// still checked independently. Cleared at check-sat entry.
+    pub(crate) finite_table_cert_grant_active: bool,
+    /// Sibling of [`Self::finite_table_cert_grant_active`] for the
+    /// CONSTANT-INTERPRETATION SAT certificate
+    /// ([`Executor::try_const_interp_sat_certificate`]).
+    ///
+    /// Set on EVERY route that grants with that certificate — the phase-2.5 /
+    /// phase-3.5 arms (where `final_result` was a quantifier-class `Unknown`)
+    /// and the restoration-branch recompute (where CEGQI had already
+    /// classified the ground remainder `Sat`). Both are needed: the phase arms
+    /// alone leave the CEGQI route uncovered, and the restoration arm alone
+    /// never fires when the result was `Unknown`.
+    ///
+    /// The marker's precondition is the same one the finite-table flag
+    /// documents — an authority that re-verified EVERY snapshot assertion
+    /// under an explicitly constructed interpretation. This certificate meets
+    /// it in the strongest available form: each assertion was discharged by an
+    /// independent ground-solver `Unsat` on the negated, interpretation-
+    /// substituted, freshly-Skolemized body. Without the marker the public
+    /// emission funnel re-checks the candidate model against universals the
+    /// certificate has already certified, cannot ground-evaluate a `forall`
+    /// over an infinite domain, and fails closed — publishing a certified
+    /// `Sat` as `unknown`. Cleared at check-sat entry.
+    pub(crate) const_interp_cert_grant_active: bool,
+    /// Sibling certificate marker for
+    /// [`Executor::mbqi_sat_validated_left_inverse_axioms`]. That routine
+    /// certifies every restored universal against an explicitly materialized
+    /// interpretation, while the retained solver model may carry only the
+    /// ground core. The public SAT funnel uses this marker to compose that
+    /// quantified evidence with its independent ground-assertion checks.
+    /// Cleared at check-sat entry.
+    pub(crate) mbqi_sat_cert_grant_active: bool,
+    /// Ground-term values from the explicitly constructed interpretation of
+    /// the active MBQI SAT certificate. The retained theory model can be
+    /// intentionally lossy for constrained UF heads; these pins make the
+    /// public model evaluator observe the exact values the certificate checked.
+    /// Cleared at check-sat entry together with the grant marker.
+    mbqi_sat_cert_pins: HashMap<TermId, model::EvalValue>,
+    /// A finite-table certificate's outer witness, parked while later
+    /// result-mapping probes run. Nested solves may overwrite `last_model` and
+    /// clear active pins; the outer mapper installs this witness only after all
+    /// such probes finish and the certificate is still the final Sat authority.
+    finite_table_cert_pending_witness: Option<(Model, HashMap<TermId, model::EvalValue>)>,
+    /// The MATERIALIZED WITNESS of a constant-interpretation certificate grant:
+    /// the interpretation `I` the certificate machine-checked, in the form
+    /// `(get-model)` can print and the model evaluator can read.
+    ///
+    /// A `Sat` must carry a model (`check_sat_internal`'s boundary
+    /// postcondition, #4642), and the certificate's model IS `I` — every head
+    /// it pinned interpreted as the CONSTANT function `λ ȳ. c_f`. Before this
+    /// field existed the certificate had no way to say that: the only route to
+    /// a function-valued model entry,
+    /// `try_register_native_adopted_macro_interp`, refuses any symbol that a
+    /// constraint mentions, which is exactly the symbol occurring in the
+    /// quantified axiom. So the certificate DECLINED whenever there was no
+    /// other model to carry the witness, and those problems published
+    /// `unknown`.
+    ///
+    /// Non-empty ONLY between a grant and the next check-sat entry, and only on
+    /// the route where the certificate is the sole source of a model
+    /// (`last_model` was `None` when it granted, so nothing here can overwrite
+    /// a theory model built by a real solve). Cleared alongside
+    /// [`Self::const_interp_cert_grant_active`].
+    const_interp_cert_witness: Vec<mbqi::ConstInterpWitnessEntry>,
     /// Deadline propagated from API-level timeout settings.
     ///
     /// LIVE shared cell (#quantifier-determinism): stop closures capture a
@@ -876,6 +1002,22 @@ pub struct Executor {
     /// assertions, causing false violations. Validation is deferred to after the
     /// original assertions are restored (#2862).
     defer_model_validation: bool,
+    /// Set by `try_bv_mbqi_refinement` when EVERY unhandled BV `forall` was
+    /// discharged over its entire domain: either symbolically by proving
+    /// `G AND NOT body[skolem]` UNSAT, or by exhaustively enumerating every
+    /// value of a small BV carrier.
+    ///
+    /// This is the certificate that separates a PROOF from a SAMPLE.
+    /// `map_quantifier_result` fails a BV-MBQI Sat closed by default, and
+    /// rightly so: "no counterexample among the candidates I tried" is not a
+    /// totality proof (the shifted-trigger wrong-sat). Symbolic entailment and
+    /// exhaustive enumeration are total, so only those BV-MBQI Sat results may
+    /// be emitted.
+    ///
+    /// Cleared on entry to `try_mbqi_refinement` and whenever any quantifier is
+    /// discharged by a weaker route, so it is only ever true for an
+    /// all-quantifiers-full-domain pass.
+    bv_quantifier_full_domain_proof: bool,
     /// When true, `solve_and_store_model_full` stores the SAT/theory model but
     /// skips SAT-preserving counterexample minimization until the caller
     /// restores the original assertion set. Used by standalone preprocessing
@@ -891,6 +1033,14 @@ pub struct Executor {
     /// `take_sat_certificate` to build a public `Sat` `VerifiedSolveResult`, so
     /// no `Sat` can escape the boundary without the funnel (#sat-chokepoint).
     last_sat_certificate: Option<SatCertificate>,
+    /// One-shot witness that the last provisional UNSAT passed the mandatory
+    /// strict-proof publication funnel for its exact authored query epoch.
+    last_unsat_certificate: Option<UnsatCertificate>,
+    /// Frozen authored assertion and assumption authority for the active public
+    /// decision. Solver-generated preprocessing terms never enter this epoch.
+    unsat_query_epoch: Option<unsat_cert::UnsatQueryEpoch>,
+    /// Monotonic identity source for [`unsat_query_epoch`](Self::unsat_query_epoch).
+    next_unsat_query_epoch: u64,
     /// Phase 2 CEGAR (#dt-array-cegar): a select-congruence lemma that the model
     /// census / general select-congruence gate found the last SAT model to
     /// VIOLATE — `(=> (and (= A B) (= i j)) (= (select A i) (select B j)))` for
@@ -1061,6 +1211,27 @@ pub struct Executor {
     /// (which fail-closes the UNVERIFIED lazy array+arith combination, a distinct
     /// path). Set only on that exact reduction; reset at each check-sat entry.
     nested_array_row_reduction_unsat: bool,
+    /// When true, `unfold_ho_seq_ops` rewrote away every higher-order sequence
+    /// combinator and the LIVE assertions it left behind contain no nested
+    /// array, so the solver is never handed the array structure
+    /// `quarantine_unverified_nested_array_unsat` guards. Unfolding is an
+    /// equivalence (a function-as-array application IS `select`), so refuting
+    /// what remains refutes the original: such an UNSAT is authoritative and
+    /// exempt from that quarantine. Set only by that pass, consumed once at the
+    /// quarantine boundary, and reset at each check-sat entry.
+    ho_seq_unfold_array_free_unsat: bool,
+    /// Re-entrancy latch for the nested-array-free entailed-residue rescue
+    /// (`nested_array_free_residue_unsat`, #nested-array-residue-rescue). That
+    /// rescue re-solves a filtered subset of the hard assertions through the
+    /// ordinary `check_sat_guarded` pipeline, which funnels back through the
+    /// same quarantine boundary that launched it. The latch makes the attempt
+    /// STRICTLY one-shot per public check-sat: no nesting, no retry loop, so a
+    /// hard instance cannot multiply the probe budget.
+    in_nested_array_residue_probe: bool,
+    /// How many nested-array residue probes have FAILED this session. Bounds
+    /// the aggregate cost across many check-sats without ever limiting
+    /// successful conversions; see `RESIDUE_MAX_FAILURES`.
+    residue_probe_failures: u32,
     /// When true, `has_negated_string_equivalence_tautology` is bypassed.
     /// Set during incremental SLIA pipeline where `self.ctx.assertions` is
     /// temporarily replaced with preprocessed assertions that may falsely
@@ -1141,6 +1312,17 @@ pub struct Executor {
     /// further eager ROW terms, or AUFLIA storecomm reproducers can project a
     /// top-level disequality onto internal store prefixes and produce false UNSAT.
     row_seeded_terms: HashSet<TermId>,
+    /// Z3-compatible array-default choice point, shared by every small-finite
+    /// array store with the same index sort.  This is deliberately keyed only
+    /// by the INDEX sort (not by the array or element sort): Z3 5.0.0's
+    /// `theory_array_full::mk_epsilon` uses exactly that sharing discipline.
+    /// Entries live for the TermStore lifetime and are cleared only by reset.
+    array_default_epsilon_by_sort: HashMap<Sort, TermId>,
+    /// Fresh unary `diag` function name paired with each default epsilon.  The
+    /// application `diag(i)` witnesses an index at which `store(a,i,v)` and `a`
+    /// agree on a non-unit small finite carrier, matching Z3's third finite-
+    /// store default axiom.
+    array_default_diag_by_sort: HashMap<Sort, String>,
     /// #6820: Cached store-equality tuples from the last fixpoint scan.
     /// Store equalities come from the original formula and don't change
     /// during the fixpoint, so we collect them once and reuse.
@@ -1309,20 +1491,6 @@ pub struct Executor {
     /// leak into a different problem. `None` means "no enumeration in progress"
     /// (a fresh front will be started on the next pareto `(check-sat)`).
     pub(crate) pareto_state: Option<optimization::ParetoState>,
-    /// When true, the independent fail-closed model-check gate
-    /// ([`ay_model_check::confirm_model`]) is NOT run after a `Sat` result.
-    ///
-    /// Default `false` (the gate is ON for `check-sat`): every `Sat` model is
-    /// re-checked by a separate, solver-independent evaluator, and a `Sat`
-    /// whose model that evaluator ground-refutes is unconditionally downgraded
-    /// to `Unknown` (fail closed); see
-    /// [`Executor::apply_independent_model_gate`]. Toggle with
-    /// [`Executor::set_independent_model_gate`] — a DEBUGGING-ONLY programmatic
-    /// escape hatch; there is deliberately NO env-var bypass (the former
-    /// `AY_NO_MODEL_CHECK_GATE` is removed — no environment variable may turn
-    /// off a soundness gate), and nothing in production code, CI, or the test
-    /// suites disables the gate.
-    independent_gate_disabled: bool,
     /// D1 shadow instrumentation for the on-assert lazy-extensionality campaign.
     /// Records the EAGER `__ay_ext_diff` witnesses emitted this solve so the
     /// finalizer can surface `auflia.ext.*` on `-st`. Measurement only.
@@ -1480,6 +1648,18 @@ mod dl_theory_tests;
 mod dl_theory_rollback_tests;
 
 impl Executor {
+    /// Install the logic the way an API constructor does — see
+    /// [`ay_frontend::elaborate::Context::set_initial_logic`]. It does NOT
+    /// count as a command-stream `(set-logic ...)`, so a script parsed
+    /// afterwards may still carry its own, exactly as z3 allows.
+    ///
+    /// # Errors
+    /// Propagates the frontend's logic validation.
+    pub fn set_initial_logic(&mut self, logic: &str) -> Result<()> {
+        self.ctx.set_initial_logic(logic)?;
+        Ok(())
+    }
+
     /// Execute a single command
     ///
     /// Returns output to be printed, if any.
@@ -1507,6 +1687,17 @@ impl Executor {
             // when export preflight or command elaboration fails. Preserve only
             // Pareto's intentional cross-query enumeration state.
             self.begin_public_solve(true);
+        }
+        // Query-local SMT-LIB 2.7 schematic instances are rebuilt by the
+        // frontend at each check.  Remove them before incremental subsystems
+        // snapshot or pop the assertion stack, so their scope boundaries are
+        // computed from authored assertions rather than the previous query's
+        // materialization.
+        if matches!(
+            cmd,
+            Command::Push(_) | Command::Pop(_) | Command::Reset | Command::ResetAssertions
+        ) {
+            self.ctx.clear_materialized_polymorphic_assertions();
         }
         let internal_probe_command = match cmd {
             Command::GetConsequences(_, _) => Some("get-consequences"),
@@ -1686,6 +1877,14 @@ impl Executor {
                 return Err(error.into());
             }
         };
+        if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {
+            // `begin_public_solve` intentionally ran before elaboration to
+            // revoke stale artifacts on every failure path. Rebind its exact
+            // UNSAT/proof authority now that SMT-LIB 2.7 schematic instances
+            // have been materialized, and before assumptions or solver-owned
+            // transformations can enter the query.
+            self.bind_materialized_public_query();
+        }
         if matches!(cmd, Command::Pop(_)) {
             if let Some(ref mut state) = self.incr_theory_state {
                 state.retain_encoded_assertions(&self.ctx.assertions);
@@ -1697,6 +1896,11 @@ impl Executor {
 
         match result {
             Some(CommandResult::CheckSat) => {
+                self.bind_unsat_query_assumptions(&[]);
+                if !self.ctx.polymorphic_instantiation_complete() {
+                    self.replace_last_result_with_unknown(UnknownReason::Unsupported);
+                    return Ok(Some(SolveResult::Unknown.to_string()));
+                }
                 if theories::bv_cnf_dump::requested()
                     && (!self.ctx.soft_constraints().is_empty()
                         || !self.ctx.objectives().is_empty())
@@ -1715,7 +1919,7 @@ impl Executor {
                     // model value as an optimum. Refuse the mixed problem until
                     // one engine certifies both objective classes together.
                     self.invalidate_last_check_result();
-                    self.last_unknown_reason = Some(UnknownReason::Unsupported);
+                    self.record_unknown_from_origin(UnknownOrigin::UnsupportedFeature);
                     SolveResult::Unknown
                 } else if has_softs {
                     // `(assert-soft ...)` present: solve the MaxSMT problem.
@@ -1732,11 +1936,17 @@ impl Executor {
                 } else {
                     self.optimize_check_sat()?
                 };
+                let sat_result = self.certify_unsat_for_publication(sat_result, &[]);
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
             }
             Some(CommandResult::CheckSatAssuming(assumptions)) => {
+                self.bind_unsat_query_assumptions(&assumptions);
+                if !self.ctx.polymorphic_instantiation_complete() {
+                    self.replace_last_result_with_unknown(UnknownReason::Unsupported);
+                    return Ok(Some(SolveResult::Unknown.to_string()));
+                }
                 if theories::bv_cnf_dump::requested()
                     && (!self.ctx.soft_constraints().is_empty()
                         || !self.ctx.objectives().is_empty())
@@ -1760,6 +1970,7 @@ impl Executor {
                     ));
                 }
                 let sat_result = self.check_sat_assuming_with_named_cores(&assumptions)?;
+                let sat_result = self.certify_unsat_for_publication(sat_result, &assumptions);
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
@@ -1776,8 +1987,10 @@ impl Executor {
             }
             Some(CommandResult::GetInfo(keyword)) => Ok(Some(self.get_info(&keyword))),
             Some(CommandResult::GetOption(keyword)) => Ok(Some(self.get_option_value(&keyword))),
+            Some(CommandResult::Labels) => Ok(Some(self.labels())),
             Some(CommandResult::GetAssertions) => Ok(Some(self.assertions())),
             Some(CommandResult::Echo(msg)) => Ok(Some(msg)),
+            Some(CommandResult::Display(term)) => Ok(Some(term)),
             Some(CommandResult::GetAssignment) => Ok(Some(self.get_assignment())),
             Some(CommandResult::GetUnsatCore) => Ok(Some(self.unsat_core())),
             Some(CommandResult::GetUnsatCoreWithFarkas) => Ok(Some(self.unsat_core_with_farkas())),

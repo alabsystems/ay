@@ -395,7 +395,7 @@ pub(in crate::executor) struct ProofProblemAssertionProvenance {
 impl Executor {
     /// Per-run gate for the inc-14 EqDiffVar pass (inc-18).
     ///
-    /// `(set-option :ay-eq-diffvar false)` disables the pass for THIS
+    /// `(set-option :ay-eq-diffvar true|false)` selects the pass for THIS
     /// executor instance only. Motivation (inc-18 attribution, IMC's
     /// itp-strengthened transition checks): on SAT-shaped guarded-eq
     /// queries with a nearly-free initial state the reduction DEFEATS the
@@ -403,11 +403,52 @@ impl Executor {
     /// form cannot decide in 30s — so ay-chc's executor adapter retries an
     /// executor-unknown query once with the pass off. (The former
     /// `AY_EQ_DIFFVAR` global env kill switch is removed; the option is the
-    /// only opt-out.)
+    /// only switch.)
+    ///
+    /// DEFAULT OFF (#eq-diffvar-uncertifiable). The pass used to default ON,
+    /// and that cost verdicts in two distinct ways — both measured at this
+    /// commit on the pass's own committed inc-13/inc-14 corpus
+    /// (`evals/repros`), and both traced to the same mechanism: EqDiffVar runs
+    /// before `GuardedEqMining` and CONSUMES the atoms that pass folds, so the
+    /// cheaper and proof-reconstructible pass never fires
+    /// (`preprocess.guarded_eq.folded_atoms` is non-zero only when EqDiffVar is
+    /// off).
+    ///
+    /// 1. It destroys the MANDATORY UNSAT certificate. The pass asserts a fresh
+    ///    `d` via the definitional pair `(<= d lin)` / `(>= d lin)`. Those are
+    ///    solver-invented, so the reconstructed refutation's leaves for them
+    ///    carry no `assume` authority, are demoted to unit `trust`, and strict
+    ///    certification rejects a CORRECT refutation:
+    ///      pigeon_3_2  unknown 11ms -> unsat 2ms
+    ///      syn2_MIN    unknown 2335ms -> unsat 44ms
+    ///
+    /// 2. It blows the certification RESCUE budget. When the outer proof leans
+    ///    on any trust step, `discharge_trust_steps_for_certification` re-decides
+    ///    the authored problem in a fresh executor under a fixed 2000ms
+    ///    wall-clock budget. That executor inherits `ctx` (so it inherits this
+    ///    option) and its verdict is the certificate. On syn2_MIN the pass makes
+    ///    that re-solve take 2335ms, i.e. it misses the budget by construction,
+    ///    and a correct `unsat` publishes as `unknown`.
+    ///
+    /// (2) is why this is an option default and not a `produce_proofs_enabled()`
+    /// gate. Gating on the proof tracker looks right — the tracker is on for
+    /// every public decision because the UNSAT certificate is mandatory — but it
+    /// is OFF inside the rescue executor, so the pass would run there and only
+    /// there. The rescue must reproduce the outer solve; a gate that makes the
+    /// two behave differently is the bug. The predicate has to be uniform, and
+    /// the only uniform predicate is the caller's explicit request.
+    ///
+    /// Opting in is unchanged and still honoured: `ay-chc` writes
+    /// `(set-option :ay-eq-diffvar true)` explicitly on the sessions whose
+    /// workloads it has measured to benefit (`pdr_executor_backend`,
+    /// `persistent`), and those keep the reduction.
+    ///
+    /// This is a pure restriction of an optimization, so it cannot cause a
+    /// wrong verdict — only cost speed.
     fn eq_diffvar_pass_enabled(&self) -> bool {
-        !matches!(
+        matches!(
             self.ctx.get_option("ay-eq-diffvar"),
-            Some(ay_frontend::OptionValue::Bool(false))
+            Some(ay_frontend::OptionValue::Bool(true))
         )
     }
 
@@ -559,8 +600,21 @@ impl Executor {
         // 21/21 hard files decided before-subst vs 18/21 after-subst) —
         // substitution then composes with the reduced atoms, and the
         // definitional inequality PAIR survives unit-equality inlining.
-        // Disabled under proof production and per-run
-        // by `(set-option :ay-eq-diffvar false)` (inc-18 retry path).
+        // Disabled under proof production, and OPT-IN ONLY otherwise:
+        // `(set-option :ay-eq-diffvar true)` (inc-18 retry path). The default
+        // is off because the reduction costs correct `unsat` verdicts two
+        // different ways — see `Executor::eq_diffvar_pass_enabled` for the
+        // measurements and for why the predicate cannot be
+        // `produce_proofs_enabled()`.
+        //
+        // The second conjunct stays `is_producing_proofs()` — "did the CALLER
+        // ask for a proof" — deliberately, and must NOT become
+        // `produce_proofs_enabled()`. The latter reads the proof TRACKER, which
+        // is on for every public decision but OFF inside the certification
+        // rescue executor, so it would run the pass in the rescue and only
+        // there; the rescue exists to reproduce the outer solve, so a predicate
+        // that makes the two disagree is itself the defect.
+        //
         // SOUNDNESS (false-SAT #eq-diffvar-congruence): the pass rewrites a
         // multi-var equality atom `(= a b)` to `(= d rhs)` over a fresh
         // difference variable `d := a - b`. That is truth-preserving for the
@@ -576,7 +630,7 @@ impl Executor {
         // benefit and is provably sound (a pure restriction of an optimization
         // can never cause a wrong verdict).
         let has_uf = crate::features::StaticFeatures::collect(&self.ctx.terms, &assertions).has_uf;
-        if self.eq_diffvar_pass_enabled() && !self.produce_proofs_enabled() && !has_uf {
+        if self.eq_diffvar_pass_enabled() && !self.is_producing_proofs() && !has_uf {
             let mut dv_pass = EqDiffVar::new();
             if dv_pass.apply_with_sources(&mut self.ctx.terms, &mut assertions, &mut source_sets) {
                 self.last_statistics
@@ -635,7 +689,7 @@ impl Executor {
         // re-assertion) so Bool-guarded equality networks don't force
         // exponential per-branch re-derivation. Exact equivalence transform;
         // disabled under proof production and by AY_GUARDED_EQ_MINING=0.
-        if !self.produce_proofs_enabled() {
+        if !self.is_producing_proofs() {
             let mut geq_pass = GuardedEqMining::new();
             if geq_pass.apply_with_sources(&mut self.ctx.terms, &mut assertions, &mut source_sets) {
                 self.last_statistics
@@ -712,7 +766,7 @@ impl Executor {
         // force extra trust steps (#6759). Completeness — not soundness — is what
         // is traded off under proofs, so this only affects how many `incomplete`
         // results a proof-producing run reports, never a verdict.
-        if !self.produce_proofs_enabled() {
+        if !self.is_producing_proofs() {
             // Clear the first round's substitution cache: reusing `var_subst`
             // adds new definitions (e.g. `x -> k*q + c`) to the map, but the
             // cache memoizes the OLD map (where `x` mapped to itself), so without
@@ -1413,40 +1467,28 @@ impl Executor {
             }
         }
 
-        // #8596 temporary debug: dump preprocessed assertions for diagnosis
-        {
-            let false_t = self.ctx.terms.false_term();
-            let has_false = preprocessed_assertions.contains(&false_t);
-            if has_false {
-                tracing::warn!(
-                    count = preprocessed_assertions.len(),
-                    "#8596 BUG: preprocessed assertions contain false_term"
+        if ay_core::misc_cli_flags().dump_auflia_assertions {
+            let max_t = preprocessed_assertions
+                .iter()
+                .map(|t| t.0)
+                .max()
+                .unwrap_or(0);
+            eprintln!("AUFLIA TERMS (0..={max_t}):");
+            for idx in 0..=max_t {
+                let tid = TermId(idx);
+                eprintln!(
+                    "  t{}: {:?}  sort={:?}",
+                    idx,
+                    self.ctx.terms.get(tid),
+                    self.ctx.terms.sort(tid)
                 );
             }
-            if ay_core::misc_cli_flags().dump_auflia_assertions {
-                // Dump all terms first
-                let max_t = preprocessed_assertions
-                    .iter()
-                    .map(|t| t.0)
-                    .max()
-                    .unwrap_or(0);
-                eprintln!("#8596 TERMS (0..={max_t}):");
-                for idx in 0..=max_t {
-                    let tid = TermId(idx);
-                    eprintln!(
-                        "  t{}: {:?}  sort={:?}",
-                        idx,
-                        self.ctx.terms.get(tid),
-                        self.ctx.terms.sort(tid)
-                    );
-                }
-                eprintln!(
-                    "#8596 DUMP: {} preprocessed assertions:",
-                    preprocessed_assertions.len()
-                );
-                for (i, &a) in preprocessed_assertions.iter().enumerate() {
-                    eprintln!("  [{}] t{}: {:?}", i, a.0, self.ctx.terms.get(a));
-                }
+            eprintln!(
+                "AUFLIA ASSERTIONS ({} preprocessed):",
+                preprocessed_assertions.len()
+            );
+            for (i, &a) in preprocessed_assertions.iter().enumerate() {
+                eprintln!("  [{}] t{}: {:?}", i, a.0, self.ctx.terms.get(a));
             }
         }
 

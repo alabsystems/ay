@@ -69,10 +69,22 @@ use tracing::{debug, info, trace};
 /// lifetime plumbing (`LraSolver`'s raw `terms_ptr`), and the arena keeps its
 /// stores in a `Vec<Box<TermStore>>` so `Drop` runs normally (no leak).
 ///
-/// Debug-only: the shadow that uses it is `#[cfg(debug_assertions)]` and is only
-/// ever armed in tests/diagnostics (no production caller), so this type is
-/// compiled out of release builds.
-#[cfg(debug_assertions)]
+/// Only ever armed by the `#[cfg(debug_assertions)]` A2 shadow in ay-dpll
+/// (tests/diagnostics; no production caller), but the TYPE is compiled
+/// unconditionally on purpose.
+///
+/// `debug_assertions` is a PROFILE property, not a crate property, so gating a
+/// `pub` item on it makes the crate's API surface differ between profiles — and
+/// anything that compiles a dependent crate with different settings than the
+/// prebuilt rlib then fails to link. Concretely: `cargo test --doc` compiles
+/// ay-dpll with `debug_assertions` ON (so the shadow's signature is live) while
+/// resolving `ay_lra` from the RELEASE rlib (where this type was gone), which
+/// broke EVERY ay-dpll doctest with `cannot find type ShadowTermStoreArena in
+/// crate ay_lra` — silently, because a lib-only test run never compiles them.
+///
+/// The struct is a few words and allocates nothing until used, so paying for it
+/// in release is cheaper than a profile-dependent public API. The shadow that
+/// USES it stays `#[cfg(debug_assertions)]`.
 #[derive(Default)]
 pub struct ShadowTermStoreArena {
     // The Box is load-bearing: `alloc` hands out `&TermStore` at the boxed
@@ -81,7 +93,6 @@ pub struct ShadowTermStoreArena {
     stores: std::cell::UnsafeCell<Vec<Box<TermStore>>>,
 }
 
-#[cfg(debug_assertions)]
 impl ShadowTermStoreArena {
     /// Create an empty arena.
     #[must_use]

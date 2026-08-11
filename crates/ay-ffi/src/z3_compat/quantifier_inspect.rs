@@ -18,8 +18,9 @@ use ay_dpll::api::TermKind;
 
 use super::quantifiers::{PatternHandle, Z3_pattern};
 use super::{
-    alloc_sort, cache_symbol, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
+    alloc_sort, cache_symbol, cache_symbol_key, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr,
+    ffi_guard_uint, lookup_ast_sort, require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context,
+    Z3_sort, Z3_symbol,
 };
 
 /// Return true if the AST is a universal quantifier.
@@ -145,10 +146,18 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_name(
                 "quantifier",
                 ptr::null_mut()
             );
+            let index = i as usize;
+            let public_symbol = ctx
+                .quantifier_public_bound_terms
+                .get(&term)
+                .and_then(|bounds| bounds.get(index))
+                .and_then(|bound| ctx.ffi_const_metadata.get(bound))
+                .map(|(_, symbol)| symbol.clone());
+            if let Some(symbol) = public_symbol {
+                return cache_symbol_key(ctx, symbol);
+            }
             match ctx.solver.quantifier_bound_vars(term) {
-                Some(vars) if (i as usize) < vars.len() => {
-                    cache_symbol(ctx, vars[i as usize].0.clone())
-                }
+                Some(vars) if index < vars.len() => cache_symbol(ctx, vars[index].0.clone()),
                 _ => ptr::null_mut(),
             }
         })
@@ -183,12 +192,25 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_sort(
                 "quantifier",
                 ptr::null_mut()
             );
-            match ctx.solver.quantifier_bound_vars(term) {
-                Some(vars) if (i as usize) < vars.len() => {
-                    alloc_sort(ctx, vars[i as usize].1.clone())
-                }
-                _ => ptr::null_mut(),
-            }
+            let index = i as usize;
+            let engine_sort = match ctx.solver.quantifier_bound_vars(term) {
+                Some(vars) if index < vars.len() => vars[index].1.clone(),
+                _ => return ptr::null_mut(),
+            };
+            let public_sort = ctx
+                .quantifier_public_bound_terms
+                .get(&term)
+                .and_then(|bounds| bounds.get(index))
+                .and_then(|&bound| lookup_ast_sort(ctx, term_to_ast(ctx, bound)))
+                .cloned()
+                .or_else(|| {
+                    ctx.parsed_quantifier_public_bound_sorts
+                        .get(&term)
+                        .and_then(|sorts| sorts.get(index))
+                        .cloned()
+                })
+                .unwrap_or(engine_sort);
+            alloc_sort(ctx, public_sort)
         })
     }
 }
@@ -267,37 +289,96 @@ pub unsafe extern "C" fn Z3_get_quantifier_pattern_ast(
 
 /// Get the weight of a quantifier (priority hint).
 ///
-/// AY does not track weights; always returns 0.
+/// Quantifiers built through the C API retain the exact caller-supplied value.
+/// Parsed quantifiers without retained weight metadata use Z3's default weight
+/// of 1. A later constructor that would reuse a hash-consed term with different
+/// metadata is rejected, so one public AST can never change another AST's
+/// introspection result.
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_get_quantifier_weight(_c: Z3_context, _a: Z3_ast) -> c_uint {
-    0
+pub unsafe extern "C" fn Z3_get_quantifier_weight(c: Z3_context, a: Z3_ast) -> c_uint {
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: `ffi_guard_uint` null-checks `c`, authenticates `a` in the
+    // closure, and catches panics before they can cross the FFI boundary.
+    unsafe {
+        ffi_guard_uint(c, 0, |ctx| {
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_get_quantifier_weight", "quantifier", 0);
+            if !matches!(
+                ctx.solver.term_kind(term),
+                TermKind::Forall | TermKind::Exists
+            ) {
+                return 0;
+            }
+            ctx.quantifier_weights.get(&term).copied().unwrap_or(1)
+        })
+    }
 }
 
 /// Get the number of no-patterns in a quantifier.
 ///
-/// AY does not support no-patterns; always returns 0.
+/// Explicit no-pattern expressions supplied through an extended constructor
+/// round-trip exactly. Quantifiers without explicit metadata return 0.
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_get_quantifier_num_no_patterns(_c: Z3_context, _a: Z3_ast) -> c_uint {
-    0
+pub unsafe extern "C" fn Z3_get_quantifier_num_no_patterns(c: Z3_context, a: Z3_ast) -> c_uint {
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: guard/authentication prevents invalid handles and unwinding.
+    unsafe {
+        ffi_guard_uint(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_num_no_patterns",
+                "quantifier",
+                0
+            );
+            ctx.quantifier_no_patterns
+                .get(&term)
+                .map_or(0, |patterns| patterns.len() as c_uint)
+        })
+    }
 }
 
 /// Get the i-th no-pattern of a quantifier.
 ///
-/// AY does not support no-patterns; always returns 0 (null AST).
+/// Returns the retained expression, or a null AST for an absent/out-of-range
+/// entry.
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_get_quantifier_no_pattern_ast(
-    _c: Z3_context,
-    _a: Z3_ast,
-    _i: c_uint,
+    c: Z3_context,
+    a: Z3_ast,
+    i: c_uint,
 ) -> Z3_ast {
-    0
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: guard/authentication prevents invalid handles and unwinding.
+    unsafe {
+        ffi_guard_ast(c, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_no_pattern_ast",
+                "quantifier",
+                0
+            );
+            ctx.quantifier_no_patterns
+                .get(&term)
+                .and_then(|patterns| patterns.get(i as usize))
+                .copied()
+                .map_or(0, |expression| term_to_ast(ctx, expression))
+        })
+    }
 }

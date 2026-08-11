@@ -315,7 +315,10 @@ fn assign_literal(assignments: &mut HashMap<TermId, bool>, literal: SignedLitera
     }
 }
 
-pub(crate) fn validate_binary_resolution_rule(
+/// `resolution` / `th_resolution` of ANY arity. Arity 2 keeps the exact
+/// binary check it always had; every other arity folds the chain (see
+/// [`validate_chain_resolution_rule`]).
+pub(crate) fn validate_resolution_rule(
     terms: &TermStore,
     step_id: ProofId,
     rule: &AletheRule,
@@ -324,11 +327,7 @@ pub(crate) fn validate_binary_resolution_rule(
     pivot: Option<TermId>,
 ) -> Result<(), ProofCheckError> {
     if premise_clauses.len() != 2 {
-        return Err(ProofCheckError::UnsupportedResolutionArity {
-            step: step_id,
-            rule: rule.name().to_string(),
-            premise_count: premise_clauses.len(),
-        });
+        return validate_chain_resolution_rule(terms, step_id, rule, clause, premise_clauses);
     }
 
     if !is_valid_binary_resolution(terms, premise_clauses[0], premise_clauses[1], clause, pivot) {
@@ -339,4 +338,172 @@ pub(crate) fn validate_binary_resolution_rule(
     }
 
     Ok(())
+}
+
+/// N-ary (chain) `resolution` / `th_resolution`.
+///
+/// #dt-premise-binding — WHY this exists. Alethe's `resolution` and
+/// `th_resolution` are N-ARY: one step may list any number of premises,
+/// resolved left-to-right. AY's checker used to reject every arity but 2,
+/// which forced emitters to spell a chain out as one BINARY step per premise —
+/// and each such step must print its whole remaining clause, so the document
+/// grows TRIANGULARLY.
+///
+/// Measured on `QF_DT/20210312-Bouvier/vlsat3_b14.smt2` (2,986 premises): the
+/// binary chain rendered a **105.6 MB** `.alethe` (5,973 lines, 105.5 MB of
+/// which was resolution-step text; line lengths decayed 75,252 → 61,678 →
+/// 36,896 → … → 83 chars). That blows the default 64 MiB emission work budget,
+/// so the shipped artefact was **no proof at all**. The identical refutation as
+/// ONE n-ary step is 193,103 bytes — 547x smaller — and carcara 1.1.0 checks it
+/// in 0.01 s. Teaching the checker the n-ary form is what lets the emitter use it:
+/// `executor/proof.rs` re-derives the empty clause from scratch whenever this
+/// checker rejects a proof, which would otherwise re-materialise the triangle.
+///
+/// SEMANTICS — deliberately STRICTER than carcara. The accumulator starts at
+/// the first premise; every later premise must contribute exactly one
+/// complementary literal pair, and the accumulator loses the pivot. Two
+/// deviations from carcara 1.1.0, both fail-closed:
+///
+///  * carcara silently ABSORBS premises once the accumulator is empty
+///    (verified: `(cl (not P1)) , P1 , P2 ⊢ (cl)` checks there, though the true
+///    resolvent is `{P2}`). Here a premise that does not resolve is an error.
+///  * an AMBIGUOUS link (two distinct complementary pairs, i.e. two different
+///    resolvents) is rejected rather than guessed, since guessing wrong would
+///    silently change the accumulated clause.
+///
+/// Complement detection is `are_complements`, the same notion the binary path
+/// falls back on (`resolve_on_semantic_pivot`), so double negations such as
+/// `(not (not X))` vs `(not X)` pair up exactly as they do today. `:args` are
+/// ignored: for a chain they are per-link (pivot, polarity) pairs, and the
+/// folded resolvent is compared against the declared clause regardless, so they
+/// can only ever be a hint.
+pub(crate) fn validate_chain_resolution_rule(
+    terms: &TermStore,
+    step_id: ProofId,
+    rule: &AletheRule,
+    clause: &[TermId],
+    premise_clauses: &[&[TermId]],
+) -> Result<(), ProofCheckError> {
+    // Fewer than two premises is not a chain, it is a malformed step. Keep the
+    // original arity error so the fail-closed posture (and its message) stands.
+    if premise_clauses.len() < 2 {
+        return Err(ProofCheckError::UnsupportedResolutionArity {
+            step: step_id,
+            rule: rule.name().to_string(),
+            premise_count: premise_clauses.len(),
+        });
+    }
+
+    let invalid = || ProofCheckError::InvalidResolution {
+        step: step_id,
+        rule: rule.name().to_string(),
+    };
+
+    let target = dedup_terms(clause);
+
+    // BOUNDED SEARCH over the ambiguous links, not a unique-pair demand.
+    //
+    // A link with two complementary pairs has two legitimate resolvents, and
+    // this used to reject rather than pick one. Nothing needs picking: the fold
+    // is CHECKED against the clause the step declares, so a branch is accepted
+    // only when it arrives there.
+    //
+    // Sound for the same reason binary resolution is — a resolvent is implied by
+    // its premises under ANY pivot choice, so a chain that ends at the declared
+    // clause witnesses that the declared clause follows. The pivot is a search
+    // detail; the entailment does not depend on it. Existence is still required
+    // (a link that resolves on nothing is still an error), so this only relaxes
+    // UNIQUENESS.
+    //
+    // `:args` cannot help here even though the doc above suggests they might:
+    // every n-ary `th_resolution` emitter in `ay-dpll` passes `Vec::new()` for
+    // args (`executor/proof_rewrite_division.rs`), so the per-link pivots are
+    // simply absent from AY's own proofs. Searching is the only route that works
+    // on them.
+    //
+    // Cost of the old behaviour, measured: `pushscope_repro` computes a correct
+    // `unsat`, certification rejects `step t110 has invalid th_resolution
+    // derivation`, and the verdict publishes as `unknown` — a caught-and-
+    // discarded refutation.
+    //
+    // The budget keeps the unambiguous case linear (one candidate per link, so
+    // the stack never grows) while bounding the branching blow-up. Exhausting it
+    // REJECTS, so the fail-closed posture is preserved.
+    let mut budget: usize = premise_clauses
+        .len()
+        .saturating_mul(CHAIN_BRANCH_BUDGET_PER_LINK)
+        .saturating_add(CHAIN_BRANCH_BUDGET_BASE);
+
+    let mut stack: Vec<(usize, Vec<TermId>)> = vec![(1, dedup_terms(premise_clauses[0]))];
+    while let Some((idx, acc)) = stack.pop() {
+        if idx == premise_clauses.len() {
+            if acc == target {
+                return Ok(());
+            }
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        for resolvent in chain_resolve_candidates(terms, &acc, premise_clauses[idx]) {
+            stack.push((idx + 1, resolvent));
+        }
+    }
+    Err(invalid())
+}
+
+/// Per-link branching allowance, and a flat base so short chains can still
+/// explore. Both are pure budget: exceeding them rejects.
+const CHAIN_BRANCH_BUDGET_PER_LINK: usize = 4;
+const CHAIN_BRANCH_BUDGET_BASE: usize = 256;
+/// Most complementary pairs considered at one link. Beyond this the link is too
+/// ambiguous to search and the step is rejected.
+const CHAIN_MAX_PAIRS_PER_LINK: usize = 8;
+
+/// Sorted, deduplicated literal set. Terms are hash-consed, so `TermId`
+/// equality IS syntactic literal equality and this is the same set the
+/// `SignedLiteral` decoding would produce (the decoding is injective on
+/// `TermId`s), just without the per-clause re-decode.
+fn dedup_terms(clause: &[TermId]) -> Vec<TermId> {
+    let mut set = clause.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
+/// One link of the chain: resolve `acc` against `next` on their unique
+/// complementary literal pair. `None` (→ rejection) when the pair does not
+/// exist or is not unique.
+fn chain_resolve_candidates(
+    terms: &TermStore,
+    acc: &[TermId],
+    next: &[TermId],
+) -> Vec<Vec<TermId>> {
+    let next_set = dedup_terms(next);
+
+    let mut pairs: Vec<(TermId, TermId)> = Vec::new();
+    for &left in acc {
+        for &right in &next_set {
+            if !are_complements(terms, left, right) {
+                continue;
+            }
+            pairs.push((left, right));
+            if pairs.len() > CHAIN_MAX_PAIRS_PER_LINK {
+                // Too ambiguous to search; fail closed.
+                return Vec::new();
+            }
+        }
+    }
+
+    pairs
+        .into_iter()
+        .map(|(pivot, neg_pivot)| {
+            let mut resolvent: Vec<TermId> = acc.iter().copied().filter(|&l| l != pivot).collect();
+            resolvent.extend(next_set.iter().copied().filter(|&l| l != neg_pivot));
+            resolvent.sort_unstable();
+            resolvent.dedup();
+            resolvent
+        })
+        .collect()
 }

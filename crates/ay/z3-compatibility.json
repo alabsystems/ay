@@ -10,11 +10,11 @@
       "status": "Ready"
     },
     {
-      "surface": "Z3-style parameter discovery subset (`ay -p` / `-pd` / `-pm` / `-pp`)",
+      "surface": "Exact Z3 5.0.0 parameter discovery (`ay -p` / `-pd` / `-pm` / `-pmmd` / `-pp`)",
       "status": "Ready"
     },
     {
-      "surface": "Explicit rejection of unsupported Z3 options (e.g. `-tactics`)",
+      "surface": "Exact Z3 5.0.0 tactic/probe/simplifier discovery (`-tactics[:NAME]` / `-probes` / `-simplifiers[:NAME]`)",
       "status": "Ready"
     }
   ],

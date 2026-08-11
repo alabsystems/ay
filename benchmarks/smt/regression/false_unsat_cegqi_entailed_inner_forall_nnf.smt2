@@ -1,0 +1,7 @@
+(set-logic AUFLIA)
+(declare-fun a (Int) Bool)
+(declare-fun k2 () Int)
+(declare-fun A () (Array Int Int))
+(assert (forall ((x Int)) (not (and (a x) (exists ((y Int)) (= (select A y) x))))))
+(assert (a k2))
+(check-sat)

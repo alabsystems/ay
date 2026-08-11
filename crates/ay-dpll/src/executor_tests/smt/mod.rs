@@ -16,6 +16,7 @@ mod bv_lia_indep_model_graft;
 mod qf_auflia;
 mod qf_auflra_and_regression;
 mod qf_ax;
+mod qf_eia;
 mod qf_lia;
 mod qf_lra;
 mod qf_uflia;

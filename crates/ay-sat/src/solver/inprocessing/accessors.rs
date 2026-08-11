@@ -295,6 +295,12 @@ impl Solver {
             pub cce_stats -> crate::cce::CCEStats, cce
     }
 
+    /// Snapshot of root symmetry preprocessing (manual: the stats live on
+    /// `cold`, not in the inprocessing bundle).
+    pub fn symmetry_report(&self) -> crate::SymmetryReport {
+        self.cold.symmetry_stats.report()
+    }
+
     // Conditioning: manual accessors.
     /// Enable or disable conditioning inprocessing.
     pub fn set_condition_enabled(&mut self, enabled: bool) {

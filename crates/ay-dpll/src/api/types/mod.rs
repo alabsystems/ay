@@ -172,7 +172,7 @@ pub use explanation::{
 pub use handles::{FuncDecl, Term};
 pub use incremental::{CoreEvolutionTracker, IncrementalCoreEvolution};
 pub use interpolant::{InterpolantResult, InterpolantStrength, PathInterpolantResult};
-pub use logic::{Logic, SortExt};
+pub use logic::{split_leading_set_logic, Logic, SortExt};
 pub use maxsmt::{MaxSmtResult, MaxSmtStatus};
 pub use model::{Model, VerifiedModel};
 pub use model_blocking::{

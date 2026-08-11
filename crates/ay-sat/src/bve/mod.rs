@@ -639,7 +639,12 @@ impl BVE {
     /// Create a new BVE engine for n variables
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
-            occ: BVEOccList::new(num_vars),
+            // Sized on first use: `OccList::add_clause` grows to cover each
+            // literal it sees, and `get` is bounds-safe, so nothing has to
+            // pre-size this. Eagerly it costs ~128 resident bytes per
+            // variable at solver construction, on every instance, whether or
+            // not this engine ever runs.
+            occ: BVEOccList::new(0),
             stats: BVEStats::default(),
             num_vars,
             eliminated: vec![false; num_vars],

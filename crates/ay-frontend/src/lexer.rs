@@ -11,7 +11,7 @@ use logos::Logos;
 /// SMT-LIB tokens
 #[derive(Logos, Debug, PartialEq, Eq, Clone)]
 #[logos(skip r"[ \t\n\r]+")]
-#[logos(skip r";[^\n]*")]
+#[logos(skip r";[^\n\r]*")]
 pub(crate) enum Token<'a> {
     /// Left parenthesis
     #[token("(")]
@@ -22,11 +22,20 @@ pub(crate) enum Token<'a> {
     RParen,
 
     /// Numeral (non-negative integer)
-    #[regex(r"[0-9]+", |lex| lex.slice())]
+    #[regex(r"0|[1-9][0-9]*", |lex| lex.slice())]
     Numeral(&'a str),
 
+    /// A digit run with a forbidden leading zero.
+    ///
+    /// This explicit longest-match token is needed because otherwise `00`
+    /// would be tokenized as two adjacent legal `0` numerals.  In a variadic
+    /// term such as `(= 00 0)` that would turn malformed lexical input into a
+    /// different, well-formed term instead of rejecting it.
+    #[regex(r"0[0-9]+(\.[0-9]+)?")]
+    InvalidLeadingZeroNumeral,
+
     /// Decimal number
-    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice())]
+    #[regex(r"(0|[1-9][0-9]*)\.[0-9]+", |lex| lex.slice())]
     Decimal(&'a str),
 
     /// Hexadecimal bitvector literal (#xABCD)
@@ -57,12 +66,12 @@ pub(crate) enum Token<'a> {
     #[regex(r"[a-zA-Z~!@$%^&*_+=<>.?/\-][a-zA-Z0-9~!@$%^&*_+=<>.?/\-]*", |lex| lex.slice())]
     Symbol(&'a str),
 
-    /// Quoted symbol |...|
-    #[regex(r"\|[^|]*\|", |lex| lex.slice())]
+    /// Quoted symbol `|...|`, including Z3 5.0.0's `\|` / `\\` escapes.
+    #[regex(r"\|([^|\\]|\\[^\x00])*\|", |lex| lex.slice())]
     QuotedSymbol(&'a str),
 
     /// Keyword (:keyword)
-    #[regex(r":[a-zA-Z0-9~!@$%^&*_+=<>.?/\-]+", |lex| lex.slice())]
+    #[regex(r":[a-zA-Z~!@$%^&*_+=<>.?/\-][a-zA-Z0-9~!@$%^&*_+=<>.?/\-]*", |lex| lex.slice())]
     Keyword(&'a str),
 
     /// Reserved words: true/false

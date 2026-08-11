@@ -1075,14 +1075,32 @@ def build_invocation(sol: Solver, track: str, logic: str, tmp: str,
                               stdin_path=tmp)
         return Invocation([str(sol.binary), "--z3-mode", *memory, *timeout,
                            tmp])
-    if sol.kind in ("z3", "plain"):
+    if sol.kind == "z3":
+        # z3 enforces `-memory:` itself and reports `unknown`; that is a real
+        # in-process ceiling, unlike the RSS watchdog, which is a Python thread
+        # inside a harness the same memory pressure is starving.
+        memory = [f"-memory:{memlimit_mb}"] if memlimit_mb > 0 else []
+        return Invocation([str(sol.binary), *memory, tmp])
+    if sol.kind == "plain":
         return Invocation([str(sol.binary), tmp])
     cmd = extract_2025_command(sol.submission or sol.name, track, logic)
     if cmd is None:
         return None  # did not participate in this track in 2025
     extra = cmd[1:]  # argv[0] is the in-archive path; swap in the local binary
     if sol.kind == "jar":
-        return Invocation([str(sol.java), "-jar", str(sol.binary), *extra, tmp],
+        # Without -Xmx the JVM sizes its own heap from PHYSICAL RAM (typically
+        # RAM/4), sibling-blind and entirely deaf to the envelope — the budget
+        # recorded next to these rows was never enforced for a jar solver at
+        # all. -Xmx bounds the heap in the process doing the allocating, so it
+        # holds when an observer would be starved out.
+        #
+        # Sized below the envelope because -Xmx caps only the Java heap: JVM
+        # metaspace, thread stacks and GC structures live outside it, so an
+        # -Xmx set AT the budget still lands over it in RSS. The RSS watchdog
+        # stays armed as the backstop for that remainder.
+        heap = [f"-Xmx{max(1, memlimit_mb * 4 // 5)}m"] if memlimit_mb > 0 else []
+        return Invocation([str(sol.java), *heap, "-jar", str(sol.binary),
+                           *extra, tmp],
                           smtcomp_command=cmd)
     return Invocation([str(sol.binary), *extra, tmp], smtcomp_command=cmd)
 

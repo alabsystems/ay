@@ -1,0 +1,42 @@
+id: sat-satcomp-2026-main-official
+version: 1
+description: >
+  The 400 instances SAT Competition 2026 actually scored, taken from the
+  instanceid column of the organizers' official per-instance results export
+  (https://satcompetition.github.io/2026/downloads/scores.csv, 12,400 rows =
+  31 sequential solvers x 400 instances, covering main / main-ai / exp / exp-ai).
+
+  Ground truth is the vresult agreed by the competition's own verified solvers:
+  191 sat / 166 unsat / 43 unresolved, with ZERO disagreements across all 31
+  solvers. Because that export also carries per-instance runtimes, every
+  official solver's score can be recomputed at any timeout, so an AY run at a
+  reduced budget can be compared against the same solvers at the same budget
+  rather than only against the published 5000 s figures.
+
+  Each local payload is bound to its official instanceid by recomputing GBD's
+  identity hash (md5 over the CNF with comment and header lines removed and
+  whitespace runs collapsed), so the corpus is verified against the competition
+  independently of transport.
+
+  This is a same-host corpus replay, not an official-hardware score. Note also
+  that AY emits no UNSAT proof on Windows (the transactional DIMACS proof path
+  is cfg(linux/macos)-gated), so Windows runs measure answer correctness only;
+  a Main-track claim additionally requires a checker-verified certificate.
+owner: andrewyates.name@gmail.com
+competition: sat-comp
+scoring: sat-comp
+inputs:
+  benchmarks_dir: benchmarks/sat/satcomp2026-main/official
+  manifest: benchmarks/sat/satcomp2026-main/SC2026.official.csv
+  ground_truth: https://satcompetition.github.io/2026/downloads/scores.csv
+  reference_solver: z3
+  timeout_sec: 60
+  standard_timeout_sec: 5000
+  runs: 1
+metrics:
+  - solved
+  - total
+  - wrong
+  - par2_avg
+outputs:
+  results_dir: evals/results/sat-satcomp-2026-main-official/{run_id}

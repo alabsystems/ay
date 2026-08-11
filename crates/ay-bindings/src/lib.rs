@@ -157,7 +157,14 @@ pub use ay_core::panic_payload_to_string;
 /// Format a symbol for SMT-LIB2 output.
 ///
 /// Delegates to [`ay_core::quote_symbol`] — the single source of truth for
-/// SMT-LIB symbol quoting, reserved word handling, and `|`/`\` sanitization.
+/// SMT-LIB symbol quoting, reserved-word handling, and `|`/`\` rendering.
+///
+/// A name containing `|` or `\` is rendered LOSSLESSLY, using the backslash
+/// escapes Z3 5.0.0 accepts, rather than by substituting the offending
+/// character. Substitution would not be identity-preserving: `a|b` and `a_b`
+/// would both print as `a_b`, so two distinct user symbols would collapse into
+/// one. The example below therefore pins the PROPERTY that matters —
+/// pipe-quoted and injective — rather than one exact spelling.
 ///
 /// # Examples
 ///
@@ -168,7 +175,15 @@ pub use ay_core::panic_payload_to_string;
 /// assert_eq!(format_symbol("let"), "|let|");
 /// assert_eq!(format_symbol("true"), "|true|");
 /// assert_eq!(format_symbol("foo::bar"), "|foo::bar|");
-/// assert_eq!(format_symbol("a|b"), "|a_b|");
+///
+/// // Delegation is exact.
+/// assert_eq!(format_symbol("a|b"), ay_core::quote_symbol("a|b"));
+///
+/// // Pipe-containing names stay quoted and stay DISTINCT from the name a
+/// // substituting renderer would have collapsed them onto.
+/// let piped = format_symbol("a|b");
+/// assert!(piped.starts_with('|') && piped.ends_with('|'));
+/// assert_ne!(piped, format_symbol("a_b"));
 /// ```
 #[must_use]
 pub fn format_symbol(name: &str) -> String {

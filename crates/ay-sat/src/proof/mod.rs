@@ -46,6 +46,7 @@ mod output;
 mod tests;
 
 pub use drat::DratWriter;
+pub(crate) use lrat::LratBoundedResourceFailure;
 pub use lrat::{LratWriter, MAX_LRAT_ORIGINAL_CLAUSES};
 pub use output::ProofOutput;
 
@@ -88,7 +89,15 @@ impl BoxedWriter {
     /// Returns `None` if the underlying writer is not a `Vec<u8>`.
     /// Panics are avoided — callers should use `.expect()` in test code.
     pub fn into_vec(self) -> Option<Vec<u8>> {
-        self.0.into_any().downcast::<Vec<u8>>().ok().map(|b| *b)
+        self.into_typed::<Vec<u8>>()
+    }
+
+    /// Recover a crate-internal concrete writer after type erasure.
+    ///
+    /// Production proof consumers use this to retain ownership of bounded
+    /// in-memory writers without a shared mutex on every emitted byte.
+    pub(crate) fn into_typed<T: Write + Send + 'static>(self) -> Option<T> {
+        self.0.into_any().downcast::<T>().ok().map(|boxed| *boxed)
     }
 }
 

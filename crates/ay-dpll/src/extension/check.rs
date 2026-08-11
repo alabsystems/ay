@@ -619,6 +619,56 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             .iter()
             .filter_map(|t| self.term_to_literal(t.term, !t.value))
             .collect();
+
+        // #6846: mid-search variable minting.
+        //
+        // A theory conflict can name a term the pre-solve encoding never gave a
+        // SAT variable — most often an N-O model equality the combiner only
+        // discovers once the search is under way. `term_to_literal` drops those
+        // silently, the clause comes back short, and the guard below fails closed
+        // to `Unknown`. That is sound but incomplete, and it is the stated reason
+        // AUFLIA is pinned to the lazy pipeline (`combined/mod.rs` #6846: "the
+        // eager extension drops theory conflicts when model equality terms lack
+        // SAT variable mappings ... causing Unknown on ... add5, add6, read7").
+        //
+        // Name the missing terms instead. The clause is the negation of a
+        // theory-inconsistent conjunction, i.e. T-VALID, so it is a legitimate
+        // theory lemma. It is returned as `AddClauses`, NOT `Conflict`: a freshly
+        // minted variable is unassigned, so the clause is not falsified by the
+        // current assignment and could not drive conflict analysis. The
+        // `AddClauses` path backtracks to level 0 before adding
+        // (`theory_backend.rs` #8480), which is exactly the state where a clause
+        // over new variables is well-formed, and then re-enters the search.
+        if clause.len() < conflict_terms.len() && mint_theory_vars_enabled() {
+            let missing: Vec<(ay_core::term::TermId, bool)> = conflict_terms
+                .iter()
+                .filter(|t| self.var_for_term(t.term).is_none())
+                .map(|t| (t.term, !t.value))
+                .collect();
+            let mut minted_all = true;
+            for (term, _) in &missing {
+                if self.mint_var_for_term(*term, ctx).is_none() {
+                    minted_all = false;
+                    break;
+                }
+            }
+            if minted_all {
+                let full: Vec<Literal> = conflict_terms
+                    .iter()
+                    .filter_map(|t| self.term_to_literal(t.term, !t.value))
+                    .collect();
+                if full.len() == conflict_terms.len() {
+                    tracing::debug!(
+                        minted = missing.len(),
+                        lits = full.len(),
+                        "#6846: minted SAT variables for an otherwise-partial theory conflict"
+                    );
+                    self.theory_conflict_count += 1;
+                    return ExtCheckResult::AddClauses(vec![full]);
+                }
+            }
+        }
+
         // Soundness guard (#3826): partial/empty clause → Unknown.
         if clause.len() < conflict_terms.len() {
             self.partial_clause_count += 1;
@@ -794,4 +844,14 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             ExtCheckResult::Conflict(clause)
         }
     }
+}
+
+/// #6846 kill switch: mid-search SAT-variable minting for theory conflicts.
+///
+/// Default OFF. Minting changes a fail-closed `Unknown` into an added T-valid
+/// lemma, which is a real behaviour change on every eager route, so it stays
+/// opt-in until its ablation is done.
+pub(super) fn mint_theory_vars_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AY_DPLL_MINT_THEORY_VARS").is_ok_and(|v| v != "0"))
 }

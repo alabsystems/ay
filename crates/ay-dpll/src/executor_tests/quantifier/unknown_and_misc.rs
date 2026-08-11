@@ -519,6 +519,132 @@ fn test_empty_universe_singleton_sat() {
     assert_eq!(out, "sat", "empty-universe EPR forall must certify SAT");
 }
 
+/// (#eu-uf-interp) REFUTATION WITNESS. A `sat` whose only constraint on a UF
+/// is a UNIVERSAL quantifier over an empty uninterpreted universe must publish
+/// an interpretation for that UF, and the interpretation must actually satisfy
+/// the assertion it is offered as a witness for.
+///
+/// This is ay's half of deductive-checks's trait-conformance soundness controls. The
+/// query is the NEGATED obligation ("some `dm` is >100 at every receiver, and
+/// the candidate body returns 0"), so `sat` IS the refutation and the printed
+/// `define-fun` IS the counterexample the control needs to display.
+///
+/// The regression: the singleton-universe lane
+/// (`mbqi_empty_universe_singleton_decide`) decided the value in its sub-solve
+/// and then dropped it, because the BV lanes Ackermannize UF applications and
+/// build no EUF function table. `(get-model)` then printed literally
+/// `(model )` and the quantified model-check gate, seeing a witness that pins
+/// no interpretation for `DT__dm`, deferred and failed the verdict CLOSED to
+/// `unknown (:reason-unknown incomplete)`. The refutation survived; the
+/// counterexample did not.
+///
+/// The assertion below is deliberately NOT "a model came back": it replays the
+/// published constant back through the solver and requires the assertion's
+/// NEGATION at that value to be `unsat` — i.e. the witness really does what a
+/// witness must.
+#[test]
+fn empty_universe_bv_uf_refutation_publishes_a_checkable_witness() {
+    let commands = parse(
+        r#"
+        (set-logic ALL)
+        (declare-sort Poly 0)
+        (declare-fun DT__dm (Poly) (_ BitVec 32))
+        (declare-const impl_result (_ BitVec 32))
+        (assert (forall ((self Poly)) (bvult #x00000064 (DT__dm self))))
+        (assert (= impl_result #x00000000))
+        (check-sat)
+    "#,
+    )
+    .expect("script parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("script executes");
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "the refutation query must stay decided, not degrade to unknown"
+    );
+
+    assert_published_constant_witness_beats_100(&exec.model());
+}
+
+/// (#eu-uf-interp) The SAME refutation shape as the test above, but with the
+/// `:pattern` deductive-checks actually attaches. The trigger changes which lane grants
+/// the `Sat` — a triggered `forall` is not "completely unhandled", so the
+/// singleton-witness decide is never consulted and the VACUOUS-TRIGGER
+/// certificate grants instead, on the bare model-existence claim that "the
+/// ground model extends by interpreting the never-grounded symbols freely".
+/// That claim was never cashed out, so the emitted witness was empty and the
+/// quantified gate deferred it to `unknown (incomplete)`. This is the shape the
+/// trait-conformance controls actually send.
+#[test]
+fn vacuous_trigger_bv_uf_refutation_publishes_a_checkable_witness() {
+    let commands = parse(
+        r#"
+        (set-logic ALL)
+        (declare-sort Poly 0)
+        (declare-fun DT__dm (Poly) (_ BitVec 32))
+        (declare-const impl_result (_ BitVec 32))
+        (assert (forall ((self Poly))
+                  (! (bvult #x00000064 (DT__dm self)) :pattern ((DT__dm self)))))
+        (assert (= impl_result #x00000000))
+        (check-sat)
+    "#,
+    )
+    .expect("script parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("script executes");
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "the triggered refutation query must stay decided, not degrade to unknown"
+    );
+    assert_published_constant_witness_beats_100(&exec.model());
+}
+
+/// Shared checker for the two tests above: the published model must NAME
+/// `DT__dm`, its interpretation must be a CONSTANT over the singleton universe,
+/// and that constant must actually satisfy `(bvult #x00000064 DT__dm(_))` —
+/// re-decided by the solver, not re-derived here. Deliberately not "a model came
+/// back": an empty or unrelated model fails every one of these.
+fn assert_published_constant_witness_beats_100(model: &str) {
+    let start = model
+        .find("define-fun DT__dm")
+        .unwrap_or_else(|| panic!("published model names no interpretation for DT__dm:\n{model}"));
+    let body = &model[start..];
+    let body = match body[1..].find("(define-fun ") {
+        Some(next) => &body[..next + 1],
+        None => body,
+    };
+    assert!(
+        !body.contains("ite"),
+        "expected a constant interpretation over the singleton universe, got:\n{body}"
+    );
+    let value_at = body
+        .find("#x")
+        .unwrap_or_else(|| panic!("no bit-vector value in the DT__dm interpretation:\n{body}"));
+    let value: String = body[value_at..]
+        .chars()
+        .take_while(|c| *c == '#' || *c == 'x' || c.is_ascii_hexdigit())
+        .collect();
+
+    // THE WITNESS MUST DO ITS JOB. `sat` claims some `DT__dm` is >100
+    // everywhere; the published one is the constant `value`, so
+    // `(bvult #x00000064 value)` must be VALID.
+    let replay = check_sat_output(&format!(
+        "(set-logic ALL)(assert (not (bvult #x00000064 {value})))(check-sat)"
+    ));
+    assert_eq!(
+        replay, "unsat",
+        "published witness DT__dm = {value} does NOT satisfy the assertion it witnesses"
+    );
+
+    // And the ground half of the counterexample is published too.
+    assert!(
+        model.contains("impl_result"),
+        "the counterexample must also pin the violating body's result:\n{model}"
+    );
+}
+
 /// (#p2-mbqi-empty-universe) Nonempty-sort refutation: `∀x.p(x) ∧ ∀x.¬p(x)`
 /// over an empty ground universe is UNSAT (SMT-LIB sorts are nonempty).
 #[test]

@@ -135,6 +135,31 @@ pub struct Routed {
 /// exactly the hole that let three genuinely unread names sit in the ledger
 /// claiming a read site each.
 pub const ROUTED: &[Routed] = &[
+    // The five REDUCTION/lane settings, migrated to `EngineEconomics` for the
+    // same reason as the twelve below but with higher stakes: three of them gate
+    // transformations that change the model a verdict is proved against, and
+    // `AY_MILP_NO_COLD_LU` was additionally a process-global `OnceLock` — the
+    // first solve in a process latched the lane for every later one. A consumer
+    // whose policy forbids exporting `AY_MILP_*` (ny) had no in-policy way to
+    // reach any of them. `AY_MILP_NO_CERT_DECOUPLE` is deliberately NOT here: its
+    // spelling is not plain presence (`0`/`off` keep the default), so it takes
+    // the caller layer first and keeps its own literal env parse.
+    Routed {
+        env: "AY_MILP_NO_DUALFIX",
+        route: Route::Tune,
+    },
+    Routed {
+        env: "AY_MILP_NO_KERNEL_REFORM",
+        route: Route::Tune,
+    },
+    Routed {
+        env: "AY_MILP_NO_FEAS_CONFLICT",
+        route: Route::Tune,
+    },
+    Routed {
+        env: "AY_MILP_NO_COLD_LU",
+        route: Route::Tune,
+    },
     // The twelve `EngineEconomics` settings. Their literal reads were removed by
     // the M1 migration (the development design notes); the name now
     // lives once, in `tune::Knob::env`.
@@ -388,6 +413,29 @@ pub fn env_audit() -> EnvAudit {
         if !k.starts_with("AY_") {
             continue;
         }
+        // A SIBLING CRATE'S NAME THAT THIS PROCESS SETS ON ITSELF.
+        //
+        // `ay_sys::govern` arms the memory governor by re-execing with its
+        // `ARMED_ENV` set, so the solve child inherits a name this crate's
+        // ledger has never heard of. The audit then classified it `unknown` and
+        // refused to run — "set but NO code reads it ... refusing to run under
+        // an environment that does not mean what it says". The binary would not
+        // run under its own governor. A real product failure: it takes out
+        // `ay-milp solve --require full` whenever the governor arms, and it had
+        // been sitting behind a red integration test in `tests/cert_io.rs`.
+        //
+        // Referenced through ay-sys's own constant rather than spelled out, for
+        // two reasons. The exclusion cannot drift from its owner if the name
+        // changes. And no `AY_*` LITERAL enters this crate's sources — which
+        // matters, because `tests/env_ledger.rs` scans the source TEXT,
+        // comments included, so writing the name here in prose would itself
+        // trip `every_ay_env_name_in_source_is_in_the_ledger`. (It did, on the
+        // first attempt.) The ledger stays exactly as strict as it was:
+        // `the_ledger_does_not_invent_names` rightly forbids an entry for a name
+        // this crate does not read, and this one genuinely belongs to ay-sys.
+        if k == ay_sys::govern::ARMED_ENV {
+            continue;
+        }
         match KNOBS.iter().find(|kn| kn.name == k) {
             None => out.unknown.push(k),
             Some(kn) if kn.bucket == Bucket::Dead => out.dead.push(k),
@@ -494,10 +542,56 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
+    // The FT-adoption ROW CEILING. Added because a gate audit found the ceiling had
+    // NO override while its cold-root sibling has `AY_MILP_COLD_LU_MAX_ROWS`, so the
+    // 106-of-379 instances above it could not be measured even in principle. Default
+    // unchanged (`REFACTOR_TALL_ROWS`); this makes the gate reachable, not different.
+    Knob {
+        name: "AY_MILP_ADOPT_FT_MAX_ROWS",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
     Knob {
         name: "AY_MILP_ALLOCSTAT",
         bucket: Bucket::Diagnostic,
         read_sites: 2,
+    },
+    // AUTO-DETECTED margin reframe (`margin::auto_margin_row`). DEFAULT OFF, and
+    // registered as an ARM rather than a kill switch for the same reason
+    // `AY_MILP_CUT_FRAC_PENALTY` and `AY_MILP_RINS_DRYCAP` are: it was MEASURED
+    // and it LOST, and the value of the name is that the negative stays
+    // re-checkable. It makes the whole `margin` module reachable from an ordinary
+    // `check()` — `mark_margin_row`'s only non-test callers require the CALLER to
+    // name the row, so the reframe was dormant on every model that arrives as a
+    // file, which is every ny W1 model. Measured over 46 W1 captures at 30s: the
+    // reframed objective is a PRIMAL driver, so it lands both previously-open SAT
+    // roots (8/10 -> 10/10) and loses FIVE UNSAT proofs (25/46 -> 22/46 decided,
+    // 379 -> 41,867 nodes on the instances both arms decide). the downstream optimization consumer's W1 deliverable
+    // is UNSAT. Unset is bit-identical to a build without it.
+    Knob {
+        name: "AY_MILP_AMO_MULTIWAY",
+        bucket: Bucket::Arm,
+        read_sites: 2,
+    },
+    // Milliseconds the ANCHOR (native proof-producing search) is given to beat a
+    // DEFERRED lane verdict on the evidence axis before that verdict is
+    // published as-is. See `claim::ANCHOR_FIRST_REFUSAL_CAP`.
+    //
+    // `0` DISABLES deferral entirely, which recovers the pre-portfolio routing
+    // behaviour exactly: every lane that clears its own floor closes as before,
+    // and a below-floor lane closes too. That degenerate point is what makes the
+    // dominance invariant a property of ONE program with a parameter rather than
+    // a claim about two programs, and `deferral_disabled_recovers_greedy_close`
+    // asserts it.
+    Knob {
+        name: "AY_MILP_ANCHOR_FIRST_REFUSAL_MS",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_AUTO_MARGIN",
+        bucket: Bucket::Arm,
+        read_sites: 1,
     },
     Knob {
         name: "AY_MILP_BB",
@@ -530,6 +624,11 @@ pub const KNOBS: &[Knob] = &[
         read_sites: 1,
     },
     Knob {
+        name: "AY_MILP_BINARY_COMPLEMENT_SUB",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
         name: "AY_MILP_BUMPDIFF_LANES",
         bucket: Bucket::Tuning,
         read_sites: 1,
@@ -542,6 +641,13 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_BUMP_DIAG",
         bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    // Opt-in for the provisional fill-rate trip (`Simplex::maybe_trip_bump_fill`).
+    // Default OFF: the predicate is known biased -- see the function.
+    Knob {
+        name: "AY_MILP_BUMP_FILL_TRIP",
+        bucket: Bucket::Arm,
         read_sites: 1,
     },
     Knob {
@@ -624,8 +730,16 @@ pub const KNOBS: &[Knob] = &[
     // ns/update/row over 39 models; spike density scores 0.841 but cannot be
     // observed from the eta lane at all), while the rebuild pressure the band
     // was actually buying down IS countable as it is paid. DEFAULT 0 = OFF.
+    // Measurement arm: try the cold dual start on EVERY shape, not just `wide_tall`.
+    // The square-ish corpus never ran it, and that is the corpus the headline LP
+    // numbers were measured on -- see the call site in `simplex.rs`.
     Knob {
-        name: "AY_MILP_COLD_LU_ETA_WORK",
+        name: "AY_MILP_COLD_DUAL_ALL",
+        bucket: Bucket::Arm,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_COLD_LU_ETA_REBUILDS",
         bucket: Bucket::Arm,
         read_sites: 1,
     },
@@ -641,8 +755,8 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_COND_TIGHTEN",
-        bucket: Bucket::Dead,
-        read_sites: 0,
+        bucket: Bucket::Arm,
+        read_sites: 1,
     },
     Knob {
         name: "AY_MILP_COVER_EXT_ROUNDS",
@@ -662,7 +776,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_CUTS_PER_ROUND",
         bucket: Bucket::Tuning,
-        read_sites: 2,
+        read_sites: 1,
     },
     Knob {
         name: "AY_MILP_CUT_EFF_FLOOR",
@@ -677,6 +791,18 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_CUT_MAX_PARALLEL",
         bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    // THE PERTURBATION-MATCHED CUT CONTROL (arm C of the three-arm cut measurement in
+    // the development design notes §9(1)). Runs the shipped cut
+    // loop unchanged and then REPLACES every row it installed with an information-free
+    // row of the same shape: a non-negative combination of the model's own column
+    // bounds, tight at the cut-free root vertex. It cuts off no point of the box, hence
+    // none of the LP relaxation, hence none of any node's relaxation — so the arm
+    // isolates what ROWS cost from what CUTS buy. See `bab::shadow_control_model`.
+    Knob {
+        name: "AY_MILP_CUT_SHADOW",
+        bucket: Bucket::Arm,
         read_sites: 1,
     },
     Knob {
@@ -705,6 +831,16 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_DEDUP_COLS",
         bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    // Restores the DENSE `m × m` `Bᵀ` assembly + `ExactLu` in the GMI separator,
+    // the path `SparseExactLu` replaced. Both arms solve `Bᵀ u = e_i` EXACTLY, and
+    // a non-singular basis has one solution, so the cuts are byte-identical; what
+    // differs is ≈36·m² bytes of peak RSS. The row cap's whole re-derivation is an
+    // A/B against this switch, so deleting it deletes the evidence.
+    Knob {
+        name: "AY_MILP_DENSE_GMI_LU",
+        bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
     Knob {
@@ -747,6 +883,16 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
+    // Widens DUAL FIXING (`dualfix.rs`) from objective-≡0 models to EVERY model. An ARM and
+    // not tuning because what it trades is the ARTIFACT, not the speed: with a real objective
+    // the verdict at stake is an OPTIMAL value whose dual-bound certificate the reduction
+    // strips and no re-solve buys back. The rule itself is sound with an objective (the sign
+    // test is implemented, sense-aware and tested); only the evidence economics differ.
+    Knob {
+        name: "AY_MILP_DUALFIX_ALL",
+        bucket: Bucket::Arm,
+        read_sites: 1,
+    },
     Knob {
         name: "AY_MILP_DUAL_ANATOMY",
         bucket: Bucket::Diagnostic,
@@ -775,6 +921,9 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
+    // THREE-VALUED, not a boolean: `0` off, unset = ARMED (a cold solve of an LP
+    // whose cold walk has already stalled), `1`/`all` = the blanket 2026-07-20
+    // behaviour and the downstream optimization consumer's diff-net lever. See `simplex::eager_perturb_mode`.
     Knob {
         name: "AY_MILP_EAGER_PERTURB",
         bucket: Bucket::Tuning,
@@ -885,6 +1034,15 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
+    // Per-cut identity fingerprints for the GMI separator (`sepstat::gmi_cut`).
+    // Separate from `AY_MILP_TRACE` on purpose: the general trace's volume is
+    // itself a cost, and it perturbs which A/B arm runs out of round budget first
+    // — which is the confounder these lines exist to remove.
+    Knob {
+        name: "AY_MILP_GMI_CUT_TRACE",
+        bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
     Knob {
         name: "AY_MILP_GMI_MAX_ROWS",
         bucket: Bucket::Tuning,
@@ -931,6 +1089,11 @@ pub const KNOBS: &[Knob] = &[
         read_sites: 1,
     },
     Knob {
+        name: "AY_MILP_HYBRID_PB_LP",
+        bucket: Bucket::Arm,
+        read_sites: 1,
+    },
+    Knob {
         name: "AY_MILP_IMPL",
         bucket: Bucket::Tuning,
         read_sites: 1,
@@ -943,6 +1106,19 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_IMPLIED_BOUND_DEBUG",
         bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    // The implied-column-bound rescue inside `safe_bound` (`implied_open_corner`):
+    // when the exact reduced-cost sign charges a column's OPEN side, read a corner
+    // off the rows' own activity instead of forfeiting the node's whole bound.
+    // OPT-IN and DEFAULT OFF: measured across 48 instances it closes ZERO of the 9
+    // root declines (the rows' other columns are open too, and anything they DO
+    // imply the exact presolve already installed) and costs 2.6x node throughput.
+    // Kept, exact-admitted and tested, for the day a source of open columns the
+    // presolve cannot see appears.
+    Knob {
+        name: "AY_MILP_IMPLIED_COL_BOUNDS",
+        bucket: Bucket::Tuning,
         read_sites: 1,
     },
     Knob {
@@ -1120,6 +1296,11 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_MIK_MIR_EXT_ROUNDS",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_MIN_VIOLATION",
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
@@ -1357,14 +1538,14 @@ pub const KNOBS: &[Knob] = &[
     // falling back to the nearest ancestor bound that covers its box. Pure
     // reporting — `Node::cover` is never read by the search.
     //
-    // ⚠ IT DOES NOT ISOLATE THE ANCESTOR-COVER CHANGE, and an earlier report
-    // here claimed it did. The root floor is delivered THROUGH `Node::cover`,
-    // so switching the `cover()` read off suppresses the floor as well.
-    // Demonstrated on 30n20b8 at `AY_MILP_MAX_NODES=0`: default gives
-    // `BOUND 44`, and `AY_MILP_NO_BOUND_COVER=1` and `AY_MILP_NO_ROOT_FLOOR=1`
-    // give an IDENTICAL `UNKNOWN SolverIncomplete`. Any A/B against this knob
-    // measures cover + root floor together; to attribute either half on its own,
-    // pair it with `AY_MILP_NO_ROOT_FLOOR` and difference the arms.
+    // IT NOW ISOLATES THE ANCESTOR-COVER CHANGE, AND IT USED NOT TO. `Node::cover`
+    // was the root floor's ONLY route to the global claim, so switching the
+    // `cover()` read off suppressed the floor with it — measured on 30n20b8 at
+    // `AY_MILP_MAX_NODES=0`: default `BOUND 44`, and `AY_MILP_NO_BOUND_COVER=1`
+    // and `AY_MILP_NO_ROOT_FLOOR=1` both `UNKNOWN SolverIncomplete`, identically.
+    // The floor now also reaches `tree_bound` directly (`root_floor_global`), so
+    // the same three arms measure `BOUND 44`, `BOUND 44`, `UNKNOWN` — this knob
+    // moves the cover channel alone. `AY_MILP_NO_TREE_FLOOR` is the other half.
     Knob {
         name: "AY_MILP_NO_BOUND_COVER",
         bucket: Bucket::KillSwitch,
@@ -1377,6 +1558,19 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_NO_BUMP_LU",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    // The A/B arm for DECOUPLING the root reductions from tree-certificate
+    // capture. The kernel reformulation and duplicate-column dedup were gated on
+    // `opts.tree_cert_leaves == 0`, and that field defaults to 256 — so both were
+    // OFF on default options, traded for an artifact `Outcome` can only carry on
+    // its `Infeasible` variant. Set this and the two gates collapse back to
+    // exactly `tree_cert_leaves == 0`, which also makes the harvest re-solve
+    // unreachable (it requires `tree_cert_leaves > 0`), so one name restores the
+    // whole prior path. See `bab::cert_decouple_enabled`.
+    Knob {
+        name: "AY_MILP_NO_CERT_DECOUPLE",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
@@ -1401,7 +1595,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_NO_COLD_LU",
         bucket: Bucket::KillSwitch,
-        read_sites: 1,
+        read_sites: 0,
     },
     Knob {
         name: "AY_MILP_NO_COND_SCOUT",
@@ -1449,6 +1643,11 @@ pub const KNOBS: &[Knob] = &[
         read_sites: 1,
     },
     Knob {
+        name: "AY_MILP_NO_DUALFIX",
+        bucket: Bucket::KillSwitch,
+        read_sites: 0,
+    },
+    Knob {
         name: "AY_MILP_NO_DUAL_CHURN_BAND",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
@@ -1460,6 +1659,26 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_NO_ETA_REUSE",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    // Restores the SIZE-gated conflict levers on the objective-≡0 feasibility
+    // class: nogood unit propagation and nogood-guided branching go back to
+    // `tall_lu() || impl_class`, propagation-conflict learning back to `impl_on`,
+    // and VSIDS branching back to default-off. Every model with a real objective
+    // reads identically either way — the gate is a property of the objective.
+    // See `feas_class` in `bab.rs`.
+    Knob {
+        name: "AY_MILP_NO_FEAS_CONFLICT",
+        bucket: Bucket::KillSwitch,
+        read_sites: 0,
+    },
+    // The A/B arm for the FILL-RATE TRIP (`Simplex::maybe_trip_bump_fill`), which
+    // arms the Markowitz bump lane on MEASURED fill instead of on the
+    // `AY_MILP_BUMP_LU_MIN` column count. Set it and `bump_active` reduces to the
+    // historical `peel_nb >= bump_lu_min()` expression byte-for-byte.
+    Knob {
+        name: "AY_MILP_NO_FILL_TRIP",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
@@ -1511,7 +1730,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_NO_KERNEL_REFORM",
         bucket: Bucket::KillSwitch,
-        read_sites: 1,
+        read_sites: 0,
     },
     Knob {
         name: "AY_MILP_NO_LATTICE",
@@ -1520,6 +1739,18 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_NO_MARGIN_REFRAME",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    // Restores the MIR-class self-gate's historical ALL-INTEGRAL predicate. The gate now
+    // excludes only all-BINARY models (`cuts::mir_family_inert`): a general integer column
+    // with a non-unit coefficient is precisely what MIR / strengthened-CG rounding is for,
+    // and gating it off cost haprp its proof outright (300s BOUND 3666028.211734 at 640,876
+    // nodes with no incumbent at all -> OPTIMAL 3673280.681685 in 63.2s at 357,624 nodes;
+    // root closure 0% -> 96.2%). Setting it also removes the MIR class's per-round wall
+    // budget, which exists only on the models this narrowing admits.
+    Knob {
+        name: "AY_MILP_NO_MIR_GENINT",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
@@ -1583,6 +1814,15 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
+    // Restores the pre-fix reduced-cost caps, which would close an OPEN column
+    // side at any finite value at all — measured up to 5.8e20 on a model whose
+    // largest bound is 673.5, derived from an `rc` of 1.5e-15. Such a cap prunes
+    // nothing and disables `safe_bound`'s open-column repair. The A/B arm.
+    Knob {
+        name: "AY_MILP_NO_RC_CAP_GUARD",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
     Knob {
         name: "AY_MILP_NO_RINS_RESCUE",
         bucket: Bucket::KillSwitch,
@@ -1617,6 +1857,11 @@ pub const KNOBS: &[Knob] = &[
         read_sites: 1,
     },
     Knob {
+        name: "AY_MILP_NO_SHAPE_CPR",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
         name: "AY_MILP_NO_SNAP",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
@@ -1628,6 +1873,11 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_NO_STRONGCG",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_NO_STRUCTURE_ROUTE",
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
@@ -1654,6 +1904,16 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
+    // Restores the pre-fix global dual bound: a MIN over the open set and the
+    // incumbent, with no floor by the root's own bound. The root floor is a
+    // valid bound on the WHOLE tree, so the min could — and on 50v-10 did —
+    // report a number 2335 units below one the solver had already proven.
+    // Reporting only; `root_floor_global` is never read by the search.
+    Knob {
+        name: "AY_MILP_NO_TREE_FLOOR",
+        bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
     Knob {
         name: "AY_MILP_NO_TRI_CRASH",
         bucket: Bucket::KillSwitch,
@@ -1672,6 +1932,11 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_NO_ZERO_HALF",
         bucket: Bucket::KillSwitch,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_OBJECTIVE_SINGLETON_SUB",
+        bucket: Bucket::Tuning,
         read_sites: 1,
     },
     Knob {
@@ -1712,7 +1977,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_ORBITOPE_DYN",
         bucket: Bucket::Tuning,
-        read_sites: 1,
+        read_sites: 2,
     },
     Knob {
         name: "AY_MILP_ORBITOPE_ILV",
@@ -1861,6 +2126,11 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         name: "AY_MILP_PUMP_SHARE",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_MILP_PUMP_WORK_MULT",
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
@@ -2179,6 +2449,9 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
+    // How far below the pseudocost pick's score a candidate may score and still
+    // be reconsidered for its orbit. DEFAULT 0 (score ties only); `1` restores
+    // the 2026-07-22 wide band. See `bab::symmetry_branch_band_setting`.
     Knob {
         name: "AY_MILP_SYM_BRANCH_BAND",
         bucket: Bucket::Tuning,
@@ -2207,12 +2480,15 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_MILP_THREADS",
         bucket: Bucket::Product,
-        read_sites: 1,
+        read_sites: 2,
     },
+    // 72 -> 74: the GMI basis factorization's fill line (`cuts.rs`, `m`/basis nnz/
+    // factor nnz/fill) and `sepstat::gmi_cut`'s per-cut identity fingerprint, which
+    // rides on the general trace as well as its own switch.
     Knob {
         name: "AY_MILP_TRACE",
         bucket: Bucket::Diagnostic,
-        read_sites: 59,
+        read_sites: 74,
     },
     Knob {
         name: "AY_MILP_TREE_CERT_LEAVES",

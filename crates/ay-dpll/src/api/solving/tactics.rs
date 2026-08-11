@@ -2004,7 +2004,7 @@ impl TacticSolver {
             self.inner
                 .record_native_replay_event(NativeReplayEventKind::CheckSat);
             self.inner.set_internal_error_unknown(&e.to_string());
-            return VerifiedSolveResult::from_validated(SolveResult::Unknown, None);
+            return self.inner.finish_verified_result(SolveResult::Unknown);
         }
         self.inner.check_sat()
     }
@@ -2018,7 +2018,7 @@ impl TacticSolver {
                     assumptions: assumptions.iter().map(|term| term.0).collect(),
                 });
             self.inner.set_internal_error_unknown(&e.to_string());
-            return VerifiedSolveResult::from_validated(SolveResult::Unknown, None);
+            return self.inner.finish_verified_result(SolveResult::Unknown);
         }
         self.inner.check_sat_assuming(assumptions)
     }
@@ -2168,6 +2168,16 @@ impl Solver {
     /// result denotes the same formulas over this solver's store.
     #[must_use]
     pub fn translate_terms_from(&mut self, source: &Solver, formulas: &[Term]) -> Vec<Term> {
+        // Propagate the `to_real`-shadowed latch for the same reason as the
+        // `is_int` latch below. `graft_term` rebuilds applications directly and
+        // therefore does not revisit declaration-time shadow detection. Losing
+        // this sticky bit would let destination equality/comparison builders
+        // assign builtin integrality semantics to a translated user UF named
+        // `to_real`, which is a wrong-verdict channel. Carrying it is
+        // conservative and can only disable an optimization. (#to-real-bridge)
+        if source.terms().to_real_is_shadowed() {
+            self.terms_mut().mark_to_real_shadowed();
+        }
         // Propagate the `is_int`-shadowed latch across the context boundary. The
         // deep copy below rebuilds a user `App(Named("is_int"), ..)` byte-
         // identically to the builtin integrality predicate, but `graft_term`
@@ -2198,6 +2208,8 @@ impl Solver {
         // step fails. Revoke both the preceding public result and every partial
         // tactic-probe artefact before publishing Unknown diagnostics.
         self.executor.begin_public_solve(false);
+        self.executor
+            .replace_last_result_with_unknown(crate::UnknownReason::InternalError);
         self.last_assumptions = None;
         self.last_unknown_reason = Some(crate::UnknownReason::InternalError);
         self.last_executor_error = Some(detail.to_string());

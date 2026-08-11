@@ -1005,16 +1005,42 @@ impl Executor {
         let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
         let entry_proof_steps = self.proof_tracker.num_steps();
         let entry_var_substitutions = self.recorded_var_substitutions.clone();
+        let entry_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
+        let entry_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
         let rollback_on_fallback = |this: &mut Self| {
-            if this.produce_proofs_enabled() && this.proof_tracker.num_steps() != entry_proof_steps
-            {
+            // #dt-auflia-rollback-proof-gate: test user-requested proof OUTPUT,
+            // not `produce_proofs_enabled()`. The latter ORs in
+            // `proof_tracker.is_enabled()`, which `begin_public_solve` turns on
+            // unconditionally for every public decision, so since 66538b006 this
+            // condition has been `true` on every real run and the guard degraded
+            // to "never roll back once any proof step was recorded" — which is
+            // essentially always. That is the mechanism audit_claims.py names for
+            // the SQ QF_Datatypes retraction (dt.rs:1011): the failed lazy
+            // attempt's scaffold survives and the pre-fix `unknown` returns.
+            //
+            // The guard's real job — never roll terms back out from under a
+            // proof that will be EXPORTED — is preserved: under `--proof` /
+            // `:produce-proofs true` / `--self-check` it still declines. The
+            // certificate half is already handled unconditionally below, exactly
+            // as in the try_solve_dt_lazy sibling.
+            if this.is_producing_proofs() && this.proof_tracker.num_steps() != entry_proof_steps {
                 return;
             }
             this.last_model = None;
             this.last_validation_stats = None;
+            // #dt-lazy-cert-rollback: the discarded attempt may have run
+            // `emit_sat_verdict` and minted a one-shot emission certificate
+            // (`SatCertificate`/`UnsatCertificate`, added by 66538b006). Those
+            // certify a model this rollback is about to destroy, so they must go
+            // with it — otherwise the next verdict is judged against a witness
+            // for a solve that no longer exists.
+            this.last_sat_certificate = None;
+            this.last_unsat_certificate = None;
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
             this.recorded_var_substitutions = entry_var_substitutions.clone();
+            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort.clone();
+            this.array_default_diag_by_sort = entry_array_default_diag_by_sort.clone();
             crate::executor::model::eval_memo_clear();
             this.ctx.terms.rollback_to(entry_terms_checkpoint);
             if std::env::var_os("AY_PHASE_TRACE").is_some() {
@@ -1220,6 +1246,8 @@ impl Executor {
 
         // Snapshot the term-store watermark BEFORE the lane mints anything.
         let oracle_checkpoint = self.ctx.terms.rollback_checkpoint();
+        let saved_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
+        let saved_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
         // Suspend the persistent incremental substrate for the window.
         let saved_incremental = self.incremental_mode;
         let saved_theory = self.incr_theory_state.take();
@@ -1260,6 +1288,8 @@ impl Executor {
             self.last_validation_stats = None;
             self.clear_dt_theory_model();
             self.dt_egraph_assignment.replace(None);
+            self.array_default_epsilon_by_sort = saved_array_default_epsilon_by_sort;
+            self.array_default_diag_by_sort = saved_array_default_diag_by_sort;
             crate::executor::model::eval_memo_clear();
             self.ctx.terms.rollback_to(oracle_checkpoint);
             if std::env::var_os("AY_PHASE_TRACE").is_some() {
@@ -1663,16 +1693,43 @@ impl Executor {
         let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
         let entry_proof_steps = self.proof_tracker.num_steps();
         let entry_var_substitutions = self.recorded_var_substitutions.clone();
+        let entry_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
+        let entry_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
         let rollback_on_fallback = |this: &mut Self| {
-            if this.produce_proofs_enabled() && this.proof_tracker.num_steps() != entry_proof_steps
-            {
-                return;
-            }
+            // #dt-lazy-isolation, repaired 2026-08-07.
+            //
+            // This guard used to skip the rollback whenever proof steps existed,
+            // and its own comment recorded the precondition that made that safe:
+            // "the SMT-COMP configuration (--z3-mode) never enables proofs and
+            // always takes the rollback". 66538b006 made proof tracking
+            // unconditional and silently voided it — the rollback stopped firing,
+            // the failed lazy attempt's scaffold survived, and the pre-fix unknown
+            // returned. Measured cost: 99 answers on MV QF_Datatypes, with SQ and
+            // MV QF_Datatypes lost outright.
+            //
+            // The guard existed because rolling terms back under recorded proof
+            // steps dangles them. That is handled directly now: the certificates
+            // minted by the discarded attempt are cleared below, so the rollback
+            // is self-consistent and always safe to run.
+            //
+            // Note this is the try_solve_dt_lazy lane ONLY. The sibling
+            // try_solve_dt_auflia_lazy guard above must stay — enabling it
+            // regresses FP/BV/NRA (measured: 14 FP failures).
             this.last_model = None;
             this.last_validation_stats = None;
+            // #dt-lazy-cert-rollback: the discarded attempt may have run
+            // `emit_sat_verdict` and minted a one-shot emission certificate
+            // (`SatCertificate`/`UnsatCertificate`, added by 66538b006). Those
+            // certify a model this rollback is about to destroy, so they must go
+            // with it — otherwise the next verdict is judged against a witness
+            // for a solve that no longer exists.
+            this.last_sat_certificate = None;
+            this.last_unsat_certificate = None;
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
             this.recorded_var_substitutions = entry_var_substitutions.clone();
+            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort.clone();
+            this.array_default_diag_by_sort = entry_array_default_diag_by_sort.clone();
             crate::executor::model::eval_memo_clear();
             this.ctx.terms.rollback_to(entry_terms_checkpoint);
             if std::env::var_os("AY_PHASE_TRACE").is_some() {

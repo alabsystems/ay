@@ -1,0 +1,179 @@
+"combinators:
+- (and-then <simplifier>+) executes the given simplifiers sequentially.
+- (using-params <tactic> <attribute>*) executes the given simplifier using the given attributes, where <attribute> ::= <keyword> <value>. ! is syntax sugar for using-params.
+builtin simplifiers:
+- bit2int simplify bit2int expressions.
+- bit-blast reduce bit-vector expressions into SAT.
+    blast_add (bool) (default: true) bit-blast adders.
+    blast_full (bool) (default: false) bit-blast any term with bit-vector sort, this option will make E-matching ineffective in any pattern containing bit-vector terms.
+    blast_mul (bool) (default: true) bit-blast multipliers (and dividers, remainders).
+    blast_quant (bool) (default: false) bit-blast quantified variables.
+    max_memory (unsigned int) (default: infty) maximum amount of memory in megabytes. (default: 4294967295)
+    max_steps (unsigned int) (default: infty) maximum number of steps. (default: 4294967295)
+- bv1-blast reduce bit-vector expressions into bit-vectors of size 1 (notes: only equality, extract and concat are supported).
+    max_memory (unsigned int) (default: infty) maximum amount of memory in megabytes. (default: 4294967295)
+    max_steps (unsigned int) (default: infty) maximum number of steps. (default: 4294967295)
+- cheap-fourier-motzkin eliminate variables from quantifiers using partial Fourier-Motzkin elimination.
+- elim-term-ite eliminate if-then-else term by hoisting them top top-level.
+- max-bv-sharing use heuristics to maximize the sharing of bit-vector expressions such as adders and multipliers.
+- pull-nested-quantifiers pull nested quantifiers to top-level.
+- push-app-ite-conservative Push functions over if-then else.
+- push-app-ite Push functions over if-then else.
+- ng-push-app-ite-conservative Push functions over if-then-else within non-ground terms only.
+- ng-push-app-ite Push functions over if-then-else within non-ground terms only.
+- randomizer shuffle assertions and rename uninterpreted functions.
+- refine-injectivity refine injectivity axioms.
+- simplify apply simplification rules.
+    algebraic_number_evaluator (bool) simplify/evaluate expressions containing (algebraic) irrational numbers. (default: true)
+    arith_ineq_lhs (bool) rewrite inequalities so that right-hand-side is a constant. (default: false)
+    arith_lhs (bool) all monomials are moved to the left-hand-side, and the right-hand-side is just a constant. (default: false)
+    bit2bool (bool) try to convert bit-vector terms of size 1 into Boolean terms (default: true)
+    blast_distinct (bool) expand a distinct predicate into a quadratic number of disequalities (default: false)
+    blast_distinct_threshold (unsigned int) when blast_distinct is true, only distinct expressions with less than this number of arguments are blasted (default: 4294967295)
+    blast_eq_value (bool) blast (some) Bit-vector equalities into bits (default: false)
+    blast_select_store (bool) eagerly replace all (select (store ..) ..) term by an if-then-else term (default: false)
+    bv_extract_prop (bool) attempt to partially propagate extraction inwards (default: false)
+    bv_ineq_consistency_test_max (unsigned int) max size of conjunctions on which to perform consistency test based on inequalities on bitvectors. (default: 0)
+    bv_ite2id (bool) rewrite ite that can be simplified to identity (default: false)
+    bv_le2extract (bool) disassemble bvule to extract (default: true)
+    bv_le_extra (bool) additional bu_(u/s)le simplifications (default: false)
+    bv_not_simpl (bool) apply simplifications for bvnot (default: false)
+    bv_sort_ac (bool) sort the arguments of all AC operators (default: true)
+    cache_all (bool) cache all intermediate results. (default: false)
+    elim_and (bool) conjunctions are rewritten using negation and disjunctions (default: false)
+    elim_ite (bool) eliminate ite in favor of and/or (default: true)
+    elim_rem (bool) replace (rem x y) with (ite (>= y 0) (mod x y) (- (mod x y))). (default: false)
+    elim_sign_ext (bool) expand sign-ext operator using concat and extract (default: true)
+    elim_to_real (bool) eliminate to_real from arithmetic predicates that contain only integers. (default: false)
+    enable_der (bool) enable destructive equality resolution to quantifiers. (default: true)
+    eq2ineq (bool) expand equalities into two inequalities (default: false)
+    expand_nested_stores (bool) replace nested stores by a lambda expression (default: false)
+    expand_power (bool) expand (^ t k) into (* t ... t) if  1 < k <= max_degree. (default: false)
+    expand_select_ite (bool) expand select over ite expressions (default: false)
+    expand_select_store (bool) conservatively replace a (select (store ...) ...) term by an if-then-else term (default: false)
+    expand_store_eq (bool) reduce (store ...) = (store ...) with a common base into selects (default: false)
+    expand_tan (bool) replace (tan x) with (/ (sin x) (cos x)). (default: false)
+    flat (bool) create nary applications for +,*,bvadd,bvmul,bvand,bvor,bvxor (default: true)
+    flat_and_or (bool) create nary applications for and,or (default: true)
+    gcd_rounding (bool) use gcd rounding on integer arithmetic atoms. (default: false)
+    hi_div0 (bool) use the 'hardware interpretation' for division by zero (for bit-vector terms) (default: true)
+    hoist_ite (bool) hoist shared summands under ite expressions (default: false)
+    hoist_mul (bool) hoist multiplication over summation to minimize number of multiplications (default: false)
+    ignore_patterns_on_ground_qbody (bool) ignores patterns on quantifiers that don't mention their bound variables. (default: true)
+    ite_extra_rules (bool) extra ite simplifications, these additional simplifications may reduce size locally but increase globally (default: true)
+    local_ctx (bool) perform local (i.e., cheap) context simplifications (default: false)
+    local_ctx_limit (unsigned int) limit for applying local context simplifier (default: 4294967295)
+    max_degree (unsigned int) max degree of algebraic numbers (and power operators) processed by simplifier. (default: 64)
+    max_memory (unsigned int) maximum amount of memory in megabytes (default: 4294967295)
+    max_steps (unsigned int) maximum number of steps (default: 4294967295)
+    mul2concat (bool) replace multiplication by a power of two into a concatenation (default: false)
+    mul_to_power (bool) collpase (* t ... t) into (^ t k), it is ignored if expand_power is true. (default: false)
+    pull_cheap_ite (bool) pull if-then-else terms when cheap. (default: false)
+    push_ite_arith (bool) push if-then-else over arithmetic terms. (default: false)
+    push_ite_bv (bool) push if-then-else over bit-vector terms. (default: false)
+    push_to_real (bool) distribute to_real over * and +. (default: true)
+    rewrite_patterns (bool) rewrite patterns. (default: false)
+    som (bool) put polynomials in sum-of-monomials form (default: false)
+    som_blowup (unsigned int) maximum increase of monomials generated when putting a polynomial in sum-of-monomials normal form (default: 10)
+    sort_disjunctions (bool) sort subterms in disjunctions (default: true)
+    sort_store (bool) sort nested stores when the indices are known to be different (default: false)
+    sort_sums (bool) sort the arguments of + application. (default: false)
+    split_concat_eq (bool) split equalities of the form (= (concat t1 t2) t3) (default: false)
+    unfold_recursive_functions (bool) apply simplification recursively on recursive functions. (default: false)
+- qe-light apply light-weight quantifier elimination.
+- card2bv convert pseudo-boolean constraints to bit-vectors.
+    cardinality.encoding (symbol) encoding used for cardinality constraints: grouped, bimander, ordered, unate, circuit (default: none)
+    keep_cardinality_constraints (bool) retain cardinality constraints for solver (default: true)
+    pb.solver (symbol) encoding used for Pseudo-Boolean constraints: totalizer, sorting, binary_merge, bv, solver. PB constraints are retained if set to 'solver' (default: solver)
+- factor polynomial factorization.
+    max_prime (unsigned int) (default: infty) Z3 polynomial factorization is composed of three steps: factorization in GF(p), lifting and search. This parameter limits the maximum prime number p to be used in the first step.
+    max_search_size (unsigned int) (default: infty) Z3 polynomial factorization is composed of three steps: factorization in GF(p), lifting and search. This parameter can be used to limit the search space.
+    num_primes (unsigned int) (default: 1) Z3 polynomial factorization is composed of three steps: factorization in GF(p), lifting and search. The search space may be reduced by factoring the polynomial in different GF(p)'s. This parameter specify the maximum number of finite factorizations to be considered, before lifiting and searching.
+    split_factors (bool) apply simplifications such as (= (* p1 p2) 0) --> (or (= p1 0) (= p2 0)). (default: true)
+- propagate-ineqs propagate ineqs/bounds, remove subsumed inequalities.
+    bound_max_refinements (unsigned int) (default: 16) maximum number of bound refinements (per round) for unbounded variables.
+    bound_threshold (double) (default: 0.05) bound propagation improvement threshold ratio.
+- propagate-bv-bounds propagate bit-vector bounds by simplifying implied or contradictory bounds.
+    propagate_eq (bool) propagate equalities from inequalities (default: false)
+- bv-divrem-bounds add range lemmas for bit-vector division/remainder terms with a symbolic divisor.
+- bv-slice simplify using bit-vector slices.
+- bvarray2uf Rewrite bit-vector arrays into bit-vector (uninterpreted) functions.
+- blast-term-ite blast term if-then-else by hoisting them.
+- cofactor-term-ite eliminate term if-then-else using cofactors.
+    cofactor_equalities (bool) (default: true) use equalities to rewrite bodies of ite-expressions. This is potentially expensive.
+- demodulator extracts equalities from quantifiers and applies them to simplify.
+- der destructive equality resolution.
+- distribute-forall distribute forall over conjunctions.
+- dom-simplify apply dominator simplification rules.
+- elim-unconstrained eliminate unconstrained variables.
+- elim-predicates eliminate predicates, macros and implicit definitions.
+- fold-unfold solve for variables.
+- injectivity Identifies and applies injectivity axioms.
+- propagate-values propagate constants.
+    algebraic_number_evaluator (bool) simplify/evaluate expressions containing (algebraic) irrational numbers. (default: true)
+    arith_ineq_lhs (bool) rewrite inequalities so that right-hand-side is a constant. (default: false)
+    arith_lhs (bool) all monomials are moved to the left-hand-side, and the right-hand-side is just a constant. (default: false)
+    bit2bool (bool) try to convert bit-vector terms of size 1 into Boolean terms (default: true)
+    blast_distinct (bool) expand a distinct predicate into a quadratic number of disequalities (default: false)
+    blast_distinct_threshold (unsigned int) when blast_distinct is true, only distinct expressions with less than this number of arguments are blasted (default: 4294967295)
+    blast_eq_value (bool) blast (some) Bit-vector equalities into bits (default: false)
+    blast_select_store (bool) eagerly replace all (select (store ..) ..) term by an if-then-else term (default: false)
+    bv_extract_prop (bool) attempt to partially propagate extraction inwards (default: false)
+    bv_ineq_consistency_test_max (unsigned int) max size of conjunctions on which to perform consistency test based on inequalities on bitvectors. (default: 0)
+    bv_ite2id (bool) rewrite ite that can be simplified to identity (default: false)
+    bv_le2extract (bool) disassemble bvule to extract (default: true)
+    bv_le_extra (bool) additional bu_(u/s)le simplifications (default: false)
+    bv_not_simpl (bool) apply simplifications for bvnot (default: false)
+    bv_sort_ac (bool) sort the arguments of all AC operators (default: true)
+    cache_all (bool) cache all intermediate results. (default: false)
+    elim_and (bool) conjunctions are rewritten using negation and disjunctions (default: false)
+    elim_ite (bool) eliminate ite in favor of and/or (default: true)
+    elim_rem (bool) replace (rem x y) with (ite (>= y 0) (mod x y) (- (mod x y))). (default: false)
+    elim_sign_ext (bool) expand sign-ext operator using concat and extract (default: true)
+    elim_to_real (bool) eliminate to_real from arithmetic predicates that contain only integers. (default: false)
+    enable_der (bool) enable destructive equality resolution to quantifiers. (default: true)
+    eq2ineq (bool) expand equalities into two inequalities (default: false)
+    expand_nested_stores (bool) replace nested stores by a lambda expression (default: false)
+    expand_power (bool) expand (^ t k) into (* t ... t) if  1 < k <= max_degree. (default: false)
+    expand_select_ite (bool) expand select over ite expressions (default: false)
+    expand_select_store (bool) conservatively replace a (select (store ...) ...) term by an if-then-else term (default: false)
+    expand_store_eq (bool) reduce (store ...) = (store ...) with a common base into selects (default: false)
+    expand_tan (bool) replace (tan x) with (/ (sin x) (cos x)). (default: false)
+    flat (bool) create nary applications for +,*,bvadd,bvmul,bvand,bvor,bvxor (default: true)
+    flat_and_or (bool) create nary applications for and,or (default: true)
+    gcd_rounding (bool) use gcd rounding on integer arithmetic atoms. (default: false)
+    hi_div0 (bool) use the 'hardware interpretation' for division by zero (for bit-vector terms) (default: true)
+    hoist_ite (bool) hoist shared summands under ite expressions (default: false)
+    hoist_mul (bool) hoist multiplication over summation to minimize number of multiplications (default: false)
+    ignore_patterns_on_ground_qbody (bool) ignores patterns on quantifiers that don't mention their bound variables. (default: true)
+    ite_extra_rules (bool) extra ite simplifications, these additional simplifications may reduce size locally but increase globally (default: true)
+    local_ctx (bool) perform local (i.e., cheap) context simplifications (default: false)
+    local_ctx_limit (unsigned int) limit for applying local context simplifier (default: 4294967295)
+    max_degree (unsigned int) max degree of algebraic numbers (and power operators) processed by simplifier. (default: 64)
+    max_memory (unsigned int) maximum amount of memory in megabytes (default: 4294967295)
+    max_rounds (unsigned int) maximum number of rounds. (default: 4)
+    max_steps (unsigned int) maximum number of steps (default: 4294967295)
+    mul2concat (bool) replace multiplication by a power of two into a concatenation (default: false)
+    mul_to_power (bool) collpase (* t ... t) into (^ t k), it is ignored if expand_power is true. (default: false)
+    pull_cheap_ite (bool) pull if-then-else terms when cheap. (default: false)
+    push_ite_arith (bool) push if-then-else over arithmetic terms. (default: false)
+    push_ite_bv (bool) push if-then-else over bit-vector terms. (default: false)
+    push_to_real (bool) distribute to_real over * and +. (default: true)
+    rewrite_patterns (bool) rewrite patterns. (default: false)
+    som (bool) put polynomials in sum-of-monomials form (default: false)
+    som_blowup (unsigned int) maximum increase of monomials generated when putting a polynomial in sum-of-monomials normal form (default: 10)
+    sort_disjunctions (bool) sort subterms in disjunctions (default: true)
+    sort_store (bool) sort nested stores when the indices are known to be different (default: false)
+    sort_sums (bool) sort the arguments of + application. (default: false)
+    split_concat_eq (bool) split equalities of the form (= (concat t1 t2) t3) (default: false)
+    unfold_recursive_functions (bool) apply simplification recursively on recursive functions. (default: false)
+- reduce-args reduce the number of arguments of function applications, when for all occurrences of a function f the i-th is a value.
+- solve-eqs solve for variables.
+    context_solve (bool) solve equalities under disjunctions. (default: false)
+    eliminate_mod (bool) eliminate modulus from equations (default: true)
+    ite_solver (bool) use if-then-else solver. (default: true)
+    solve_eqs_max_occs (unsigned int) (default: infty) maximum number of occurrences for considering a variable for gaussian eliminations. (default: 4294967295)
+    theory_solver (bool) theory solvers. (default: true)
+- special-relations detect and replace by special relations.
+- euf-completion simplify modulo congruence closure.
+"

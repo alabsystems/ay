@@ -20,6 +20,9 @@ pub const QF_LRA: &str = "QF_LRA";
 /// Quantifier-free nonlinear integer arithmetic.
 pub const QF_NIA: &str = "QF_NIA";
 
+/// Quantifier-free integer arithmetic with exponentiation.
+pub const QF_EIA: &str = "QF_EIA";
+
 /// Quantifier-free nonlinear real arithmetic.
 pub const QF_NRA: &str = "QF_NRA";
 

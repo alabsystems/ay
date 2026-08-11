@@ -3,8 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Strict-mode schema validation for the array `TheoryLemmaKind`s:
-//! `ArraySelectStore`, `ArrayStorePermutation`, `ArrayRowChain`, and
-//! `ArrayExtensionality`.
+//! `ArraySelectStore`, `ArrayStorePermutation`, `ArrayRowChain`,
+//! `ArrayDefaultConst`, and `ArrayExtensionality`.
 //!
 //! Context (#8820): the previous checker accepted any non-empty clause here,
 //! so an attacker could forge an "array axiom" lemma containing arbitrary
@@ -50,6 +50,12 @@ use ay_core::{
 
 use super::ProofCheckError;
 
+/// Maximum number of `store` nodes the folded-default checker will traverse.
+/// This bounds work on untrusted proof bundles independently of proof size.
+/// Only reached on a provably infinite index carrier -- see
+/// [`sort_provably_infinite`].
+const MAX_ARRAY_DEFAULT_STORE_DEPTH: usize = 1_024;
+
 /// Validate a `ArraySelectStore { index_eq }` lemma in strict mode.
 pub(crate) fn validate_array_select_store(
     terms: &TermStore,
@@ -66,6 +72,7 @@ pub(crate) fn validate_array_select_store(
     reject_non_bool_literals(terms, step_id, clause, "array axiom")?;
 
     let literals = flatten_clause_literals(terms, clause);
+    reject_non_bool_literals(terms, step_id, &literals, "array axiom")?;
     let valid = if index_eq {
         matches_row1_unit(terms, &literals) || matches_row1_conditional(terms, &literals)
     } else {
@@ -111,6 +118,12 @@ pub fn recognize_array_select_store(terms: &TermStore, clause: &[TermId]) -> Opt
         return None;
     }
     let literals = flatten_clause_literals(terms, clause);
+    if literals
+        .iter()
+        .any(|&lit| !matches!(terms.sort(lit), Sort::Bool))
+    {
+        return None;
+    }
     if matches_row1_unit(terms, &literals) || matches_row1_conditional(terms, &literals) {
         Some(true)
     } else if matches_row2_conditional(terms, &literals) {
@@ -172,6 +185,12 @@ pub(crate) fn array_select_store_printer_terms(
         },
         _ => (clause, None),
     };
+    if clause
+        .iter()
+        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return None;
+    }
     if index_eq {
         let candidates = match clause {
             [row] => [Some((*row, None)), None],
@@ -281,6 +300,10 @@ pub(crate) enum RowChainEnd {
     Value { outer: TermId, value: TermId },
     /// The walk exhausted the chain: the value is `(select base x)`.
     Base { base: TermId },
+    /// The walk exhausted at `(const-array value)`, so every read is `value`.
+    /// The internal checker validates this SMT-LIB axiom directly; the pinned
+    /// external Alethe checker currently has no corresponding primitive rule.
+    Const { array: TermId, value: TermId },
 }
 
 /// The intermediate array terms of one chain walk, in outermost-first order.
@@ -328,6 +351,23 @@ pub(crate) enum ArrayRowChainPrinterTerms {
         right: RowChainPath,
         packed_or: Option<TermId>,
     },
+}
+
+/// Primitive terms of the exact array-read congruence clause
+/// `not (= L R) OR (= (select L i) (select R i))`.
+///
+/// This deliberately does not share the more permissive ROW-chain matcher:
+/// neither side is evaluated, and every root/index is matched syntactically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrayReadCongruenceTerms {
+    conclusion: TermId,
+    array_eq_lit: TermId,
+    eq_term: TermId,
+    left: TermId,
+    right: TermId,
+    left_read: TermId,
+    right_read: TermId,
+    read_index: TermId,
 }
 
 /// The literal `(= a b)` / `(= b a)` of `literals`, if the clause carries one.
@@ -387,6 +427,19 @@ fn row_chain_path_at(
         });
         current = inner;
     }
+    if let Some(value) = terms.get_const_array(current) {
+        if terms.sort(value) != &array_sort.element_sort {
+            return None;
+        }
+        return Some(RowChainPath {
+            root: term,
+            skips,
+            end: RowChainEnd::Const {
+                array: current,
+                value,
+            },
+        });
+    }
     Some(RowChainPath {
         root: term,
         skips,
@@ -399,7 +452,49 @@ fn path_end_denotes(terms: &TermStore, path: &RowChainPath, index: TermId, targe
     match path.end {
         RowChainEnd::Value { value, .. } => value == target,
         RowChainEnd::Base { base } => is_select_of(terms, target, base, index),
+        RowChainEnd::Const { value, .. } => value == target,
     }
+}
+
+/// Build the proof path from `array` to `target` at `index`.
+///
+/// Usually `target` is the result of actually reducing a non-empty store
+/// chain.  Under an array-equality premise, however, one side of the
+/// congruence may intentionally remain the exact root read
+/// `(select array index)`: the other side's ROW reduction plus congruence is
+/// already sufficient.  The returned flag records whether this path performs
+/// at least one genuine ROW step, so callers can reject the vacuous case where
+/// both endpoints are merely their root reads.
+fn row_chain_path_to_target(
+    terms: &TermStore,
+    array: TermId,
+    index: TermId,
+    literals: &[TermId],
+    target: TermId,
+) -> Option<(RowChainPath, bool)> {
+    if let Some(path) = row_chain_path_at(terms, array, index, literals) {
+        if path_end_denotes(terms, &path, index, target) {
+            let reduced = !path.skips.is_empty()
+                || matches!(
+                    path.end,
+                    RowChainEnd::Value { .. } | RowChainEnd::Const { .. }
+                );
+            return Some((path, reduced));
+        }
+    }
+
+    let (target_array, target_index) = well_sorted_select_parts(terms, target)?;
+    if target_array != array || target_index != index {
+        return None;
+    }
+    Some((
+        RowChainPath {
+            root: array,
+            skips: Vec::new(),
+            end: RowChainEnd::Base { base: array },
+        },
+        false,
+    ))
 }
 
 /// Whether `literals` is EXACTLY the set `used` (order and multiplicity are
@@ -470,6 +565,28 @@ pub(crate) fn array_row_chain_printer_terms(
         }
     }
 
+    // Sub-schema (D): exact select congruence. Keep this syntactically
+    // separate from (B): accepting two unreduced endpoints in the general
+    // ROW matcher would silently broaden all of its guarded-chain shapes.
+    if let Some(congruence) = exact_array_read_congruence_terms(terms, &literals) {
+        let base_path = |root| RowChainPath {
+            root,
+            skips: Vec::new(),
+            end: RowChainEnd::Base { base: root },
+        };
+        return Some(ArrayRowChainPrinterTerms::UnderArrayEq {
+            conclusion: congruence.conclusion,
+            array_eq_lit: congruence.array_eq_lit,
+            eq_term: congruence.eq_term,
+            left_target: congruence.left_read,
+            right_target: congruence.right_read,
+            read_index: congruence.read_index,
+            left: base_path(congruence.left),
+            right: base_path(congruence.right),
+            packed_or,
+        });
+    }
+
     // Sub-schema (B).
     let premises: Vec<(TermId, TermId, TermId)> = literals
         .iter()
@@ -504,21 +621,22 @@ pub(crate) fn array_row_chain_printer_terms(
                 if terms.sort(read_index) != &array_sort.index_sort {
                     continue;
                 }
-                let (Some(left_path), Some(right_path)) = (
-                    row_chain_path_at(terms, left, read_index, &literals),
-                    row_chain_path_at(terms, right, read_index, &literals),
-                ) else {
-                    continue;
-                };
-                let targets = if path_end_denotes(terms, &left_path, read_index, lhs)
-                    && path_end_denotes(terms, &right_path, read_index, rhs)
-                {
-                    (lhs, rhs)
-                } else if path_end_denotes(terms, &left_path, read_index, rhs)
-                    && path_end_denotes(terms, &right_path, read_index, lhs)
-                {
-                    (rhs, lhs)
-                } else {
+                let mut matched = None;
+                for (left_target, right_target) in [(lhs, rhs), (rhs, lhs)] {
+                    let (Some((left_path, left_reduced)), Some((right_path, right_reduced))) = (
+                        row_chain_path_to_target(terms, left, read_index, &literals, left_target),
+                        row_chain_path_to_target(terms, right, read_index, &literals, right_target),
+                    ) else {
+                        continue;
+                    };
+                    // Pure congruence belongs to the EUF lane.  This array
+                    // schema must contribute at least one checked ROW step.
+                    if left_reduced || right_reduced {
+                        matched = Some((left_target, right_target, left_path, right_path));
+                        break;
+                    }
+                }
+                let Some((left_target, right_target, left_path, right_path)) = matched else {
                     continue;
                 };
                 let mut used: Vec<TermId> = left_path
@@ -540,8 +658,8 @@ pub(crate) fn array_row_chain_printer_terms(
                     conclusion: lit,
                     array_eq_lit: premise_lit,
                     eq_term,
-                    left_target: targets.0,
-                    right_target: targets.1,
+                    left_target,
+                    right_target,
                     read_index,
                     left: left_path,
                     right: right_path,
@@ -582,6 +700,15 @@ pub fn recognize_array_theory_lemma(
         return None;
     }
     let literals = flatten_clause_literals(terms, clause);
+    if literals
+        .iter()
+        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return None;
+    }
+    if matches_array_default_const(terms, &literals) {
+        return Some(TheoryLemmaKind::ArrayDefaultConst);
+    }
     if matches_store_permutation(terms, &literals) {
         return Some(TheoryLemmaKind::ArrayStorePermutation);
     }
@@ -589,6 +716,220 @@ pub fn recognize_array_theory_lemma(
         return Some(TheoryLemmaKind::ArrayRowChain);
     }
     None
+}
+
+/// Validate the exact array-default/const-array schemas.
+///
+/// The accepted clause has exactly two flattened literals: a negated equality
+/// between an array `A` and a well-sorted finite `store` chain rooted at one
+/// exact `const-array(v)`, and a positive equality between `default(A)` and
+/// that same `v`. Every term and sort is re-derived from the clause; the
+/// producer's theory label carries no authority. A second exact shape accepts
+/// `not (= (store A i v) (store (const-array fill) i v))) OR
+/// (= (default A) fill)`: same-index/same-value stores preserve their bases'
+/// defaults, and the constant-array base has default `fill`.
+pub(crate) fn validate_array_default_const(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if clause.is_empty()
+        || clause
+            .iter()
+            .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array-default-const clause must contain only Boolean literals".to_string(),
+        });
+    }
+    let literals = flatten_clause_literals(terms, clause);
+    reject_non_bool_literals(terms, step_id, &literals, "array-default-const")?;
+    if matches_array_default_const(terms, &literals) {
+        return Ok(());
+    }
+    Err(ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: "array-default-const clause must be exactly `(not (= A store*(const-array(v)))) OR (= (default A) v)`, or the exact matched-store form `(not (= (store A i v) (store (const-array(fill)) i v))) OR (= (default A) fill)`"
+            .to_string(),
+    })
+}
+
+fn matches_array_default_const(terms: &TermStore, literals: &[TermId]) -> bool {
+    if matches_default_const_under_equal_matched_stores(terms, literals) {
+        return true;
+    }
+    if literals.len() != 2 {
+        return false;
+    }
+
+    for premise_index in 0..2 {
+        let conclusion_index = 1 - premise_index;
+        let Some((premise_lhs, premise_rhs)) =
+            negated_equality_sides(terms, literals[premise_index])
+        else {
+            continue;
+        };
+        let Some((conclusion_lhs, conclusion_rhs)) =
+            equality_sides(terms, literals[conclusion_index])
+        else {
+            continue;
+        };
+
+        for (array, folded_array) in [(premise_lhs, premise_rhs), (premise_rhs, premise_lhs)] {
+            let Some(fill) = const_array_default_fill(terms, folded_array) else {
+                continue;
+            };
+            let Sort::Array(array_sort) = terms.sort(array) else {
+                continue;
+            };
+            if terms.sort(folded_array) != terms.sort(array)
+                || terms.sort(fill) != &array_sort.element_sort
+            {
+                continue;
+            }
+
+            for (default_term, value) in [
+                (conclusion_lhs, conclusion_rhs),
+                (conclusion_rhs, conclusion_lhs),
+            ] {
+                if value == fill
+                    && terms.get_array_default(default_term) == Some(array)
+                    && terms.sort(default_term) == &array_sort.element_sort
+                    && terms.sort(value) == &array_sort.element_sort
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Re-derive `default(array)` for an EXACT constant-array term. No `store`
+/// peeling — see the soundness note.
+///
+/// # Soundness
+///
+/// From the clause's premise `A = const-array(v)`, congruence gives
+/// `default(A) = default(const-array(v))` and the constant-array axiom gives
+/// `= v`. That holds on **every** carrier, under any axiomatization containing
+/// the const axiom — including AY's own, which is too weak to derive the fold.
+/// No cardinality reasoning is needed, which is why this form is safe.
+///
+/// # Why peeling a `store` was removed
+///
+/// This function used to walk up to `MAX_ARRAY_DEFAULT_STORE_DEPTH` stores to a
+/// constant root and return that root's fill. That is the rule
+/// `default(store(a,i,v)) = default(a)`, which is **carrier-sensitive** and
+/// false on a finite index carrier — a store can change the element the default
+/// is read from. One store over `Bool` already breaks it; measured against
+/// Z3 5.0.0:
+///
+/// ```text
+/// (= a (store ((as const (Array Bool Int)) 0) true 7))
+/// (not (= (default a) 0))                                  => sat
+/// ```
+///
+/// and with a chain that covers the carrier the const root's fill is provably
+/// the wrong answer:
+///
+/// ```text
+/// A = (store (store ((as const (Array Bool Int)) 0) false 7) true 7)
+/// (= (default A) 0) => unsat        (= (default A) 7) => sat
+/// ```
+///
+/// The matcher inspects no carrier, so it accepted both. Note this was NOT a
+/// covering-chain-only defect: a single store over any finite carrier suffices.
+/// Re-admitting peels requires a carrier-cardinality side condition the checker
+/// cannot currently evaluate — `validate_array_default_const` is dispatched
+/// without a datatype registry, so a finite enum is indistinguishable from a
+/// genuine uninterpreted sort.
+fn const_array_default_fill(terms: &TermStore, array: TermId) -> Option<TermId> {
+    let Sort::Array(array_sort) = terms.sort(array) else {
+        return None;
+    };
+    let expected = array_sort.as_ref().clone();
+    let expected_array_sort = Sort::Array(Box::new(expected.clone()));
+
+    // Peel stores ONLY when no finite chain can reach the whole carrier. On a
+    // provably infinite index sort the fold is valid (oracle-confirmed); on any
+    // other carrier -- including one we merely cannot classify -- refuse and
+    // accept only an exact constant array.
+    let may_peel = sort_provably_infinite(&expected.index_sort);
+
+    let mut current = array;
+    let mut seen: DetHashSet<TermId> = det_hash_set_new();
+
+    for _ in 0..=MAX_ARRAY_DEFAULT_STORE_DEPTH {
+        if !seen.insert(current) || terms.sort(current) != &expected_array_sort {
+            return None;
+        }
+        if let Some(fill) = terms.get_const_array(current) {
+            return (terms.sort(fill) == &expected.element_sort).then_some(fill);
+        }
+        if !may_peel {
+            return None;
+        }
+        let TermData::App(Symbol::Named(symbol), args) = terms.get(current) else {
+            return None;
+        };
+        if symbol != "store"
+            || args.len() != 3
+            || terms.sort(args[0]) != &expected_array_sort
+            || terms.sort(args[1]) != &expected.index_sort
+            || terms.sort(args[2]) != &expected.element_sort
+        {
+            return None;
+        }
+        current = args[0];
+    }
+    None
+}
+
+/// Whether `sort` is **provably** infinite from its structure alone.
+///
+/// Deliberately conservative and one-sided: `false` means "not proven infinite",
+/// never "proven finite". Every caller must treat `false` as a refusal.
+///
+/// This is the side condition that makes peeling a `store` sound again. The rule
+/// `default(store(a,i,v)) = default(a)` fails exactly when a store can change the
+/// element the default is read from, which requires a carrier a finite chain can
+/// reach. On a provably infinite index sort no finite chain can, and the oracle
+/// agrees — Z3 5.0.0 refutes `(not (= (default A) 3))` for
+/// `A = (store (store ((as const (Array Int Int)) 3) 0 5) 7 9)`.
+///
+/// `Uninterpreted` and `Datatype` MUST return `false`, and that is soundness
+/// rather than caution: [`validate_array_default_const`] is dispatched without a
+/// datatype registry, so a three-element enum arrives indistinguishable from a
+/// genuine uninterpreted sort. Z3 refutes the fold for such an enum
+/// (`(declare-datatypes ((C3 0)) (((r)(g)(b))))` ... `(not (= (default a) 0))`
+/// => sat), so accepting either would reinstate the hole this narrowing closed.
+fn sort_provably_infinite(sort: &Sort) -> bool {
+    match sort {
+        // Unbounded by construction.
+        Sort::Int | Sort::Real | Sort::String | Sort::RegLan => true,
+        // `|Seq T|` is infinite for any inhabited `T`, and every sort is inhabited.
+        Sort::Seq(_) => true,
+        // `|Array I E| = |E|^|I|`, and `|I| >= 1` always, so an infinite element
+        // sort forces an infinite array sort. An infinite INDEX sort does not:
+        // `(Array Int E)` with `|E| = 1` has exactly one inhabitant -- which is a
+        // real shape, not a hypothetical.
+        Sort::Array(a) => sort_provably_infinite(&a.element_sort),
+        // Finite by construction.
+        Sort::Bool | Sort::BitVec(_) | Sort::FloatingPoint(..) => false,
+        // Cardinality not recoverable here -- see the doc note above.
+        Sort::Uninterpreted(_) | Sort::Datatype(_) => false,
+        // Everything else, INCLUDING any sort added after this was written.
+        //
+        // The catch-all is deliberate and must stay: this predicate gates a
+        // proof-checker rule, so an unclassified sort has to fail CLOSED. An
+        // exhaustive match would turn "someone added a sort" into a compile
+        // error, which is louder but tempts a mechanical `=> true` fix; here the
+        // silent default is the safe one. `Char` lands here correctly -- it is a
+        // bounded code point over [0, 196607], i.e. finite.
+        _ => false,
+    }
 }
 
 /// Validate an `ArrayStorePermutation` lemma in strict mode.
@@ -630,6 +971,7 @@ pub(crate) fn validate_array_store_permutation(
     reject_non_bool_literals(terms, step_id, clause, "array store permutation")?;
 
     let literals = flatten_clause_literals(terms, clause);
+    reject_non_bool_literals(terms, step_id, &literals, "array store permutation")?;
     if matches_store_permutation(terms, &literals) {
         return Ok(());
     }
@@ -668,6 +1010,41 @@ pub(crate) fn validate_array_store_permutation(
 ///     conclusion with no such select is REJECTED (the checker will not guess a
 ///     witness index).
 ///
+/// (C) EQUAL STORES FORCE THE BASE ALIAS. Exactly four literals spell
+///     `¬(A = store(B,i,v)) ∨ ¬(A = store(B,j,v)) ∨ i=j ∨ B=A`, modulo
+///     equality orientation and literal order. The two store terms are exact
+///     depth-one, well-sorted stores over the same `B` with the same `v`.
+///
+/// (D) EXACT SELECT CONGRUENCE. Exactly two literals spell
+///     `not (= A B) OR (= (select A i) (select B i))`, modulo equality and
+///     literal orientation. Both reads use the exact premise roots and the
+///     same exact, well-sorted index. This is intentionally disjoint from (B):
+///     it does not relax (B)'s requirement that at least one side perform a
+///     genuine ROW reduction.
+///
+/// (E) EXACT CONST-ARRAY READ UNDER EQUALITY. Exactly two literals spell
+///     `not (= A (const-array fill)) OR (= (select A i) fill)`, modulo equality
+///     and literal orientation, with exactly one const-array side and an exact,
+///     well-sorted read of the other premise root.
+///
+/// (F) EXACT STORE CONGRUENCE. Exactly two literals spell
+///     `not (= A B) OR (= (store A i v) (store B i v))`, modulo equality and
+///     literal orientation. The roots, index, and value are exact shared terms;
+///     no chain peeling or equality side condition is consulted.
+///
+/// (G) EXACT STORE IDEMPOTENCE UNDER EQUALITY. Exactly two literals spell
+///     `not (= A S) OR (= S (store A i v))`, where `S` is exactly the
+///     depth-one, well-sorted term `(store B i v)`. All occurrences of `A`,
+///     `S`, `i`, and `v` are exact shared terms.
+///
+/// (H) GUARDED MATCHING-OUTER-STORE READ. Exactly three literals spell
+///     `i=k OR not (= (store A i v) (store C i v)) OR (= (select X k)
+///     (select Y k))`.  `X` must be either the left outer store or its exact
+///     base `A`, and `Y` must independently be either the right outer store or
+///     its exact base `C` (modulo equality orientation).  The endpoints must
+///     remain cross-side: two terms from the same store/base family are not
+///     accepted by this sub-schema.
+///
 /// SOUNDNESS. Assume the clause false. Then every `(= x i)` literal consumed by
 /// `eval` is false, i.e. `x != i`, so each skipped `store` is transparent at
 /// `x` by the read-over-write-negative axiom and each taken entry gives its
@@ -675,7 +1052,18 @@ pub(crate) fn validate_array_store_permutation(
 /// For (A) that already contradicts the assumed-false conclusion.
 /// For (B) the negative literal being false gives `L = R`, so by congruence
 /// `select(L, x) = select(R, x)`, i.e. `U = W` — again contradicting the
-/// assumed-false conclusion. Extra literals are harmless.
+/// assumed-false conclusion. For (C), assuming both store equalities and
+/// `i != j`, equality of the stores at `i` and `j` forces `B[i] = v` and
+/// `B[j] = v`; therefore either write leaves `B` unchanged and `A = B`,
+/// contradicting the final assumed-false equality. (D) is ordinary equality
+/// congruence. In (E), the false negative premise identifies `A` with the
+/// constant array, whose read is `fill`. (F) is ordinary congruence of the
+/// well-sorted `store(_, i, v)` function. For (G), substituting `A=S` and the
+/// same-index overwrite law give `store(A,i,v)=store(S,i,v)=S`. Extra literals
+/// are harmless in (A)/(B). For (H), falsity of `i=k` gives `i != k`, so ROW
+/// makes each outer store read equal to its base read at `k`; the false
+/// negative premise and congruence make the two side families equal at `k`.
+/// (C)/(D)/(E)/(F)/(G)/(H) are intentionally exact.
 pub(crate) fn validate_array_row_chain(
     terms: &TermStore,
     step_id: ProofId,
@@ -690,6 +1078,7 @@ pub(crate) fn validate_array_row_chain(
     reject_non_bool_literals(terms, step_id, clause, "array read-over-write chain")?;
 
     let literals = flatten_clause_literals(terms, clause);
+    reject_non_bool_literals(terms, step_id, &literals, "array read-over-write chain")?;
     if matches_row_chain(terms, &literals) {
         return Ok(());
     }
@@ -776,6 +1165,7 @@ pub(crate) fn validate_array_extensionality(
     reject_non_bool_literals(terms, step_id, clause, "array extensionality")?;
 
     let literals = flatten_clause_literals(terms, clause);
+    reject_non_bool_literals(terms, step_id, &literals, "array extensionality")?;
     if let Some(bindings) = extensionality_chain_parts(terms, &literals) {
         let Some(registry) = registry else {
             return Err(ProofCheckError::InvalidTheoryLemma {
@@ -910,6 +1300,12 @@ pub fn recognize_array_extensionality_chain(
         return None;
     }
     let literals = flatten_clause_literals(terms, clause);
+    if literals
+        .iter()
+        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return None;
+    }
     extensionality_chain_parts(terms, &literals)
 }
 
@@ -2124,10 +2520,37 @@ fn eval_chain_at(
             return None;
         }
     }
+    if let Some(value) = terms.get_const_array(chain.base) {
+        let Sort::Array(base_sort) = terms.sort(chain.base) else {
+            return None;
+        };
+        return (terms.sort(value) == &base_sort.element_sort).then_some(ChainValue::Value(value));
+    }
     Some(ChainValue::SelectOfBase {
         array: chain.base,
         index,
     })
+}
+
+/// Whether `target` is either the checked reduction of `array[index]` or the
+/// exact, well-sorted root read itself.  The flag is true only when a
+/// non-empty store chain was reduced; an array-equality ROW lemma must reduce
+/// at least one of its two sides rather than smuggling plain congruence through
+/// the array schema.
+fn chain_or_root_select_denotes(
+    terms: &TermStore,
+    array: TermId,
+    index: TermId,
+    target: TermId,
+    eqs: &PositiveEqPairs,
+) -> Option<bool> {
+    let chain = parse_store_chain(terms, array)?;
+    if eval_chain_at(terms, array, index, eqs).is_some_and(|value| value.denotes(terms, target)) {
+        return Some(!chain.entries.is_empty());
+    }
+
+    let (target_array, target_index) = well_sorted_select_parts(terms, target)?;
+    (target_array == array && target_index == index).then_some(false)
 }
 
 /// See [`validate_array_row_chain`] for the schema and its soundness argument.
@@ -2135,6 +2558,341 @@ fn matches_row_chain(terms: &TermStore, literals: &[TermId]) -> bool {
     let eqs = PositiveEqPairs::collect(terms, literals);
     matches_row_chain_eval(terms, literals, &eqs)
         || matches_row_chain_under_array_eq(terms, literals, &eqs)
+        || matches_equal_stores_force_base_alias(terms, literals)
+        || exact_array_read_congruence_terms(terms, literals).is_some()
+        || matches_exact_const_array_read_under_eq(terms, literals)
+        || matches_exact_store_congruence(terms, literals)
+        || matches_exact_store_idempotence_under_eq(terms, literals)
+        || matches_exact_guarded_matching_outer_store_read(terms, literals)
+}
+
+/// Sub-schema (D): exact, two-literal select congruence.
+fn exact_array_read_congruence_terms(
+    terms: &TermStore,
+    literals: &[TermId],
+) -> Option<ArrayReadCongruenceTerms> {
+    if literals.len() != 2 {
+        return None;
+    }
+
+    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+        let Some((left, right)) = negated_equality_sides(terms, array_eq_lit) else {
+            continue;
+        };
+        let Sort::Array(array_sort) = terms.sort(left) else {
+            continue;
+        };
+        if terms.sort(right) != terms.sort(left) {
+            continue;
+        }
+        let conclusion = literals[1 - premise_position];
+        let Some((lhs, rhs)) = equality_sides(terms, conclusion) else {
+            continue;
+        };
+        if terms.sort(lhs) != &array_sort.element_sort || terms.sort(rhs) != terms.sort(lhs) {
+            continue;
+        }
+        for (left_read, right_read) in [(lhs, rhs), (rhs, lhs)] {
+            let (Some((left_root, left_index)), Some((right_root, right_index))) = (
+                well_sorted_select_parts(terms, left_read),
+                well_sorted_select_parts(terms, right_read),
+            ) else {
+                continue;
+            };
+            if left_root != left
+                || right_root != right
+                || left_index != right_index
+                || terms.sort(left_index) != &array_sort.index_sort
+            {
+                continue;
+            }
+            let eq_term = match terms.get(array_eq_lit) {
+                TermData::Not(inner) => *inner,
+                _ => continue,
+            };
+            return Some(ArrayReadCongruenceTerms {
+                conclusion,
+                array_eq_lit,
+                eq_term,
+                left,
+                right,
+                left_read,
+                right_read,
+                read_index: left_index,
+            });
+        }
+    }
+    None
+}
+
+/// Sub-schema (E): exact read of a root equated to a const-array.
+fn matches_exact_const_array_read_under_eq(terms: &TermStore, literals: &[TermId]) -> bool {
+    if literals.len() != 2 {
+        return false;
+    }
+
+    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+        let Some((lhs, rhs)) = negated_equality_sides(terms, array_eq_lit) else {
+            continue;
+        };
+        for (root, constant_array) in [(lhs, rhs), (rhs, lhs)] {
+            // Exactly one side supplies the const-array axiom. Keeping the
+            // root non-constant makes this shape disjoint and auditable.
+            let Some(fill) = terms.get_const_array(constant_array) else {
+                continue;
+            };
+            if terms.get_const_array(root).is_some()
+                || terms.sort(root) != terms.sort(constant_array)
+            {
+                continue;
+            }
+            let Sort::Array(array_sort) = terms.sort(root) else {
+                continue;
+            };
+            if terms.sort(fill) != &array_sort.element_sort {
+                continue;
+            }
+            let conclusion = literals[1 - premise_position];
+            let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
+                continue;
+            };
+            for (read, value) in [
+                (conclusion_lhs, conclusion_rhs),
+                (conclusion_rhs, conclusion_lhs),
+            ] {
+                let Some((read_root, read_index)) = well_sorted_select_parts(terms, read) else {
+                    continue;
+                };
+                if read_root == root
+                    && value == fill
+                    && terms.sort(read_index) == &array_sort.index_sort
+                    && terms.sort(value) == &array_sort.element_sort
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Sub-schema (F): exact, two-literal congruence of one `store(_, i, v)`.
+fn matches_exact_store_congruence(terms: &TermStore, literals: &[TermId]) -> bool {
+    if literals.len() != 2 {
+        return false;
+    }
+
+    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+        let Some((left, right)) = negated_equality_sides(terms, array_eq_lit) else {
+            continue;
+        };
+        if !matches!(terms.sort(left), Sort::Array(_)) || terms.sort(right) != terms.sort(left) {
+            continue;
+        }
+        let conclusion = literals[1 - premise_position];
+        let Some((lhs, rhs)) = equality_sides(terms, conclusion) else {
+            continue;
+        };
+        if terms.sort(lhs) != terms.sort(left) || terms.sort(rhs) != terms.sort(lhs) {
+            continue;
+        }
+        for (left_store, right_store) in [(lhs, rhs), (rhs, lhs)] {
+            let (
+                Some((left_root, left_index, left_value)),
+                Some((right_root, right_index, right_value)),
+            ) = (
+                well_sorted_store_parts(terms, left_store),
+                well_sorted_store_parts(terms, right_store),
+            )
+            else {
+                continue;
+            };
+            if left_root == left
+                && right_root == right
+                && left_index == right_index
+                && left_value == right_value
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Sub-schema (G): exact idempotent rewrite of a depth-one store under an
+/// equality premise.
+fn matches_exact_store_idempotence_under_eq(terms: &TermStore, literals: &[TermId]) -> bool {
+    if literals.len() != 2 {
+        return false;
+    }
+
+    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+        let Some((lhs, rhs)) = negated_equality_sides(terms, array_eq_lit) else {
+            continue;
+        };
+        for (anchor, stored) in [(lhs, rhs), (rhs, lhs)] {
+            let Some(chain) = parse_store_chain(terms, stored) else {
+                continue;
+            };
+            if chain.entries.len() != 1 || terms.sort(anchor) != terms.sort(stored) {
+                continue;
+            }
+            let (index, value) = chain.entries[0];
+            let conclusion = literals[1 - premise_position];
+            let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
+                continue;
+            };
+            if terms.sort(conclusion_lhs) != terms.sort(stored)
+                || terms.sort(conclusion_rhs) != terms.sort(stored)
+            {
+                continue;
+            }
+            for (stored_side, rewritten_side) in [
+                (conclusion_lhs, conclusion_rhs),
+                (conclusion_rhs, conclusion_lhs),
+            ] {
+                let Some((rewritten_root, rewritten_index, rewritten_value)) =
+                    well_sorted_store_parts(terms, rewritten_side)
+                else {
+                    continue;
+                };
+                if stored_side == stored
+                    && rewritten_root == anchor
+                    && rewritten_index == index
+                    && rewritten_value == value
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Sub-schema (H): an exact guarded read consequence of equality between two
+/// stores with the same outer index and value.
+fn matches_exact_guarded_matching_outer_store_read(terms: &TermStore, literals: &[TermId]) -> bool {
+    if literals.len() != 3 {
+        return false;
+    }
+
+    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+        let Some((left_store, right_store)) = negated_equality_sides(terms, array_eq_lit) else {
+            continue;
+        };
+        let (
+            Some((left_base, left_index, left_value)),
+            Some((right_base, right_index, right_value)),
+        ) = (
+            well_sorted_store_parts(terms, left_store),
+            well_sorted_store_parts(terms, right_store),
+        )
+        else {
+            continue;
+        };
+        if terms.sort(left_store) != terms.sort(right_store)
+            || left_index != right_index
+            || left_value != right_value
+        {
+            continue;
+        }
+
+        for (conclusion_position, &conclusion) in literals.iter().enumerate() {
+            if conclusion_position == premise_position {
+                continue;
+            }
+            let Some((lhs, rhs)) = equality_sides(terms, conclusion) else {
+                continue;
+            };
+            let (Some((lhs_root, lhs_index)), Some((rhs_root, rhs_index))) = (
+                well_sorted_select_parts(terms, lhs),
+                well_sorted_select_parts(terms, rhs),
+            ) else {
+                continue;
+            };
+            if lhs_index != rhs_index || terms.sort(lhs) != terms.sort(rhs) {
+                continue;
+            }
+
+            let lhs_is_left = lhs_root == left_store || lhs_root == left_base;
+            let lhs_is_right = lhs_root == right_store || lhs_root == right_base;
+            let rhs_is_left = rhs_root == left_store || rhs_root == left_base;
+            let rhs_is_right = rhs_root == right_store || rhs_root == right_base;
+            if !((lhs_is_left && rhs_is_right) || (lhs_is_right && rhs_is_left)) {
+                continue;
+            }
+
+            let Some((guard_position, &guard)) =
+                literals.iter().enumerate().find(|(position, _)| {
+                    *position != premise_position && *position != conclusion_position
+                })
+            else {
+                continue;
+            };
+            debug_assert_ne!(guard_position, premise_position);
+            debug_assert_ne!(guard_position, conclusion_position);
+            if matches_equality_pair(terms, guard, left_index, lhs_index) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Sub-schema (C):
+/// `¬(A=store(B,i,v)) ∨ ¬(A=store(B,j,v)) ∨ i=j ∨ B=A`.
+fn matches_equal_stores_force_base_alias(terms: &TermStore, literals: &[TermId]) -> bool {
+    if literals.len() != 4 {
+        return false;
+    }
+
+    // Each candidate records (literal position, A, B, i, v). Try both
+    // equality orientations; only the store side is decomposed.
+    let mut candidates = Vec::new();
+    for (position, &literal) in literals.iter().enumerate() {
+        let Some((lhs, rhs)) = negated_equality_sides(terms, literal) else {
+            continue;
+        };
+        for (anchor, stored) in [(lhs, rhs), (rhs, lhs)] {
+            let Some(chain) = parse_store_chain(terms, stored) else {
+                continue;
+            };
+            if chain.entries.len() != 1 || terms.sort(anchor) != terms.sort(stored) {
+                continue;
+            }
+            let (index, value) = chain.entries[0];
+            candidates.push((position, anchor, chain.base, index, value));
+        }
+    }
+
+    for &(p1, anchor, base, i, value) in &candidates {
+        for &(p2, other_anchor, other_base, j, other_value) in &candidates {
+            if p1 >= p2
+                || anchor != other_anchor
+                || base != other_base
+                || value != other_value
+                || i == j
+            {
+                continue;
+            }
+            let remaining: Vec<usize> = (0..literals.len())
+                .filter(|&position| position != p1 && position != p2)
+                .collect();
+            let [first, second] = remaining.as_slice() else {
+                continue;
+            };
+            let first_lit = literals[*first];
+            let second_lit = literals[*second];
+            if (matches_equality_pair(terms, first_lit, i, j)
+                && matches_equality_pair(terms, second_lit, base, anchor))
+                || (matches_equality_pair(terms, second_lit, i, j)
+                    && matches_equality_pair(terms, first_lit, base, anchor))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Sub-schema (A): `(= (select C x) eval(C, x))`.
@@ -2214,16 +2972,16 @@ fn matches_row_chain_under_array_eq(
                 if terms.sort(read_index) != &array_sort.index_sort {
                     continue;
                 }
-                let (Some(left_value), Some(right_value)) = (
-                    eval_chain_at(terms, left, read_index, eqs),
-                    eval_chain_at(terms, right, read_index, eqs),
-                ) else {
-                    continue;
-                };
-                if (left_value.denotes(terms, lhs) && right_value.denotes(terms, rhs))
-                    || (left_value.denotes(terms, rhs) && right_value.denotes(terms, lhs))
-                {
-                    return true;
+                for (left_target, right_target) in [(lhs, rhs), (rhs, lhs)] {
+                    let (Some(left_reduced), Some(right_reduced)) = (
+                        chain_or_root_select_denotes(terms, left, read_index, left_target, eqs),
+                        chain_or_root_select_denotes(terms, right, read_index, right_target, eqs),
+                    ) else {
+                        continue;
+                    };
+                    if left_reduced || right_reduced {
+                        return true;
+                    }
                 }
             }
         }
@@ -2243,7 +3001,33 @@ fn well_sorted_select_parts(terms: &TermStore, term: TermId) -> Option<(TermId, 
     Some((array, index))
 }
 
+/// `(store array index value)` with a complete signature agreeing with the
+/// base array sort. `TermStore` permits raw applications, so strict checking
+/// must re-establish every sort relation here.
+fn well_sorted_store_parts(terms: &TermStore, term: TermId) -> Option<(TermId, TermId, TermId)> {
+    let TermData::App(Symbol::Named(symbol), args) = terms.get(term) else {
+        return None;
+    };
+    if symbol != "store" || args.len() != 3 {
+        return None;
+    }
+    let (array, index, value) = (args[0], args[1], args[2]);
+    let Sort::Array(array_sort) = terms.sort(array) else {
+        return None;
+    };
+    if terms.sort(term) != terms.sort(array)
+        || terms.sort(index) != &array_sort.index_sort
+        || terms.sort(value) != &array_sort.element_sort
+    {
+        return None;
+    }
+    Some((array, index, value))
+}
+
 fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    if !matches!(terms.sort(term), Sort::Bool) {
+        return None;
+    }
     match terms.get(term) {
         TermData::App(Symbol::Named(sym), args) if sym == "=" && args.len() == 2 => {
             Some((args[0], args[1]))
@@ -2253,6 +3037,9 @@ fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 }
 
 fn negated_equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    if !matches!(terms.sort(term), Sort::Bool) {
+        return None;
+    }
     match terms.get(term) {
         TermData::Not(inner) => equality_sides(terms, *inner),
         _ => None,
@@ -2267,4 +3054,114 @@ fn matches_equality_pair(terms: &TermStore, term: TermId, lhs: TermId, rhs: Term
 fn matches_not_equality_pair(terms: &TermStore, term: TermId, lhs: TermId, rhs: TermId) -> bool {
     negated_equality_sides(terms, term)
         .is_some_and(|(a, b)| (a == lhs && b == rhs) || (a == rhs && b == lhs))
+}
+
+/// Exact two-literal schema used by Seq model completion:
+/// `¬(store(A,i,v)=store(C,i,v)) ∨ default(A)=fill`, where `C` is a bounded,
+/// well-sorted `store*` chain rooted at `const-array(fill)`. Only the matching
+/// outer stores are peeled here; `A` remains the exact root named by the
+/// conclusion.
+///
+/// # Carrier side condition
+///
+/// Like the folded form, this schema is CARRIER-SENSITIVE, and for the same
+/// reason: the premise pins `A` only OFF the stored indices, so concluding its
+/// default requires that a finite chain cannot reach the whole carrier.
+/// Measured against Z3 5.0.0 with its builtin `default`:
+///
+/// ```text
+/// Int  index: (= (store A 0 1) (store ((as const (Array Int Int)) 7) 0 1))
+///             (not (= (default A) 7))                            => unsat  VALID
+/// Bool index: (= (store A true 1) (store ((as const (Array Bool Int)) 7) true 1))
+///             (not (= (default A) 7))                            => sat    INVALID
+/// ```
+///
+/// So it is gated on [`sort_provably_infinite`] exactly as the folded form is.
+/// An earlier draft of this work DELETED this schema outright on the belief it
+/// had no sound instance at any depth; that was wrong — the counterexample
+/// behind it used a deliberately weak local axiomatization of `default` rather
+/// than the real one, so it re-proved that AY's axioms are incomplete instead of
+/// exhibiting a false clause.
+fn matches_default_const_under_equal_matched_stores(
+    terms: &TermStore,
+    literals: &[TermId],
+) -> bool {
+    if literals.len() != 2 {
+        return false;
+    }
+
+    // Carrier gate: refuse unless no finite store chain can reach the whole
+    // index carrier. See the doc comment for the oracle measurements.
+    let carrier_ok = literals.iter().any(|&lit| {
+        equality_sides(terms, lit)
+            .or_else(|| negated_equality_sides(terms, lit))
+            .into_iter()
+            .flat_map(|(l, r)| [l, r])
+            .any(|t| match terms.sort(t) {
+                Sort::Array(a) => sort_provably_infinite(&a.index_sort),
+                _ => false,
+            })
+    });
+    if !carrier_ok {
+        return false;
+    }
+
+    for premise_position in 0..2 {
+        let Some((premise_lhs, premise_rhs)) =
+            negated_equality_sides(terms, literals[premise_position])
+        else {
+            continue;
+        };
+        let (
+            Some((left_base, left_index, left_value)),
+            Some((right_base, right_index, right_value)),
+        ) = (
+            well_sorted_store_parts(terms, premise_lhs),
+            well_sorted_store_parts(terms, premise_rhs),
+        )
+        else {
+            continue;
+        };
+        if terms.sort(premise_lhs) != terms.sort(premise_rhs) {
+            continue;
+        }
+        if left_index != right_index || left_value != right_value {
+            continue;
+        }
+
+        for (array, folded_constant_base) in [(left_base, right_base), (right_base, left_base)] {
+            let Some(fill) = const_array_default_fill(terms, folded_constant_base) else {
+                continue;
+            };
+            if array == folded_constant_base
+                || terms.sort(array) != terms.sort(folded_constant_base)
+            {
+                continue;
+            }
+            let Sort::Array(array_sort) = terms.sort(array) else {
+                continue;
+            };
+            if terms.sort(fill) != &array_sort.element_sort {
+                continue;
+            }
+            let Some((conclusion_lhs, conclusion_rhs)) =
+                equality_sides(terms, literals[1 - premise_position])
+            else {
+                continue;
+            };
+            for (default_term, value) in [
+                (conclusion_lhs, conclusion_rhs),
+                (conclusion_rhs, conclusion_lhs),
+            ] {
+                if terms.get_array_default(default_term) == Some(array)
+                    && value == fill
+                    && terms.sort(default_term) == &array_sort.element_sort
+                    && terms.sort(value) == &array_sort.element_sort
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

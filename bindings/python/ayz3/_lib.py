@@ -151,8 +151,23 @@ Z3_UNKNOWN_AST = 1000
 # Z3_decl_kind subset (return of Z3_get_decl_kind). AY exposes the same numeric
 # values as upstream Z3; we only need the ones the cross-context rebuild routes
 # on. Anything not listed routes through the operator-NAME path instead.
-# Byte-for-byte the upstream Z3_decl_kind enum (verified vs z3py 4.15.4).
-Z3_OP_UNINTERPRETED = 45102  # 0xB02E
+# Z3 5.0.0 finite-set plugin and exact enum tail.
+Z3_OP_FINITE_SET_EMPTY = 49152
+Z3_OP_FINITE_SET_SINGLETON = 49153
+Z3_OP_FINITE_SET_UNION = 49154
+Z3_OP_FINITE_SET_INTERSECT = 49155
+Z3_OP_FINITE_SET_DIFFERENCE = 49156
+Z3_OP_FINITE_SET_IN = 49157
+Z3_OP_FINITE_SET_SIZE = 49158
+Z3_OP_FINITE_SET_SUBSET = 49159
+Z3_OP_FINITE_SET_MAP = 49160
+Z3_OP_FINITE_SET_FILTER = 49161
+Z3_OP_FINITE_SET_RANGE = 49162
+Z3_OP_FINITE_SET_EXT = 49163
+Z3_OP_FINITE_SET_MAP_INVERSE = 49164
+Z3_OP_INTERNAL = 49165
+Z3_OP_RECURSIVE = 49166
+Z3_OP_UNINTERPRETED = 49167
 
 # Z3_sort_kind (upstream Z3_sort_kind enum, verified vs z3py 4.15.4).
 Z3_UNINTERPRETED_SORT = 0
@@ -196,6 +211,22 @@ _SIGS = [
     ("Z3_mk_bv_sort", Z3_sort, [Z3_context, ctypes.c_uint]),
     ("Z3_get_sort_kind", ctypes.c_uint, [Z3_context, Z3_sort]),
     ("Z3_get_bv_sort_size", ctypes.c_uint, [Z3_context, Z3_sort]),
+    # Z3 5.0.0 distinct finite-set theory.
+    ("Z3_mk_finite_set_sort", Z3_sort, [Z3_context, Z3_sort]),
+    ("Z3_is_finite_set_sort", ctypes.c_bool, [Z3_context, Z3_sort]),
+    ("Z3_get_finite_set_sort_basis", Z3_sort, [Z3_context, Z3_sort]),
+    ("Z3_mk_finite_set_empty", Z3_ast, [Z3_context, Z3_sort]),
+    ("Z3_mk_finite_set_singleton", Z3_ast, [Z3_context, Z3_ast]),
+    ("Z3_mk_finite_set_union", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_intersect", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_difference", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_member", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_size", Z3_ast, [Z3_context, Z3_ast]),
+    ("Z3_mk_finite_set_subset", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_map", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_filter", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_finite_set_range", Z3_ast, [Z3_context, Z3_ast, Z3_ast]),
+    ("Z3_mk_as_array", Z3_ast, [Z3_context, Z3_func_decl]),
 
     # Constants & numerals
     ("Z3_mk_const", Z3_ast, [Z3_context, Z3_symbol, Z3_sort]),
@@ -322,6 +353,10 @@ _SIGS = [
     ("Z3_get_decl_kind", ctypes.c_uint, [Z3_context, Z3_func_decl]),
     ("Z3_get_decl_num_parameters", ctypes.c_uint, [Z3_context, Z3_func_decl]),
     ("Z3_get_decl_int_parameter", ctypes.c_int, [Z3_context, Z3_func_decl, ctypes.c_uint]),
+    ("Z3_get_decl_parameter_kind", ctypes.c_uint,
+     [Z3_context, Z3_func_decl, ctypes.c_uint]),
+    ("Z3_get_decl_sort_parameter", Z3_sort,
+     [Z3_context, Z3_func_decl, ctypes.c_uint]),
 
     # Arrays
     ("Z3_mk_array_sort", Z3_sort, [Z3_context, Z3_sort, Z3_sort]),

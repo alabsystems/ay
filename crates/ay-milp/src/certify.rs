@@ -661,13 +661,54 @@ pub(crate) fn solve_sparse(
     Some(z)
 }
 
+/// Unbudgeted exact dense solve. TEST-ONLY: every shipping caller must pass a
+/// deadline through [`solve_dense_by`], for the reason documented there.
+#[cfg(test)]
 pub(crate) fn solve_dense(
+    a: Vec<Vec<BigRational>>,
+    b: Vec<BigRational>,
+) -> Option<Vec<BigRational>> {
+    solve_dense_by(a, b, None)
+}
+
+/// Exact dense Gaussian elimination, with a deadline polled throughout
+/// elimination and back-substitution.
+///
+/// # Why this needed a deadline at all
+///
+/// This is exact dense Gaussian elimination over `BigRational` on a basis of up
+/// to [`MAX_EXACT_BASIS_ROWS`] rows, and the numerators grow as it runs, so its
+/// cost is not bounded by anything the caller can see from the row count. It
+/// had no interruption point of any kind, which made it an ATOMIC unit of work
+/// LARGER THAN A WHOLE SOLVE.
+///
+/// MEASURED, release binary, `control30-3-2-3` (510 rows after presolve),
+/// `--time-limit 3`, three serial runs:
+///
+/// ```text
+///   default routing               UNKNOWN Timeout @ 15.9 s   ZERO nodes searched
+///   AY_MILP_NO_STRUCTURE_ROUTE=1  FEASIBLE 5.9594  @  2.8 s   141 nodes
+/// ```
+///
+/// A 5.3x overrun of the caller's own deadline, with branch-and-bound never
+/// entered. `sample(1)` put 100% of the process here: `hybrid_pb_lp::try_solve_certified`
+/// -> `certify_bounded` -> `solve_dense`. The lane was passed a correct 600 ms
+/// slice and simply could not observe it.
+///
+/// A deadline that a lane cannot poll is not a budget, it is a wish. Polling at
+/// bounded loop intervals keeps every large pass interruptible, and a `None`
+/// return is already the "no certificate" path every caller handles.
+pub(crate) fn solve_dense_by(
     mut a: Vec<Vec<BigRational>>,
     mut b: Vec<BigRational>,
+    deadline: Option<std::time::Instant>,
 ) -> Option<Vec<BigRational>> {
     let n = b.len();
     debug_assert!(a.len() == n && a.iter().all(|r| r.len() == n));
     for k in 0..n {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return None;
+        }
         let piv = (k..n).find(|&i| !a[i][k].is_zero())?;
         if piv != k {
             a.swap(k, piv);
@@ -675,11 +716,18 @@ pub(crate) fn solve_dense(
         }
         // Eliminate below.
         for i in (k + 1)..n {
+            if i & 0xf == 0 && deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                return None;
+            }
             if a[i][k].is_zero() {
                 continue;
             }
             let f = &a[i][k] / &a[k][k];
             for j in k..n {
+                if j & 0x3f == 0 && deadline.is_some_and(|limit| std::time::Instant::now() >= limit)
+                {
+                    return None;
+                }
                 let sub = &f * &a[k][j];
                 a[i][j] -= sub;
             }
@@ -690,8 +738,14 @@ pub(crate) fn solve_dense(
     // Back-substitute.
     let mut z = vec![BigRational::zero(); n];
     for k in (0..n).rev() {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return None;
+        }
         let mut acc = b[k].clone();
         for j in (k + 1)..n {
+            if j & 0x3f == 0 && deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                return None;
+            }
             acc -= &a[k][j] * &z[j];
         }
         z[k] = acc / &a[k][k];
@@ -1017,7 +1071,539 @@ pub(crate) fn exact_vertex_with_rest(
 /// Adjudicate `cand` against `model`. `None` means "not proven optimal" — the
 /// caller must fall back, never guess.
 pub(crate) fn certify(model: &Model, lp: &FloatLp, cand: &Candidate) -> Option<CertifiedOptimum> {
-    certify_bounded(model, lp, cand, &lp.lower, &lp.upper)
+    certify_bounded_by(model, lp, cand, &lp.lower, &lp.upper, None)
+}
+
+/// As [`certify`], but every matrix construction/elimination pass shares one
+/// absolute deadline. A miss is only a declined advice basis.
+pub(crate) fn certify_with_deadline(
+    model: &Model,
+    lp: &FloatLp,
+    cand: &Candidate,
+    deadline: Option<std::time::Instant>,
+) -> Option<CertifiedOptimum> {
+    certify_bounded_by(model, lp, cand, &lp.lower, &lp.upper, deadline)
+}
+
+/// Adjudicate a float lane's combinatorial basis against `model`'s TRUE data.
+///
+/// Unlike [`certify_with_deadline`], this entry does not read any numeric data
+/// back from [`FloatLp`].  `basis` and `at` are advice-only indices/statuses;
+/// the matrix, row bounds, column bounds, objective, and objective sense are
+/// reconstructed from [`Model`], including every authoritative exact-rational
+/// side-store override.  This makes the adjudicator usable by any route that
+/// lowers a model to a float LP but must not grant rounded proxy coefficients
+/// proof authority.
+///
+/// The result is deliberately fail-closed.  A malformed or singular basis, an
+/// exactly infeasible vertex, a wrong reduced-cost sign, an expired deadline,
+/// or a final certificate that the independent checker rejects all return
+/// `None`.  The objective value excludes the model's constant offset, matching
+/// [`CertifiedOptimum`] and [`OptimalityCertificate`].
+pub(crate) fn certify_model_basis_with_deadline(
+    model: &Model,
+    basis: &[usize],
+    at: &[NbBound],
+    deadline: Option<std::time::Instant>,
+) -> Option<CertifiedOptimum> {
+    const INDEX_DEADLINE_STRIDE: usize = 256;
+    const ROW_DEADLINE_STRIDE: usize = 64;
+
+    let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
+    model.validate().ok()?;
+    let n = model.num_cols();
+    let m = model.num_rows();
+    let cols = n.checked_add(m)?;
+    if m > MAX_EXACT_BASIS_ROWS || basis.len() != m || at.len() != cols || expired() {
+        return None;
+    }
+
+    // A basis is exactly one distinct computational column per model row.
+    // Keep the reverse map so every later membership test is O(1).
+    let mut basis_position = vec![None; cols];
+    for (position, &column) in basis.iter().enumerate() {
+        if position.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let slot = basis_position.get_mut(column)?;
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(position);
+    }
+
+    // Exact bounds in computational-column order: structural columns first,
+    // then one logical per row.  A logical carries the TRUE row bounds, not the
+    // rounded `f64` proxies copied into FloatLp.
+    let mut lower = Vec::with_capacity(cols);
+    let mut upper = Vec::with_capacity(cols);
+    for column in 0..n {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let (lb, ub) = model.col_bounds(Col(column as u32));
+        lower.push(exact(lb));
+        upper.push(exact(ub));
+    }
+    for row in 0..m {
+        if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let (_, lb, ub) = model.row(Row(row as u32));
+        lower.push(model.row_lb_exact(row, lb));
+        upper.push(model.row_ub_exact(row, ub));
+    }
+
+    // Recover both the caller's objective and the minimize-form objective used
+    // for reduced costs.  Objective side-store entries remain authoritative
+    // even when their rounded advice coefficient is zero.
+    let mut user_cost = Vec::with_capacity(n);
+    for column in 0..n {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let col = Col(column as u32);
+        user_cost.push(model.obj_coeff_exact_at(column as u32, model.obj_coeff(col)));
+    }
+    let flip = matches!(model.sense(), Sense::Maximize);
+    let mut minimize_cost = Vec::with_capacity(cols);
+    minimize_cost.extend(user_cost.iter().map(|coefficient| {
+        if flip {
+            -coefficient
+        } else {
+            coefficient.clone()
+        }
+    }));
+    minimize_cost.resize(cols, BigRational::zero());
+
+    // Pin each nonbasic to the exact bound named by the float basis. `Zero` is
+    // the free-column state, not a license to place a bounded column at an
+    // arbitrary interior value.
+    let mut z = vec![BigRational::zero(); cols];
+    for column in 0..cols {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        if basis_position[column].is_some() {
+            continue;
+        }
+        z[column] = match at[column] {
+            NbBound::Lower => lower[column].clone()?,
+            NbBound::Upper => upper[column].clone()?,
+            NbBound::Zero if lower[column].is_none() && upper[column].is_none() => {
+                BigRational::zero()
+            }
+            NbBound::Zero => return None,
+        };
+    }
+
+    // Build B and `-N x_N` directly from the model's true matrix. The
+    // computational matrix is M=[A|-I], so a nonbasic logical contributes its
+    // value positively to the right-hand side.
+    let mut bmat = vec![vec![BigRational::zero(); m]; m];
+    let mut rhs = vec![BigRational::zero(); m];
+    for row in 0..m {
+        if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let (coefficients, _, _) = model.row(Row(row as u32));
+        for (entry, &(column, rounded)) in coefficients.iter().enumerate() {
+            if entry.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+                return None;
+            }
+            let coefficient = model.row_coeff_exact(row, column, rounded);
+            if let Some(position) = basis_position[column as usize] {
+                bmat[row][position] = coefficient;
+            } else if !z[column as usize].is_zero() {
+                rhs[row] -= coefficient * &z[column as usize];
+            }
+        }
+        let logical = n + row;
+        if let Some(position) = basis_position[logical] {
+            bmat[row][position] = -BigRational::from_integer(1.into());
+        } else if !z[logical].is_zero() {
+            rhs[row] += &z[logical];
+        }
+    }
+
+    // Solve both exact basis systems.  The float solution/duals are not read:
+    // only the combinatorial basis survives into this proof lane.
+    let mut transpose = vec![vec![BigRational::zero(); m]; m];
+    for row in 0..m {
+        if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        for column in 0..m {
+            transpose[column][row] = bmat[row][column].clone();
+        }
+    }
+    let basic_cost: Vec<BigRational> = basis
+        .iter()
+        .map(|&column| minimize_cost[column].clone())
+        .collect();
+    let basic_values = solve_dense_by(bmat, rhs, deadline)?;
+    let row_duals = solve_dense_by(transpose, basic_cost, deadline)?;
+    for (position, &column) in basis.iter().enumerate() {
+        z[column] = basic_values[position].clone();
+    }
+
+    // Check every computational bound, including the nonbasics. This catches
+    // corrupted resting statuses as well as float-feasible/exact-infeasible
+    // basic values.
+    for column in 0..cols {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        if lower[column]
+            .as_ref()
+            .is_some_and(|bound| z[column] < *bound)
+            || upper[column]
+                .as_ref()
+                .is_some_and(|bound| z[column] > *bound)
+        {
+            return None;
+        }
+    }
+
+    // Independently recompute Mz and every reduced cost from the TRUE matrix.
+    // Besides detecting a bad solve, `activity == logical` proves the returned
+    // structural point satisfies every exact model row.
+    let mut reduced = minimize_cost;
+    for row in 0..m {
+        if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        let (coefficients, _, _) = model.row(Row(row as u32));
+        let mut activity = BigRational::zero();
+        for (entry, &(column, rounded)) in coefficients.iter().enumerate() {
+            if entry.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+                return None;
+            }
+            let coefficient = model.row_coeff_exact(row, column, rounded);
+            if !z[column as usize].is_zero() {
+                activity += &coefficient * &z[column as usize];
+            }
+            if !row_duals[row].is_zero() {
+                reduced[column as usize] -= coefficient * &row_duals[row];
+            }
+        }
+        if activity != z[n + row] {
+            return None;
+        }
+        // c_logical=0 and M_logical=-e_r, hence d_logical=y_r.
+        reduced[n + row] += &row_duals[row];
+    }
+
+    // A true basis has exactly-zero basic reduced costs.  Nonbasic signs are
+    // the exact textbook optimality conditions in the minimize frame.
+    for &column in basis {
+        if !reduced[column].is_zero() {
+            return None;
+        }
+    }
+    for column in 0..cols {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        if basis_position[column].is_some() {
+            continue;
+        }
+        // A fixed column has no feasible direction, so either reduced-cost
+        // sign is dual feasible.  The proof below cites the lower or upper
+        // fact selected by that sign; both are tight at this vertex.  Decide
+        // fixedness in exact arithmetic because a rounded equality may be a
+        // genuine range (or vice versa) in the model side store.
+        if lower[column]
+            .as_ref()
+            .zip(upper[column].as_ref())
+            .is_some_and(|(lb, ub)| lb == ub)
+        {
+            continue;
+        }
+        match at[column] {
+            NbBound::Lower if reduced[column].is_negative() => return None,
+            NbBound::Upper if reduced[column].is_positive() => return None,
+            NbBound::Zero if !reduced[column].is_zero() => return None,
+            _ => {}
+        }
+    }
+
+    // Orient non-zero reduced costs onto public model facts. The final replay
+    // below is the authority: construction alone never licenses a verdict.
+    let mut multipliers = Vec::new();
+    for column in 0..cols {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        if basis_position[column].is_some() || reduced[column].is_zero() {
+            continue;
+        }
+        let coefficient = &reduced[column];
+        let (fact, magnitude) = if column < n {
+            let col = Col(column as u32);
+            if coefficient.is_positive() {
+                (
+                    FactRef::ColBound {
+                        col,
+                        side: BoundSide::Lower,
+                    },
+                    coefficient.clone(),
+                )
+            } else {
+                (
+                    FactRef::ColBound {
+                        col,
+                        side: BoundSide::Upper,
+                    },
+                    -coefficient.clone(),
+                )
+            }
+        } else {
+            let row = Row((column - n) as u32);
+            if coefficient.is_positive() {
+                (
+                    FactRef::RowBound {
+                        row,
+                        side: BoundSide::Lower,
+                    },
+                    coefficient.clone(),
+                )
+            } else {
+                (
+                    FactRef::RowBound {
+                        row,
+                        side: BoundSide::Upper,
+                    },
+                    -coefficient.clone(),
+                )
+            }
+        };
+        multipliers.push(Multiplier {
+            fact,
+            coeff: magnitude,
+        });
+    }
+
+    let mut value = BigRational::zero();
+    for (column, coefficient) in user_cost.iter().enumerate() {
+        if column.is_multiple_of(INDEX_DEADLINE_STRIDE) && expired() {
+            return None;
+        }
+        if !coefficient.is_zero() && !z[column].is_zero() {
+            value += coefficient * &z[column];
+        }
+    }
+    let cert = OptimalityCertificate {
+        sense: model.sense(),
+        objective: user_cost
+            .into_iter()
+            .enumerate()
+            .filter(|(_, coefficient)| !coefficient.is_zero())
+            .map(|(column, coefficient)| (column as u32, coefficient))
+            .collect(),
+        bound: value.clone(),
+        multipliers,
+    };
+    if expired() {
+        return None;
+    }
+    cert.verify_with_deadline(model, deadline).ok()?;
+    if expired() {
+        return None;
+    }
+
+    Some(CertifiedOptimum {
+        values: z[..n].to_vec(),
+        value,
+        cert,
+    })
+}
+
+#[cfg(test)]
+mod true_model_basis_tests {
+    use super::*;
+    use num_traits::One;
+
+    fn rat(numerator: i64, denominator: i64) -> BigRational {
+        BigRational::new(numerator.into(), denominator.into())
+    }
+
+    #[test]
+    fn exact_side_stores_own_the_vertex_objective_and_certificate() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 10.0);
+        let row = model.add_row(2.0 / 3.0, 2.0 / 3.0, &[(x, 1.0 / 3.0)]);
+        model.record_inexact_row_coeff(row, x.0, rat(1, 3));
+        model.record_inexact_row_bound(row, true, rat(2, 3));
+        model.record_inexact_row_bound(row, false, rat(2, 3));
+        model.set_objective(&[(x, 5.0 / 7.0)], Sense::Minimize);
+        model.record_inexact_obj_coeff(x.0, rat(5, 7));
+        // CertifiedOptimum and the certificate deliberately exclude offsets.
+        model.set_objective_offset(11.0);
+
+        // x is basic; the equality logical is nonbasic at its lower side.
+        let proven = certify_model_basis_with_deadline(
+            &model,
+            &[x.index()],
+            &[NbBound::Zero, NbBound::Lower],
+            None,
+        )
+        .expect("the exact true-model basis is optimal");
+
+        assert_eq!(proven.values, vec![rat(2, 1)]);
+        assert_eq!(proven.value, rat(10, 7));
+        assert_eq!(proven.cert.objective, vec![(x.0, rat(5, 7))]);
+        assert_eq!(proven.cert.bound, rat(10, 7));
+        proven
+            .cert
+            .verify(&model)
+            .expect("the public checker must accept the emitted identity");
+        model
+            .check_point(&proven.values)
+            .expect("the reconstructed point must satisfy the true row");
+    }
+
+    #[test]
+    fn maximize_basis_is_certified_in_the_callers_sense() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 2.0);
+        model.set_objective(&[(x, 1.0)], Sense::Maximize);
+
+        let proven = certify_model_basis_with_deadline(&model, &[], &[NbBound::Upper], None)
+            .expect("max x over [0,2] has an exact upper-bound proof");
+        assert_eq!(proven.values, vec![rat(2, 1)]);
+        assert_eq!(proven.value, rat(2, 1));
+        assert_eq!(proven.cert.sense, Sense::Maximize);
+        proven.cert.verify(&model).unwrap();
+    }
+
+    #[test]
+    fn fixed_nonbasic_may_use_either_exact_bound_side() {
+        let mut model = Model::new();
+        let x = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        model.add_row(1.0, 1.0, &[(x, 1.0)]);
+        model.set_objective(&[(x, -1.0)], Sense::Minimize);
+
+        // The equality logical is fixed at 1 and stored as `Lower`, while its
+        // exact reduced cost is negative. It has no feasible direction; the
+        // valid proof therefore uses the same fixed fact's upper orientation.
+        let proven = certify_model_basis_with_deadline(
+            &model,
+            &[x.index()],
+            &[NbBound::Zero, NbBound::Lower],
+            None,
+        )
+        .expect("a fixed nonbasic accepts either reduced-cost sign");
+        assert_eq!(proven.values, vec![BigRational::one()]);
+        assert_eq!(proven.value, -BigRational::one());
+        assert!(matches!(
+            proven.cert.multipliers.as_slice(),
+            [Multiplier {
+                fact: FactRef::RowBound {
+                    side: BoundSide::Upper,
+                    ..
+                },
+                ..
+            }]
+        ));
+        proven.cert.verify(&model).unwrap();
+    }
+
+    #[test]
+    fn malformed_basis_and_resting_vectors_decline() {
+        let mut model = Model::new();
+        let x = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let y = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        model.add_row(0.0, 0.0, &[(x, 1.0)]);
+        model.add_row(0.0, 0.0, &[(y, 1.0)]);
+        let at = [NbBound::Zero, NbBound::Zero, NbBound::Lower, NbBound::Lower];
+
+        assert!(certify_model_basis_with_deadline(&model, &[x.index()], &at, None).is_none());
+        assert!(
+            certify_model_basis_with_deadline(&model, &[x.index(), x.index()], &at, None).is_none()
+        );
+        assert!(certify_model_basis_with_deadline(&model, &[x.index(), 4], &at, None).is_none());
+        assert!(
+            certify_model_basis_with_deadline(&model, &[x.index(), y.index()], &at[..3], None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn true_singular_basis_declines() {
+        let mut model = Model::new();
+        let x = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let y = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let row = model.add_row(0.0, 0.0, &[(x, 1.0)]);
+        model.record_inexact_row_coeff(row, x.0, BigRational::zero());
+        model.add_row(0.0, 0.0, &[(y, 1.0)]);
+        let at = [NbBound::Zero, NbBound::Zero, NbBound::Lower, NbBound::Lower];
+
+        assert!(
+            certify_model_basis_with_deadline(&model, &[x.index(), y.index()], &at, None).is_none(),
+            "the rounded proxy is nonsingular, but the authoritative zero is not"
+        );
+    }
+
+    #[test]
+    fn exactly_primal_infeasible_basis_declines() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.add_row(2.0, 2.0, &[(x, 1.0)]);
+
+        assert!(
+            certify_model_basis_with_deadline(
+                &model,
+                &[x.index()],
+                &[NbBound::Zero, NbBound::Lower],
+                None,
+            )
+            .is_none(),
+            "the basis equation puts x=2 outside its true column box"
+        );
+        assert!(
+            certify_model_basis_with_deadline(
+                &model,
+                &[model.num_cols()],
+                &[NbBound::Zero, NbBound::Zero],
+                None,
+            )
+            .is_none(),
+            "a bounded nonbasic cannot masquerade as a free column at zero"
+        );
+    }
+
+    #[test]
+    fn exactly_dual_infeasible_basis_declines() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(
+            certify_model_basis_with_deadline(&model, &[], &[NbBound::Upper], None).is_none(),
+            "positive reduced cost at an upper bound is not dual feasible"
+        );
+
+        // The rounded objective says lower is optimal; the exact objective says
+        // upper is. The side store, not the float advice, must decide.
+        model.record_inexact_obj_coeff(x.0, -BigRational::one());
+        assert!(
+            certify_model_basis_with_deadline(&model, &[], &[NbBound::Lower], None).is_none(),
+            "a proxy-optimal basis must decline under the true objective"
+        );
+    }
+
+    #[test]
+    fn expired_deadline_declines_before_certification() {
+        let mut model = Model::new();
+        model.add_col(0.0, 1.0);
+        assert!(certify_model_basis_with_deadline(
+            &model,
+            &[],
+            &[NbBound::Lower],
+            Some(std::time::Instant::now()),
+        )
+        .is_none());
+    }
 }
 
 /// As [`certify`], but under a branch-and-bound node's tightened bounds.
@@ -1025,6 +1611,8 @@ pub(crate) fn certify(model: &Model, lp: &FloatLp, cand: &Candidate) -> Option<C
 /// The certificate is still checked against the ORIGINAL `model`, so a node's
 /// certificate proves a statement about the node, not about the model — the
 /// caller is responsible for only ever using it that way.
+/// Unbudgeted variant, retained for the two in-tree callers that hold no
+/// deadline of their own (`certify` and the branch-and-bound leaf path).
 pub(crate) fn certify_bounded(
     model: &Model,
     lp: &FloatLp,
@@ -1032,9 +1620,28 @@ pub(crate) fn certify_bounded(
     lower: &[f64],
     upper: &[f64],
 ) -> Option<CertifiedOptimum> {
+    certify_bounded_by(model, lp, cand, lower, upper, None)
+}
+
+/// [`certify_bounded`] under a caller deadline.
+///
+/// The two exact dense solves inside are the whole cost, and until this
+/// existed neither could be interrupted — see [`solve_dense_by`] for the
+/// measured `control30-3-2-3` overrun that made a 600 ms lane slice into a
+/// 15.9 s one on a 3 s budget. Expiry returns `None`, which is the ordinary
+/// "no certificate available" answer every caller already handles.
+pub(crate) fn certify_bounded_by(
+    model: &Model,
+    lp: &FloatLp,
+    cand: &Candidate,
+    lower: &[f64],
+    upper: &[f64],
+    deadline: Option<std::time::Instant>,
+) -> Option<CertifiedOptimum> {
+    let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
     let n = lp.n;
     let m = lp.m;
-    if m > MAX_EXACT_BASIS_ROWS {
+    if m > MAX_EXACT_BASIS_ROWS || expired() {
         return None;
     }
     // The engine minimizes; a Maximize model was negated on the way in. Work in
@@ -1044,7 +1651,10 @@ pub(crate) fn certify_bounded(
 
     // O(1) basic test; `basis.contains` would make every sweep below quadratic.
     let mut is_basic = vec![false; lp.cols];
-    for &j in &cand.basis {
+    for (index, &j) in cand.basis.iter().enumerate() {
+        if index & 0x3f == 0 && expired() {
+            return None;
+        }
         if j >= lp.cols || is_basic[j] {
             return None; // malformed basis: duplicate or out-of-range column
         }
@@ -1055,6 +1665,9 @@ pub(crate) fn certify_bounded(
     //     bound; a free column rests at zero. ---
     let mut z = vec![BigRational::zero(); lp.cols]; // full [x ; s]
     for j in 0..lp.cols {
+        if j & 0xff == 0 && expired() {
+            return None;
+        }
         if is_basic[j] {
             continue; // basic; filled in below
         }
@@ -1070,6 +1683,9 @@ pub(crate) fn certify_bounded(
     if m > 0 {
         let mut rhs = vec![BigRational::zero(); m];
         for j in 0..lp.cols {
+            if j & 0xff == 0 && expired() {
+                return None;
+            }
             if is_basic[j] || z[j].is_zero() {
                 continue;
             }
@@ -1079,18 +1695,27 @@ pub(crate) fn certify_bounded(
         }
         let mut bmat = vec![vec![BigRational::zero(); m]; m];
         for (k, &j) in cand.basis.iter().enumerate() {
+            if k & 0x3f == 0 && expired() {
+                return None;
+            }
             for (r, a) in m_column(lp, j) {
                 bmat[r][k] = a;
             }
         }
-        let xb = solve_dense(bmat, rhs)?;
+        let xb = solve_dense_by(bmat, rhs, deadline)?;
         for (k, &j) in cand.basis.iter().enumerate() {
+            if k & 0x3f == 0 && expired() {
+                return None;
+            }
             z[j] = xb[k].clone();
         }
         // Primal feasibility of the basics. (Non-basics sit on their bounds by
         // construction.)
         let trace = std::env::var_os("AY_MILP_TRACE").is_some();
-        for &j in &cand.basis {
+        for (index, &j) in cand.basis.iter().enumerate() {
+            if index & 0x3f == 0 && expired() {
+                return None;
+            }
             if let Some(lo) = exact(lower[j]) {
                 if z[j] < lo {
                     if trace {
@@ -1121,12 +1746,15 @@ pub(crate) fn certify_bounded(
     if m > 0 {
         let mut bt = vec![vec![BigRational::zero(); m]; m];
         for (k, &j) in cand.basis.iter().enumerate() {
+            if k & 0x3f == 0 && expired() {
+                return None;
+            }
             for (r, a) in m_column(lp, j) {
                 bt[k][r] = a; // transpose
             }
         }
         let cb: Option<Vec<BigRational>> = cand.basis.iter().map(|&j| minimize_cost(j)).collect();
-        y = solve_dense(bt, cb?)?;
+        y = solve_dense_by(bt, cb?, deadline)?;
     }
 
     // --- Reduced costs, and dual feasibility. ---
@@ -1134,6 +1762,9 @@ pub(crate) fn certify_bounded(
     // reduced cost is simply y_r.
     let mut d = vec![BigRational::zero(); lp.cols];
     for j in 0..lp.cols {
+        if j & 0xff == 0 && expired() {
+            return None;
+        }
         let mut dot = BigRational::zero();
         for (r, a) in m_column(lp, j) {
             dot += a * &y[r];
@@ -1141,6 +1772,9 @@ pub(crate) fn certify_bounded(
         d[j] = minimize_cost(j)? - dot;
     }
     for j in 0..lp.cols {
+        if j & 0xff == 0 && expired() {
+            return None;
+        }
         if is_basic[j] {
             continue;
         }
@@ -1155,6 +1789,9 @@ pub(crate) fn certify_bounded(
     // --- The certificate: the duals, oriented onto model facts. ---
     let mut multipliers: Vec<Multiplier> = Vec::new();
     for j in 0..lp.cols {
+        if j & 0xff == 0 && expired() {
+            return None;
+        }
         if is_basic[j] {
             continue; // a basic column's reduced cost is zero by construction
         }
@@ -1219,6 +1856,9 @@ pub(crate) fn certify_bounded(
     };
     let mut obj = BigRational::zero();
     for j in 0..n {
+        if j & 0xff == 0 && expired() {
+            return None;
+        }
         let c = user_coeff(j);
         if c != 0.0 {
             obj += exact(c)? * &z[j];
@@ -1239,7 +1879,13 @@ pub(crate) fn certify_bounded(
     // identity does not close, the basis was not what we thought it was and the
     // caller takes the exact rim — the one outcome we never permit is shipping
     // an optimum whose evidence does not check out.
-    cert.verify(model).ok()?;
+    if expired() {
+        return None;
+    }
+    cert.verify_with_deadline(model, deadline).ok()?;
+    if expired() {
+        return None;
+    }
 
     Some(CertifiedOptimum {
         values: z[..n].to_vec(),
@@ -1365,6 +2011,727 @@ impl ExactLu {
             z[i] = &acc / &self.lu[i][i];
         }
         z
+    }
+}
+
+/// The same exact factorization as [`ExactLu`], held SPARSE.
+///
+/// ## Why this exists: `m` was never a time budget, it was a MEMORY budget
+///
+/// [`ExactLu`] consumes a DENSE `Vec<Vec<Rational>>`, and the GMI separator built
+/// one unconditionally — `vec![vec![Rational::zero(); m]; m]`, m² rationals to
+/// hold a basis with `O(nnz)` non-zeros in it, and allocated BEFORE the deadline
+/// was consulted, so an ALREADY-EXPIRED deadline still paid for it in full.
+/// Measured peak RSS, dense against this, **3 repetitions each** (the root cut
+/// loop is DEADLINE-bound, so a single observation of anything is worthless on a
+/// contended box — see the note on the digest below):
+///
+/// ```text
+///   instance          m      sparse MB (x3)      dense MB (x3)           ratio
+///   haprp         1,048   18.8 / 18.7 / 19.7   49.7 /   50.4 /   49.7     2.7x
+///   railway_8_1_0 2,527   16.8 / 16.6 / 18.1  186.2 /  348.9 /  186.3      11x
+///   h80x6320d     6,558   53.2 / 65.1 / 57.2 1146.8 / 2124.6 / 1861.4      32x
+///   decomp2      10,765   73.5 / 84.3 / 77.7 3128.9 / 4423.1 / 3329.5      43x
+/// ```
+///
+/// The sparse arm is essentially FLAT in `m` — 17 MB to 78 MB across a 10x range,
+/// and most of that is the model, not the factorization. The dense arm goes 50 MB
+/// to 3.3 GB over the same range, 66x for 10.3x in `m`, and its own spread comes
+/// from completing a different NUMBER of cut rounds (each round allocates a fresh
+/// `m²` at a slightly larger `m`). It gets worse than `24·m²` per entry as bit
+/// growth boxes the rationals; extrapolated to the corpus's largest model (169,576
+/// rows) it is ~1 PB.
+///
+/// The 600-row cap in `cuts.rs` documented itself as a TIME budget ("its LU is
+/// dense and cubic and runs once per cut round"), and a cost-curve study over 173
+/// uncapped calls refuted that. Spearman rho of factor seconds against `m` is
+/// +0.82, but `m` is useless for MAGNITUDE — within `m ∈ [900,1400]` the
+/// factorisation spans 0.0007s to 0.2897s (414x), the single most expensive
+/// factorisation in the sweep was at m=996 (1.0437s), and m=2313 factored in
+/// 0.0232s. Every expensive factorisation sits BELOW any middling cap, so the cap
+/// never protected against one. The DEADLINE governs the time and was measured
+/// doing it: 28 of those 173 calls aborted inside `factor_with_deadline`, worst
+/// overrun anywhere 1.0437s. What `m` governed was the allocation above — remove
+/// it and the cap has nothing left to protect.
+///
+/// ## Markowitz, not the natural order
+///
+/// [`ExactLu`] pivots on the first non-zero in column order. That rule is free
+/// only because it runs on a dense array, where fill-in costs nothing that was
+/// not already paid; on a sparse representation the pivot order is exactly what
+/// decides whether the factors STAY sparse. [`solve_sparse`] already measured
+/// what fixed-order elimination does to a real basis — a near-triangular big-M
+/// DAG "densified it into a blow-up that never returned" — so the pivot here is
+/// the least Markowitz count `(row_nnz−1)·(col_nnz−1)`, the same rule and for the
+/// same reason.
+///
+/// ## Why the cuts do not move
+///
+/// A simplex basis is NON-SINGULAR, so `Bᵀ u = e_i` has exactly one solution, and
+/// this arithmetic is exact — no rounding exists for two pivot orders to disagree
+/// about, so any non-zero pivot sequence reaches that same `u`. The pivot order is
+/// therefore free: it buys sparsity and cannot buy a different answer. A singular
+/// basis declines either way (no admissible pivot here, no non-zero in the column
+/// there). None of this is left as an argument: `AY_MILP_DENSE_GMI_LU=1` restores
+/// the dense path, the tests below require byte-equal solutions from both over
+/// random, near-triangular and deliberately fill-prone systems, and the corpus A/B
+/// was run with the switch as the only difference.
+pub(crate) struct SparseExactLu {
+    /// Step `k`'s multipliers as `(earlier step, f)`, ascending in step. The unit
+    /// diagonal is implicit, exactly as [`ExactLu`]'s below-diagonal storage is.
+    l: Vec<Vec<(u32, ay_lra::rational::Rational)>>,
+    /// Step `k`'s reduced pivot row MINUS its pivot entry — by construction only
+    /// columns pivoted LATER survive there, which is what makes the back-solve a
+    /// back-solve.
+    u: Vec<Vec<(u32, ay_lra::rational::Rational)>>,
+    /// Step `k`'s pivot entry, lifted out of `u[k]` so the back-solve never
+    /// searches a row for its own diagonal.
+    diag: Vec<ay_lra::rational::Rational>,
+    /// Original row / column index of step `k`'s pivot: the two permutations.
+    pivot_row: Vec<u32>,
+    pivot_col: Vec<u32>,
+    n: usize,
+}
+
+/// How many candidate rows the Markowitz search examines before settling for the
+/// best it has seen. FULL Markowitz — [`solve_sparse`]'s rule — rescans every live
+/// non-zero at every pivot, which is `O(n · nnz)` over a factorization and was
+/// affordable there only because that lane is capped at a few hundred rows. This
+/// path is meant to run at m in the thousands, so the search is bounded: rows are
+/// visited in increasing length (the cheapest rows to eliminate with, and the ones
+/// Markowitz prefers anyway), a singleton wins immediately, and eight candidates
+/// is where the search stops. Correctness is indifferent — any non-zero pivot is
+/// exact — so this trades nothing but fill.
+const MARKOWITZ_CANDIDATES: usize = 8;
+
+/// Rows between deadline checks inside ONE pivot's elimination sweep. [`ExactLu`]
+/// checks once per pivot column, which was proportionate when a pivot touched at
+/// most 600 rows; at m in the thousands a single sweep is long enough to overrun a
+/// round on its own. `Instant::now` against a rational row update is noise.
+const SPARSE_LU_DEADLINE_STRIDE: usize = 64;
+
+/// The FILL BUDGET: stored non-zeros this factorization may hold, across the live
+/// rows and both factors, before it declines.
+///
+/// This is the guard the 600-row cap was a PROXY for, stated directly. The
+/// deadline bounds the TIME and cannot bound the memory: fill-in is allocated as
+/// it is created, and a factorization that blows up to `O(m²)` reaches the
+/// blow-up before it reaches a clock check. A row count cannot bound it either —
+/// that is the same "cheap quantity stands in for the real cost" shape
+/// the development design notes names, and the
+/// reason a 600-row time budget was denying the primary cut family to 63% of the
+/// corpus while the genuinely expensive factorisations sat below it.
+///
+/// So the budget counts the thing it is protecting: entries. At 32 bytes for a
+/// `(u32, Rational)` slot this is 512 MiB of table on an inline-rational
+/// factorization, and MEASURED FILL on real bases is nowhere near it — Markowitz
+/// keeps these factorizations essentially fill-free:
+///
+/// ```text
+///   instance    m       basis nnz   factor nnz   fill    m² (the dense array)
+///   air05        426        2,387        3,819   1.60x            181,476
+///   haprp      1,048        2,450        2,450   1.00x          1,098,304
+///   h80x6320d  6,558        7,012        7,012   1.00x         43,007,364
+///   decomp2   10,765       24,928       25,073   1.01x        115,885,225
+/// ```
+///
+/// decomp2's factorization is **4,623x smaller than the array the dense path
+/// allocated for the same basis**, and the budget is 669x above it. What the
+/// budget adds is not headroom, it is a BOUND: fill has no cheap a-priori model
+/// either, so the only honest guard is to count the entries as they are created
+/// and stop. Declining is FAIL-CLOSED — it costs the round its GMI cuts, never a
+/// wrong one.
+const SPARSE_LU_MAX_NNZ: usize = 16_777_216;
+
+impl SparseExactLu {
+    /// Factor `rows` (consumed; row `i` given as `(column, value)` pairs in any
+    /// order, duplicates resolved LAST-WINS to match the dense builder's repeated
+    /// `bt[k][r] = a` store). `None` if singular — or if `deadline` passes
+    /// mid-elimination.
+    pub(crate) fn factor_with_deadline(
+        rows: Vec<Vec<(u32, ay_lra::rational::Rational)>>,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<Self> {
+        Self::factor_with_limits(rows, deadline, SPARSE_LU_MAX_NNZ)
+    }
+
+    /// [`Self::factor_with_deadline`] with the fill budget spelled out, so a test
+    /// can reach the decline without building half a gigabyte of matrix.
+    pub(crate) fn factor_with_limits(
+        rows: Vec<Vec<(u32, ay_lra::rational::Rational)>>,
+        deadline: Option<std::time::Instant>,
+        max_nnz: usize,
+    ) -> Option<Self> {
+        use ay_lra::rational::Rational;
+        let n = rows.len();
+        // Rows held SORTED by column, non-zeros only: a lookup is a binary search,
+        // an update is a linear merge, and the iteration order is DETERMINISTIC.
+        // (A `HashMap` row — what `solve_sparse` uses — would make the Markowitz
+        // tie-break depend on the process's hash seed, and nodes-to-proof is a
+        // determinism contract in this engine, not a nicety.)
+        let mut a: Vec<Vec<(u32, Rational)>> = Vec::with_capacity(n);
+        for mut row in rows {
+            row.sort_by_key(|(c, _)| *c);
+            // Keep the LAST of each run of equal columns, in place and still
+            // ascending — the dense builder's last write to `bt[k][r]` won.
+            let mut w = 0;
+            for i in 0..row.len() {
+                if i + 1 < row.len() && row[i + 1].0 == row[i].0 {
+                    continue;
+                }
+                row.swap(w, i);
+                w += 1;
+            }
+            row.truncate(w);
+            // A stored exact zero is the same matrix as an absent entry, and the
+            // sparse invariant is that only non-zeros are present.
+            row.retain(|(c, v)| {
+                debug_assert!((*c as usize) < n, "column out of range");
+                !v.is_zero()
+            });
+            if row.is_empty() {
+                return None; // an all-zero row is a singular basis
+            }
+            a.push(row);
+        }
+
+        // Live occurrences per column, and which rows hold them. `col_rows` is
+        // allowed to go STALE (a row that cancelled its entry away stays listed);
+        // every consumer re-checks with a binary search, and the alternative —
+        // deleting from the middle of an occurrence list — costs more than the
+        // occasional wasted probe.
+        let mut col_nnz = vec![0u32; n];
+        let mut col_rows: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // Stored non-zeros, against [`SPARSE_LU_MAX_NNZ`]. Live rows plus the two
+        // factors: a pivot row's entries simply move from one to the other, so the
+        // running total is exactly what is resident.
+        let mut nnz: usize = 0;
+        for (i, row) in a.iter().enumerate() {
+            nnz += row.len();
+            for (c, _) in row {
+                col_nnz[*c as usize] += 1;
+                col_rows[*c as usize].push(i as u32);
+            }
+        }
+        if nnz > max_nnz {
+            return None;
+        }
+        // Rows bucketed by length, so the Markowitz search reaches the cheapest
+        // rows without scanning the live set. Stale entries are dropped lazily by
+        // the search itself.
+        let mut by_len: Vec<Vec<u32>> = vec![Vec::new(); n + 1];
+        for (i, row) in a.iter().enumerate() {
+            by_len[row.len()].push(i as u32);
+        }
+        let mut min_len = 1usize;
+
+        let mut used = vec![false; n];
+        // Row `i`'s multipliers as they accrue; moved into `l` when `i` is pivoted.
+        let mut lmul: Vec<Vec<(u32, Rational)>> = vec![Vec::new(); n];
+        // Guards against a row listed twice in one occurrence list (cancel, then
+        // fill back in) being eliminated twice at the same pivot.
+        let mut stamp = vec![u32::MAX; n];
+
+        let mut l = Vec::with_capacity(n);
+        let mut u = Vec::with_capacity(n);
+        let mut diag = Vec::with_capacity(n);
+        let mut pivot_row = Vec::with_capacity(n);
+        let mut pivot_col = Vec::with_capacity(n);
+
+        for k in 0..n {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
+            // --- Pivot: least Markowitz count among a bounded number of the
+            //     shortest live rows.
+            let mut best: Option<(usize, u32, u32)> = None; // (count, row, column)
+            let mut seen = 0usize;
+            let mut first_live = min_len;
+            let mut len = min_len;
+            'search: while len <= n {
+                let mut idx = 0;
+                while idx < by_len[len].len() {
+                    let r = by_len[len][idx] as usize;
+                    if used[r] || a[r].len() != len {
+                        by_len[len].swap_remove(idx);
+                        continue;
+                    }
+                    if seen == 0 {
+                        first_live = len;
+                    }
+                    for (c, _) in &a[r] {
+                        // `saturating_sub` for the same reason `solve_sparse` uses
+                        // it: a live row holding `c` guarantees `col_nnz[c] >= 1`,
+                        // and a mis-scored pivot must cost FILL, never a panic.
+                        let mark = (len - 1) * (col_nnz[*c as usize] as usize).saturating_sub(1);
+                        if best.is_none_or(|(bm, _, _)| mark < bm) {
+                            best = Some((mark, r as u32, *c));
+                        }
+                    }
+                    seen += 1;
+                    if best.is_some_and(|(bm, _, _)| bm == 0) || seen >= MARKOWITZ_CANDIDATES {
+                        break 'search;
+                    }
+                    idx += 1;
+                }
+                len += 1;
+            }
+            min_len = first_live;
+            // No live row left to pivot on: the remaining submatrix has no
+            // non-zero, i.e. the basis is singular.
+            let (_, p, c) = best?;
+
+            used[p as usize] = true;
+            let prow = std::mem::take(&mut a[p as usize]);
+            // The pivot row leaves the live set: every column it holds loses one
+            // live occurrence.
+            for (cc, _) in &prow {
+                col_nnz[*cc as usize] -= 1;
+            }
+            let dpos = prow.binary_search_by_key(&c, |(cc, _)| *cc).ok()?;
+            let pivot = prow[dpos].1.clone();
+
+            // --- Eliminate column `c` from every other live row that holds it.
+            let holders = std::mem::take(&mut col_rows[c as usize]);
+            let mut swept = 0usize;
+            for &ri in &holders {
+                let r = ri as usize;
+                if used[r] || stamp[r] == k as u32 {
+                    continue;
+                }
+                let Ok(pos) = a[r].binary_search_by_key(&c, |(cc, _)| *cc) else {
+                    continue; // stale listing: the entry cancelled away earlier
+                };
+                stamp[r] = k as u32;
+                if swept % SPARSE_LU_DEADLINE_STRIDE == 0
+                    && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                {
+                    return None;
+                }
+                swept += 1;
+
+                let f = &a[r][pos].1 / &pivot;
+                // row_r := row_r − f·row_p, as a merge of two ascending runs. One
+                // allocation per elimination, against the m² the dense path paid
+                // before it read its first coefficient.
+                let mut old = std::mem::take(&mut a[r]);
+                let mut new: Vec<(u32, Rational)> = Vec::with_capacity(old.len() + prow.len());
+                let (mut ia, mut ip) = (0usize, 0usize);
+                while ia < old.len() && ip < prow.len() {
+                    let (ca, cp) = (old[ia].0, prow[ip].0);
+                    if ca == cp {
+                        if ca == c {
+                            // The pivot column cancels EXACTLY —
+                            // `a_rc − (a_rc/pivot)·pivot` — so it is dropped, never
+                            // computed.
+                            col_nnz[c as usize] -= 1;
+                        } else {
+                            let v = &old[ia].1 - &(&f * &prow[ip].1);
+                            if v.is_zero() {
+                                col_nnz[ca as usize] -= 1;
+                            } else {
+                                new.push((ca, v));
+                            }
+                        }
+                        ia += 1;
+                        ip += 1;
+                    } else if ca < cp {
+                        new.push((ca, std::mem::take(&mut old[ia].1)));
+                        ia += 1;
+                    } else {
+                        // Fill-in. `f` and `prow[ip].1` are both non-zero, so this
+                        // term cannot be a zero worth testing for.
+                        new.push((cp, -(&f * &prow[ip].1)));
+                        col_nnz[cp as usize] += 1;
+                        col_rows[cp as usize].push(ri);
+                        ip += 1;
+                    }
+                }
+                while ia < old.len() {
+                    new.push((old[ia].0, std::mem::take(&mut old[ia].1)));
+                    ia += 1;
+                }
+                while ip < prow.len() {
+                    new.push((prow[ip].0, -(&f * &prow[ip].1)));
+                    col_nnz[prow[ip].0 as usize] += 1;
+                    col_rows[prow[ip].0 as usize].push(ri);
+                    ip += 1;
+                }
+                if new.is_empty() {
+                    return None; // a live row with nothing in it: singular
+                }
+                // Fill accounting: the row's own delta, plus the multiplier that
+                // just joined L. Checked per row, not per pivot — one runaway sweep
+                // is all it takes.
+                nnz = nnz + new.len() + 1 - old.len();
+                if nnz > max_nnz {
+                    return None;
+                }
+                by_len[new.len()].push(ri);
+                min_len = min_len.min(new.len());
+                a[r] = new;
+                lmul[r].push((k as u32, f));
+            }
+
+            let mut urow = prow;
+            let d = urow.remove(dpos).1;
+            l.push(std::mem::take(&mut lmul[p as usize]));
+            u.push(urow);
+            diag.push(d);
+            pivot_row.push(p);
+            pivot_col.push(c);
+        }
+
+        Some(Self {
+            l,
+            u,
+            diag,
+            pivot_row,
+            pivot_col,
+            n,
+        })
+    }
+
+    /// Solve `A z = b` using the stored factors. `b` and the returned `z` are both
+    /// in ORIGINAL index space — the two permutations stay inside.
+    pub(crate) fn solve(
+        &self,
+        b: &[ay_lra::rational::Rational],
+    ) -> Vec<ay_lra::rational::Rational> {
+        use ay_lra::rational::Rational;
+        let n = self.n;
+        let fused = exact_lu_fma_enabled();
+        // Forward: y_k = b[pivot_row[k]] − Σ_{k'<k} L[k][k']·y_{k'}.
+        let mut y = vec![Rational::zero(); n];
+        for k in 0..n {
+            let mut acc = b[self.pivot_row[k] as usize].clone();
+            for (kk, f) in &self.l[k] {
+                let yv = &y[*kk as usize];
+                if !yv.is_zero() {
+                    acc -= if fused { f * yv } else { f.clone() * yv };
+                }
+            }
+            y[k] = acc;
+        }
+        // Back: z[pivot_col[k]] = (y_k − Σ U[k]·z) / diag_k, over columns pivoted
+        // later — whose `z` this loop has therefore already produced.
+        let mut z = vec![Rational::zero(); n];
+        for k in (0..n).rev() {
+            let mut acc = std::mem::take(&mut y[k]);
+            for (cc, v) in &self.u[k] {
+                let zv = &z[*cc as usize];
+                if !zv.is_zero() {
+                    acc -= if fused { v * zv } else { v.clone() * zv };
+                }
+            }
+            z[self.pivot_col[k] as usize] = &acc / &self.diag[k];
+        }
+        z
+    }
+
+    /// Stored non-zeros across both factors — what the dense path spent `m²` on.
+    /// Diagnostic (`AY_MILP_TRACE`), and the number the row cap's replacement
+    /// argument rests on.
+    pub(crate) fn factor_nnz(&self) -> usize {
+        self.l.iter().map(Vec::len).sum::<usize>()
+            + self.u.iter().map(Vec::len).sum::<usize>()
+            + self.n
+    }
+}
+
+#[cfg(test)]
+mod sparse_exact_lu_tests {
+    use super::{ExactLu, SparseExactLu};
+    use ay_lra::rational::Rational;
+    use num_traits::Zero;
+
+    /// Deterministic LCG — a fixed seed makes any failure reproducible, and this
+    /// crate's workflow forbids wall-clock or OS entropy in a test.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 16
+        }
+        fn range(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + (self.next() % ((hi - lo + 1) as u64)) as i64
+        }
+    }
+
+    fn to_sparse(dense: &[Vec<Rational>]) -> Vec<Vec<(u32, Rational)>> {
+        dense
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.is_zero())
+                    .map(|(c, v)| (c as u32, v.clone()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// THE IDENTITY BAR. The sparse factorization must reach the SAME solvability
+    /// verdict and, when it solves, byte-identical rationals — and that solution
+    /// must have an exactly-zero residual against the original system, so the two
+    /// cannot agree on a wrong answer.
+    fn assert_agrees(dense: &[Vec<Rational>], b: &[Rational]) {
+        let d = ExactLu::factor_with_deadline(dense.to_vec(), None);
+        let s = SparseExactLu::factor_with_deadline(to_sparse(dense), None);
+        assert_eq!(
+            d.is_some(),
+            s.is_some(),
+            "dense and sparse disagreed on singularity"
+        );
+        let (Some(d), Some(s)) = (d, s) else { return };
+        let zd = d.solve(b);
+        let zs = s.solve(b);
+        assert_eq!(zd, zs, "dense and sparse solutions differ");
+        for (i, row) in dense.iter().enumerate() {
+            let mut acc = Rational::zero();
+            for (c, v) in row.iter().enumerate() {
+                if !v.is_zero() && !zs[c].is_zero() {
+                    acc += v * &zs[c];
+                }
+            }
+            assert_eq!(acc, b[i], "row {i} residual is not exactly zero");
+        }
+    }
+
+    fn rat(n: i64, d: i64) -> Rational {
+        Rational::new(n, d)
+    }
+
+    #[test]
+    fn matches_dense_on_random_dominant_systems() {
+        let mut rng = Lcg(0x5eed_0000_0000_0001);
+        for _ in 0..300 {
+            let n = rng.range(1, 9) as usize;
+            let mut a: Vec<Vec<Rational>> = (0..n)
+                .map(|_| {
+                    (0..n)
+                        .map(|_| rat(rng.range(-4, 4), rng.range(1, 4)))
+                        .collect()
+                })
+                .collect();
+            // Big diagonal ⇒ strictly diagonally dominant ⇒ non-singular.
+            for (i, row) in a.iter_mut().enumerate() {
+                row[i] = rat(100 + rng.range(0, 9), 1);
+            }
+            let b: Vec<Rational> = (0..n)
+                .map(|_| rat(rng.range(-6, 6), rng.range(1, 3)))
+                .collect();
+            assert_agrees(&a, &b);
+        }
+    }
+
+    /// The shape the separator actually hands it: a simplex basis is mostly
+    /// LOGICAL columns (a single −1) with a minority of structural ones. This is
+    /// also the shape where the two pivot rules diverge most — the dense rule
+    /// takes the first non-zero in column order, Markowitz takes the singletons
+    /// first — so it is the strongest place to insist the answers agree.
+    #[test]
+    fn matches_dense_on_basis_shaped_systems() {
+        let mut rng = Lcg(0xba51_5000_0000_000d);
+        for _ in 0..300 {
+            let n = rng.range(2, 24) as usize;
+            let mut a: Vec<Vec<Rational>> = vec![vec![Rational::zero(); n]; n];
+            for (k, row) in a.iter_mut().enumerate() {
+                if rng.range(0, 3) == 0 {
+                    // A structural column: a handful of entries anywhere.
+                    let nz = rng.range(1, 4) as usize;
+                    for _ in 0..nz {
+                        let c = rng.range(0, n as i64 - 1) as usize;
+                        row[c] = rat(rng.range(-5, 5), rng.range(1, 3));
+                    }
+                    // Keep the diagonal occupied so the basis stays non-singular
+                    // far more often than not; the singular draws are covered by
+                    // the agreement assertion either way.
+                    row[k] = rat(rng.range(1, 9), 1);
+                } else {
+                    row[k] = rat(-1, 1); // a logical column
+                }
+            }
+            let b: Vec<Rational> = (0..n)
+                .map(|_| rat(rng.range(-9, 9), rng.range(1, 4)))
+                .collect();
+            assert_agrees(&a, &b);
+        }
+    }
+
+    /// The blow-up shape `solve_sparse` documents: a near-triangular DAG whose
+    /// NATURAL column order fills in badly. The dense reference still has to agree
+    /// with it, which is the point — the pivot order is free, the answer is not.
+    #[test]
+    fn matches_dense_on_arrow_and_reversed_triangular_systems() {
+        let n = 40;
+        // Reversed triangular: the natural first-non-zero rule pivots on the
+        // densest column available, Markowitz pivots on the singleton.
+        let mut a: Vec<Vec<Rational>> = vec![vec![Rational::zero(); n]; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = rat(1, 1);
+            for (j, cell) in row.iter_mut().enumerate().take(i) {
+                *cell = rat((i + j) as i64 % 3 - 1, 2);
+            }
+        }
+        a.reverse();
+        let b: Vec<Rational> = (0..n).map(|i| rat(i as i64 - 7, 3)).collect();
+        assert_agrees(&a, &b);
+
+        // Arrow: a full last row and column over a diagonal. Eliminating in the
+        // natural order fills the whole trailing block; a Markowitz order does not.
+        let mut arrow: Vec<Vec<Rational>> = vec![vec![Rational::zero(); n]; n];
+        for i in 0..n {
+            arrow[i][i] = rat(3, 1);
+            arrow[i][n - 1] = rat(1, 1);
+            arrow[n - 1][i] = rat(1, 1);
+        }
+        arrow[n - 1][n - 1] = rat(n as i64 + 5, 1);
+        assert_agrees(&arrow, &b);
+    }
+
+    #[test]
+    fn singular_systems_decline_on_both_paths() {
+        // A duplicated row.
+        let a = vec![
+            vec![rat(1, 1), rat(2, 1), rat(3, 1)],
+            vec![rat(1, 1), rat(2, 1), rat(3, 1)],
+            vec![rat(0, 1), rat(1, 1), rat(1, 1)],
+        ];
+        assert_agrees(&a, &[rat(1, 1), rat(1, 1), rat(1, 1)]);
+        assert!(SparseExactLu::factor_with_deadline(to_sparse(&a), None).is_none());
+
+        // An all-zero row, and a zero COLUMN (nothing to pivot on at the end).
+        let zrow = vec![vec![rat(1, 1), rat(1, 1)], vec![rat(0, 1), rat(0, 1)]];
+        assert_agrees(&zrow, &[rat(1, 1), rat(0, 1)]);
+        let zcol = vec![vec![rat(1, 1), rat(0, 1)], vec![rat(2, 1), rat(0, 1)]];
+        assert_agrees(&zcol, &[rat(1, 1), rat(0, 1)]);
+
+        // Rank-deficient only AFTER elimination: the cancellation has to be seen,
+        // not predicted from the pattern.
+        let late = vec![
+            vec![rat(1, 1), rat(1, 1), rat(0, 1)],
+            vec![rat(2, 1), rat(2, 1), rat(1, 1)],
+            vec![rat(3, 1), rat(3, 1), rat(1, 1)],
+        ];
+        assert_agrees(&late, &[rat(1, 1), rat(1, 1), rat(2, 1)]);
+        assert!(SparseExactLu::factor_with_deadline(to_sparse(&late), None).is_none());
+    }
+
+    /// An exact zero handed in as a stored entry is the same matrix as an absent
+    /// one, and a repeated column resolves LAST-WINS — the semantics of the dense
+    /// builder's repeated `bt[k][r] = a` store, which the sparse assembly replaced.
+    #[test]
+    fn stored_zeros_and_duplicate_columns_match_the_dense_store() {
+        let rows = vec![
+            vec![(1u32, rat(5, 1)), (0, rat(9, 1)), (0, rat(2, 1))],
+            vec![(0u32, rat(0, 1)), (1, rat(4, 1))],
+        ];
+        let f = SparseExactLu::factor_with_deadline(rows, None).expect("non-singular");
+        let z = f.solve(&[rat(1, 1), rat(1, 1)]);
+        // Last write wins: row 0 is `2·x0 + 5·x1`, not `9·x0 + 5·x1`.
+        let dense = vec![
+            vec![rat(2, 1), rat(5, 1)],
+            vec![Rational::zero(), rat(4, 1)],
+        ];
+        let d = ExactLu::factor_with_deadline(dense, None).expect("non-singular");
+        assert_eq!(z, d.solve(&[rat(1, 1), rat(1, 1)]));
+    }
+
+    /// THE MEMORY GUARD, stated directly rather than proxied by a row count. The
+    /// deadline cannot do this job: fill is allocated as it is created, so a
+    /// blow-up arrives before the next clock check. Declining is fail-closed — the
+    /// round loses its GMI cuts, never gets a wrong one.
+    #[test]
+    fn the_fill_budget_declines_instead_of_allocating() {
+        // A dense 30x30: 900 live entries before a single pivot.
+        let dense: Vec<Vec<(u32, Rational)>> = (0..30)
+            .map(|i| {
+                (0..30)
+                    .map(|j| (j as u32, rat(if i == j { 40 } else { 1 }, 1)))
+                    .collect()
+            })
+            .collect();
+        assert!(
+            SparseExactLu::factor_with_limits(dense.clone(), None, 899).is_none(),
+            "an input that already exceeds the budget must decline, not allocate"
+        );
+        assert!(
+            SparseExactLu::factor_with_limits(dense.clone(), None, usize::MAX).is_some(),
+            "the same matrix factors when the budget allows it"
+        );
+        // A CIRCULANT, which no pivot order keeps sparse: a budget between the
+        // input size and the factored size has to fire MID-elimination, which is
+        // the case a check-on-entry would miss and the one that matters.
+        let n = 60;
+        let circ: Vec<Vec<(u32, Rational)>> = (0..n)
+            .map(|i| {
+                let mut row = vec![
+                    (i as u32, rat(5, 1)),
+                    (((i + 1) % n) as u32, rat(1, 1)),
+                    (((i + 7) % n) as u32, rat(-2, 1)),
+                ];
+                row.sort_by_key(|(c, _)| *c);
+                row
+            })
+            .collect();
+        let input_nnz: usize = circ.iter().map(Vec::len).sum();
+        let full = SparseExactLu::factor_with_limits(circ.clone(), None, usize::MAX)
+            .expect("non-singular");
+        assert!(
+            full.factor_nnz() > 2 * input_nnz,
+            "test is vacuous unless the factorization actually fills in (got {} from {input_nnz})",
+            full.factor_nnz()
+        );
+        assert!(
+            SparseExactLu::factor_with_limits(circ, None, input_nnz + 8).is_none(),
+            "a budget below the factored size must fire mid-elimination"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_declines_before_any_elimination() {
+        let a = vec![vec![rat(2, 1), rat(1, 1)], vec![rat(1, 1), rat(3, 1)]];
+        assert!(SparseExactLu::factor_with_deadline(
+            to_sparse(&a),
+            Some(std::time::Instant::now())
+        )
+        .is_none());
+        assert!(SparseExactLu::factor_with_deadline(to_sparse(&a), None).is_some());
+    }
+
+    /// The reason the change exists: the factors must be `O(nnz)`, not `O(m²)`.
+    /// A logical-only basis is the extreme case (`m` singletons), and a diagonal
+    /// plus one dense row is the case a natural-order elimination would densify.
+    #[test]
+    fn factor_stays_sparse_where_the_dense_array_would_not() {
+        let n = 200;
+        let mut logicals: Vec<Vec<(u32, Rational)>> = Vec::new();
+        for i in 0..n {
+            logicals.push(vec![(i as u32, rat(-1, 1))]);
+        }
+        let f = SparseExactLu::factor_with_deadline(logicals, None).expect("non-singular");
+        assert_eq!(
+            f.factor_nnz(),
+            n,
+            "a permutation must factor to its diagonal"
+        );
+
+        let mut arrow: Vec<Vec<(u32, Rational)>> = Vec::new();
+        for i in 0..n - 1 {
+            arrow.push(vec![(i as u32, rat(3, 1)), ((n - 1) as u32, rat(1, 1))]);
+        }
+        arrow.push((0..n).map(|c| (c as u32, rat(1, 1))).collect());
+        let f = SparseExactLu::factor_with_deadline(arrow, None).expect("non-singular");
+        assert!(
+            f.factor_nnz() < n * n / 4,
+            "arrow factored to {} non-zeros; the dense array would hold {}",
+            f.factor_nnz(),
+            n * n
+        );
     }
 }
 
@@ -1710,4 +3077,30 @@ mod solve_sparse_diff_tests {
         let b = vec![rat(1, 1), rat(3, 1)]; // 2*(row0) != row1's rhs
         assert!(solve_sparse(to_sparse(&dense), b, None).is_none());
     }
+}
+
+/// Force every lazily-cached environment read in this module to happen NOW.
+///
+/// # The race this closes
+///
+/// `tune.rs` states the property the crate is supposed to have: *"The environment
+/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
+/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
+/// of the crate: 1 accessors here cache their value in a `OnceLock` and call
+/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
+/// happens to reach them — at an arbitrary point, on an arbitrary thread.
+///
+/// That is the exact hazard `EngineEconomics` was built to remove.
+/// the development design notes records the consumer's mitigation:
+/// it *"rewrites the same constant values before every window solve"*, so a
+/// `set_var` on one thread can land while another thread is mid-solve taking its
+/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
+/// is `unsafe` in edition 2024.
+///
+/// Priming collapses those windows into ONE, at solve entry, before any worker is
+/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
+/// It only moves *when* they are read, from "scattered across the solve" to "once,
+/// at a point the caller controls".
+pub(crate) fn prime_env() {
+    let _ = exact_lu_fma_enabled();
 }

@@ -17,8 +17,25 @@ use super::{instantiate_body, TermIndex};
 /// the quantifier body with every combination.
 ///
 /// This is a simplified form of Z3's MBQI: instead of using the model to guide
-/// instantiation, we enumerate all available ground terms. Sound because every
-/// instantiation of a universally quantified formula is implied by the formula.
+/// instantiation, we enumerate all available ground terms.
+///
+/// # CALLER OBLIGATION (#auflia-disjunct-forall-false-unsat)
+///
+/// The doc here used to claim this is "sound because every instantiation of a
+/// universally quantified formula is implied by the formula". Implied by the
+/// FORMULA — yes. Implied by the PROBLEM — only when the problem ENTAILS the
+/// formula. Every caller conjoins the returned instances into `ctx.assertions`
+/// as top-level facts, so calling this on a `forall` that is merely a DISJUNCT
+/// (`(or c (forall x. p x))`, a positive `=>` conclusion, an `ite` branch)
+/// fabricates a constraint and can refute a satisfiable problem — measured on
+/// six `AUFLIA/20170829-Rodin` benchmarks that answered `unsat` against a
+/// declared and doubly-oracle-confirmed `sat`.
+///
+/// This function CANNOT check that itself: it sees one quantifier, not its
+/// position. The caller MUST gate on
+/// [`crate::ematching::collect_entailed_foralls`] /
+/// [`crate::ematching::entailed_forall_set`] first — `setup_cegqi_for_unhandled`
+/// does.
 ///
 /// Reference: Z3 smt/smt_model_based_qi.cpp, CVC5 QuantifiersEngine::getTermForType
 pub(crate) fn enumerative_instantiation(

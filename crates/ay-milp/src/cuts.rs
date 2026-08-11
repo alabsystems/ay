@@ -38,20 +38,283 @@ use num_traits::Zero;
 use crate::model::{exact, Col, ColKind, Model, Row};
 
 /// A cut must be violated by at least this much to be worth its row.
+///
+/// # It is PRINCIPLED, and the principle is SUBSUMPTION, not numerics (measured 2026-08-01)
+///
+/// the development design notes lists this constant as half of
+/// its sixth and last root-closure cause: "valid cuts generated and then killed entirely by
+/// post-filters — the absolute nnz cap and the efficacy floor", on 6 of 65 zero-cut instances.
+/// That attribution was made by reading the code. Counting it says something different.
+///
+/// The number itself is not defensible on its own terms: `violation` is scale-DEPENDENT, so
+/// multiplying a cut through by ten multiplies its violation by ten while the inequality says
+/// exactly the same thing, and `1e-4` therefore tests the cut's UNITS as much as its strength.
+/// What rescues it is that nothing downstream ranks on raw violation either. The root pool ranks
+/// on scale-free [`cut_depth`] and applies its own floor there (`bab::default_root_cut_eff_floor`,
+/// `1e-3` or `6e-3` by shape), which for any cut with `‖a‖ >= 0.1` is the STRICTER of the two.
+///
+/// So the question is not how many cuts `1e-4` refuses but how many of them the pool's own floor
+/// would have kept, and `sepstat::GATE_CUT_MIN_VIOLATION` counts exactly that. Over **101
+/// instances** (66 spanning all three corpus tiers plus the 35-instance named/slow-prover set,
+/// serial, `AY_ROOT_CLOSURE=1`, 10 s):
+///
+/// ```text
+///   fires on                                     17 / 101 instances
+///   violated cuts refused                       163
+///   of which would clear the pool's DEPTH floor    3   (all on glass4)
+/// ```
+///
+/// 160 of 163 were shallow in the only currency the pool spends. The count is not merely
+/// suggestive, it BOUNDS the loss: a cut has to clear the depth floor to enter the pool at all,
+/// so at most THREE cuts corpus-wide could have reached it had this filter never existed — and
+/// those three are glass4's, which buy nothing (its root bound is 800002400 with them and
+/// without). The arm agrees: `AY_MILP_MIN_VIOLATION=1e-12` over the 25 instances where either
+/// post-filter fires moves mean root closure by **−0.01pp — zero instances better, one worse**
+/// (aflow30a 12.76% → 12.56%, an extra shallow row displacing a better one), with the
+/// fractional-integer-column count at the root identical on all 25.
+///
+/// ⚠ MEASUREMENT HYGIENE, learned the hard way in this pass: the root cut loop is
+/// DEADLINE-bound (`AY_MILP_CUT_SHARE`), so `cuts` and `gain` are NOT deterministic under CPU
+/// contention — three consecutive runs of the same binary on qnet1 returned 32, 28 and 21 adopted
+/// cuts. A second worktree was solving on the same box. Every verdict claim in this comment and
+/// in [`crate::bab::MAX_CUT_NNZ`]'s was therefore re-taken with three repetitions per arm, which
+/// is how two phantom verdict "gains" (qiu, danoint) were caught and discarded. The COUNTS above
+/// are robust in a way the closure deltas are not, because they are bounded by the depth floor
+/// rather than by how many rounds the deadline allowed.
+///
+/// **Verdict: this filter forgoes nothing on real models. Left exactly as it is.** The arm stays
+/// (`AY_MILP_MIN_VIOLATION`, see [`min_violation`]) so the negative result is re-derivable.
 const MIN_VIOLATION: f64 = 1e-4;
+
+/// [`MIN_VIOLATION`] as the cut-ADMISSION filters apply it, overridable for measurement with
+/// `AY_MILP_MIN_VIOLATION=<f>`.
+///
+/// # Scope, and why it is deliberately narrow
+///
+/// `MIN_VIOLATION` appears at two kinds of site and only one of them is a policy. The ADMISSION
+/// sites ask "is this finished cut violated enough to be worth its row" and are the ones this
+/// function governs — [`clears_min_violation`], [`Cut::clean`]'s survival test, the single-row
+/// flow-cover arg-max floor, the exact-cover emit test, and the whole-row screen in
+/// `best_over_deltas` (whose ONLY claim is that no delta on the row can reach the admission
+/// floor, so it must move with it or the arm measures a screen, not a policy).
+///
+/// The other sites reuse the same number as a small SLACK tolerance in a family's own geometry —
+/// `slack >= 1 - MIN_VIOLATION` in the cover greedy, `weight <= 1 + MIN_VIOLATION` in the lifting
+/// pass, the odd-hole `1 - MIN_VIOLATION` test, [`Cut::snap`]'s "does it still cut on this grid"
+/// retry. Those are not admission decisions and are left on the constant on purpose: an arm that
+/// moved them would measure four changes at once and attribute the result to one.
+fn min_violation() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("AY_MILP_MIN_VIOLATION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(MIN_VIOLATION)
+    })
+}
+
+/// The most permissive scale-free DEPTH floor the root pool ever applies
+/// (`bab::default_root_cut_eff_floor`; the shape-gated arm is six times this). Used only by the
+/// census below, to answer whether a cut [`MIN_VIOLATION`] refuses could have survived the filter
+/// that actually governs the pool. Kept as a literal rather than a cross-module import because it
+/// is a MEASUREMENT reference point, not a policy: if the pool's floor moves, this census
+/// over-counts, which is the safe direction for a "what did we forgo" number.
+const POOL_DEPTH_FLOOR_MIN: f64 = 1e-3;
+
+/// Charge a fully derived, genuinely violated cut that the raw-violation floor refused.
+///
+/// # Why the cost is not the violation
+///
+/// [`MIN_VIOLATION`] is applied to `violation`, which is scale-DEPENDENT: multiply a cut through
+/// by ten and its violation multiplies by ten while the inequality says exactly the same thing.
+/// Nothing downstream ranks on that number — the root pool ranks on [`cut_depth`] and applies its
+/// own floor there. So "how many cuts did 1e-4 refuse" is a fire rate and orders nothing (the
+/// lesson of `1c1ce672c`, four families at fire rate zero and four different verdicts); the
+/// decision statistic is how many of the refused cuts would ALSO have cleared the DEPTH floor,
+/// i.e. how many were real capability rather than scale.
+///
+/// One f64 dot product plus one norm, on a cut that has already been built exactly — strictly
+/// dominated by the derivation that produced it, and only on the refusal branch.
+#[inline]
+fn charge_min_violation(cut: &Cut, v: f64) {
+    if v <= 0.0 {
+        return; // a satisfied cut cost nothing: there was no capability to forgo
+    }
+    let norm = cut
+        .coeffs
+        .iter()
+        .map(|&(_, a)| a * a)
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-12);
+    crate::sepstat::gate_charge(
+        crate::sepstat::GATE_CUT_MIN_VIOLATION,
+        u64::from(v / norm >= POOL_DEPTH_FLOOR_MIN),
+    );
+}
+
+/// `violation(cut, x) > MIN_VIOLATION`, with the refusal charged to the census.
+///
+/// Behaviourally identical to the bare comparison it replaces — same operands, same operator,
+/// same order — so every measurement taken through the old spelling keeps its meaning.
+#[inline]
+fn clears_min_violation(cut: &Cut, x: &[f64]) -> bool {
+    let v = violation(cut, x);
+    if v > min_violation() {
+        return true;
+    }
+    charge_min_violation(cut, v);
+    false
+}
 
 /// The dyadic grids a cut's coefficients are rounded onto, COARSEST FIRST -- see `Cut::snap`.
 /// Coarse is what keeps the exact basis cheap, so the first grid the cut can afford wins.
 const SNAP_GRIDS: [i32; 5] = [6, 10, 14, 20, 26];
 
-/// The largest basis GMI will factor EXACTLY. Its LU is dense and cubic and runs once per cut
-/// ROUND, so this is a far tighter budget than the exact replay's -- see the note at its use.
+/// The largest basis GMI will factor EXACTLY.
+///
+/// # This was a MEMORY budget wearing a time budget's docstring, and it cost 63% of the corpus
+///
+/// It read 600 from 2026-07-14 (`b68d10a18`) to 2026-08-01, and that number was never measured.
+/// `b68d10a18` diagnosed GMI as having wrongly inherited `certify::MAX_EXACT_BASIS_ROWS` -- "two
+/// jobs, two costs, two caps" -- then created this function and left the inherited literal
+/// unchanged. The cost that motivated a cap was fixed by a DIFFERENT bug in the same commit
+/// (`Cut::snap`, which flattened separation to mod010 0.88 / 0.84 / 0.95s), so the cap was never
+/// remeasured against the code that shipped.
+///
+/// The docstring it carried called this a TIME budget -- "its LU is dense and cubic and runs once
+/// per cut ROUND". At 600 it denied EXACT-BASIS GMI, the primary cut family, to **238 of 379 MIPLIB
+/// instances (63%)**, on a front where root closure is the single largest measured gap to Gurobi
+/// (7.02% against 54.69%). A full cost-curve study over 173 uncapped calls says the time reading
+/// was WRONG on every count:
+///
+/// * **No cheap quantity predicts the time.** Spearman rho against LU-factor seconds: `m` +0.82,
+///   `m·n` +0.69, nonbasic count +0.52, `nnz` +0.45 -- every proposed replacement is WORSE than `m`,
+///   and `m` is useless for MAGNITUDE. Within `m ∈ [900,1400]` factor time spans 0.0007s to 0.2897s
+///   (414x); the most expensive factorisation in the whole sweep was at **m=996 (1.0437s)**, and
+///   m=2313 factored in 0.0232s (m=4554 costs 0.044s). Measured over 27 bases the same ordering
+///   fails again: inside `m ∈ [930,1130]` the LU spans 0.0017s to 1.044s, 614x at fixed `m`.
+///   `ExactLu::factor_with_deadline` skips exact zeros, so its cost tracks fill-in and bit growth,
+///   and no function of `m` orders those.
+/// * **Every expensive factorisation sat BELOW any middling cap**, so the cap never protected
+///   against one.
+/// * **The deadline already governs the time, and was measured doing it**: 28 of the 173 uncapped
+///   calls aborted inside `ExactLu::factor_with_deadline`, worst overrun anywhere 1.0437s.
+/// * **The exemplars were stale**: air05 (426 rows) now factors in 0.0033s and its whole GMI share
+///   is ~0.57s, not the 11.2s the note quoted.
+///
+/// What `m` really governed was one line: `vec![vec![Rational::zero(); m]; m]`, O(m²) and
+/// unconditional, built from a SPARSE basis and allocated BEFORE the deadline was consulted -- at
+/// 36 B/entry that is 4.26 GB at m=10765 and 9.51 GB at m=16381, and THAT is the cost the cap was
+/// really bounding. Measured peak RSS against the sparse assembly that replaced it
+/// (`AY_MILP_DENSE_GMI_LU=1` restores the old one), 3 repetitions each: 50 MB vs 19 MB at m=1048,
+/// 186 MB vs 17 MB at m=2527, 1861 MB vs 57 MB at m=6558, and **3329 MB vs 78 MB at m=10765** --
+/// 43x, with the dense arm tracking m² (66x the bytes for 10.3x the rows) and the sparse arm
+/// essentially flat. On the corpus's largest model (169,576 rows) the dense assembly is ~1 PB.
+/// See [`SparseExactLu`] for the full table and the per-repetition spread.
+///
+/// # The intermediate step: 600 -> 2000, and why its limits no longer bind
+///
+/// Before the sparse assembly existed the cap was raised to 2000 == 144 MB worst case, the memory
+/// budget expressed in the units the dense code had. GATED, 15s solves, arms interleaved
+/// back-to-back in one serial worker, checked against MIPLIB references and cross-checked against
+/// `~/ay-bench/milp/Highs.log`:
+///   * ALL 73 corpus instances whose row count lies in (600, 2000] -- the complete population where
+///     that cap binds differently from 600: verdicts GAINED 1, LOST 0, soundness alarms 0.
+///   * 26 tightest-gap in-band instances re-run at 60s: GAINED 1, LOST 0, alarms 0.
+///   * 62 controls (both arms gated identically): 0 verdicts gained, 0 lost.
+/// The gain was `haprp` (m=1048), and it is the SAME gain the 12000 A/B re-measures below. That
+/// study's honest limit was that its verdict evidence justified only `>= 1048`, and that the
+/// bands above bought zero verdicts at 15s and 60s; do not read the bound/incumbent deltas as
+/// support, because 62 control pairs running IDENTICAL code differed on 15 of them (24%),
+/// including one status change and a dual bound moving -109,730 -> -1,300,747. The one
+/// reproducible COST recorded there is primal: `neos2` (m=1103) incumbent 488.77 -> 1043.47, 3/3
+/// deterministic, against a 454.86 reference. Root closure is not the scoreboard and does not
+/// track the win -- haprp's own root gain FELL (7042 -> 5659 in an earlier sweep) while its verdict
+/// rose; over 40 in-band instances closure went up on 16, down on 5, flat on 19.
+///
+/// # What the number is now
+///
+/// A BACKSTOP, and no longer the memory guard: [`SparseExactLu`]'s fill budget bounds the
+/// factorization's bytes DIRECTLY (it counts entries, the thing it is protecting, rather than
+/// proxying them by a row count), and the deadline bounds its time. What is left scaling with `m` is
+/// the per-cut `e`/`u` dense rational vectors and the separator's O(m) bookkeeping -- linear, and
+/// small next to the O(nnz) work per cut. So the cap exists to stop a basis so large that the
+/// SEPARATOR's own linear costs stop being noise, not to stop the factorization. This is the
+/// durable fix the 2000-era note asked for ("gate on `36 * m * m <= budget` and let the deadline own
+/// the time"), except that counting entries beats any `m`-shaped proxy for them.
+///
+/// KILL SWITCH: `AY_MILP_GMI_MAX_ROWS` (registered in `knobs.rs`, bucket `Tuning`) sets this at
+/// runtime; `AY_MILP_GMI_MAX_ROWS=600` restores the pre-2026-08-01 behaviour exactly, and
+/// `AY_MILP_DENSE_GMI_LU=1` restores the dense assembly independently.
 fn gmi_max_basis_rows() -> usize {
     std::env::var("AY_MILP_GMI_MAX_ROWS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(600)
+        .unwrap_or(DEFAULT_GMI_MAX_BASIS_ROWS)
 }
+
+/// See [`gmi_max_basis_rows`]. VALUE SET BY A/B, not by the memory argument: the memory argument
+/// only says the cap CAN rise, and this campaign has twice measured that more cuts is not better
+/// (seven verdicts lost to a bigger cut budget, five to a PERFECT root bound that made trees 1.72x
+/// bigger). 12000 is what the corpus A/B admitted, and it is where the evidence stops -- nothing
+/// above it has been measured, so nothing above it is claimed.
+///
+/// # The A/B, both sides of it
+///
+/// 70 instances (40 gurobi / 20 mid / 10 large, all with `rows > 600`), 15s, SERIAL, three arms one
+/// binary apart: A0 = 600 + the old dense `Bᵀ` (`AY_MILP_DENSE_GMI_LU=1`), A1 = 600 + sparse,
+/// A2 = 12000 + sparse. Every headline below was RE-TAKEN at 3 repetitions; the gate pass itself is
+/// a screen, not the evidence, because it is one observation per cell.
+///
+/// * **A0 -> A2: +1 verdict, -0, 0 soundness alarms.** The gain is `haprp` (m=1048), FEASIBLE ->
+///   OPTIMAL at 3673280.681685. It is not a budget squeak: at 60s and 3 repeats it proves 3/3 at
+///   **exactly 31,609 nodes every time** (12.9s / 16.2s / 18.0s of a heavily loaded box -- wall
+///   moves, nodes-to-proof does not), while cap 600 fails to prove 6/6 at 60s having reached
+///   94,842 to 116,724 nodes. The cap is buying a SMALLER TREE, not more clock. The value is NOT
+///   the manifest's (3673280.6808, off by 2.4e-10); it agrees with HiGHS's proved optimum
+///   3673280.68169 to 12 significant figures, so the manifest is the outlier -- cross-checked
+///   against `~/ay-bench/milp/Highs.log`, per the standing rule that the manifest is not ground
+///   truth.
+/// * **A0 -> A1 is the representation change alone and moves NOTHING that reproduces.** The one
+///   verdict it appeared to lose (`app1-1`) separates ZERO GMI cuts in every arm, and 9 repeats
+///   produced 9 non-proofs with node counts from 21 to 60 at the same budget: a wall-clock-budget
+///   instance on a loaded box, not a regression. The load-invariant statistic says the same thing
+///   the other way: on the two instances that PROVE, nodes-to-proof is EQUAL to the node --
+///   `rout` 15,328 = 15,328 and `misc07` 7,491 = 7,491 -- which is what "same cuts" looks like from
+///   the search's side.
+///
+/// # What it costs, named -- and ONLY what survived repetition
+///
+/// The root cut loop is DEADLINE-bound, so a single 15s observation is not a result: six of the
+/// gate's per-instance movements were re-run at 3 repetitions per arm and **two of the four
+/// primal ones evaporated** (`fiball`'s gained incumbent and `p200x1188c`'s lost optimum were both
+/// the box, not the cap). What is left, at 3/3:
+///
+/// * `beasleyC2` (m=1750) gets a REPRODUCIBLY WORSE incumbent: 308/308/308 at 12000 against
+///   256/256/256 at 600 (optimum 144), on MORE nodes (5385-5543 against 3955-4059).
+/// * `n5-3` (m=1062) gets a WEAKER dual bound (4573-4589 against 4664-4708) on 10x fewer nodes
+///   (205-227 against 623-1039).
+/// * `qiu` (m=1192) explores 528-734 nodes at 12000 against 1221-6171 at 600, a 3x loss of
+///   throughput. Its incumbent lands at the worst end of a spread cap 600 ALREADY had (-110.84,
+///   where 600 ranged -110.84 to the optimum -132.873 across repeats), so the node loss is the
+///   finding and the incumbent is not.
+///
+/// What it buys, at 3/3: `nsa` (m=1297) REACHES its optimum -- 120/120/120 at 12000 against
+/// 123/123/123 at 600 -- and `haprp` proves. The one-shot movements on `graphdraw-domain`,
+/// `supportcase26`, `g200x740`, `bg512142`, `n3div36`, `mtest4ma`, `tr12-30`, `nu25-pr12`,
+/// `neos-3610173-itata` and `neos-1430701` are recorded in the gate JSON and are deliberately NOT
+/// claimed here, because the two of that class that were tested did not reproduce.
+///
+/// The shape of the trade is consistent: the cap raise buys BOUND QUALITY PER NODE and pays for it
+/// in NODE THROUGHPUT, since every adopted row is charged at every node below it. It wins where the
+/// tree is bound-limited (haprp: 31,609 nodes to proof against >116,724 without) and loses where
+/// the tree is throughput-limited (qiu, n5-3).
+///
+/// `noswot`, `misc07`, `fiball` and `app1-1` are unaffected either way -- they separate the SAME
+/// cuts (8, 12, 0 and 0) at both caps, because their bases never reach 600 in the first place.
+const DEFAULT_GMI_MAX_BASIS_ROWS: usize = 12000;
 
 /// Kill switch for the fused multiply-add / clone-elided form of the exact GMI
 /// back-solve dot products (`separate_gmi_budget`). The fused path computes the
@@ -292,7 +555,15 @@ impl Cut {
         } else {
             self.lb - act
         };
-        v > MIN_VIOLATION
+        if v <= min_violation() {
+            // Charged like every other refusal, but note what `clean` can and cannot cost: it
+            // spends at most `budget` (0.1) of the violation the cut arrived with, so a row that
+            // falls through here arrived at 1.11e-4 or less and was ALREADY within a hair of the
+            // floor. The sparsifier does not turn a deep cut into a shallow one.
+            charge_min_violation(self, v);
+            return false;
+        }
+        true
     }
 }
 
@@ -463,7 +734,7 @@ fn separate_covering_modk(model: &Model, x: &[f64]) -> Vec<Cut> {
             let bsum = rows[ri].b + rows[rj].b;
             for &k in &ks {
                 if let Some(c) = build(&acc, bsum, k) {
-                    if violation(&c, x) > MIN_VIOLATION {
+                    if clears_min_violation(&c, x) {
                         cuts.push(c);
                     }
                 }
@@ -487,7 +758,7 @@ fn separate_covering_modk(model: &Model, x: &[f64]) -> Vec<Cut> {
                 let bsum = rows[ri].b + rows[rj].b + rows[rk].b;
                 for &k in &ks {
                     if let Some(c) = build(&acc, bsum, k) {
-                        if violation(&c, x) > MIN_VIOLATION {
+                        if clears_min_violation(&c, x) {
                             cuts.push(c);
                         }
                     }
@@ -1309,8 +1580,40 @@ mod cover_view_tests {
 
 use num_traits::{One, Signed, ToPrimitive};
 
-use crate::certify::ExactLu;
+use crate::certify::{ExactLu, SparseExactLu};
 use crate::simplex::{Candidate, FloatLp, NbBound};
+
+/// The GMI basis factorization, in whichever representation this run asked for.
+///
+/// The sparse path is the default and the only one the row cap is now sized
+/// against; the dense one is reachable only through `AY_MILP_DENSE_GMI_LU` and
+/// exists so the representation change stays FALSIFIABLE — same instance, same
+/// seed, one env var apart, and the cuts have to come out byte-identical.
+enum BasisLu {
+    Sparse(SparseExactLu),
+    Dense(ExactLu),
+}
+
+impl BasisLu {
+    fn solve(&self, b: &[ay_lra::rational::Rational]) -> Vec<ay_lra::rational::Rational> {
+        match self {
+            Self::Sparse(f) => f.solve(b),
+            Self::Dense(f) => f.solve(b),
+        }
+    }
+}
+
+/// Kill switch for the sparse GMI basis factorization: set `AY_MILP_DENSE_GMI_LU=1`
+/// to rebuild the `m × m` dense `Bᵀ` and factor it the way this separator did
+/// before [`SparseExactLu`] existed. Kept because the claim being made is
+/// "identical cuts, less memory", and half of that claim is only checkable if the
+/// old path can still be run. It is also how the QUADRATIC peak-RSS curve was
+/// measured (see [`gmi_max_basis_rows`] for the table) — the measurement that
+/// showed the 600-row cap was a memory budget wearing a time budget's docstring.
+#[inline]
+fn dense_gmi_lu() -> bool {
+    std::env::var_os("AY_MILP_DENSE_GMI_LU").is_some()
+}
 
 /// GMI rounds are the expensive ones (an exact `Bᵀ` solve per cut row), so they
 /// happen once, at the root, where the whole tree pays for them.
@@ -1425,11 +1728,121 @@ pub(crate) fn gmi_rounds() -> usize {
         .unwrap_or(MAX_GMI_ROUNDS)
 }
 
-pub(crate) fn cuts_per_round() -> usize {
+/// The ONE read of `AY_MILP_CUTS_PER_ROUND`. Every budget below funnels through here so the
+/// override keeps a single meaning and the ledger keeps a single read site — and, importantly,
+/// so that an EXPLICIT `AY_MILP_CUTS_PER_ROUND=4` still forces four. The shape default below
+/// also happens to be four on wide models; collapsing the two would silently convert every
+/// baseline arm ever measured through this knob into a shape-gated arm.
+fn cuts_per_round_env() -> Option<usize> {
     std::env::var("AY_MILP_CUTS_PER_ROUND")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_CUTS_PER_ROUND)
+}
+
+pub(crate) fn cuts_per_round() -> usize {
+    cuts_per_round_env().unwrap_or(MAX_CUTS_PER_ROUND)
+}
+
+/// A model is WIDE when `cols >= 4 * rows`.
+///
+/// This is not a fitted threshold: [`default_root_cut_eff_floor`] already uses the identical
+/// predicate to demand a 6× stricter cut-efficacy bar, on the independent grounds that
+/// knapsack-shaped models want fewer, better cuts. The per-round budget turns out to be the
+/// same phenomenon measured from the other end.
+pub(crate) fn is_wide_shape(num_rows: usize, num_cols: usize) -> bool {
+    num_rows > 0 && num_cols / num_rows >= 4
+}
+
+/// Per-round cut budget on NARROW models. See [`cuts_per_round_for_shape`].
+pub(crate) const NARROW_CUTS_PER_ROUND: usize = 8;
+
+/// Per-round cut budget on WIDE models — ONE, not the historical flat four.
+///
+/// The first cut of this gate kept wide models at `MAX_CUTS_PER_ROUND` on the reasoning that the
+/// wider budget merely failed to help there. That was too timid: a budget sweep on load-invariant
+/// node counts showed the flat four is DOMINATED in the wide regime, strictly, by every smaller
+/// value. Wide models do not want the extra cuts declined — they want fewer than they were
+/// already getting.
+///
+/// ```text
+///   node counts, unseeded (answers byte-identical at every budget -- verified)
+///     budget           4         2         1         0
+///     mas76      1249781    821481    808359    808367
+///     gt2          56670     48955      5094      1178
+///     khb05250/air03/mod010/markshare1/markshare2: bit-identical at all four
+///
+///   WALL, unseeded, measured SERIALLY on an idle machine (the deliverable):
+///     wide subset   cpr=4  37.187 s  ->  cpr=1  26.596 s   (-10.59 s, -28.5%)
+///       mas76       24.832 -> 16.099 s   (-8.73 s)
+///       khb05250, air03, mod010 all faster at IDENTICAL node counts -- the removed
+///       cost is pure per-node cut overhead, with no search effect either way.
+///
+///   SEEDED mas76 (incumbent luck held fixed -- so this is search quality, not timing):
+///     cpr=4  21.061 s / 975265 nodes   ->   cpr=1  16.494 s / 810077 nodes
+/// ```
+///
+/// `cpr=0` ties this (26.564 s vs 26.596 s) and is NOT chosen: one keeps a minimal cut stream
+/// alive instead of disabling separation outright on every wide model, which is the smaller
+/// behavioural change for wide instances outside this corpus. The corpus cannot tell them apart.
+///
+/// gt2's 48x is deliberately discounted — gt2's node count is set by incumbent discovery and six
+/// separate gt2 headlines evaporated under the seeded control in one session. Excluding it
+/// entirely the gain is still -8.94 s, carried by mas76, which is not a lottery instance (800k+
+/// nodes) and whose gain survives seeding.
+pub(crate) const WIDE_CUTS_PER_ROUND: usize = 1;
+
+/// Shape-gated per-round cut budget.
+///
+/// # The measurement (2026-08-05, full corpus, BOTH arms seeded)
+///
+/// `AY_MILP_CUTS_PER_ROUND=8` was measured on 16 corpus instances with both arms seeded from
+/// the same witness, so incumbent-discovery luck is held fixed and only the budget varies (the
+/// unseeded version of this table is worthless — it reversed sign on qnet1; see
+/// the development design notes). Sorted by shape:
+///
+/// ```text
+///   NARROW (cols/rows < 4)                 WIDE (cols/rows >= 4)
+///     qnet1    3.06   -2.053 s               mas76     12.58   +1.994 s
+///     qiu      0.70   -1.009 s               khb05250  13.37   +0.546 s
+///     misc07   1.23   -0.665 s               air03     86.75   +0.100 s
+///     p0201    1.51   -0.068 s               mod010    18.18   +0.012 s
+///     dcmulti  1.89   -0.048 s               markshare1 10.33  -0.002 s
+///     blend2   1.29   -0.037 s               markshare2 10.57  -0.005 s
+///     flugpl   1.00    0.000 s
+///     rout     1.91    0.000 s
+///     gen      1.12   +0.003 s
+///     pk1      1.91   +0.131 s
+///     SUM            -3.746 s               SUM               +2.645 s
+/// ```
+///
+/// The sign separates on shape with a 4× margin (narrow tops out at 3.06, wide starts at
+/// 10.33) and only two negligible exceptions, both narrow. Applied globally the knob is a
+/// WASH (−1.10 s net, one big win cancelling one big loss) and not shippable; gated to narrow
+/// models it keeps −3.75 s and declines +2.65 s.
+///
+/// # Why the wide models lose
+///
+/// Not a bound/tree trade-off — on the losers the node count does not move AT ALL (mas76
+/// 975265 → 982027, khb05250 15 → 17) while wall rises. The extra cuts buy zero search and
+/// are pure overhead, exactly as [`MAX_GMI_ROUNDS`]'s note predicts: *every row the root adopts
+/// is a row in every LP of every node*. On a wide model there are many more columns per row for
+/// a cut to be dense over, and correspondingly fewer rows to tighten.
+///
+/// `AY_MILP_CUTS_PER_ROUND` overrides this entirely (both directions);
+/// `AY_MILP_NO_SHAPE_CPR=1` disables the gate and restores the flat four.
+pub(crate) fn cuts_per_round_for_shape(num_rows: usize, num_cols: usize) -> usize {
+    cuts_per_round_env().unwrap_or_else(|| shape_cuts_per_round(num_rows, num_cols))
+}
+
+fn shape_cuts_per_round(num_rows: usize, num_cols: usize) -> usize {
+    if std::env::var_os("AY_MILP_NO_SHAPE_CPR").is_some() {
+        return MAX_CUTS_PER_ROUND;
+    }
+    if is_wide_shape(num_rows, num_cols) {
+        WIDE_CUTS_PER_ROUND
+    } else {
+        NARROW_CUTS_PER_ROUND
+    }
 }
 
 /// The ROOT loop's per-round cut budget, which is a different economy from a node's.
@@ -1454,15 +1867,22 @@ pub(crate) fn cuts_per_round() -> usize {
 /// `AY_MILP_ROOT_CUTS_PER_ROUND` overrides; the historical `AY_MILP_CUTS_PER_ROUND` still
 /// overrides both, so every measurement taken through the old knob keeps its meaning.
 pub(crate) fn root_cuts_per_round() -> usize {
+    root_cuts_per_round_env().unwrap_or(ROOT_CUTS_PER_ROUND)
+}
+
+fn root_cuts_per_round_env() -> Option<usize> {
     std::env::var("AY_MILP_ROOT_CUTS_PER_ROUND")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or_else(|| {
-            std::env::var("AY_MILP_CUTS_PER_ROUND")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(ROOT_CUTS_PER_ROUND)
+        .or_else(cuts_per_round_env)
+}
+
+/// The root loop's per-round budget under the same shape gate as
+/// [`cuts_per_round_for_shape`] — the measured arm raised BOTH budgets together (the historical
+/// `AY_MILP_CUTS_PER_ROUND` overrides node and root alike), so the gate has to move both to
+/// reproduce it.
+pub(crate) fn root_cuts_per_round_for_shape(num_rows: usize, num_cols: usize) -> usize {
+    root_cuts_per_round_env().unwrap_or_else(|| shape_cuts_per_round(num_rows, num_cols))
 }
 
 /// The cap on the root loop's CLIQUE-ONLY extension rounds (see `add_root_cuts`): the loop ends
@@ -1789,15 +2209,34 @@ const ROOT_CUTS_PER_ROUND: usize = MAX_CUTS_PER_ROUND;
 /// the right-hand side is relaxed by exactly the damage the rounding can do:
 /// `Σ_k |ĉ_k − c_k| · max|x_k|` over the box. The stored `f64` cut is then implied
 /// by the exact one, and is valid for every integer point of the model.
+/// `base_rows`/`base_cols` are the shape of the model BEFORE any cut rows were adopted.
+///
+/// They cannot be read off `model`: the root loop passes its accumulating `work` model here, so
+/// `model.num_rows()` grows every round as cuts are adopted. Deriving the gate from that would
+/// make the budget depend on how far the loop had already got — a model wide enough to decline
+/// the wider budget could talk itself into it after enough rounds. The shape is a property of
+/// the MODEL, not of the loop's progress through it.
+///
+/// (This was found while chasing an 8-node drift on mas76 and is NOT its cause — that turned out
+/// to be sub-MIPs, which are separate models and are classified on their own shape. The latent
+/// defect here is real anyway.)
 pub(crate) fn separate_gmi(
     model: &Model,
     lp: &FloatLp,
     cand: &Candidate,
     deadline: Option<std::time::Instant>,
+    base_rows: usize,
+    base_cols: usize,
 ) -> Vec<Cut> {
     // Only the ROOT loop calls this entry point; every node site calls
     // `separate_gmi_budget` with its own budget, so the root budget stays root-scoped.
-    separate_gmi_budget(model, lp, cand, deadline, root_cuts_per_round())
+    separate_gmi_budget(
+        model,
+        lp,
+        cand,
+        deadline,
+        root_cuts_per_round_for_shape(base_rows, base_cols),
+    )
 }
 
 /// [`separate_gmi`] with an explicit per-call cut budget. The root loop keeps its tuned
@@ -1824,6 +2263,12 @@ pub(crate) fn separate_gmi_budget(
     //
     // So the separator holds a deadline and stops at a cut boundary when it runs out, and a hard cap
     // stays only as a backstop against a basis so large that even one cut overruns.
+    //
+    // That reasoning was right and the CAP DID NOT FOLLOW IT: at 600 it was refusing 63% of the
+    // corpus on a quantity the note itself says predicts nothing, because the real thing the number
+    // held back was an O(m²) allocation two screens down. That allocation is gone (see the `bt`
+    // assembly below and [`SparseExactLu`]), and `gmi_max_basis_rows` now documents what the number
+    // is a backstop FOR.
     if m == 0 || m > gmi_max_basis_rows() {
         return Vec::new();
     }
@@ -1908,15 +2353,35 @@ pub(crate) fn separate_gmi_budget(
         }
     };
 
+    // A basis has one column per row slot. The dense assembly below used to index
+    // `bt[k]` straight from this iteration, which PANICS on a longer basis; the
+    // sparse one would silently factor a non-square matrix instead. Neither is an
+    // answer, so a malformed candidate is refused here.
+    if cand.basis.len() != m {
+        return Vec::new();
+    }
+
     // Bᵀ, factored ONCE; each cut row is a back-solve, not another elimination.
-    let mut bt = vec![vec![Rational::zero(); m]; m];
-    for (k, &j) in cand.basis.iter().enumerate() {
+    //
+    // SPARSE, AND THAT IS A MEMORY DECISION, NOT A SPEED ONE. This used to be
+    // `vec![vec![Rational::zero(); m]; m]` — m² rationals, unconditional, built
+    // out of a basis that is sparse (one structural column's non-zeros, or a
+    // single −1 for a logical) and allocated BEFORE the deadline was consulted, so
+    // an already-expired deadline still paid for it in full. Measured peak RSS (3
+    // repetitions per point) grew QUADRATICALLY with it: 50 MB at m=1048 up to
+    // 3329 MB at m=10765 — 66x the bytes for 10.3x the rows — against 19 MB and
+    // 78 MB on this assembly. Extrapolated to the corpus's largest model (169,576
+    // rows) the dense array alone is ~1 PB. That allocation, not the factor time,
+    // is what the
+    // 600-row cap above was actually holding back — see [`SparseExactLu`] for the
+    // cost-curve study that refuted the time reading, and `gmi_max_basis_rows` for
+    // what the cap became once the quadratic term was gone.
+    let mut bt: Vec<Vec<(u32, Rational)>> = Vec::with_capacity(m);
+    for &j in &cand.basis {
         if j < n {
-            for (r, a) in &ecol[j] {
-                bt[k][*r as usize] = a.clone();
-            }
+            bt.push(ecol[j].clone());
         } else {
-            bt[k][j - n] = -Rational::new(1, 1);
+            bt.push(vec![((j - n) as u32, -Rational::new(1, 1))]);
         }
     }
     // The deadline goes INTO the factorization: rational elimination's cost is
@@ -1924,8 +2389,31 @@ pub(crate) fn separate_gmi_budget(
     // factors in 0.33s; domset mw19's 468-row covering basis was measured at
     // 72s — four times the whole cut share — while the per-cut checks below
     // waited politely for a loop that had not started).
-    let Some(lu) = ExactLu::factor_with_deadline(bt, deadline) else {
-        return Vec::new();
+    let lu = if dense_gmi_lu() {
+        let mut dense = vec![vec![Rational::zero(); m]; m];
+        for (k, row) in bt.iter().enumerate() {
+            for (r, a) in row {
+                dense[k][*r as usize] = a.clone();
+            }
+        }
+        let Some(f) = ExactLu::factor_with_deadline(dense, deadline) else {
+            return Vec::new();
+        };
+        BasisLu::Dense(f)
+    } else {
+        let bt_nnz: usize = bt.iter().map(Vec::len).sum();
+        let Some(f) = SparseExactLu::factor_with_deadline(bt, deadline) else {
+            return Vec::new();
+        };
+        if std::env::var_os("AY_MILP_TRACE").is_some() {
+            eprintln!(
+                "AY_MILP_TRACE   gmi lu: m={m} basis_nnz={bt_nnz} factor_nnz={} fill={:.2}x dense_would_be={}",
+                f.factor_nnz(),
+                f.factor_nnz() as f64 / bt_nnz.max(1) as f64,
+                m * m,
+            );
+        }
+        BasisLu::Sparse(f)
     };
 
     let one = Rational::new(1, 1);
@@ -2112,6 +2600,35 @@ pub(crate) fn separate_gmi_budget(
             damage += cost;
             f_coeffs.push((col, cf));
         }
+        if !ok {
+            // FORGONE COST (see `sepstat::discarded`). The exact cut is already
+            // built: `cx`/`rhs` are complete, and this refusal throws them away.
+            // The gate's implicit claim is that what it discards is worthless, and
+            // that claim is checkable for free HERE, because evaluating the exact
+            // cut at the point it was separating costs one pass over a vector this
+            // loop just finished walking.
+            //
+            // Fire rate cannot answer it -- a refusal that discards a SATISFIED cut
+            // costs nothing, and one that discards a VIOLATED cut is capability the
+            // model had and did not get. Only the second number is a finding, and
+            // the two are indistinguishable in a count of refusals.
+            let mut lhs = BigRational::zero();
+            for (k, c) in cx.iter().enumerate() {
+                if c.is_zero() {
+                    continue;
+                }
+                // `cand.values` is f64 ADVICE, which is the right precision for a
+                // census: this decides nothing, and a bound is never admitted from
+                // it. `exact` fails only on a non-finite value, where "was it
+                // violated" has no answer and abstaining is correct.
+                let Some(xk) = cand.values.get(k).copied().and_then(exact) else {
+                    lhs = rhs.clone();
+                    break;
+                };
+                lhs += c * xk;
+            }
+            crate::sepstat::discarded(lhs < rhs);
+        }
         if !ok || f_coeffs.is_empty() {
             continue;
         }
@@ -2124,6 +2641,11 @@ pub(crate) fn separate_gmi_budget(
         }
         // Round the stored bound DOWN, so `f64` conversion cannot tighten it either.
         lb -= lb.abs().mul_add(f64::EPSILON, f64::MIN_POSITIVE);
+
+        // The identity digest, at the last point the cut is still exactly what this
+        // separator decided (see `sepstat::gmi_cut`). This is the evidence the
+        // sparse factorization's "same cuts" claim rests on.
+        crate::sepstat::gmi_cut(lb, f_coeffs.iter().map(|(c, v)| (c.0, *v)));
 
         cuts.push(Cut {
             coeffs: f_coeffs,
@@ -2191,10 +2713,13 @@ pub(crate) fn separate_mir(model: &Model, x: &[f64], n_rows: usize, budget: usiz
 /// MIR. Strong CG and MIR do not dominate each other, so this runs BESIDE `separate_mir` and the
 /// pool keeps whichever cut is deeper per row; Gurobi's qnet1 root log carries both.
 ///
-/// SELF-GATING is inherited unchanged: `separate_mir_family` returns nothing on an all-integral
-/// model (no continuous column, nothing for the substitution to reason about), so the dense-binary
-/// ladder — where GMI already saturates — separates zero strong CG cuts and its search is
-/// bit-identical. `AY_MILP_NO_STRONGCG` is the kill switch.
+/// SELF-GATING is inherited unchanged: `separate_mir_family` returns nothing on an all-BINARY
+/// model (see `mir_family_inert`), so the dense-binary ladder — where GMI already saturates —
+/// separates zero strong CG cuts and its search is bit-identical. It now also runs on an
+/// all-integral model with GENERAL integer columns, and there it is NOT the load-bearing half:
+/// haprp proves in 27.0s / 88,481 nodes with `AY_MILP_NO_STRONGCG=1` against 63.2s / 357,624
+/// with it on. See `mir_family_inert` for the full verdict. `AY_MILP_NO_STRONGCG` is the kill
+/// switch.
 pub(crate) fn separate_strongcg(
     model: &Model,
     x: &[f64],
@@ -2279,6 +2804,151 @@ pub(crate) fn separate_mir_cached(
     )
 }
 
+/// THE MIR-CLASS SELF-GATE — the models on which `separate_mir` / `separate_strongcg` /
+/// `separate_mir_agg` provably have nothing to say, and so decline to be paid for.
+///
+/// The gate used to read ALL-INTEGRAL: "no continuous column, nothing for the bound substitution
+/// to reason about". Half of that is right and half of it was a MEASURED LOSS. What the family
+/// adds over GMI on a CONTINUOUS column is bound substitution and the `x <= u·y` VUB rewrite —
+/// none of which a 0/1 column offers, since a binary is already at a bound on both sides and the
+/// MIR step function collapses to something GMI has already found. That half is kept: the
+/// journal's own measurement is that opening the family on the 70-binary benchmark cost
+/// 9.8s -> 11.8s for no cuts at all, so a 0/1 model still declines to pay for the scan.
+///
+/// A GENERAL INTEGER column is a different object, and the old predicate swept it into the same
+/// bin. `x_j ∈ {0..u}` with a non-unit coefficient is exactly what MIR's `⌊a/δ⌋ + (f_j−f)⁺/(1−f)`
+/// step function was built for. Measured on `haprp` (1048 rows, 1828 general integers, ZERO
+/// binaries), the difference is the instance:
+///
+/// ```text
+///   root closure   0 cuts, gain 0   ->  24 cuts, gain 7042.4578 of a 7317.47 gap (96.2%)
+///   300s solve     BOUND 3666028.211734 @ 640,876 nodes, NO INCUMBENT AT ALL
+///                  ->  OPTIMAL 3673280.681685 in 63.2s @ 357,624 nodes
+/// ```
+///
+/// (HiGHS reports 3673280.68169 on the same file; the manifest's 3673280.6808 is the less
+/// precise number — do NOT read ay/HiGHS agreement here as a reference violation.)
+/// `neos-3083819-nubu` is the second signal: root closure 0% -> 54.3%, and at 300s its
+/// primal-dual gap closes 68,185 -> 12,344.
+///
+/// ⚠ MIR, NOT STRONG CG, IS WHAT CARRIES haprp — measured, against the opposite expectation.
+/// `AY_MILP_NO_STRONGCG=1` proves haprp in 27.0s at 88,481 nodes against 63.2s at 357,624 with
+/// strong CG on, so on this instance the strengthened rounding is a 2.3x COST that the MIR cuts
+/// pay for anyway. It is left on because it is corpus-wide neutral-to-positive here (it is part
+/// of every "BETTER" row of the sweep below and costs no verdict), but nothing in this change
+/// rests on it, and `AY_MILP_NO_STRONGCG` is the arm if the tree-size cost is chased later.
+///
+/// So the predicate is BINARY, not integral. Of 379 corpus instances 128 are all-integral and
+/// trip this gate; by THIS reader's own classification 63 of those are pure 0/1 and keep their
+/// historical path bit-for-bit, and 65 carry at least one general integer column and are what
+/// the family can now see. (The bench manifest's `bins` column is HiGHS's and says 66/62: it
+/// counts `eil33-2`, `eilA101-2` and `qap10` as binary where `mps.rs` reads their integer
+/// columns as general integers. All three separate ZERO cuts either way, so the discrepancy
+/// costs nothing — but the ledger of what changed is the READER's, not the manifest's.)
+///
+/// Measured root closure over the admitted set, serial, one binary per arm: 16 BETTER / 0 WORSE
+/// / 30 same on the 46 non-large members, and on the 16 large members every difference is on an
+/// instance separating ZERO cuts in BOTH arms (the diag's "gain" there is two differently
+/// budgeted LP solves, and the CONTROL alone spans 47.14-51.18 on comp07-2idx across three
+/// runs). On 35 pure-binary members the cut COUNT is identical on all 35 and the gain identical
+/// to the digit wherever any cut exists; a 20-instance pure-binary SOLVE A/B at 30s matches
+/// every verdict and every value, with node counts identical on all five it proves.
+///
+/// WHAT IT COSTS, honestly. Over the admitted set at a 30s budget: 0 verdicts gained, 0 lost,
+/// 0 soundness violations, and the node geomean over the four instances both arms prove is
+/// 1.61 — the vertex/fractionality trade this crate has measured before (`gt2` closes 8.7% ->
+/// 89.6% of its root gap and its tree goes 272 -> 514 nodes; `decomp2` still proves -160 but at
+/// 702 -> 2,477 nodes). Two instances are worse in a way the cuts cause and time does not fix:
+/// `neos-3024952-loue`'s incumbent at 60s is 32,889 -> 35,291 against an optimum of 26,756
+/// (its dual bound is better, 22,882 -> 22,925), and `neos-4738912-atrato`'s 60s dual bound is
+/// 207.6M -> 169.6M against an optimum of 283.6M. They are the price of haprp.
+///
+/// `AY_MILP_NO_MIR_GENINT` restores the all-integral predicate byte-identically — the A/B arm the
+/// numbers above were taken against, and the escape hatch if a general-integer model ever pays
+/// for separation it does not get back.
+fn mir_family_inert(model: &Model) -> bool {
+    if mir_genint_off() {
+        return (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)).is_integral());
+    }
+    (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)) == ColKind::Binary)
+}
+
+/// Kill switch for [`mir_family_inert`]'s narrowing — restores the historical all-integral gate.
+fn mir_genint_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("AY_MILP_NO_MIR_GENINT").is_some())
+}
+
+/// Is this a model the NARROWED gate newly admits — all-integral, with at least one general
+/// integer column? The root cut loop uses this to charge the MIR class a wall budget on exactly
+/// this set and on no other: these are the models where the class is NEW, so there is no
+/// historical separation wall to preserve, and (measured) they are where it is expensive.
+///
+/// With `AY_MILP_NO_MIR_GENINT` set this is `false` everywhere, because `mir_family_inert` is
+/// then true on every all-integral model — so the kill switch restores the historical path
+/// including the absence of any budget.
+pub(crate) fn mir_class_newly_admitted(model: &Model) -> bool {
+    model.num_cols() > 0
+        && (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)).is_integral())
+        && !mir_family_inert(model)
+}
+
+thread_local! {
+    /// The wall-clock deadline the MIR-class row loops stop at, or `None` for the historical
+    /// unbounded behaviour. Thread-local for exactly the reason [`DELTA_CAP`] is: the row
+    /// derivations are `fn` pointers whose signature cannot grow a parameter without touching
+    /// every family, and the engine is single-threaded per solve.
+    static SEP_WALL: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with a wall budget on the MIR-class row loops (`None` = unbounded, the historical
+/// behaviour and what every caller outside the root loop passes).
+///
+/// WHY THE CLASS NEEDS ONE AT ALL. Narrowing the self-gate (see [`mir_family_inert`]) makes MIR
+/// and strong CG separate on all-integral models with general integer columns — and on a wide
+/// one that is not free. Measured on `30n20b8` (576 rows, 18,380 columns) at the default 15%
+/// root-cut share of a 60s budget, a round's MIR + strong CG costs 3.3s where the whole round
+/// used to cost 0.07s. That wall is not the problem by itself; what it does is push the round
+/// past `d − 1.5·round_lp_secs`, which is the clamp `separate_gmi`'s own deadline is computed
+/// from — so GMI, which runs LAST among the round's expensive steps, got a deadline ALREADY IN
+/// THE PAST and returned zero cuts without factorising anything. The instance's whole root
+/// closure is GMI's: 149.4226 of gain became 148.4849 (its second and third cuts lost), and the
+/// MIR-class rows that displaced them sparsified away to nothing. Confirmed by handing the loop
+/// the whole budget (`AY_MILP_CUT_SHARE=1.0`): GMI reappears and the gain is 149.4226 to the
+/// digit, identical to the pre-narrowing arm. The regression was WALL, not cut quality.
+///
+/// THE BUDGET. The class stops at
+/// `max( min(now + (d−now)/2, d − 1.5·round_lp_secs), now + round_lp_secs )`, one absolute
+/// instant computed BEFORE MIR runs and shared by MIR and strong CG (a fresh half-tail per
+/// family would let the second one spend the reservation the first one left). The two inner
+/// clamps are `separate_gmi`'s, for the same reason: one family may not spend the wall the
+/// round's adopting re-solve needs. The outer floor is what keeps the budget from suppressing
+/// the family on a model whose root LP is slower than the whole share (`rococoB10-011000`
+/// solves its root LP in 21.5s against a 9s share) — the class may always have as long as the
+/// LP it is trying to improve. On 30n20b8 that restores GMI's slot and the 149.4226 gain; on
+/// `haprp`, where the round LP is 0.1s and the class needs 0.4s of a 4.5s budget, it never
+/// binds.
+pub(crate) fn sep_wall_scope<T>(d: Option<std::time::Instant>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEP_WALL.with(|c| c.set(self.0));
+        }
+    }
+    let _r = Restore(SEP_WALL.with(std::cell::Cell::get));
+    SEP_WALL.with(|c| c.set(d));
+    f()
+}
+
+/// Has the MIR-class wall budget run out? `false` when no budget is in force, and the clock is
+/// not read at all in that case — this is called once per candidate row.
+fn sep_wall_expired() -> bool {
+    SEP_WALL
+        .with(std::cell::Cell::get)
+        .is_some_and(|d| std::time::Instant::now() >= d)
+}
+
 fn separate_mir_family(
     model: &Model,
     x: &[f64],
@@ -2292,9 +2962,9 @@ fn separate_mir_family(
         &std::collections::HashMap<usize, (BigRational, usize)>,
     ) -> Option<Cut>,
 ) -> Vec<Cut> {
-    // The all-integral self-gate is re-checked here BEFORE the VUB scan, so an
-    // integral model pays neither (see the note inside `_with`).
-    if (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)).is_integral()) {
+    // The self-gate is re-checked here BEFORE the VUB scan, so a gated model pays
+    // neither (see the note inside `_with`).
+    if mir_family_inert(model) {
         return Vec::new();
     }
     separate_mir_family_with(model, x, n_rows, budget, row_fn, &node_vubs(model), None)
@@ -2315,14 +2985,9 @@ fn separate_mir_family_with(
     vubs: &Vubs,
     orients: Option<&[(u32, bool)]>,
 ) -> Vec<Cut> {
-    // ONLY WHERE THERE IS A CONTINUOUS COLUMN TO REASON ABOUT.
-    //
-    // Everything this family adds over GMI is in how it treats the CONTINUOUS variables -- rounding
-    // against them, and (where the model has the structure) substituting the VARIABLE upper bound
-    // `x <= u·y` so the binary switch enters the row. A model with no continuous columns has nothing
-    // here for it to find, and separating anyway is pure cost: it took the 70-binary benchmark from
-    // 9.8s to 11.8s for nothing.
-    if (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)).is_integral()) {
+    // NOT ON AN ALL-BINARY MODEL -- see `mir_family_inert` for what this gate does and does not
+    // exclude. (It used to exclude every all-INTEGRAL model, which cost haprp its proof.)
+    if mir_family_inert(model) {
         return Vec::new();
     }
 
@@ -2371,6 +3036,12 @@ fn separate_mir_family_with(
         }
     };
     for &(r, negate) in orients {
+        // STOP AT A ROW BOUNDARY when the class's wall budget runs out (see `sep_wall_scope`;
+        // no budget in force means no clock read). The candidates already derived still rank
+        // and ship — a truncated search returns fewer cuts, never a wrong one.
+        if sep_wall_expired() {
+            break;
+        }
         if r as usize >= model.num_rows() {
             continue;
         }
@@ -2413,6 +3084,11 @@ fn separate_mir_family_with(
 /// tuning: each eval is one exact-rational aggregation plus one `mir_from_row` delta search.
 const MIR_AGG_STEPS: usize = 3;
 const MIR_AGG_PARTNER_NNZ: usize = 64;
+/// NOT A CUT FILTER, and the cause-6 diagnosis lists it as one. The aggregate is MIR'd after
+/// EVERY step, so by the time this fires every cut the chain has produced is already banked in
+/// `cand`; what it refuses is the remaining aggregation STEPS, never a built inequality. It also
+/// **never fires** over 101 instances (`sepstat::GATE_MIR_AGG_NNZ`, measured 2026-08-01) — no
+/// aggregate on the corpus grows past 250 terms inside its three-step budget.
 const MIR_AGG_MAX_NNZ: usize = 250;
 const MIR_AGG_MAX_EVALS: usize = 1024;
 
@@ -2439,8 +3115,9 @@ pub(crate) fn separate_mir_agg(model: &Model, x: &[f64], n_rows: usize, budget: 
     if budget == 0 {
         return Vec::new();
     }
-    // The same self-gate as `separate_mir`: no continuous column, nothing to cancel.
-    if (0..model.num_cols()).all(|j| model.col_kind(Col(j as u32)).is_integral()) {
+    // The same self-gate as `separate_mir` (`mir_family_inert`): on an all-binary model there is
+    // no continuous column to cancel and nothing for the rounding to bite on.
+    if mir_family_inert(model) {
         return Vec::new();
     }
     let n_rows = n_rows.min(model.num_rows());
@@ -2500,6 +3177,12 @@ pub(crate) fn separate_mir_agg(model: &Model, x: &[f64], n_rows: usize, budget: 
     let mut seen: std::collections::HashSet<Vec<(u32, u64)>> = std::collections::HashSet::new();
     let mut evals = 0usize;
     'rows: for r in 0..n_rows {
+        // The same row-boundary stop the single-row family takes (`sep_wall_scope`): the
+        // aggregate walk is the most expensive thing in the class, at one exact-rational
+        // aggregation plus a full delta search per eval.
+        if sep_wall_expired() {
+            break 'rows;
+        }
         let (coeffs, lb, ub) = model.row(Row(r as u32));
         if !coeffs.iter().any(|&(c, _)| frac[c as usize]) {
             continue;
@@ -2679,6 +3362,16 @@ pub(crate) fn separate_mir_agg(model: &Model, x: &[f64], n_rows: usize, budget: 
                 terms.retain(|_, v| !v.is_zero());
                 used.push(prow);
                 if terms.len() > MIR_AGG_MAX_NNZ {
+                    // FORGONE COST, and note what this gate is NOT. It refuses no built cut: the
+                    // aggregate is MIR'd after every step (below), so every cut this chain has
+                    // produced so far is already in `cand`. What it forgoes is the REMAINING
+                    // aggregation steps, and that is the unit charged. Listed among the
+                    // "absolute nnz caps" of the cause-6 diagnosis, which is a misreading of the
+                    // site worth recording rather than repeating.
+                    crate::sepstat::gate_charge(
+                        crate::sepstat::GATE_MIR_AGG_NNZ,
+                        (MIR_AGG_STEPS.saturating_sub(used.len())) as u64,
+                    );
                     break; // the aggregate is turning into a monster; stop feeding it
                 }
                 // MIR the aggregate after EVERY step: the one-step cut is often the strong one,
@@ -3142,7 +3835,7 @@ fn mixing_from_rows(model: &Model, x: &[f64], rows: &[MixRow], delta: &BigRation
         lb,
         ub: f64::INFINITY,
     };
-    (violation(&cut, x) > MIN_VIOLATION).then_some(cut)
+    clears_min_violation(&cut, x).then_some(cut)
 }
 
 /// A REAL CUT LOOP WAS RUN, AND IT SETTLES THE QUESTION. Two facts, both measured on rout.
@@ -3876,7 +4569,7 @@ fn best_over_deltas(
         // clears `MIN_VIOLATION`. If no delta on this row can reach that floor, then whichever cut
         // won the efficacy ranking would have been thrown away by the final test, so the row's
         // answer is `None` however the ranking came out -- and every exact pass on it is dead work.
-        if all_known && row_max <= MIN_VIOLATION {
+        if all_known && row_max <= min_violation() {
             crate::sepstat::add(&crate::sepstat::SCREEN_SKIP, deltas.len() as u64);
             crate::sepstat::bump(&crate::sepstat::SCREEN_ROW_KILL);
             return None;
@@ -3916,7 +4609,7 @@ fn best_over_deltas(
         }
     }
     let (_, cut) = best?;
-    let out = (violation(&cut, x) > MIN_VIOLATION).then_some(cut);
+    let out = clears_min_violation(&cut, x).then_some(cut);
     if out.is_some() {
         crate::sepstat::bump(&crate::sepstat::ROW_RET);
     }
@@ -4793,7 +5486,7 @@ mod gmi_tests {
             if cand.status != crate::simplex::SimplexStatus::Optimal {
                 continue;
             }
-            let cuts = separate_gmi(&m, &lp, &cand, None);
+            let cuts = separate_gmi(&m, &lp, &cand, None, m.num_rows(), m.num_cols());
             if cuts.is_empty() {
                 continue;
             }
@@ -4998,7 +5691,7 @@ mod gmi_tests {
             }
             let x: Vec<f64> = cand.values[..n].to_vec();
 
-            let mut cuts = separate_gmi(&m, &lp, &cand, None);
+            let mut cuts = separate_gmi(&m, &lp, &cand, None, m.num_rows(), m.num_cols());
             cuts.extend(separate_mixing(&m, &x, m.num_rows(), 8));
             cuts.extend(separate_mir(&m, &x, m.num_rows(), 8));
             cuts.extend(separate_strongcg(&m, &x, m.num_rows(), 8));
@@ -5782,6 +6475,99 @@ mod mir_tests {
         // other separators' tests running in parallel.)
     }
 
+    /// THE MIR-CLASS SELF-GATE KEYS ON *BINARY*, NOT ON INTEGRALITY.
+    ///
+    /// `mir_family_inert` used to read "every column is integral", which swept a GENERAL integer
+    /// column into the same bin as a 0/1 column on the reasoning that neither is continuous. The
+    /// reasoning holds for 0/1 and fails for `{0..u}`: MIR's `⌊a/δ⌋ + (f_j−f)⁺/(1−f)` step
+    /// function and the Letchford–Lodi strengthening above it are exactly the tools for a
+    /// non-unit coefficient on a bounded integer. On the corpus the old predicate cost haprp its
+    /// proof outright — 0 cuts and a 300s BOUND with no incumbent at all, against 24 MIR + 24 SCG
+    /// cuts, 96.2% root closure and OPTIMAL in 16.1s. This is that gate at unit scale.
+    ///
+    /// Three arms, and the last two are a KIND-ONLY control: they hold the rows, the bounds and
+    /// the point fixed and differ solely in whether the column was declared `Integer` or
+    /// `Binary`. So neither the "it separates" nor the "it separates nothing" half can pass by
+    /// accident about the row shape — the gate is reading the column kind and nothing else.
+    #[test]
+    fn mir_family_gate_admits_general_integers_and_still_excludes_binaries() {
+        // ARM 1 — the haprp shape at unit scale: an ALL-INTEGRAL model, no continuous column
+        // anywhere, general integer columns with non-unit coefficients. `6x₁ + 4x₂ <= 9` over
+        // `{0..5}²` is Letchford–Lodi's Example 1 with the test-only continuous column REMOVED;
+        // the historical gate returned `Vec::new()` here without ever looking at the row.
+        let mut m = Model::new();
+        let x1 = m.add_int_col(0.0, 5.0);
+        let x2 = m.add_int_col(0.0, 5.0);
+        m.add_row(f64::NEG_INFINITY, 9.0, &[(x1, 6.0), (x2, 4.0)]);
+        m.set_objective(&[(x1, 1.0)], Sense::Maximize);
+        assert!(
+            (0..m.num_cols()).all(|j| m.col_kind(Col(j as u32)).is_integral()),
+            "arm 1 must be all-integral or it does not exercise the gate at all"
+        );
+        let x = vec![1.5, 0.0];
+        let mir = separate_mir(&m, &x, m.num_rows(), cuts_per_round());
+        let scg = separate_strongcg(&m, &x, m.num_rows(), cuts_per_round());
+        assert!(
+            !mir.is_empty() && !scg.is_empty(),
+            "the MIR class separated nothing on an all-integral model with GENERAL integer \
+             columns (mir={} scg={}): the narrowed gate is not in force",
+            mir.len(),
+            scg.len()
+        );
+        for c in mir.iter().chain(scg.iter()) {
+            assert!(violation(c, &x) > MIN_VIOLATION);
+        }
+
+        // ARM 2 / ARM 3 — the kind-only control. `3a + 3b <= 4` at `a = b = 2/3` is a row whose
+        // Chvátal-Gomory rounding (`a + b <= 1`) cuts the point off, written twice over columns
+        // with IDENTICAL `[0, 1]` bounds: once as `ColKind::Integer` (the shape a presolve
+        // tightening of a `{0..u}` column leaves behind) and once as `ColKind::Binary`.
+        let build = |binary: bool| {
+            let mut m = Model::new();
+            let (a, b) = if binary {
+                (m.add_binary_col(), m.add_binary_col())
+            } else {
+                // `add_int_col` classifies `[0, 1]` as Binary, so the general-integer kind has to
+                // be taken first and the bounds tightened after — exactly what presolve does.
+                let (a, b) = (m.add_int_col(0.0, 2.0), m.add_int_col(0.0, 2.0));
+                m.set_col_bounds(a, 0.0, 1.0);
+                m.set_col_bounds(b, 0.0, 1.0);
+                (a, b)
+            };
+            m.add_row(f64::NEG_INFINITY, 4.0, &[(a, 3.0), (b, 3.0)]);
+            m.set_objective(&[(a, 1.0), (b, 1.0)], Sense::Maximize);
+            m
+        };
+        let pt = vec![2.0 / 3.0, 2.0 / 3.0];
+        let m_int = build(false);
+        let m_bin = build(true);
+        assert_eq!(
+            m_int.col_bounds(Col(0)),
+            m_bin.col_bounds(Col(0)),
+            "the control arms must differ ONLY in column kind"
+        );
+        let int_cuts = separate_mir(&m_int, &pt, m_int.num_rows(), cuts_per_round());
+        assert!(
+            !int_cuts.is_empty(),
+            "the general-integer control separated nothing, so the binary arm below proves nothing"
+        );
+        let bin_cuts = separate_mir(&m_bin, &pt, m_bin.num_rows(), cuts_per_round());
+        assert!(
+            bin_cuts.is_empty(),
+            "the MIR class ran on an ALL-BINARY model: the 66 pure-binary corpus instances are \
+             no longer bit-for-bit (got {} cuts)",
+            bin_cuts.len()
+        );
+        assert!(
+            separate_strongcg(&m_bin, &pt, m_bin.num_rows(), cuts_per_round()).is_empty(),
+            "strong CG ran on an ALL-BINARY model"
+        );
+        assert!(
+            separate_mir_agg(&m_bin, &pt, m_bin.num_rows(), cuts_per_round()).is_empty(),
+            "aggregated MIR ran on an ALL-BINARY model"
+        );
+    }
+
     /// A model with an exact-rational side store must be declined before the
     /// separator reads any f64 proxy row. The exact control keeps this guard
     /// non-vacuous: the same proxy matrix separates before an override exists.
@@ -6449,7 +7235,12 @@ fn mir_from_lp_row(
         .iter()
         .map(|&(c, a)| a * cand.values[c.index()])
         .sum();
-    (act - cut.ub > MIN_VIOLATION).then_some(cut)
+    let v = act - cut.ub;
+    if v <= min_violation() {
+        charge_min_violation(&cut, v);
+        return None;
+    }
+    Some(cut)
 }
 
 /// Snap to a multiple of `2^-20`: exactness is required of the COMBINATION, not of the multipliers,
@@ -6609,7 +7400,7 @@ pub(crate) fn separate_flow_cover(model: &Model, x: &[f64], n_rows: usize) -> Ve
             let Some(cut) = flow_cover_from_row(model, x, coeffs, sign, sign * rhs, &vubs) else {
                 continue;
             };
-            if violation(&cut, x) > MIN_VIOLATION {
+            if clears_min_violation(&cut, x) {
                 cuts.push(cut);
                 break;
             }
@@ -6738,7 +7529,25 @@ fn flow_cover_from_row(
             .filter(|(_, v)| !v.is_zero())
             .map(|(j, v)| (Col(j as u32), to_f64(&v)))
             .collect();
-        if coeffs.is_empty() || coeffs.len() > MAX_CUT_NNZ_LOCAL {
+        let too_wide = coeffs.len() > MAX_CUT_NNZ_LOCAL;
+        if coeffs.is_empty() || too_wide {
+            // FORGONE COST — same shape as the aggregated sibling below. The exact `coeffs`/`rhs`
+            // pair is fully built, so charging costs one f64 dot product on the refusal branch.
+            // `separate_flow_cover` returns ONE cut (the arg-max over cover prefixes), so a wide
+            // candidate no deeper than the incumbent cost nothing: charge only the candidates
+            // that would have BEEN the returned cut, using the very test two lines down.
+            if too_wide {
+                let n = coeffs.len() as u64;
+                let refused = Cut {
+                    coeffs,
+                    lb: f64::NEG_INFINITY,
+                    ub: to_f64(&rhs),
+                };
+                let v = violation(&refused, x);
+                if v > best.as_ref().map_or(min_violation(), |(bv, _)| *bv) {
+                    crate::sepstat::gate_charge(crate::sepstat::GATE_FLOWCOVER_NNZ, n);
+                }
+            }
             continue;
         }
         let cut = Cut {
@@ -6747,7 +7556,7 @@ fn flow_cover_from_row(
             ub: to_f64(&rhs),
         };
         let v = violation(&cut, x);
-        if v > best.as_ref().map_or(MIN_VIOLATION, |(bv, _)| *bv) {
+        if v > best.as_ref().map_or(min_violation(), |(bv, _)| *bv) {
             best = Some((v, cut));
         }
     }
@@ -6756,6 +7565,12 @@ fn flow_cover_from_row(
 
 /// A flow cover is naturally sparse (one term per arc in the cover, plus its switch), so this only
 /// ever fires on a pathological row.
+///
+/// MEASURED 2026-08-01 and the sentence above is exactly right: `sepstat::GATE_FLOWCOVER_NNZ` and
+/// `GATE_FLOWCOVER_AGG_NNZ` **never fire** over 101 instances (66 across all three corpus tiers
+/// plus the 35-instance named set). No pathological row was reached at either site, so both of
+/// this constant's uses have an EMPTY excluded population and neither is the "absolute nnz cap"
+/// the cause-6 diagnosis is about.
 const MAX_CUT_NNZ_LOCAL: usize = 400;
 
 #[cfg(test)]
@@ -7196,10 +8011,23 @@ fn agg_flow_cover(
             continue;
         };
         if cut.coeffs.len() > MAX_CUT_NNZ_LOCAL {
+            // FORGONE COST — the same shape as the `coef_to_f64` refusal: `emit_le_cut`
+            // has returned Some, so an exact aggregated flow cover is fully derived and
+            // then discarded unexamined. `agg_flow_cover` returns ONE cut (the arg-max
+            // over cover prefixes), so a wide candidate that is violated but no deeper
+            // than the incumbent cost nothing: charge only candidates that would have
+            // BEEN the returned cut, using the very test the surviving branch applies
+            // two lines down. One f64 dot product, below the rational aggregation of
+            // the same loop iteration — not free, but strictly dominated by it.
+            let v = violation(&cut, x);
+            crate::sepstat::gate_charge(
+                crate::sepstat::GATE_FLOWCOVER_AGG_NNZ,
+                u64::from(v > best.as_ref().map_or(min_violation(), |(bv, _)| *bv)),
+            );
             continue;
         }
         let v = violation(&cut, x);
-        if v > best.as_ref().map_or(MIN_VIOLATION, |(bv, _)| *bv) {
+        if v > best.as_ref().map_or(min_violation(), |(bv, _)| *bv) {
             best = Some((v, cut));
         }
     }
@@ -7535,7 +8363,7 @@ pub(crate) fn separate_implied_bound(model: &Model, x: &[f64], n_rows: usize) ->
         terms.insert(j, <BigRational as One>::one());
         terms.insert(y, -u);
         if let Some(cut) = emit_le_cut(model, &terms, &BigRational::zero()) {
-            if violation(&cut, x) > MIN_VIOLATION {
+            if clears_min_violation(&cut, x) {
                 cuts.push(cut);
             }
         }
@@ -8166,7 +8994,7 @@ fn lifted_cover_from_row(model: &Model, x: &[f64], coeffs: &[(u32, f64)], ub: f6
         lb: f64::NEG_INFINITY,
         ub: rhs,
     };
-    (violation(&cut, x) > MIN_VIOLATION).then_some(cut)
+    clears_min_violation(&cut, x).then_some(cut)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -8372,6 +9200,20 @@ pub(crate) fn separate_clique(model: &Model, x: &[f64], n_rows: usize) -> Vec<Cu
             if surplus.len() > MAX_CLIQUE_ROW_SUPPORT {
                 // Keep the LARGEST surpluses: they are the ones that conflict at all.
                 let cut_from = surplus.len() - MAX_CLIQUE_ROW_SUPPORT;
+                // FORGONE COST. The doc claims "the biggest surpluses conflict first, so
+                // truncation only forgoes edges" — but conflict is s_j + s_k > slack, so a
+                // SMALL surplus still conflicts with a large one. Count the dropped
+                // columns that PROVABLY carried an edge: ascending order makes that a
+                // suffix of the drained prefix. A missing lane-B edge does not merely
+                // shrink the search — `adjacent` is the ground-truth oracle and the
+                // emitted cut re-verifies every pair against it, so a VALID clique can be
+                // rejected at admission. `thresh` may be negative, in which case every
+                // dropped column conflicted: that reading refutes the doc outright and is
+                // the number worth having. O(log cut_from) rational compares against the
+                // full rational sort already performed on the line above.
+                let thresh = &slack - &surplus[surplus.len() - 1].1;
+                let lost = cut_from - surplus[..cut_from].partition_point(|(_, s)| s <= &thresh);
+                crate::sepstat::gate_charge(crate::sepstat::GATE_CLIQUE_ROW_SUPPORT, lost as u64);
                 surplus.drain(..cut_from);
             }
             // Two pointers over ascending surpluses: `(p, hi)` conflicts iff s_p + s_hi > slack,
@@ -8914,9 +9756,14 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
         }
         walk.pop(); // remove closing duplicate
         let len = walk.len();
-        if len < 5 || len.is_multiple_of(2) || len > ODD_CYCLE_MAX_LEN {
+        if len < 5 || len.is_multiple_of(2) {
             continue; // need a simple ODD cycle of length ≥ 5
         }
+        // The ODD_CYCLE_MAX_LEN arm moved DOWN, past the simplicity dedup, the
+        // consecutive-conflict re-verification and the `seen` dedup, so the census
+        // charges only holes that are genuinely cuts. Output-identical: a duplicate
+        // `seen` key is the same COLUMN SET and therefore the same length, so a long
+        // cycle entering `seen` can never displace a short one.
         // Simplicity: the shortest odd walk need not be a simple cycle; only emit when it is.
         let mut sorted = walk.clone();
         sorted.sort_unstable();
@@ -8936,6 +9783,20 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
         let mut key: Vec<u32> = ordered.iter().map(|&c| c as u32).collect();
         key.sort_unstable();
         if !seen.insert(key) {
+            continue;
+        }
+        if len > ODD_CYCLE_MAX_LEN {
+            // FORGONE COST. A violated, simple, re-verified, non-duplicate odd hole
+            // refused for length. Depth = violation/‖a‖ = ((1 − best)/2)/√len — the same
+            // quantity the pool's efficacy floor tests (bab.rs, MEASURED 2026-07-22), so
+            // the charge is directly comparable to the doc's "wide, weak row" claim.
+            // Edge weights are CLAMPED non-negative, so `best` over-states the walk
+            // weight and this charge UNDER-states the true violation: conservative by
+            // construction. Value lies in [0, 500_000].
+            crate::sepstat::gate_charge(
+                crate::sepstat::GATE_ODD_CYCLE_LEN,
+                ((((1.0 - best) / 2.0) / (len as f64).sqrt()) * 1e6) as u64,
+            );
             continue;
         }
         raw.push((best, ordered));
@@ -8968,7 +9829,7 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
             lb: f64::NEG_INFINITY,
             ub: k as f64,
         };
-        if violation(&cut, x) > MIN_VIOLATION {
+        if clears_min_violation(&cut, x) {
             cuts.push(cut);
         }
     }
@@ -9625,6 +10486,12 @@ mod lifted_cover_tests {
 const ZH_MAX_ROWS: u32 = 12;
 const ZH_MAX_CUTS: usize = 40;
 /// Cap the nonzeros of an emitted zero-half cut — a dense cut slows every LP that carries it.
+///
+/// MEASURED 2026-08-01, `sepstat::GATE_ZH_NNZ`: **never fires**. Over 101 instances (66 spanning
+/// all three corpus tiers plus the 35-instance named set) not one violated, slack-feasible
+/// zero-half row was refused for width. Its excluded population is EMPTY, so it is neither a cost
+/// control that is paying nor a filter that is costing — it is a backstop that has never been
+/// reached, and the cause-6 diagnosis's "the absolute nnz cap" does not mean this one.
 const ZH_MAX_NNZ: usize = 200;
 
 /// Is `model` PURE SET PARTITIONING — every row an all-binary, all-ones,
@@ -9936,6 +10803,24 @@ pub(crate) fn separate_zero_half(model: &Model, x: &[f64]) -> Vec<Cut> {
             .map(|(c, v)| (Col(c), (v / 2) as f64))
             .collect();
         if out.is_empty() || out.len() > ZH_MAX_NNZ {
+            // FORGONE COST — `out` is the finished halved coefficient vector and `rhs` follows
+            // from `bsum` alone, so the refused row is fully derived and one f64 dot product
+            // says whether the refusal cost anything. Charged only when the row is BOTH
+            // violated and slack-feasible, i.e. only when it would otherwise have been kept:
+            // charging a row the next test would have thrown out anyway overstates the loss.
+            if !out.is_empty() {
+                let refused = Cut {
+                    coeffs: out,
+                    lb: f64::NEG_INFINITY,
+                    ub: bsum.div_euclid(2) as f64,
+                };
+                if total_slack < 1.0 - 1e-9 && violation(&refused, x) > min_violation() {
+                    crate::sepstat::gate_charge(
+                        crate::sepstat::GATE_ZH_NNZ,
+                        refused.coeffs.len() as u64,
+                    );
+                }
+            }
             continue;
         }
         out.sort_by_key(|&(c, _)| c.index());
@@ -9947,7 +10832,7 @@ pub(crate) fn separate_zero_half(model: &Model, x: &[f64]) -> Vec<Cut> {
         };
         // Keep only genuinely violated cuts (total_slack < 1 is necessary but the f64 activity is the
         // ground truth the pool ranks on).
-        if violation(&cut, x) > MIN_VIOLATION && total_slack < 1.0 - 1e-9 {
+        if total_slack < 1.0 - 1e-9 && clears_min_violation(&cut, x) {
             cuts.push(cut);
         }
     }
@@ -10712,7 +11597,7 @@ fn lnp_exact_cut(
         lb: lbf,
         ub: f64::INFINITY,
     };
-    (violation(&cut, x) > MIN_VIOLATION).then_some(cut)
+    clears_min_violation(&cut, x).then_some(cut)
 }
 
 #[cfg(test)]
@@ -11049,5 +11934,274 @@ mod lnp_tests {
                 efficacy(c, &cand.values)
             );
         }
+    }
+}
+
+/// Force every lazily-cached environment read in this module to happen NOW.
+///
+/// # The race this closes
+///
+/// `tune.rs` states the property the crate is supposed to have: *"The environment
+/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
+/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
+/// of the crate: 3 accessors here cache their value in a `OnceLock` and call
+/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
+/// happens to reach them — at an arbitrary point, on an arbitrary thread.
+///
+/// That is the exact hazard `EngineEconomics` was built to remove.
+/// the development design notes records the consumer's mitigation:
+/// it *"rewrites the same constant values before every window solve"*, so a
+/// `set_var` on one thread can land while another thread is mid-solve taking its
+/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
+/// is `unsafe` in edition 2024.
+///
+/// Priming collapses those windows into ONE, at solve entry, before any worker is
+/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
+/// It only moves *when* they are read, from "scattered across the solve" to "once,
+/// at a point the caller controls".
+pub(crate) fn prime_env() {
+    let _ = min_violation();
+    let _ = mir_genint_off();
+    let _ = screen_audit();
+    let _ = screen_off();
+}
+
+#[cfg(test)]
+mod post_filter_census_tests {
+    use super::*;
+
+    /// One `<=` cut over columns `0..n` at the point `x = (1, 1, ..., 1)`, with a chosen
+    /// violation. Activity is `Σ a_j`, so `ub = Σ a_j − v` makes the violation exactly `v`.
+    fn cut_with(coeffs: &[f64], v: f64) -> (Cut, Vec<f64>) {
+        let act: f64 = coeffs.iter().sum();
+        let cut = Cut {
+            coeffs: coeffs
+                .iter()
+                .enumerate()
+                .map(|(j, &a)| (Col(j as u32), a))
+                .collect(),
+            lb: f64::NEG_INFINITY,
+            ub: act - v,
+        };
+        (cut, vec![1.0; coeffs.len()])
+    }
+
+    /// THE CENSUS MUST SEPARATE SCALE FROM DEPTH, because that separation is the whole
+    /// finding it reports.
+    ///
+    /// [`MIN_VIOLATION`] tests raw [`violation`], which is scale-DEPENDENT — multiply a cut
+    /// through by ten and it multiplies by ten while the inequality says the same thing.
+    /// The root pool never spends that currency: it ranks and floors on scale-free
+    /// [`cut_depth`]. So a count of refusals is a fire rate and orders nothing
+    /// (`1c1ce672c`: four families at fire rate zero, four different verdicts), and the
+    /// number the census exists to produce is how many refused cuts would ALSO have
+    /// cleared the pool's own floor. Two cuts with the SAME violation and different
+    /// coefficient scales must therefore be charged differently — if this test ever passes
+    /// with the depth term removed, the census is back to reporting a fire rate and the
+    /// 163-refusals/3-deep measurement in [`MIN_VIOLATION`]'s comment is void.
+    #[test]
+    fn the_efficacy_floor_census_charges_depth_not_violation() {
+        let _guard = crate::sepstat::adoption_test_guard();
+        let site = crate::sepstat::GATE_CUT_MIN_VIOLATION;
+
+        // Same violation (5e-5, an order under the floor) in both, differing only by the
+        // scale of the coefficients — so `violation` cannot tell them apart and `depth` can.
+        let (deep, x_deep) = cut_with(&[0.01], 5e-5); // depth 5e-3, above the pool's 1e-3
+        let (flat, x_flat) = cut_with(&[1.0], 5e-5); // depth 5e-5, below it
+
+        let before = crate::sepstat::gate_read(site);
+        assert!(
+            !clears_min_violation(&deep, &x_deep),
+            "5e-5 is under the floor"
+        );
+        let after_deep = crate::sepstat::gate_read(site);
+        assert_eq!(
+            (after_deep.0 - before.0, after_deep.1 - before.1),
+            (1, 1),
+            "a refused cut whose DEPTH clears the pool's floor is the forgone capability"
+        );
+
+        assert!(
+            !clears_min_violation(&flat, &x_flat),
+            "5e-5 is under the floor"
+        );
+        let after_flat = crate::sepstat::gate_read(site);
+        assert_eq!(
+            (after_flat.0 - after_deep.0, after_flat.1 - after_deep.1),
+            (1, 0),
+            "the same violation at a hundred times the scale is shallow, and cost NOTHING"
+        );
+
+        // A SATISFIED cut is not a refusal at all: there was no capability to forgo, so it
+        // must not even register as a hit. Without this the denominator is wrong and the
+        // "3 of 163" ratio is meaningless.
+        let (sat, x_sat) = cut_with(&[1.0], -1.0);
+        assert!(!clears_min_violation(&sat, &x_sat));
+        let after_sat = crate::sepstat::gate_read(site);
+        assert_eq!(
+            after_sat, after_flat,
+            "a satisfied cut cost the search nothing and must not be charged"
+        );
+    }
+
+    /// Charging must not have MOVED the filter. Every measurement in this crate taken
+    /// through the old bare `violation(&cut, x) > MIN_VIOLATION` spelling keeps its meaning
+    /// only while the helper decides exactly what that expression decided — including at the
+    /// boundary, where `>` and `>=` differ and a cut violated by precisely `1e-4` is REFUSED.
+    #[test]
+    fn the_census_helper_decides_exactly_what_the_bare_comparison_did() {
+        let mut seed = 0x00C6_F117_u64;
+        let mut rnd = |s: &mut u64| {
+            *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((*s >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        let mut refused = 0usize;
+        for _ in 0..2_000 {
+            let n = 1 + (seed as usize % 4);
+            let coeffs: Vec<f64> = (0..n).map(|_| rnd(&mut seed) * 10.0).collect();
+            // Violations straddling the floor by orders of magnitude in both directions.
+            let v = rnd(&mut seed) * 4.0 * MIN_VIOLATION;
+            let (cut, x) = cut_with(&coeffs, v);
+            let bare = violation(&cut, &x) > MIN_VIOLATION;
+            assert_eq!(clears_min_violation(&cut, &x), bare);
+            refused += usize::from(!bare);
+        }
+        // THE EXACT BOUNDARY, and it has to be built rather than asked for. `cut_with(&[1.0],
+        // MIN_VIOLATION)` does NOT produce a cut violated by 1e-4: `1.0 - 1e-4` is not exact in
+        // f64 and the difference comes back 9.999999999998899e-5, a hair UNDER the floor, so the
+        // assertion would pass under `>` and `>=` alike and prove nothing. (Measured: it did —
+        // the first version of this test failed to catch a deliberate `>` -> `>=` sabotage.)
+        // Putting the floor in the COEFFICIENT and zero in the right-hand side makes the
+        // subtraction exact, so this is the one input on which the two operators disagree.
+        let edge = Cut {
+            coeffs: vec![(Col(0), MIN_VIOLATION)],
+            lb: f64::NEG_INFINITY,
+            ub: 0.0,
+        };
+        let x_edge = vec![1.0];
+        assert_eq!(
+            violation(&edge, &x_edge),
+            MIN_VIOLATION,
+            "the boundary case must be EXACT or it tests nothing"
+        );
+        assert!(
+            !clears_min_violation(&edge, &x_edge),
+            "the floor is strict: a cut violated by exactly MIN_VIOLATION is refused"
+        );
+        assert!(
+            refused > 200,
+            "anti-vacuity: the sample must actually exercise the refusal branch, got {refused}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shape_gate_tests {
+    use super::{is_wide_shape, MAX_CUTS_PER_ROUND, NARROW_CUTS_PER_ROUND, WIDE_CUTS_PER_ROUND};
+
+    /// The corpus shapes this gate was measured on, as `(rows, cols)`.
+    ///
+    /// NARROW summed **-3.746 s** under `AY_MILP_CUTS_PER_ROUND=8` with both arms seeded;
+    /// WIDE summed **+2.645 s**. The predicate has to reproduce that partition exactly, or the
+    /// default it drives is not the one that was measured.
+    const NARROW: &[(usize, usize, &str)] = &[
+        (503, 1541, "qnet1 -2.053s"),
+        (1192, 840, "qiu -1.009s"),
+        (212, 260, "misc07 -0.665s"),
+        (133, 201, "p0201 -0.068s"),
+        (290, 548, "dcmulti -0.048s"),
+        (274, 353, "blend2 -0.037s"),
+        (18, 18, "flugpl 0.000s"),
+        (291, 556, "rout 0.000s"),
+        (780, 870, "gen +0.003s"),
+        (45, 86, "pk1 +0.131s"),
+    ];
+    const WIDE: &[(usize, usize, &str)] = &[
+        (12, 151, "mas76 +1.994s"),
+        (101, 1350, "khb05250 +0.546s"),
+        (124, 10757, "air03 +0.100s"),
+        (146, 2655, "mod010 +0.012s"),
+        (6, 62, "markshare1 -0.002s"),
+        (7, 74, "markshare2 -0.005s"),
+        (13, 151, "mas74 (held out; sibling of mas76)"),
+        (426, 7195, "air05 (held out)"),
+    ];
+
+    #[test]
+    fn the_shape_predicate_reproduces_the_measured_partition() {
+        for &(r, c, who) in NARROW {
+            assert!(
+                !is_wide_shape(r, c),
+                "{who}: {r}x{c} (ratio {:.2}) must be NARROW -- it GAINED under the wider budget",
+                c as f64 / r as f64
+            );
+        }
+        for &(r, c, who) in WIDE {
+            assert!(
+                is_wide_shape(r, c),
+                "{who}: {r}x{c} (ratio {:.2}) must be WIDE -- it LOST under the wider budget",
+                c as f64 / r as f64
+            );
+        }
+    }
+
+    /// What the corpus actually pins, stated honestly: the measurement separates the two classes
+    /// anywhere in `(3.06, 10.33]`, NOT at 4 uniquely. Four is chosen because
+    /// `default_root_cut_eff_floor` already uses that exact predicate for the same reason
+    /// (knapsack-shaped models want fewer, better cuts), so the gate adds no new fitted number.
+    /// This test fails if someone "tunes" the threshold outside the measured margin.
+    #[test]
+    fn the_threshold_sits_inside_the_measured_margin() {
+        let widest_narrow = NARROW
+            .iter()
+            .map(|&(r, c, _)| c as f64 / r as f64)
+            .fold(0.0_f64, f64::max);
+        let narrowest_wide = WIDE
+            .iter()
+            .map(|&(r, c, _)| c as f64 / r as f64)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            widest_narrow < 4.0 && 4.0 <= narrowest_wide,
+            "threshold 4 left the measured margin ({widest_narrow:.2}, {narrowest_wide:.2}]"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_shape_is_never_wide() {
+        // `num_rows == 0` would divide by zero; the guard must hold before the ratio is formed.
+        assert!(!is_wide_shape(0, 100));
+        assert!(!is_wide_shape(0, 0));
+    }
+
+    #[test]
+    fn the_narrow_budget_is_strictly_wider_than_the_flat_default() {
+        assert!(
+            NARROW_CUTS_PER_ROUND > MAX_CUTS_PER_ROUND,
+            "the gate only means anything if narrow models get MORE cuts than the flat default"
+        );
+    }
+
+    /// The gate moves the two regimes in OPPOSITE directions, and that is the whole point: the
+    /// corpus says narrow models are starved of cuts and wide models are over-served by them.
+    /// A change that collapsed either side back onto the flat four would silently discard one
+    /// half of the measurement.
+    #[test]
+    fn the_two_regimes_straddle_the_flat_default() {
+        assert!(
+            WIDE_CUTS_PER_ROUND < MAX_CUTS_PER_ROUND
+                && MAX_CUTS_PER_ROUND < NARROW_CUTS_PER_ROUND,
+            "expected wide {WIDE_CUTS_PER_ROUND} < flat {MAX_CUTS_PER_ROUND} < narrow {NARROW_CUTS_PER_ROUND}"
+        );
+    }
+
+    /// Wide models keep a MINIMAL cut stream rather than none. `cpr=0` measured as a statistical
+    /// tie (26.564 s vs 26.596 s over the wide subset) and was declined as the larger behavioural
+    /// change; if someone later drops this to zero they should do it on evidence, not by drift.
+    #[test]
+    fn the_wide_budget_still_separates_something() {
+        assert!(
+            WIDE_CUTS_PER_ROUND > 0,
+            "wide models keep one cut per round; zero ties it on this corpus but disables              separation outright, which the corpus cannot justify"
+        );
     }
 }

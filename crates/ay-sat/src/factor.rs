@@ -1293,6 +1293,13 @@ impl Factor {
         self.schedule.clear();
         self.in_schedule.clear();
         self.in_schedule.resize(self.num_vars * 2, false);
+        // `AY_FACTOR_PROBE=1`: report what the candidate schedule actually saw.
+        // AY factors 0 variables where Kissat factors 545, and size limit,
+        // scheduling, effort and the acceptance bound are all eliminated — so
+        // the open question is whether this schedule is empty (occurrence list
+        // build is the defect) or full (quotient construction is).
+        let probe = std::env::var_os("AY_FACTOR_PROBE").is_some();
+        let (mut max_count, mut nonzero) = (0usize, 0usize);
         for var_idx in 0..self.num_vars {
             if var_idx * 2 < vals.len() && vals[var_idx * 2] != 0 {
                 continue;
@@ -1307,11 +1314,24 @@ impl Factor {
                     Literal::negative(Variable(var_idx as u32))
                 };
                 let count = occ.count(lit);
+                if probe && count > 0 {
+                    max_count = max_count.max(count);
+                    nonzero += 1;
+                }
                 if count >= MIN_FACTOR_MATCHES {
                     self.in_schedule[lit.index()] = true;
                     self.schedule.push((count, lit));
                 }
             }
+        }
+        if probe {
+            eprintln!(
+                "c factor_probe num_vars={} scheduled={} lits_with_occ={} max_occ={}",
+                self.num_vars,
+                self.schedule.len(),
+                nonzero,
+                max_count
+            );
         }
     }
 

@@ -1909,7 +1909,10 @@ fn failing_tactic_check_retires_preceding_sat_witness() {
     );
     assert!(solver.solver().model().is_none());
     assert!(solver.solver().model_for_consumer().is_none());
-    assert!(solver.inner.executor.last_result().is_none());
+    assert!(
+        solver.inner.executor.last_result_is_unknown(),
+        "the failed public query must replace the stale SAT result with registered Unknown"
+    );
 }
 
 #[test]
@@ -1929,7 +1932,10 @@ fn failing_tactic_assuming_check_retires_witness_and_assumption_state() {
     );
     assert!(solver.solver().model_for_consumer().is_none());
     assert!(solver.inner.last_assumptions.is_none());
-    assert!(solver.inner.executor.last_result().is_none());
+    assert!(
+        solver.inner.executor.last_result_is_unknown(),
+        "the failed public query must replace the stale SAT result with registered Unknown"
+    );
 }
 
 /// Every new transform-batch `ApplyTactic` maps to a distinct, non-`Skip`

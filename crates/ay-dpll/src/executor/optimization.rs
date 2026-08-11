@@ -21,10 +21,11 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
+use super::check_sat::contains_symbolic_integer_power;
 use super::model::{EvalValue, Model};
 use super::Executor;
 use crate::ematching::contains_quantifier;
-use crate::executor_types::{ExecutorError, Result, SolveResult, UnknownReason};
+use crate::executor_types::{ExecutorError, Result, SolveResult, UnknownOrigin, UnknownReason};
 
 /// Upper bound on the TOTAL soft weight the core-guided OLL engine will accept
 /// before falling back to the binary-search baseline.
@@ -509,7 +510,7 @@ impl Executor {
     /// spurious `unknown`. A placeholder parsed term keeps them aligned;
     /// `truncate_assertions` reverts both vectors together.
     fn maxsmt_assert(&mut self, term: TermId) {
-        self.ctx.add_assertion_with_parsed(
+        self.ctx.add_transient_assertion_with_parsed(
             term,
             ay_frontend::Term::Symbol("__ay_soft_internal__".to_string()),
         );
@@ -519,7 +520,7 @@ impl Executor {
     /// elaborated and parsed assertion stacks aligned. The caller must restore
     /// both stacks with `Context::truncate_assertions` on every exit path.
     fn optimization_assert(&mut self, term: TermId) {
-        self.ctx.add_assertion_with_parsed(
+        self.ctx.add_transient_assertion_with_parsed(
             term,
             ay_frontend::Term::Symbol("__ay_opt_internal__".to_string()),
         );
@@ -1390,6 +1391,15 @@ impl Executor {
         // DAGs here so a native oversized BV objective cannot reach model
         // construction or the finite-domain binary search.
         let solve_roots = self.public_solve_roots(&[]);
+        if contains_symbolic_integer_power(&self.ctx.terms, &solve_roots) {
+            self.last_model = None;
+            self.record_unknown_from_origin(UnknownOrigin::UnsupportedArithmeticFragment);
+            self.record_unknown_diagnostic(
+                UnknownReason::UnsupportedArithmetic,
+                "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
+            );
+            return Ok(SolveResult::Unknown);
+        }
         if let Some(result) = self.reject_array_ext_witness_capture(&solve_roots) {
             return Ok(result);
         }
@@ -1416,7 +1426,10 @@ impl Executor {
             self.invalidate_last_check_result();
         }
         result = result.map(|solve_result| {
-            self.quarantine_unverified_nested_array_unsat(&solve_roots, solve_result)
+            // `None`: as in `check_sat_assuming`, an optimization query's
+            // verdict rests on soft constraints and objectives too, which are
+            // not entailed by the hard assertions. No residue rescue here.
+            self.quarantine_unverified_nested_array_unsat(&solve_roots, None, solve_result)
         });
         result
     }
@@ -1824,10 +1837,22 @@ impl Executor {
                 // the next `(check-sat)` restarts the front from the first point.
                 // Keep `last_point` for `(get-objectives)` after the terminal unsat.
                 let last = state.last_point.clone();
+                // #pareto-terminal-obligation — the claim this `unsat` makes is
+                // "no feasible point escapes the emitted front", i.e. a
+                // refutation of `authored AND block`, and `block` is what the
+                // seed probe just refuted with. Declare it so the mandatory
+                // certification certifies THAT property instead of rejecting a
+                // correct refutation for assuming a term the authored
+                // assertions do not contain. Declared BEFORE `state` is reset,
+                // since `block` was built from the emitted points.
+                self.declare_pareto_front_exhaustion_extension(&block);
                 self.pareto_state = Some(ParetoState {
                     emitted: Vec::new(),
                     last_point: last,
                 });
+                // Left as `None` deliberately: the blocking conjuncts travel in
+                // the epoch's own extension slot, and `(get-unsat-assumptions)`
+                // must keep reporting nothing for a plain `(check-sat)`.
                 self.last_assumptions = None;
                 self.last_assumption_core = None;
                 self.last_model = None;

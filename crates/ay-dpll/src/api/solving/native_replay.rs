@@ -32,7 +32,7 @@ use crate::api::types::{
     NativeReplayStatistics, NativeReplayTermNode, NativeReplayUnknownProgress, Term,
     NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA, NATIVE_REPLAY_SCHEMA,
 };
-use crate::api::{Solver, SolverError};
+use crate::api::{ProofAcceptanceMode, Solver, SolverError, UnsatProofArtifact};
 
 /// Wall-clock creation timestamp for the replay artifact, in Unix epoch
 /// milliseconds.
@@ -248,7 +248,8 @@ impl Solver {
     pub fn replay_native_replay_artifact(
         artifact: &NativeReplayArtifact,
     ) -> Result<crate::api::types::SolveDetails, SolverError> {
-        Self::replay_native_replay_artifact_impl(artifact, None, false)
+        let (details, _) = Self::replay_native_replay_artifact_impl(artifact, None, false)?;
+        Ok(details)
     }
 
     /// Replay an exported native artifact with a caller-bounded, strict proof
@@ -274,15 +275,52 @@ impl Solver {
         artifact: &NativeReplayArtifact,
         timeout: Duration,
     ) -> Result<crate::api::types::SolveDetails, SolverError> {
-        let details = Self::replay_native_replay_artifact_impl(artifact, Some(timeout), true)?;
+        let (details, _) = Self::replay_native_replay_artifact_impl(artifact, Some(timeout), true)?;
         Self::require_native_replay_proof_authority(details)
+    }
+
+    /// Replay a native artifact once and return its checked UNSAT proof
+    /// artifact alongside the solve envelope.
+    ///
+    /// This has the same strict proof-authority contract and timeout behavior
+    /// as [`Self::replay_native_replay_artifact_with_proofs`]. For an accepted
+    /// UNSAT result, the second tuple element is guaranteed to be `Some` and
+    /// its [`UnsatProofArtifact::strict_verdict`] is verified. SAT and Unknown
+    /// remain diagnostic results and return `None` for the proof artifact.
+    /// The artifact is exported from the solver instance that performed this
+    /// replay; the obligation is not solved a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed replay artifacts, option setup failures,
+    /// or an UNSAT result that lacks a complete strict proof artifact.
+    pub fn replay_native_replay_artifact_with_checked_proof(
+        artifact: &NativeReplayArtifact,
+        timeout: Duration,
+    ) -> Result<(crate::api::types::SolveDetails, Option<UnsatProofArtifact>), SolverError> {
+        let (details, replay_solver) =
+            Self::replay_native_replay_artifact_impl(artifact, Some(timeout), true)?;
+        let details = Self::require_native_replay_proof_authority(details)?;
+        if !details.result.is_unsat() {
+            return Ok((details, None));
+        }
+
+        let proof = replay_solver.export_last_unsat_artifact().ok_or_else(|| {
+            native_replay_proof_error(
+                "strict UNSAT replay did not retain an exportable proof artifact".to_string(),
+            )
+        })?;
+        proof
+            .accept_for_consumer(ProofAcceptanceMode::Strict)
+            .map_err(|error| native_replay_proof_error(error.to_string()))?;
+        Ok((details, Some(proof)))
     }
 
     fn replay_native_replay_artifact_impl(
         artifact: &NativeReplayArtifact,
         caller_timeout: Option<Duration>,
         require_proofs: bool,
-    ) -> Result<crate::api::types::SolveDetails, SolverError> {
+    ) -> Result<(crate::api::types::SolveDetails, Self), SolverError> {
         let logic = Logic::from_str(artifact.logic.as_deref().unwrap_or("ALL"))?;
         validate_native_replay_identity_tables(artifact)?;
         let mut solver = Self::try_new(logic)?;
@@ -351,15 +389,16 @@ impl Solver {
             }
         }
 
-        if let Some(assumptions) = final_check_sat_assumptions(&artifact.events) {
+        let details = if let Some(assumptions) = final_check_sat_assumptions(&artifact.events) {
             let assumptions = assumptions
                 .iter()
                 .map(|&term| map_term(term, &term_map).map(Term))
                 .collect::<Result<Vec<_>, SolverError>>()?;
-            Ok(solver.check_sat_assuming_with_details(&assumptions).solve)
+            solver.check_sat_assuming_with_details(&assumptions).solve
         } else {
-            Ok(solver.check_sat_with_details())
-        }
+            solver.check_sat_with_details()
+        };
+        Ok((details, solver))
     }
 
     fn require_native_replay_proof_authority(
@@ -1889,6 +1928,13 @@ fn native_replay_term_error(node: TermId, message: impl Into<String>) -> SolverE
 fn native_replay_artifact_error(message: impl Into<String>) -> SolverError {
     SolverError::InvalidArgument {
         operation: "native_replay",
+        message: message.into(),
+    }
+}
+
+fn native_replay_proof_error(message: impl Into<String>) -> SolverError {
+    SolverError::InvalidArgument {
+        operation: "native_replay_with_checked_proof",
         message: message.into(),
     }
 }

@@ -8,14 +8,11 @@ use num_bigint::BigInt;
 use super::{Context, ElaborateError, Result};
 
 impl Context {
-    /// Char operators (`char.to_int`, `char.<=`, `char.is_digit`) desugar to Int
-    /// arithmetic on a Unicode code point: a char literal `(_ char n)` lowers to
-    /// the Int `n` (see `elaborate/indexed.rs`), and the native `Sort::Char` also
-    /// lowers to a bounded Int. So a well-formed char-op argument is `Int`- or
-    /// `Char`-sorted. ANY other sort means the argument is not a code point —
-    /// e.g. a variable over an auto-uninterpreted `Char` sort name: the SMT-LIB
-    /// frontend does not resolve `Char`, so `(declare-const c Char)` yields
-    /// `Uninterpreted("Char")` (which z3 rejects outright as an unknown sort).
+    /// Z3 5.0.0 Char operators desugar to arithmetic on a Unicode code point.
+    /// `(_ Char n)` and the supported character-valued operations lower to Int
+    /// in AY's term store while `public_sorts.rs` retains and checks their
+    /// distinct public type. The free `Unicode` sort stays unsupported until
+    /// the textual frontend can attach its mandatory 0..=196607 domain bound.
     /// Desugaring `char.to_int` as the identity over such a term leaked an
     /// uninterpreted-sorted value into an Int context and produced a WRONG
     /// `unsat` (#char-nonint-arg: `char.to_int(c)=65` → unsat because `c`
@@ -24,11 +21,9 @@ impl Context {
     /// (those are `Int`) or an FFI `Char`-sorted term.
     fn expect_char_code_arg(&self, arg: TermId) -> Result<()> {
         match self.terms.sort(arg) {
-            Sort::Int | Sort::Char => Ok(()),
-            // Label the expected sort `Int` (the code point): the auto-declared
-            // `Uninterpreted("Char")` sort renders as "Char" too, so naming the
-            // expected side `Char` would print the baffling "Sorts Char and Char
-            // are incompatible". Valid CLI char-op args are always `Int`.
+            Sort::Int => Ok(()),
+            // Label the expected engine sort `Int`; the public validator emits
+            // the character/Int surface mismatch before a command is accepted.
             other => Err(ElaborateError::SortMismatch {
                 expected: Sort::Int.to_string(),
                 actual: other.to_string(),
@@ -252,11 +247,9 @@ impl Context {
                     Sort::Bool,
                 )))
             }
-            // Char theory. A Char is a Unicode code point, which AY represents as
-            // that bounded Int (char literals `(_ Char n)` elaborate to the Int
-            // `n`, see `elaborate/indexed.rs`), so every char operator desugars to
-            // Int arithmetic on the code point — sound because a Char IS its code
-            // point. `char.to_int` is then the identity.
+            // Char theory. A character value is represented by its integer code
+            // point, so `char.to_int` is the identity and ordering/digit tests
+            // are ordinary integer predicates after public type checking.
             "char.to_int" => {
                 self.expect_exact_arity("char.to_int", arg_ids, 1)?;
                 self.expect_char_code_arg(arg_ids[0])?;
@@ -280,6 +273,40 @@ impl Context {
                 let ge_lo = self.terms.mk_le(lo, arg_ids[0]);
                 let le_hi = self.terms.mk_le(arg_ids[0], hi);
                 Ok(Some(self.terms.mk_and(vec![ge_lo, le_hi])))
+            }
+            "char.to_bv" => {
+                self.expect_exact_arity("char.to_bv", arg_ids, 1)?;
+                self.expect_char_code_arg(arg_ids[0])?;
+                Ok(Some(self.terms.mk_int2bv(18, arg_ids[0])))
+            }
+            "char.from_bv" => {
+                self.expect_exact_arity("char.from_bv", arg_ids, 1)?;
+                let width = self.expect_bv_operand_width("char.from_bv", arg_ids[0])?;
+                if width != 18 {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "(_ BitVec 18)".to_string(),
+                        actual: format!("(_ BitVec {width})"),
+                    });
+                }
+                let value = match self.terms.get(arg_ids[0]) {
+                    TermData::Const(Constant::BitVec { value, .. })
+                        if value <= &BigInt::from(0x2_FFFFu32) =>
+                    {
+                        value.clone()
+                    }
+                    TermData::Const(Constant::BitVec { .. }) => {
+                        return Err(ElaborateError::Unsupported(
+                            "char.from_bv input is outside the Unicode character range".to_string(),
+                        ));
+                    }
+                    _ => {
+                        return Err(ElaborateError::Unsupported(
+                            "symbolic char.from_bv requires a bounded Unicode result encoding"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Some(self.terms.mk_int(value)))
             }
             "str.to_re" | "str.to.re" => {
                 self.expect_exact_arity(name, arg_ids, 1)?;

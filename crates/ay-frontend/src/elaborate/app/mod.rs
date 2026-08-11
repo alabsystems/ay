@@ -82,7 +82,7 @@ impl Context {
             if &actual == expected {
                 continue;
             }
-            if actual == Sort::Int && expected == &Sort::Real {
+            if self.int_real_coercions() && actual == Sort::Int && expected == &Sort::Real {
                 *arg = self.coerce_int_to_real(*arg);
                 continue;
             }
@@ -170,7 +170,10 @@ impl Context {
                 let actual = self.terms.sort(body_term).clone();
                 if actual == result_sort {
                     Ok(body_term)
-                } else if actual == Sort::Int && result_sort == Sort::Real {
+                } else if self.int_real_coercions()
+                    && actual == Sort::Int
+                    && result_sort == Sort::Real
+                {
                     Ok(self.coerce_int_to_real(body_term))
                 } else {
                     Err(ElaborateError::SortMismatch {
@@ -194,7 +197,13 @@ impl Context {
         // built — too late to stop the runaway recursion.) A non-constant guard
         // falls through to the normal eager elaboration below, so symbolic ITEs
         // are unaffected.
-        if name == "ite" && args.len() == 3 {
+        let builtin_ite_spelling =
+            name == "ite" || name == "if" || (self.logic.is_none() && name == "if_then_else");
+        if builtin_ite_spelling
+            && !self.symbols.contains_key(name)
+            && !self.overloaded_symbols.contains_key(name)
+            && args.len() == 3
+        {
             let cond = self.elaborate_term(&args[0], env)?;
             match self.terms.get(cond) {
                 TermData::Const(Constant::Bool(true)) => {
@@ -374,7 +383,14 @@ impl Context {
         // ite/and/or/not — exactly the closure-environment SSA chains a bounded
         // model checker emits (`local = ite(c, C(..), <havoc'd dt var>)`), which
         // otherwise leave the solver `unknown`.
-        if name == "=" && arg_ids.len() == 2 && self.is_datatype_sorted(arg_ids[0]) {
+        let builtin_eq_spelling =
+            name == "=" || (self.logic.is_none() && matches!(name, "equals" | "equiv" | "iff"));
+        if builtin_eq_spelling
+            && !self.symbols.contains_key(name)
+            && !self.overloaded_symbols.contains_key(name)
+            && arg_ids.len() == 2
+            && self.is_datatype_sorted(arg_ids[0])
+        {
             // z3 4.15.4 parity: a datatype `=` whose operands have DIFFERENT
             // sorts (e.g. `(= dt 5)`, dt vs Int) is a sort error, reported before
             // the datatype fold ever runs. Datatypes are non-coercible, so the

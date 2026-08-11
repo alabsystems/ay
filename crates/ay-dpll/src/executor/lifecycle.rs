@@ -52,6 +52,26 @@ impl Executor {
         Ok(())
     }
 
+    /// Register a native function alias with an exact public signature.
+    pub(crate) fn register_native_global_public_function_alias(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        public_arg_sorts: Vec<ay_frontend::PublicSort>,
+        public_sort: ay_frontend::PublicSort,
+    ) -> Result<()> {
+        let changed = self.ctx.register_native_global_public_function_alias(
+            surface_name,
+            internal_name,
+            public_arg_sorts,
+            public_sort,
+        )?;
+        if changed {
+            self.invalidate_last_check_result();
+        }
+        Ok(())
+    }
+
     /// Retire a completed decision after a native API mutation that is held in
     /// the API layer rather than represented by a frontend command.
     pub(crate) fn invalidate_for_native_api_mutation(&mut self) {
@@ -68,6 +88,7 @@ impl Executor {
             cmd,
             Command::SetLogic(_)
                 | Command::DeclareSort(..)
+                | Command::DeclareSortParameter(..)
                 | Command::DefineSort(..)
                 | Command::DeclareDatatype(..)
                 | Command::DeclareDatatypes(..)
@@ -104,6 +125,7 @@ impl Executor {
         self.last_result = None;
         self.last_model = None;
         self.last_sat_certificate = None;
+        self.last_unsat_certificate = None;
         self.last_assumptions = None;
         self.last_assumption_core = None;
         self.last_core_term_to_name = None;
@@ -111,9 +133,11 @@ impl Executor {
         self.last_proof_term_overrides = None;
         self.proof_problem_assertion_provenance = None;
         self.quant_expansion_records.clear();
+        self.ematching_proof_records.clear();
         self.last_proof_rebuild_originals.clear();
         self.last_proof_quality = None;
         self.last_unknown_reason = None;
+        self.last_unknown_origin = None;
         self.last_clause_trace = None;
         self.last_lrat_certificate = None;
         self.last_var_to_term = None;
@@ -171,8 +195,8 @@ impl Executor {
         }
     }
 
-    /// Install an externally synthesized `Unknown` result and revoke every
-    /// artifact belonging to an older or partially completed decision.
+    /// Publish `Unknown` from an authoritative production origin and revoke
+    /// every artifact belonging to an older or partially completed decision.
     ///
     /// CLI preflight rejection and panic containment can decide to fail closed
     /// without receiving a normal `Unknown` from the solver. This canonical
@@ -180,11 +204,68 @@ impl Executor {
     /// a stale result. Decision tracing is also detached and permanently
     /// suppressed when configured, because replay would reproduce the solver's
     /// raw result rather than the external boundary's synthesized result.
-    pub fn replace_last_result_with_unknown(&mut self, reason: UnknownReason) {
+    pub(crate) fn publish_unknown_from_origin(&mut self, origin: UnknownOrigin) {
         self.detach_persistent_decision_trace_writers();
         self.invalidate_last_check_result();
         self.last_result = Some(SolveResult::Unknown);
-        self.last_unknown_reason = Some(reason);
+        self.last_unknown_reason = Some(origin.reason());
+        self.last_unknown_origin = Some(origin);
+    }
+
+    /// Compatibility entrypoint for existing external fail-closed callers.
+    ///
+    /// The reason is immediately converted to its unique registered origin;
+    /// callers cannot create a mismatched reason/origin pair.
+    pub fn replace_last_result_with_unknown(&mut self, reason: UnknownReason) {
+        self.publish_unknown_from_origin(reason.origin());
+    }
+
+    /// Classify a provisional internal Unknown through the typed origin
+    /// registry. The public solve boundary subsequently calls
+    /// [`Self::finalize_unknown_publication`] to revoke artifacts and publish
+    /// the result. Production origin sites use this instead of independently
+    /// pairing a reason with a code string.
+    pub(crate) fn record_unknown_from_origin(&mut self, origin: UnknownOrigin) {
+        self.last_unknown_reason = Some(origin.reason());
+        self.last_unknown_origin = Some(origin);
+    }
+
+    /// Inject an exact registered production origin for the authenticated
+    /// conformance executable's negative/coverage campaign.
+    ///
+    /// This is not a solver option and ordinary solving never calls it. The
+    /// hidden probe reports the injection honestly and pairs it with the
+    /// audited production chokepoint from [`UnknownOrigin::production_chokepoint`].
+    #[doc(hidden)]
+    pub fn conformance_inject_unknown_origin(&mut self, origin: UnknownOrigin) {
+        self.record_unknown_from_origin(origin);
+        let _ = self.finalize_unknown_publication(SolveResult::Unknown);
+    }
+
+    /// Apply the mandatory public Unknown boundary to a provisional result.
+    ///
+    /// This is intentionally idempotent. Every public solve route calls it
+    /// after the internal lane chooses a result, so direct internal writes to
+    /// `last_unknown_reason` cannot bypass result-artifact revocation.
+    pub(crate) fn finalize_unknown_publication(&mut self, proposed: SolveResult) -> SolveResult {
+        if proposed.is_unknown() {
+            let reason = self.last_unknown_reason.unwrap_or(UnknownReason::Unknown);
+            self.publish_unknown_from_origin(reason.origin());
+            SolveResult::Unknown
+        } else {
+            self.last_unknown_origin = None;
+            proposed
+        }
+    }
+
+    /// Exact production origin for the last public Unknown result.
+    #[must_use]
+    pub fn unknown_origin(&self) -> Option<UnknownOrigin> {
+        self.last_result
+            .as_ref()
+            .is_some_and(SolveResult::is_unknown)
+            .then_some(self.last_unknown_origin)
+            .flatten()
     }
 
     /// Reject the current internal UNSAT at a mandatory certification boundary.
@@ -213,6 +294,13 @@ impl Executor {
     pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
         self.array_ext_witness_cache
             .begin_public_solve(&self.ctx.terms);
+        // Proof output is optional; proof-backed UNSAT correctness is not.
+        // Enable internal proof tracking for every public decision before the
+        // authored scope is finalized. `--no-proof` and `:produce-proofs false`
+        // still suppress user-facing artifacts, but cannot disable the soundness
+        // certificate required to publish `unsat`.
+        self.proof_tracker.enable();
+        self.ctx.set_retain_parsed_assertions(true);
         let authored_assertions = self.ctx.assertions.clone();
         let pareto_state = if preserve_pareto_enumeration {
             self.pareto_state.take()
@@ -223,11 +311,28 @@ impl Executor {
         if preserve_pareto_enumeration {
             self.pareto_state = pareto_state;
         }
-        // Freeze proof authority once, at the public-query boundary. Recursive
-        // retries and optimization/probe solves may temporarily replace or
-        // extend `ctx.assertions`; they must inherit these roots rather than
+        self.begin_unsat_query_epoch(&authored_assertions);
+        // Install the pre-elaboration proof authority at the public-query
+        // boundary. SMT-LIB command dispatch may replace it exactly once with
+        // authenticated schematic instances; recursive retries and
+        // optimization/probe solves then inherit those roots rather than
         // recapturing their generated working set as authored input.
         self.install_proof_source_provenance(&authored_assertions);
+    }
+
+    /// Bind public UNSAT/proof authority to the frontend's final query roots.
+    ///
+    /// `begin_public_solve` runs before command elaboration so even a malformed
+    /// query revokes stale artifacts. SMT-LIB 2.7 schematic assertions are
+    /// materialized during that elaboration, however, and must be included in
+    /// the exact epoch before any solver lane runs. This is the sole permitted
+    /// pre-solve rebind; the epoch method refuses it once assumptions are bound.
+    pub(crate) fn bind_materialized_public_query(&mut self) {
+        let assertions = self.ctx.assertions.clone();
+        self.proof_problem_assertion_provenance = None;
+        if self.rebind_unsat_query_epoch_assertions(&assertions) {
+            self.install_proof_source_provenance(&assertions);
+        }
     }
 
     /// Native API assertions bypass `Command::Assert`, so they must manually
@@ -324,9 +429,11 @@ impl Executor {
             last_proof_term_overrides: None,
             proof_problem_assertion_provenance: None,
             quant_expansion_records: Vec::new(),
+            ematching_proof_records: Vec::new(),
             last_proof_rebuild_originals: Vec::new(),
             last_proof_quality: None,
             last_unknown_reason: None,
+            last_unknown_origin: None,
             last_statistics: Statistics::default(),
             debug_ufbv: false,
             incremental_mode: false,
@@ -339,6 +446,7 @@ impl Executor {
             incr_theory_state: None,
             counterexample_style: crate::CounterexampleStyle::default(),
             proof_tracker: crate::proof_tracker::ProofTracker::new(),
+            proof_output_requested: false,
             proof_reconstruction_step_budget: None,
             last_clause_trace: None,
             last_var_to_term: None,
@@ -359,6 +467,12 @@ impl Executor {
             in_closed_universal_precheck: false,
             in_quantified_model_gate: false,
             dt_cert_grant_active: false,
+            finite_table_cert_grant_active: false,
+            const_interp_cert_grant_active: false,
+            mbqi_sat_cert_grant_active: false,
+            mbqi_sat_cert_pins: HashMap::default(),
+            finite_table_cert_pending_witness: None,
+            const_interp_cert_witness: Vec::new(),
             solve_deadline: SolveDeadlineCell::new(),
             quantifier_deadline_backstop_installed: false,
             quantifier_pipeline_engaged: false,
@@ -381,9 +495,13 @@ impl Executor {
             dt_pre_lift_assertions: Vec::new(),
             dt_lazy_splits: None,
             defer_model_validation: false,
+            bv_quantifier_full_domain_proof: false,
             defer_counterexample_minimization: false,
             last_model_validated: false,
             last_sat_certificate: None,
+            last_unsat_certificate: None,
+            unsat_query_epoch: None,
+            next_unsat_query_epoch: 0,
             cegar_pending_lemma: None,
             cegar_rounds_remaining: 0,
             cegar_emitted_lemmas: HashSet::default(),
@@ -404,6 +522,9 @@ impl Executor {
             original_problem_had_quantifiers: false,
             sat_validated_by_mod_div_or_branch: false,
             nested_array_row_reduction_unsat: false,
+            ho_seq_unfold_array_free_unsat: false,
+            in_nested_array_residue_probe: false,
+            residue_probe_failures: 0,
             bypass_string_tautology_guard: false,
             slia_accepted_unknown: false,
             w7_defs: None,
@@ -412,6 +533,8 @@ impl Executor {
             self_check_authored_assertions: None,
             array_axiom_scope: None,
             row_seeded_terms: HashSet::default(),
+            array_default_epsilon_by_sort: HashMap::default(),
+            array_default_diag_by_sort: HashMap::default(),
             cached_store_eqs: Vec::new(),
             store_eq_scan_hwm: 0,
             cached_select_indices_by_array: HashMap::default(),
@@ -449,7 +572,6 @@ impl Executor {
             last_soft_violations: None,
             finite_objective_values: HashMap::default(),
             pareto_state: None,
-            independent_gate_disabled: false,
             array_ext_shadow: ArrayExtShadow::default(),
             array_ext_witness_cache: ArrayExtWitnessCache::default(),
             // M-A2 lazy-persistent-combiner shadow: OFF by default (§5 A2).
@@ -540,22 +662,16 @@ impl Executor {
             .is_some_and(QuantifierManager::demand_active)
     }
 
-    /// Enable or disable the independent fail-closed model-check gate.
-    ///
-    /// The gate is ON by default. When ON, every `Sat` result is re-checked by
-    /// [`ay_model_check::confirm_model`] against the assertions; a `Sat` whose
-    /// model the gate ground-refutes (`ModelViolates`) is unconditionally
-    /// downgraded to `Unknown` (a coverage gap the gate cannot evaluate is
-    /// recorded but keeps the verdict). Disabling the gate is a DEBUGGING-ONLY
-    /// escape hatch; no production path calls this with `false`.
-    pub fn set_independent_model_gate(&mut self, enabled: bool) {
-        self.independent_gate_disabled = !enabled;
-    }
+    /// Compatibility shim retained for callers that previously toggled model
+    /// checking. Independent SAT validation is now a mandatory publication
+    /// boundary and cannot be disabled.
+    #[deprecated(note = "the independent model gate is mandatory and cannot be disabled")]
+    pub fn set_independent_model_gate(&mut self, _enabled: bool) {}
 
     /// Whether the independent model-check gate is currently enabled.
     #[must_use]
-    pub fn independent_model_gate_enabled(&self) -> bool {
-        !self.independent_gate_disabled
+    pub const fn independent_model_gate_enabled(&self) -> bool {
+        true
     }
 
     /// Create a new executor with a specific verification level (#4444).
@@ -651,6 +767,7 @@ impl Executor {
     ///
     /// This is required for VerifierConsumer integration (proof certificates).
     pub fn set_produce_proofs(&mut self, enabled: bool) {
+        self.proof_output_requested = enabled;
         if enabled {
             self.proof_tracker.enable();
             // Proof export aligns Assume steps with the ORIGINAL parsed
@@ -678,7 +795,11 @@ impl Executor {
     /// Check if proof production is enabled
     #[must_use]
     pub fn is_producing_proofs(&self) -> bool {
-        self.proof_tracker.is_enabled()
+        self.proof_output_requested
+            || matches!(
+                self.ctx.get_option("produce-proofs"),
+                Some(OptionValue::Bool(true))
+            )
     }
 
     /// Bound post-UNSAT SAT-proof reconstruction with a deterministic step
@@ -939,7 +1060,11 @@ impl Executor {
     /// Returns None if the last result was not UNSAT or if proof production was disabled.
     #[must_use]
     pub fn last_proof(&self) -> Option<&Proof> {
-        self.last_proof.as_ref()
+        if self.is_producing_proofs() {
+            self.last_proof.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Get access to the term store
@@ -1015,6 +1140,9 @@ impl Executor {
         *self.required_terms_index.borrow_mut() = None;
         self.last_result = None;
         self.last_model = None;
+        self.last_sat_certificate = None;
+        self.last_unsat_certificate = None;
+        self.unsat_query_epoch = None;
         self.last_assumptions = None;
         self.last_assumption_core = None;
         self.last_core_term_to_name = None;
@@ -1031,6 +1159,7 @@ impl Executor {
         self.last_original_clause_theory_proofs = None;
         self.proof_problem_assertion_provenance = None;
         self.quant_expansion_records.clear();
+        self.ematching_proof_records.clear();
         self.last_negations = None;
         self.incremental_mode = false;
         self.pivot_enum_depth = 0;
@@ -1050,6 +1179,8 @@ impl Executor {
         self.slia_accepted_unknown = false;
         self.array_axiom_scope = None;
         self.row_seeded_terms.clear();
+        self.array_default_epsilon_by_sort.clear();
+        self.array_default_diag_by_sort.clear();
         self.cached_store_eqs.clear();
         self.store_eq_scan_hwm = 0;
         self.cached_select_indices_by_array.clear();
@@ -1175,6 +1306,130 @@ mod result_rejection_tests {
                 .execute(&Command::CheckSat)
                 .expect("later decision remains usable"),
             Some("sat".to_string())
+        );
+    }
+
+    #[test]
+    fn every_registered_unknown_reason_uses_the_shared_artifact_revocation_policy() {
+        for reason in UnknownReason::ALL {
+            let mut executor = Executor::new();
+            executor.last_result = Some(SolveResult::Sat);
+            executor.last_model = Some(Model::empty());
+            executor.last_model_validated = true;
+            executor.last_assumptions = Some(Vec::new());
+            executor.last_assumption_core = Some(Vec::new());
+            executor.last_core_term_to_name = Some(HashMap::default());
+            executor.last_proof = Some(Proof::new());
+            executor.last_lrat_certificate = Some(vec![1]);
+            executor.last_proof_term_overrides = Some(HashMap::default());
+            executor.last_clause_trace = Some(ClauseTrace::new());
+            executor.last_var_to_term = Some(HashMap::default());
+            executor.last_trail_provenance = Some(HashMap::default());
+            executor.last_clausification_proofs = Some(Vec::new());
+            executor.last_original_clause_theory_proofs = Some(Vec::new());
+            executor.last_soft_cost = Some(1);
+            executor.last_soft_cost_optimal = false;
+            executor.last_soft_violations = Some(vec![0]);
+
+            executor.replace_last_result_with_unknown(reason);
+
+            assert!(
+                executor.last_result_is_unknown(),
+                "reason={}",
+                reason.code()
+            );
+            assert_eq!(executor.get_reason_unknown(), Some(reason));
+            assert!(executor.last_model.is_none(), "reason={}", reason.code());
+            assert!(!executor.last_model_validated, "reason={}", reason.code());
+            assert!(
+                executor.last_assumptions.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_assumption_core.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_core_term_to_name.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(executor.last_proof.is_none(), "reason={}", reason.code());
+            assert!(
+                executor.last_lrat_certificate.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_proof_term_overrides.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_clause_trace.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_var_to_term.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_trail_provenance.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_clausification_proofs.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_original_clause_theory_proofs.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(
+                executor.last_soft_cost.is_none(),
+                "reason={}",
+                reason.code()
+            );
+            assert!(executor.last_soft_cost_optimal, "reason={}", reason.code());
+            assert!(
+                executor.last_soft_violations.is_none(),
+                "reason={}",
+                reason.code()
+            );
+        }
+    }
+
+    #[test]
+    fn public_unknown_boundary_revokes_artifacts_from_direct_internal_classification() {
+        let mut executor = Executor::new();
+        executor.last_result = Some(SolveResult::Sat);
+        executor.last_model = Some(Model::empty());
+        executor.last_unknown_reason = Some(UnknownReason::QuantifierDeferred);
+
+        let published = executor.finalize_unknown_publication(SolveResult::Unknown);
+
+        assert_eq!(published, SolveResult::Unknown);
+        assert_eq!(
+            executor.unknown_origin(),
+            Some(UnknownOrigin::DeferredInstantiation)
+        );
+        assert!(executor.last_model.is_none());
+
+        // External-stop attribution runs after the first public publication.
+        // Reclassification must update the public pair atomically rather than
+        // leave the original origin attached to a new reason.
+        executor.record_unknown_from_origin(UnknownOrigin::SolveDeadline);
+        assert_eq!(executor.unknown_reason(), Some(UnknownReason::Timeout));
+        assert_eq!(
+            executor.unknown_origin(),
+            Some(UnknownOrigin::SolveDeadline)
         );
     }
 

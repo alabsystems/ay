@@ -48,6 +48,8 @@ pub enum Logic {
     QfAuflira,
     /// Quantifier-free non-linear integer arithmetic
     QfNia,
+    /// Quantifier-free integer arithmetic with exponentiation
+    QfEia,
     /// Quantifier-free non-linear real arithmetic
     QfNra,
     /// Quantifier-free non-linear mixed integer/real arithmetic
@@ -152,6 +154,7 @@ impl Logic {
             Self::QfAuflra => "QF_AUFLRA",
             Self::QfAuflira => "QF_AUFLIRA",
             Self::QfNia => "QF_NIA",
+            Self::QfEia => "QF_EIA",
             Self::QfNra => "QF_NRA",
             Self::QfNira => "QF_NIRA",
             Self::QfBv => "QF_BV",
@@ -219,6 +222,7 @@ impl std::str::FromStr for Logic {
             "QF_AUFLRA" => Ok(Self::QfAuflra),
             "QF_AUFLIRA" => Ok(Self::QfAuflira),
             "QF_NIA" => Ok(Self::QfNia),
+            "QF_EIA" => Ok(Self::QfEia),
             "QF_NRA" => Ok(Self::QfNra),
             "QF_NIRA" => Ok(Self::QfNira),
             "QF_BV" => Ok(Self::QfBv),
@@ -330,6 +334,108 @@ impl SortExt for Sort {
             Self::TypeVar(name) => CmdSort::Simple(name.clone()),
             // All current Sort variants handled above (#5692).
             other => unreachable!("unhandled Sort variant in to_command_sort(): {other:?}"),
+        }
+    }
+}
+
+/// Split a leading `(set-logic L)` off an SMT-LIB script.
+///
+/// Returns the declared logic — or `fallback` when the script declares none, or
+/// names one this build does not recognize — together with the script minus
+/// that command.
+///
+/// [`crate::api::Solver::try_new`] and its `_with_config` sibling dispatch a
+/// `set-logic` of their own, so a `set-logic` left in a script handed to
+/// [`crate::api::Solver::parse_smtlib2`] is the SECOND one, which the
+/// elaborator rejects exactly as z3 does. Callers that feed a self-contained
+/// script should build the solver with the logic that script declares:
+///
+/// ```
+/// use ay_dpll::api::{split_leading_set_logic, Logic, Solver};
+///
+/// let script = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (> x 0))\n";
+/// let (logic, body) = split_leading_set_logic(script, Logic::All);
+/// assert_eq!(logic, Logic::QfLia);
+/// let mut solver = Solver::try_new(logic).expect("QF_LIA supported");
+/// solver.parse_smtlib2(&body).expect("no second set-logic remains");
+/// ```
+///
+/// Deliberately textual and conservative: only the FIRST command is removed (a
+/// genuine second one is a real error and must still reach the elaborator), and
+/// anything not matching the exact `(set-logic <token>)` shape is passed
+/// through verbatim rather than silently altered.
+#[must_use]
+pub fn split_leading_set_logic(smt: &str, fallback: Logic) -> (Logic, std::borrow::Cow<'_, str>) {
+    use std::borrow::Cow;
+    use std::str::FromStr;
+
+    let Some(open) = smt.find("(set-logic") else {
+        return (fallback, Cow::Borrowed(smt));
+    };
+    let after = open + "(set-logic".len();
+    // Require a delimiter so `(set-logicX …)` is not treated as a match.
+    if !smt[after..].starts_with([' ', '\t', '\n', '\r']) {
+        return (fallback, Cow::Borrowed(smt));
+    }
+    let Some(rel_close) = smt[after..].find(')') else {
+        return (fallback, Cow::Borrowed(smt));
+    };
+    let close = after + rel_close;
+    let token = smt[after..close].trim();
+    if token.is_empty() || token.contains('(') {
+        return (fallback, Cow::Borrowed(smt));
+    }
+    let logic = Logic::from_str(token).unwrap_or(fallback);
+    let mut body = String::with_capacity(smt.len());
+    body.push_str(&smt[..open]);
+    body.push_str(&smt[close + 1..]);
+    (logic, Cow::Owned(body))
+}
+
+#[cfg(test)]
+mod split_leading_set_logic_tests {
+    use super::{split_leading_set_logic, Logic};
+
+    #[test]
+    fn takes_the_declared_logic_and_removes_only_the_first_command() {
+        let (logic, body) = split_leading_set_logic(
+            "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (> x 0))\n",
+            Logic::All,
+        );
+        assert_eq!(logic, Logic::QfLia);
+        assert!(!body.contains("set-logic"), "must be stripped: {body}");
+        assert!(
+            body.contains("(assert (> x 0))"),
+            "body must survive: {body}"
+        );
+
+        // A genuine second `set-logic` is a real error and must still reach the
+        // elaborator, so only the first is removed.
+        let (_, two) = split_leading_set_logic(
+            "(set-logic QF_LIA)\n(set-logic QF_UF)\n(assert true)\n",
+            Logic::All,
+        );
+        assert!(
+            two.contains("(set-logic QF_UF)"),
+            "second must survive: {two}"
+        );
+    }
+
+    #[test]
+    fn falls_back_and_passes_unrecognized_shapes_through_verbatim() {
+        let none = "(declare-fun x () Int)\n";
+        let (logic, body) = split_leading_set_logic(none, Logic::QfLia);
+        assert_eq!(logic, Logic::QfLia);
+        assert_eq!(body, none);
+
+        for odd in [
+            "(set-logicQF_LIA)\n(assert true)\n",
+            "(set-logic (weird))\n(assert true)\n",
+            "(set-logic\n",
+        ] {
+            let (logic, body) = split_leading_set_logic(odd, Logic::QfLia);
+            assert_eq!(logic, Logic::QfLia, "must fall back on {odd:?}");
+            assert_eq!(body, odd, "must be untouched: {odd:?}");
         }
     }
 }

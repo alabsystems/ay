@@ -26,6 +26,8 @@
 use super::{has_duplicate_literal, ToDimacs};
 use crate::literal::Literal;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const LRAT_PENDING_DELETIONS_INITIAL_CAPACITY: usize = 64;
 const LRAT_PENDING_DELETIONS_MAX_RETAINED_CAPACITY: usize = 32 * 1024;
@@ -33,6 +35,16 @@ const LRAT_TEXT_LINE_INITIAL_CAPACITY: usize = 256;
 const LRAT_TEXT_LINE_MAX_RETAINED_CAPACITY: usize = 256 * 1024;
 const LRAT_TEXT_ID_BYTES_ESTIMATE: usize = 21; // u64::MAX plus trailing space.
 const LRAT_TEXT_LIT_BYTES_ESTIMATE: usize = 12; // i32 DIMACS literal plus trailing space.
+
+/// Typed failure from the bounded pending-deletion buffer used by the
+/// in-memory resolution-DAG producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LratBoundedResourceFailure {
+    /// The configured deletion-id count was exceeded.
+    PendingDeletionLimit { limit: usize, attempted: usize },
+    /// Fallible deletion-buffer growth failed.
+    PendingDeletionAllocation,
+}
 
 /// Largest original-clause count from which at least one universally
 /// representable LRAT addition ID remains. Binary LRAT doubles IDs, while RAT
@@ -185,6 +197,12 @@ pub struct LratWriter<W: Write> {
     latest_id: u64,
     /// Pending deletions (batched for efficiency)
     pending_deletions: Vec<u64>,
+    /// Optional hard pending-deletion count for bounded in-memory producers.
+    max_pending_deletions: Option<usize>,
+    /// First bounded-resource failure, if any.
+    bounded_resource_failure: Option<LratBoundedResourceFailure>,
+    /// Shared solve interrupt set on bounded storage failure.
+    bounded_interrupt: Option<Arc<AtomicBool>>,
     /// Reusable buffer for text LRAT lines.
     text_line: Vec<u8>,
     /// Count of clauses successfully added (does not count failed writes)
@@ -201,17 +219,40 @@ impl<W: Write> LratWriter<W> {
     /// `num_original_clauses` is the number of clauses in the original formula.
     /// The first learned clause will get ID `num_original_clauses + 1`.
     pub fn new_text(writer: W, num_original_clauses: u64) -> Self {
-        Self::new(writer, false, num_original_clauses)
+        Self::new(writer, false, num_original_clauses, None, None)
     }
 
     /// Create a new LRAT writer with binary format
     ///
     /// `num_original_clauses` is the number of clauses in the original formula.
     pub fn new_binary(writer: W, num_original_clauses: u64) -> Self {
-        Self::new(writer, true, num_original_clauses)
+        Self::new(writer, true, num_original_clauses, None, None)
     }
 
-    fn new(writer: W, binary: bool, num_original_clauses: u64) -> Self {
+    /// Binary writer with a hard cap on deletion IDs waiting between proof
+    /// additions. Used only by the bounded in-memory ResolutionDag path.
+    pub(crate) fn new_binary_bounded(
+        writer: W,
+        num_original_clauses: u64,
+        max_pending_deletions: usize,
+        interrupt: Arc<AtomicBool>,
+    ) -> Self {
+        Self::new(
+            writer,
+            true,
+            num_original_clauses,
+            Some(max_pending_deletions),
+            Some(interrupt),
+        )
+    }
+
+    fn new(
+        writer: W,
+        binary: bool,
+        num_original_clauses: u64,
+        max_pending_deletions: Option<usize>,
+        bounded_interrupt: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let next_id = num_original_clauses.checked_add(1).filter(|&id| {
             num_original_clauses <= MAX_LRAT_ORIGINAL_CLAUSES && i64::try_from(id).is_ok()
         });
@@ -223,11 +264,32 @@ impl<W: Write> LratWriter<W> {
             // count a permanently failed writer instead of wrapping ID 0.
             next_id: next_id.unwrap_or(i64::MAX as u64),
             latest_id: num_original_clauses,
-            pending_deletions: Vec::with_capacity(LRAT_PENDING_DELETIONS_INITIAL_CAPACITY),
-            text_line: Vec::with_capacity(LRAT_TEXT_LINE_INITIAL_CAPACITY),
+            pending_deletions: if max_pending_deletions.is_some() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(LRAT_PENDING_DELETIONS_INITIAL_CAPACITY)
+            },
+            max_pending_deletions,
+            bounded_resource_failure: None,
+            bounded_interrupt,
+            text_line: if max_pending_deletions.is_some() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(LRAT_TEXT_LINE_INITIAL_CAPACITY)
+            },
             added_count: 0,
             deleted_count: 0,
             io_failed: next_id.is_none(),
+        }
+    }
+
+    fn fail_bounded_resource(&mut self, failure: LratBoundedResourceFailure) {
+        if self.bounded_resource_failure.is_none() {
+            self.bounded_resource_failure = Some(failure);
+        }
+        self.io_failed = true;
+        if let Some(interrupt) = &self.bounded_interrupt {
+            interrupt.store(true, Ordering::Release);
         }
     }
 
@@ -245,7 +307,7 @@ impl<W: Write> LratWriter<W> {
                 self.write_binary_id(*id)?;
             }
             self.writer.write_all(&[0])?;
-            clear_pending_deletions(&mut deletions);
+            self.recycle_pending_deletions(&mut deletions);
             self.pending_deletions = deletions;
         } else {
             // Text format: "step_id d id1 id2 ... 0"
@@ -259,10 +321,22 @@ impl<W: Write> LratWriter<W> {
                 build_text_delete_line(line, del_id, &self.pending_deletions)
             })?;
             self.latest_id = del_id;
-            clear_pending_deletions(&mut self.pending_deletions);
+            if self.max_pending_deletions.is_some() {
+                self.pending_deletions.clear();
+            } else {
+                clear_pending_deletions(&mut self.pending_deletions);
+            }
         }
 
         Ok(())
+    }
+
+    fn recycle_pending_deletions(&self, deletions: &mut Vec<u64>) {
+        if self.max_pending_deletions.is_some() {
+            deletions.clear();
+        } else {
+            clear_pending_deletions(deletions);
+        }
     }
 
     /// Log addition of a learned clause with resolution hints.
@@ -497,6 +571,89 @@ impl<W: Write> LratWriter<W> {
         }
     }
 
+    /// Emit a caller-prevalidated positive-RUP addition without repeating
+    /// whole-hint scans. The bounded ResolutionDag producer has already
+    /// enforced nonzero/unique/known hints under its deadline and count caps.
+    pub(crate) fn add_bounded_prevalidated_rup(
+        &mut self,
+        clause: &[Literal],
+        hints: &[u64],
+    ) -> io::Result<u64> {
+        if self.io_failed {
+            return Ok(0);
+        }
+        if let Err(error) = self.flush_deletions() {
+            self.io_failed = true;
+            return Err(error);
+        }
+        let id = self.next_id;
+        if id > i64::MAX as u64 {
+            self.io_failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LRAT clause ID exceeds the signed/binary encoding limit",
+            ));
+        }
+        let result = if self.binary {
+            self.write_binary_add(id, clause, hints)
+        } else {
+            self.write_text_add(id, clause, hints)
+        };
+        match result {
+            Ok(()) => {
+                self.next_id = id + 1;
+                self.io_failed |= self.next_id > i64::MAX as u64;
+                self.latest_id = id;
+                self.added_count += 1;
+                Ok(id)
+            }
+            Err(error) => {
+                self.io_failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Emit a pre-assigned caller-prevalidated positive-RUP addition without
+    /// generic RAT/duplicate preflight allocation or scans.
+    pub(crate) fn add_with_id_bounded_prevalidated_rup(
+        &mut self,
+        clause_id: u64,
+        clause: &[Literal],
+        hints: &[i64],
+    ) -> io::Result<()> {
+        if self.io_failed {
+            return Ok(());
+        }
+        if clause_id == 0
+            || clause_id > i64::MAX as u64
+            || clause_id >= self.next_id
+            || clause_id <= self.latest_id
+        {
+            self.io_failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid or non-monotonic pre-assigned bounded LRAT addition",
+            ));
+        }
+        let result = if self.binary {
+            self.write_binary_add_i64_hints(clause_id, clause, hints)
+        } else {
+            self.write_text_add_i64_hints(clause_id, clause, hints)
+        };
+        match result {
+            Ok(()) => {
+                self.latest_id = clause_id;
+                self.added_count += 1;
+                Ok(())
+            }
+            Err(error) => {
+                self.io_failed = true;
+                Err(error)
+            }
+        }
+    }
+
     /// Write addition in text format: "id lit1 lit2 ... 0 hint1 hint2 ... 0"
     fn write_text_add(&mut self, id: u64, clause: &[Literal], hints: &[u64]) -> io::Result<()> {
         let needed = lrat_text_add_capacity_estimate(clause.len(), hints.len());
@@ -568,6 +725,56 @@ impl<W: Write> LratWriter<W> {
         );
         if self.io_failed {
             return Ok(());
+        }
+        if let Some(limit) = self.max_pending_deletions {
+            let attempted = self.pending_deletions.len().checked_add(1).ok_or_else(|| {
+                self.fail_bounded_resource(LratBoundedResourceFailure::PendingDeletionLimit {
+                    limit,
+                    attempted: usize::MAX,
+                });
+                io::Error::other("bounded LRAT pending-deletion count overflow")
+            })?;
+            if attempted > limit {
+                self.fail_bounded_resource(LratBoundedResourceFailure::PendingDeletionLimit {
+                    limit,
+                    attempted,
+                });
+                return Err(io::Error::other(
+                    "bounded LRAT pending-deletion limit exceeded",
+                ));
+            }
+            if self.pending_deletions.len() == self.pending_deletions.capacity() {
+                let current = self.pending_deletions.capacity();
+                let target = if current == 0 {
+                    LRAT_PENDING_DELETIONS_INITIAL_CAPACITY.min(limit)
+                } else {
+                    current.saturating_mul(2).min(limit)
+                }
+                .max(attempted);
+                if self
+                    .pending_deletions
+                    .try_reserve_exact(target - self.pending_deletions.len())
+                    .is_err()
+                {
+                    self.fail_bounded_resource(
+                        LratBoundedResourceFailure::PendingDeletionAllocation,
+                    );
+                    return Err(io::Error::other(
+                        "bounded LRAT pending-deletion allocation failed",
+                    ));
+                }
+                if self.pending_deletions.capacity() > limit {
+                    let actual = self.pending_deletions.capacity();
+                    self.pending_deletions = Vec::new();
+                    self.fail_bounded_resource(LratBoundedResourceFailure::PendingDeletionLimit {
+                        limit,
+                        attempted: actual,
+                    });
+                    return Err(io::Error::other(
+                        "bounded LRAT allocator exceeded pending-deletion limit",
+                    ));
+                }
+            }
         }
         self.deleted_count += 1;
         self.pending_deletions.push(clause_id);
@@ -693,6 +900,11 @@ impl<W: Write> LratWriter<W> {
     /// Returns true if any I/O error occurred during proof writing
     pub fn has_io_error(&self) -> bool {
         self.io_failed
+    }
+
+    /// Return the first bounded pending-deletion resource failure.
+    pub(crate) fn bounded_resource_failure(&self) -> Option<LratBoundedResourceFailure> {
+        self.bounded_resource_failure
     }
 
     #[cfg(test)]

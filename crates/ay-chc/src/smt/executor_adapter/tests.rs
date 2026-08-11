@@ -39,21 +39,43 @@ fn test_quote_symbol_matches_ay_core_on_reserved_words() {
     }
 }
 
-/// Verify that `quote_symbol` (now delegating to `ay_core::quote_symbol`)
-/// correctly sanitizes pipe characters inside names.
+/// Verify that `quote_symbol` (delegating to `ay_core::quote_symbol`) renders
+/// pipe- and backslash-containing names LOSSLESSLY.
+///
+/// This used to pin `"|a_b|"` — substitution — which CONFLATES distinct user
+/// symbols: `a|b` and `a_b` both become `a_b`, so two different predicates
+/// print as one. `ay_core` switched to escaping, which AY's own reader accepts
+/// (verified round-trip) and which Z3 accepts; the test was not updated with
+/// it and pinned the abandoned contract.
+///
+/// What matters here is the property, not the spelling: the rendering must be
+/// pipe-quoted and INJECTIVE, so assert that distinct names stay distinct
+/// rather than re-hardcoding one expected string.
 #[test]
 fn test_quote_symbol_matches_ay_core_on_pipe_chars() {
-    let name = "a|b";
-    let local = quote_symbol(name);
-    let core = ay_core::quote_symbol(name);
-    assert_eq!(
-        local, core,
-        "quote_symbol should match ay_core for pipe-containing name"
+    for name in ["a|b", "a\\b", "a\\|b"] {
+        assert_eq!(
+            quote_symbol(name),
+            ay_core::quote_symbol(name),
+            "quote_symbol should delegate to ay_core for {name:?}"
+        );
+        let quoted = quote_symbol(name);
+        assert!(
+            quoted.starts_with('|') && quoted.ends_with('|'),
+            "{name:?} needs quoting: got {quoted:?}"
+        );
+    }
+    // Injectivity is the load-bearing property: the previous underscore
+    // substitution collapsed these two onto the same rendering.
+    assert_ne!(
+        quote_symbol("a|b"),
+        quote_symbol("a_b"),
+        "distinct symbols must not render identically"
     );
-    // Pipe chars should be sanitized to underscores inside pipe-quoted name.
-    assert_eq!(
-        local, "|a_b|",
-        "pipe char should be sanitized: got {local:?}"
+    assert_ne!(
+        quote_symbol("a|b"),
+        quote_symbol("a\\b"),
+        "distinct symbols must not render identically"
     );
 }
 
@@ -1734,4 +1756,63 @@ fn test_parse_simple_value_beyond_i128() {
         parse_simple_value(&format!("Int (- {min_magnitude}))")),
         Some(SmtValue::Int(i128::MIN))
     );
+}
+
+/// `Solver::try_new*` dispatches its own `set-logic`, so a script that keeps
+/// one makes it the SECOND — which the elaborator rejects for z3 parity
+/// (`118630ef6`). Callers must therefore hand construction the script's own
+/// logic and strip the command; when they did not, `parse_smtlib2` failed and
+/// the error was swallowed into a bare `None`, surfacing as checked replay
+/// reporting "did not produce a native strict-Alethe UNSAT certificate".
+#[test]
+fn split_leading_set_logic_takes_the_declared_logic_and_removes_the_command() {
+    use ay_dpll::api::Logic;
+
+    let (logic, body) = super::split_leading_set_logic(
+        "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (> x 0))\n",
+        Logic::All,
+    );
+    assert_eq!(logic, Logic::QfLia, "the script's own logic must be used");
+    assert!(
+        !body.contains("set-logic"),
+        "the command must be stripped so the constructor's is the only one: {body}"
+    );
+    assert!(
+        body.contains("(assert (> x 0))"),
+        "body must survive: {body}"
+    );
+
+    // Only the FIRST is removed — a genuine second one is a real error and must
+    // still reach the elaborator.
+    let (_, two) = super::split_leading_set_logic(
+        "(set-logic QF_LIA)\n(set-logic QF_UF)\n(assert true)\n",
+        Logic::All,
+    );
+    assert!(
+        two.contains("(set-logic QF_UF)"),
+        "second must survive: {two}"
+    );
+}
+
+#[test]
+fn split_leading_set_logic_falls_back_and_leaves_unrecognized_input_alone() {
+    use ay_dpll::api::Logic;
+
+    // No declaration: caller's fallback, script untouched.
+    let script = "(declare-fun x () Int)\n(assert (> x 0))\n";
+    let (logic, body) = super::split_leading_set_logic(script, Logic::QfLia);
+    assert_eq!(logic, Logic::QfLia);
+    assert_eq!(body, script);
+
+    // Not the `(set-logic <token>)` shape — pass through verbatim rather than
+    // silently altering a script we do not understand.
+    for odd in [
+        "(set-logicQF_LIA)\n(assert true)\n",
+        "(set-logic (weird))\n(assert true)\n",
+        "(set-logic\n",
+    ] {
+        let (logic, body) = super::split_leading_set_logic(odd, Logic::QfLia);
+        assert_eq!(logic, Logic::QfLia, "must fall back on {odd:?}");
+        assert_eq!(body, odd, "must be untouched: {odd:?}");
+    }
 }

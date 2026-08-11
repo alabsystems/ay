@@ -19,6 +19,8 @@ use ay_maxsat::{MaxSatResult, MaxSatSolver};
 use clap::Subcommand;
 use serde::Serialize;
 
+use crate::maxsat_cert;
+
 const EMBEDDED_OOM_GUARD: &str = include_str!("../../../scripts/_oom_guard.py");
 const MAXSAT_WATCHDOG_SERVER_READY: &[u8] = b"AY_OOM_WATCHDOG_SERVER_READY_V1\n";
 const MAXSAT_WATCHDOG_SERVER_MAX_LINE: u64 = 4096;
@@ -1284,14 +1286,28 @@ struct MaxSatCapture {
 }
 
 impl MaxSatCapture {
-    fn start<R>(mut reader: R) -> Self
+    fn start<R>(reader: R) -> Self
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        Self::start_capped(reader, MAXSAT_CAPTURE_BYTES)
+    }
+
+    /// [`start`](Self::start) with an explicit cap.
+    ///
+    /// The 32MiB default is sized for a solver's `v`-line, which is one token
+    /// per variable; a startup probe against a two-variable formula wants a far
+    /// smaller reservation, because `start` pre-allocates the whole cap up
+    /// front (`Vec::with_capacity` + `VecDeque::with_capacity`) and this host
+    /// is under chronic memory pressure.
+    fn start_capped<R>(mut reader: R, cap: usize) -> Self
     where
         R: std::io::Read + Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let head_cap = MAXSAT_CAPTURE_BYTES / 2;
-            let tail_cap = MAXSAT_CAPTURE_BYTES - head_cap;
+            let head_cap = cap / 2;
+            let tail_cap = cap - head_cap;
             let mut head = Vec::with_capacity(head_cap);
             let mut tail = VecDeque::with_capacity(tail_cap);
             let mut total = 0usize;
@@ -1315,7 +1331,7 @@ impl MaxSatCapture {
                     tail.push_back(*byte);
                 }
             }
-            let truncated = total > MAXSAT_CAPTURE_BYTES;
+            let truncated = total > cap;
             if !tail.is_empty() {
                 if truncated {
                     head.extend_from_slice(b"\n[... output truncated ...]\n");
@@ -1334,6 +1350,144 @@ impl MaxSatCapture {
     }
 }
 
+/// Wall-clock budget for ONE certificate-lane startup probe.
+///
+/// The probes run a two-variable formula against a six-line proof; the pinned
+/// checker answers in ~0.06s. 60s is three orders of magnitude of slack and
+/// still a bound — the point is that a checker which hangs cannot hold the
+/// host-wide MaxSAT lease open forever before the sweep has even started.
+const CERT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Capture cap for one startup probe. The expected output is two lines; this
+/// is enough slack for a stack trace and small enough to allocate three times
+/// in a row without noticing.
+const CERT_PROBE_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// What one bounded startup probe produced.
+#[derive(Debug)]
+pub(crate) struct CertProbeOutput {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// Run a certificate-lane STARTUP probe under the same discipline every other
+/// spawn in this file gets.
+///
+/// `maxsat_cert`'s `--version` cross-check and its two self-test probes used
+/// plain `Command::output()`: no deadline, no process group, no bound on the
+/// captured bytes. They run while the host-wide exclusive MaxSAT lease is held
+/// and before a single instance has been spawned, so a checker that hangs or
+/// spews there stalls or bloats the whole campaign. This wrapper gives them
+/// their own process group (so a group-wide SIGKILL reaps descendants), a
+/// bounded in-memory capture, and a wall-clock deadline.
+///
+/// What it deliberately does NOT do is borrow the oom-guard RSS envelope:
+/// `MaxSatResources::watch` requires the per-instance SIGSTOP handshake and a
+/// registered watchdog server, which is machinery for a 3600s solve, not for a
+/// 0.06s probe against a two-variable formula. The deadline plus the group kill
+/// is the discipline that is meaningful at this size.
+///
+/// # Errors
+/// The spawn failed, the wait failed, or the probe outlived its budget (in
+/// which case its process group has already been killed).
+pub(crate) fn run_cert_probe(
+    program: &Path,
+    args: &[&std::ffi::OsStr],
+) -> std::result::Result<CertProbeOutput, String> {
+    run_cert_probe_bounded(program, args, CERT_PROBE_TIMEOUT, CERT_PROBE_CAPTURE_BYTES)
+}
+
+/// [`run_cert_probe`] with the two bounds passed in.
+///
+/// The bounds are parameters rather than baked-in constants so the tests can
+/// prove they BITE: a 60s deadline and a 64KiB cap are correct for the sweep
+/// and untestable in a unit test, and a bound nothing exercises is how "it is
+/// bounded" becomes a claim instead of a property.
+pub(crate) fn run_cert_probe_bounded(
+    program: &Path,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    capture_bytes: usize,
+) -> std::result::Result<CertProbeOutput, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    isolate_maxsat_process_group(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot execute `{}`: {error}", program.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| MaxSatCapture::start_capped(pipe, capture_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| MaxSatCapture::start_capped(pipe, capture_bytes));
+
+    let start = Instant::now();
+    let mut wait_error: Option<String> = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                wait_error = Some(error.to_string());
+                break None;
+            }
+        }
+    };
+    // Reap the GROUP on every exit path, not only on the timeout. A checker
+    // that answers promptly while leaving a child, a helper or a wrapper
+    // running leaks it into a sweep that is about to spawn `jobs` solvers
+    // beside it; this host has kernel-panicked twice from over-subscription,
+    // and `run_certificate_checker` already kills unconditionally for exactly
+    // this reason. The status the loop observed is the one reported: a probe
+    // that outlived its budget must stay an error, not become whatever the kill
+    // returned.
+    //
+    // RESIDUAL WINDOW, stated rather than waved away: when `try_wait` has
+    // already reaped the leader AND no survivor holds the group, the pgid is
+    // free and could in principle name a recycled group by the time we signal.
+    // Closing that properly needs a no-reap poll (`waitid(WNOWAIT)`), signal,
+    // then reap — machinery this 0.06s probe does not justify. The window is
+    // the microseconds between reaping and signalling, and requires the kernel
+    // to wrap the whole pid space inside it. We take that over the alternative,
+    // because the failure it prevents is a leaked checker process running
+    // beside `jobs` solvers on a host that has kernel-panicked twice, and that
+    // one is not hypothetical.
+    terminate_maxsat_process_group_with_status(&mut child);
+    let collect =
+        |capture: Option<MaxSatCapture>| capture.map(MaxSatCapture::finish).unwrap_or_default().0;
+    let captured_stdout = collect(stdout);
+    let captured_stderr = collect(stderr);
+
+    if let Some(error) = wait_error {
+        return Err(format!("cannot wait for `{}`: {error}", program.display()));
+    }
+    let Some(status) = status else {
+        return Err(format!(
+            "`{}` exceeded its {:.0}s probe budget and its process group was killed",
+            program.display(),
+            timeout.as_secs_f64()
+        ));
+    };
+    Ok(CertProbeOutput {
+        code: status.code(),
+        stdout: captured_stdout,
+        stderr: captured_stderr,
+    })
+}
+
 /// MaxSAT solving commands.
 #[derive(Subcommand)]
 pub(crate) enum MaxSatCommand {
@@ -1342,6 +1496,27 @@ pub(crate) enum MaxSatCommand {
     /// Run a corpus of WCNF instances and score against reference data.
     Bench(MaxSatBenchArgs),
 }
+
+/// #bench-giant-gate: giant instances (multi-million-clause families like
+/// abstraction-refinement) can push a single solver process to several GB, and
+/// the name-sorted queue clusters same-family giants onto concurrent workers.
+/// Above this size the bench loop limits how many may run at once.
+///
+/// It is also the ceiling the certificate size guard is sized against — see
+/// [`PROOF_MAX_INSTANCE_MIB_DEFAULT`].
+const GIANT_INSTANCE_BYTES: u64 = 80 * 1024 * 1024;
+
+/// Default `--proof-max-instance-mib`.
+///
+/// MEASURED expansion, on disk, per armed row: a 43,020,161-byte `.wcnf`
+/// produced a 71,989,226-byte `.opb` plus a 7,059,974-byte `.pbp` — 79,049,200
+/// bytes, 1.84x the input. The default is chosen so that an instance the guard
+/// ADMITS still lands under [`GIANT_INSTANCE_BYTES`] of artifacts: 40MiB of
+/// `.wcnf` is ~73.5MiB of `.opb` + `.pbp`, just inside the 80MiB at which the
+/// OOM guard already special-cases an instance. `proof_size_guard_default_*`
+/// pins that arithmetic; raising the default without re-deriving it puts a
+/// giant's worth of artifacts on a 24GB host that has kernel-panicked twice.
+const PROOF_MAX_INSTANCE_MIB_DEFAULT: u64 = 40;
 
 /// Arguments for `ay maxsat solve`.
 #[derive(clap::Args)]
@@ -1357,6 +1532,11 @@ pub(crate) struct MaxSatSolveArgs {
     /// families (facility-location / MPE / auctions) where OLL stalls.
     #[arg(long)]
     pub milp: bool,
+    /// Write a VeriPB certificate of the reported answer to `<STEM>.opb` and
+    /// `<STEM>.opb.pbp`. Emission is write-only: it can refuse to certify (which
+    /// raises an alarm) but never changes the answer AY reports.
+    #[arg(long, value_name = "STEM")]
+    pub proof: Option<PathBuf>,
 }
 
 /// Arguments for `ay maxsat bench`.
@@ -1387,6 +1567,38 @@ pub(crate) struct MaxSatBenchArgs {
     /// Skip re-verifying reported models against the instance.
     #[arg(long)]
     pub no_verify: bool,
+    /// Certify every reported optimum: ask the solver child for a VeriPB
+    /// certificate and check it with the pinned checker before the row is
+    /// scored. OFF by default. A certified sweep writes a multi-MB `.opb` per
+    /// instance (36MB for a 1,035,351-constraint one) and pays for that
+    /// emission inside the measured `seconds`, so its PAR2 and solved count are
+    /// DELIBERATELY pessimistic — campaign numbers come from the uncertified
+    /// lane. Certification can only downgrade a row or annotate it; it can
+    /// never turn a non-optimum into an optimum.
+    #[arg(long)]
+    pub proof_check: bool,
+    /// Directory for certificate artifacts. Default: a per-run scratch
+    /// directory under the system temp dir, removed when the sweep ends.
+    /// Point this at a large volume when certifying the full corpus.
+    #[arg(long, value_name = "DIR", requires = "proof_check")]
+    pub proof_dir: Option<PathBuf>,
+    /// Skip certification for instances above this size (MiB; 0 = no cap).
+    /// The artifacts are BIGGER than the `.wcnf`, not "roughly its size":
+    /// measured, a 43,020,161-byte `.wcnf` produced a 71,989,226-byte `.opb`
+    /// plus a 7,059,974-byte `.pbp` — 1.84x the input, on disk, for every armed
+    /// row. The default is therefore 40MiB of `.wcnf`, which is ~74MiB of
+    /// artifacts: just under `GIANT_INSTANCE_BYTES` (80MiB), the size at which
+    /// the OOM guard already special-cases an instance. The checker's RSS is
+    /// also not in the resource plan (`MaxSatResources::plan`) — it borrows the
+    /// solver's slot after the solver exits. Skips are annotated per row and
+    /// counted in the summary; they are never silently recorded as verified.
+    #[arg(
+        long,
+        value_name = "MIB",
+        default_value_t = PROOF_MAX_INSTANCE_MIB_DEFAULT,
+        requires = "proof_check"
+    )]
+    pub proof_max_instance_mib: u64,
     /// Benchmark an external solver instead of AY: "NAME=CMD" where CMD is
     /// a program plus arguments; "{file}" in CMD is replaced by the
     /// instance path (appended if absent). The same wall-clock timeout,
@@ -1401,6 +1613,89 @@ pub(crate) fn run(cmd: &MaxSatCommand) -> Result<i32> {
         MaxSatCommand::Solve(args) => solve(args),
         MaxSatCommand::Bench(args) => bench(args),
     }
+}
+
+/// Solve Z3's `-wcnf` input mode and emit its compact optimization transcript.
+///
+/// This is deliberately separate from the MaxSAT-competition surface: the
+/// latter emits `o`/`s`/`v` records and competition exit codes, while Z3's
+/// shell emits an SMT-style verdict followed by the optimum value.
+pub(crate) fn run_z3_compat(
+    path: Option<&Path>,
+    use_stdin: bool,
+    display_model: bool,
+    display_stats: bool,
+    timeout_ms: Option<u64>,
+) -> Result<i32> {
+    let mut solver = MaxSatSolver::new();
+    let mut has_objective = false;
+    let mut install = |weight: Option<u64>, literals: &[i32]| -> Result<()> {
+        match weight {
+            Some(weight) => {
+                has_objective = true;
+                solver.add_soft_clause(literals.to_vec(), weight);
+            }
+            None => solver.add_hard_clause(literals.to_vec()),
+        }
+        Ok(())
+    };
+    let summary = if use_stdin {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        stream_wcnf_reader(&mut input, &mut install).context("reading WCNF stdin")?
+    } else {
+        let path = path.context("input file was not specified")?;
+        stream_wcnf_file(path, &mut install)
+            .with_context(|| format!("failed to parse '{}'", path.display()))?
+    };
+    drop(install);
+
+    let deadline = timeout_ms
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
+    solver.set_deadline(deadline);
+    let result = solver.solve();
+    match result {
+        MaxSatResult::Optimal { model, cost } => {
+            println!("sat");
+            if display_stats {
+                emit_z3_compat_stats(&solver);
+            }
+            if display_model {
+                emit_z3_compat_model(summary.num_vars, &model);
+            }
+            if has_objective {
+                println!("   {cost}");
+            }
+        }
+        MaxSatResult::Unsatisfiable => {
+            println!("unsat");
+            if display_stats {
+                emit_z3_compat_stats(&solver);
+            }
+        }
+        MaxSatResult::Unknown => {
+            println!("unknown");
+            if display_stats {
+                emit_z3_compat_stats(&solver);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn emit_z3_compat_model(num_vars: usize, model: &[bool]) {
+    for variable in (1..=num_vars).rev() {
+        let value = model.get(variable).copied().unwrap_or(false);
+        println!("(define-fun k!{variable} () Bool");
+        println!("  {value})");
+    }
+}
+
+fn emit_z3_compat_stats(solver: &MaxSatSolver) {
+    let stats = solver.stats();
+    println!("sat decisions: {}", stats.sat_calls);
+    println!("time:                0.00 secs");
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,6 +1728,26 @@ const MILP_RACE_MAX_VARS: usize = 100_000;
 /// cuts race-thread CPU contention at bench jobs=10.
 const MILP_RACE_MAX_HARDS: usize = 150_000;
 const MILP_RACE_MAX_SOFTS: usize = 100_000;
+/// #milp-race-tall: the hard-clause cap above is a PROXY for MILP cost, but
+/// simplex cost is driven by COLUMNS, not rows. This gate's own cited evidence
+/// says so: the confirmed wins are auctions (152 cols) and warehouses (5,200
+/// cols), while the cited failure css-refactoring guardian has **18,036 cols**
+/// — its 259k rows came with a large column space. A TALL-THIN model (few
+/// columns, many rows) is a different animal: the simplex works in the column
+/// space and Kemeny-style LP relaxations over such models are tight.
+///
+/// Measured on MSE2024 exact-weighted: `judgment-aggregation/ja-kemeny` is
+/// 1,596 columns x 175,560 rows — FEWER columns than warehouses, a confirmed
+/// win — yet the row cap excludes it. AY solves **0 of 15** judgment instances
+/// while the field takes the easiest in 3.5s. `af-synthesis` is the same shape
+/// (17k-21k cols, 236k-302k rows) and AY solves 0 of those too. Together they
+/// are 26 of the instances AY needs to win MSE2024.
+///
+/// So: admit tall-thin models on a COLUMN criterion, keeping the row cap for
+/// column-heavy ones. The row bound here matches the 600k figure UWrMaxSat
+/// itself allows (see the comment above) and bounds streaming memory.
+const MILP_RACE_TALL_MAX_VARS: usize = 25_000;
+const MILP_RACE_TALL_MAX_HARDS: usize = 600_000;
 /// Numeric gate (MsSolver.cc:767): total soft weight must fit f64-coefficient
 /// arithmetic with headroom (2^49 = 53-bit mantissa minus 4 safety bits).
 const MILP_RACE_MAX_WEIGHT_SUM: u64 = 1 << 49;
@@ -1444,16 +1759,33 @@ const MILP_RACE_DELAY_SECS: f64 = 3.0;
 /// If no OLL incumbent has appeared by this point, launch unseeded anyway.
 const MILP_RACE_UB_WAIT_SECS: f64 = 6.0;
 
-/// Opt-in: `AY_AB_MAXSAT_MILP_RACE=1` enables the race lane. DEFAULT OFF for
-/// the bench protocol: at `bench --jobs 10` on a 14-core box the extra
-/// threads oversubscribe and cost ~7 borderline (20-50s) solves for ~2
-/// MILP wins (full-track attribution legs, 2026-07-19: bundle3 296 with race
-/// vs norace 298). In a competition setting (one instance per machine) the
-/// second thread is free — enable it there.
+/// **DEFAULT ON** (`AY_AB_MAXSAT_MILP_RACE=0` disables it).
+///
+/// This lane used to be opt-in, and the justification was a BENCH-PROTOCOL
+/// measurement: at `bench --jobs 10` on a 14-core box the extra threads
+/// oversubscribe and cost ~7 borderline (20-50s) solves for ~2 MILP wins
+/// (2026-07-19: bundle3 296 with race vs 298 without). That measurement is
+/// correct and it is also the WRONG CONDITION for the thing that matters — the
+/// same comment already said so: *"In a competition setting (one instance per
+/// machine) the second thread is free — enable it there."* Nobody did, because
+/// it needed a flag, so the capability was dead where it counted.
+///
+/// Measured at jobs=1 on `judgment-aggregation-ja-kemeny-preflib-00049-00000405`
+/// (175,560 hards / 1,596 vars, optimum 504), 300s:
+///   race ON  -> `s OPTIMUM FOUND`, o 504  (CORRECT)
+///   race OFF -> `s UNKNOWN`,       o 516  (stalls; cannot prove)
+/// AY solves 0 of 15 judgment instances without it. The LP relaxation of a
+/// Kemeny-style instance is tight, and OLL's `lb += w_min` convergence over
+/// hundreds of tiny cores is not — this lane supplies the bound OLL cannot
+/// reach on its own.
+///
+/// Contention is a property of the HARNESS, not of the solver, so the harness
+/// disables it (`AY_AB_MAXSAT_MILP_RACE=0`) rather than every competition run
+/// having to remember to switch it on. Correct by default; opt OUT for bench.
 fn maxsat_milp_race_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_MILP_RACE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_MILP_RACE").as_deref() != Ok("0"))
 }
 
 /// A race-lane verdict, produced by the MILP worker thread.
@@ -1732,6 +2064,7 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     // is unaffected).
     let race_wanted = maxsat_milp_race_enabled() && deadline.is_some();
     let mut race_hard: Vec<Vec<i32>> = Vec::new();
+    let mut race_hard_seen: std::collections::HashSet<Vec<i32>> = std::collections::HashSet::new();
     let mut race_soft: Vec<(u64, Vec<i32>)> = Vec::new();
     let mut race_weight_sum: u64 = 0;
     let mut race_ok = race_wanted;
@@ -1741,7 +2074,21 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
         match weight {
             None => {
                 if race_ok {
-                    if race_hard.len() < MILP_RACE_MAX_HARDS {
+                    // #hard-dedup: count DISTINCT hard clauses, not raw rows.
+                    // The engine dedups hards at install (oll.rs), so the model
+                    // this lane would build has the distinct count — gating on
+                    // the raw stream rejects instances for rows that do not
+                    // survive normalisation. Measured: judgment-aggregation
+                    // ja-kemeny streams 1,560,780 rows but is 520,260 distinct
+                    // (every hard appears exactly 3x), i.e. comfortably inside
+                    // the tall cap it was being rejected by.
+                    let mut key = lits.to_vec();
+                    key.sort_unstable();
+                    key.dedup();
+                    let fresh = race_hard_seen.insert(key);
+                    if !fresh {
+                        // duplicate: already modelled
+                    } else if race_hard.len() < MILP_RACE_TALL_MAX_HARDS {
                         race_hard.push(lits.to_vec());
                     } else {
                         race_ok = false;
@@ -1771,8 +2118,16 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     })
     .with_context(|| format!("failed to parse '{}'", args.file.display()))?;
     let num_vars = summary.num_vars;
-    if num_vars >= MILP_RACE_MAX_VARS {
+    // #milp-race-tall: eligible if EITHER the original column-and-row gate
+    // passes, OR the model is tall-thin (few columns, many rows) — see
+    // MILP_RACE_TALL_MAX_VARS.
+    let standard_ok = num_vars < MILP_RACE_MAX_VARS && race_hard.len() < MILP_RACE_MAX_HARDS;
+    let tall_ok =
+        num_vars <= MILP_RACE_TALL_MAX_VARS && race_hard.len() <= MILP_RACE_TALL_MAX_HARDS;
+    if !(standard_ok || tall_ok) {
         race_ok = false;
+        race_hard = Vec::new();
+        race_soft = Vec::new();
     }
     // Weighted instances only: on uniform-weight (unweighted-style) instances
     // the OLL engine's cardinality reasoning dominates any 0/1-LP relaxation
@@ -1829,11 +2184,39 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     solver.set_deadline(deadline);
     match solver.solve_interruptible(&should_stop, &mut on_upper_bound) {
         MaxSatResult::Optimal { model, cost } => {
+            // #answer-audit: never claim an optimum without re-checking the
+            // model against the instance. A wrong answer is disqualifying, so a
+            // failed audit downgrades to UNKNOWN rather than emitting.
+            if let Some(reason) = audit_reported_answer(&args.file, &model, cost) {
+                eprintln!("c SOUNDNESS-ALARM[{reason}]");
+                eprintln!(
+                    "c SOUNDNESS-ALARM: refusing to report OPTIMUM; downgrading to \
+                     UNKNOWN. An unsolved instance costs one solve, a wrong answer \
+                     is disqualifying."
+                );
+                println!("s UNKNOWN");
+                return Ok(0);
+            }
             if last_printed != Some(cost) {
                 println!("o {cost}");
             }
             println!("s OPTIMUM FOUND");
             print_assignment(num_vars, &model);
+            // Emission runs LAST, after the answer is on stdout. It happens
+            // inside the child's RSS envelope and inside the bench harness's
+            // kill grace, and a 36MB `.opb` is not instant: with emission
+            // first, a SIGKILL mid-write destroyed the ANSWER (stdout never
+            // reached `s OPTIMUM FOUND`, so the harness fell through to its
+            // `_` arm and recorded a TIMEOUT). Printing first makes such a kill
+            // cost the certificate instead — and a missing certificate is
+            // exactly what the bench lane's Unvalidated branch is for.
+            emit_proof_if_requested(
+                args,
+                &model,
+                cost,
+                solver.paid_mined_cores(),
+                solver.paid_sat_cores(),
+            );
             Ok(30)
         }
         MaxSatResult::Unsatisfiable => {
@@ -1852,18 +2235,38 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                     if oll_better {
                         eprintln!("c milp-race: DISCARDED Exact({cost}) — OLL incumbent is better");
                     } else {
+                        // #answer-audit: the same gate as the OLL path. A
+                        // cross-lane optimum is not exempt — it is the lane
+                        // with the LEAST coverage, and it is now default-on.
+                        if let Some(reason) = audit_reported_answer(&args.file, &model, cost) {
+                            eprintln!("c SOUNDNESS-ALARM[milp-race-exact/{reason}]");
+                            println!("s UNKNOWN");
+                            return Ok(0);
+                        }
                         if last_printed != Some(cost) {
                             println!("o {cost}");
                         }
                         println!("s OPTIMUM FOUND");
                         print_assignment(num_vars, &model);
                         eprintln!("c milp-race: optimum {cost} proven by MILP lane");
+                        // Answer first, certificate second — see the OLL
+                        // OPTIMUM site above. The race lane is DEFAULT ON, so
+                        // this reorder matters as much as that one: a SIGKILL
+                        // landing in the middle of a 74MiB `.opb` write must
+                        // cost the certificate, never the answer.
+                        emit_proof_if_requested(args, &model, cost, &[], &[]);
                         return Ok(30);
                     }
                 }
                 Some(MilpRaceWin::CutoffProof { optimum }) => {
                     if let Some((cost, model)) = solver.best_solution() {
                         if cost == optimum {
+                            // #answer-audit: same gate (see :1931).
+                            if let Some(reason) = audit_reported_answer(&args.file, model, cost) {
+                                eprintln!("c SOUNDNESS-ALARM[milp-race-cutoff/{reason}]");
+                                println!("s UNKNOWN");
+                                return Ok(0);
+                            }
                             if last_printed != Some(cost) {
                                 println!("o {cost}");
                             }
@@ -1872,6 +2275,11 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                             eprintln!(
                                 "c milp-race: OLL incumbent {cost} proven optimal by MILP cutoff"
                             );
+                            // Answer first, certificate second — see the OLL
+                            // OPTIMUM site above.
+                            // (mined cores live behind the same &mut borrow as
+                            // `model` here; the M0 interval is still emitted)
+                            emit_proof_if_requested(args, model, cost, &[], &[]);
                             return Ok(30);
                         }
                         eprintln!(
@@ -1890,11 +2298,27 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                 None => {}
             }
             if let Some((cost, model)) = solver.best_solution() {
+                // The anytime certificate. This is the case `--proof` exists
+                // for: AY holds a model it cannot prove optimal, and the
+                // emitted `lo <= obj <= cost` interval says exactly that —
+                // the incumbent is checked in full, and the interval does not
+                // claim optimality unless the mined-core floor happens to meet
+                // it, in which case the checker has proven it independently.
                 if last_printed != Some(cost) {
                     println!("o {cost}");
                 }
                 println!("s UNKNOWN");
                 print_assignment(num_vars, model);
+                // Answer first, certificate second — see the OPTIMUM site
+                // above. This path matters most: it is the one a bench sweep
+                // hits hundreds of times, always within the kill grace.
+                emit_proof_if_requested(
+                    args,
+                    model,
+                    cost,
+                    solver.paid_mined_cores(),
+                    solver.paid_sat_cores(),
+                );
             } else {
                 println!("s UNKNOWN");
             }
@@ -1926,7 +2350,13 @@ fn print_assignment(num_vars: usize, model: &[bool]) {
 ///   soft w (l1..lk)  -> binary r; row Σ lit + r >= 1; objective += w·r
 ///   minimize Σ w·r   == weighted-MaxSAT cost.
 /// ay-milp uses exact rational arithmetic, so a proven `Optimal` is the exact
-/// optimum — safe to report (bench still re-verifies model + optimum).
+/// optimum of THE MODEL IT WAS GIVEN. That is not the same as being safe to
+/// report: the encoding, the objective offset and the variable mapping all sit
+/// between the instance and that model. The previous wording here — "safe to
+/// report (bench still re-verifies model + optimum)" — is the same reasoning
+/// that let `o 3477` ship against a true optimum of 3366: verification that
+/// only runs in the bench harness does not run at competition. The emission
+/// below is audited like every other.
 fn milp_solve(args: &MaxSatSolveArgs) -> Result<i32> {
     use ay_milp::{BabSession, Outcome, SolveOpts};
     use num_traits::ToPrimitive;
@@ -1970,8 +2400,6 @@ fn milp_solve(args: &MaxSatSolveArgs) -> Result<i32> {
             ..
         } => {
             let cost = value.to_integer();
-            println!("o {cost}");
-            println!("s OPTIMUM FOUND");
             let mut shifted = vec![false; num_vars + 1];
             for v in 0..num_vars {
                 shifted[v + 1] = model_values
@@ -1979,11 +2407,38 @@ fn milp_solve(args: &MaxSatSolveArgs) -> Result<i32> {
                     .and_then(ToPrimitive::to_f64)
                     .is_some_and(|f| f > 0.5);
             }
+            // #answer-audit: build the model BEFORE claiming anything, then
+            // check it against the instance on disk. Exact rational arithmetic
+            // inside the MILP says nothing about the encoding around it.
+            //
+            // This lane carries cost as a BigInt while the rest of the pipeline
+            // is u64. A cost that does not fit u64 cannot be a MaxSAT weight sum
+            // for any instance this binary can parse, so it is itself an alarm
+            // rather than a reason to skip the check.
+            let Some(c) = cost.to_u64() else {
+                eprintln!(
+                    "c SOUNDNESS-ALARM[milp-direct/COST_NOT_REPRESENTABLE: {cost} does not \
+                     fit u64 and cannot be a weight sum for this instance]"
+                );
+                println!("s UNKNOWN");
+                return Ok(0);
+            };
+            if let Some(reason) = audit_reported_answer(&args.file, &shifted, c) {
+                eprintln!("c SOUNDNESS-ALARM[milp-direct/{reason}]");
+                println!("s UNKNOWN");
+                return Ok(0);
+            }
+            println!("o {cost}");
+            println!("s OPTIMUM FOUND");
             print_assignment(num_vars, &shifted);
             eprintln!(
                 "milp: proved optimum {cost} in {:.2}s",
                 elapsed.as_secs_f64()
             );
+            // Answer first, certificate second — see the OLL OPTIMUM site in
+            // `solve`. Same reason: emission is not instant and a kill during
+            // it must cost the certificate, not the answer.
+            emit_proof_if_requested(args, &shifted, c, &[], &[]);
             Ok(30)
         }
         Outcome::Infeasible { .. } => {
@@ -2022,12 +2477,19 @@ struct FieldData {
 }
 
 /// Outcome status of one bench run.
+///
+/// `pub(crate)` so `crate::maxsat_cert` can name it: the certificate fold
+/// returns a status, and keeping that fold in its own module is what makes
+/// never-upgrade checkable in isolation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunStatus {
+pub(crate) enum RunStatus {
     /// Proved optimum, model verified, matches reference optimum (if known).
     Optimum,
-    /// Solver reported hard clauses unsatisfiable without an independently
-    /// checked UNSAT proof. It is retained as evidence but never scored.
+    /// The solver made a claim that this harness could not independently
+    /// check — a bare UNSAT (no proof path in this command), or, under
+    /// `--proof-check`, an OPTIMUM whose certificate could not be checked at
+    /// all. Retained as evidence but never scored, and it forces a non-zero
+    /// bench exit code.
     Unvalidated,
     /// Exceeded the exact per-child RSS envelope.
     Memout,
@@ -2053,30 +2515,30 @@ impl RunStatus {
 }
 
 #[derive(Debug, Clone)]
-struct RunResult {
-    instance: String,
-    status: RunStatus,
-    seconds: f64,
-    cost: Option<u64>,
-    detail: String,
-    authority: String,
+pub(crate) struct RunResult {
+    pub(crate) instance: String,
+    pub(crate) status: RunStatus,
+    pub(crate) seconds: f64,
+    pub(crate) cost: Option<u64>,
+    pub(crate) detail: String,
+    pub(crate) authority: String,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BenchSummary {
-    solved: usize,
-    wrong: usize,
+pub(crate) struct BenchSummary {
+    pub(crate) solved: usize,
+    pub(crate) wrong: usize,
     errors: usize,
     memouts: usize,
-    unvalidated: usize,
+    pub(crate) unvalidated: usize,
     par2: f64,
 }
 
-fn scoring_solved(status: RunStatus) -> bool {
+pub(crate) fn scoring_solved(status: RunStatus) -> bool {
     status == RunStatus::Optimum
 }
 
-fn summarize_bench(results: &[RunResult], timeout: f64) -> BenchSummary {
+pub(crate) fn summarize_bench(results: &[RunResult], timeout: f64) -> BenchSummary {
     let count = |status| {
         results
             .iter()
@@ -2106,7 +2568,7 @@ fn summarize_bench(results: &[RunResult], timeout: f64) -> BenchSummary {
     }
 }
 
-fn bench_exit_code(summary: BenchSummary) -> i32 {
+pub(crate) fn bench_exit_code(summary: BenchSummary) -> i32 {
     i32::from(summary.wrong > 0 || summary.errors > 0 || summary.unvalidated > 0)
 }
 
@@ -2150,6 +2612,38 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     let resources = MaxSatResources::plan(requested_jobs)?;
     let jobs = resources.plan.jobs;
 
+    // #bench-cert: resolve and PROVE the checker BEFORE the first spawn.
+    //
+    // This is the one place where an unusable checker is fatal, and it is fatal
+    // precisely because it costs nothing: not one instance has run, so a bad
+    // `--proof-check` setup fails at t~=0.2s instead of after 473 solver-hours.
+    // Mid-sweep the policy inverts (see `maxsat_cert`'s module doc): a checker
+    // that dies later downgrades its row to Unvalidated and the sweep goes on,
+    // because `bench_exit_code` already fails on any Unvalidated row, so the
+    // loss is loud without being destructive.
+    let cert = if args.proof_check {
+        let plan = maxsat_cert::CertPlan::new(
+            args.proof_dir.as_deref(),
+            args.proof_max_instance_mib,
+            // A checker that needs longer than the solve did is itself a
+            // finding; it lands in Unvalidated, never in green.
+            Duration::from_secs_f64(args.timeout.max(60.0)),
+        )
+        .map_err(|why| anyhow::anyhow!("--proof-check: {why}"))?;
+        safe_println!(
+            "certificate lane: checker {} (reports {}, pin {} patch {}), artifacts under {}, cap {}MiB",
+            plan.checker.display(),
+            plan.checker_version,
+            maxsat_cert::pin::commit(),
+            maxsat_cert::pin::patch_sha256(),
+            plan.dir.display(),
+            args.proof_max_instance_mib,
+        );
+        Some(plan)
+    } else {
+        None
+    };
+
     safe_println!(
         "ay maxsat bench: {} instances, timeout {}s, {} parallel jobs{}; memory={}MiB/child NBCORE={} headroom={}MiB enforcement={} aggregate={}",
         files.len(),
@@ -2191,13 +2685,10 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     let done = std::sync::atomic::AtomicUsize::new(0);
     let total = files.len();
 
-    // OOM guard (#bench-giant-gate): giant instances (multi-million-clause
-    // families like abstraction-refinement) can push a single solver process
-    // to several GB, and the name-sorted queue clusters same-family giants
-    // onto concurrent workers. Cap concurrently-running giants; small
-    // instances keep the remaining workers busy so wall-clock skew stays
-    // negligible (~7% of the corpus is above the threshold).
-    const GIANT_INSTANCE_BYTES: u64 = 80 * 1024 * 1024;
+    // OOM guard (#bench-giant-gate): see `GIANT_INSTANCE_BYTES`. Cap
+    // concurrently-running giants; small instances keep the remaining workers
+    // busy so wall-clock skew stays negligible (~7% of the corpus is above the
+    // threshold).
     const MAX_CONCURRENT_GIANTS: usize = 3;
     let giants_running = std::sync::atomic::AtomicUsize::new(0);
 
@@ -2231,6 +2722,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
                     !args.no_verify,
                     field.as_ref(),
                     &resources,
+                    cert.as_ref(),
                 );
                 if is_giant {
                     giants_running.fetch_sub(1, Ordering::AcqRel);
@@ -2264,8 +2756,11 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     results.sort_by(|a, b| a.instance.cmp(&b.instance));
 
     // Only independently model-checked, reference-consistent optima count as
-    // solved. Bare UNSAT claims have no proof path in this command and remain
-    // explicit non-scoring failures.
+    // solved. The certificate lane (`--proof-check`) covers OPTIMUM claims
+    // only: a checked UNSAT proof is deliberately out of scope, because the
+    // emitter has no UNSAT proof path and promoting an unproven UNSAT to a
+    // scored status would be exactly the upgrade this harness forbids. Bare
+    // UNSAT claims therefore remain explicit non-scoring failures.
     let summary = summarize_bench(&results, args.timeout);
 
     safe_println!("");
@@ -2281,12 +2776,64 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
         summary.errors
     );
 
+    if let Some(cert) = &cert {
+        // The certificate clause is reported separately from `solved` on
+        // purpose: `certified` is a subset of `solved`, and a skip is an
+        // annotated Optimum, not a failure. Routing skips to Unvalidated
+        // instead would make the DEFAULT settings guarantee a red sweep on ~7%
+        // of the corpus for a deliberate, documented operator choice — which
+        // trains people to ignore red, and that is worse than an annotated
+        // Optimum plus a visible skip count.
+        safe_println!(
+            "certified {}/{} ({} closed, skipped {}, rejected {}, unchecked {})",
+            cert.verified(),
+            results.len(),
+            cert.closed(),
+            cert.skipped(),
+            cert.rejected(),
+            cert.unchecked(),
+        );
+        if cert.retained() > 0 {
+            safe_println!(
+                "retained {} certificate artifact pairs ({:.1}MiB) under {}",
+                cert.retained(),
+                cert.retained_bytes() as f64 / (1024.0 * 1024.0),
+                cert.dir.display()
+            );
+        }
+        if cert.retention_refused() > 0 {
+            // Never silent. Retention is capped because Unusable is a systemic
+            // per-sweep condition, but a reader who sees N failing rows and
+            // fewer than N artifact pairs has to be told why — and told BOTH
+            // caps, because an unvalidated row is refused at the smaller one.
+            let (max_rows, max_bytes, reserved_rows, reserved_bytes) =
+                maxsat_cert::CertPlan::retention_caps();
+            safe_println!(
+                "retention cap reached ({} pairs / {}MiB, of which {} pairs / {}MiB are \
+                 reserved for wrong-answer evidence): {} further failing rows had their \
+                 artifacts DELETED — re-run those instances with --proof-dir to reproduce",
+                max_rows,
+                max_bytes / (1024 * 1024),
+                reserved_rows,
+                reserved_bytes / (1024 * 1024),
+                cert.retention_refused(),
+            );
+        }
+    }
+
     if let Some(field) = &field {
         print_leaderboard(&solver_name, field, &results, args.timeout);
     }
 
     if let Some(out) = &args.out {
-        write_json_report(out, args, &results, field.as_ref(), &resources.plan)?;
+        write_json_report(
+            out,
+            args,
+            &results,
+            field.as_ref(),
+            &resources.plan,
+            cert.as_ref(),
+        )?;
         safe_println!("wrote {}", out.display());
     }
 
@@ -2401,6 +2948,7 @@ fn write_json_report(
     results: &[RunResult],
     field: Option<&FieldData>,
     resource_plan: &MaxSatResourcePlan,
+    cert: Option<&maxsat_cert::CertPlan>,
 ) -> Result<()> {
     let summary = summarize_bench(results, args.timeout);
     let items: Vec<serde_json::Value> = results
@@ -2436,6 +2984,32 @@ fn write_json_report(
             "errors": summary.errors,
             "par2": summary.par2,
             "exit_code": bench_exit_code(summary),
+        },
+        // The checker's IDENTITY travels with its counts on purpose: a verdict
+        // from an unpinned checker is not evidence, and this report is the only
+        // place that fact can be recovered after the sweep. The per-row verdict
+        // itself needs no schema change — it is fully carried by `detail` and
+        // `authority` above.
+        "certificate": match cert {
+            Some(cert) => serde_json::json!({
+                "requested": true,
+                "checker": cert.checker.display().to_string(),
+                "checker_version": cert.checker_version,
+                "pin_commit": maxsat_cert::pin::commit(),
+                "pin_patch_sha256": maxsat_cert::pin::patch_sha256(),
+                "verified": cert.verified(),
+                "closed": cert.closed(),
+                "skipped": cert.skipped(),
+                "rejected": cert.rejected(),
+                "unchecked": cert.unchecked(),
+                // Retention is capped; a reader comparing failing rows against
+                // artifact pairs on disk needs the refusal count to explain the
+                // difference.
+                "retained": cert.retained(),
+                "retained_bytes": cert.retained_bytes(),
+                "retention_refused": cert.retention_refused(),
+            }),
+            None => serde_json::json!({ "requested": false }),
         },
         "results": items,
         "resource_plan": resource_plan,
@@ -2563,6 +3137,7 @@ fn classify_unsat_claim(
 /// Solve one instance in a subprocess and judge the outcome. When
 /// `external` is given, its command runs instead of AY (with `{file}`
 /// substituted), under the same wall-clock kill policy and verification.
+#[allow(clippy::too_many_arguments)]
 fn run_one(
     exe: &Path,
     external: Option<&(String, Vec<String>)>,
@@ -2571,8 +3146,19 @@ fn run_one(
     verify: bool,
     field: Option<&FieldData>,
     resources: &MaxSatResources,
+    cert: Option<&maxsat_cert::CertPlan>,
 ) -> RunResult {
     let instance = instance_key(file);
+    // #bench-cert: decide the certificate arm before anything is spawned. `Off`
+    // unless `--proof-check` is on and this is the internal solver; `Skipped`
+    // when the size guard declines the instance.
+    let arm = maxsat_cert::arm_certificate(cert, external.is_some(), file, &instance);
+    // RAII net. Every early return below drops this and takes the artifacts
+    // with it, and so does the anytime path — a `s UNKNOWN` with an incumbent
+    // emits a full `.opb` too, so a 3600s sweep of timeouts would otherwise
+    // accumulate the whole corpus on disk without a single check being run.
+    // The fold marks the two outcomes worth keeping.
+    let mut artifacts = maxsat_cert::CertArtifacts::for_arm(&arm);
     let start = Instant::now();
     if let Err(error) = resources.ensure_campaign_lease() {
         return RunResult {
@@ -2611,6 +3197,12 @@ fn run_one(
                 .arg(file)
                 .arg("--timeout")
                 .arg(format!("{timeout}"));
+            // Attach the certificate request HERE, ahead of `wrap_stopped`
+            // below: the oom-guard wrapper copies only the target's program and
+            // args, so anything set on `cmd` after that call is silently lost.
+            if let maxsat_cert::CertArm::Armed { stem } = &arm {
+                cmd.arg("--proof").arg(stem);
+            }
             cmd
         }
     };
@@ -2925,6 +3517,10 @@ fn run_one(
     match status_line {
         "OPTIMUM FOUND" => {
             let Some(cost) = last_o else {
+                // #bench-cert: a `Wrong` row keeps its certificate, whichever
+                // detector produced it. Positive evidence here: the solver's own
+                // stdout is self-contradictory — `s OPTIMUM FOUND` with no cost.
+                artifacts.retain_if_evidence(cert, RunStatus::Wrong);
                 return RunResult {
                     instance,
                     status: RunStatus::Wrong,
@@ -2940,6 +3536,12 @@ fn run_one(
                 .and_then(|r| r.o_value);
             if let Some(expected) = expected_optimum {
                 if expected != cost {
+                    // Positive evidence: an independent reference optimum
+                    // CONTRADICTS the reported cost. The certificate is the
+                    // artifact a reader needs to adjudicate that, so it survives
+                    // — this row `return`s before the fold, which is how the
+                    // guard used to delete it.
+                    artifacts.retain_if_evidence(cert, RunStatus::Wrong);
                     return RunResult {
                         instance,
                         status: RunStatus::Wrong,
@@ -2953,6 +3555,11 @@ fn run_one(
             // Model verification: re-evaluate the reported model.
             if verify {
                 if let Err(msg) = verify_model(file, v_line, cost) {
+                    // Positive evidence: this harness re-evaluated the reported
+                    // model against the instance and it does not satisfy the
+                    // hard clauses, or does not cost what was claimed. Same
+                    // rule as above: the certificate is kept.
+                    artifacts.retain_if_evidence(cert, RunStatus::Wrong);
                     return RunResult {
                         instance,
                         status: RunStatus::Wrong,
@@ -2963,24 +3570,71 @@ fn run_one(
                     };
                 }
             }
+            let base_authority = match (expected_optimum.is_some(), verify) {
+                (true, true) => "reference optimum + independently verified model",
+                (true, false) => "reference optimum; model verification disabled",
+                (false, true) => "solver optimality claim + independently verified model",
+                (false, false) => "solver claim; verification disabled",
+            };
+            // #bench-cert: the certificate fold. Control only reaches here when
+            // the row was ALREADY going to be `RunStatus::Optimum` — the
+            // wall-clock demotion, the missing-`o`-line check, the
+            // reference-field check and `verify_model` are all upstream — so
+            // `classify_certificate` can hold that verdict or lower it and can
+            // do nothing else. It is handed no status to raise.
+            // A pair that could not be bound to this run (see
+            // `CertArtifacts::for_arm`) is not checked at all: certifying an
+            // artifact this row may not have written is how a stale file
+            // becomes a false `RunStatus::Wrong`.
+            let stale = artifacts.stale();
+            let outcome = match &arm {
+                maxsat_cert::CertArm::Armed { .. } => artifacts.paths().map(|(opb, pbp)| {
+                    stale
+                        .clone()
+                        .or_else(|| maxsat_cert::precheck_artifacts(opb, pbp))
+                        .unwrap_or_else(|| {
+                            // Safe to borrow the solver's already-finished slot:
+                            // the child was killed and reaped above.
+                            run_certificate_checker(
+                                cert.expect("armed certificate implies a plan"),
+                                resources,
+                                opb,
+                                pbp,
+                                cost,
+                            )
+                        })
+                }),
+                maxsat_cert::CertArm::Off | maxsat_cert::CertArm::Skipped(_) => None,
+            };
+            let (status, detail, authority) =
+                maxsat_cert::classify_certificate(&arm, outcome.as_ref(), cost, base_authority);
+            // Retention keys on the VERDICT this row ended up with, not on the
+            // outcome variant: a verified interval that excludes the reported
+            // cost scores `Wrong` and is precisely the case whose artifacts
+            // must survive. It is also capped — see `retain_or_delete`.
+            artifacts.retain_if_evidence(cert, status);
+            if let Some(cert) = cert {
+                cert.record(&arm, outcome.as_ref(), cost);
+            }
             RunResult {
                 instance,
-                status: RunStatus::Optimum,
+                status,
                 seconds,
                 cost: Some(cost),
-                detail: String::new(),
-                authority: match (expected_optimum.is_some(), verify) {
-                    (true, true) => "reference optimum + independently verified model",
-                    (true, false) => "reference optimum; model verification disabled",
-                    (false, true) => "solver optimality claim + independently verified model",
-                    (false, false) => "solver claim; verification disabled",
-                }
-                .to_string(),
+                detail,
+                authority,
             }
         }
         "UNSATISFIABLE" => {
             let (status, detail, authority) =
                 classify_unsat_claim(field, &instance, external.is_some());
+            // The fifth detector: an UNSAT claim that contradicts a feasible
+            // reference optimum. The emitter has no UNSAT proof path, so there
+            // is normally nothing on disk here and this costs nothing — but the
+            // rule is "every `Wrong` row keeps its certificate, whichever
+            // detector produced it", and a rule with an exception is the shape
+            // this defect keeps coming back in.
+            artifacts.retain_if_evidence(cert, status);
             RunResult {
                 instance,
                 status,
@@ -3006,6 +3660,166 @@ fn run_one(
             },
             authority: if killed { "wall-clock harness" } else { "none" }.to_string(),
         },
+    }
+}
+
+/// Check one emitted certificate with the pinned VeriPB checker.
+///
+/// Runs AFTER the solver child has been killed and reaped, so it BORROWS that
+/// worker's already-planned slot: the same `wrap_stopped` + `watch` envelope,
+/// the same process-group isolation, the same bounded capture. `MaxSatResources`
+/// has no separate term for a checker and inventing one would double the host's
+/// committed RAM — on a 24GB box under chronic memory pressure that is the
+/// difference between a sweep and a kernel panic.
+///
+/// Every failure mode here returns `Unusable`, never `Verified` and never
+/// `Rejected`: "we could not obtain a verdict" is not evidence that the answer
+/// is wrong, and it is certainly not evidence that it is right. `Unusable`
+/// lands the row in `Unvalidated`, which is unscored and forces a non-zero
+/// bench exit.
+fn run_certificate_checker(
+    plan: &maxsat_cert::CertPlan,
+    resources: &MaxSatResources,
+    opb: &Path,
+    pbp: &Path,
+    cost: u64,
+) -> maxsat_cert::CertOutcome {
+    use maxsat_cert::CertOutcome;
+
+    let mut target = Command::new(&plan.checker);
+    // `--opb` explicitly. Letting the checker guess the formula format by
+    // extension has bitten this workspace before, and our formula is always the
+    // OPB restatement, never the `.wcnf`.
+    target.arg("--opb").arg(opb).arg(pbp);
+    let mut command = resources.wrap_stopped(&target);
+    command.env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string());
+    command.env("NBCORE", resources.plan.nbcore_per_child.to_string());
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    // Unlike the solver (whose stderr is nulled), the checker gets its own
+    // pipe: a rejection's diagnostics ARE the evidence we are here to collect.
+    command.stderr(Stdio::piped());
+    isolate_maxsat_process_group(&mut command);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return CertOutcome::Unusable(format!(
+                "cannot spawn `{}`: {error}",
+                plan.checker.display()
+            ))
+        }
+    };
+    // Separate captures from the solver's. A chatty checker sharing the
+    // solver's capture could push it past MAXSAT_CAPTURE_BYTES and turn a good
+    // row into ERROR — a certificate must not be able to damage the answer it
+    // is checking.
+    let stdout_capture = child.stdout.take().map(MaxSatCapture::start);
+    let stderr_capture = child.stderr.take().map(MaxSatCapture::start);
+    let finish = |stdout: Option<MaxSatCapture>, stderr: Option<MaxSatCapture>| {
+        (
+            stdout.map(MaxSatCapture::finish).unwrap_or_default(),
+            stderr.map(MaxSatCapture::finish).unwrap_or_default(),
+        )
+    };
+
+    let mut watchdog = match resources.watch(&mut child, "ay maxsat bench certificate") {
+        Ok(watchdog) => watchdog,
+        Err(error) => {
+            let _ = finish(stdout_capture, stderr_capture);
+            return CertOutcome::Unusable(format!(
+                "cannot arm the checker's RSS watchdog: {error}"
+            ));
+        }
+    };
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let mut breached = false;
+    let mut poll_error: Option<String> = None;
+    let completed_normally = loop {
+        match observe_maxsat_child_unreaped(&child, false, "VeriPB checker") {
+            Ok(MaxSatUnreapedChildState::Exited) => break true,
+            Ok(MaxSatUnreapedChildState::Running) => {
+                match watchdog.poll() {
+                    Ok(Some(outcome)) if outcome.breached => {
+                        breached = true;
+                        break false;
+                    }
+                    Ok(Some(_)) => {
+                        poll_error = Some(String::from("RSS watchdog stopped before the checker"));
+                        break false;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        poll_error = Some(error.to_string());
+                        break false;
+                    }
+                }
+                if start.elapsed() > plan.check_timeout {
+                    timed_out = true;
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(MaxSatUnreapedChildState::Stopped) => {
+                poll_error = Some(String::from("checker stopped unexpectedly"));
+                break false;
+            }
+            Err(error) => {
+                poll_error = Some(error.to_string());
+                break false;
+            }
+        }
+    };
+    let cleanup_status = terminate_maxsat_process_group_with_status(&mut child);
+    let status = completed_normally.then_some(cleanup_status).flatten();
+    let watchdog_result = watchdog.finish_after_target_cleanup();
+    let (stdout, stderr) = finish(stdout_capture, stderr_capture);
+
+    if timed_out {
+        return CertOutcome::Unusable(format!(
+            "checker exceeded its {:.0}s budget",
+            plan.check_timeout.as_secs_f64()
+        ));
+    }
+    if breached || watchdog_result.as_ref().is_ok_and(|o| o.breached) {
+        return CertOutcome::Unusable(format!(
+            "checker process-group RSS exceeded {}MiB",
+            resources.plan.memlimit_mb_per_child
+        ));
+    }
+    if let Err(error) = watchdog_result {
+        return CertOutcome::Unusable(format!("checker RSS watchdog cleanup failed: {error}"));
+    }
+    if let Some(error) = poll_error {
+        return CertOutcome::Unusable(format!("checker supervision failed: {error}"));
+    }
+    let Some(status) = status else {
+        return CertOutcome::Unusable(String::from("checker did not exit normally"));
+    };
+
+    // The checker's stderr is where a refusal explains itself AND where an
+    // infrastructure failure names itself: the pinned checker prints NOTHING on
+    // stdout for either (measured — a false conclusion, a missing `.pbp`, a
+    // truncated `.opb` and a truncated `.pbp` all print only its banner and
+    // exit 1). So both failure shapes carry a bounded excerpt into the row,
+    // which is what makes the JSON report self-contained once the artifacts are
+    // inspected and removed.
+    let annotate = |why: String| -> String {
+        if stderr.0.trim().is_empty() {
+            why
+        } else {
+            format!(
+                "{why}; stderr: {}",
+                maxsat_cert::excerpt(&stderr.0, maxsat_cert::DETAIL_EXCERPT_MAX)
+            )
+        }
+    };
+    match maxsat_cert::parse_verdict(status.code(), &stdout.0, cost) {
+        CertOutcome::Rejected(why) => CertOutcome::Rejected(annotate(why)),
+        CertOutcome::Unusable(why) => CertOutcome::Unusable(annotate(why)),
+        verified @ CertOutcome::Verified { .. } => verified,
     }
 }
 
@@ -3173,7 +3987,7 @@ fn verify_model(file: &Path, v_line: Option<&str>, cost: u64) -> std::result::Re
 // ---------------------------------------------------------------------------
 
 /// Summary of a streamed WCNF file.
-struct WcnfSummary {
+pub(crate) struct WcnfSummary {
     /// Declared (old format) or maximum-seen (new format) variable count.
     num_vars: usize,
 }
@@ -3185,15 +3999,189 @@ struct WcnfSummary {
 /// Byte-level and buffered: peak memory is one clause, regardless of file
 /// size, and parsing runs at buffer speed (no UTF-8 validation, no per-line
 /// allocation).
-fn stream_wcnf_file(
+/// #answer-audit: re-check a reported answer against the instance on disk before
+/// claiming it.
+///
+/// AY shipped a WRONG ANSWER — `s OPTIMUM FOUND` at costs above the true optimum
+/// — and nothing on this path noticed. `verify_model` existed but was wired only
+/// into the bench harness, so the competition path printed the answer unchecked.
+///
+/// This is cheap (one pass over the file, negligible beside any solve) and it
+/// catches the checkable half of an optimality claim:
+///   * every HARD clause must be satisfied by the emitted model, and
+///   * the reported cost must equal the model's actual cost.
+/// It CANNOT check the other half — that no cheaper model exists — which needs a
+/// real optimality certificate. So a clean audit means "the answer is internally
+/// consistent", not "the answer is optimal".
+///
+/// Returns `None` when the answer checks out, or `Some(reason)` naming the
+/// inconsistency. Every failure is a SOUNDNESS ALARM: at competition a wrong
+/// answer scores worse than losing, so callers downgrade rather than emit.
+/// Emit a VeriPB certificate of a reported answer, if `--proof` asked for one.
+///
+/// WRITE-ONLY (see `crate::maxsat_proof`): this runs AFTER the answer is
+/// settled and returns nothing the caller acts on. Emission failure is logged,
+/// never promoted to a verdict change — a certificate we could not write says
+/// nothing about whether the answer is right, and silently downgrading on an
+/// I/O error would turn a full disk into a lost instance.
+fn emit_proof_if_requested(
+    args: &MaxSatSolveArgs,
+    model: &[bool],
+    cost: u64,
+    cores: &[ay_maxsat::PaidMinedCore],
+    sat_cores: &[ay_maxsat::PaidSatCore],
+) {
+    let Some(stem) = args.proof.as_ref() else {
+        return;
+    };
+    let cores: Vec<crate::maxsat_proof::PaidCore> = cores
+        .iter()
+        .map(|c| crate::maxsat_proof::PaidCore {
+            hard_row: c.hard_row,
+            w_min: c.w_min,
+            members: c.members.clone(),
+        })
+        .collect();
+    let sat_cores: Vec<crate::maxsat_proof::SatCore> = sat_cores
+        .iter()
+        .map(|c| crate::maxsat_proof::SatCore {
+            w_min: c.w_min,
+            members: c.members.clone(),
+        })
+        .collect();
+    let stream = |p: &Path, cb: &mut dyn FnMut(Option<u64>, &[i32]) -> Result<()>| -> Result<()> {
+        stream_wcnf_file(p, cb).map(|_| ())
+    };
+    match crate::maxsat_proof::emit_certificate(
+        &args.file, stem, model, cost, &cores, &sat_cores, &stream,
+    ) {
+        Ok(e) => {
+            let sat_note = if e.sat_cores_over_budget {
+                // Named, not silent: a bound that is weaker because the machine
+                // was small must be distinguishable from one that is weaker
+                // because the cores were not provable.
+                format!(
+                    "{} SAT cores SKIPPED (propagation index over memory budget)",
+                    e.sat_cores_offered
+                )
+            } else {
+                format!(
+                    "{}/{} SAT cores certified",
+                    e.sat_cores_certified, e.sat_cores_offered
+                )
+            };
+            // Preprocessing bounds the emitter DERIVED FOR ITSELF from the
+            // `.wcnf` (see `maxsat_proof`): `preproc_cost` is never plumbed
+            // here. A bound weakened because the machine was small must be
+            // distinguishable from one that was never provable, so the budget
+            // skips are named too.
+            let mut preproc_note = format!(
+                "preproc lb {} ({} P1 softs of which {} by rup, {} am1 layers)",
+                e.preproc_lower_bound,
+                e.p1_softs_certified,
+                e.p1b_softs_certified,
+                e.am1_layers_certified
+            );
+            if e.p1b_over_budget {
+                preproc_note.push_str(", P1b SKIPPED (propagation index over memory budget)");
+            }
+            if e.am1_graph_truncated {
+                preproc_note.push_str(", am1 graph TRUNCATED (edge budget)");
+            }
+            eprintln!(
+                "c proof: {} vars, {} constraints, {} mined cores, {sat_note}, \
+                 {preproc_note}, certified {} <= obj <= {}",
+                e.num_vars,
+                e.num_constraints,
+                cores.len(),
+                e.lower_bound,
+                cost
+            );
+            if let Some(why) = e.lb_declined {
+                // Declining is the fail-closed branch, and it is exactly the
+                // signal worth shouting about: the engine paid cores whose
+                // arithmetic we could not reproduce.
+                // Say which rung it actually landed on. The fallback ladder
+                // now has three rungs (combined -> mined-only -> preprocessing
+                // -> 0), so a flat "fell back to lower bound 0" was false
+                // whenever a later rung succeeded — and an alarm that
+                // misdescribes the outcome trains a reader to discount it.
+                eprintln!(
+                    "c SOUNDNESS-ALARM[LB_NOT_DERIVABLE]: {why}; certificate \
+                     fell back to lower bound {}",
+                    e.lower_bound
+                );
+            }
+        }
+        Err(err) => eprintln!("c proof: emission failed: {err:#}"),
+    }
+}
+
+fn audit_reported_answer(path: &Path, model: &[bool], reported_cost: u64) -> Option<String> {
+    let val = |lit: i32| -> bool {
+        let idx = lit.unsigned_abs() as usize;
+        // OLL uses RAW variable ids (id 0 unused), so DIMACS n indexes model[n].
+        let assigned = model.get(idx).copied().unwrap_or(false);
+        if lit > 0 {
+            assigned
+        } else {
+            !assigned
+        }
+    };
+    let mut violated_hard: Option<Vec<i32>> = None;
+    let mut n_hard: u64 = 0;
+    let mut computed: u64 = 0;
+    let res = stream_wcnf_file(path, &mut |weight, lits| {
+        match weight {
+            None => {
+                n_hard += 1;
+                if violated_hard.is_none() && !lits.iter().any(|&l| val(l)) {
+                    violated_hard = Some(lits.to_vec());
+                }
+            }
+            Some(w) => {
+                if !lits.iter().any(|&l| val(l)) {
+                    computed = computed.saturating_add(w);
+                }
+            }
+        }
+        Ok(())
+    });
+    if res.is_err() {
+        return None; // cannot audit; do not manufacture an alarm
+    }
+    if let Some(c) = violated_hard {
+        let head: Vec<i32> = c.iter().take(8).copied().collect();
+        return Some(format!(
+            "HARD_VIOLATED: the emitted model falsifies a hard clause {head:?} \
+             (of {n_hard} hards) — the reported model is not a solution"
+        ));
+    }
+    if computed != reported_cost {
+        return Some(format!(
+            "COST_MISMATCH: reported o {reported_cost} but the emitted model \
+             actually costs {computed} — the cost accounting is wrong"
+        ));
+    }
+    None
+}
+
+pub(crate) fn stream_wcnf_file(
     path: &Path,
     on_clause: &mut dyn FnMut(Option<u64>, &[i32]) -> Result<()>,
 ) -> Result<WcnfSummary> {
-    use std::io::{BufReader, Read as _};
+    use std::io::BufReader;
 
     let file =
         fs::File::open(path).with_context(|| format!("failed to open '{}'", path.display()))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
+    stream_wcnf_reader(&mut reader, on_clause)
+}
+
+fn stream_wcnf_reader(
+    reader: &mut dyn std::io::Read,
+    on_clause: &mut dyn FnMut(Option<u64>, &[i32]) -> Result<()>,
+) -> Result<WcnfSummary> {
     let mut buf = vec![0u8; 1 << 20];
 
     // Tokenizer state.
@@ -4113,6 +5101,7 @@ mod tests {
             false,
             None,
             &resources,
+            None,
         );
         assert_eq!(result.status, RunStatus::Timeout, "{}", result.detail);
         assert_eq!(fs::read_to_string(env_file).unwrap().trim(), "3");
@@ -4135,6 +5124,344 @@ mod tests {
         panic!(
             "descendant {} survived process-group cleanup",
             descendant.trim()
+        );
+    }
+
+    /// A script at `path`, executable.
+    #[cfg(unix)]
+    fn write_probe_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::write(path, body).expect("write script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    fn probe_scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-probe-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// #D5, half one: a startup probe has a DEADLINE, and it bites.
+    ///
+    /// These probes run while the host-wide exclusive MaxSAT lease is held and
+    /// before a single instance has been spawned, so a checker that hangs there
+    /// stalls the entire campaign at t=0 with the lease in hand. Before the
+    /// fix they used plain `Command::output()`, which waits forever.
+    ///
+    /// Kill mutation: in `run_cert_probe_bounded`, drop the
+    /// `if start.elapsed() >= timeout { break None; }` arm — this test then
+    /// hangs on the sleeping child instead of returning an error.
+    #[cfg(unix)]
+    #[test]
+    fn maxsat_cert_probe_deadline_bites_and_reaps_the_group() {
+        let dir = probe_scratch("deadline");
+        let script = dir.join("hang.sh");
+        let pid_file = dir.join("descendant.pid");
+        write_probe_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > '{}'\nsleep 300\n",
+                pid_file.display()
+            ),
+        );
+
+        let start = Instant::now();
+        let error = run_cert_probe_bounded(&script, &[], Duration::from_millis(300), 4096)
+            .expect_err("a probe that never exits must not be waited on forever");
+        let elapsed = start.elapsed();
+        assert!(error.contains("probe budget"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the deadline did not bite at the budget it was given: {elapsed:?}"
+        );
+
+        // And the group kill took the descendant with it: `kill -0` fails once
+        // the process is gone.
+        let descendant = fs::read_to_string(&pid_file).unwrap_or_default();
+        if let Ok(pid) = descendant.trim().parse::<i32>() {
+            let mut alive = true;
+            for _ in 0..200 {
+                alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+                if !alive {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "probe descendant {pid} survived the group kill");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #N4: the probe's process GROUP is reaped on every exit path, not just
+    /// on the timeout.
+    ///
+    /// A checker that answers promptly while leaving a child, a helper or a
+    /// wrapper running leaks it into a sweep that is about to spawn `jobs`
+    /// solvers beside it. This host has kernel-panicked twice from
+    /// over-subscription, and the leak is invisible: the probe SUCCEEDS.
+    ///
+    /// Kill mutation: wrap the `terminate_maxsat_process_group_with_status`
+    /// call in `run_cert_probe_bounded` back in `if status.is_none() { ... }` —
+    /// the descendant then survives the probe and this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn maxsat_cert_probe_reaps_survivors_of_a_prompt_exit() {
+        let dir = probe_scratch("survivors");
+        let script = dir.join("leak.sh");
+        let pid_file = dir.join("descendant.pid");
+        write_probe_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > '{}'\necho 'veripb 3.0.2'\nexit 0\n",
+                pid_file.display()
+            ),
+        );
+
+        let output = run_cert_probe_bounded(&script, &[], Duration::from_secs(60), 4096)
+            .expect("the probe exits promptly and successfully");
+        assert_eq!(output.code, Some(0), "{output:?}");
+        assert!(output.stdout.contains("veripb 3.0.2"), "{output:?}");
+
+        let descendant = fs::read_to_string(&pid_file).expect("descendant pid");
+        let pid = descendant.trim().parse::<i32>().expect("pid");
+        let mut alive = true;
+        for _ in 0..200 {
+            alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if alive {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+        assert!(
+            !alive,
+            "a checker that exited promptly leaked descendant {pid} into the sweep"
+        );
+    }
+
+    /// #D5, half two: a startup probe's capture is BOUNDED.
+    ///
+    /// `Command::output()` buffers without limit. A checker that spews on
+    /// stdout would be read into memory in full, at t=0, on a 24GB host under
+    /// chronic memory pressure.
+    ///
+    /// Kill mutation: in `run_cert_probe_bounded`, pass `MAXSAT_CAPTURE_BYTES`
+    /// to `MaxSatCapture::start_capped` instead of `capture_bytes` — the 4KiB
+    /// bound then never applies and the assertion below fails on a 2MiB
+    /// capture.
+    #[cfg(unix)]
+    #[test]
+    fn maxsat_cert_probe_capture_is_bounded() {
+        let dir = probe_scratch("capture");
+        let script = dir.join("spew.sh");
+        // 2MiB on stdout and 2MiB on stderr, well past the 4KiB cap below.
+        write_probe_script(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 2048 ]; do\n\
+             \tawk 'BEGIN{s=\"\";while(length(s)<1024)s=s \"X\";print s}'\n\
+             \ti=$((i+1))\n\
+             done\n\
+             i=0\nwhile [ $i -lt 2048 ]; do\n\
+             \tawk 'BEGIN{s=\"\";while(length(s)<1024)s=s \"Y\";print s}' >&2\n\
+             \ti=$((i+1))\n\
+             done\nexit 0\n",
+        );
+
+        let cap = 4096;
+        let output = run_cert_probe_bounded(&script, &[], Duration::from_secs(120), cap)
+            .expect("a spewing probe still exits");
+        assert_eq!(output.code, Some(0));
+        for (which, text) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            assert!(
+                text.len() < cap * 2,
+                "{which} capture was not bounded: {} bytes",
+                text.len()
+            );
+            assert!(
+                text.contains("output truncated"),
+                "{which} was silently dropped rather than marked truncated"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #D9: the certificate size guard's default is DERIVED, not guessed.
+    ///
+    /// Artifacts are BIGGER than the instance: measured, a 43,020,161-byte
+    /// `.wcnf` produced a 71,989,226-byte `.opb` plus a 7,059,974-byte `.pbp`.
+    /// The default admits an instance only if its artifacts still land under
+    /// `GIANT_INSTANCE_BYTES`, the size at which the OOM guard already
+    /// special-cases an instance — because the checker's RSS is not in
+    /// `MaxSatResources::plan` at all, it borrows the solver's slot.
+    ///
+    /// Kill mutation: set `PROOF_MAX_INSTANCE_MIB_DEFAULT` to 80 (or anything
+    /// above 43) — the admitted artifacts then exceed the giant threshold and
+    /// the last assertion fails.
+    #[test]
+    fn proof_size_guard_default_keeps_artifacts_under_the_giant_threshold() {
+        // The measurement the doc comment quotes, restated as arithmetic.
+        const MEASURED_WCNF: u64 = 43_020_161;
+        const MEASURED_OPB: u64 = 71_989_226;
+        const MEASURED_PBP: u64 = 7_059_974;
+        let artifacts = MEASURED_OPB + MEASURED_PBP;
+        // 1.84x, to the two decimal places the flag's help text claims.
+        let ratio_hundredths = artifacts * 100 / MEASURED_WCNF;
+        assert_eq!(
+            (artifacts * 1000 / MEASURED_WCNF).div_ceil(10),
+            184,
+            "the documented 1.84x expansion no longer matches the measurement"
+        );
+        assert!((183..=184).contains(&ratio_hundredths));
+
+        let admitted = PROOF_MAX_INSTANCE_MIB_DEFAULT * 1024 * 1024;
+        let worst_case_artifacts = admitted * artifacts / MEASURED_WCNF;
+        assert!(
+            worst_case_artifacts < GIANT_INSTANCE_BYTES,
+            "an instance the size guard ADMITS ({admitted} bytes) expands to \
+             {worst_case_artifacts} bytes of artifacts, past the {GIANT_INSTANCE_BYTES}-byte \
+             giant threshold the default is supposed to stay under"
+        );
+    }
+
+    /// #D8: the answer reaches stdout BEFORE certificate emission starts.
+    ///
+    /// Emission happens inside the child's RSS envelope and inside the bench
+    /// harness's kill grace, and a 74MiB `.opb` is not instant. With emission
+    /// first, a SIGKILL landing mid-write destroyed the ANSWER: stdout never
+    /// reached `s OPTIMUM FOUND`, so the harness fell through to its `_` arm
+    /// and recorded a TIMEOUT for an instance that had been solved. Printing
+    /// first makes such a kill cost the certificate instead — and a missing
+    /// certificate is exactly what the bench lane's `Unvalidated` branch is
+    /// for.
+    ///
+    /// This is a STRUCTURAL test, and deliberately so: the property is "no
+    /// answer line is printed after the emission call in the same block", which
+    /// is a statement about the source. Making it behavioural needs a kill
+    /// landing inside a multi-MB write in a subprocess running the built
+    /// binary, which a unit test in this crate can neither locate nor time
+    /// deterministically. The four call sites in `solve`/`milp_solve` — the OLL
+    /// OPTIMUM site, both MILP-race sites and the anytime `s UNKNOWN` site —
+    /// are all covered here; the `--milp` site in `milp_solve` is the fifth.
+    ///
+    /// Kill mutation: at any one call site, move the
+    /// `emit_proof_if_requested(...)` line back above its `println!("s ...")` —
+    /// the forward scan then finds an answer line inside the same block and
+    /// this test names the offending line.
+    #[test]
+    fn maxsat_certificate_emission_never_precedes_the_answer_lines() {
+        let source = include_str!("cmd_maxsat.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let is_answer = |line: &str| {
+            let line = line.trim_start();
+            line.starts_with("println!(\"s ") || line.starts_with("print_assignment(")
+        };
+
+        let mut sites = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("emit_proof_if_requested(") {
+                continue;
+            }
+            sites += 1;
+            let depth = indent(line);
+            // Walk forward to the end of the block this call sits in: the first
+            // non-blank line indented LESS than the call closes it.
+            for (offset, follower) in lines[index + 1..].iter().enumerate() {
+                if follower.trim().is_empty() {
+                    continue;
+                }
+                if indent(follower) < depth {
+                    break;
+                }
+                assert!(
+                    !is_answer(follower),
+                    "cmd_maxsat.rs:{}: `{}` is printed AFTER the certificate emission at line {} \
+                     — a kill during emission would destroy the answer instead of the certificate",
+                    index + offset + 2,
+                    follower.trim(),
+                    index + 1
+                );
+            }
+        }
+        assert!(
+            sites >= 5,
+            "expected every `emit_proof_if_requested` call site to be checked, found {sites}"
+        );
+    }
+
+    /// #N3, as a rule rather than as three call sites: no `run_one` detector
+    /// may construct a `RunStatus::Wrong` row without first retaining that
+    /// row's certificate.
+    ///
+    /// The unit behaviour is pinned by
+    /// `a_wrong_verdict_keeps_its_artifacts_whichever_detector_produced_it`;
+    /// what this adds is that the NEXT detector cannot be added without the
+    /// call, which is precisely how the reference-field and model-verifier
+    /// paths came to delete their own evidence while the fold kept its.
+    ///
+    /// Kill mutation: delete any one
+    /// `artifacts.retain_if_evidence(cert, RunStatus::Wrong);` line — the
+    /// `RunResult` below it then has no retain call in front of it and this
+    /// test names the line.
+    #[test]
+    fn maxsat_every_wrong_row_retains_its_certificate() {
+        let source = include_str!("cmd_maxsat.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut checked = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            // Only the row CONSTRUCTIONS, not the enum's own arms or matches.
+            if line.trim() != "status: RunStatus::Wrong," {
+                continue;
+            }
+            checked += 1;
+            let window = index.saturating_sub(12)..index;
+            assert!(
+                lines[window].iter().any(|earlier| earlier
+                    .trim_start()
+                    .starts_with("artifacts.retain_if_evidence(")),
+                "cmd_maxsat.rs:{}: a `Wrong` row is built without retaining its certificate — \
+                 the artifacts go out with `CertArtifacts`'s Drop, deleting the evidence in \
+                 exactly the row an independent authority contradicted",
+                index + 1
+            );
+        }
+        assert!(
+            checked >= 3,
+            "expected the early-returning wrong-answer detectors to be checked, found {checked}"
+        );
+        // The scan above only sees rows built with a LITERAL
+        // `status: RunStatus::Wrong,`. Two retain sites pass a `status`
+        // variable instead — the classify fold and the UNSAT/reference-field
+        // detector — so deleting either left this test green, which a mutation
+        // audit caught. Count the calls directly so every site is pinned.
+        // Count STATEMENT lines only. A plain `matches()` over the whole file
+        // also counts this test's own doc comment and its two string literals,
+        // so `>= 5` would have been satisfied by just two real call sites —
+        // a guard that counts itself is no guard.
+        let calls = lines
+            .iter()
+            .filter(|line| {
+                line.trim_start()
+                    .starts_with("artifacts.retain_if_evidence(")
+            })
+            .count();
+        assert!(
+            calls >= 5,
+            "found {calls} `retain_if_evidence` call sites, expected at least 5: the reference \
+             optimum check, `verify_model`, the wall-clock demotion, the certificate fold, and \
+             the UNSAT-vs-feasible-reference detector. A wrong-answer row whose site was dropped \
+             deletes the very evidence an independent authority produced"
         );
     }
 }

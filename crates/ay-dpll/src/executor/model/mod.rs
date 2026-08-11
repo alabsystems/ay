@@ -21,6 +21,7 @@ use ay_fp::{FpModel, FpModelValue};
 use ay_lia::LiaModel;
 use ay_lra::LraModel;
 use ay_seq::SeqModel;
+use ay_set::OP_CARD;
 use ay_strings::StringModel;
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -876,6 +877,17 @@ impl Executor {
     /// the memoized `evaluate_term` wrapper so shared subterms are computed once.
     fn evaluate_term_inner(&self, model: &Model, term_id: TermId) -> EvalValue {
         stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
+            // The MBQI SAT certificate can exhibit a total interpretation that
+            // is richer than the lossy ground-theory model retained for output.
+            // Its ground pins are values in that exhibited interpretation and
+            // were installed only after every original assertion re-evaluated
+            // to true. Binder-dependent terms are excluded because one TermId
+            // can denote several beta instances.
+            if !dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id) {
+                if let Some(pin) = self.mbqi_sat_cert_pins.get(&term_id) {
+                    return pin.clone();
+                }
+            }
             // Total-datatype-model pins (#dt-total-model): a datatype-sorted
             // term, selector application, or tester application whose value the
             // datatype model-construction phase pinned evaluates to that pinned
@@ -889,6 +901,23 @@ impl Executor {
             {
                 if let Some(pin) = model.dt_pins.get(&term_id) {
                     return pin.clone();
+                }
+            }
+            // CONSTANT-INTERPRETATION CERTIFICATE WITNESS pins. When the
+            // certificate published `I` as the model, `I(f)` is the CONSTANT
+            // function `λ ȳ. c_f` — so `f` applied to anything, and a 0-ary `f`
+            // itself, evaluate to `c_f`. Without this the evaluator would fall
+            // through to the completion defaults `(get-model)` is overriding,
+            // and `(get-value)` would contradict the printed model.
+            //
+            // Not a widening: the pins are live only between a grant and the
+            // next check-sat entry, and only on the route where the certificate
+            // supplied the whole model (`last_model` was `None`), so there is no
+            // theory-model value for a pin to override. The pinned value is a
+            // closed constant, so the recursive call terminates immediately.
+            if let Some(value) = self.const_interp_witness_value(term_id) {
+                if value != term_id {
+                    return self.evaluate_term(model, value);
                 }
             }
             let term = self.ctx.terms.get(term_id);
@@ -1232,6 +1261,27 @@ impl Executor {
                         | "bvsmod" | "concat" | "extract" | "zero_extend" | "sign_extend"
                         | "rotate_left" | "rotate_right" | "repeat" | "int2bv" | "bv2nat"
                         | "bvcomp" => self.evaluate_bv_app(model, sym, name, args, sort, term_id),
+                        // Finite-set cardinality: count the members of the
+                        // carrier AS THE MODEL PRINTS IT (#set-card-model-witness).
+                        // `set.card` is otherwise an opaque UF whose value is
+                        // read back from the solver's LIA assignment — which is
+                        // exactly how `(get-model)` (the empty set) and
+                        // `(get-value ((set.card s)))` (1) came to contradict
+                        // each other. Counting from the printed interpretation
+                        // makes get-value a function of the model, so the two
+                        // can never disagree, and lets model validation reject a
+                        // carrier whose size does not match the assertion.
+                        // Fail-closed: `None` (an infinite/co-finite carrier, an
+                        // unevaluable index, a carrier with no interpretation)
+                        // falls back to the previous opaque-UF lookup rather
+                        // than inventing a count.
+                        OP_CARD if args.len() == 1 => {
+                            match self.set_card_model_count(model, args[0]) {
+                                Some(n) => EvalValue::Rational(BigRational::from(n)),
+                                None => self
+                                    .evaluate_uninterpreted_app(model, name, args, sort, term_id),
+                            }
+                        }
                         // Array select: select(a, i) -> evaluate using array axioms,
                         // falling back to BV model for bitblasted select terms (#4087).
                         "select" if args.len() == 2 => {

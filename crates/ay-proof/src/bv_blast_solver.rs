@@ -50,7 +50,11 @@ use crate::bv_blast_export::{
     ClauseProvenance, GateCache, Lit, OperandRef, Refutation, ResRule, ResolutionStep,
     SliceObligation, VarRole, VarTable, FORMAT_VERSION,
 };
-use ay_sat::{Literal, ResolutionDag, ResolutionDagError, RupStep, Variable};
+use ay_core::time::Instant;
+use ay_sat::{
+    Literal, ResolutionDag, ResolutionDagError, ResolutionProofError, ResolutionProofLimits,
+    RupStep, Variable,
+};
 use std::collections::BTreeSet;
 
 /// Errors from [`export_bv_blast_proof_solved`].
@@ -81,6 +85,22 @@ pub enum BvSolvedExportError {
         /// The LRAT id of the derived clause that failed to expand.
         id: u64,
     },
+    /// Bounded RUP expansion exhausted its explicit step/deadline envelope.
+    #[error("proof resource `{resource}` exceeds limit {limit} (actual {actual})")]
+    ResourceLimit {
+        /// Stable resource name.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: usize,
+        /// Observed amount.
+        actual: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct RupExpansionLimits {
+    max_steps: usize,
+    deadline: Instant,
 }
 
 /// Largest width the solver-backed path accepts. Bounded so the var-id space
@@ -252,7 +272,7 @@ pub fn export_bv_blast_proof_solved(
 
     // The LRAT original-clause ids are 1..=clauses.len() in input order, which is
     // exactly our `clauses` Vec index + 1. Map an LRAT id → BvBlast premise id.
-    let refutation = expand_dag_to_resolution(&dag, &clauses)?;
+    let refutation = expand_dag_to_resolution(&dag, &clauses, None)?;
 
     let obligation_record = match op {
         // All are operand-swapped `op(a,b)` vs `op(b,a)`; Add/Xor/And/Or are
@@ -293,6 +313,7 @@ pub fn export_bv_blast_proof_solved(
 fn expand_dag_to_resolution(
     dag: &ResolutionDag,
     clauses: &[Clause],
+    limits: Option<RupExpansionLimits>,
 ) -> Result<Refutation, BvSolvedExportError> {
     let nclauses = clauses.len() as u32;
 
@@ -313,8 +334,10 @@ fn expand_dag_to_resolution(
 
     let mut steps: Vec<ResolutionStep> = Vec::new();
     let mut next_step_id = nclauses;
+    let mut expansion_work = 0_usize;
 
     for rup in &dag.derived {
+        check_rup_expansion_budget(limits, steps.len(), expansion_work)?;
         let target: Vec<Lit> = rup.clause.iter().map(lit_from_sat).collect();
         let final_premise_id = expand_one_rup_step(
             rup,
@@ -323,6 +346,8 @@ fn expand_dag_to_resolution(
             &lrat_to_premise,
             &mut steps,
             &mut next_step_id,
+            limits,
+            &mut expansion_work,
         )?;
         // Register this derived clause so later steps can cite it.
         lrat_to_premise.insert(rup.id, final_premise_id);
@@ -330,6 +355,31 @@ fn expand_dag_to_resolution(
     }
 
     Ok(Refutation { steps })
+}
+
+fn check_rup_expansion_budget(
+    limits: Option<RupExpansionLimits>,
+    steps: usize,
+    work: usize,
+) -> Result<(), BvSolvedExportError> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    if steps > limits.max_steps {
+        return Err(BvSolvedExportError::ResourceLimit {
+            resource: "expanded resolution steps",
+            limit: limits.max_steps,
+            actual: steps,
+        });
+    }
+    if work & 1_023 == 0 && Instant::now() >= limits.deadline {
+        return Err(BvSolvedExportError::ResourceLimit {
+            resource: "RUP expansion deadline",
+            limit: 0,
+            actual: 1,
+        });
+    }
+    Ok(())
 }
 
 /// Expand a single RUP step into binary resolutions and return the BvBlast
@@ -349,6 +399,8 @@ fn expand_one_rup_step(
     lrat_to_premise: &std::collections::HashMap<u64, u32>,
     steps: &mut Vec<ResolutionStep>,
     next_step_id: &mut u32,
+    limits: Option<RupExpansionLimits>,
+    expansion_work: &mut usize,
 ) -> Result<u32, BvSolvedExportError> {
     // ── 1. RUP replay to discover per-hint unit literals. ──
     // Trail value: var → assigned bool. Assume ¬target.
@@ -361,6 +413,8 @@ fn expand_one_rup_step(
     let mut hint_units: Vec<Option<Lit>> = Vec::with_capacity(rup.rup_hints.len());
     let mut conflict_at: Option<usize> = None;
     for (i, &h) in rup.rup_hints.iter().enumerate() {
+        *expansion_work = expansion_work.saturating_add(1);
+        check_rup_expansion_budget(limits, steps.len(), *expansion_work)?;
         let clause = lits_by_lrat
             .get(&h)
             .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
@@ -418,6 +472,8 @@ fn expand_one_rup_step(
 
     // Walk hints before the conflict, in reverse, resolving on their unit vars.
     for j in (0..conflict_idx).rev() {
+        *expansion_work = expansion_work.saturating_add(1);
+        check_rup_expansion_budget(limits, steps.len(), *expansion_work)?;
         let Some(unit) = hint_units[j] else {
             continue; // no-op / satisfied hint contributes nothing
         };
@@ -435,8 +491,21 @@ fn expand_one_rup_step(
         let hint_premise = *lrat_to_premise
             .get(&hint_id)
             .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
+        if limits.is_some_and(|limits| steps.len() >= limits.max_steps) {
+            return Err(BvSolvedExportError::ResourceLimit {
+                resource: "expanded resolution steps",
+                limit: limits.map_or(0, |limits| limits.max_steps),
+                actual: steps.len().saturating_add(1),
+            });
+        }
         let step_id = *next_step_id;
-        *next_step_id += 1;
+        *next_step_id = next_step_id
+            .checked_add(1)
+            .ok_or(BvSolvedExportError::ResourceLimit {
+                resource: "resolution step id space",
+                limit: u32::MAX as usize,
+                actual: usize::MAX,
+            })?;
         steps.push(ResolutionStep {
             id: step_id,
             clause: new_resolvent.clone(),
@@ -1039,6 +1108,31 @@ pub enum BvExprExportError {
     /// The surfaced refutation could not be lifted to pure-RUP resolution.
     #[error("refutation not surfaceable as pure-RUP resolution: {0}")]
     RefutationNotSurfaceable(String),
+    /// A bounded proof-producing call exceeded an explicit preflight or
+    /// surfaced-proof resource limit.
+    #[error("proof resource `{resource}` exceeds limit {limit} (actual {actual})")]
+    ResourceLimit {
+        /// Stable resource name.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: usize,
+        /// Observed or conservatively estimated amount.
+        actual: usize,
+    },
+}
+
+/// Explicit bounds for proof-producing [`BvExpr`] validation.
+///
+/// The expression preflight runs before CNF allocation. The nested resolution
+/// limits then bound SAT search, LRAT output/materialization, and independent
+/// replay. Callers must provide an absolute deadline in `resolution`.
+#[derive(Clone, Debug)]
+pub(crate) struct BvExprProofLimits {
+    pub(crate) max_expr_nodes: usize,
+    pub(crate) max_expr_depth: usize,
+    pub(crate) max_estimated_gate_work: usize,
+    pub(crate) max_resolution_steps: usize,
+    pub(crate) resolution: ResolutionProofLimits,
 }
 
 /// Scratch state shared across the bit-blast of BOTH sides of the equality: one
@@ -1546,6 +1640,140 @@ impl ExprBlaster {
     }
 }
 
+#[derive(Default)]
+struct BvExprPreflight {
+    nodes: usize,
+    estimated_gate_work: usize,
+}
+
+fn preflight_bv_expr(
+    expr: &BvExpr,
+    limits: &BvExprProofLimits,
+    state: &mut BvExprPreflight,
+    depth: usize,
+) -> Result<u32, BvExprExportError> {
+    if depth > limits.max_expr_depth {
+        return Err(BvExprExportError::ResourceLimit {
+            resource: "expression depth",
+            limit: limits.max_expr_depth,
+            actual: depth,
+        });
+    }
+    charge_bv_expr_resource(
+        "expression nodes",
+        &mut state.nodes,
+        1,
+        limits.max_expr_nodes,
+    )?;
+
+    let mut child = |inner: &BvExpr| preflight_bv_expr(inner, limits, state, depth + 1);
+    let (width, local_work) = match expr {
+        BvExpr::Leaf { width, .. } | BvExpr::Const { width, .. } => {
+            (*width, usize::try_from(*width).unwrap_or(usize::MAX))
+        }
+        BvExpr::ZeroExt(inner, added) | BvExpr::SignExt(inner, added) => {
+            let inner_width = child(inner)?;
+            let width = inner_width.checked_add(*added).ok_or_else(|| {
+                BvExprExportError::Malformed("bit-vector extension width overflow".to_string())
+            })?;
+            (width, usize::try_from(width).unwrap_or(usize::MAX))
+        }
+        BvExpr::Extract { inner, high, low } => {
+            let inner_width = child(inner)?;
+            if low > high || *high >= inner_width {
+                return Err(BvExprExportError::Malformed(format!(
+                    "extract [{high}:{low}] out of bounds for {inner_width}-bit operand"
+                )));
+            }
+            let width = high - low + 1;
+            (width, usize::try_from(width).unwrap_or(usize::MAX))
+        }
+        BvExpr::Not(inner) => {
+            let width = child(inner)?;
+            (width, 2_usize.saturating_mul(width as usize))
+        }
+        BvExpr::Add(lhs, rhs) | BvExpr::Sub(lhs, rhs) => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            (lhs_width, 8_usize.saturating_mul(lhs_width as usize))
+        }
+        BvExpr::Or(lhs, rhs) | BvExpr::And(lhs, rhs) | BvExpr::Xor(lhs, rhs) => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            (lhs_width, 4_usize.saturating_mul(lhs_width as usize))
+        }
+        BvExpr::Eq(lhs, rhs) => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            (1, 4_usize.saturating_mul(lhs_width as usize))
+        }
+        BvExpr::CarryOut { lhs, rhs, .. } => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            (1, 8_usize.saturating_mul(lhs_width as usize))
+        }
+        BvExpr::Mul(lhs, rhs)
+        | BvExpr::Shl(lhs, rhs)
+        | BvExpr::Lshr(lhs, rhs)
+        | BvExpr::Ashr(lhs, rhs) => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            let width = lhs_width as usize;
+            // Both the truncated array multiplier and variable barrel shifter
+            // are O(width^2) in the supported range. The factor 16 strictly
+            // dominates their current gate topologies and leaves headroom for
+            // saturation/comparison gates without relying on cache sharing.
+            let work = 16_usize.saturating_mul(width).saturating_mul(width);
+            (lhs_width, work)
+        }
+    };
+
+    if width == 0 || width > SOLVED_MAX_WIDTH {
+        return Err(BvExprExportError::UnsupportedWidth {
+            got: width,
+            max: SOLVED_MAX_WIDTH,
+        });
+    }
+    charge_bv_expr_resource(
+        "estimated bit-blast gates",
+        &mut state.estimated_gate_work,
+        local_work,
+        limits.max_estimated_gate_work,
+    )?;
+    Ok(width)
+}
+
+fn require_bv_expr_width_match(lhs: u32, rhs: u32) -> Result<(), BvExprExportError> {
+    if lhs == rhs {
+        Ok(())
+    } else {
+        Err(BvExprExportError::WidthMismatch { lhs, rhs })
+    }
+}
+
+fn charge_bv_expr_resource(
+    resource: &'static str,
+    total: &mut usize,
+    amount: usize,
+    limit: usize,
+) -> Result<(), BvExprExportError> {
+    let actual = total.checked_add(amount).unwrap_or(usize::MAX);
+    if actual > limit {
+        return Err(BvExprExportError::ResourceLimit {
+            resource,
+            limit,
+            actual,
+        });
+    }
+    *total = actual;
+    Ok(())
+}
+
 /// Build a zero-trust [`BvBlastProof`] for an arbitrary BitVec equality `lhs == rhs`
 /// over the [`BvExpr`] fragment, refuting `not(lhs == rhs)` via the `ay-sat` solver.
 ///
@@ -1569,6 +1797,37 @@ impl ExprBlaster {
 pub fn export_bv_blast_proof_expr(
     lhs: &BvExpr,
     rhs: &BvExpr,
+) -> Result<BvBlastProof, BvExprExportError> {
+    export_bv_blast_proof_expr_impl(lhs, rhs, None)
+}
+
+/// Bounded sibling used by strict proof recognition. Unlike the compatibility
+/// entry point above, this rejects oversized expression trees before CNF
+/// allocation and routes proof search/materialization/replay through ay-sat's
+/// explicit finite-limit API.
+pub(crate) fn export_bv_blast_proof_expr_with_limits(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    limits: &BvExprProofLimits,
+) -> Result<BvBlastProof, BvExprExportError> {
+    if limits.resolution.deadline.is_none() {
+        return Err(BvExprExportError::ResourceLimit {
+            resource: "absolute proof deadline",
+            limit: 1,
+            actual: 0,
+        });
+    }
+    let mut preflight = BvExprPreflight::default();
+    let lhs_width = preflight_bv_expr(lhs, limits, &mut preflight, 1)?;
+    let rhs_width = preflight_bv_expr(rhs, limits, &mut preflight, 1)?;
+    require_bv_expr_width_match(lhs_width, rhs_width)?;
+    export_bv_blast_proof_expr_impl(lhs, rhs, Some(limits))
+}
+
+fn export_bv_blast_proof_expr_impl(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    limits: Option<&BvExprProofLimits>,
 ) -> Result<BvBlastProof, BvExprExportError> {
     let mut vars = VarTable::default();
     let mut bit_lemmas: Vec<BitLemma> = Vec::new();
@@ -1616,6 +1875,16 @@ pub fn export_bv_blast_proof_expr(
         provenance: ClauseProvenance::Disequality,
     });
 
+    if let Some(limits) = limits {
+        if bit_lemmas.len() > limits.max_estimated_gate_work {
+            return Err(BvExprExportError::ResourceLimit {
+                resource: "actual bit-blast gates",
+                limit: limits.max_estimated_gate_work,
+                actual: bit_lemmas.len(),
+            });
+        }
+    }
+
     // Hand the CNF to ay-sat and surface the actual refutation (never fabricated).
     let num_vars = vars.len();
     let sat_clauses: Vec<Vec<Literal>> = clauses
@@ -1623,19 +1892,64 @@ pub fn export_bv_blast_proof_expr(
         .map(|c| c.lits.iter().map(lit_to_sat).collect())
         .collect();
 
-    let dag = match ay_sat::prove_unsat_resolution_dag(num_vars, &sat_clauses) {
-        Ok(dag) => dag,
-        Err(ResolutionDagError::Satisfiable) => return Err(BvExprExportError::NoRefutation),
-        Err(ResolutionDagError::Unknown) => return Err(BvExprExportError::SolverUnknown),
-        Err(other) => {
-            return Err(BvExprExportError::RefutationNotSurfaceable(
-                other.to_string(),
-            ))
+    let dag = if let Some(limits) = limits {
+        match ay_sat::prove_unsat_resolution_dag_with_limits(
+            num_vars,
+            &sat_clauses,
+            &limits.resolution,
+        ) {
+            Ok(dag) => dag,
+            Err(ResolutionProofError::Satisfiable) => return Err(BvExprExportError::NoRefutation),
+            Err(other) => {
+                return Err(BvExprExportError::RefutationNotSurfaceable(format!(
+                    "bounded resolution proof failed: {other}"
+                )))
+            }
+        }
+    } else {
+        match ay_sat::prove_unsat_resolution_dag(num_vars, &sat_clauses) {
+            Ok(dag) => dag,
+            Err(ResolutionDagError::Satisfiable) => return Err(BvExprExportError::NoRefutation),
+            Err(ResolutionDagError::Unknown) => return Err(BvExprExportError::SolverUnknown),
+            Err(other) => {
+                return Err(BvExprExportError::RefutationNotSurfaceable(
+                    other.to_string(),
+                ))
+            }
         }
     };
 
-    let refutation = expand_dag_to_resolution(&dag, &clauses)
-        .map_err(|e| BvExprExportError::RefutationNotSurfaceable(e.to_string()))?;
+    let expansion_limits = limits.map(|limits| RupExpansionLimits {
+        max_steps: limits.max_resolution_steps,
+        // The bounded entry point already rejects a missing deadline.
+        deadline: limits
+            .resolution
+            .deadline
+            .expect("bounded proof limits require an absolute deadline"),
+    });
+    let refutation = expand_dag_to_resolution(&dag, &clauses, expansion_limits).map_err(
+        |error| match error {
+            BvSolvedExportError::ResourceLimit {
+                resource,
+                limit,
+                actual,
+            } => BvExprExportError::ResourceLimit {
+                resource,
+                limit,
+                actual,
+            },
+            other => BvExprExportError::RefutationNotSurfaceable(other.to_string()),
+        },
+    )?;
+    if let Some(limits) = limits {
+        if refutation.steps.len() > limits.max_resolution_steps {
+            return Err(BvExprExportError::ResourceLimit {
+                resource: "expanded resolution steps",
+                limit: limits.max_resolution_steps,
+                actual: refutation.steps.len(),
+            });
+        }
+    }
 
     // Lineage record. The proof's soundness rests ENTIRELY on vars/lemmas/clauses/
     // refutation (all re-checked by `validate()` and the downstream proof consumer); the

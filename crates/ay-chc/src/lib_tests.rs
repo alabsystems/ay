@@ -1962,9 +1962,21 @@ fn test_bmc_acyclic_model_checker_consumer_overlap_copy_never_safe() {
 fn test_bmc_acyclic_model_checker_consumer_overlap_copy_reports_unsafe() {
     let smt2 =
         include_str!("../tests/fixtures/model_checker_consumer_overlap_copy_acyclic_unsafe.smt2");
-    let config = BmcConfig::default()
-        .with_max_depth(64)
-        .with_time_budget(std::time::Duration::from_secs(30));
+    // The exact-acyclic route is what this test is about, and
+    // `prefer_exact_acyclic_executor_first` only takes it when BOTH flags are
+    // set (or the problem has >128 predicates, which this fixture does not).
+    // With a plain `BmcConfig::default()` the run fell back to incremental
+    // deepening, whose per-depth cost on this fixture grows quadratically
+    // (~5s/depth by depth 14) while the counterexample is at depth 31 — so the
+    // budget always expired mid-search, which is not what the assertion is
+    // meant to be measuring. Matches the sibling `vec13` / `fib_fail` cases.
+    let config = BmcConfig {
+        max_depth: 64,
+        acyclic_safe: true,
+        prefer_exact_acyclic_first: true,
+        time_budget: Some(std::time::Duration::from_mins(1)),
+        ..BmcConfig::default()
+    };
     let result = engines::solve_bmc_only_from_str(smt2, config).expect("fixture should parse");
     assert!(
         result.is_unsafe(),
@@ -2382,4 +2394,66 @@ fn chc_safe_replay_obligations_non_empty_model_unchanged() {
     assert!(error
         .to_string()
         .contains("missing invariant interpretation"));
+}
+
+/// A model that is NOT inductive must never be certified as a proof.
+///
+/// The transition system below is genuinely UNSAFE — 0 -> 1 -> 2 reaches `error`:
+///     x = 0                        => Inv(x)
+///     Inv(x) ∧ x ≤ 0 ∧ x' = x + 1  => Inv(x')
+///     Inv(x) ∧ x ≥ 1 ∧ x' = x + 1  => Inv(x')
+///     Inv(x) ∧ x = 2               => error
+/// so NO invariant model is valid, and `I(x) := x ≤ 1 ∧ ¬(x = 1)` in particular is
+/// not inductive: from `x = 0` the first transition reaches `x' = 1`, where
+/// `¬(x' = 1)` fails. Any certification here would be a false PROOF.
+///
+/// SCOPE — measured, so nobody over-reads this test: it was written to try to
+/// exercise a specific hole (the "best-effort longer timeout" arm of
+/// `pdr/verification/model_inductive_unknown.rs` accepts a discharge of the
+/// WEAKENED `query_filtered` without setting `used_filtered_invariant`, so the #73
+/// query re-check is skipped). It does NOT discriminate that hole: the model is
+/// rejected both with and without that flag set, i.e. some other backstop catches
+/// this shape first. Keep it as a general non-inductive-rejection guard; do NOT
+/// cite it as evidence about the filtered-head path.
+#[test]
+fn filtered_head_must_not_certify_a_non_inductive_model() {
+    let smt2 = r#"
+(declare-rel Inv (Int))
+(declare-rel error ())
+(declare-var x Int)
+(declare-var xp Int)
+(rule (=> (= x 0) (Inv x)))
+(rule (=> (and (Inv x) (<= x 0) (= xp (+ x 1))) (Inv xp)))
+(rule (=> (and (Inv x) (>= x 1) (= xp (+ x 1))) (Inv xp)))
+(rule (=> (and (Inv x) (= x 2)) error))
+(query error)
+"#;
+    let problem = ChcParser::parse(smt2).expect("witness fixture should parse");
+    let inv = problem.lookup_predicate("Inv").expect("Inv predicate");
+    let error = problem.lookup_predicate("error").expect("error predicate");
+    let x = ChcVar::new("x", ChcSort::Int);
+
+    // I(x) := (x <= 1) AND NOT(x = 1) — the point-blocking conjunct is exactly
+    // what `filter_blocking_lemmas` throws away.
+    let candidate = ChcExpr::and(
+        ChcExpr::le(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+        ChcExpr::not(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1))),
+    );
+
+    let mut model = InvariantModel::new();
+    model.set(inv, PredicateInterpretation::new(vec![x], candidate));
+    model.set(
+        error,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(false)),
+    );
+
+    let config = PdrConfig::default();
+    let certified = engines::validate_external_invariant_model(&problem, &model, &config)
+        .expect("validation should not panic");
+    assert!(
+        !certified,
+        "FALSE PROOF: a model that is not inductive on the real head was certified. \
+         The transition system reaches `error` via 0 -> 1 -> 2, so no invariant model \
+         can be valid here; acceptance means a weakened head was used as a certificate."
+    );
 }

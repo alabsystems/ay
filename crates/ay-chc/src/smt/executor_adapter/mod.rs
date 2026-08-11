@@ -199,11 +199,15 @@ pub(crate) struct StrictUnsatCert {
 /// executor error, ay panic, a non-`unsat` verdict, or a missing proof returns
 /// `None`. A `None` return must be treated by the caller as "not strictly
 /// discharged" (fail-close to metadata-only / unknown), never as a pass.
+/// Re-export of the shared splitter that lives with the `Solver` API it
+/// exists to serve; see [`ay_dpll::api::split_leading_set_logic`].
+pub(crate) use ay_dpll::api::split_leading_set_logic;
+
 pub(crate) fn smtlib_strict_unsat_cert_via_executor(
     smt: &str,
     timeout: Option<std::time::Duration>,
 ) -> Option<StrictUnsatCert> {
-    use ay_dpll::api::{Logic, Solver, SolverConfig};
+    use ay_dpll::api::{Solver, SolverConfig};
 
     ay_core::catch_ay_panics(
         AssertUnwindSafe(|| {
@@ -213,15 +217,33 @@ pub(crate) fn smtlib_strict_unsat_cert_via_executor(
                 }
                 _ => SolverConfig::default(),
             };
-            // The obligation's own `(set-logic …)` re-selects the logic during
-            // `parse_smtlib2`; `Logic::All` is a permissive starting point.
-            let mut solver = Solver::try_new_with_config(Logic::All, config).ok()?;
+            // Take the obligation's OWN `(set-logic …)` and build the solver
+            // with it, rather than opening at `Logic::All` and letting the
+            // script re-select.
+            //
+            // `Solver::try_new_with_config` dispatches a `set-logic` of its
+            // own, so a `set-logic` left in the script is the SECOND one — and
+            // since `118630ef6` ("z3 exit-code contract … reject a second
+            // set-logic") the elaborator rejects that, exactly as z3 does.
+            // `parse_smtlib2` would then fail and `.ok()?` would swallow it as
+            // a bare `None`, which every caller must read as "not strictly
+            // discharged". The visible symptom was checked replay reporting
+            // "did not produce a native strict-Alethe UNSAT certificate;
+            // staying metadata-only" for obligations that are perfectly
+            // provable.
+            //
+            // Constructing with the declared logic keeps the obligation's own
+            // semantics instead of silently widening it to `ALL`; an
+            // unrecognized or absent declaration falls back to `ALL`, which is
+            // what this path used before.
+            let (logic, body) = split_leading_set_logic(smt, ay_dpll::api::Logic::All);
+            let mut solver = Solver::try_new_with_config(logic, config).ok()?;
 
             // Enable proof production BEFORE any assertion is installed so the
             // executor retains parsed assertions for proof rebuild. The
             // obligation text's `(check-sat)` is skipped by `parse_smtlib2`; we
             // run the solve ourselves below to capture the proof artifact.
-            let script = format!("(set-option :produce-proofs true)\n{smt}");
+            let script = format!("(set-option :produce-proofs true)\n{body}");
             solver.parse_smtlib2(&script).ok()?;
 
             let result = solver.check_sat();

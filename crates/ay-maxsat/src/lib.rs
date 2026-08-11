@@ -66,8 +66,10 @@
 //! - Martins et al., "Incremental Cardinality Constraints for MaxSAT"
 //! - Ansótegui et al., "SAT-based MaxSAT algorithms" (stratification, hardening)
 
+mod dpw;
 mod oll;
 mod solver;
 
 pub use ay_sat::SignedClause;
+pub use oll::{PaidMinedCore, PaidSatCore};
 pub use solver::{MaxSatResult, MaxSatSolver, MaxSatStats};

@@ -17,6 +17,8 @@ use super::Sort;
 pub enum Index {
     /// A decimal numeral token.
     Numeral(String),
+    /// A decimal-fraction token.
+    Decimal(String),
     /// A symbol token, including a quoted symbol.
     Symbol(String),
     /// A hexadecimal bitvector token such as `#x41`.
@@ -26,6 +28,13 @@ pub enum Index {
 }
 
 impl Index {
+    /// Parse an SMT-LIB index token that is valid independently of the
+    /// declaration consuming it.
+    ///
+    /// Decimal tokens are not part of the ordinary indexed-identifier grammar.
+    /// Z3 5.0.0 accepts them only as parameters to its pseudo-Boolean plugin;
+    /// [`Self::from_indexed_identifier_sexp`] handles that extension without
+    /// making decimals valid BitVec widths or bit-vector operator indices.
     pub(super) fn from_sexp(sexp: &SExpr) -> Option<Self> {
         match sexp {
             SExpr::Numeral(value) => Some(Self::Numeral(value.clone())),
@@ -36,10 +45,23 @@ impl Index {
         }
     }
 
+    fn from_indexed_identifier_sexp(identifier: &str, sexp: &SExpr) -> Option<Self> {
+        if matches!(
+            identifier,
+            "at-most" | "at-least" | "pble" | "pbge" | "pbeq"
+        ) {
+            if let SExpr::Decimal(value) = sexp {
+                return Some(Self::Decimal(value.clone()));
+            }
+        }
+        Self::from_sexp(sexp)
+    }
+
     /// Return the token text without changing its token kind.
     pub fn text(&self) -> &str {
         match self {
             Self::Numeral(value)
+            | Self::Decimal(value)
             | Self::Symbol(value)
             | Self::Hexadecimal(value)
             | Self::Binary(value) => value,
@@ -89,7 +111,7 @@ impl QualifiedIdentifier {
                 let indices = items[2..]
                     .iter()
                     .map(|index| {
-                        Index::from_sexp(index).ok_or_else(|| {
+                        Index::from_indexed_identifier_sexp(name, index).ok_or_else(|| {
                             ParseError::new("qualified indexed identifier has an invalid index")
                         })
                     })
@@ -217,6 +239,38 @@ impl Term {
                 }
             }
             Self::Const(_) | Self::Symbol(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Term;
+    use crate::sexp::parse_sexp;
+
+    #[test]
+    fn legacy_z3_match_cases_parse_as_standard_match_cases() {
+        let standard = Term::from_sexp(
+            &parse_sexp("(match o ((none 0) ((some x) x)))").expect("standard fixture"),
+        )
+        .expect("standard match parses");
+        let legacy = Term::from_sexp(
+            &parse_sexp("(match o (case none 0) (case (some x) x))").expect("legacy fixture"),
+        )
+        .expect("legacy match parses");
+
+        assert_eq!(legacy, standard);
+    }
+
+    #[test]
+    fn legacy_z3_match_rejects_malformed_or_mixed_cases() {
+        for input in [
+            "(match o (case none))",
+            "(match o (case none 0 extra))",
+            "(match o (case none 0) ((some x) x))",
+        ] {
+            let sexp = parse_sexp(input).expect("rejection fixture is an s-expression");
+            assert!(Term::from_sexp(&sexp).is_err(), "must reject {input}");
         }
     }
 }
@@ -391,37 +445,71 @@ impl Term {
         Ok(Self::Lambda(bindings, Box::new(body)))
     }
 
-    /// Parse a match term: (match \<scrutinee\> ((\<pattern\> \<body\>)+))
+    /// Parse a match term in either accepted Z3 5.0.0 spelling:
+    ///
+    /// - SMT-LIB 2.6: `(match <scrutinee> ((<pattern> <body>)+))`
+    /// - legacy Z3: `(match <scrutinee> (case <pattern> <body>) ...)`
     ///
     /// The cases are NOT ordinary function arguments — each case is a
     /// `(pattern body)` pair whose pattern head is a constructor or binder — so
     /// `match` cannot flow through [`Self::parse_application`] and must be parsed
     /// explicitly.
     fn parse_match(items: &[SExpr]) -> Result<Self, ParseError> {
-        if items.len() != 3 {
+        if items.len() < 3 {
             return Err(ParseError::new(
-                "match requires a scrutinee and a list of cases",
+                "match requires a scrutinee and at least one case",
             ));
         }
         let scrutinee = Self::from_sexp(&items[1])?;
-        let cases_sexp = items[2]
-            .as_list()
-            .ok_or_else(|| ParseError::new("match cases must be a list"))?;
-        if cases_sexp.is_empty() {
-            return Err(ParseError::new("match requires at least one case"));
-        }
 
-        let mut cases = Vec::with_capacity(cases_sexp.len());
-        for case in cases_sexp {
-            let case_list = case
-                .as_list()
-                .ok_or_else(|| ParseError::new("match case must be a (pattern body) list"))?;
-            if case_list.len() != 2 {
-                return Err(ParseError::new("match case must have a pattern and a body"));
+        let legacy = items[2]
+            .as_list()
+            .and_then(|case| case.first())
+            .is_some_and(|head| head.is_symbol("case"));
+        let mut cases = if legacy {
+            Vec::with_capacity(items.len() - 2)
+        } else {
+            Vec::new()
+        };
+
+        if legacy {
+            for case in &items[2..] {
+                let case_list = case.as_list().ok_or_else(|| {
+                    ParseError::new("legacy match case must be (case pattern body)")
+                })?;
+                if case_list.len() != 3 || !case_list[0].is_symbol("case") {
+                    return Err(ParseError::new(
+                        "legacy match case must be (case pattern body)",
+                    ));
+                }
+                let pattern = Self::parse_match_pattern(&case_list[1])?;
+                let body = Self::from_sexp(&case_list[2])?;
+                cases.push((pattern, body));
             }
-            let pattern = Self::parse_match_pattern(&case_list[0])?;
-            let body = Self::from_sexp(&case_list[1])?;
-            cases.push((pattern, body));
+        } else {
+            if items.len() != 3 {
+                return Err(ParseError::new(
+                    "standard match requires one parenthesized list of cases",
+                ));
+            }
+            let cases_sexp = items[2]
+                .as_list()
+                .ok_or_else(|| ParseError::new("match cases must be a list"))?;
+            if cases_sexp.is_empty() {
+                return Err(ParseError::new("match requires at least one case"));
+            }
+            cases.reserve(cases_sexp.len());
+            for case in cases_sexp {
+                let case_list = case
+                    .as_list()
+                    .ok_or_else(|| ParseError::new("match case must be a (pattern body) list"))?;
+                if case_list.len() != 2 {
+                    return Err(ParseError::new("match case must have a pattern and a body"));
+                }
+                let pattern = Self::parse_match_pattern(&case_list[0])?;
+                let body = Self::from_sexp(&case_list[1])?;
+                cases.push((pattern, body));
+            }
         }
 
         Ok(Self::Match(Box::new(scrutinee), cases))
@@ -489,7 +577,7 @@ impl Term {
         let indices: Vec<Index> = items[2..]
             .iter()
             .map(|sexp| {
-                Index::from_sexp(sexp)
+                Index::from_indexed_identifier_sexp(name, sexp)
                     .ok_or_else(|| ParseError::new("indexed identifier has an invalid index"))
             })
             .collect::<Result<_, _>>()?;
@@ -508,7 +596,7 @@ impl Term {
         let (func_name, args_start) = if let SExpr::List(head_items) = &items[0] {
             if items.len() == 1 {
                 return Err(ParseError::new(
-                    "qualified or indexed application requires at least one argument",
+                    "invalid function application, arguments missing",
                 ));
             }
             if !head_items.is_empty() && head_items[0].is_symbol("_") {
@@ -526,7 +614,7 @@ impl Term {
                 let indices: Vec<Index> = head_items[2..]
                     .iter()
                     .map(|sexp| {
-                        Index::from_sexp(sexp).ok_or_else(|| {
+                        Index::from_indexed_identifier_sexp(&name, sexp).ok_or_else(|| {
                             ParseError::new("indexed application has an invalid index")
                         })
                     })

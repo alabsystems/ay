@@ -11,7 +11,23 @@
 
 use super::super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT_HOOK_CALLS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl Solver {
+    #[cfg(test)]
+    pub(crate) fn reset_fmla_learned_lrat_dry_run_artifact_hook_calls() {
+        FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT_HOOK_CALLS.with(|calls| calls.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fmla_learned_lrat_dry_run_artifact_hook_calls() -> u64 {
+        FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT_HOOK_CALLS.with(std::cell::Cell::get)
+    }
+
     /// Get the proof writer (for testing/inspection)
     pub fn proof_writer(&self) -> Option<&ProofOutput> {
         self.proof_manager.as_ref().map(ProofManager::output)
@@ -25,6 +41,11 @@ impl Solver {
     /// Take the proof writer out of the solver (consumes proof logging capability)
     pub fn take_proof_writer(&mut self) -> Option<ProofOutput> {
         self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
+        self.proof_manager.take().map(ProofManager::into_output)
+    }
+
+    /// Take proof output without consulting ambient artifact-export env vars.
+    pub(crate) fn take_proof_writer_without_artifact(&mut self) -> Option<ProofOutput> {
         self.proof_manager.take().map(ProofManager::into_output)
     }
 
@@ -75,6 +96,13 @@ impl Solver {
     }
 
     pub(super) fn maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env(&self) {
+        #[cfg(test)]
+        FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT_HOOK_CALLS
+            .with(|calls| calls.set(calls.get().saturating_add(1)));
+
+        if !self.cold.ambient_artifacts_enabled {
+            return;
+        }
         let Ok(path) = std::env::var(
             crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
         ) else {

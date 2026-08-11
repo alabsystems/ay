@@ -494,6 +494,17 @@ impl Solver {
 
         // Current assumption index we're trying to set
         let mut assumption_idx = 0;
+        // #assumption-prefix-depth: `assumptions.len()` is an INDEX count, but it
+        // was being compared against DECISION LEVELS. An assumption already
+        // assigned to its correct value consumes an index WITHOUT creating a
+        // level (see the `assumption_idx += 1; continue;` skip below), so with
+        // j of k assumptions implied the true prefix occupies levels 1..(k-j)
+        // while the tests compared against k. Conflicts landing in that gap were
+        // misclassified as "inside the assumption prefix", which sent the core
+        // walk through ordinary search decisions it cannot name — the source of
+        // the under-approximated cores. `assump_idx_at_level[L]` is the
+        // assumption index after the assumption that created level L.
+        let mut assump_idx_at_level: Vec<usize> = vec![0];
 
         // IC3 assumption cache (#8443): save current assumptions and mark
         // cache valid for the next solve call. This is set here (before
@@ -616,7 +627,9 @@ impl Solver {
                 // assumption_idx; the on_learned hook extracts the failed
                 // assumption core while var levels are still valid
                 // (pre-backtrack).
-                let num_assumptions = assumptions.len() as u32;
+                // True prefix depth = number of assumptions that actually got a
+                // decision level, NOT `assumptions.len()`.
+                let num_assumptions = (assump_idx_at_level.len().saturating_sub(1)) as u32;
                 // #8423: Track backtrack level for eager extension callback.
                 let mut ext_bt_level: Option<u32> = None;
                 let has_eager_ext = eager_ext.is_some();
@@ -624,7 +637,14 @@ impl Solver {
                     conflict_ref,
                     "assumption loop",
                     |_solver, bt_level| {
-                        if bt_level < num_assumptions {
+                        // CONSERVATIVE rewind, deliberately unchanged from HEAD.
+                        // Rewinding via the level->index map would set a HIGHER
+                        // index and thereby SKIP assumptions that the backtrack
+                        // may have unassigned, so they would never be
+                        // re-established. Under-skipping only costs a re-scan.
+                        // The level-vs-index confusion is corrected where it
+                        // actually matters: the core-walk guards below.
+                        if (bt_level as usize) < assumptions.len() {
                             assumption_idx = bt_level as usize;
                         }
                         if has_eager_ext {
@@ -638,11 +658,18 @@ impl Solver {
                         // walk the original conflict clause's implication graph
                         // to collect every contributing assumption.
                         if actual_bt_level < num_assumptions {
-                            let conflict_core = solver.resolve_conflict_for_unsat_core(
-                                conflict_ref,
-                                &is_assumption,
-                                &assumption_lit,
-                            );
+                            // `_incomplete` is EXPECTED here: this harvest runs
+                            // pre-backtrack, so ordinary search decisions are
+                            // still on the trail and the walk provably reaches
+                            // one. It only feeds `failed_assumptions`, published
+                            // as a core at FORMULA-UNSAT exits where the true
+                            // core is empty and accumulation over-approximates.
+                            let (conflict_core, _incomplete) = solver
+                                .resolve_conflict_for_unsat_core(
+                                    conflict_ref,
+                                    &is_assumption,
+                                    &assumption_lit,
+                                );
                             for assump_lit in conflict_core {
                                 let var_idx = assump_lit.variable().index();
                                 if var_idx < is_failed.len() && !is_failed[var_idx] {
@@ -716,8 +743,27 @@ impl Solver {
                             // Seed: the conflicting variable's negation (it was
                             // propagated to the opposite of the assumption).
                             let seed = vec![assump_lit.negated()];
-                            let mut core =
+                            let (mut core, incomplete) =
                                 self.minimize_unsat_core(&seed, &is_assumption, &assumption_lit);
+                            if incomplete {
+                                if std::env::var("AY_SAT_L0_UNSAT_TRACE").is_ok() {
+                                    eprintln!(
+                                        "c CORE-FAILSAFE: minimized={} -> certified={} (conflicts={})",
+                                        core.len(),
+                                        assumptions.len(),
+                                        self.num_conflicts(),
+                                    );
+                                }
+                                // #core-failsafe: the walk met a node it could
+                                // neither expand nor name, so `core` is not a
+                                // certified unsatisfiable subset. The FULL
+                                // assumption prefix is unsatisfiable here, so
+                                // return that: over-approximating costs
+                                // precision, under-approximating is a WRONG
+                                // ANSWER (it inflates OLL's `w_min`, driving the
+                                // lower bound past the true optimum).
+                                core = assumptions.to_vec();
+                            }
 
                             // SOUNDNESS (#unsat-core): `minimize_unsat_core` keys its
                             // `assumption_lit` lookup by VARIABLE, so it cannot
@@ -771,6 +817,13 @@ impl Solver {
                     );
                     assumption_idx += 1;
                     self.decide(assump_lit);
+                    {
+                        let lvl = self.decision_level as usize;
+                        if assump_idx_at_level.len() <= lvl {
+                            assump_idx_at_level.resize(lvl + 1, assumption_idx);
+                        }
+                        assump_idx_at_level[lvl] = assumption_idx;
+                    }
                     continue;
                 }
 
@@ -1026,9 +1079,11 @@ impl Solver {
         conflict_ref: ClauseRef,
         is_assumption: &[bool],
         assumption_lit: &[Option<Literal>],
-    ) -> Vec<Literal> {
+    ) -> (Vec<Literal>, bool) {
         if !self.arena.is_active(conflict_ref.0 as usize) {
-            return vec![];
+            // #core-failsafe: the conflict clause is gone; nothing can be
+            // certified from it.
+            return (vec![], true);
         }
         let seed_lits = self.arena.literals(conflict_ref.0 as usize);
         self.minimize_unsat_core(seed_lits, is_assumption, assumption_lit)
@@ -1056,9 +1111,9 @@ impl Solver {
         seed_lits: &[Literal],
         is_assumption: &[bool],
         assumption_lit: &[Option<Literal>],
-    ) -> Vec<Literal> {
+    ) -> (Vec<Literal>, bool) {
         if seed_lits.is_empty() {
-            return vec![];
+            return (vec![], false);
         }
 
         let nv = self.num_vars;
@@ -1067,6 +1122,9 @@ impl Solver {
         let mut queue: Vec<usize> = Vec::new();
         let mut core: Vec<Literal> = Vec::new();
         let mut in_core = vec![false; nv];
+        // #core-failsafe (2026-07-28): set when the BFS cannot account for a
+        // branch of the implication graph. See the fallback at the end.
+        let mut incomplete = false;
 
         // Seed the BFS with the seed literals' variables.
         for &lit in seed_lits {
@@ -1093,7 +1151,10 @@ impl Solver {
             match self.var_reason_kind(var_idx) {
                 ReasonKind::Decision => {
                     // Decision variable: if it's an assumption, add to core.
-                    if var_idx < is_assumption.len() && is_assumption[var_idx] {
+                    if var_idx >= is_assumption.len() {
+                        // #core-failsafe: cannot classify this node.
+                        incomplete = true;
+                    } else if is_assumption[var_idx] {
                         // SOUNDNESS (#unsat-core-polarity, A7): `assumption_lit`
                         // stores ONE literal per VARIABLE, so when the caller
                         // assumes a variable at both polarities in the same
@@ -1129,6 +1190,19 @@ impl Solver {
                                 core.push(a_lit);
                             }
                         }
+                    } else {
+                        // #core-failsafe: an ORDINARY SEARCH DECISION. The
+                        // conflict depends on it, but it is not an assumption,
+                        // so it cannot appear in the core — meaning the set we
+                        // are building does NOT explain the conflict and is
+                        // therefore NOT an unsatisfiable subset. Dropping it
+                        // silently (the previous behaviour) UNDER-approximates
+                        // the core, and under-approximation is the unsound
+                        // direction: a proper subset of a core need not be
+                        // unsat, so a core-guided MaxSAT engine charges a
+                        // larger `w_min` than it is entitled to and its lower
+                        // bound climbs past the true optimum.
+                        incomplete = true;
                     }
                 }
                 ReasonKind::Clause(cref) => {
@@ -1150,6 +1224,9 @@ impl Solver {
                     }
                 }
                 ReasonKind::LazyTheory(_) => {
+                    // #core-failsafe: an unexpanded reason is an unaccounted
+                    // branch; fall back rather than under-approximate.
+                    incomplete = true;
                     // Lazy theory reasons should have been pre-materialized
                     // before conflict analysis. If we reach here during
                     // assumption core extraction, treat as decision (no expansion).
@@ -1159,7 +1236,14 @@ impl Solver {
             }
         }
 
-        core
+        // #core-failsafe: `core` is a SUBSET of a genuine explanation and is
+        // NOT certified unsatisfiable. Growing it by the seed does not help — a
+        // superset of an UNDER-approximation proves nothing, and at the
+        // conflict-clause call site every seed literal is FALSE on the trail,
+        // so copying one publishes the NEGATION of the assumption that
+        // participated (#unsat-core-polarity, A7). Report the flag; only the
+        // caller knows the certified over-approximation.
+        (core, incomplete)
     }
 
     /// Partial restart - only restart back to a given level (for assumption-based solving)

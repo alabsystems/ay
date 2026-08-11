@@ -172,6 +172,25 @@ impl Solver {
         self.cold.unsat_certificate_enabled = enabled;
     }
 
+    /// Disable encoding-dump, Fmla authority/artifact, solver-start JIT hooks,
+    /// and startup walk, and do not retain a second copy of emitted backward
+    /// LRAT steps in the result.
+    ///
+    /// Startup walk is only a phase-selection heuristic. On tiny proof-routed
+    /// formulas its fixed work can dominate the complete CDCL search; periodic
+    /// rephase walk remains enabled and available to longer solves.
+    ///
+    /// This is crate-internal because ordinary solver callers retain the
+    /// historical artifact and certificate behavior.
+    pub(crate) fn set_bounded_in_memory_proof_posture(&mut self) {
+        self.cold.ambient_artifacts_enabled = false;
+        self.cold.retain_unsat_certificate = false;
+        // Solver-start native/JIT installation is process-global and may
+        // compile or load artifacts selected by the ambient environment.
+        self.cold.jit_disabled = true;
+        self.set_startup_walk_enabled(false);
+    }
+
     /// Check if clause trace is enabled
     pub fn clause_trace_enabled(&self) -> bool {
         self.cold.clause_trace.is_some()
@@ -453,5 +472,19 @@ impl Solver {
                 panic!("{}", mismatch.describe());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_posture_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_in_memory_posture_disables_ambient_hooks_and_retention() {
+        let mut solver = Solver::new(1);
+        solver.set_bounded_in_memory_proof_posture();
+        assert!(!solver.cold.ambient_artifacts_enabled);
+        assert!(!solver.cold.retain_unsat_certificate);
+        assert!(solver.cold.jit_disabled);
     }
 }

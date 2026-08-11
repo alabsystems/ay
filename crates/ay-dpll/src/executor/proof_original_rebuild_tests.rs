@@ -13,6 +13,181 @@
 
 use super::*;
 
+struct SeqPushBackRowFixture {
+    zero_seed: TermId,
+    seed_len: TermId,
+    goal: TermId,
+    array: TermId,
+    read_index: TermId,
+    len: TermId,
+    value: TermId,
+}
+
+fn seq_push_back_row_fixture(exec: &mut Executor) -> SeqPushBackRowFixture {
+    let terms = &mut exec.ctx.terms;
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let array = terms.mk_var("seq_array", array_sort.clone());
+    let read_index = terms.mk_var("seq_offset", Sort::Int);
+    let seed_len = terms.mk_var("seq_len_before", Sort::Int);
+    let len = terms.mk_var("seq_len_proxy", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let value = terms.mk_int(BigInt::from(30_u8));
+    let store_index = terms.mk_app(Symbol::named("+"), [read_index, len], Sort::Int);
+    let stored = terms.mk_app(
+        Symbol::named("store"),
+        [array, store_index, value],
+        array_sort,
+    );
+    let selected = terms.mk_app(Symbol::named("select"), [stored, read_index], Sort::Int);
+    let row_eq = terms.mk_app(Symbol::named("="), [value, selected], Sort::Bool);
+    let goal = terms.mk_not_raw(row_eq);
+    let zero_seed = terms.mk_app(Symbol::named("="), [zero, seed_len], Sort::Bool);
+    let seed_len = terms.mk_app(Symbol::named("="), [seed_len, len], Sort::Bool);
+    SeqPushBackRowFixture {
+        zero_seed,
+        seed_len,
+        goal,
+        array,
+        read_index,
+        len,
+        value,
+    }
+}
+
+fn terminal_empty_trust_proof() -> Proof {
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+    proof
+}
+
+#[test]
+fn authenticated_seq_push_back_row_rebuilds_with_two_exact_lia_equalities() {
+    let mut exec = Executor::new();
+    let f = seq_push_back_row_fixture(&mut exec);
+    let authored = vec![f.zero_seed, f.seed_len, f.goal];
+    let mut proof = terminal_empty_trust_proof();
+
+    exec.plan_authenticated_seq_push_back_row1(&authored)
+        .expect("the exact two-equality fixture must produce a proof plan");
+    assert!(exec.try_rebuild_authenticated_seq_push_back_row1(&mut proof, &authored));
+    let quality = ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("the rebuilt LIA + guarded ROW1 proof must strictly replay");
+    assert!(quality.is_complete());
+    assert!(
+        ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &authored).is_ok(),
+        "every reachable assumption must be one of the exact authored roots"
+    );
+    assert!(proof.steps.iter().all(|step| !matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::Generic,
+            ..
+        }
+    )));
+    let assumed: Vec<TermId> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Assume(term) => Some(*term),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assumed, authored,
+        "both LIA links and the goal are consumed"
+    );
+}
+
+#[test]
+fn authenticated_seq_push_back_row_refuses_missing_or_changed_lia_link() {
+    let mut exec = Executor::new();
+    let f = seq_push_back_row_fixture(&mut exec);
+
+    for authored in [vec![f.zero_seed, f.goal], {
+        let other_len = exec.ctx.terms.mk_var("other_len", Sort::Int);
+        let TermData::App(Symbol::Named(_), args) = exec.ctx.terms.get(f.seed_len).clone() else {
+            panic!("fixture link must be an equality")
+        };
+        let changed = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [args[0], other_len], Sort::Bool);
+        vec![f.zero_seed, changed, f.goal]
+    }] {
+        let mut proof = terminal_empty_trust_proof();
+        assert!(
+            !exec.try_rebuild_authenticated_seq_push_back_row1(&mut proof, &authored),
+            "a missing/changed authored length link must fail closed"
+        );
+        assert_eq!(
+            ay_proof::terminal_trust_report(&proof).trust_rule_on_path,
+            1
+        );
+    }
+}
+
+#[test]
+fn authenticated_seq_push_back_row_refuses_changed_store_index_or_value() {
+    let mut exec = Executor::new();
+    let f = seq_push_back_row_fixture(&mut exec);
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+
+    let wrong_offset = exec.ctx.terms.mk_var("wrong_offset", Sort::Int);
+    let wrong_store_index =
+        exec.ctx
+            .terms
+            .mk_app(Symbol::named("+"), [wrong_offset, f.len], Sort::Int);
+    let wrong_index_store = exec.ctx.terms.mk_app(
+        Symbol::named("store"),
+        [f.array, wrong_store_index, f.value],
+        array_sort.clone(),
+    );
+    let wrong_index_select = exec.ctx.terms.mk_app(
+        Symbol::named("select"),
+        [wrong_index_store, f.read_index],
+        Sort::Int,
+    );
+    let wrong_index_eq = exec.ctx.terms.mk_app(
+        Symbol::named("="),
+        [f.value, wrong_index_select],
+        Sort::Bool,
+    );
+    let wrong_index_goal = exec.ctx.terms.mk_not_raw(wrong_index_eq);
+
+    let store_index = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("+"), [f.read_index, f.len], Sort::Int);
+    let stored = exec.ctx.terms.mk_app(
+        Symbol::named("store"),
+        [f.array, store_index, f.value],
+        array_sort,
+    );
+    let selected =
+        exec.ctx
+            .terms
+            .mk_app(Symbol::named("select"), [stored, f.read_index], Sort::Int);
+    let wrong_value = exec.ctx.terms.mk_int(BigInt::from(31_u8));
+    let wrong_value_eq =
+        exec.ctx
+            .terms
+            .mk_app(Symbol::named("="), [wrong_value, selected], Sort::Bool);
+    let wrong_value_goal = exec.ctx.terms.mk_not_raw(wrong_value_eq);
+
+    for goal in [wrong_index_goal, wrong_value_goal] {
+        let authored = vec![f.zero_seed, f.seed_len, goal];
+        let mut proof = terminal_empty_trust_proof();
+        assert!(
+            !exec.try_rebuild_authenticated_seq_push_back_row1(&mut proof, &authored),
+            "a changed store index/value must not match the exact ROW1 lane"
+        );
+        assert_eq!(
+            ay_proof::terminal_trust_report(&proof).trust_rule_on_path,
+            1
+        );
+    }
+}
+
 /// Build the store-flat fixture:
 ///
 /// ```text

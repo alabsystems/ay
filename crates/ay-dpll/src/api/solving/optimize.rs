@@ -140,8 +140,10 @@ impl Solver {
             // The executor context does not contain API-owned softs, so entering
             // its objective optimizer here would silently ignore them and make
             // the returned model value look like a joint optimum.
+            self.executor
+                .replace_last_result_with_unknown(crate::UnknownReason::Unsupported);
             self.last_unknown_reason = Some(crate::UnknownReason::Unsupported);
-            return VerifiedSolveResult::from_validated(SolveResult::Unknown, None);
+            return self.finish_verified_result(SolveResult::Unknown);
         }
 
         let deadline = self.timeout.map(|duration| Instant::now() + duration);
@@ -163,7 +165,7 @@ impl Solver {
         self.executor.clear_solve_controls();
         if let Err(e) = exec_result {
             self.record_executor_failure_unknown(&e);
-            return VerifiedSolveResult::from_validated(SolveResult::Unknown, None);
+            return self.finish_verified_result(SolveResult::Unknown);
         }
 
         let result = self
@@ -174,8 +176,7 @@ impl Solver {
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
             self.classify_unknown_reason(deadline);
         }
-        let sat_certificate = self.executor.take_sat_certificate();
-        VerifiedSolveResult::from_validated(result, sat_certificate)
+        self.finish_verified_result(result)
     }
 
     /// Get the optimum value of objective `idx` after [`optimize_check`](Self::optimize_check).

@@ -97,6 +97,55 @@ class PlanSolverResourcesTest(unittest.TestCase):
         self.assertEqual(plan.headroom_mb, 4096)
         self.assertEqual(plan.memlimit_mb, (24576 - 4096) // 6)
 
+    def test_live_free_memory_trims_a_plan_sized_for_an_idle_host(self):
+        # The 2026-07-30 panic shape: a second campaign is already resident, so
+        # `RAM - headroom` describes a machine that no longer exists. The plan
+        # must size against what is free NOW, keeping one child's worth spare.
+        idle = og.plan_solver_resources(4, ram_mb=24576, cores=14)
+        busy = og.plan_solver_resources(4, ram_mb=24576, cores=14,
+                                        available_mb=6000)
+        self.assertLess(busy.memlimit_mb, idle.memlimit_mb)
+        self.assertLessEqual(busy.jobs * busy.memlimit_mb, 6000 - 1024)
+
+    def test_live_free_memory_can_only_shrink_a_plan(self):
+        # A host reporting more free memory than the static policy allows must
+        # NOT widen the envelope — headroom still binds.
+        idle = og.plan_solver_resources(4, ram_mb=24576, cores=14)
+        roomy = og.plan_solver_resources(4, ram_mb=24576, cores=14,
+                                         available_mb=24576)
+        self.assertEqual(roomy.memlimit_mb, idle.memlimit_mb)
+        self.assertEqual(roomy.jobs, idle.jobs)
+
+    def test_no_free_memory_fails_closed(self):
+        # A machine with nothing left must refuse to plan, not hand out a
+        # budget it cannot back.
+        with self.assertRaisesRegex(RuntimeError, "remains after effective"):
+            og.plan_solver_resources(4, ram_mb=24576, cores=14,
+                                     available_mb=512)
+
+    def test_unknown_free_memory_leaves_the_static_plan_intact(self):
+        # 0 means "could not read the counter". That must not refuse every run
+        # on a platform whose counters we cannot parse.
+        idle = og.plan_solver_resources(4, ram_mb=24576, cores=14)
+        unknown = og.plan_solver_resources(4, ram_mb=24576, cores=14,
+                                           available_mb=0)
+        self.assertEqual(unknown.memlimit_mb, idle.memlimit_mb)
+
+    def test_negative_available_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "available_mb must be"):
+            og.plan_solver_resources(4, ram_mb=24576, cores=14,
+                                     available_mb=-1)
+
+    def test_host_available_ram_is_readable_and_bounded_by_physical(self):
+        # Detection itself must never raise; on a supported host it returns a
+        # positive figure that cannot exceed physical RAM.
+        available = og.host_available_ram_mb()
+        self.assertIsInstance(available, int)
+        self.assertGreaterEqual(available, 0)
+        if sys.platform in ("darwin", "linux"):
+            self.assertGreater(available, 0)
+            self.assertLessEqual(available, og._host_physical_ram_mb())
+
     def test_explicit_unknown_ram_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "ram_mb must be positive"):
             og.plan_solver_resources(6, ram_mb=0, cores=14)

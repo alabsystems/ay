@@ -9,6 +9,8 @@
 //! UNSAT twin (and vice versa); all verdicts verified against z3.
 
 use super::*;
+use ay_core::Sort;
+use num_bigint::BigInt;
 
 // ---------------------------------------------------------------------------
 // LIA: same-direction ∀∃ alternation (previously unknown)
@@ -252,6 +254,100 @@ fn qe_prepass_mixed_ground_constraint_respected() {
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs, vec!["unsat"]);
+}
+
+/// #qe-prepass-restore-cert: a ground constraint next to a quantified
+/// assertion the deep-QE pre-pass ELIMINATES. The eliminated form drives the
+/// verdict and the restored (authored) universal must still be certified
+/// against the emitted model. z3: sat (`a = 10`) / unsat.
+#[test]
+fn qe_prepass_restore_cert_model_dependent_universal_sat() {
+    // ∀x.(0 ≤ x ≤ 3 ⇒ x < a) eliminates to `a > 3`, so the disjunctive ground
+    // constraint is forced to the `a = 10` branch (z3: sat).
+    let input = r#"
+        (set-logic LIA)
+        (declare-const a Int)
+        (assert (or (= a 0) (= a 10)))
+        (assert (forall ((x Int)) (=> (and (<= 0 x) (<= x 3)) (< x a))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["sat"]);
+}
+
+/// Opposite-verdict twin: pinning `a` to the falsifying branch refutes
+/// (z3: unsat). A certificate that confirmed the universal without reading
+/// the model would leave this `sat`.
+#[test]
+fn qe_prepass_restore_cert_model_dependent_universal_twin_unsat() {
+    let input = r#"
+        (set-logic LIA)
+        (declare-const a Int)
+        (assert (= a 0))
+        (assert (forall ((x Int)) (=> (and (<= 0 x) (<= x 3)) (< x a))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+/// #qe-prepass-restore-cert NON-VACUITY. The restore certificate must actually
+/// EVALUATE the eliminated universal against the EMITTED MODEL, not merely
+/// observe that the pre-pass could eliminate it.
+///
+/// Same assertion, same code path, two models: `∀x.(0 ≤ x ≤ 3 ⇒ x < a)`
+/// eliminates to `a > 3`, so the certificate must ACCEPT under a model pinning
+/// `a = 10` and REJECT the falsifying `a = 0`. (The accept leg also pins the
+/// wiring: were the rebuilt `a` a different node from the declared constant,
+/// the equivalent would be unevaluable and BOTH legs would return `false`.)
+#[test]
+fn qe_prepass_restore_cert_rejects_falsifying_model() {
+    fn cert_under_pin(pin: i64) -> bool {
+        let input = format!("(set-logic LIA)(declare-const a Int)(assert (= a {pin}))(check-sat)");
+        let commands = parse(&input).unwrap();
+        let mut exec = Executor::new();
+        assert_eq!(exec.execute_all(&commands).unwrap(), vec!["sat"]);
+        // Install the quantified assertion into the emitted model's window
+        // without disturbing the model (a `Command::Assert` would invalidate
+        // it), exactly as `restore_assertions` hands it to the certificate.
+        // `a` must be the DECLARED constant's own node: the front end mints it
+        // with `mk_fresh_named_var`, so re-interning the name would build a
+        // different (unpinned) leaf.
+        let a = exec
+            .ctx
+            .symbol_iter()
+            .find(|(name, _)| name.as_str() == "a")
+            .and_then(|(_, info)| info.term)
+            .expect("declared constant `a` must carry a term");
+        let x = exec.ctx.terms.mk_var("x", Sort::Int);
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let three = exec.ctx.terms.mk_int(BigInt::from(3));
+        let lo = exec.ctx.terms.mk_le(zero, x);
+        let hi = exec.ctx.terms.mk_le(x, three);
+        let guard = exec.ctx.terms.mk_and(vec![lo, hi]);
+        let concl = exec.ctx.terms.mk_lt(x, a);
+        let body = exec.ctx.terms.mk_implies(guard, concl);
+        let fa = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        exec.ctx.assertions.push(fa);
+        exec.qe_prepass_certifies_restored_quantifiers()
+    }
+
+    assert!(
+        cert_under_pin(10),
+        "a = 10 satisfies the eliminated universal (a > 3): the certificate must confirm"
+    );
+    assert!(
+        !cert_under_pin(0),
+        "a = 0 FALSIFIES the eliminated universal (a > 3): the certificate must refuse — \
+         a confirmation here would be vacuous"
+    );
 }
 
 // ---------------------------------------------------------------------------

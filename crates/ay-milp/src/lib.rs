@@ -46,6 +46,8 @@
 //! columns represented as 0/1 disjunctions.
 
 mod bab;
+mod block_angular_route;
+mod cardinality_branch;
 #[doc(hidden)]
 pub use bab::{
     bump_lu_diff_on_model,
@@ -70,6 +72,11 @@ pub use bab::{
 };
 mod cert;
 pub mod cert_io;
+// THE COMMON CURRENCY: what a lane may claim, how strong the evidence behind it
+// has to be, and the one function (`claim::may_close`) that decides whether a
+// lane is allowed to end the solve or must stand behind the anchor.
+mod claim;
+pub mod compare;
 // Reduced-frame -> caller-frame certificate translation, called from the
 // `expand_*_outcome` functions in `bab.rs`.
 mod cert_lift;
@@ -79,8 +86,36 @@ mod certify;
 #[doc(hidden)]
 pub use certify::sealed_scale::diag_sealed_scale_rational_weak_row;
 mod cuts;
+mod direct_cnf;
+// DUAL FIXING BY LOCK COUNTING. Deliberately NOT part of `presolve`: it is the
+// one reduction in the crate that cuts off feasible points (see its header).
+mod dualfix;
+/// Full-size dual-fix campaign; see [`dualfix::diag_dualfix_campaign_at_scale`].
+/// Exposed for `examples/dualfix_campaign.rs` so the campaign is a runnable
+/// target rather than an `#[ignore]`d test that never runs.
+#[doc(hidden)]
+pub use dualfix::diag_dualfix_campaign_at_scale;
+/// One-line census of what dual fixing does to a model, without solving it:
+/// integer columns free before, after propagation alone (the `DualReductions=0`
+/// arm), and after the full fixpoint. Measurement scaffold for `ay-milp diag
+/// dualfix`, not a shipped API.
+#[doc(hidden)]
+#[must_use]
+pub fn diag_dualfix(model: &Model, secs: f64) -> String {
+    dualfix::diag_line(model, secs)
+}
 mod error;
 mod exact;
+mod hybrid_integer_lift;
+mod hybrid_pb_lp;
+#[doc(hidden)]
+pub use block_angular_route::diag_block_angular;
+pub use block_angular_route::{
+    verify_optimality_certificate as verify_block_angular_optimality_certificate,
+    BlockAngularOptimalityCertificate,
+};
+pub use hybrid_integer_lift::HybridIntegerLiftInfeasibilityCertificate;
+pub use hybrid_pb_lp::HybridPbLpInfeasibilityCertificate;
 mod knobs;
 pub use knobs::{
     env_audit, Bucket, Deprecation, EnvAudit, Knob, Route, Routed, ZeroIgnored, ALLOW_UNKNOWN_ENV,
@@ -93,12 +128,54 @@ mod margin;
 pub use margin::diag_margin_reframe;
 mod model;
 mod mps;
+mod network_design_benders;
+mod network_design_pb;
+mod network_design_route;
+pub use network_design_route::{
+    verify_infeasibility_certificate as verify_network_design_infeasibility_certificate,
+    verify_optimality_certificate as verify_network_design_optimality_certificate,
+    NetworkDesignInfeasibilityCertificate, NetworkDesignOptimalityCertificate,
+};
 mod ns;
+mod open_domain;
+mod open_domain_route;
 mod opts;
 mod outcome;
 mod parity;
+pub use parity::{verify_parity_infeasibility_certificate, ParityInfeasibilityCertificate};
+// The first pattern-count tranche is deliberately classifier-only.  Production
+// wiring follows only after exact pricing/frontier proof support exists.
+#[allow(dead_code)]
+mod pattern_count_route;
+mod pb_route;
+/// Model-bound replay for the PB projection proof artifacts a routed solve
+/// publishes on [`BabSession`].
+///
+/// These verdicts do not travel on `Outcome::Infeasible { cert, tree_cert }` —
+/// a PB decision DAG is neither a Farkas combination nor a case-split tree — so
+/// a consumer that must re-check a routed INFEASIBLE reads the artifact off the
+/// session and replays it here, against its OWN `Model`. Each entry point
+/// rebuilds the exact projection from that model rather than trusting the
+/// artifact's embedded copy, which is what makes it evidence about one model
+/// instead of a self-report.
+pub use pb_route::{
+    verify_multi_row_infeasibility_certificate as verify_multi_row_bdd_infeasibility_certificate,
+    verify_single_row_infeasibility_certificate as verify_single_row_dp_infeasibility_certificate,
+};
+mod pb_translate;
 mod presolve;
 mod probe;
+mod sat_relu;
+pub use sat_relu::{
+    verify_infeasibility_certificate as verify_sat_relu_infeasibility_certificate,
+    SatReluInfeasibilityCertificate, SatReluInfeasibilityVerificationError,
+};
+mod sat_route;
+mod scheduling_route;
+pub use scheduling_route::{
+    verify_optimality_certificate as verify_single_machine_scheduling_optimality_certificate,
+    SingleMachineSchedulingOptimalityCertificate,
+};
 pub mod sepstat;
 mod session;
 mod simplex;
@@ -128,8 +205,9 @@ pub use session::{
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,
     CertifiedAdaptiveFourLeafComb, CertifiedAdaptiveThreeLeafHarvest,
     CertifiedAdaptiveThreeLeafTree, CertifiedBinaryAssignmentTree, CertifiedBinaryTreeHarvest,
-    CertifiedSplitHarvest, LpSession, ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbReport,
-    MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
+    CertifiedSplitHarvest, LpSession, ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbPrefixOpts,
+    TargetFsbReport, MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
+    MAX_TARGET_FSB_PREFIX_CANDIDATES,
 };
 pub use simplex::{
     iter_ledger_line, px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line,

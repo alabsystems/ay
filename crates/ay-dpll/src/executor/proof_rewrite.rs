@@ -12,7 +12,7 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
-use ay_core::{Proof, TermId};
+use ay_core::{Proof, ProofStep, TermId};
 
 use super::proof_surface_syntax::collect_surface_term_overrides;
 use super::Executor;
@@ -117,10 +117,48 @@ impl Executor {
         exportable
     }
 
-    /// Rewrite proof terms to use surface syntax for canonicalized operators.
+    /// Rewrite proof terms to use surface syntax for canonicalized operators,
+    /// then run the ASSUME-AUTHORIZATION tail.
+    ///
+    /// Only the surface-override collection needs the parsed AST. Everything
+    /// after it — `demote_auxiliary_non_problem_assumptions`,
+    /// `derive_conjunct_assumptions_from_problem_roots`,
+    /// `demote_non_problem_assumptions` and
+    /// `rebuild_trust_leaf_proof_from_original_assertions` — decides whether
+    /// the MANDATORY UNSAT certificate can be minted at all, and must run
+    /// whether or not a parsed AST was retained.
+    ///
+    /// #retain-parsed-verdict-divergence. Retaining the parsed AST is a
+    /// peak-RSS optimization the CLI turns OFF whenever no proof artifact can
+    /// be emitted (`--no-proof`, `--z3-mode`, competition mode —
+    /// `crates/ay/src/run.rs`), on the documented premise that "verdicts are
+    /// unaffected; every consumer degrades gracefully on an empty prefix".
+    /// That premise was false BECAUSE of this early return: skipping it also
+    /// skipped the demotion pass, so an `assume` leaf left behind by an
+    /// in-place preprocessing rewrite (e.g. the QF_ABV dense finite-array
+    /// initializer rewrite) stayed a bare `assume` instead of becoming a
+    /// `trust` step, and strict certification HARD-REJECTED the whole
+    /// refutation with "assumes term outside the supplied problem obligation".
+    /// Measured on this commit: six QF_ABV instances that z3, the library API
+    /// and default CLI mode all decide `unsat` published `unknown` under
+    /// `--z3-mode`/`--no-proof` — i.e. exactly the mode used for z3 parity.
+    /// Moving the same `(set-option :produce-proofs true/false)` toggle from
+    /// AFTER the assertions to BEFORE them (the only effect of which is to
+    /// retain the parsed stack) flipped the verdict back to `unsat`.
+    ///
+    /// This grants no new authority: a demoted assume becomes a `trust` step
+    /// that `mint_unsat_certificate` must still discharge INDEPENDENTLY (the
+    /// forged-UNSAT fresh re-solve, full strict validation of every non-trust
+    /// step, and per-clause confirmation) before the verdict may publish. It
+    /// only makes the two CLI modes agree on the reference behaviour the
+    /// library API and default mode already have.
+    ///
+    /// The overrides themselves still degrade to nothing without a parsed
+    /// stack: both `override_pairs` arms zip against `parsed_assertions`, so
+    /// an empty parsed stack yields no pairs and no term overrides.
     pub(super) fn apply_input_syntax_rewrites_to_proof(&mut self, proof: &mut Proof) {
         self.last_proof_term_overrides = None;
-        if self.ctx.assertions.is_empty() || self.ctx.assertions_parsed().is_empty() {
+        if self.ctx.assertions.is_empty() {
             return;
         }
 
@@ -195,6 +233,48 @@ impl Executor {
         }
 
         Self::infer_auxiliary_division_rewrites(&mut self.ctx.terms, proof, &mut rewrites);
+
+        // #authored-aux-name-collision — this surface rewrite is COSMETIC (it
+        // prints `div`/`mod` in the exported proof instead of the client's
+        // quotient/remainder encoding), but it can move an `Assume` LEAF out of
+        // the authored problem obligation, and an unauthorized assume is a hard
+        // reject in the mandatory strict certification. A correct `unsat` then
+        // publishes as `unknown`. Print fidelity must yield to the verdict.
+        //
+        // The trigger is that `as_aux_quotient_var` / `as_aux_remainder_var`
+        // recognise the encoder's auxiliaries purely by variable NAME PREFIX
+        // (`_mod_q`, `_div_q`, `_divmod_q` and the `_r` twins). AY's own
+        // div/mod elimination never mints those names — only ay-chc's
+        // `ChcExpr::eliminate_mod` does, and it declares them to the executor as
+        // ordinary `(declare-const _mod_q_0 Int)`. So every variable this
+        // heuristic ever matches belongs to the CLIENT, and the "side
+        // conditions" it infers from are frequently DERIVED terms (here, the
+        // post-substitution `(= (+ (* _mod_q_2 2) _mod_r_3) (+ (* _mod_q_0 2)
+        // _mod_r_1 1))`) rather than authored ones — so filtering on "is this an
+        // authored assertion" does not catch it. What is decisive is the effect:
+        // if applying the rewrites would change an `Assume` leaf into a term the
+        // obligation does not contain, drop the whole rewrite.
+        //
+        // Verified on the query
+        // `adaptive::tests::test_try_synthesis_accepts_chccomp_extra_small_lia_safe_summaries`
+        // issues: renaming ONLY `_mod_q_`/`_mod_r_` to `zzq`/`zzr` in the dumped
+        // `.smt2` — semantically identical, and enough to make the heuristic miss
+        // — flipped it from `unknown (self-check-rejected)` to `unsat`.
+        if !rewrites.is_empty() {
+            let obligation = self.problem_assertions_for_strict_proof();
+            let mut cache: HashMap<TermId, TermId> = HashMap::default();
+            let breaks_authorization = proof.steps.iter().any(|step| {
+                let ProofStep::Assume(term) = step else {
+                    return false;
+                };
+                let rewritten =
+                    Self::rewrite_term(&mut self.ctx.terms, *term, &rewrites, &mut cache);
+                rewritten != *term && !obligation.contains(&rewritten)
+            });
+            if breaks_authorization {
+                rewrites.clear();
+            }
+        }
 
         if !rewrites.is_empty() {
             let step_count_before = proof.steps.len();

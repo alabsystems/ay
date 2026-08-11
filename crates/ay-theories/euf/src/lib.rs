@@ -51,3 +51,5 @@ pub use solver::EufSolver;
 pub use solver_query::DiscoveredDisequality;
 pub use theory_propagate::{EUF_LAZY_MAGIC, EUF_LAZY_MAGIC_MASK};
 pub use types::{EufModel, FunctionTable, SortModel};
+
+pub mod theories_ledger;

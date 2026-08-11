@@ -20,10 +20,26 @@ use crate::fmla_runtime_ledger::{
     FMLA_MAIN_LRAT_EXTERNAL_CHECKER_VERDICT_SCHEMA,
 };
 use crate::proof::ProofOutput;
+use crate::resolution_dag::{ResolutionDag, RupStep};
 use crate::test_util::lit;
 use crate::Literal;
+use ay_core::time::Instant;
+use std::io::{self, Write};
+use std::time::Duration;
 
 const FMLA_RETAINED_PROOF_OUT_PATH: &str = "runs/fmla/proof/proof.out";
+
+struct AlwaysFailWrite;
+
+impl Write for AlwaysFailWrite {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "test writer"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 fn decompose_context(sidecar_row_index: usize) -> DecomposeProofEmitContext {
     DecomposeProofEmitContext {
@@ -1405,6 +1421,221 @@ fn test_signed_lrat_binary_add_encodes_negative_hints() {
         }
         other => panic!("expected signed add step, got {other:?}"),
     }
+}
+
+#[test]
+fn bounded_direct_backward_and_terminal_emission_replay_validly() {
+    let output = ProofOutput::lrat_binary(Vec::new(), 3);
+    let mut manager = ProofManager::new(output, 2);
+    let originals = vec![
+        (1, vec![lit(0, true)]),
+        (2, vec![lit(0, false), lit(1, true)]),
+        (3, vec![lit(1, false)]),
+    ];
+    for (id, clause) in &originals {
+        manager.register_original_clause(clause);
+        manager.register_clause_id(*id);
+    }
+
+    let learned_id = manager.reserve_lrat_id_for_backward();
+    assert_eq!(learned_id, 4);
+    let deadline = Some(Instant::now() + Duration::from_secs(5));
+    manager
+        .emit_bounded_backward_rup_step(learned_id, &[lit(1, true)], &[1, 2], deadline)
+        .expect("direct bounded learned step");
+    let empty_id = manager
+        .emit_bounded_empty_rup_step(&[learned_id, 3], deadline)
+        .expect("direct bounded terminal step");
+    assert_eq!(empty_id, 5);
+    assert_eq!(manager.added_count(), 2);
+    assert!(manager.has_file_visible_terminal_empty());
+    manager.verify_unsat_chain();
+
+    let bytes = manager
+        .into_output()
+        .into_vec()
+        .expect("binary proof bytes");
+    let parsed = ay_lrat_check::lrat_parser::parse_binary_lrat(&bytes)
+        .expect("direct bounded binary LRAT parses");
+    assert_eq!(parsed.len(), 2);
+
+    let dag = ResolutionDag {
+        num_vars: 2,
+        original_clauses: originals,
+        derived: vec![
+            RupStep {
+                id: learned_id,
+                clause: vec![lit(1, true)],
+                rup_hints: vec![1, 2],
+            },
+            RupStep {
+                id: empty_id,
+                clause: Vec::new(),
+                rup_hints: vec![learned_id, 3],
+            },
+        ],
+        empty_clause_id: empty_id,
+    };
+    dag.validate()
+        .expect("direct bounded proof independently replays");
+}
+
+#[test]
+fn bounded_direct_multi_root_includes_unrelated_reserved_reason_and_replays() {
+    let output = ProofOutput::lrat_binary(Vec::new(), 5);
+    let mut manager = ProofManager::new(output, 4);
+    let originals = vec![
+        (1, vec![lit(0, true)]),
+        (2, vec![lit(0, false), lit(1, true)]),
+        (3, vec![lit(1, false)]),
+        (4, vec![lit(2, true)]),
+        (5, vec![lit(2, false), lit(3, true)]),
+    ];
+    for (id, clause) in &originals {
+        manager.register_original_clause(clause);
+        manager.register_clause_id(*id);
+    }
+    let unrelated_reason = manager.reserve_lrat_id_for_backward();
+    let conflict_reason = manager.reserve_lrat_id_for_backward();
+    assert_eq!((unrelated_reason, conflict_reason), (6, 7));
+    let deadline = Some(Instant::now() + Duration::from_secs(5));
+    manager
+        .emit_bounded_backward_rup_step(unrelated_reason, &[lit(3, true)], &[4, 5], deadline)
+        .expect("unrelated level-0 reserved reason");
+    manager
+        .emit_bounded_backward_rup_step(conflict_reason, &[lit(1, true)], &[1, 2], deadline)
+        .expect("conflict component reason");
+    manager
+        .finish_bounded_backward_emission(deadline)
+        .expect("all planned roots emitted");
+    let empty_id = manager
+        .emit_bounded_empty_rup_step(&[unrelated_reason, conflict_reason, 3], deadline)
+        .expect("terminal chain may replay an unrelated root before the conflict root");
+
+    let dag = ResolutionDag {
+        num_vars: 4,
+        original_clauses: originals,
+        derived: vec![
+            RupStep {
+                id: unrelated_reason,
+                clause: vec![lit(3, true)],
+                rup_hints: vec![4, 5],
+            },
+            RupStep {
+                id: conflict_reason,
+                clause: vec![lit(1, true)],
+                rup_hints: vec![1, 2],
+            },
+            RupStep {
+                id: empty_id,
+                clause: Vec::new(),
+                rup_hints: vec![unrelated_reason, conflict_reason, 3],
+            },
+        ],
+        empty_clause_id: empty_id,
+    };
+    dag.validate()
+        .expect("multi-root bounded DAG independently replays");
+}
+
+#[test]
+fn bounded_direct_terminal_deadline_expires_before_acceptance() {
+    let mut manager = manager_with_complementary_unit_origins();
+    let error = manager
+        .emit_bounded_empty_rup_step(&[1, 2], Some(Instant::now()))
+        .expect_err("expired direct-emission deadline");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(manager.added_count(), 0);
+    assert!(!manager.has_file_visible_terminal_empty());
+}
+
+#[test]
+fn bounded_direct_terminal_failure_never_sets_terminal_bookkeeping() {
+    let output = ProofOutput::lrat_binary(Vec::new(), 1);
+    let mut unusable = ProofManager::new(output, 1);
+    unusable.register_original_clause(&[lit(0, true)]);
+    unusable.register_clause_id(1);
+    let error = unusable
+        .emit_bounded_empty_rup_step(&[99], Some(Instant::now() + Duration::from_secs(5)))
+        .expect_err("unknown bounded hint");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(unusable.added_count(), 0);
+    assert!(!unusable.has_file_visible_terminal_empty());
+
+    let output = ProofOutput::lrat_binary(AlwaysFailWrite, 2);
+    let mut storage = ProofManager::new(output, 1);
+    storage.register_original_clause(&[lit(0, true)]);
+    storage.register_clause_id(1);
+    storage.register_original_clause(&[lit(0, false)]);
+    storage.register_clause_id(2);
+    let error = storage
+        .emit_bounded_empty_rup_step(&[1, 2], Some(Instant::now() + Duration::from_secs(5)))
+        .expect_err("writer failure");
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(storage.added_count(), 0);
+    assert!(!storage.has_file_visible_terminal_empty());
+    assert!(storage.has_io_error());
+}
+
+#[test]
+fn bounded_direct_learned_step_only_skips_an_already_visible_id() {
+    let output = ProofOutput::lrat_binary(Vec::new(), 1);
+    let mut visible = ProofManager::new(output, 1);
+    visible.register_original_clause(&[lit(0, true)]);
+    visible.register_clause_id(1);
+    let visible_id = visible
+        .emit_add(&[lit(0, true)], &[1], ProofAddKind::Derived)
+        .expect("visible derived line");
+    let before = visible.added_count();
+    visible
+        .emit_bounded_backward_rup_step(
+            visible_id,
+            &[lit(0, true)],
+            &[1],
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .expect("already-visible line is a coherent no-op");
+    assert_eq!(visible.added_count(), before);
+
+    let output = ProofOutput::lrat_binary(Vec::new(), 1);
+    let mut unknown = ProofManager::new(output, 1);
+    unknown.register_original_clause(&[lit(0, true)]);
+    unknown.register_clause_id(1);
+    let error = unknown
+        .emit_bounded_backward_rup_step(
+            99,
+            &[lit(0, true)],
+            &[1],
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .expect_err("unknown nonreserved ID must not disappear silently");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(unknown.added_count(), 0);
+    assert!(unknown.has_io_error());
+}
+
+#[test]
+fn bounded_finish_retires_unemitted_reserved_ids() {
+    let output = ProofOutput::lrat_binary(Vec::new(), 1);
+    let mut manager = ProofManager::new(output, 1);
+    manager.register_original_clause(&[lit(0, true)]);
+    manager.register_clause_id(1);
+    let emitted = manager.reserve_lrat_id_for_backward();
+    let unreachable = manager.reserve_lrat_id_for_backward();
+    let deadline = Some(Instant::now() + Duration::from_secs(5));
+    manager
+        .emit_bounded_backward_rup_step(emitted, &[lit(0, true)], &[1], deadline)
+        .expect("planned reservation emits");
+    manager
+        .finish_bounded_backward_emission(deadline)
+        .expect("retire unreachable reservations");
+    assert!(manager.lrat_id_visible_in_file(emitted));
+    assert!(!manager.lrat_id_visible_in_file(unreachable));
+    let error = manager
+        .emit_bounded_empty_rup_step(&[unreachable], deadline)
+        .expect_err("unemitted reservation cannot become a file hint");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!manager.has_file_visible_terminal_empty());
 }
 
 #[test]

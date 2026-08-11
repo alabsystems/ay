@@ -15,6 +15,9 @@ name = "ay-z3-parity"
 path = "src/main.rs"
 
 [dependencies]
+# Non-optional on purpose: this crate ships a bin target, and every bin must
+# be able to arm the kernel memory bound (see crates/ay-sys/src/govern.rs).
+ay-sys.workspace = true
 # dlopen both dylibs at RUNTIME — nothing is linked at build time. The whole
 # point is that an outsider can aim this tool at ANY two .dylib/.so files.
 libloading = "0.8"
@@ -28,6 +31,7 @@ ay-frontend = { workspace = true }
 ay-bench = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

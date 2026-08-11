@@ -294,13 +294,40 @@ fn test_native_api_diseq_half_prints_trust_free() {
     );
 }
 
-/// FAIL-CLOSED: a conjunct outside the linear fragment (an opaque nonlinear
-/// product the bounds refutation cannot use) must NOT be bridged by trust
-/// surgery or a fabricated certificate — the proof keeps its demoted trust
-/// step and the strict checker keeps rejecting it.
+/// NO FARKAS CERTIFICATE, BUT A CERTIFIED VERDICT: a conjunct outside the
+/// linear fragment (an opaque nonlinear product the bounds refutation cannot
+/// use) must NOT be bridged by trust surgery or a fabricated certificate. It is
+/// not: the proof keeps its demoted trust step and the strict checker keeps
+/// rejecting it.
+///
+/// WHY THE EXPECTATION MOVED (was: `unknown` + revoked artifacts).
+/// The query is GENUINELY UNSAT — `y = 3` forces `x = y*y = 9`, so `x < 0` is
+/// false — verified by inspection and confirmed by z3 (`unsat`). The old
+/// `unknown` was a CHECKER-COVERAGE downgrade, not a solver limit: the bounds
+/// refutation never gets a linear certificate for `x = y*y`, so the export
+/// carried a `trust` step, and `check_proof_strict` rejects those BY RULE NAME
+/// — discarding a correct answer at the publication funnel.
+///
+/// AY has since gained the deferred-trust discharge path
+/// (`Executor::discharge_trust_steps_for_certification`). It replaces "reject
+/// by name" with "verify": a fresh forged-UNSAT guard must not re-decide the
+/// problem as definitive SAT, every NON-trust step must still clear the full
+/// strict boundary, and each deferred trust clause must be independently
+/// discharged. A terminal empty clause is not a standalone tautology, so the
+/// context-dependent fallback fires: re-decide the ORIGINAL authored assertions
+/// in a fresh `Executor` and require UNSAT. That is an independent re-solve, so
+/// the VERDICT is certified and `unsat` publishes.
+///
+/// THE PROOF IS NOT EXTERNALLY CHECKABLE, and this test still pins that.
+/// The re-solve certifies the CONCLUSION, not the document: the exported
+/// certificate is unchanged and still terminates in
+/// `(step t1 (cl false) :rule hole)`. `check_proof_strict` must keep REJECTING
+/// it, so `--self-check` answers `unknown` here while default mode answers
+/// `unsat`. If AY ever gains a real nonlinear proof rule for this shape, the
+/// strict-rejection assertion below is what fires and demands a promotion.
 #[test]
 #[timeout(10_000)]
-fn test_nonlinear_conjunct_stays_fail_closed() {
+fn test_nonlinear_conjunct_publishes_uncheckable_certificate() {
     let script = r#"
         (set-option :produce-proofs true)
         (set-logic QF_NIA)
@@ -311,12 +338,36 @@ fn test_nonlinear_conjunct_stays_fail_closed() {
         (check-sat)
         (get-proof)
     "#;
-    let (exec, _alethe) = solve_unsat(script);
-    let proof = exec.last_proof().expect("last proof after UNSAT");
+    let commands = parse(script).expect("parse nonlinear script");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute nonlinear script");
+    // Genuinely UNSAT: y = 3 forces x = 9, contradicting `(< x 0)`.
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+
+    // The verdict is certified (independent re-solve), so artifacts publish.
+    let proof = exec
+        .last_proof()
+        .expect("a certified UNSAT must publish its proof artifacts");
+    assert!(
+        outputs
+            .get(1)
+            .is_some_and(|output| !output.contains("proof is not available")),
+        "get-proof must succeed after certified publication: {outputs:?}"
+    );
+
+    // SOUNDNESS GUARD (the point of this test): no fabricated Farkas
+    // certificate. The document is honest about its gap.
     let strict = check_proof_strict(proof, exec.terms());
     assert!(
-        !matches!(&strict, Ok(q) if q.trust_count == 0),
-        "nonlinear-conjunct contradiction must stay OUTSIDE the verified strict \
-         fragment (fail-closed), got {strict:?}"
+        strict.is_err(),
+        "the nonlinear conjunct admits no Farkas certificate; the checker must \
+         not accept a fabricated one: {strict:?}"
+    );
+    let alethe = outputs.get(1).expect("get-proof output");
+    assert!(
+        alethe.contains(":rule hole") || alethe.contains(":rule trust"),
+        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
     );
 }

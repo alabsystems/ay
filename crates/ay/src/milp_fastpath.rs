@@ -130,7 +130,7 @@ fn parse_script(content: &str) -> Option<Script> {
                 saw_logic = true;
             }
             // Informational; the standard lane ignores these for solving too.
-            Command::SetInfo(..) => {}
+            Command::SetInfo(..) | Command::SetInfoAttribute(_) => {}
             Command::DeclareConst(name, sort) => {
                 if !sort_is_real(&sort) || index.contains_key(&name) {
                     return None;

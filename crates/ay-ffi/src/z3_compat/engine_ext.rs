@@ -31,11 +31,13 @@ use std::ffi::c_uint;
 use ay_dpll::api::{FuncDecl, Model, SolverError, Sort, Term};
 
 use super::{
-    checked_ast_to_term, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
-    ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort, require_term_ast_or_return,
-    require_term_asts_or_return, term_ast_belongs_to, term_to_ast, ModelHandle, Z3Context, Z3_ast,
-    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_sort, Z3_symbol, HANDLE_TAG_MASK,
-    TERM_AST_PAYLOAD_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_IOB, Z3_SORT_ERROR,
+    activate_finite_set_quantifier_gate, activate_finite_set_sat_gate, checked_ast_to_term,
+    ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, ffi_guard_uint,
+    finite_set_engine_public_sort, lookup_ast_sort, public_ast_sort, record_ast_sort,
+    require_term_ast_or_return, require_term_asts_or_return, sort_mentions_finite_set,
+    term_ast_belongs_to, term_to_ast, ModelHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
+    Z3_func_decl, Z3_model, Z3_sort, Z3_symbol, HANDLE_TAG_MASK, TERM_AST_PAYLOAD_MASK,
+    Z3_EXCEPTION, Z3_INVALID_ARG, Z3_IOB, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -333,11 +335,16 @@ pub unsafe extern "C" fn Z3_mk_array_default(c: Z3_context, array: Z3_ast) -> Z3
         ffi_guard_ast(c, |ctx| {
             let array_term =
                 require_term_ast_or_return!(ctx, array, "Z3_mk_array_default", "array", 0);
+            let public_sort = public_ast_sort(ctx, array, array_term);
+            let Sort::Array(public_array) = public_sort else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_array_default: public operand sort is not an Array".to_string());
+                return 0;
+            };
             let t = ctx.solver.array_default(array_term);
             let r = term_to_ast(ctx, t);
-            let elem = lookup_ast_sort(ctx, array).and_then(|s| s.array_element().cloned());
-            let sort = elem.unwrap_or_else(|| ctx.solver.term_sort(t));
-            record_ast_sort(ctx, r, sort);
+            record_ast_sort(ctx, r, public_array.element_sort);
             r
         })
     }
@@ -364,16 +371,31 @@ pub unsafe extern "C" fn Z3_mk_as_array(c: Z3_context, f: Z3_func_decl) -> Z3_as
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let (1, Some(dom0)) = (arity, dom0) else {
+            let (public_domain, public_range) = ctx
+                .finite_set_decl_signatures
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| (dom0.clone().into_iter().collect::<Vec<_>>(), range.clone()));
+            let [public_domain] = public_domain.as_slice() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg =
                     Some("Z3_mk_as_array requires a unary (arity 1) function".to_string());
                 return 0;
             };
-            let array_sort = Sort::array(dom0, range.clone());
-            let t = ctx.solver.as_array(&name, array_sort.clone());
+            if arity != 1 || dom0.is_none() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_mk_as_array requires a unary (arity 1) function".to_string());
+                return 0;
+            }
+            let public_array_sort = Sort::array(public_domain.clone(), public_range);
+            let engine_array_sort = finite_set_engine_public_sort(ctx, &public_array_sort);
+            let t = ctx.solver.as_array(&name, engine_array_sort);
             let r = term_to_ast(ctx, t);
-            record_ast_sort(ctx, r, array_sort);
+            if sort_mentions_finite_set(ctx, &public_array_sort) {
+                activate_finite_set_sat_gate(ctx, t, "Z3_mk_as_array");
+            }
+            record_ast_sort(ctx, r, public_array_sort);
             r
         })
     }
@@ -443,11 +465,16 @@ pub unsafe extern "C" fn Z3_mk_lambda(
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let body = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda", "body", 0);
+            let body_term = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda", "body", 0);
+            let body_public_sort = public_ast_sort(ctx, body, body_term);
+            let has_finite_set_binder = decl_data
+                .iter()
+                .any(|(sort, _)| sort_mentions_finite_set(ctx, sort));
             let vars: Vec<Term> = decl_data
                 .iter()
                 .map(|(sort, name)| {
-                    let v = ctx.solver.declare_const(name, sort.clone());
+                    let engine_sort = finite_set_engine_public_sort(ctx, sort);
+                    let v = ctx.solver.declare_const(name, engine_sort);
                     let ast = term_to_ast(ctx, v);
                     record_ast_sort(ctx, ast, sort.clone());
                     v
@@ -458,14 +485,29 @@ pub unsafe extern "C" fn Z3_mk_lambda(
             // indices to the enclosing scope — otherwise `__db{k}` leaks into
             // the lambda as a free variable and `select` beta-reduction
             // produces an OPEN term (a wrong value).
-            let mut acc = ctx.solver.bind_de_bruijn(&vars, body);
+            let mut acc = ctx.solver.bind_de_bruijn(&vars, body_term);
             // Curry: lambda(x0, lambda(x1, .. lambda(x_{n-1}, body))).
             for &var in vars.iter().rev() {
                 acc = ctx.solver.lambda_array(var, acc);
             }
+            let mut public_sort = body_public_sort;
+            for (sort, _) in decl_data.iter().rev() {
+                public_sort = Sort::array(sort.clone(), public_sort);
+            }
+            let expected_engine_sort = finite_set_engine_public_sort(ctx, &public_sort);
+            if ctx.solver.term_sort(acc) != expected_engine_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_lambda: engine result sort does not match its public signature"
+                        .to_string(),
+                );
+                return 0;
+            }
             let r = term_to_ast(ctx, acc);
-            let sort = ctx.solver.term_sort(acc);
-            record_ast_sort(ctx, r, sort);
+            if has_finite_set_binder {
+                activate_finite_set_quantifier_gate(ctx, acc, "Z3_mk_lambda");
+            }
+            record_ast_sort(ctx, r, public_sort);
             r
         })
     }
@@ -512,13 +554,38 @@ pub unsafe extern "C" fn Z3_mk_lambda_const(
         ffi_guard_ast(c, |ctx| {
             let vars =
                 require_term_asts_or_return!(ctx, &bound_asts, "Z3_mk_lambda_const bounds", 0);
-            let mut acc = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda_const", "body", 0);
+            let public_bound_sorts: Vec<Sort> = bound_asts
+                .iter()
+                .zip(&vars)
+                .map(|(&ast, &term)| public_ast_sort(ctx, ast, term))
+                .collect();
+            let has_finite_set_binder = public_bound_sorts
+                .iter()
+                .any(|sort| sort_mentions_finite_set(ctx, sort));
+            let body_term = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda_const", "body", 0);
+            let body_public_sort = public_ast_sort(ctx, body, body_term);
+            let mut acc = body_term;
             for &var in vars.iter().rev() {
                 acc = ctx.solver.lambda_array(var, acc);
             }
+            let mut public_sort = body_public_sort;
+            for sort in public_bound_sorts.iter().rev() {
+                public_sort = Sort::array(sort.clone(), public_sort);
+            }
+            let expected_engine_sort = finite_set_engine_public_sort(ctx, &public_sort);
+            if ctx.solver.term_sort(acc) != expected_engine_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_lambda_const: engine result sort does not match its public signature"
+                        .to_string(),
+                );
+                return 0;
+            }
             let r = term_to_ast(ctx, acc);
-            let sort = ctx.solver.term_sort(acc);
-            record_ast_sort(ctx, r, sort);
+            if has_finite_set_binder {
+                activate_finite_set_quantifier_gate(ctx, acc, "Z3_mk_lambda_const");
+            }
+            record_ast_sort(ctx, r, public_sort);
             r
         })
     }
@@ -571,12 +638,14 @@ pub unsafe extern "C" fn Z3_mk_map(
                 ));
                 return 0;
             }
+            let (public_domain, public_range) = ctx
+                .finite_set_decl_signatures
+                .get(decl.name())
+                .cloned()
+                .unwrap_or_else(|| (decl.domain().to_vec(), decl.range().clone()));
             let mut idx_sort: Option<Sort> = None;
             for (i, (&a, &term)) in arg_asts.iter().zip(&arg_terms).enumerate() {
-                let sort = match lookup_ast_sort(ctx, a).cloned() {
-                    Some(s) => s,
-                    None => ctx.solver.term_sort(term),
-                };
+                let sort = public_ast_sort(ctx, a, term);
                 let Sort::Array(arr) = &sort else {
                     ctx.last_error = Z3_SORT_ERROR;
                     ctx.error_msg = Some("Z3_mk_map: argument is not an array".to_string());
@@ -596,14 +665,14 @@ pub unsafe extern "C" fn Z3_mk_map(
                     Some(_) => {}
                 }
                 // Element sort must match the function's i-th domain sort.
-                if arr.element_sort != decl.domain()[i] {
+                if arr.element_sort != public_domain[i] {
                     ctx.last_error = Z3_SORT_ERROR;
                     ctx.error_msg = Some(format!(
                         "Z3_mk_map: array {} has element sort {} but {} expects {}",
                         i,
                         arr.element_sort,
                         decl.name(),
-                        decl.domain()[i]
+                        public_domain[i]
                     ));
                     return 0;
                 }
@@ -636,11 +705,15 @@ pub unsafe extern "C" fn Z3_mk_map(
                         .insert(decl.name().to_string(), decl.clone());
                 }
             }
-            let result_sort = Sort::array(idx_sort, decl.range().clone());
+            let result_sort = Sort::array(idx_sort, public_range);
+            let engine_result_sort = finite_set_engine_public_sort(ctx, &result_sort);
             let t = ctx
                 .solver
-                .array_map(decl.name(), &arg_terms, result_sort.clone());
+                .array_map(decl.name(), &arg_terms, engine_result_sort);
             let r = term_to_ast(ctx, t);
+            if sort_mentions_finite_set(ctx, &result_sort) {
+                activate_finite_set_sat_gate(ctx, t, "Z3_mk_map result");
+            }
             record_ast_sort(ctx, r, result_sort);
             r
         })
@@ -731,15 +804,40 @@ unsafe fn mk_set_nary(
         ffi_guard_ast(c, |ctx| {
             let arg_terms =
                 require_term_asts_or_return!(ctx, &arg_asts, "set combinator arguments", 0);
+            let expected = set_sort_of(ctx, first, arg_terms[0]);
+            let Sort::Array(expected_array) = &expected else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "set combinator argument must have public legacy (Array T Bool) sort"
+                        .to_string(),
+                );
+                return 0;
+            };
+            if expected_array.element_sort != Sort::Bool {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "set combinator argument must have public legacy (Array T Bool) sort"
+                        .to_string(),
+                );
+                return 0;
+            }
+            for (&ast, &term) in arg_asts.iter().zip(&arg_terms).skip(1) {
+                if set_sort_of(ctx, ast, term) != expected {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some("set combinator public set sorts differ".to_string());
+                    return 0;
+                }
+            }
             if num_args == 1 {
                 return term_to_ast(ctx, arg_terms[0]);
             }
-            let set_sort = set_sort_of(ctx, first, arg_terms[0]);
-            let t = ctx
-                .solver
-                .array_map(combinator, &arg_terms, set_sort.clone());
+            let t = ctx.solver.array_map(
+                combinator,
+                &arg_terms,
+                finite_set_engine_public_sort(ctx, &expected),
+            );
             let r = term_to_ast(ctx, t);
-            record_ast_sort(ctx, r, set_sort);
+            record_ast_sort(ctx, r, expected);
             r
         })
     }
@@ -761,10 +859,26 @@ pub unsafe extern "C" fn Z3_mk_set_difference(c: Z3_context, arg1: Z3_ast, arg2:
             let arg2_term =
                 require_term_ast_or_return!(ctx, arg2, "Z3_mk_set_difference", "right set", 0);
             let set_sort = set_sort_of(ctx, arg1, arg1_term);
-            let not_arg2 = ctx.solver.array_map("not", &[arg2_term], set_sort.clone());
+            let Sort::Array(array) = &set_sort else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_set_difference: expected public legacy (Array T Bool) sort".to_string(),
+                );
+                return 0;
+            };
+            if array.element_sort != Sort::Bool || set_sort_of(ctx, arg2, arg2_term) != set_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_set_difference: public legacy set sorts differ".to_string());
+                return 0;
+            }
+            let engine_sort = finite_set_engine_public_sort(ctx, &set_sort);
+            let not_arg2 = ctx
+                .solver
+                .array_map("not", &[arg2_term], engine_sort.clone());
             let t = ctx
                 .solver
-                .array_map("and", &[arg1_term, not_arg2], set_sort.clone());
+                .array_map("and", &[arg1_term, not_arg2], engine_sort);
             let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, set_sort);
             r
@@ -784,7 +898,22 @@ pub unsafe extern "C" fn Z3_mk_set_complement(c: Z3_context, arg: Z3_ast) -> Z3_
         ffi_guard_ast(c, |ctx| {
             let arg_term = require_term_ast_or_return!(ctx, arg, "Z3_mk_set_complement", "set", 0);
             let set_sort = set_sort_of(ctx, arg, arg_term);
-            let t = ctx.solver.array_map("not", &[arg_term], set_sort.clone());
+            let Sort::Array(array) = &set_sort else {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_set_complement: expected public legacy (Array T Bool) sort".to_string(),
+                );
+                return 0;
+            };
+            if array.element_sort != Sort::Bool {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_set_complement: expected public legacy (Array T Bool) sort".to_string(),
+                );
+                return 0;
+            }
+            let engine_sort = finite_set_engine_public_sort(ctx, &set_sort);
+            let t = ctx.solver.array_map("not", &[arg_term], engine_sort);
             let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, set_sort);
             r

@@ -186,6 +186,135 @@ fn test_default_limit_floors_never_exceed_detected_ceiling() {
     assert_eq!(default_embedded_memory_limit_from(0), 0);
 }
 
+/// THE property: the cooperative limit must sit strictly below the kernel's.
+///
+/// A cooperative ceiling above the kernel cap is worse than none — every
+/// `global_memory_exceeded` check reads far below its threshold right up until
+/// SIGKILL, so ay never runs its graceful path and a memout is indistinguishable
+/// from a crash. On the 2026-08-02 panic box this was 108.8 GiB of self-granted
+/// headroom against an 8 GiB kernel budget.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_cooperative_limit_stays_under_the_kernel_budget() {
+    let mb = 1024 * 1024;
+    let gb = 1024 * mb;
+
+    // The soft gate fires at 95% of the cooperative limit; that firing point
+    // must land below the kernel budget with room for the graceful path.
+    for &budget in &[64 * mb, 192 * mb, 2 * gb, 8 * gb, 108 * gb] {
+        let coop = standalone_limit_under_kernel_bound(budget);
+        assert!(
+            coop < budget,
+            "cooperative limit {coop} must be under the kernel budget {budget}"
+        );
+        let gate_fires_at = coop / 100 * 95;
+        assert!(
+            gate_fires_at < budget,
+            "soft gate at {gate_fires_at} must fire before the kernel cap {budget}"
+        );
+    }
+
+    // 90% of budget, exactly.
+    assert_eq!(
+        standalone_limit_under_kernel_bound(8 * gb),
+        8 * gb / 100 * 90
+    );
+
+    // No 2 GB floor here: re-imposing it above a small budget would recreate the
+    // very incoherence this function removes.
+    let tiny = 64 * mb;
+    assert!(
+        standalone_limit_under_kernel_bound(tiny) < 2 * gb,
+        "the 2 GB floor must NOT be applied under a kernel bound"
+    );
+
+    // No kernel bound detected => 0 in, 0 out (caller falls back to RAM policy).
+    assert_eq!(standalone_limit_under_kernel_bound(0), 0);
+}
+
+/// `active_budget_bytes` must report a bound ONLY when one is actually in force,
+/// because its `None` is what tells callers to fall back to the RAM policy.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_active_budget_reported_only_when_armed() {
+    // This test reads process-wide env, so it asserts the invariant that holds
+    // in whichever state the test binary runs: armed => Some, unarmed => None.
+    // Test harnesses do not call `arm()` (only bin targets do), so the usual
+    // state here is unarmed.
+    match govern::is_armed() {
+        false => assert!(
+            govern::active_budget_bytes().is_none(),
+            "no kernel bound is in force, so none may be reported"
+        ),
+        true => assert!(
+            govern::active_budget_bytes().is_some_and(|b| b > 0),
+            "armed processes must report the budget they are bounded by"
+        ),
+    }
+}
+
+/// The wiring test: `default_standalone_memory_limit()` must actually CONSULT
+/// the kernel budget.
+///
+/// The two tests above do not establish this. Each exercises one piece in
+/// isolation — the pure helper, and `active_budget_bytes` — so deleting the
+/// `govern::active_budget_bytes()` call from `default_standalone_memory_limit`
+/// (the entire substance of the change) leaves both green. A test that cannot
+/// fail when the fix is removed is not evidence.
+///
+/// Runs in a subprocess because it must set process-wide environment, which is
+/// unsound to mutate in a threaded test binary.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn test_standalone_limit_actually_consults_the_kernel_budget() {
+    use std::process::Command;
+
+    // Re-invoke this same test binary with the marker + a distinctive budget,
+    // and have it print the limit it computes. `--exact --nocapture` keeps the
+    // harness from running anything else.
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = Command::new(&exe)
+        // `--exact` matches the FULL test path, not the bare fn name.
+        .args([
+            "--exact",
+            "--nocapture",
+            "tests::print_standalone_limit_for_subprocess",
+        ])
+        .env(govern::ARMED_ENV, "1")
+        .env(govern::BUDGET_ENV, "512")
+        .env("AY_SYS_PRINT_LIMIT", "1")
+        .output()
+        .expect("re-invoke test binary");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = text.lines().find_map(|l| l.strip_prefix("LIMIT=")) else {
+        panic!("subprocess did not report a limit; stdout was:\n{text}");
+    };
+    let limit: usize = line.trim().parse().expect("limit parses");
+
+    let budget = 512 * 1024 * 1024;
+    assert!(
+        limit > 0 && limit < budget,
+        "under a 512 MiB kernel budget the cooperative limit must be under it, \
+         got {limit} (would be ~85% of RAM if the budget were not consulted)"
+    );
+    assert_eq!(
+        limit,
+        standalone_limit_under_kernel_bound(budget),
+        "the limit must be exactly the kernel-derived figure"
+    );
+}
+
+/// Helper body for [`test_standalone_limit_actually_consults_the_kernel_budget`].
+/// Inert unless the parent sets `AY_SYS_PRINT_LIMIT`, so a normal test run is a
+/// no-op rather than noise.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn print_standalone_limit_for_subprocess() {
+    if std::env::var_os("AY_SYS_PRINT_LIMIT").is_some() {
+        println!("LIMIT={}", default_standalone_memory_limit());
+    }
+}
+
 /// The real Linux read path (cgroupfs + sysconf) must never panic, whatever
 /// environment the test runs in (bare host, v1 or v2 cgroup, container), and
 /// any detected figure must be a usable ceiling.
@@ -366,4 +495,64 @@ fn test_counting_allocator_realloc_grow_and_shrink() {
     // SAFETY: frees the live block with its current (512-byte) layout.
     unsafe { alloc.dealloc(ptr, shrunk) };
     assert_eq!(current_live_bytes(), base);
+}
+
+/// The hard ceiling is a strict `>` comparison against an armed, non-zero
+/// bound, and is inert while disarmed. The probe takes `live` as an argument,
+/// so this exercises the predicate without moving the real allocator counter —
+/// arming a low ceiling in-process would `_exit` the test runner.
+#[test]
+fn hard_memory_ceiling_is_inert_until_armed_and_then_strict() {
+    // Far above anything this process will ever hold live, so no real
+    // allocation can breach it while the test runs.
+    const CEILING: usize = 1 << 60;
+
+    assert!(
+        !hard_memory_ceiling_breached(usize::MAX),
+        "a disarmed ceiling never breaches, at any live size"
+    );
+
+    HARD_MEMORY_CEILING.store(CEILING, Ordering::SeqCst);
+    assert!(
+        !hard_memory_ceiling_breached(CEILING - 1),
+        "below the ceiling is not a breach"
+    );
+    assert!(
+        !hard_memory_ceiling_breached(CEILING),
+        "exactly at the ceiling is not a breach"
+    );
+    assert!(
+        hard_memory_ceiling_breached(CEILING + 1),
+        "one byte past the ceiling is a breach"
+    );
+    HARD_MEMORY_CEILING.store(0, Ordering::SeqCst);
+
+    assert!(
+        !hard_memory_ceiling_breached(usize::MAX),
+        "disarming restores the inert state"
+    );
+}
+
+/// Arming publishes the action before the ceiling, so a breach can never see a
+/// live ceiling with no verdict to emit.
+#[test]
+fn arming_the_hard_ceiling_publishes_the_action() {
+    static ACTION: HardMemoryCeiling = HardMemoryCeiling {
+        stdout_line: b"unknown\n",
+        stderr_line: b"(:reason-unknown \"memout\")\n",
+        exit_code: 124,
+    };
+
+    arm_hard_memory_ceiling(0, &ACTION);
+    let published = HARD_MEMORY_CEILING_ACTION.load(Ordering::SeqCst);
+    assert!(!published.is_null(), "the action must be published");
+    // SAFETY: just stored from a `&'static HardMemoryCeiling`.
+    let published = unsafe { &*published };
+    assert_eq!(published.exit_code, 124);
+    assert_eq!(published.stdout_line, b"unknown\n");
+    assert_eq!(
+        HARD_MEMORY_CEILING.load(Ordering::SeqCst),
+        0,
+        "arming with 0 leaves the ceiling disabled"
+    );
 }

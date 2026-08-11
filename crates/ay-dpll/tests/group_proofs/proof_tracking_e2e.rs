@@ -456,16 +456,15 @@ fn test_propositional_multi_clause_resolution_proof() {
 // test_euf_proof_end_to_end_carcara_valid
 // Carcara tests must be run manually with CARCARA_PATH set.
 
-/// QF_BV proof: trust theory lemma + th_resolution (no :rule hole).
+/// QF_BV proof: independently replayed bit-blast theorem + resolution.
 ///
-/// BV bit-blasting creates SAT variables without SMT-level term mappings,
-/// so the DRUP/SAT resolution path cannot reconstruct individual steps.
-/// Instead we emit a `trust` theory lemma (negation of all assumptions)
-/// and resolve it against each assumption via th_resolution to derive (cl).
-/// The internal proof checker accepts trust lemmas as axioms.
+/// AY's strict checker regenerates and checks the exact BV refutation. Alethe
+/// 1.0/Carcara has no compatible rule for AY's bit-blast convention, so the
+/// external rendering honestly marks that already-internally-certified theorem
+/// as `hole`; this must not be confused with authority in the proof IR.
 #[test]
 #[timeout(5_000)]
-fn test_bv_proof_end_to_end_trust_valid() {
+fn test_bv_proof_end_to_end_strict_internal_certificate() {
     let input = r#"
         (set-option :produce-proofs true)
         (set-logic QF_BV)
@@ -482,44 +481,24 @@ fn test_bv_proof_end_to_end_trust_valid() {
 
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0], "unsat");
-    assert_last_unsat_proof_is_valid(&exec);
-
-    // Quality validation: BV trust can appear as an explicit Trust step or as a
-    // trust-labeled theory lemma in the reconstructed chain.
-    let quality = assert_last_unsat_proof_quality(&exec);
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(quality.trust_count, 0, "strict BV certificate: {quality}");
+    assert_eq!(quality.hole_count, 0, "strict BV certificate: {quality}");
     assert!(
-        quality.trust_count > 0 || quality.theory_lemma_count > 0,
-        "BV proof should contain trust signal (trust step or theory lemma): {quality}"
-    );
-    assert_eq!(
-        quality.hole_count, 0,
-        "BV proof should have no hole steps: {quality}"
+        quality.theory_lemma_count >= 1,
+        "expected BV theorem: {quality}"
     );
 
     let proof = &outputs[1];
 
-    // Must NOT contain :rule hole
     assert!(
-        !proof.contains(":rule hole"),
-        "proof should not contain :rule hole:\n{proof}"
+        proof.contains(":rule hole"),
+        "Alethe must honestly expose its missing AY-style BV rule:\n{proof}"
     );
-
-    // Must contain trust theory lemma
     assert!(
-        proof.contains(":rule trust"),
-        "expected :rule trust theory lemma in proof:\n{proof}"
+        !proof.contains(":rule trust"),
+        "the obsolete trust spelling must not return:\n{proof}"
     );
-
-    // Depending on reconstruction detail level, BV may emit either a
-    // trust+th_resolution chain or a direct trusted empty-clause step.
-    if !proof.contains(":rule th_resolution") {
-        assert!(
-            proof.contains(":rule trust"),
-            "expected trust-based BV UNSAT proof:\n{proof}"
-        );
-    }
-
-    // Must derive empty clause
     assert!(
         proof.contains("(cl)"),
         "expected empty clause (cl) in proof:\n{proof}"
@@ -923,9 +902,13 @@ fn test_lia_alethe_proof_structure_preserves_lra_farkas_4521() {
         proof_text.contains(":args (1 1)"),
         "expected unit Farkas coefficients in exported Alethe proof:\n{proof_text}"
     );
+    // The exporter now spells the fine-grained Boolean closure with standard
+    // `resolution` steps instead of the older coarse `th_resolution` wrapper.
+    // Require the terminal empty clause to be produced by that checked rule;
+    // accepting either spelling would let this regression miss a fallback.
     assert!(
-        proof_text.contains(":rule th_resolution"),
-        "expected theory resolution chain in exported Alethe proof:\n{proof_text}"
+        proof_text.contains("(cl) :rule resolution"),
+        "expected an explicit terminal resolution step in exported Alethe proof:\n{proof_text}"
     );
 
     let proof = exec.last_proof().expect("proof");
@@ -1300,21 +1283,48 @@ fn test_uflia_equality_arg_order_resolution() {
     assert_eq!(outputs[0], "unsat");
     let proof = &outputs[1];
 
-    // Must derive empty clause via th_resolution (not trust fallback)
+    // The exact authored bridge derives a=c by two checked Farkas bounds plus
+    // antisymmetry, then transports f(a)=10 through congruence/transitivity.
     assert!(
         proof.contains("(cl)"),
         "expected empty clause derivation:\n{proof}"
     );
-    // Mixed UFLIA conflicts containing equalities and UF terms are not eligible
-    // for la_generic/lia_generic (Carcara rejects them). They correctly fall back
-    // to the `trust` rule. The conflict here includes `(= (f a) 10)` with UF `f`.
     assert!(
-        proof.contains(":rule trust") || proof.contains(":rule lia_generic"),
-        "QF_UFLIA lemma must use trust or lia_generic:\n{proof}"
+        proof.contains(":rule la_generic")
+            && proof.contains(":rule la_disequality")
+            && proof.contains(":rule eq_congruent")
+            && proof.contains(":rule eq_transitive"),
+        "expected the composed arithmetic/EUF certificate:\n{proof}"
     );
+    assert!(!proof.contains(":rule trust"), "trust-free proof:\n{proof}");
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(quality.trust_count, 0, "strict UFLIA proof: {quality}");
+}
 
-    // Internal proof checker validates the proof (would panic before fix)
-    assert_last_unsat_proof_is_valid(&exec);
+#[test]
+#[timeout(10_000)]
+fn test_uflia_affine_euf_bridge_rejects_non_implied_argument_equality() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_UFLIA)
+        (declare-fun f (Int) Int)
+        (declare-const a Int)
+        (declare-const b Int)
+        (declare-const c Int)
+        (assert (= (+ a b) c))
+        (assert (= b 1))
+        (assert (= (f a) 10))
+        (assert (not (= (f c) 10)))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse mutation");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute mutation");
+    assert_eq!(outputs.first().map(String::as_str), Some("sat"));
+    assert!(
+        exec.last_proof().is_none(),
+        "a non-implied argument equality must never mint a refutation"
+    );
 }
 
 /// Composite Boolean assumption with proof: `(and (= x 0) (= x 1))` through
@@ -1411,6 +1421,132 @@ fn test_smt_proof_pipeline_qf_uf_strict() {
     );
 }
 
+/// Clean submits theorem goals as one authored negated implication rather than
+/// three already-clausified assertions.  Top-level Boolean decomposition must
+/// derive the antecedent conjuncts and negated consequent from that exact root;
+/// it may not turn the flattened atoms into `trust` assumptions.
+#[test]
+#[timeout(5_000)]
+fn test_smt_proof_pipeline_qf_uf_composed_authored_root_strict() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_UF)
+        (declare-const x Int)
+        (declare-const y Int)
+        (declare-const z Int)
+        (assert (not (=> (and (= x y) (= y z)) (= x z))))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("parse input");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute input");
+
+    assert_eq!(outputs[0], "unsat");
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(
+        quality.trust_count, 0,
+        "composed QF_UF proof should derive every flattened atom from the authored root: {quality}"
+    );
+    let alethe = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("composed QF_UF UNSAT should retain a proof")
+        .expect("composed QF_UF proof should export in the authored problem scope");
+    assert!(
+        alethe.contains(":rule eq_transitive")
+            && alethe.contains(":rule implies_neg1")
+            && alethe.contains(":rule implies_neg2")
+            && !alethe.contains(":rule trust")
+            && !alethe.contains(":rule hole"),
+        "composed QF_UF proof must export its authored implication decomposition and EUF theorem:\n{alethe}"
+    );
+}
+
+/// The same authenticated-root decomposition must survive LIA preprocessing.
+#[test]
+#[timeout(5_000)]
+fn test_smt_proof_pipeline_qf_lia_composed_authored_root_strict() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_LIA)
+        (declare-const x Int)
+        (declare-const y Int)
+        (assert (not (=> (and (= x 2) (= y 3)) (= (+ x y) 5))))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("parse input");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute input");
+
+    assert_eq!(outputs[0], "unsat");
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(
+        quality.trust_count, 0,
+        "composed QF_LIA proof should derive every flattened atom from the authored root: {quality}"
+    );
+    let alethe = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("composed QF_LIA UNSAT should retain a proof")
+        .expect("composed QF_LIA proof should export in the authored problem scope");
+    assert!(
+        alethe.contains(":rule eq_congruent")
+            && alethe.contains(":rule lia_generic")
+            && alethe.contains(":rule eq_transitive"),
+        "affine equality must export as congruence + linear identity + transitivity:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule trust")
+            && !alethe.contains(":rule hole")
+            && !alethe.contains(":rule la_generic"),
+        "affine equality export must not hide authority or encode a disequality case split as one la_generic step:\n{alethe}"
+    );
+}
+
+/// ROW2 is contextual: the index disequality and negated read equality must be
+/// derived from the single authored negated implication before the guarded
+/// array lemma can close the proof.
+#[test]
+#[timeout(5_000)]
+fn test_smt_proof_pipeline_qf_auflia_composed_row2_root_strict() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_AUFLIA)
+        (declare-const a (Array Int Int))
+        (declare-const i Int)
+        (declare-const j Int)
+        (declare-const v Int)
+        (assert
+          (not
+            (=> (not (= i j))
+                (= (select (store a i v) j) (select a j)))))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("parse input");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute input");
+
+    assert_eq!(outputs[0], "unsat");
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(
+        quality.trust_count, 0,
+        "composed ROW2 proof should derive both contextual hypotheses from the authored root: {quality}"
+    );
+    let alethe = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("composed ROW2 UNSAT should retain a proof")
+        .expect("composed ROW2 proof should export in the authored problem scope");
+    assert!(
+        alethe.contains(":rule arrays_row")
+            && alethe.contains(":rule implies_neg1")
+            && alethe.contains(":rule implies_neg2")
+            && !alethe.contains(":rule trust")
+            && !alethe.contains(":rule hole"),
+        "composed ROW2 proof must export its authored implication decomposition and guarded array theorem:\n{alethe}"
+    );
+}
+
 /// Phase C: QF_UF congruence contradiction produces a strict proof.
 #[test]
 #[timeout(5_000)]
@@ -1461,6 +1597,44 @@ fn test_smt_proof_pipeline_qf_lia_strict() {
     assert_eq!(
         quality.trust_count, 0,
         "QF_LIA bounds-contradiction proof should have zero trust steps: {quality}"
+    );
+}
+
+/// The Euclidean remainder range makes `(mod x 3) = 4` impossible for every
+/// integer `x`.  The auxiliary quotient/remainder encoding must retain a
+/// strict certificate for that range contradiction instead of collapsing the
+/// correct UNSAT answer to a terminal trust step.
+#[test]
+#[timeout(5_000)]
+fn test_smt_proof_pipeline_mod_constant_range_strict() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic ALL)
+        (declare-const x Int)
+        (assert (= (mod x 3) 4))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("parse input");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute input");
+
+    assert_eq!(outputs[0], "unsat");
+    let quality = assert_last_unsat_proof_strict(&exec);
+    assert_eq!(
+        quality.trust_count, 0,
+        "constant-divisor mod range proof should have zero trust steps: {quality}"
+    );
+    assert!(
+        exec.last_proof()
+            .is_some_and(|proof| proof.steps.iter().any(|step| matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::LiaModRange,
+                    ..
+                }
+            ))),
+        "strict proof must carry the checker-owned Euclidean mod-range certificate"
     );
 }
 

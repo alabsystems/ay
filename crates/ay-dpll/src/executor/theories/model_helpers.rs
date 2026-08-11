@@ -17,7 +17,7 @@ use ay_lra::LraModel;
 use ay_sat::{SatResult, SatUnknownReason};
 use ay_strings::StringModel;
 
-use crate::executor_types::{Result, SolveResult, UnknownReason};
+use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 
 use super::super::model::Model;
 use super::super::Executor;
@@ -33,24 +33,28 @@ impl Executor {
         reason: Option<SatUnknownReason>,
     ) {
         if let Some(reason) = reason {
-            *target = Some(Self::map_sat_unknown_reason(reason));
+            *target = Some(Self::map_sat_unknown_origin(reason).reason());
         }
     }
 
     pub(in crate::executor) fn map_sat_unknown_reason(reason: SatUnknownReason) -> UnknownReason {
+        Self::map_sat_unknown_origin(reason).reason()
+    }
+
+    pub(in crate::executor) fn map_sat_unknown_origin(reason: SatUnknownReason) -> UnknownOrigin {
         match reason {
-            SatUnknownReason::Interrupted => UnknownReason::Interrupted,
-            SatUnknownReason::ResourceBudget => UnknownReason::ResourceLimit,
+            SatUnknownReason::Interrupted => UnknownOrigin::InterruptFlag,
+            SatUnknownReason::ResourceBudget => UnknownOrigin::DeterministicResourceBudget,
             SatUnknownReason::TheoryStop | SatUnknownReason::ExtensionUnknown => {
-                UnknownReason::Incomplete
+                UnknownOrigin::IncompleteSolverLane
             }
-            SatUnknownReason::UnsupportedConfig => UnknownReason::Unsupported,
+            SatUnknownReason::UnsupportedConfig => UnknownOrigin::UnsupportedFeature,
             SatUnknownReason::EmptyTheoryConflict
             | SatUnknownReason::Unspecified
             | SatUnknownReason::AssumptionUnknown
-            | SatUnknownReason::InvalidSatModel => UnknownReason::Unknown,
+            | SatUnknownReason::InvalidSatModel => UnknownOrigin::UntaggedSolverUnknown,
             #[allow(unreachable_patterns)]
-            _ => UnknownReason::Unknown,
+            _ => UnknownOrigin::UntaggedSolverUnknown,
         }
     }
 

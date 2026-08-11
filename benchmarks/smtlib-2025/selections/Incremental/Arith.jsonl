@@ -1,0 +1,11 @@
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/Ackermann01_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "Ackermann01_true-termination.c.smt2"}
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/AliasDarteFeautrierGonnord-SAS2010-Fig1_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "AliasDarteFeautrierGonnord-SAS2010-Fig1_true-termination.c.smt2"}
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/AliasDarteFeautrierGonnord-SAS2010-Fig2b_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "AliasDarteFeautrierGonnord-SAS2010-Fig2b_true-termination.c.smt2"}
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/AliasDarteFeautrierGonnord-SAS2010-nestedLoop_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "AliasDarteFeautrierGonnord-SAS2010-nestedLoop_true-termination.c.smt2"}
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/HarrisLalNoriRajamani-SAS2010-Fig1_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "HarrisLalNoriRajamani-SAS2010-Fig1_true-termination.c.smt2"}
+{"relpath": "incremental/LIA/UltimateBuchiAutomizer/gcd1_true-termination.c.smt2", "logic": "LIA", "family": "UltimateBuchiAutomizer", "name": "gcd1_true-termination.c.smt2"}
+{"relpath": "incremental/LRA/20160930-Kopczynski-LOIS/incremental0.smt2", "logic": "LRA", "family": "20160930-Kopczynski-LOIS", "name": "incremental0.smt2"}
+{"relpath": "incremental/LRA/20160930-Kopczynski-LOIS/incremental1.smt2", "logic": "LRA", "family": "20160930-Kopczynski-LOIS", "name": "incremental1.smt2"}
+{"relpath": "incremental/LRA/20160930-Kopczynski-LOIS/incremental2.smt2", "logic": "LRA", "family": "20160930-Kopczynski-LOIS", "name": "incremental2.smt2"}
+{"relpath": "incremental/LRA/20160930-Kopczynski-LOIS/incremental3.smt2", "logic": "LRA", "family": "20160930-Kopczynski-LOIS", "name": "incremental3.smt2"}
+{"relpath": "incremental/LRA/20160930-Kopczynski-LOIS/incremental4.smt2", "logic": "LRA", "family": "20160930-Kopczynski-LOIS", "name": "incremental4.smt2"}

@@ -1559,8 +1559,15 @@ fn test_ffi_pop_empty_scope_no_abort() {
     }
 }
 
-/// Test that Z3_mk_eq with sort mismatch triggers the catch_unwind guard
-/// instead of aborting.
+/// `Z3_mk_eq` over mismatched sorts must fail as a DIAGNOSED sort error, never
+/// abort and never build the term.
+///
+/// This used to accept `Z3_EXCEPTION`, the code the FFI guard sets when it
+/// catches a solver panic: at the time the sort mismatch reached the engine and
+/// unwound. `Z3_mk_eq` now checks the two operands' PUBLIC sorts itself and
+/// rejects with `Z3_SORT_ERROR` plus a message naming both — which is also what
+/// libz3 reports (`Z3_CATCH_RETURN` maps an `ast_exception` from `mk_eq` to
+/// `Z3_SORT_ERROR`), so the code is pinned rather than left as "any error".
 #[test]
 fn test_ffi_eq_sort_mismatch_no_abort() {
     // SAFETY: Test-scope unsafe block: all handles (solvers, contexts, AST ids, etc.) are
@@ -1582,19 +1589,25 @@ fn test_ffi_eq_sort_mismatch_no_abort() {
         let sym_b = Z3_mk_string_symbol(ctx, c"b".as_ptr());
         let b = Z3_mk_const(ctx, sym_b, bool_sort);
 
-        // eq(Int, Bool) — sort mismatch. If the solver panics on this,
-        // the FFI guard should catch it. If the solver handles it gracefully
-        // (returns a term or error), that's also acceptable.
+        // eq(Int, Bool) — a sort mismatch. The call must return the null AST
+        // (the ill-sorted term is never built) and REACH THIS LINE: no abort.
         let result = Z3_mk_eq(ctx, x, b);
+        assert_eq!(result, 0, "an ill-sorted equality must not be built");
 
-        // Either the result is a valid AST (solver accepted it) or
-        // it's 0 (null AST from caught panic). Both are acceptable.
-        // The key assertion is that we REACHED THIS LINE (no abort).
-        if result == 0 {
-            // Panic was caught — verify error flag is set
-            let err_code = Z3_get_error_code(ctx);
-            assert_eq!(err_code, Z3_EXCEPTION);
-        }
+        // The rejection is DIAGNOSED, not merely a caught unwind: the typed
+        // sort-error code, and a message naming both operand sorts. z3 reports
+        // this input the same way (`Z3_CATCH_RETURN` maps `mk_eq`'s
+        // `ast_exception` to `Z3_SORT_ERROR`), so the code is pinned rather
+        // than left as "any error". This used to expect `Z3_EXCEPTION`, the
+        // code the FFI guard installs for a CAUGHT PANIC, because the mismatch
+        // used to reach the engine and unwind; rejecting it up front is the
+        // fix, not a regression.
+        assert_eq!(Z3_get_error_code(ctx), Z3_SORT_ERROR);
+        let message = (*ctx).error_msg.clone().expect("sort error message");
+        assert!(
+            message.contains("Int") && message.contains("Bool"),
+            "the diagnostic must name the mismatched sorts, got {message:?}"
+        );
 
         // Context must still be functional
         let five = Z3_mk_int(ctx, 5, int_sort);
@@ -4231,7 +4244,11 @@ fn test_fixedpoint_safe_query_unreachable() {
         );
 
         let ans = Z3_fixedpoint_get_answer(ctx, fp);
-        assert!(!ans.is_null());
+        assert_ne!(ans, 0);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(Z3_ast_to_string(ctx, ans)).to_bytes(),
+            b"false"
+        );
 
         Z3_fixedpoint_dec_ref(ctx, fp);
         Z3_del_context(ctx);
@@ -4285,7 +4302,7 @@ fn test_fixedpoint_to_string() {
         let fp = Z3_mk_fixedpoint(ctx);
         let _ = build_counter_system(ctx, fp);
 
-        let s = Z3_fixedpoint_to_string(ctx, fp);
+        let s = Z3_fixedpoint_to_string(ctx, fp, 0, std::ptr::null_mut());
         assert!(!s.is_null());
         let rendered = std::ffi::CStr::from_ptr(s).to_str().expect("utf8");
         assert!(rendered.contains("declare-rel inv"), "got: {rendered}");
@@ -5702,14 +5719,14 @@ fn test_decl_ast_sort_kind_z3py_parity() {
         assert_eq!(Z3_OP_AND, 261);
         assert_eq!(Z3_OP_EQ, 258);
         assert_eq!(Z3_OP_LE, 514);
-        assert_eq!(Z3_OP_UNINTERPRETED, 45102);
+        assert_eq!(Z3_OP_UNINTERPRETED, 49167);
         check(Z3_mk_add(ctx, 2, [x, y].as_ptr()), "int +", 518);
         check(Z3_mk_and(ctx, 2, [p, q].as_ptr()), "and", 261);
         check(Z3_mk_eq(ctx, x, y), "=", 258);
         check(Z3_mk_le(ctx, x, y), "<=", 514);
         let f_sym = Z3_mk_string_symbol(ctx, c"f".as_ptr());
         let f = Z3_mk_func_decl(ctx, f_sym, 1, [int_sort].as_ptr(), int_sort);
-        check(Z3_mk_app(ctx, f, 1, [x].as_ptr()), "uf f(x)", 45102);
+        check(Z3_mk_app(ctx, f, 1, [x].as_ptr()), "uf f(x)", 49167);
 
         // ---- Arrays ----
         assert_eq!(Z3_OP_STORE, 768);

@@ -2569,6 +2569,33 @@ fn test_auflia_quantifier_forall_trigger_instantiation_8616() {
     );
 }
 
+#[test]
+fn test_auflia_quantifier_forall_trigger_ground_equality_conflict() {
+    let mut solver = Solver::new(Logic::Auflia);
+    let f = solver.declare_fun("f", &[Sort::Int], Sort::Int);
+    let x = solver.fresh_var("x", Sort::Int);
+    let f_x = solver.apply(&f, &[x]);
+    let zero = solver.int_const(0);
+    let f_x_gt_0 = solver.gt(f_x, zero);
+    let trigger = &[f_x];
+    let forall = solver
+        .try_forall_with_triggers(&[x], f_x_gt_0, &[trigger])
+        .expect("valid forall with triggers");
+    solver.assert_term(forall);
+
+    let seven = solver.int_const(7);
+    let f_7 = solver.apply(&f, &[seven]);
+    let neg_one = solver.int_const(-1);
+    let f_7_eq_neg_one = solver.eq(f_7, neg_one);
+    solver.assert_term(f_7_eq_neg_one);
+
+    let result = solver.check_sat();
+    assert!(
+        result.is_unsat(),
+        "Expected strictly certified UNSAT via E-matching, got {result:?}"
+    );
+}
+
 /// #reserved-ops (Remediate2): the programmatic API ADOPTS an
 /// identical-signature redeclaration of a datatype constructor/selector/
 /// tester as a handle to the registered member — the documented embedder

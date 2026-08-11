@@ -15,6 +15,7 @@ use serial_test::serial;
 
 mod congruence;
 mod disequality;
+mod forgone_cost;
 mod infrastructure;
 mod soundness;
 

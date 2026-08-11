@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::io;
 
+mod bounded;
 mod live_id_set;
 use live_id_set::LiveIdSet;
 
@@ -2775,17 +2776,6 @@ impl ProofManager {
     /// previous solve cycle or from `pop()`'s selector-clause emission (#7175).
     pub(crate) fn clear_last_add(&mut self) {
         self.last_add = None;
-    }
-
-    /// Whether the proof stream's most recent addition is a usable empty
-    /// clause. DRAT has no clause-ID visibility bookkeeping; a successful
-    /// write is sufficient there. LRAT additionally requires the terminal ID
-    /// to remain visible to the standalone checker.
-    #[inline]
-    pub(crate) fn has_file_visible_terminal_empty(&self) -> bool {
-        self.last_add.is_some_and(|last_add| {
-            last_add.is_empty && (!self.lrat_mode || self.lrat_id_visible_in_file(last_add.id))
-        })
     }
 
     /// Structural LRAT chain integrity check: verify all hints reference

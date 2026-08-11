@@ -167,12 +167,112 @@ pub(crate) fn collect_auxiliary_proof_declarations(
     let problem_free_vars =
         collect_free_vars_from_roots(terms, problem_assertions.iter().copied())?;
 
+    // A symbol that is FREE in the proof and NOT in the problem scope has no
+    // declaration anywhere the checker can see: the problem file does not
+    // declare it, so the proof document must. That is the whole obligation —
+    // there is no second condition to test.
+    //
+    // This used to additionally require the name to match one of six hard-coded
+    // prefixes (`_mod_`, `_div_`, `__ay_`, `_sk_`, `sk_`, `skolem`). Every
+    // internal symbol family outside that list was silently DROPPED from the
+    // preamble, producing a document no checker can even parse. Measured on
+    // QF_DT/20230720-blocksworld: the eager datatype engine's field-split
+    // symbols (`s_tmp___!left`, 281 occurrences in one proof) fall through, and
+    // carcara stops at
+    //   `parser error: identifier 's_tmp___!left' is not defined (line 4)`
+    // before checking a single rule. The `reduce-args` tactic's per-constant
+    // `f!k` names are in the same position.
+    //
+    // Nothing is lost by dropping the prefix test. Bound variables are already
+    // excluded by the binder tracking in `collect_free_vars_in_term`, and
+    // Skolem witnesses rendered as Alethe `choice` terms are skipped at the
+    // emission site (`is_skolem_witness_name`), which is where that decision
+    // belongs — the printer, not this collector, knows what it resugared away.
     Ok(proof_free_vars
         .into_iter()
-        .filter(|(name, _)| {
-            !problem_free_vars.contains_key(name) && is_auxiliary_proof_symbol(name)
-        })
+        .filter(|(name, _)| !problem_free_vars.contains_key(name))
         .collect())
+}
+
+/// Free variable names of `roots`, with their sorts discarded.
+///
+/// Used by the Skolem-`choice` preamble guard: a `define-fun` may only be
+/// emitted when every free symbol of its body is one an external checker can
+/// already resolve. Sorts are irrelevant to that question, and the caller has
+/// nothing to do with a clash, so a [`SymbolSortConflict`] is reported as "no
+/// resolvable symbols" — the guard then withholds every definition, which is
+/// the fail-closed direction.
+pub(crate) fn free_var_names(
+    terms: &TermStore,
+    roots: impl IntoIterator<Item = TermId>,
+) -> HashSet<String> {
+    collect_free_vars_from_roots(terms, roots)
+        .map(|vars| vars.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Names of every FUNCTION symbol applied anywhere under `roots`.
+///
+/// [`collect_free_vars_from_roots`] deliberately walks only `Var` nodes, so an
+/// application head — `P` in `(P x)` — is invisible to it. That is right for
+/// the declaration collector (AY never declared function symbols) but wrong for
+/// building a checker scope: carcara resolves `P` against the problem file, and
+/// a scope missing it would reject a perfectly good `define-fun` body.
+///
+/// Built-in operators come back too (`=`, `+`, `select`, ...). That is
+/// harmless and deliberate: [`ProblemScope`](crate::ProblemScope) is documented
+/// to err toward "declared", because the dangerous direction is a MISSING
+/// declaration causing a false reject.
+pub(crate) fn application_symbol_names(
+    terms: &TermStore,
+    roots: impl IntoIterator<Item = TermId>,
+) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::default();
+    let mut visited: HashSet<TermId> = HashSet::default();
+    let mut stack: Vec<TermId> = roots.into_iter().collect();
+    while let Some(term_id) = stack.pop() {
+        if !visited.insert(term_id) {
+            continue;
+        }
+        match terms.get(term_id) {
+            TermData::Var(..) | TermData::Const(_) => {}
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(cond, then_branch, else_branch) => {
+                stack.push(*cond);
+                stack.push(*then_branch);
+                stack.push(*else_branch);
+            }
+            TermData::App(symbol, args) => {
+                match symbol {
+                    ay_core::Symbol::Named(name) | ay_core::Symbol::Indexed(name, _) => {
+                        names.insert(name.clone());
+                    }
+                    // `Symbol` is `#[non_exhaustive]`. An unrecognised head
+                    // simply contributes no name; the preamble check then
+                    // withholds any definition that mentions it, which is the
+                    // fail-closed direction.
+                    _ => {}
+                }
+                stack.extend(args.iter().copied());
+            }
+            TermData::Let(bindings, body) => {
+                for (name, value) in bindings {
+                    // A `let`-bound name is resolvable wherever it is in scope.
+                    names.insert(name.clone());
+                    stack.push(*value);
+                }
+                stack.push(*body);
+            }
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                stack.push(*body);
+                for trigger_set in triggers {
+                    stack.extend(trigger_set.iter().copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
@@ -194,6 +294,24 @@ fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
         }
     }
     roots
+}
+
+/// The problem's declared symbol names, as the Alethe exporter sees them.
+///
+/// This is exactly the set `collect_auxiliary_proof_declarations` treats as
+/// "already declared elsewhere", so a symbol the exporter chose NOT to declare
+/// is in here by construction. The round-trip self-check uses it as the
+/// in-process fallback scope when the problem text is not on disk (stdin).
+///
+/// Returns an empty set on a sort conflict: the exporter declines to emit a
+/// certificate at all in that case, so there is nothing to check.
+pub(crate) fn problem_scope_symbol_names(
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+) -> Vec<String> {
+    collect_free_vars_from_roots(terms, problem_assertions.iter().copied())
+        .map(|vars| vars.into_keys().collect())
+        .unwrap_or_default()
 }
 
 fn collect_free_vars_from_roots(
@@ -287,9 +405,4 @@ fn collect_free_vars_in_term(
         _ => unreachable!("unexpected TermData variant"),
     }
     Ok(())
-}
-
-fn is_auxiliary_proof_symbol(name: &str) -> bool {
-    const AUX_PREFIXES: &[&str] = &["_mod_", "_div_", "__ay_", "_sk_", "sk_", "skolem"];
-    AUX_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }

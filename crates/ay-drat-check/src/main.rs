@@ -16,6 +16,11 @@ enum Mode {
 }
 
 fn main() {
+    // FIRST statement of main: arm() re-execs this process under a kernel-held
+    // memory bound, so anything above it is discarded work, and it sets an env
+    // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+
     let args = env::args_os().collect::<Vec<_>>();
     if matches!(args.as_slice(), [_, flag] if flag == "--provenance") {
         print_exact_provenance();

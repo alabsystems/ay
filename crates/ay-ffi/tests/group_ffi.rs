@@ -12,6 +12,8 @@
 mod c_consumer_link;
 #[path = "group_ffi/capi_ast_containers_link.rs"]
 mod capi_ast_containers_link;
+#[path = "group_ffi/capi_finite_set_link.rs"]
+mod capi_finite_set_link;
 #[path = "group_ffi/capi_func_interp_link.rs"]
 mod capi_func_interp_link;
 #[path = "group_ffi/capi_goal_probe_link.rs"]
@@ -30,9 +32,15 @@ mod capi_simplifier_link;
 mod capi_solver_completion_link;
 #[path = "group_ffi/capi_tactic_completion_link.rs"]
 mod capi_tactic_completion_link;
+#[path = "group_ffi/capi_z3_500_additional_link.rs"]
+mod capi_z3_500_additional_link;
+#[path = "group_ffi/capi_z3_500_remaining_link.rs"]
+mod capi_z3_500_remaining_link;
 #[path = "group_ffi/cpp_consumer_link.rs"]
 mod cpp_consumer_link;
 #[path = "group_ffi/header_coverage.rs"]
 mod header_coverage;
 #[path = "group_ffi/soundness_5511.rs"]
 mod soundness_5511;
+#[path = "group_ffi/z3_500_typed_surface_link.rs"]
+mod z3_500_typed_surface_link;

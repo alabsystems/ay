@@ -506,6 +506,12 @@ fn drat_comprehensive_satcomp_crn_11_99_u() {
 }
 
 /// spg_200_316 (SATCOMP2024 known-UNSAT) with DRAT proof.
+///
+/// `benchmarks/sat/satcomp2024-sample/*.cnf[.xz]` is a PROVISIONED corpus, not
+/// a committed one (`benchmarks/.gitignore` excludes `*.cnf`/`*.cnf.xz` there;
+/// `scripts/fetch_satcomp_sample.sh` downloads it from the GBD mirror). So the
+/// instance is optional exactly like `crn_11_99_u` above — the DRAT assertion
+/// is unchanged and still runs whenever the corpus has been fetched.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]
@@ -514,13 +520,17 @@ fn drat_comprehensive_satcomp_spg_200_316() {
         eprintln!("SKIP: spg_200_316 DRAT exceeds debug-mode timeout");
         return;
     }
-    let cnf_text = super::common::load_repo_benchmark(
+    let Some(cnf_text) = super::common::load_optional_repo_benchmark(
         "benchmarks/sat/satcomp2024-sample/b5028686db9bd1073fa09cbd8c805f47-spg_200_316.cnf",
-    );
+    ) else {
+        return;
+    };
     solve_dimacs_and_verify_drat(&cnf_text, "spg_200_316");
 }
 
 /// FmlaEquivChain_4_6_6 (SATCOMP2024 known-UNSAT) with DRAT proof.
+///
+/// Provisioned-corpus instance; see `drat_comprehensive_satcomp_spg_200_316`.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]
@@ -529,9 +539,11 @@ fn drat_comprehensive_satcomp_fmla_equiv_chain() {
         eprintln!("SKIP: FmlaEquivChain DRAT exceeds debug-mode timeout");
         return;
     }
-    let cnf_text = super::common::load_repo_benchmark(
+    let Some(cnf_text) = super::common::load_optional_repo_benchmark(
         "benchmarks/sat/satcomp2024-sample/9cd3acdb765c15163bc239ae3a57f880-FmlaEquivChain_4_6_6.sanitized.cnf",
-    );
+    ) else {
+        return;
+    };
     solve_dimacs_and_verify_drat(&cnf_text, "fmla_equiv_chain_4_6_6");
 }
 

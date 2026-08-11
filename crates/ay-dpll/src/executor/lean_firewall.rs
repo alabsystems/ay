@@ -8054,33 +8054,374 @@ pub(crate) fn parsed_fp_vocabulary_is_binary64(
         .any(|name| format_of(name) == Some(Some(BINARY64_FORMAT)))
 }
 
-/// Deliberately decline every parsed floating-point dot-error proof request.
+/// The two SMT-LIB spellings of round-to-nearest-ties-to-even.
 ///
-/// TWO gates stand in the way, and BOTH must be cleared before this hook may
-/// ever return `Some`.
+/// `FpBridge.NearestF64` is deliberately tie-rule agnostic, so `RNA` would in
+/// fact also be sound under it. It is NOT accepted here: the emitter's job is
+/// to recognize one certified shape, and every extra accepted spelling is
+/// another line a reviewer has to check against the standard for no gain.
+const FPDOT_RNE_SPELLINGS: [&str; 2] = ["RNE", "roundNearestTiesToEven"];
+
+/// The asserted position/offset magnitude bound the bridge is proved for:
+/// `2^48` (`FpBridge.B48`).
+const FPDOT_B48: i128 = 281_474_976_710_656;
+
+/// Largest numerator/denominator the emitter will put into the emitted Lean:
+/// `10^30`. Keeps the rendered `Int` literals small enough that the `omega`
+/// side conditions stay trivial, and makes every `i128` product below
+/// overflow-free by construction (`64 * 10^30` is ~7 orders under `i128::MAX`).
+const FPDOT_MAX_RATIONAL: i128 = 1_000_000_000_000_000_000_000_000_000_000;
+
+/// Decimal digits in [`FPDOT_MAX_RATIONAL`] minus one: a longer integer or
+/// fractional part cannot survive the range check, so it is refused before a
+/// long digit string is built.
+const FPDOT_MAX_RATIONAL_DIGITS: usize = 30;
+
+/// Follow nullary `define-fun` macro links to the first non-macro term.
 ///
-/// 1. FORMAT (implemented, live). See [`parsed_fp_vocabulary_is_binary64`]: the
-///    parsed assertion terms of the `Float64` benchmark and of its SATISFIABLE
-///    `Float32` clone are byte-identical, so an emitter that cannot read the
-///    declared format cannot be sound. This gate now reads it and declines on
-///    anything that is not `binary64`.
+/// Returns `None` on a cycle or an over-long chain rather than looping.
+fn fpdot_deref<'a>(t: &'a PTerm, defined: &'a [(String, PTerm)]) -> Option<&'a PTerm> {
+    let mut cur = t;
+    for _ in 0..32 {
+        let PTerm::Symbol(s) = cur else {
+            return Some(cur);
+        };
+        match defined.iter().find(|(n, _)| n == s) {
+            Some((_, body)) => cur = body,
+            None => return Some(cur),
+        }
+    }
+    None
+}
+
+/// A LEAF: a bare symbol that is neither a macro nor a rounding mode.
+fn fpdot_leaf(t: &PTerm, defined: &[(String, PTerm)]) -> Option<String> {
+    match fpdot_deref(t, defined)? {
+        PTerm::Symbol(s) if !SMTLIB_ROUNDING_MODES.contains(&s.as_str()) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// `(<op> RNE a b)` → `(a, b)`. Any other rounding mode, arity or head declines.
+fn fpdot_rne_binop<'a>(
+    t: &'a PTerm,
+    op: &str,
+    defined: &'a [(String, PTerm)],
+) -> Option<(&'a PTerm, &'a PTerm)> {
+    let PTerm::App(head, args) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    if head != op || args.len() != 3 {
+        return None;
+    }
+    let PTerm::Symbol(mode) = &args[0] else {
+        return None;
+    };
+    if !FPDOT_RNE_SPELLINGS.contains(&mode.as_str()) {
+        return None;
+    }
+    Some((&args[1], &args[2]))
+}
+
+/// `(fp.to_real x)` → `x`.
+fn fpdot_to_real<'a>(t: &'a PTerm, defined: &'a [(String, PTerm)]) -> Option<&'a PTerm> {
+    let PTerm::App(head, args) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    if head != "fp.to_real" || args.len() != 1 {
+        return None;
+    }
+    Some(&args[0])
+}
+
+/// `(fp.to_real l)` where `l` is a leaf → the leaf name.
+fn fpdot_to_real_leaf(t: &PTerm, defined: &[(String, PTerm)]) -> Option<String> {
+    fpdot_leaf(fpdot_to_real(t, defined)?, defined)
+}
+
+fn fpdot_gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// An SMT-LIB numeral or decimal literal → the EXACT rational `(num, den)` in
+/// lowest terms with `den > 0`. Declines (never wraps, never rounds) on
+/// anything whose numerator or denominator would exceed [`FPDOT_MAX_RATIONAL`].
+fn fpdot_parse_decimal(text: &str) -> Option<(i128, i128)> {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    if frac_part.len() > FPDOT_MAX_RATIONAL_DIGITS || int_part.len() > FPDOT_MAX_RATIONAL_DIGITS {
+        return None;
+    }
+    let mut num: i128 = format!("{int_part}{frac_part}").parse().ok()?;
+    let mut den: i128 = 1;
+    for _ in 0..frac_part.len() {
+        den = den.checked_mul(10)?;
+    }
+    if negative {
+        num = num.checked_neg()?;
+    }
+    let divisor = i128::try_from(fpdot_gcd(num.unsigned_abs(), den.unsigned_abs())).ok()?;
+    if divisor > 0 {
+        num /= divisor;
+        den /= divisor;
+    }
+    if num.abs() > FPDOT_MAX_RATIONAL || den > FPDOT_MAX_RATIONAL || den <= 0 {
+        return None;
+    }
+    Some((num, den))
+}
+
+/// A numeral/decimal literal, possibly behind nullary `define-fun` macros
+/// (`(define-fun B () Real 281474976710656.0)`), as an exact rational.
+fn fpdot_rational(t: &PTerm, defined: &[(String, PTerm)]) -> Option<(i128, i128)> {
+    let PTerm::Const(c) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    match c {
+        PConst::Numeral(n) => fpdot_parse_decimal(n),
+        PConst::Decimal(d) => fpdot_parse_decimal(d),
+        _ => None,
+    }
+}
+
+/// Flatten a (binary or n-ary) `+` tree into its summands.
+fn fpdot_flatten_add<'a>(
+    t: &'a PTerm,
+    defined: &'a [(String, PTerm)],
+    depth: u32,
+    out: &mut Vec<&'a PTerm>,
+) -> bool {
+    if depth > 8 || out.len() > 8 {
+        return false;
+    }
+    let Some(term) = fpdot_deref(t, defined) else {
+        return false;
+    };
+    if let PTerm::App(head, args) = term {
+        if head == "+" {
+            return args
+                .iter()
+                .all(|a| fpdot_flatten_add(a, defined, depth + 1, out));
+        }
+    }
+    out.push(term);
+    true
+}
+
+/// `(* (fp.to_real a) (fp.to_real b))` → `(a, b)`.
+fn fpdot_real_product(t: &PTerm, defined: &[(String, PTerm)]) -> Option<(String, String)> {
+    let PTerm::App(head, args) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    if head != "*" || args.len() != 2 {
+        return None;
+    }
+    Some((
+        fpdot_to_real_leaf(&args[0], defined)?,
+        fpdot_to_real_leaf(&args[1], defined)?,
+    ))
+}
+
+/// `(and (fp.isNormal L) (<= (fp.to_real (fp.abs L)) BOUND))` → `(L, BOUND)`.
 ///
-/// 2. SEMANTIC BRIDGE (open). `AySoundness.FpBridge` now proves, in the kernel,
-///    the whole rational side of the argument: `rne_step` (a nearest-value
-///    rounding hypothesis yields the half-ULP bound AND the magnitude cap),
-///    `isF64_representable` (every `IsF64` point really is a finite binary64
-///    bit pattern under the independent `FpUnderflow.decodeFin` model),
-///    `guard_claim_intermediates_finite` (all six intermediates stay `<= 2^51`,
-///    so none is `±∞`/NaN and `fp.to_real` is specified on all of them) and
-///    `guard_claim_no_model` (the composed conflict, certified bound `17/64`).
-///    What NO theorem discharges is the identification of SMT-LIB
-///    `fp.mul RNE` / `fp.add RNE`, read through `fp.to_real`, with
-///    `FpBridge.NearestF64`. That identification is hand-argued, it lives
-///    OUTSIDE the kernel, and it is categorically larger than the `Int`↔`Int`
-///    identifications the other emitters make, because ay's floating-point
-///    verdicts come from a BIT-BLASTER rather than from a nearest-value
-///    definition. Firing here would make the firewall depend on exactly the
-///    semantics it exists to check independently, so it stays closed.
+/// Both conjuncts must name the SAME leaf; the `fp.isNormal` conjunct is what
+/// makes `fp.to_real L` a rational at all (SMT-LIB leaves `fp.to_real`
+/// unspecified on NaN/±∞), so an assertion missing it is refused even though
+/// the Lean atom set drops it.
+fn fpdot_magnitude_assertion(
+    t: &PTerm,
+    defined: &[(String, PTerm)],
+) -> Option<(String, (i128, i128))> {
+    let PTerm::App(head, args) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    if head != "and" || args.len() != 2 {
+        return None;
+    }
+    let PTerm::App(normal, normal_args) = fpdot_deref(&args[0], defined)? else {
+        return None;
+    };
+    if normal != "fp.isNormal" || normal_args.len() != 1 {
+        return None;
+    }
+    let leaf = fpdot_leaf(&normal_args[0], defined)?;
+
+    let PTerm::App(le, le_args) = fpdot_deref(&args[1], defined)? else {
+        return None;
+    };
+    if le != "<=" || le_args.len() != 2 {
+        return None;
+    }
+    let PTerm::App(abs, abs_args) = fpdot_deref(fpdot_to_real(&le_args[0], defined)?, defined)?
+    else {
+        return None;
+    };
+    if abs != "fp.abs" || abs_args.len() != 1 || fpdot_leaf(&abs_args[0], defined)? != leaf {
+        return None;
+    }
+    Some((leaf, fpdot_rational(&le_args[1], defined)?))
+}
+
+/// The recognized `guard_claim` shape: the seven leaves in the order
+/// `nx ny nz px py pz d` and the refuted threshold as an exact rational.
+struct FpDotShape {
+    leaves: [String; 7],
+    tnum: i128,
+    tden: i128,
+}
+
+/// `(>= (- (fp.to_real RF) RREAL) THRESHOLD)`, with `RF` the six-operation RNE
+/// evaluation and `RREAL` the exact real dot product over the SAME leaves in
+/// the SAME order.
+fn fpdot_claim_assertion(t: &PTerm, defined: &[(String, PTerm)]) -> Option<FpDotShape> {
+    let PTerm::App(ge, ge_args) = fpdot_deref(t, defined)? else {
+        return None;
+    };
+    if ge != ">=" || ge_args.len() != 2 {
+        return None;
+    }
+    let PTerm::App(minus, minus_args) = fpdot_deref(&ge_args[0], defined)? else {
+        return None;
+    };
+    if minus != "-" || minus_args.len() != 2 {
+        return None;
+    }
+
+    // The rounded side: rf = fp.add(fp.add(fp.add(n*p, n*p), n*p), d), exactly
+    // this association — `close_add`/`close_trans_add` accumulate the certified
+    // 17/32 spacing for THIS tree and no other.
+    let rounded = fpdot_to_real(&minus_args[0], defined)?;
+    let (s2, d_term) = fpdot_rne_binop(rounded, "fp.add", defined)?;
+    let (s1, t3) = fpdot_rne_binop(s2, "fp.add", defined)?;
+    let (t1, t2) = fpdot_rne_binop(s1, "fp.add", defined)?;
+    let (nx, px) = fpdot_rne_binop(t1, "fp.mul", defined)?;
+    let (ny, py) = fpdot_rne_binop(t2, "fp.mul", defined)?;
+    let (nz, pz) = fpdot_rne_binop(t3, "fp.mul", defined)?;
+    let leaves = [
+        fpdot_leaf(nx, defined)?,
+        fpdot_leaf(ny, defined)?,
+        fpdot_leaf(nz, defined)?,
+        fpdot_leaf(px, defined)?,
+        fpdot_leaf(py, defined)?,
+        fpdot_leaf(pz, defined)?,
+        fpdot_leaf(d_term, defined)?,
+    ];
+    // Seven DISTINCT values: the Lean model has thirteen independent `Rat`
+    // fields, so an aliased leaf would be modeled as two unrelated values.
+    let mut distinct: Vec<&String> = leaves.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() != leaves.len() {
+        return None;
+    }
+
+    // The exact side: the same three products and the same offset, in the same
+    // order as the emitted atom `((nx*px + ny*py) + nz*pz) + d`.
+    let mut summands: Vec<&PTerm> = Vec::new();
+    if !fpdot_flatten_add(&minus_args[1], defined, 0, &mut summands) || summands.len() != 4 {
+        return None;
+    }
+    for (index, summand) in summands.iter().take(3).enumerate() {
+        let (n_leaf, p_leaf) = fpdot_real_product(summand, defined)?;
+        if n_leaf != leaves[index] || p_leaf != leaves[index + 3] {
+            return None;
+        }
+    }
+    if fpdot_to_real_leaf(summands[3], defined)? != leaves[6] {
+        return None;
+    }
+
+    let (tnum, tden) = fpdot_rational(&ge_args[1], defined)?;
+    Some(FpDotShape { leaves, tnum, tden })
+}
+
+/// Emit the binary64 RNE dot-product forward-error refutation, grounded in the
+/// kernel-checked `AySoundness.FpBridge.guard_claim_no_model`.
+///
+/// # What the emitted certificate rests on
+///
+/// The Lean theorem is quantified over the ROUNDING SPECIFICATION, not over a
+/// rounding function and not over ay's bit-blaster. `guard_claim_no_model`
+/// takes thirteen arbitrary rationals and six hypotheses of the form
+/// `NearestF64 r x` — "if `|x|` is under the overflow guard `2^60`, then `r` is
+/// at least as close to `x` as any representable value". It is RELATIONAL, so
+/// it does not even assume rounding is deterministic, and it is tie-rule
+/// agnostic. Nothing in it mentions how ay computes anything: if ay's
+/// bit-blaster were wrong, this certificate would be unaffected.
+///
+/// # The residual identification, stated so a reviewer can disagree with it
+///
+/// For a model of the SMT formula to contradict the theorem, five readings of
+/// the SMT-LIB standard have to be right. They are SPECIFICATION readings, of
+/// the same kind as (though longer than) the `Int`↔`Int` readings the other
+/// emitters make. None of them is machine-checked here.
+///
+/// 1. `fp.mul RNE` / `fp.add RNE` denote the exact real product/sum of the
+///    operands' values, rounded to the format's nearest representable value
+///    (SMT-LIB `FloatingPoint`, which defers to IEEE-754 §4.3.1/§5.1). The
+///    emitted atoms say exactly this, weakened to "no farther than any
+///    `IsF64` point".
+/// 2. `IsF64 ⊆ representable binary64`. This one is NOT a reading — it is
+///    `FpBridge.isF64_representable`, proved in the kernel against the
+///    independent `FpUnderflow.decodeFin 11 53` bit decode. It is the direction
+///    that matters: a non-representable point inside `IsF64` would make the
+///    rounding hypothesis STRONGER than the IEEE fact and the certificate
+///    unsound.
+/// 3. `fp.to_real` on a FINITE float is that float's exact value, and
+///    `fp.to_real (fp.abs v)` is `|fp.to_real v|`. `fp.abs` is exact.
+/// 4. The thirteen modeled values really are rationals. The seven leaves are
+///    finite by the asserted `fp.isNormal` (which is why this emitter refuses a
+///    magnitude assertion that omits it, even though the Lean atom set drops
+///    it); the six intermediates are finite by
+///    `FpBridge.guard_claim_intermediates_finite`, which bounds them by `2^51`
+///    — nine binades under the `2^60` guard and 972 under the binary64
+///    overflow threshold. That chain also supplies each `NearestF64`
+///    hypothesis' antecedent in turn, so the six can be extracted in sequence.
+/// 5. The `Real`-sorted claim `(>= (- (fp.to_real rf) rreal) T)` transcribes to
+///    `tnum ≤ tden * (rf − dot)`. All the values involved are rational, so no
+///    real-closure argument is needed.
+///
+/// WHAT A REVIEWER SHOULD ATTACK. The weakest link is (1): it is a reading of a
+/// natural-language standard, and it is the same proposition ay's bit-blaster
+/// is trying to implement. The reason that is acceptable here — and the reason
+/// this differs from the earlier "restating the semantics the solver
+/// implements" objection that kept this emitter closed — is that the
+/// certificate assumes only that the STANDARD says this, never that AY
+/// COMPUTES it. Every theory emitter restates a specification; what a firewall
+/// must not do is restate an implementation. If you believe (1) misreads
+/// SMT-LIB, the certificate is void; if you believe ay's blaster is buggy, the
+/// certificate still stands.
+///
+/// # Gates
+///
+/// - FORMAT: [`parsed_fp_vocabulary_is_binary64`]. The `Float64` benchmark and
+///   its SATISFIABLE `Float32` clone have BYTE-IDENTICAL parsed terms, so this
+///   gate — not the term shape — is what stands between the emitter and a
+///   `no_model` certificate for a satisfiable formula.
+/// - SHAPE: exactly eight assertions — seven
+///   `(and (fp.isNormal L) (<= (fp.to_real (fp.abs L)) B))` over seven DISTINCT
+///   leaves with `B = 1` for the three direction leaves and `B = 2^48` for the
+///   three position leaves and the offset, and one claim assertion in the
+///   certified association.
+/// - THRESHOLD: strictly above the certified accumulated bound `17/64`
+///   (`17·tden < 64·tnum`). `guard_claim_tight_1e7` (`1e-7`) is genuinely SAT
+///   and is refused here.
 pub(crate) fn emit_fp_dot_error_bound_firewall_lean_from_parsed(
     parsed: &[PTerm],
     defined: &[(String, PTerm)],
@@ -8091,14 +8432,229 @@ pub(crate) fn emit_fp_dot_error_bound_firewall_lean_from_parsed(
     if !parsed_fp_vocabulary_is_binary64(parsed, defined, fp_formats) {
         return None;
     }
-    // AUTHORITY GATE (still closed). See the doc comment above: the residual
-    // identification of SMT-LIB `fp.mul`/`fp.add` RNE — read through
-    // `fp.to_real` — with `AySoundness.FpBridge.NearestF64` is a hand-argued
-    // specification identification that no Lean theorem discharges. ay's FP
-    // verdicts come from a BIT-BLASTER, not from a nearest-value definition, so
-    // firing here would make the firewall depend on the very semantics it
-    // exists to check independently. Decline.
-    None
+    if parsed.len() != 8 {
+        return None;
+    }
+
+    let mut shape: Option<FpDotShape> = None;
+    let mut magnitudes: Vec<(String, (i128, i128))> = Vec::new();
+    for assertion in parsed {
+        if let Some(found) = fpdot_claim_assertion(assertion, defined) {
+            if shape.is_some() {
+                return None;
+            }
+            shape = Some(found);
+        } else if let Some(mag) = fpdot_magnitude_assertion(assertion, defined) {
+            magnitudes.push(mag);
+        } else {
+            return None;
+        }
+    }
+    let shape = shape?;
+    if magnitudes.len() != 7 {
+        return None;
+    }
+
+    // `|n| <= 1` on the three direction leaves, `|p|,|d| <= 2^48` on the rest.
+    // A LARGER asserted bound would under-approximate the true ulp, so the
+    // match is exact in both directions.
+    for (index, leaf) in shape.leaves.iter().enumerate() {
+        let expected = if index < 3 { (1, 1) } else { (FPDOT_B48, 1) };
+        let asserted = magnitudes
+            .iter()
+            .filter(|(name, _)| name == leaf)
+            .map(|(_, bound)| *bound)
+            .collect::<Vec<_>>();
+        if asserted.len() != 1 || asserted[0] != expected {
+            return None;
+        }
+        // Belt and braces over the vocabulary gate: each leaf is itself a
+        // DECLARED binary64 value, not merely a symbol the gate tolerated.
+        if fp_formats
+            .iter()
+            .find(|(name, _)| name == leaf)
+            .map(|(_, format)| *format)
+            != Some(Some(BINARY64_FORMAT))
+        {
+            return None;
+        }
+    }
+
+    // THRESHOLD GATE: strictly above the certified accumulated bound 17/64.
+    // `fpdot_parse_decimal` already pinned `0 < tden <= 10^18` and
+    // `|tnum| <= 10^18`, so both products are far inside `i128`.
+    let (tnum, tden) = (shape.tnum, shape.tden);
+    if tden <= 0 || 17 * tden >= 64 * tnum {
+        return None;
+    }
+
+    Some(render_fp_dot_error_bound_lean(tnum, tden))
+}
+
+/// Render the binary64 RNE dot-product forward-error firewall Lean.
+///
+/// Constant template up to the refuted threshold `tnum/tden` and the namespace
+/// hash. The leaf NAMES are deliberately not copied into the artifact (they are
+/// untrusted input and carry no proof content): the thirteen `Val` fields are
+/// positional, in the same order the recognizer fixed them.
+fn render_fp_dot_error_bound_lean(tnum: i128, tden: i128) -> String {
+    let hash = fnv_hex(&format!("fpdotrne:{tnum}/{tden}"));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.FpBridge
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — binary64 RNE dot-product FORWARD-ERROR
+  refutation, grounded in the verified `firewall_combined_unsat` and in
+  `AySoundness.FpBridge.guard_claim_no_model`.
+
+  Seven binary64 leaves with `|n| <= 1` and `|p|,|d| <= 2^48`, the six-operation
+  RNE evaluation `rf = ((n*p + n*p) + n*p) + d`, and the refuted claim
+  `rf - exact_dot >= {tnum}/{tden}`. The certified accumulated half-ULP forward
+  error is `17/64`, and `17*{tden} < 64*{tnum}`, so the claim has no model.
+
+  THE ROUNDING HYPOTHESIS IS A SPECIFICATION, NOT AN IMPLEMENTATION. Atoms 8-13
+  are `FpBridge.NearestF64 r x`: "if `|x| <= 2^60` then `r` is at least as close
+  to `x` as ANY `IsF64` point". `guard_claim_no_model` is universally quantified
+  over all thirteen rationals satisfying that relation, so the certificate is
+  independent of how ay computes floating point — a buggy bit-blaster cannot
+  make it true and cannot make it false. `FpBridge.isF64_representable` proves
+  in the kernel that every `IsF64` point IS a finite binary64 bit pattern (under
+  the independent `FpUnderflow.decodeFin 11 53` decode), which is the direction
+  that keeps the hypothesis weaker than the IEEE-754 fact.
+
+  The `fp.isNormal` conjunct of each leaf assertion is DROPPED from the atom set
+  (refuting a weaker set refutes the original); it is required syntactically by
+  the emitter because it is what makes `fp.to_real` of each leaf a rational at
+  all. The six intermediates' finiteness is not assumed: it is
+  `FpBridge.guard_claim_intermediates_finite` (all `<= 2^51`).
+
+  Model: thirteen `Rat` fields — the `fp.to_real` values of the seven leaves and
+  of the six rounded intermediates. Pure Lean 4 core + `FpBridge`.
+-/
+namespace AySoundness.Emitted.FpDotRne_{hash}
+open AySoundness
+open AySoundness.FpBridge
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  nx : Rat
+  ny : Rat
+  nz : Rat
+  px : Rat
+  py : Rat
+  pz : Rat
+  d : Rat
+  t1 : Rat
+  t2 : Rat
+  t3 : Rat
+  s1 : Rat
+  s2 : Rat
+  rf : Rat
+
+/-- Atoms 1-7: the asserted magnitude bounds. Atoms 8-13: the IEEE-754 RNE
+    nearest-value specification of the six recognized operations. Atom 14: the
+    refuted claim, scaled to `{tnum} <= {tden} * (rf - dot)`. -/
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (AbsLe m.nx 1)
+  | 2 => decide (AbsLe m.ny 1)
+  | 3 => decide (AbsLe m.nz 1)
+  | 4 => decide (AbsLe m.px B48)
+  | 5 => decide (AbsLe m.py B48)
+  | 6 => decide (AbsLe m.pz B48)
+  | 7 => decide (AbsLe m.d B48)
+  | 8 => decide (NearestF64 m.t1 (m.nx * m.px))
+  | 9 => decide (NearestF64 m.t2 (m.ny * m.py))
+  | 10 => decide (NearestF64 m.t3 (m.nz * m.pz))
+  | 11 => decide (NearestF64 m.s1 (m.t1 + m.t2))
+  | 12 => decide (NearestF64 m.s2 (m.s1 + m.t3))
+  | 13 => decide (NearestF64 m.rf (m.s2 + m.d))
+  | 14 => decide (({tnum} : Rat) ≤ ({tden} : Rat) *
+            (m.rf - (((m.nx * m.px + m.ny * m.py) + m.nz * m.pz) + m.d)))
+  | _ => false
+
+def original : List (Cid × Clause) :=
+  [(1, [1]), (2, [2]), (3, [3]), (4, [4]), (5, [5]), (6, [6]), (7, [7]),
+   (8, [8]), (9, [9]), (10, [10]), (11, [11]), (12, [12]), (13, [13]), (14, [14])]
+
+def lemmas : List (Cid × Clause) :=
+  [(15, [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14])]
+
+def proof : List (Cid × Clause × List Int) :=
+  [(16, [], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])]
+
+theorem lemma_valid (m : Val) :
+    clauseSat (atomVal m) [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14] = true := by
+  by_cases h1 : AbsLe m.nx 1
+  · by_cases h2 : AbsLe m.ny 1
+    · by_cases h3 : AbsLe m.nz 1
+      · by_cases h4 : AbsLe m.px B48
+        · by_cases h5 : AbsLe m.py B48
+          · by_cases h6 : AbsLe m.pz B48
+            · by_cases h7 : AbsLe m.d B48
+              · by_cases h8 : NearestF64 m.t1 (m.nx * m.px)
+                · by_cases h9 : NearestF64 m.t2 (m.ny * m.py)
+                  · by_cases h10 : NearestF64 m.t3 (m.nz * m.pz)
+                    · by_cases h11 : NearestF64 m.s1 (m.t1 + m.t2)
+                      · by_cases h12 : NearestF64 m.s2 (m.s1 + m.t3)
+                        · by_cases h13 : NearestF64 m.rf (m.s2 + m.d)
+                          · by_cases h14 : ({tnum} : Rat) ≤ ({tden} : Rat) *
+                                (m.rf - (((m.nx * m.px + m.ny * m.py) + m.nz * m.pz) + m.d))
+                            · exact absurd
+                                (guard_claim_no_model m.nx m.ny m.nz m.px m.py m.pz m.d
+                                  m.t1 m.t2 m.t3 m.s1 m.s2 m.rf
+                                  ((1 : Rat) / ((32 : Int) : Rat))
+                                  ((1 : Rat) / ((16 : Int) : Rat))
+                                  ((1 : Rat) / ((8 : Int) : Rat))
+                                  ((1 : Rat) / ((4 : Int) : Rat))
+                                  (Rat.div_mul_cancel (by decide))
+                                  (Rat.div_mul_cancel (by decide))
+                                  (Rat.div_mul_cancel (by decide))
+                                  (Rat.div_mul_cancel (by decide))
+                                  h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12 h13
+                                  {tnum} {tden} (by omega) (by omega) (by simpa using h14))
+                                (by simp)
+                            -- NOT `simp [.., atomVal, h14]`: with `tden = 1`
+                            -- `simp` rewrites `1 * x` to `x` in the goal but
+                            -- not in `h14`, and the branch stops closing.
+                            -- Discharging the atom first is `tden`-independent.
+                            · have h14false : atomVal m 14 = false := by
+                                simp only [atomVal, decide_eq_false_iff_not]
+                                exact h14
+                              simp [clauseSat, litSat, List.any_cons, List.any_nil, h14false]
+                          · simp [clauseSat, litSat, atomVal, h13]
+                        · simp [clauseSat, litSat, atomVal, h12]
+                      · simp [clauseSat, litSat, atomVal, h11]
+                    · simp [clauseSat, litSat, atomVal, h10]
+                  · simp [clauseSat, litSat, atomVal, h9]
+                · simp [clauseSat, litSat, atomVal, h8]
+              · simp [clauseSat, litSat, atomVal, h7]
+            · simp [clauseSat, litSat, atomVal, h6]
+          · simp [clauseSat, litSat, atomVal, h5]
+        · simp [clauseSat, litSat, atomVal, h4]
+      · simp [clauseSat, litSat, atomVal, h3]
+    · simp [clauseSat, litSat, atomVal, h2]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- The asserted binary64 `guard_claim` set has NO model — via the firewall.
+    Reads through the IEEE-754 round-to-nearest SPECIFICATION (`NearestF64`),
+    not through any rounding implementation. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.FpDotRne_{hash}
+"#,
+    )
 }
 
 /// `(str.len s)` (parsed) → `s`.

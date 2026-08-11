@@ -1691,6 +1691,116 @@ fn test_executor_qf_abv_finite_array_masked_concat_multi_leaf_fails_closed_11924
     );
 }
 
+/// #retain-parsed-verdict-divergence — dropping the parsed AST must not
+/// change a verdict.
+///
+/// `set_retain_parsed_assertions(false)` is a peak-RSS optimization the CLI
+/// applies whenever no proof artifact can be emitted (`--no-proof`,
+/// `--z3-mode`, competition mode). Before the fix in
+/// `executor/proof_rewrite.rs`, `apply_input_syntax_rewrites_to_proof`
+/// returned early on an empty parsed stack and so ALSO skipped the
+/// assume-authorization tail; the QF_ABV dense finite-array rewrite's `assume`
+/// leaf then stayed unauthorized and the mandatory UNSAT certificate rejected
+/// the refutation with "assumes term outside the supplied problem obligation".
+/// Measured at that commit: `ay --z3-mode` printed `unknown` on this exact
+/// file where z3 5.0.0, `ay` default mode and the sibling test below all print
+/// `unsat`.
+///
+/// `rewrites`/`exact_rewrites` are asserted too so this cannot pass vacuously
+/// by some other route deciding the query while the dense pass stays dead.
+#[test]
+fn test_executor_qf_abv_exact_select_unsat_survives_dropped_parsed_ast_11928() {
+    use std::fmt::Write;
+
+    let mut smt = String::new();
+    writeln!(smt, "(set-logic QF_ABV)").unwrap();
+    writeln!(
+        smt,
+        "(declare-const table (Array (_ BitVec 8) (_ BitVec 8)))"
+    )
+    .unwrap();
+    for idx in 0..32u8 {
+        let value = u8::from(idx == 9);
+        writeln!(smt, "(assert (= (select table #x{idx:02x}) #x{value:02x}))").unwrap();
+    }
+    writeln!(smt, "(assert (= false (= #x01 (select table #x09))))").unwrap();
+    writeln!(smt, "(check-sat)").unwrap();
+
+    let commands = parse(&smt).unwrap();
+    let mut exec = Executor::new();
+    // Exactly what `--no-proof` / `--z3-mode` / competition mode do.
+    exec.set_retain_parsed_assertions(false);
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "the peak-RSS parsed-AST drop must not revoke a certified refutation; \
+         unknown_reason={:?}; statistics={:?}",
+        exec.unknown_reason(),
+        exec.statistics()
+    );
+    assert!(
+        exec.statistics()
+            .get_int("smt.abv.finite_array.exact_rewrites")
+            .unwrap_or(0)
+            > 0,
+        "the dense finite-array pass must still be the route under test; statistics={:?}",
+        exec.statistics()
+    );
+}
+
+/// Sibling of the test above for the SPARSE-PREDICATE rewrite shape, which
+/// reaches the certificate through `build_index_membership` (a freshly minted
+/// disjunction) rather than a constant substitution. Same invariant: the
+/// parsed-AST retention flag is a memory knob, never a verdict knob.
+#[test]
+fn test_executor_qf_abv_sparse_predicate_unsat_survives_dropped_parsed_ast_11924() {
+    use std::fmt::Write;
+
+    let mut smt = String::new();
+    writeln!(smt, "(set-logic QF_ABV)").unwrap();
+    writeln!(
+        smt,
+        "(declare-const table (Array (_ BitVec 8) (_ BitVec 8)))"
+    )
+    .unwrap();
+    writeln!(smt, "(declare-const idx (_ BitVec 8))").unwrap();
+
+    for idx in 0..=255u16 {
+        let value = u16::from(matches!(idx, 9 | 10 | 32));
+        writeln!(smt, "(assert (= (select table #x{idx:02x}) #x{value:02x}))").unwrap();
+    }
+
+    writeln!(smt, "(assert (= false (= #x00 (select table idx))))").unwrap();
+    writeln!(smt, "(assert (not (= idx #x09)))").unwrap();
+    writeln!(smt, "(assert (not (= idx #x0a)))").unwrap();
+    writeln!(smt, "(assert (not (= idx #x20)))").unwrap();
+    writeln!(smt, "(check-sat)").unwrap();
+
+    let commands = parse(&smt).unwrap();
+    let mut exec = Executor::new();
+    exec.set_retain_parsed_assertions(false);
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "the peak-RSS parsed-AST drop must not revoke a certified refutation; \
+         unknown_reason={:?}; statistics={:?}",
+        exec.unknown_reason(),
+        exec.statistics()
+    );
+    assert!(
+        exec.statistics()
+            .get_int("smt.abv.finite_array.predicate_rewrites")
+            .unwrap_or(0)
+            > 0,
+        "the dense sparse-predicate rewrite must still be the route under test; statistics={:?}",
+        exec.statistics()
+    );
+}
+
 #[test]
 fn test_executor_qf_abv_finite_array_exact_select_rewrite_unsat_11928() {
     use std::fmt::Write;
@@ -1984,14 +2094,14 @@ fn test_executor_qf_abv_try_nested_bv1_select_wrapper_validates_11920() {
     );
     assert_eq!(
         exec.statistics().get_string("model_check_gate.result"),
-        Some("cannot-confirm"),
-        "the independent evaluator must honestly decline unsupported quantified syntax"
+        Some("confirmed-sat"),
+        "exhaustive BV-domain coverage must certify the quantified root"
     );
     assert_eq!(
         exec.statistics()
             .get_string("model_check_gate.cannot_confirm_reason"),
-        Some("quantifier is not evaluable by the gate"),
-        "cannot-confirm must name the unsupported quantified boundary"
+        None,
+        "an exactly certified BV quantifier must not retain a refusal reason"
     );
 }
 

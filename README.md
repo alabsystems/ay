@@ -44,8 +44,21 @@ tools can adopt AY one workflow at a time; new tools can embed its native
 Rust APIs directly.
 
 > **Status:** AY 0.x is under active development. Its tested Z3-compatible
-> subset is useful today, with logic, API, and performance coverage expanding
-> toward full parity.
+> subset is useful today, but the exact Z3 5.0.0 full-replacement gate is still
+> red. The gate authenticates all 807 required exports and the byte-exact
+> 11-header/805-declaration C surface; current runtime evidence executes
+> 217/805 declarations and has 0/805 exhaustive per-API semantic contracts.
+> The source-owned behavioral catalog also has 301 explicit unresolved owners
+> (asserted, pending a gate re-run — the owner-manifest digests are stale, so the
+> overlay validators currently fail closed),
+> and the pinned 438,631-query official corpus has not been run. Public SMT
+> `sat` publication now fails closed to `unknown` whenever the independent model
+> boundary cannot confirm the witness, in every mode; `--self-check` additionally
+> requests the stricter user-facing proof workflow. Read
+> [`LIMITATIONS.md`](LIMITATIONS.md),
+> [the development design notes](the development design notes), and the
+> [full-replacement gate](the development design notes) before substituting AY
+> for Z3 anywhere the answer matters.
 
 ## Quick start
 
@@ -400,9 +413,11 @@ underlying techniques began here.
   [`smtlib-conformance` gate](the development design notes) separately pins
   SMT-LIB 2.7 and the exact Z3 5.0.0 overlay, then fails closed on any
   unowned requirement, incomplete source inventory, skip, unknown, or
-  unvalidated SAT model/UNSAT proof. It currently serves as an executable
-  readiness contract: only target identity is implemented, so no build can
-  receive a full replacement pass yet.
+  unvalidated SAT model/UNSAT proof. All 18 validators across its twelve
+  dimensions are executable and fail closed. That closes the validator-
+  implementation work, not the product contract: unresolved source-owned
+  behaviors, incomplete C runtime semantics, and the unmaterialized official
+  corpus still prevent any build from receiving a full-replacement pass.
 
 ## AY in ALab Systems
 

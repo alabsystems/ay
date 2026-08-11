@@ -269,6 +269,22 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     pub(super) theory_propagation_count: u64,
     /// Count of partial clause events where `term_to_literal` dropped terms (#5000).
     pub(super) partial_clause_count: u64,
+    /// Mid-search minted term -> SAT variable mappings (#6846).
+    ///
+    /// `term_to_var` is an immutable borrow of the encoding built before the
+    /// solve, so a theory conflict naming a term that was never encoded used to
+    /// map to a PARTIAL clause and fail closed to `Unknown` — the documented
+    /// reason AUFLIA is pinned to the lazy pipeline. This overlay lets the
+    /// extension name such a term with a fresh variable beyond the solver's
+    /// current `num_vars()`; `add_theory_lemma` already grows the solver for
+    /// out-of-range literals. Consulted by `var_for_term` after `term_to_var`,
+    /// and it must OUTLIVE the individual check, so the mapping stays stable for
+    /// later rounds (a term must never be renamed to a second variable).
+    pub(super) minted_term_to_var: HashMap<TermId, u32>,
+    /// Reverse of `minted_term_to_var`, for model/diagnostic lookups.
+    pub(super) minted_var_to_term: HashMap<u32, TermId>,
+    /// Count of variables minted mid-search (#6846), for `--stats` attribution.
+    pub(super) minted_var_count: u64,
     /// Pending split/lemma request from the theory solver (#4919).
     /// Stored here instead of panicking so that eager mode can be used with
     /// theories that produce splits at full-model time (LRA, LIA, strings).

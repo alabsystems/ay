@@ -80,11 +80,10 @@ impl Solver {
         {
             return None;
         }
+        self.executor
+            .replace_last_result_with_unknown(UnknownReason::Unsupported);
         self.last_unknown_reason = Some(UnknownReason::Unsupported);
-        Some(VerifiedSolveResult::from_validated(
-            SolveResult::Unknown,
-            None,
-        ))
+        Some(self.finish_verified_result(SolveResult::Unknown))
     }
 
     /// Instance wrapper for [`reject_bv_cnf_export_operation`] that also
@@ -124,6 +123,8 @@ impl Solver {
         // An errored decision query admits no model, certificate, proof, or
         // optimum. Drop any partial artefacts left by the failed executor path.
         self.executor.begin_public_solve(false);
+        self.executor
+            .replace_last_result_with_unknown(UnknownReason::InternalError);
         self.last_unknown_reason = Some(UnknownReason::InternalError);
         self.last_artifact_export_failure = match error {
             ExecutorError::ArtifactExport(detail) => Some(detail.clone()),
@@ -152,6 +153,7 @@ impl Solver {
     }
 
     fn preflight_unknown(&mut self, reason: UnknownReason) -> VerifiedSolveResult {
+        self.executor.replace_last_result_with_unknown(reason);
         self.last_unknown_reason = Some(reason);
         if crate::Executor::bv_cnf_export_requested() {
             let error = match crate::Executor::invalidate_bv_cnf_export_for_rejected_check() {
@@ -166,7 +168,73 @@ impl Solver {
             };
             self.last_executor_error = Some(error.to_string());
         }
-        VerifiedSolveResult::from_validated(SolveResult::Unknown, None)
+        self.finish_verified_result(SolveResult::Unknown)
+    }
+
+    /// Cross the sole native-API result boundary.
+    ///
+    /// Definite wrappers can only be built by consuming the executor's exact
+    /// one-shot SAT/UNSAT capability. A missing capability is a certification
+    /// failure, not a wrapper-local state: publish the registered Unknown on
+    /// the executor first so every stale artifact is revoked and both views of
+    /// the last query remain identical.
+    pub(super) fn finish_verified_result(&mut self, result: SolveResult) -> VerifiedSolveResult {
+        let sat_certificate = self.executor.take_sat_certificate();
+        let unsat_certificate = self.executor.take_unsat_certificate();
+        match result {
+            SolveResult::Sat => match sat_certificate {
+                Some(certificate) => VerifiedSolveResult::certified_sat(certificate),
+                None => {
+                    let published = self
+                        .executor
+                        .reject_uncertified_verdict_for_publication(
+                            "computed SAT reached the native API boundary without its model-validation capability"
+                                .to_string(),
+                        );
+                    match published {
+                        SolveResult::Unknown => {
+                            self.last_unknown_reason = self.executor.unknown_reason();
+                            VerifiedSolveResult::unknown()
+                        }
+                        SolveResult::Sat | SolveResult::Unsat(_) => unreachable!(
+                            "reject_uncertified_verdict_for_publication must fail closed"
+                        ),
+                    }
+                }
+            },
+            SolveResult::Unsat(proof) => match unsat_certificate {
+                Some(certificate) => VerifiedSolveResult::certified_unsat(proof, certificate),
+                None => {
+                    let published = self
+                        .executor
+                        .reject_uncertified_verdict_for_publication(
+                            "computed UNSAT reached the native API boundary without its strict-proof capability"
+                                .to_string(),
+                        );
+                    match published {
+                        SolveResult::Unknown => {
+                            self.last_unknown_reason = self.executor.unknown_reason();
+                            VerifiedSolveResult::unknown()
+                        }
+                        SolveResult::Sat | SolveResult::Unsat(_) => unreachable!(
+                            "reject_uncertified_verdict_for_publication must fail closed"
+                        ),
+                    }
+                }
+            },
+            SolveResult::Unknown => match self
+                .executor
+                .finalize_unknown_publication(SolveResult::Unknown)
+            {
+                SolveResult::Unknown => {
+                    self.last_unknown_reason = self.executor.unknown_reason();
+                    VerifiedSolveResult::unknown()
+                }
+                SolveResult::Sat | SolveResult::Unsat(_) => {
+                    unreachable!("finalize_unknown_publication changed an Unknown verdict")
+                }
+            },
+        }
     }
 
     /// Reject invalid raw handles and solver-generated array witnesses before
@@ -242,22 +310,24 @@ impl Solver {
     /// Classify an `Unknown` result that has no reason yet, using executor
     /// state, interrupt flag, deadline, and memory limit.
     pub(super) fn classify_unknown_reason(&mut self, deadline: Option<Instant>) {
-        if let Some(reason) = self.executor.unknown_reason() {
-            self.last_unknown_reason = Some(reason);
+        let reason = if let Some(reason) = self.executor.unknown_reason() {
+            reason
         } else if self.interrupt.load(Ordering::Relaxed) {
-            self.last_unknown_reason = Some(UnknownReason::Interrupted);
+            UnknownReason::Interrupted
         } else if deadline.is_some_and(|d| Instant::now() >= d) {
-            self.last_unknown_reason = Some(UnknownReason::Timeout);
+            UnknownReason::Timeout
         } else if crate::memory::memory_exceeded(self.memory_limit)
             || ay_sys::process_memory_exceeded()
             || self
                 .term_memory_limit
                 .is_some_and(|limit| self.terms().instance_memory_exceeded(limit))
         {
-            self.last_unknown_reason = Some(UnknownReason::MemoryLimit);
+            UnknownReason::MemoryLimit
         } else {
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
-        }
+            UnknownReason::Incomplete
+        };
+        self.executor.replace_last_result_with_unknown(reason);
+        self.last_unknown_reason = Some(reason);
     }
 
     // =========================================================================
@@ -278,6 +348,7 @@ impl Solver {
     /// to check whether model validation actually ran. Part of #5748, #5973.
     pub fn check_sat(&mut self) -> VerifiedSolveResult {
         self.clear_last_solve_state(true, false);
+        self.executor.bind_unsat_query_assumptions(&[]);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         if let Some(rejected) = self.reject_native_array_ext_witness_capture(&[]) {
             return rejected;
@@ -304,12 +375,12 @@ impl Solver {
             }
         };
 
+        let result = self.executor.certify_unsat_for_publication(result, &[]);
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
             self.classify_unknown_reason(deadline);
         }
 
-        let sat_certificate = self.executor.take_sat_certificate();
-        VerifiedSolveResult::from_validated(result, sat_certificate)
+        self.finish_verified_result(result)
     }
 
     /// Check satisfiability with an additional cooperative interrupt callback.
@@ -322,6 +393,7 @@ impl Solver {
         F: Fn() -> bool + Send + 'static,
     {
         self.clear_last_solve_state(true, false);
+        self.executor.bind_unsat_query_assumptions(&[]);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         if let Some(rejected) = self.reject_mixed_soft_ownership() {
             return rejected;
@@ -344,12 +416,12 @@ impl Solver {
             }
         };
 
+        let result = self.executor.certify_unsat_for_publication(result, &[]);
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
             self.classify_unknown_reason(deadline);
         }
 
-        let sat_certificate = self.executor.take_sat_certificate();
-        VerifiedSolveResult::from_validated(result, sat_certificate)
+        self.finish_verified_result(result)
     }
 
     /// Check satisfiability with a per-call timeout override.
@@ -418,8 +490,10 @@ impl Solver {
     /// ```
     pub fn check_sat_assuming(&mut self, assumptions: &[Term]) -> VerifiedSolveResult {
         self.clear_last_solve_state(false, false);
+        let assumption_ids: Vec<_> = assumptions.iter().map(|term| term.0).collect();
+        self.executor.bind_unsat_query_assumptions(&assumption_ids);
         self.record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
-            assumptions: assumptions.iter().map(|term| term.0).collect(),
+            assumptions: assumption_ids.clone(),
         });
         if let Some(rejected) = self.reject_native_array_ext_witness_capture(assumptions) {
             return rejected;
@@ -436,7 +510,6 @@ impl Solver {
 
         self.install_solve_controls(deadline);
 
-        let assumption_ids: Vec<_> = assumptions.iter().map(|t| t.0).collect();
         self.last_assumptions = Some(assumptions.iter().map(|t| (t.0, *t)).collect());
 
         // User-facing entry: named assertions are assumption-tracked when
@@ -456,11 +529,78 @@ impl Solver {
             }
         };
 
+        let result = self
+            .executor
+            .certify_unsat_for_publication(result, &assumption_ids);
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
             self.classify_unknown_reason(deadline);
         }
 
-        let sat_certificate = self.executor.take_sat_certificate();
-        VerifiedSolveResult::from_validated(result, sat_certificate)
+        self.finish_verified_result(result)
+    }
+}
+
+#[cfg(test)]
+mod finish_verified_result_tests {
+    use super::*;
+    use crate::api::Logic;
+    use crate::UnknownOrigin;
+
+    #[test]
+    fn missing_reused_sat_capability_publishes_registered_unknown_and_revokes_model() {
+        let mut solver = Solver::new(Logic::QfLia);
+        let x = solver.declare_const("x", crate::api::Sort::Int);
+        let five = solver.int_const(5);
+        let constraint = solver.eq(x, five);
+        solver.assert_term(constraint);
+        let first = solver.check_sat();
+        assert!(first.is_sat());
+        assert!(solver.model().is_some());
+
+        let replayed_definite = first.result().clone();
+        let rejected = solver.finish_verified_result(replayed_definite);
+
+        assert!(rejected.is_unknown());
+        assert_eq!(
+            solver.unknown_reason(),
+            Some(UnknownReason::SelfCheckRejected)
+        );
+        assert_eq!(
+            solver.executor.unknown_origin(),
+            Some(UnknownOrigin::VerdictCertification)
+        );
+        assert!(solver.executor.last_result_is_unknown());
+        assert!(solver.model().is_none());
+        assert!(solver.executor.take_sat_certificate().is_none());
+        assert!(solver.executor.take_unsat_certificate().is_none());
+    }
+
+    #[test]
+    fn missing_reused_unsat_capability_publishes_registered_unknown_and_revokes_proof() {
+        let mut solver = Solver::new(Logic::QfLia);
+        solver.set_produce_proofs(true);
+        let contradiction = solver.bool_const(false);
+        solver.assert_term(contradiction);
+        let first = solver.check_sat();
+        assert!(first.is_unsat());
+        assert!(solver.last_proof().is_some());
+
+        let replayed_definite = first.result().clone();
+        let rejected = solver.finish_verified_result(replayed_definite);
+
+        assert!(rejected.is_unknown());
+        assert_eq!(
+            solver.unknown_reason(),
+            Some(UnknownReason::SelfCheckRejected)
+        );
+        assert_eq!(
+            solver.executor.unknown_origin(),
+            Some(UnknownOrigin::VerdictCertification)
+        );
+        assert!(solver.executor.last_result_is_unknown());
+        assert!(solver.last_proof().is_none());
+        assert!(solver.try_get_unsat_core().is_err());
+        assert!(solver.executor.take_sat_certificate().is_none());
+        assert!(solver.executor.take_unsat_certificate().is_none());
     }
 }

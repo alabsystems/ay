@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use ay_sat::{AssumeResult, Literal, Solver as SatSolver, Variable};
 
+use crate::dpw::{dpw_size, gte_size, DpwEnc};
 use crate::solver::MaxSatStats;
 
 /// Diagnostics gate: set `AY_MAXSAT_DEBUG=1` to trace engine decisions on
@@ -135,6 +136,13 @@ const AM1_PROBE_MAX_ACTIVE: usize = 2000;
 const AM1_PROBE_MAX_ITERS: u32 = 64;
 /// Distinct-soft-weight count at/above which the overlapping weighted clique
 /// cover replaces the disjoint one (#am1-overlap gate; see `am1_overlap`).
+/// #core-mine: cap the arity of a mined core. A hard clause that forbids k
+/// unit softs from all holding is a core of size k; very wide ones are weak
+/// (they pay one `w_min` regardless of k) and cost more to carry.
+const CORE_MINE_MAX_ARITY: usize = 8;
+/// #core-mine: cap on collected cores, so the scan is O(hards) with bounded
+/// memory on formulas where nearly every clause qualifies.
+const CORE_MINE_MAX_CORES: usize = 200_000;
 const AM1_OVERLAP_MIN_DISTINCT_WEIGHTS: usize = 20;
 
 /// #am1-maxcover kill switch (env A/B). DEFAULT ON: for the overlapping AM1
@@ -427,6 +435,262 @@ fn maxsat_oneshot_preproc_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_PREPROC").as_deref() != Ok("0"))
 }
 
+/// Kill switch for RATE-AWARE descent entry (#cold-core-descent). DEFAULT ON:
+/// `AY_AB_MAXSAT_COLD_DESCENT=0` restores the pre-2026-08-02 gate, so the lever
+/// can be measured as a paired A/B — with an A/A control — from ONE binary, the
+/// way `AY_AB_MAXSAT_EARLY_DESCENT` and `AY_AB_MAXSAT_DESCENT_RESIDUAL` are.
+///
+/// THE DEFECT. The organic descent gate's core conjunct is
+/// `cores_found >= lsu_min_cores` (64), a FLAT COUNT that is blind to how fast
+/// cores arrive. Where the count is never reached the wait is the whole run:
+/// af-synthesis ends at ~17 cores, and AY is 0/15 there while the upper-bound
+/// solvers are 15/15.
+///
+/// ⚠️ THE MOTIVATING TRACE DID NOT REPRODUCE, AND THE HONEST READING MATTERS.
+/// An earlier probe of `causal-discovery_wt-causal_n6_i2_N500_uai13_log_int` at
+/// 900s reported 641 of 806 seconds spent reaching core #64 at one core per
+/// 20-40s, with the descent then closing the instance in 164s — i.e. 80% of the
+/// run spent waiting on a counter. Re-measured here, twice, on the same box and
+/// the same 900s budget: core #64 lands at t=408.3s (lever off) and t=473.2s
+/// (lever on), the walk is still paying `w_min` 8.17e6 of lb per core the whole
+/// way, and the instance closes at 491.0s / 561.6s with the correct optimum.
+/// The rate arm fires in NEITHER leg, and it should not: nothing had gone cold.
+/// So this lever is NOT justified by causal-discovery. Its case rests on the
+/// families where the count arm is structurally unreachable.
+///
+/// THE SIGNAL. Core discovery on these families does not decay gently, it
+/// COLLAPSES (CSG: 111 cores in 38.7s then zero; css-ebay: 465 in 40.7s then
+/// zero), so "no core for a long time BY THIS INSTANCE'S OWN STANDARDS" is a
+/// sharp, cheap statement — see [`OllEngine::core_discovery_cold`]. It is
+/// measured against the instance's own RECENT inter-core intervals because the
+/// corpus spans 3 to 1,035,351 hard clauses and no absolute interval could mean
+/// the same thing at both ends.
+///
+/// SOUNDNESS. Structurally nil risk: this changes only WHEN `ensure_descent_enc`
+/// is called, never WHAT it builds. Every descent encoding is sound on its own
+/// terms (a violated soft implies its indicator, and any model extends to exact
+/// indicator values), and the descent's UNSAT branch is a complete optimality
+/// proof of the incumbent. An earlier entry can cost TIME, but it cannot make an
+/// answer wrong. The cost is bounded as well as sound: a cold entry takes a
+/// REVERSIBLE slice (see [`descent_slice_len`]), so a misfire costs one slice
+/// rather than the rest of the budget.
+fn cold_core_descent_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_COLD_DESCENT").as_deref() != Ok("0"))
+}
+
+/// #cold-core-descent: how many of the MOST RECENT search-derived inter-core
+/// intervals form the rate baseline.
+///
+/// TRAILING, not "the first N" — which is what shipped first and what the
+/// measurement killed. A first-N baseline samples the OPENING BURST, and on
+/// this corpus the opening cores fall out of propagation-level conflicts in
+/// milliseconds on nearly every family, so `COLD_CORE_DROUGHT_MULT * median`
+/// collapses to a few hundred ms and [`COLD_CORE_MIN_DROUGHT`] becomes the
+/// entire bar. Measured over every core of every traced run, the relative term
+/// bound on ONE trace out of 63, and there by 2.5% (`bar_ms=30756` against the
+/// 30000ms floor). A term documented as adaptive that is measurably a constant
+/// is worse than a constant, because the comment stops people re-deriving it.
+///
+/// MEASURED, both statistics against the same real gap streams
+/// (`AY_MAXSAT_DEBUG=1`, this box):
+///
+///   causal-discovery_wt-causal_n6_i2_N500_uai13_log_int @240s — 53 intervals,
+///   ramping 20ms -> 21.3s (last sixteen: 13.5 8.6 9.1 3.8 10.1 9.2 21.3 8.1
+///   15.2 13.8 11.5 11.9 8.0s):
+///     first-N median   1303ms -> bar   30000ms  (the FLOOR; term inert)
+///     trailing median  9607ms -> bar  115284ms  (the term BINDS, 3.8x)
+///   With the flat 30s bar this walk reads as COLD after ~1.4 of its own
+///   typical gaps — the premature commit the slow-walk families cannot afford.
+///
+///   af-synthesis_wt-af-synthesis_stb_50_160_9 @120s — 16 intervals, all
+///   sub-7s: BOTH statistics give bar 30000ms. The family the lever measured
+///   its win on is unmoved by the statistic change, which is the point.
+///
+/// A trailing window CANNOT cancel itself on a decelerating walk, which is the
+/// failure the first-N cap was defending against: a drought contributes NO
+/// interval until a core actually ARRIVES, so the baseline freezes the instant
+/// discovery stops and the drought grows past it. What the trailing window adds
+/// is that the slowdown must beat the instance's RECENT trend rather than its
+/// opening burst — i.e. it is a rate-of-DECELERATION test, which a flat floor
+/// is not. On a geometric slowdown with ratio r the arm needs the current
+/// drought to exceed `COLD_CORE_DROUGHT_MULT / r^(WINDOW/2)` times the last
+/// observed gap; at r = 1.4 that is ~3x beyond trend, not "slightly slower".
+const COLD_CORE_WINDOW: usize = 16;
+
+/// #cold-core-descent: intervals required before the rate is meaningful, so the
+/// gate cannot fire on the first few cores (an instance whose 2nd core is slow
+/// says nothing about its rate). Set below the ~16 intervals the af-synthesis
+/// runs produce, since those are a target of this lever.
+const COLD_CORE_MIN_SAMPLE: usize = 8;
+
+/// #cold-core-descent: multiple of the instance's own median inter-core
+/// interval that a drought must reach to count as cold.
+const COLD_CORE_DROUGHT_MULT: u64 = 12;
+
+/// #cold-core-descent: absolute floor under the relative bar. It is the binding
+/// term on the FAST families and only there: on an instance whose recent cores
+/// are milliseconds apart, `COLD_CORE_DROUGHT_MULT` times the trailing median
+/// is milliseconds too, and a sub-second lull is noise rather than a collapse.
+/// Once the trailing median passes 2.5s — the slow-walk families this lever
+/// must not disturb — the RELATIVE term takes over and this floor is inert.
+/// That division of labour is asserted in
+/// `cold_core_gate_measures_the_drought_against_the_instances_own_rate`.
+///
+/// SET FROM MEASURED TRAJECTORIES, not from taste, and expressed in the
+/// engine's own unit: ONE ORGANIC DESCENT SLICE. The gate is about to spend at
+/// least that much on a descent, so "we have gone longer than that without a
+/// core" is the natural bar for calling the walk over.
+///
+/// Traced on causal n6 at 900s (`AY_MAXSAT_DEBUG=1`, this box), inter-core gaps
+/// in seconds:
+///
+///   cores #21-32 (t=9..18):    0.08 0.24 0.74 0.08 0.08 0.14 1.30 1.64 ...
+///   cores #33-40 (t=25..65):   6.96 2.83 6.03 2.57 3.38 15.15 3.53 6.13
+///   cores #41-54 (t=70..220):  5.24 8.64 3.70 9.21 4.88 17.63 7.32 13.74
+///                              7.89 13.21 13.32 11.63 27.82
+///
+/// i.e. a SMOOTH deceleration, with the walk still paying `w_min` 8.17e6 of lb
+/// per core at t=220. A 20s floor would have committed one-way right there, on
+/// a gap barely above the ones either side of it — "slower", not "stopped" —
+/// and that is the premature commit that would cost the slow-walk families
+/// (rna-alignment, protein_ins) instances AY solves today. 30s clears the whole
+/// observed deceleration including its 27.8s outlier.
+///
+/// The other side of the bracket, from `af-synthesis_wt-af-synthesis_stb_50_120_5`
+/// at 900s — the family the count arm cannot reach (AY 0/15): 16 cores arrive
+/// sub-second by t=16.5 (median 569ms), then ONE 41.0s assumption solve delivers
+/// core #17 at t=57.49. That 41s is a drought the gate never sees (brake 2 in
+/// [`OllEngine::core_discovery_cold`]: it is a single in-flight solve, and it
+/// PAID), so the arm stays shut and the reversible `#expensive-core-descent`
+/// kick takes the entry at t=57.59 exactly as it does today. The rate arm's
+/// reach on this family is the entry AFTER that: once a kick slice hands back
+/// dry, the next evaluation is 30s+ past core #17 with nothing since, and the
+/// descent gets the longer, evidence-backed slice instead of another 10s one —
+/// which is the whole point on a family where the kick already reaches 14/15
+/// entries and converts 0.
+///
+/// The 41s gap DOES enter the trailing window when core #17 lands, but with 15
+/// sub-second gaps still in a 16-wide window the median stays sub-second, so
+/// this floor remains the bar on af-synthesis exactly as it was under the
+/// first-N baseline. That is deliberate: the statistic change must not move the
+/// family the lever measured a win on.
+const COLD_CORE_MIN_DROUGHT: Duration = ORGANIC_DESCENT_SLICE;
+
+/// #cold-core-descent: no rate-based entry inside the opening of a run,
+/// matching the `#ub-stale-descent` floor. The incumbent is usually still
+/// moving here, and an early entry is the one that risks
+/// [`OllEngine::select_descent_enc`] declining on size — see
+/// `descent_size_declined` for why that decline is no longer permanent.
+const COLD_CORE_MIN_ELAPSED: Duration = Duration::from_secs(20);
+
+/// #cold-core-descent: where a core handed to [`OllEngine::process_core`] came
+/// from. Consumed ONLY by the rate gate — every other effect of `process_core`
+/// is identical for both variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoreOrigin {
+    /// Extracted from a SAT call that returned UNSAT under assumptions (the
+    /// main OLL loop, `exhaust_sum`). Only these measure how fast the engine
+    /// is DISCOVERING cores, so only these set the rate baseline.
+    Search,
+    /// Paid out of a batch that was computed without a SAT call of its own:
+    /// `pay_mined_cores` replaying pre-mined cores at entry and at every level
+    /// change, and the AM1 probe's failed-selector loop. These land
+    /// back-to-back in MICROSECONDS — 8 of them satisfy `COLD_CORE_MIN_SAMPLE`
+    /// with a ~0ms median, which would hand the gate a "the instance was
+    /// streaming cores" baseline manufactured entirely out of bookkeeping.
+    Batch,
+}
+
+/// Which arm opened the descent entry gate, and therefore what treatment the
+/// entry gets. Naming the arm is what makes a corpus sweep attributable: the
+/// trace used to label by core count, which reports every cold-rate entry on an
+/// instance that had also reached `lsu_min_cores` as a `count` entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DescentArm {
+    /// The gate is shut.
+    None,
+    /// `#ub-stale-descent` / `#expensive-core-descent` / `#fold-descent-kick`:
+    /// a heuristic gap signal with no stall evidence. Bounded 10s-class slice.
+    Kick,
+    /// #cold-core-descent: core discovery went cold against this instance's own
+    /// recent rate. Bounded organic-length slice.
+    Cold,
+    /// The historical organic gate: `cores_found >= lsu_min_cores`, lb-stalling,
+    /// gap open. One-way commit unless `#descent-organic-slice` is enabled.
+    Count,
+}
+
+/// The descent entry gate, as a pure function of the arms' evidence.
+///
+/// Extracted from `solve` so the WIRING is testable, not only the predicates it
+/// consumes: before this existed, deleting `cold_entry` from the gate or
+/// reverting the kick/cold precedence left the whole suite green.
+///
+/// PRECEDENCE. `Cold` outranks `Kick` because a kick and the rate arm can open
+/// in the SAME iteration — on the af-synthesis family the
+/// `#expensive-core-descent` kick arms within a minute of the last core, which
+/// is also when a drought passes the rate bar. If `Kick` won that race the
+/// entry would be downgraded to a 10s slice, which is precisely the rotation
+/// this lever exists to replace on a family where the kick already reaches
+/// 14/15 entries and converts 0 while the upper-bound solvers go 15/15. The
+/// rate arm carries evidence the kick does not (a drought past the instance's
+/// OWN bar, over a minimum sample of search-derived intervals, with an
+/// incumbent in hand), so it earns the LONGER — still reversible — slice.
+/// With `cold_enabled == false` the classification is bit-identical to the
+/// pre-lever gate, which is what makes the A/B a single-binary paired run.
+fn classify_descent_arm(
+    have_incumbent: bool,
+    cold_enabled: bool,
+    cold_ready: bool,
+    kick_armed: bool,
+    count_ready: bool,
+) -> DescentArm {
+    if !have_incumbent {
+        return DescentArm::None;
+    }
+    if cold_enabled && cold_ready {
+        return DescentArm::Cold;
+    }
+    if kick_armed {
+        return DescentArm::Kick;
+    }
+    if count_ready {
+        return DescentArm::Count;
+    }
+    DescentArm::None
+}
+
+/// How long this entry's descent slice may run: `Some(len)` for a REVERSIBLE
+/// slice that hands control back to OLL when it expires dry, `None` for the
+/// one-way commit (no deadline; lb is frozen for the rest of the budget,
+/// because `descend` only ever moves ub).
+///
+/// `DescentArm::None` never reaches here — the gate is shut — and maps to
+/// `None` only because there is no slice to run.
+fn descent_slice_len(
+    arm: DescentArm,
+    organic_slice_enabled: bool,
+    kick_len: Duration,
+    organic_len: Duration,
+) -> Option<Duration> {
+    match arm {
+        DescentArm::Kick => Some(kick_len),
+        // #cold-core-descent D5: ALWAYS reversible, independent of the
+        // `#descent-organic-slice` flag. The cold arm carries the weakest
+        // evidence of the three (no core count, no lb-stall test, no gap cap
+        // beyond `gap_ok`), so it must not carry the strongest treatment. On
+        // the slow-walk families it is most likely to misfire on — rna-alignment
+        // and protein_ins — the core walk is the PRODUCTIVE path, and a one-way
+        // commit there forfeits instances AY solves today. Escalating a cold
+        // entry to an unbounded commit needs its own paired A/B, not a default.
+        DescentArm::Cold => Some(organic_len),
+        DescentArm::Count => organic_slice_enabled.then_some(organic_len),
+        DescentArm::None => None,
+    }
+}
+
 /// Kill switch for the expensive-core early descent kick
 /// (#expensive-core-descent). DEFAULT ON: `AY_AB_MAXSAT_EARLY_DESCENT=0`
 /// restores the pre-fix gate. Motivation (rna-alignment_wt-k100 family): on a
@@ -482,42 +746,90 @@ const ORGANIC_DESCENT_BUDGET_DIVISOR: u32 = 8;
 const ORGANIC_DESCENT_SLICE_MIN: Duration = Duration::from_secs(10);
 const ORGANIC_DESCENT_SLICE_MAX: Duration = Duration::from_secs(300);
 
-/// #descent-gap-tile: the two descent kick gates cap at `ub - lb <= 32` while
-/// the organic gate's `gap_ok` (uniform-weight arm) floors at
-/// `ub - lb > w * lsu_min_gap_units` = 128w. Nothing covers `32 < gap <= 128w`,
-/// so a uniform-weight instance sitting in that band can NEVER descend by any
-/// path. Traced on minimize-5gons (unweighted, optimum 77): 31 cores, lb=30,
-/// ub=102 — gap 72, squarely inside the band — then no bound motion whatsoever
-/// for the rest of the run, and zero descent lines in the trace. 99 of AY's 122
-/// achievable unweighted misses (81%) have ub <= 128, so their entire gap range
-/// lies at or below the organic floor.
-///
-/// This raises the kick cap to meet the organic floor so the two mechanisms
-/// TILE the gap range instead of leaving a hole. It does not make the descent
-/// fire more often than the organic gate already permits above the floor, and
-/// kick entries are reversible 10s slices, so a mis-fire costs one slice.
-///
-/// DEFAULT OFF pending the paired A/B; `AY_AB_MAXSAT_DESCENT_GAP_TILE=1`.
-fn descent_gap_tile_enabled() -> bool {
+/// A/B escape for [`OllEngine::descent_kick_gap_cap`]: restore the pre-2026-08-02
+/// ABSOLUTE kick gap bar (`DESCENT_KICK_GAP`, ignoring the objective's own
+/// granularity). Exists only so the scale-relative bar can be measured against
+/// its predecessor as a paired A/B; delete once that measurement is banked.
+/// `AY_AB_MAXSAT_KICK_GAP_ABS=1`.
+fn kick_gap_abs_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_GAP_TILE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_KICK_GAP_ABS").as_deref() == Ok("1"))
 }
 
-/// Pre-tile kick gap cap, kept as the floor of the tiled bar.
+/// Floor of the kick gap bar; see [`OllEngine::descent_kick_gap_cap`] for the
+/// scale-relative widening built on top of it.
 const DESCENT_KICK_GAP: Weight = 32;
+
+/// Mirrors the `gte_build` budgets in `ensure_descent_enc` (the `inputs.len() >
+/// 10_000` bail and `out_budget`). The gap bar only widens where those budgets
+/// predict a GTE/totalizer rather than the propagation-dead wide adder.
+const GTE_CHEAP_INPUTS: usize = 10_000;
+const GTE_CHEAP_OUTS: Weight = 400_000;
+
+/// #dpw-descent: DPW's own emission budgets, enforced by the closed-form
+/// predictor BEFORE a variable is allocated or a clause emitted. Deliberately
+/// the same numbers `gte_build` uses, so "which encoding is cheaper" is asked
+/// on one scale.
+const DPW_VAR_BUDGET: usize = 400_000;
+const DPW_CLAUSE_BUDGET: usize = 4_000_000;
+
+/// #dpw-descent: how much smaller than the GTE a DPW must be before it is
+/// taken.
+///
+/// NOT a tie-break at 1x. DPW is a strictly WEAKER PROPAGATOR than the GTE it
+/// would replace — measured over 26,948 arc-consistency probes, DPW forces
+/// 81.9% of the literals GTE's 100% does, and the loss concentrates exactly at
+/// the boundary a closing UNSAT lives on (58.5% at excess 1, degrading with top
+/// granularity: 77.9% at this family's `2^3`). Trading that away for a 5%
+/// clause saving is a bad deal in both directions; trading it for the measured
+/// 6.0x–11.0x on the af-synthesis family is the whole point of the encoding.
+/// A 2x floor keeps today's behaviour on everything in between.
+const DPW_MIN_ADVANTAGE: usize = 2;
+
+/// #dpw-descent: THE selection predicate — is the watchdog a decisive enough
+/// win over the GTE this instance would otherwise get?
+///
+/// Factored out so `select_descent_enc` and
+/// [`lsu_tests::dpw_selection_requires_a_decisive_size_win`] decide on the
+/// same code rather than on two copies of it.
+fn dpw_beats_gte(dpw_clauses: usize, gte_clauses: usize) -> bool {
+    dpw_clauses.saturating_mul(DPW_MIN_ADVANTAGE) <= gte_clauses
+}
+
+/// #dpw-descent escape hatch. DEFAULT ON. `AY_AB_MAXSAT_DPW=0` never selects
+/// DPW, leaving encoding choice bit-identical to the pre-lever engine, so the
+/// lever can be measured as a paired A/B — with an A/A control — from ONE
+/// binary (the discipline `AY_AB_MAXSAT_DESCENT_RESIDUAL=0` exists for).
+fn dpw_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DPW").as_deref() != Ok("0"))
+}
 
 /// The measured kick slice, and the floor of the budget-scaled form.
 const DESCENT_KICK_SLICE: Duration = Duration::from_secs(10);
 
-/// #descent-residual: encode the descent bound over the REFORMULATED residual
-/// objective (cap `ub - lb`) instead of the original objective (cap
-/// `ub - preproc_cost`). See `DescentEnc::ResidualTot`. DEFAULT OFF;
-/// `AY_AB_MAXSAT_DESCENT_RESIDUAL=1`.
+/// #descent-residual: hard ceiling on how many residual cuts one run may build.
+/// A rebuild already requires the cap to have halved, so this is a backstop
+/// against pathological cap sequences, not the primary limiter.
+const RESIDUAL_MAX_BUILDS: u32 = 8;
+
+/// #descent-residual: strengthen the descent with a redundant cut over the
+/// REFORMULATED residual objective at cap `ub - lb`, alongside the exact
+/// original-objective encoding at `ub - preproc_cost`. See [`ResidualBound`]
+/// for the encodings and the additive rationale, and
+/// [`OllEngine::descent_residual_cap`] for the soundness invariant.
+///
+/// DEFAULT ON. `AY_AB_MAXSAT_DESCENT_RESIDUAL=0` is an ESCAPE HATCH: it builds
+/// and tightens no residual cut, leaving the descent bit-identical to the
+/// pre-lever engine (encoding SELECTION is untouched either way). Kept, as
+/// `AY_AB_MAXSAT_EARLY_DESCENT=0` is, so the lever can be measured as a paired
+/// A/B — with an A/A control — from one binary.
 fn descent_residual_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_RESIDUAL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_RESIDUAL").as_deref() != Ok("0"))
 }
 
 /// #descent-kick-scale: budget-scale the KICK descent slice, which is otherwise
@@ -656,6 +968,12 @@ pub(crate) struct OllTuning {
     /// Test-only: try the cluster descent BEFORE the GTE so tiny
     /// brute-force instances exercise the ClusterTot path.
     pub(crate) force_cluster: bool,
+    /// #dpw-descent test-only: take the DPW descent whenever it BUILDS,
+    /// skipping the size comparison against the GTE. Brute-force fixtures are
+    /// far too small for DPW to win on size honestly (the watchdog's advantage
+    /// is asymptotic in the cap), so without this the end-to-end nets would
+    /// never reach the path at all.
+    pub(crate) force_dpw: bool,
     /// LP-boost lane mode (#lp-boost). Default Auto (on, gated to
     /// non-uniform weights).
     pub(crate) lp_boost: LpBoostMode,
@@ -680,6 +998,7 @@ impl Default for OllTuning {
             // correctness nets stay exercised through the test tunings.
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Auto,
             tot_eqs: None,
             core_clause: None,
@@ -1137,6 +1456,47 @@ fn gte_build(
     Some(outs)
 }
 
+/// Test-only: run the real [`gte_build`] on a private solver under the given
+/// budgets, reporting `(aux vars allocated, root outputs)`, or `None` when it
+/// declined.
+///
+/// The budgets are the observable: `gte_build` consumes exactly one
+/// `out_budget` unit per fresh output and exactly one `clause_budget` unit per
+/// emitted clause, so running it at a budget one unit below `dpw::gte_size`'s
+/// prediction — and requiring it to decline — pins the mirror's counts to the
+/// builder's own accounting. (The solver's `num_original_clauses` is refreshed
+/// from the arena at solve time, not incremented on add, so it cannot serve.)
+#[cfg(test)]
+pub(crate) fn gte_build_for_test(
+    weights: &[Weight],
+    cap: Weight,
+    out_budget: i64,
+    clause_budget: i64,
+) -> Option<(usize, usize)> {
+    let mut sat = SatSolver::new(0);
+    let inputs: Vec<(Literal, Weight)> = weights
+        .iter()
+        .map(|&w| (Literal::positive(sat.new_var()), w))
+        .collect();
+    let mut vars = 0usize;
+    let mut fresh = |s: &mut SatSolver| {
+        vars += 1;
+        Literal::positive(s.new_var())
+    };
+    let mut out_budget = out_budget;
+    let mut clause_budget = clause_budget;
+    let outs = gte_build(
+        &inputs,
+        cap,
+        &mut sat,
+        &mut fresh,
+        None,
+        &mut out_budget,
+        &mut clause_budget,
+    );
+    outs.map(|outs| (vars, outs.len()))
+}
+
 /// Tseitin gates for the adder network. `None` encodes constant false.
 /// Full equality encodings keep auxiliary variables functionally
 /// determined, so any input assignment extends to the circuit.
@@ -1307,11 +1667,83 @@ struct SumRef {
     bound: usize,
 }
 
+/// A core read straight off a hard clause at install time.
+#[derive(Clone, Debug)]
+struct MinedCore {
+    /// The UNIT-soft selectors the clause forbids from all being true.
+    lits: Vec<Literal>,
+    /// 1-based position of the originating clause among the instance's hard
+    /// clauses. The loader adds hard clauses unconditionally in file order, so
+    /// this is also that clause's constraint id in an emitted OPB — which is
+    /// what lets a certificate name the row a core came from.
+    hard_row: u64,
+}
+
+/// A mined core the engine charged, in the terms a PB proof needs.
+#[derive(Clone, Debug)]
+pub struct PaidMinedCore {
+    /// Constraint id of the originating hard clause (see `MinedCore::hard_row`).
+    pub hard_row: u64,
+    /// The weight actually charged, measured as the lower bound's increase.
+    pub w_min: u64,
+    /// Core members as DIMACS literals. For a unit soft the selector IS the
+    /// soft's own literal, so no translation is needed.
+    pub members: Vec<i32>,
+}
+
+/// A core returned by a SAT CALL that the engine charged, in the terms a PB
+/// proof needs.
+///
+/// Distinct from [`PaidMinedCore`] in exactly one way that matters to a
+/// certificate: a mined core IS an input hard clause, so its PB derivation is
+/// pure `pol` over input rows. This one is a REFUTATION — the solver needed
+/// search to establish it — so the emitter has to justify it as a separate
+/// derivation step and must first convince itself the step is replayable. That
+/// check lives in `ay::maxsat_proof`, not here; this struct only reports what
+/// the engine did.
+///
+/// Only cores over UNIT-soft selectors are recorded. A core containing a
+/// totalizer / sum / AM1-disjunction selector names variables that exist
+/// nowhere in the emitted OPB, so it cannot be stated at all, let alone
+/// checked.
+#[derive(Clone, Debug)]
+pub struct PaidSatCore {
+    /// The weight actually charged, measured as the lower bound's increase.
+    pub w_min: u64,
+    /// Core members as DIMACS literals. For a unit soft the selector IS the
+    /// soft's own literal, so no translation is needed.
+    pub members: Vec<i32>,
+}
+
+/// Cap on recorded SAT-derived cores. Bounds the evidence buffer on instances
+/// that extract hundreds of thousands of cores; the certificate simply omits
+/// the overflow, which only weakens the bound.
+const PAID_SAT_CORE_CAP: usize = 4096;
+
 /// OLL engine state over one persistent incremental SAT solver.
 pub(crate) struct OllEngine {
     sat: SatSolver,
     /// Next fresh raw variable id (variable ids are used raw; id 0 unused).
     next_var: u32,
+    /// #core-mine: cores found by scanning hard clauses at install time (see
+    /// `mine_any_arity_cores`). Each entry is a set of UNIT-soft selectors that
+    /// a hard clause forbids from all being true, i.e. a ready-made UNSAT core.
+    mined_cores: Vec<MinedCore>,
+    /// #core-mine: mined cores this run actually PAID, as proof evidence.
+    ///
+    /// Recorded for certificate emission only. Nothing in the engine reads this
+    /// back — see the write-only rule in `ay::maxsat_proof`.
+    paid_mined_cores: Vec<PaidMinedCore>,
+    /// Cores returned by SAT CALLS that this run charged, as proof evidence.
+    ///
+    /// Same write-only rule as `paid_mined_cores`: recorded for certificate
+    /// emission only, never read back by the engine. Kept in a separate vector
+    /// because the two need DIFFERENT proof steps (input-row `pol` versus a
+    /// `rup` the emitter must first verify for itself).
+    paid_sat_cores: Vec<PaidSatCore>,
+    /// #core-mine: selectors already charged by a paid mined core. Persistent
+    /// across strata so disjointness holds over the WHOLE run, not per level.
+    mined_used: HashSet<Literal>,
     /// Original soft clause literals for model-cost evaluation.
     softs: ClauseStore,
     /// Weights parallel to `softs`.
@@ -1366,13 +1798,39 @@ pub(crate) struct OllEngine {
     tuning: OllTuning,
     /// Cached descent encoding, built once and reused across time slices.
     descent: Option<DescentEnc>,
-    /// True when no descent encoding is available (build too large).
+    /// True when no descent encoding can EVER be available on this instance
+    /// (every residual soft is hardened, or `ub == preproc_cost`). Sticky, and
+    /// deliberately NOT set by the size-budget declines — see
+    /// `descent_size_declined`.
     descent_unavailable: bool,
-    /// #descent-residual: the residual bound can no longer tighten (it is a
-    /// relaxation, so a model can meet it and still cost `ub`). Latches so the
-    /// next build falls back to the exact original-objective encoding, which is
-    /// the only one that can certify optimality.
+    /// #cold-core-descent D6: `(hardened_sels.len(), ub)` at the last SIZE
+    /// decline in [`OllEngine::select_descent_enc`].
+    ///
+    /// The size budgets there are STATE-DEPENDENT: the residual soft set
+    /// shrinks as softs harden and the cap `ub - preproc_cost` falls as the
+    /// incumbent improves, so an encoding that is too large at t=25s can fit
+    /// at t=200s. Poisoning the sticky `descent_unavailable` on those declines
+    /// made an EARLY entry permanently forfeit the descent — and the whole
+    /// point of the rate arm is to enter EARLIER, i.e. exactly when the
+    /// encoding is at its largest. Recording the size signature instead lets
+    /// the engine re-try, but only once one of its two monotone components has
+    /// strictly improved (`hardened_sels` only grows, `ub` only falls), so a
+    /// declining instance still short-circuits the gate for free rather than
+    /// re-running `flush_pending` every stalling iteration.
+    descent_size_declined: Option<(usize, Weight)>,
+    /// #descent-residual: LATCHED fail-safe. Set only when
+    /// `descent_residual_cap` catches `lb > ub` — an arithmetic impossibility
+    /// that means the residual accounting is inconsistent. Once set, no residual
+    /// cut is ever built or tightened again and the descent runs on the exact
+    /// original-objective encoding alone.
     residual_exhausted: bool,
+    /// #descent-residual: the newest redundant cut over the residual objective,
+    /// asserted alongside the exact descent encoding. See [`ResidualBound`].
+    /// Older cuts stay in the solver — each was independently sound when built
+    /// and only ever excluded models costing at least the incumbent of the day.
+    residual_bound: Option<ResidualBound>,
+    /// Residual cuts built so far, so a long run cannot pile them up.
+    residual_builds: u32,
     /// Wall-clock deadline for the whole solve, when the caller supplied one
     /// (`MaxSatSolver::set_deadline`). `None` = budget-blind, the historical
     /// behaviour: policies fall back to their fixed absolute constants.
@@ -1395,6 +1853,23 @@ pub(crate) struct OllEngine {
     /// one window has elapsed, so the gate cannot fire in the first
     /// seconds no matter how slow the first SAT call is.
     lb_last_window_gain: Option<Weight>,
+    /// #cold-core-descent: this instance's TRAILING inter-core arrival
+    /// intervals in ms, most recent last, at most `COLD_CORE_WINDOW` entries.
+    /// Fed ONLY by [`CoreOrigin::Search`] cores (see `note_search_core`).
+    core_gaps_ms: Vec<u64>,
+    /// Cached median of `core_gaps_ms` — one sort of <= `COLD_CORE_WINDOW`
+    /// u64s per search core, so the search loop reads the rate baseline free.
+    core_gap_median_ms: u64,
+    /// #cold-core-descent: SEARCH time already banked toward the current
+    /// drought, i.e. time since the last search-derived core MINUS the spans
+    /// the clock was paused for. See [`OllEngine::core_drought`].
+    core_drought: Duration,
+    /// Start of the drought segment currently running; `None` while the
+    /// drought clock is PAUSED (the engine is not looking for cores).
+    core_drought_since: Option<Instant>,
+    /// Count of [`CoreOrigin::Search`] cores, so the first one does not record
+    /// a bogus "interval" measured from the start of the run.
+    core_search_cores: u64,
     /// Original-selector membership of the first observed cores, recorded
     /// BEFORE weight splitting consumes them. Drives core-informed
     /// abstraction-set formation (CGSS-style co-occurrence clustering):
@@ -1506,48 +1981,140 @@ enum DescentEnc {
         bits: Vec<Option<Literal>>,
         bound: Weight,
     },
-    /// #descent-residual: uniform-weight totalizer over the REFORMULATED
-    /// residual objective (`active ∪ pool` at residual weights) rather than
-    /// over the original softs at original weights.
+    /// #dpw-descent: Dynamic Polynomial Watchdog (Paxian et al., SAT 2018)
+    /// over mixed weights, taken ONLY where it is decisively smaller than the
+    /// GTE this instance would otherwise get. See [`crate::dpw`].
     ///
-    /// The other variants encode the ORIGINAL objective capped at
-    /// `ub - preproc_cost` — the whole objective — so on a proof-bound instance
-    /// the descent's query re-proves from scratch what OLL already established
-    /// through its cores (measured 2×–931× too loose, worst where the gap is
-    /// smallest). Here the cap is `ub - lb`, so the query shrinks as OLL works.
+    /// ⚠️ UNLIKE EVERY OTHER VARIANT THE BOUND IS NOT A CLAUSE. `k` is carried
+    /// by the assumption vector rebuilt each round in `descend_slice`, because
+    /// DPW's tare constant `T* = 2^{p-1} − 1 − (k mod 2^{p-1})` is NON-MONOTONE
+    /// in `k` (k=115→T=4, k=112→T=7, k=111→T=0) and therefore cannot be
+    /// committed one-way. `k_last` is bookkeeping for the trace only — the
+    /// tighten arm adds nothing.
     ///
-    /// SOUNDNESS. Identity: `cost(A) = lb + Σ_{active ∪ pool} + T(A)`, all terms
-    /// nonnegative, so `Σ <= cost - lb`. Excluding models with `Σ >= ub - lb`
-    /// therefore only excludes models with `cost >= ub`. Verified empirically:
-    /// `AY_MAXSAT_IDENTITY_CHECK=1` printed `HOLDS=true` on every descent model.
+    /// CONSEQUENCE, and it is a real behaviour change: the GTE/adder bounds are
+    /// unguarded HARD clauses that constrain OLL's own solves too; DPW's
+    /// clauses are inert definitions outside the descent. The compensating
+    /// requirement is absolute — these literals must reach the descent solve
+    /// and NOWHERE else, or an extracted core will contain watchdog internals
+    /// and corrupt OLL's cost identity (see the `debug_assert` in
+    /// `process_core`).
     ///
-    /// ⚠️ THIS IS A RELAXATION, NOT AN EXACT COST ENCODING. A first attempt was
-    /// reverted for TEN wrong answers, and both bugs were the same mistake —
-    /// applying exact-encoding logic to it:
-    ///   1. the build clamped `units` with `.min(sels.len())`, silently turning
-    ///      a VACUOUS bound into a real one that excluded models where every
-    ///      selector is falsified;
-    ///   2. the tighten step used `k.min(units)`, deriving the bound from the
-    ///      model just found. That is valid for an exact encoding ("find
-    ///      something strictly better than this model") but invalid here,
-    ///      because a model with the SAME Σ can be cheaper.
-    /// So: the bound is only ever derived from `ub`, never from a model, and a
-    /// bound that cannot be represented (`units > sels.len()`) is VACUOUS and
-    /// must not be asserted at all.
-    ResidualTot {
+    /// ⚠️ MEASURED COST OF THAT CHOICE — RSS. On
+    /// `af-synthesis_wt-af-synthesis_stb_50_120_5` at 900s, sampled every 5s,
+    /// same binary, `AY_AB_MAXSAT_DPW` the only difference (2 runs each, both
+    /// legs identical in outcome within a leg):
+    ///
+    /// | t | DPW RSS | GTE RSS |
+    /// | --- | --- | --- |
+    /// | 300s | 2.40 GB | 1.77 GB |
+    /// | 600s | 5.00 GB | 3.56 GB |
+    /// | ~700s | **>6.0 GB — killed** | 4.4 GB |
+    /// | 900s | — | 5.59 GB peak, ran to completion |
+    ///
+    /// The encoding itself is 8.6x SMALLER here (13,743 clauses against the
+    /// GTE's 118,460), so this is not the watchdog's own footprint — it is the
+    /// learned-clause database growing faster because OLL's solves no longer
+    /// see the `Σ < ub` bound the GTE leaves behind as hard units. Both legs
+    /// end at the same incumbent (`o 115`) and neither proves it, so nothing
+    /// was traded for it. That is the first thing to fix before this lever is
+    /// worth an A/B — the identified remedy is hard-committing the top bound as
+    /// `¬S_top[i]` units while keeping the NON-MONOTONE tare on assumptions
+    /// (sound: a leftover unit at `K0 >= K_now` states a WEAKER bound), which
+    /// needs its own brute-force net.
+    Dpw { enc: DpwEnc, k_last: Option<Weight> },
+}
+
+/// #descent-residual: a redundant cut over the REFORMULATED residual objective,
+/// asserted ALONGSIDE the descent's exact encoding rather than instead of it.
+///
+/// THE PROBLEM. Every `DescentEnc` above encodes the ORIGINAL objective capped
+/// at `ub - preproc_cost` — the WHOLE objective — so on a proof-bound instance
+/// the closing UNSAT call re-derives from scratch the bound OLL already paid
+/// cores for. Traced on MSE24 exact-weighted at 300s with `AY_MAXSAT_DEBUG=1`,
+/// reading the two caps off the same descent entry:
+///
+/// | instance | original cap | residual cap (`ub - lb`) | discarded |
+/// | --- | --- | --- | --- |
+/// | `causal_Bands_6_277` | 100243 | 49502 (ub 100243, lb 50741) | 51% |
+/// | `CSG_wt-CSGNaive140-140-6` | 53132 | 4245 (ub 57056, lb 52811) | 92% |
+///
+/// A longer probe of `causal n6` reports the same shape at the other end of the
+/// scale — cap 877436991 against `lb` 711233689, 81% discarded, an adder 36 sum
+/// bits wide where the residual mass needs ~28 — with 1.35 BILLION propagations
+/// spent on 40k conflicts. (Its descent does not engage inside 300s, so that
+/// one is not reproducible from a short run.)
+///
+/// THE FIX, AND WHY IT IS ADDITIVE. `Σ <= ub - lb - 1` is sound (see
+/// [`OllEngine::descent_residual_cap`]) but it is a RELAXATION: the identity's
+/// ladder term is slack, so a model can satisfy it and still cost more than the
+/// incumbent. Measured, running it as the descent's ONLY encoding: on
+/// `CSGNaive140-140-6` the first model under a cap of 3516 cost 57269 against
+/// `ub` 56309; on `causal_Bands_6_277`, 217861 against `ub` 107215. A
+/// relaxation therefore CANNOT drive the `ub` walk — it wastes a solve and
+/// falls back. Conjoined with the exact encoding it costs nothing and pays
+/// twice over: the exact bound keeps every SAT model strictly `ub`-improving,
+/// while this cut is what the UNSAT proof actually needs.
+///
+/// It is REDUNDANT semantically (`Σ >= ub - lb` implies `cost >= ub`, which the
+/// exact bound already forbids) and NOT redundant propagationally, which is the
+/// entire point: the exact encodings are propagation-dead on these families
+/// (`causal n6`: 1.35 BILLION propagations for 40k conflicts) because they are
+/// stated over the original softs at a cap an order of magnitude too loose,
+/// while this is stated over the very sum selectors OLL's cores are about, at a
+/// cap that shrinks every time OLL pays for one.
+///
+/// ⚠️ RELAXATION, NOT AN EXACT COST ENCODING. A first attempt at this lever was
+/// reverted for TEN wrong answers, and both bugs were the same mistake —
+/// applying exact-encoding logic to it:
+///   1. the build clamped `units` with `.min(sels.len())`, silently turning a
+///      VACUOUS bound into a real one that excluded models where every selector
+///      is falsified;
+///   2. the tighten step derived the bound from the model just found. Valid for
+///      an exact encoding ("find something strictly better than this"), invalid
+///      here, because a model with the SAME `Σ` can be cheaper.
+/// So: the bound comes only ever from `ub`, never from a model, and a bound the
+/// encoding cannot represent is VACUOUS and must not be asserted. All three
+/// encodings below are vacuous-safe BY CONSTRUCTION rather than by a clamp —
+/// `residual_units` returns `None`, `gte_build`'s capped sums match no output,
+/// and `assert_sum_le` returns early — and none of them may be "fixed" with a
+/// `.min(width)`.
+struct ResidualBound {
+    enc: ResidualBoundEnc,
+    /// The residual objective as encoded: `(selector, residual weight)`,
+    /// selectors in POSITIVE form. Read by the debug identity check in
+    /// `descend` only.
+    terms: Vec<(Literal, Weight)>,
+    /// `self.lb` when `terms` were read — the `lb` of `(★)`. MUST be the plain
+    /// `lb`, never `effective_lb()`: the LP-boost `boost_lb` is an external lift
+    /// that does not participate in the identity.
+    lb_at_build: Weight,
+    /// Tightest cap asserted so far, so a round that cannot tighten adds no
+    /// clauses.
+    last_cap: Weight,
+}
+
+/// Encoding behind a [`ResidualBound`], picked by the residual objective's own
+/// weight shape: counting totalizer when its live weights are uniform (much the
+/// cheapest — this is the case the retired `AY_AB_MAXSAT_DESCENT_RESIDUAL=1`
+/// prototype was restricted to), else the same `gte_build` / `adder_build` pair
+/// the original objective already uses.
+enum ResidualBoundEnc {
+    /// Uniform residual weight `w`: unweighted totalizer over the violation
+    /// indicators, bounding the COUNT at `last_k`.
+    Tot {
         tot: TotNode,
-        /// Common residual weight of every encoded selector.
         w: Weight,
-        /// Selectors in POSITIVE form; falsified when the model does not
-        /// satisfy the literal.
-        sels: Vec<Literal>,
-        /// `self.lb` when `sels`/`w` were read. MUST be the plain `lb`, never
-        /// `effective_lb()`: the LP-boost `boost_lb` is an external lift that
-        /// does not participate in the identity.
-        lb_at_build: Weight,
-        /// Tightest count bound asserted so far.
         last_k: usize,
     },
+    /// Generalized totalizer outputs (sorted by capped sum) with the index of
+    /// the first forced-false output.
+    Gte {
+        outs: Vec<(Weight, Literal)>,
+        forbidden_from: usize,
+    },
+    /// Adder-network sum bits, little-endian.
+    Adder { bits: Vec<Option<Literal>> },
 }
 
 impl OllEngine {
@@ -1693,6 +2260,19 @@ impl OllEngine {
             (hard, soft, soft_weights)
         };
         let mut sat = SatSolver::new(num_vars as usize);
+        // #witness-oracle: `AY_SOLUTION_FILE` installs a known-good model, after
+        // which ay-sat checks EVERY clause at insertion and every shrunken
+        // clause, panicking on the first one the model falsifies. A sound
+        // derivation can never falsify a true model, so a panic names the exact
+        // clause that wrongly excluded it. This was already wired for ay-dpll
+        // and the DIMACS CLI but NOT for the MaxSAT lane; wiring it here is what
+        // proved the clause database stays sound during a wrong answer, which
+        // localised the defect to unsat-core construction instead.
+        //
+        // NOTE: OLL uses RAW variable ids (DIMACS n -> id n, id 0 unused) while
+        // `load_solution_file` maps DIMACS n -> index n-1, so a witness file
+        // must be shifted by one or every report is a false positive.
+        sat.maybe_load_solution_from_env();
         // (The interim #maxsat-domain-bcp-regression-workaround that disabled
         // domain BCP for +5 is now REMOVED: the underlying regression is fixed
         // directly — see #maxsat-domain-bcp-fix (propagate_domain_bcp's fused
@@ -1815,13 +2395,88 @@ impl OllEngine {
                 sat.set_inprocessing_profile(&profile);
             }
         }
-        // Binary hard clauses feed intrinsic at-most-one detection below.
+        // #hard-dedup: the SOFT install path normalises and merges identical
+        // clauses (see the `merged` HashMap below), but the HARD path did not,
+        // so duplicate hards were installed verbatim. That is not a corner
+        // case: on `judgment-aggregation/ja-kemeny` every hard clause appears
+        // exactly THREE times (175,560 -> 58,520 distinct; the 1.56M-hard
+        // members collapse to 520,260). Duplicates cost watch-list scans on
+        // every propagation, and they inflate `hard.len()`, which is what the
+        // size-band gates above key on — so a formula could be pushed into a
+        // band that strips vivify/subsume/probe/transred/sweep purely on
+        // duplicated rows, and then nothing ever removes the duplicates because
+        // subsumption was the thing that got disabled.
+        //
+        // Sound: adding a clause twice is logically identical to adding it
+        // once. Literals are sorted for the key only; the clause installed
+        // keeps its original order.
+        // #core-mine: unit-soft literals, for the any-arity core scan below.
+        // For a unit soft the SELECTOR IS THE LITERAL ITSELF (see the selector
+        // construction later in this function), so a mined clause maps to a
+        // core with no further translation.
+        let unit_soft_lits: HashSet<Literal> = soft
+            .iter()
+            .zip(soft_weights.iter())
+            .filter(|(lits, w)| lits.len() == 1 && **w > 0)
+            .map(|(lits, _)| lits[0])
+            .collect();
+        let mut mined: Vec<MinedCore> = Vec::new();
         let mut binary: Vec<(Literal, Literal)> = Vec::new();
-        for clause in hard.iter() {
+        let mut seen_hard: HashSet<Vec<Literal>> = HashSet::with_capacity(hard.len());
+        let mut dup_hards = 0usize;
+        for (hard_idx, clause) in hard.iter().enumerate() {
+            let mut key = clause.to_vec();
+            key.sort_unstable();
+            key.dedup();
+            if !seen_hard.insert(key) {
+                dup_hards += 1;
+                continue;
+            }
             if clause.len() == 2 && clause[0].variable() != clause[1].variable() {
                 binary.push((clause[0], clause[1]));
             }
+            // #core-mine: AY's install-time lower bound was arity-locked to
+            // binary clauses — `binary` above feeds `adapt_am1`, and nothing
+            // else looks at a hard clause. On an all-ternary formula
+            // (judgment-aggregation/ja-kemeny: 175,560 hards, every clause
+            // length exactly 3, zero unit, zero binary) that means OLL starts
+            // at lb = 0 and must buy the whole optimum one small core at a
+            // time — measured 90.7% of its cores have min-weight 1, so it
+            // needs 400+ UNSAT proofs over a 175k-clause formula and solves
+            // 0 of 15 such instances.
+            //
+            // But a hard clause all of whose literals are the NEGATION of a
+            // unit soft's literal is already an UNSAT core over those softs:
+            // it asserts they cannot all be satisfied. Collect them here; they
+            // are paid (greedily, disjointly) once the first stratum is
+            // active. This is the any-arity generalisation of `adapt_am1`.
+            if clause.len() >= 2
+                && clause.len() <= CORE_MINE_MAX_ARITY
+                && mined.len() < CORE_MINE_MAX_CORES
+                && clause.iter().all(|l| unit_soft_lits.contains(&l.negated()))
+            {
+                let mut core: Vec<Literal> = clause.iter().map(|l| l.negated()).collect();
+                core.sort_unstable();
+                core.dedup();
+                if core.len() == clause.len() {
+                    // `hard_idx` counts hard clauses in file order INCLUDING the
+                    // duplicates skipped above, which is the numbering an OPB
+                    // restatement of the same file uses.
+                    mined.push(MinedCore {
+                        lits: core,
+                        hard_row: hard_idx as u64 + 1,
+                    });
+                }
+            }
             sat.add_clause(clause.to_vec());
+        }
+        if dup_hards > 0 && debug_trace() {
+            eprintln!(
+                "c hard-dedup: {} duplicate hard clauses dropped ({} -> {})",
+                dup_hards,
+                hard.len(),
+                hard.len() - dup_hards
+            );
         }
         if oneshot_preproc {
             // Run the single BVE+subsumption pass now (hards added, softs not
@@ -1967,6 +2622,10 @@ impl OllEngine {
         let mut engine = OllEngine {
             sat,
             next_var: num_vars,
+            mined_cores: mined,
+            paid_mined_cores: Vec::new(),
+            paid_sat_cores: Vec::new(),
+            mined_used: HashSet::new(),
             softs: ClauseStore::new(),
             soft_weights: Vec::new(),
             soft_selectors: Vec::new(),
@@ -2000,13 +2659,21 @@ impl OllEngine {
             tuning: OllTuning::default(),
             descent: None,
             descent_unavailable: false,
+            descent_size_declined: None,
             residual_exhausted: false,
+            residual_bound: None,
+            residual_builds: 0,
             deadline: None,
             descent_guard: None,
             hardened_sels: HashSet::new(),
             abstraction_done: false,
             lb_window: None,
             lb_last_window_gain: None,
+            core_gaps_ms: Vec::new(),
+            core_gap_median_ms: 0,
+            core_drought: Duration::ZERO,
+            core_drought_since: None,
+            core_search_cores: 0,
             core_history: Vec::new(),
             lp_cores: Vec::new(),
             lp_core_seen: HashSet::new(),
@@ -2687,7 +3354,12 @@ impl OllEngine {
             // here; each probed selector is distinct, so this always holds.
             if self.active.contains_key(&s) {
                 self.stats.am1_probe_failed = self.stats.am1_probe_failed.saturating_add(1);
-                self.process_core(&[s]);
+                let lb_pre = self.lb;
+                // #cold-core-descent: BATCH — these failed selectors were all
+                // decided by the one probe sweep above and are paid back-to-back
+                // in microseconds, with no SAT call between them.
+                self.process_core(&[s], CoreOrigin::Batch);
+                self.record_sat_core(&[s], lb_pre);
             }
         }
         if !failed_set.is_empty() {
@@ -3129,6 +3801,22 @@ impl OllEngine {
         &self.stats
     }
 
+    /// Mined cores this run charged, for certificate emission.
+    ///
+    /// Write-only evidence (see `ay::maxsat_proof`): the engine never reads it
+    /// back, and a caller may not derive a verdict from it.
+    pub(crate) fn take_paid_mined_cores(&mut self) -> Vec<PaidMinedCore> {
+        std::mem::take(&mut self.paid_mined_cores)
+    }
+
+    /// SAT-derived cores this run charged, for certificate emission.
+    ///
+    /// Write-only evidence (see `ay::maxsat_proof`): the engine never reads it
+    /// back, and a caller may not derive a verdict from it.
+    pub(crate) fn take_paid_sat_cores(&mut self) -> Vec<PaidSatCore> {
+        std::mem::take(&mut self.paid_sat_cores)
+    }
+
     /// Best (cost, model) found so far.
     pub(crate) fn best(&self) -> Option<(Weight, Vec<bool>)> {
         self.best_model.clone().map(|m| (self.ub, m))
@@ -3368,7 +4056,221 @@ impl OllEngine {
     /// Already-active selectors need no motion: the per-call assumption
     /// filter in solve() re-judges every residual against the current
     /// level, so residuals requalify automatically as the level drops.
+    /// #core-mine: pay install-time mined cores that are now fully active.
+    ///
+    /// Each mined entry is a set of unit-soft selectors that a hard clause
+    /// forbids from ALL holding, so every model violates at least one of them.
+    ///
+    /// SOUNDNESS — the load-bearing precondition is ALL-MEMBERS-ACTIVE-AND-
+    /// LEVEL-QUALIFIED, **not** disjointness.
+    ///
+    /// For a unit soft the selector IS the soft's literal (see the
+    /// `lits.len() == 1` branch of selector construction), and every
+    /// relaxation / sum / AM1-disjunction selector lives on a variable minted
+    /// by `fresh_lit` at an id >= `num_vars`. A mined member is the negation of
+    /// an ORIGINAL hard-clause literal, so a hit in `self.active` for it can
+    /// only be a surviving unit soft's selector. With EVERY member present,
+    /// `process_core`'s `w_min` filter_map degenerates to a true minimum and
+    /// the split debits every member in full, so the peel is the exact OLL
+    /// weight-splitting identity and `lb` cannot outrun the optimum.
+    ///
+    /// A core with a MISSING member must be DISCARDED, never shrunk: a
+    /// not-all-true clause has NO valid proper subset — (¬s1∨¬s2∨¬s3) does not
+    /// entail (¬s1∨¬s2) — so paying `w_min` over the survivors charges `lb` for
+    /// weight the absent member no longer carries. This is NOT the AM1 case:
+    /// `relax_am1_clique`'s neighbouring `filter_map` shrink is safe because
+    /// every subset of an at-most-one set is still at-most-one. DO NOT copy
+    /// that idiom here. Counterexample: hard (¬x1∨¬x2), softs (x1)=7 (x2)=2,
+    /// optimum 2 — `adapt_am1` spends x2 to zero, and shrinking the mined core
+    /// to {x1} pays lb = 7. That is the #stale-core wrong answer recorded
+    /// above (privilege-escalation-task-54: reported 20, optimum 19).
+    ///
+    /// The `w >= self.level` half is not optional. Presence alone suffices at
+    /// the solve-entry call, where `activate_stratum` has just built `active`
+    /// from an empty map. It is NOT enough at the level-change call, where
+    /// `active` still holds selectors whose residual an earlier peel drove
+    /// below the NEW level; paying one queues a core whose relaxation mints a
+    /// sum selector the assumption filter can never assume.
+    ///
+    /// `mined_used` is a BATCHING heuristic, not a safety property. Dropping it
+    /// is also sound and pays strictly more lb (measured 381 -> 435 of the 504
+    /// optimum on judgment-00049-00000405). Keep or drop it on MEASUREMENT.
+    fn pay_mined_cores(&mut self) {
+        if self.mined_cores.is_empty() {
+            return;
+        }
+        let mined = std::mem::take(&mut self.mined_cores);
+        let mut deferred: Vec<MinedCore> = Vec::new();
+        let (mut paid, lb_before) = (0usize, self.lb);
+        for mined_core in mined {
+            let core = mined_core.lits.clone();
+            if core.iter().any(|l| self.mined_used.contains(l)) {
+                // Batching only (see above), NOT soundness: requeue rather
+                // than drop so a later batch can still pay it.
+                deferred.push(mined_core);
+                continue;
+            }
+            // [SOUND-CRITICAL] every member must be a LIVE, LEVEL-QUALIFIED
+            // UNIT-soft selector. Defer the core WHOLE on any failure; never
+            // shrink it. The unit test is redundant today (fresh_lit ids
+            // >= num_vars cannot alias an original literal) and is kept so a
+            // future change to variable allocation cannot silently admit a
+            // multi-literal soft's selector, for which "selector false" only
+            // ALLOWS a violation rather than entailing one.
+            let payable = core.iter().all(|l| {
+                self.sel_to_soft
+                    .get(l)
+                    .is_some_and(|&i| self.softs.get(i as usize).len() == 1)
+                    && self.active.get(l).is_some_and(|&w| w >= self.level)
+            });
+            if !payable {
+                deferred.push(mined_core);
+                continue;
+            }
+            for &l in &core {
+                self.mined_used.insert(l);
+            }
+            let lb_pre = self.lb;
+            // #cold-core-descent: BATCH — mined cores are replayed from a
+            // pre-computed list, not discovered by this engine's search.
+            let _ = self.process_core(&core, CoreOrigin::Batch);
+            paid += 1;
+            // Proof evidence, recorded AFTER the fact: the charge is the lower
+            // bound's actual increase, so it cannot overstate what the engine
+            // did even if `process_core` changes. Write-only — nothing in the
+            // engine reads `paid_mined_cores` back.
+            self.paid_mined_cores.push(PaidMinedCore {
+                hard_row: mined_core.hard_row,
+                w_min: self.lb.saturating_sub(lb_pre),
+                // NOT `to_dimacs()`: that maps internal variable index `v` to
+                // DIMACS `v + 1`, but OLL uses RAW ids where internal `n` IS
+                // DIMACS `n` (id 0 unused). Getting this wrong has already cost
+                // this project two false results; the certificate's fail-closed
+                // membership check caught it a third time.
+                members: core
+                    .iter()
+                    .map(|l| {
+                        // `raw()` packs as `2 * var + sign`, so `raw() >> 1` is
+                        // the variable id with no DIMACS shift applied.
+                        let v = (l.raw() >> 1) as i32;
+                        if l.is_positive() {
+                            v
+                        } else {
+                            -v
+                        }
+                    })
+                    .collect(),
+            });
+            // [SOUND-CRITICAL] F4 fail-safe. `ub` is the cost of a model this
+            // engine actually found, so it is ACHIEVABLE; a lower bound above
+            // an achievable cost is arithmetically impossible and means the
+            // accounting over-paid. Stop mining immediately and surrender the
+            // rest of the batch: an unsolved instance costs one solve, a wrong
+            // `s OPTIMUM FOUND` is disqualifying.
+            if self.ub != Weight::MAX && self.lb > self.ub {
+                self.stats.core_mine_abandoned = self.stats.core_mine_abandoned.saturating_add(1);
+                eprintln!(
+                    "c CORE-MINE-ABANDONED: lb {} exceeded reached cost ub {} — \
+                     mined-core accounting is inconsistent; disabling the pass",
+                    self.lb, self.ub
+                );
+                self.mined_cores.clear();
+                self.mined_used.clear();
+                // The accounting that produced these is the thing we just
+                // caught being wrong; do not certify from it. That verdict
+                // covers the SAT-derived evidence too — the over-pay is in the
+                // shared residual accounting, not in the mining pass alone.
+                self.paid_mined_cores.clear();
+                self.paid_sat_cores.clear();
+                return;
+            }
+        }
+        if debug_trace() && paid > 0 {
+            eprintln!(
+                "c core-mine: paid {paid} disjoint cores, lb {} -> {}, {} deferred",
+                lb_before,
+                self.lb,
+                deferred.len()
+            );
+        }
+        self.mined_cores = deferred;
+    }
+
+    /// Record a core that came out of a SAT CALL as certificate evidence.
+    ///
+    /// Call this IMMEDIATELY after the `process_core` that charged it, passing
+    /// the lower bound as it stood BEFORE that call: the charge is measured as
+    /// the bound's actual increase, so this cannot overstate what the engine
+    /// did even if `process_core`'s arithmetic changes underneath it.
+    ///
+    /// Write-only — see the rule in `ay::maxsat_proof`. Nothing here may be
+    /// read back by the engine, and this function must have no effect on the
+    /// solve beyond its own bookkeeping.
+    ///
+    /// Two filters, both mandatory:
+    ///
+    /// * **charge > 0** — a core that moved nothing contributes nothing and
+    ///   would only add a `0 *` term to the derivation.
+    /// * **every member is a UNIT-soft selector** — for a unit soft the
+    ///   selector IS the soft's own literal, which is the one case where the
+    ///   core can be restated over the emitted OPB's variables. A totalizer /
+    ///   sum / AM1-disjunction selector lives on a variable minted by
+    ///   `fresh_lit` that appears NOWHERE in the OPB, so such a core is not
+    ///   weak evidence, it is inexpressible. Skip it whole; never shrink it
+    ///   to the expressible members (a not-all-true set has no valid proper
+    ///   subset — the #stale-core wrong answer, oll.rs:3531).
+    fn record_sat_core(&mut self, core: &[Literal], lb_before: Weight) {
+        if self.paid_sat_cores.len() >= PAID_SAT_CORE_CAP || core.is_empty() {
+            return;
+        }
+        let charge = self.lb.saturating_sub(lb_before);
+        if charge == 0 {
+            return;
+        }
+        let all_unit_soft = core.iter().all(|l| {
+            self.sel_to_soft
+                .get(l)
+                .is_some_and(|&i| self.softs.get(i as usize).len() == 1)
+        });
+        if !all_unit_soft {
+            return;
+        }
+        let mut members: Vec<i32> = core
+            .iter()
+            .map(|l| {
+                // NOT `to_dimacs()`: that maps internal variable index `v` to
+                // DIMACS `v + 1`, but OLL uses RAW ids where internal `n` IS
+                // DIMACS `n` (id 0 unused). `raw()` packs as `2 * var + sign`,
+                // so `raw() >> 1` is the variable id with no DIMACS shift.
+                // Getting this wrong has already cost this project two false
+                // results.
+                let v = (l.raw() >> 1) as i32;
+                if l.is_positive() {
+                    v
+                } else {
+                    -v
+                }
+            })
+            .collect();
+        // A core is a SET of assumptions; a repeated member would be charged
+        // twice by the emitter's accounting and would emit `+1 r +1 r >= 1`.
+        members.sort_unstable();
+        members.dedup();
+        self.paid_sat_cores.push(PaidSatCore {
+            w_min: charge,
+            members,
+        });
+    }
+
     fn activate_stratum(&mut self, threshold: Weight) {
+        // #cold-core-descent D4: a stratification level change legitimately
+        // pauses core discovery — the previous stratum ran out of assumable
+        // selectors and the new one has not been searched yet — and the rate
+        // gate cannot tell that apart from discovery going cold. Without this
+        // reset the arm can take the entry before the fresh stratum has had a
+        // single chance to produce a core. This is the one chokepoint through
+        // which every level activation passes, including the first.
+        self.reset_core_drought();
         if debug_trace() {
             eprintln!(
                 "c level: threshold={} pool={} active={} lb={} ub={}",
@@ -3608,8 +4510,41 @@ impl OllEngine {
     /// point (flush_pending); only the immediate accounting (lb payment,
     /// weight splitting, bound bumps of existing sums, unit-core hard
     /// clauses) happens at extraction time.
-    fn process_core(&mut self, core: &[Literal]) -> Vec<Literal> {
+    ///
+    /// `origin` feeds ONLY the #cold-core-descent rate gate and nothing else;
+    /// it is a required parameter rather than an inferred flag so that a new
+    /// call site cannot silently be counted as core-discovery progress (see
+    /// [`CoreOrigin`]).
+    fn process_core(&mut self, core: &[Literal], origin: CoreOrigin) -> Vec<Literal> {
+        // #dpw-descent [SOUND-CRITICAL, debug builds]: DPW is the only descent
+        // encoding whose literals are ASSUMED, and they are assumed at exactly
+        // one site (`descend_slice`). If a tare variable or a watchdog output
+        // ever reached a core-producing solve — OLL's own extraction, or the
+        // minimisation probes — the extracted core would contain watchdog
+        // internals and OLL's cost identity would be corrupted, which is a
+        // wrong answer and not a lost solve. The memory note on this family's
+        // soundness hunts is explicit that such bookkeeping bugs are
+        // trajectory-dependent and will not reproduce under plain defaults, so
+        // the invariant is asserted rather than argued.
+        #[cfg(debug_assertions)]
+        if let Some(DescentEnc::Dpw { enc, .. }) = self.descent.as_ref() {
+            for &lit in core {
+                debug_assert!(
+                    !enc.owns(lit),
+                    "DPW literal {lit:?} leaked into an UNSAT core: the watchdog's \
+                     assumptions escaped `descend_slice`",
+                );
+            }
+        }
         self.stats.cores_found = self.stats.cores_found.saturating_add(1);
+        match origin {
+            CoreOrigin::Search => self.note_search_core(Instant::now()),
+            // Batch payments are lb progress but NOT search progress, so they
+            // never enter the rate sample. They do restart the drought clock,
+            // which is the conservative direction: it can only DELAY the rate
+            // arm, never advance it.
+            CoreOrigin::Batch => self.reset_core_drought(),
+        }
         let mut new_sums = Vec::new();
         // Record original-selector membership BEFORE weight splitting
         // consumes members, for core-informed abstraction formation.
@@ -4399,7 +5334,9 @@ impl OllEngine {
                         return false;
                     }
                     self.stats.exhaust_steps = self.stats.exhaust_steps.saturating_add(1);
-                    let new_sums = self.process_core(&core);
+                    let lb_pre = self.lb;
+                    let new_sums = self.process_core(&core, CoreOrigin::Search);
+                    self.record_sat_core(&core, lb_pre);
                     suspended.extend(new_sums.iter().copied());
                     match new_sums.last() {
                         Some(&next) => sel = next,
@@ -4443,17 +5380,291 @@ impl OllEngine {
         w0.filter(|&w| w > 0)
     }
 
-    /// The live residual objective (`active ∪ pool`) when every live selector
-    /// carries the SAME residual weight, as selector literals plus that weight.
+    /// #cold-core-descent: THE DROUGHT CLOCK. Time already banked toward the
+    /// current drought, plus the segment currently running (nothing, if the
+    /// clock is paused).
     ///
-    /// This is the objective OLL actually maintains, as opposed to
-    /// `residual_uniform_weight`, which despite its name scans the ORIGINAL
-    /// softs at their ORIGINAL weights. Hardened selectors are satisfied in
-    /// every remaining model and are skipped; dropping zero-cost terms keeps
-    /// the identity's inequality direction (`Σ <= cost - lb`) intact.
-    fn uniform_residual_objective(&self) -> Option<(Vec<Literal>, Weight)> {
-        let mut sels: Vec<Literal> = Vec::with_capacity(self.active.len() + self.pool.len());
-        let mut w0: Option<Weight> = None;
+    /// The drought must measure time the engine spent LOOKING FOR CORES and
+    /// finding none. A plain `last_core.elapsed()` does not: the wall clock
+    /// keeps running while the engine is inside [`OllEngine::descend`], where
+    /// no core can arrive BY CONSTRUCTION (the descent walks the ub side and
+    /// never calls `process_core`). That charged descent time as evidence of a
+    /// core drought, so a descent slice manufactured the very drought that
+    /// justified the next, stronger entry — a self-triggering ratchet.
+    /// `pause_core_drought`/`resume_core_drought` bracket that span.
+    fn core_drought(&self) -> Duration {
+        match self.core_drought_since {
+            Some(t) => self.core_drought.saturating_add(t.elapsed()),
+            None => self.core_drought,
+        }
+    }
+
+    /// #cold-core-descent: stop charging drought time (entering a span in
+    /// which no core CAN arrive). Idempotent.
+    fn pause_core_drought(&mut self) {
+        self.pause_core_drought_at(Instant::now());
+    }
+
+    /// #cold-core-descent: resume charging drought time. Idempotent, and it
+    /// does NOT clear what was already banked — the drought that preceded the
+    /// paused span is still real evidence.
+    fn resume_core_drought(&mut self) {
+        self.resume_core_drought_at(Instant::now());
+    }
+
+    /// [`Self::pause_core_drought`] at an explicit instant, so the clock's
+    /// arithmetic is testable without sleeping.
+    fn pause_core_drought_at(&mut self, at: Instant) {
+        if let Some(t) = self.core_drought_since.take() {
+            self.core_drought = self
+                .core_drought
+                .saturating_add(at.saturating_duration_since(t));
+        }
+    }
+
+    /// [`Self::resume_core_drought`] at an explicit instant.
+    fn resume_core_drought_at(&mut self, at: Instant) {
+        if self.core_drought_since.is_none() {
+            self.core_drought_since = Some(at);
+        }
+    }
+
+    /// #cold-core-descent: forget the current drought and start a fresh one.
+    ///
+    /// Used where core discovery legitimately stops and restarting it is
+    /// EXPECTED rather than evidence of collapse: a stratification level
+    /// change (`activate_stratum`) re-populates the assumable set, and the
+    /// gate cannot otherwise tell "the previous stratum ran out" apart from
+    /// "the search went cold" — it would let the arm commit before the new
+    /// stratum had produced a single core.
+    fn reset_core_drought(&mut self) {
+        self.core_drought = Duration::ZERO;
+        self.core_drought_since = Some(Instant::now());
+    }
+
+    /// #cold-core-descent: record a SEARCH-derived core arrival — its interval
+    /// joins the trailing rate baseline, and the drought clock restarts.
+    ///
+    /// The whole per-core cost of the rate gate: one `Instant`, one push, and
+    /// one sort of at most `COLD_CORE_WINDOW` u64s.
+    fn note_search_core(&mut self, at: Instant) {
+        // The first search core has no predecessor, so the "interval" would be
+        // the time from the start of the run — not a rate observation.
+        if self.core_search_cores > 0 {
+            let gap = self
+                .core_drought
+                .saturating_add(match self.core_drought_since {
+                    Some(t) => at.saturating_duration_since(t),
+                    None => Duration::ZERO,
+                });
+            if self.core_gaps_ms.len() == COLD_CORE_WINDOW {
+                self.core_gaps_ms.remove(0);
+            }
+            self.core_gaps_ms.push(gap.as_millis() as u64);
+            let mut sorted = self.core_gaps_ms.clone();
+            sorted.sort_unstable();
+            self.core_gap_median_ms = sorted[sorted.len() / 2];
+        }
+        self.core_search_cores = self.core_search_cores.saturating_add(1);
+        self.core_drought = Duration::ZERO;
+        self.core_drought_since = Some(at);
+    }
+
+    /// #cold-core-descent: the drought (ms of core-searching time since the
+    /// last search-derived core) that counts as COLD on this instance —
+    /// `COLD_CORE_DROUGHT_MULT` times its own TRAILING median inter-core
+    /// interval, floored at `COLD_CORE_MIN_DROUGHT`.
+    ///
+    /// The bar is RELATIVE by construction. An absolute one cannot exist here:
+    /// the corpus runs from 3 to 1,035,351 hard clauses, so a 30s lull is a
+    /// catastrophe on an instance that was streaming 10 cores a second and a
+    /// perfectly ordinary step on one that pays ~1s per assumption solve.
+    /// TRAILING rather than "first N" is what makes that statement true in
+    /// practice rather than only in the comment — see [`COLD_CORE_WINDOW`].
+    fn cold_core_bar_ms(&self) -> u64 {
+        self.core_gap_median_ms
+            .saturating_mul(COLD_CORE_DROUGHT_MULT)
+            .max(COLD_CORE_MIN_DROUGHT.as_millis() as u64)
+    }
+
+    /// #cold-core-descent: has core discovery gone COLD relative to this
+    /// instance's own recent arrival rate?
+    ///
+    /// This is an ADDITIONAL descent entry path, disjoined with (never
+    /// substituted for) the `cores_found >= lsu_min_cores` count. It carries
+    /// the organic gate's other conjuncts — `gap_ok`, an incumbent, and
+    /// `descent_not_before` — but deliberately NOT `oll_stalling` (see the
+    /// `cold_ready` binding in `solve` for the trace that forced that choice).
+    ///
+    /// WHAT STOPS IT FIRING WHILE THE SLOW CORE WALK IS STILL THE WINNING PATH
+    /// (rna-alignment, protein_ins — where a premature commit would lose
+    /// instances AY solves today). Five independent brakes:
+    ///
+    ///  1. THE BAR IS THE INSTANCE'S OWN RECENT RATE. A walk that keeps
+    ///     delivering a core every ~20s has a ~20s trailing median, so its bar
+    ///     is ~240s: steady slowness never reads as cold, only a collapse
+    ///     relative to the CURRENT trend does. Under the shipped first-N
+    ///     baseline this brake was inert (see [`COLD_CORE_WINDOW`]); the
+    ///     trailing window is what makes it real.
+    ///  2. A DROUGHT SPENT INSIDE ONE ASSUMPTION SOLVE IS INVISIBLE. The gate
+    ///     is evaluated only BETWEEN OLL iterations, so a long solve that
+    ///     returns a core resets the drought before the gate ever sees it —
+    ///     the arm structurally cannot preempt a solve that is about to pay.
+    ///     Measured on causal n6 at 900s, whose late gaps are exactly that
+    ///     shape: at the descent entry the gate reported `drought_ms=0` against
+    ///     `bar_ms=30756`, in both the lever-on and lever-off legs, and the arm
+    ///     never fired in either. Only droughts that span SEVERAL iterations —
+    ///     churn that produces no cores — reach this gate.
+    ///  3. NO FIRING ON THE FIRST FEW CORES (`COLD_CORE_MIN_SAMPLE` intervals,
+    ///     all of them SEARCH-derived — see [`CoreOrigin`]) or inside the
+    ///     opening `COLD_CORE_MIN_ELAPSED` of the run.
+    ///  4. IT CANNOT PREEMPT THE COUNT PATH ON A FAST INSTANCE. Where cores
+    ///     stream (rna: 66 by t=18.5s), the 64-core bar is reached before a
+    ///     30s drought can even exist, so the count path fires first and this
+    ///     one is inert. The instances it reaches are the ones the count path
+    ///     reaches late (causal n6: core #64 at t=408-473s here) or never
+    ///     (af-synthesis: ~16 cores, then nothing for the rest of the run).
+    ///  5. THE CLOCK ONLY RUNS WHILE THE ENGINE IS LOOKING FOR CORES. Descent
+    ///     slices are paused out and stratum activations reset it, so neither
+    ///     the arm's own effect nor an ordinary level change can be mistaken
+    ///     for evidence that discovery collapsed (see [`Self::core_drought`]).
+    ///
+    /// `lsu_min_cores == u64::MAX` is the tuning sentinel for "descents never
+    /// engage" (the pure-OLL nets), and is honoured here too — this path must
+    /// not smuggle a descent into a fixture that forbids one.
+    fn core_discovery_cold(&self, started: Instant) -> bool {
+        if self.tuning.lsu_min_cores == u64::MAX {
+            return false;
+        }
+        // No incumbent => nothing for `descend` to improve on. (The caller
+        // tests this too; keeping it here makes the predicate self-contained
+        // and its trace honest.)
+        if self.best_model.is_none() {
+            return false;
+        }
+        if self.core_gaps_ms.len() < COLD_CORE_MIN_SAMPLE {
+            return false;
+        }
+        if started.elapsed() < COLD_CORE_MIN_ELAPSED {
+            return false;
+        }
+        (self.core_drought().as_millis() as u64) >= self.cold_core_bar_ms()
+    }
+
+    /// #cold-core-descent D6: can a descent encoding still be built on this
+    /// instance? The cheap short-circuit the entry gate uses BEFORE paying for
+    /// `flush_pending`.
+    ///
+    /// `descent_unavailable` is permanent; a SIZE decline is not, so it is
+    /// re-tried once one of the two monotone components of the recorded
+    /// signature has strictly improved (`hardened_sels` only grows and `ub`
+    /// only falls — both shrink the encoding). See `descent_size_declined`.
+    fn descent_reachable(&self) -> bool {
+        if self.descent.is_some() {
+            return true;
+        }
+        if self.descent_unavailable {
+            return false;
+        }
+        match self.descent_size_declined {
+            None => true,
+            Some((hardened, ub)) => self.hardened_sels.len() > hardened || self.ub < ub,
+        }
+    }
+
+    /// Kick-entry gap bar, in units of the objective's own granularity.
+    ///
+    /// `DESCENT_KICK_GAP` is an ABSOLUTE cost tested against `ub - lb` on a
+    /// track whose optima span 3..3.7e10 — a dimensional error. Measured on the
+    /// MSE24 exact-weighted addressable set (AY unsolved at 60s, some MSE24
+    /// solver solved; 138 instances, 131 of which carry an incumbent): 57 of
+    /// those 131 have `incumbent - optimum > 32`, and `lb <= optimum` makes
+    /// `ub - lb > 32` for the whole run, so the kick can never fire on 44% of
+    /// the target set.
+    /// Traced at the constant's boundary on af-synthesis (same family, same
+    /// binary, same load, 120s):
+    ///
+    /// | instance | cores | lb | ub | gap | descent lines |
+    /// | --- | --- | --- | --- | --- | --- |
+    /// | `af-synthesis_stb_50_120_5` | 17 | 83 | 115 | **32** | 1 (GTE, cap 115) |
+    /// | `af-synthesis_stb_50_160_5` | 16 | 77 | 113 | **36** | **0** |
+    ///
+    /// `160_5` is sitting on its exact optimum (113) and is blocked from proving
+    /// it by four units against a hard-coded constant; the sibling proves the
+    /// encoding it would need costs nothing. Both descent paths are shut on this
+    /// family at once — the organic gate needs `cores_found >= lsu_min_cores`
+    /// (64) and these runs end at 16-18 — which is why AY is 0/15 here and the
+    /// upper-bound-descent solvers are 15/15.
+    ///
+    /// The uniform arm of `gap_ok` already states the right unit:
+    /// `w * lsu_min_gap_units`. The generalization to mixed weights is the
+    /// MINIMUM live weight — the finest granularity the residual objective can
+    /// move by — which agrees with the uniform arm exactly whenever it is
+    /// defined.
+    ///
+    /// Widening is gated on the descent encoding being the cheap GTE. Where the
+    /// projection is the wide adder instead (causal-discovery: cap 8.7e8 -> 36
+    /// sum bits, one call outliving the whole 10s slice), keep the absolute bar:
+    /// there the alternation is pure duty-cycle tax.
+    ///
+    /// Cheap O(softs) scan on the same path as `residual_uniform_weight`, i.e.
+    /// the descent entry gate only, never a per-core hot path.
+    fn descent_kick_gap_cap(&self) -> Weight {
+        if kick_gap_abs_enabled() {
+            return DESCENT_KICK_GAP;
+        }
+        let mut w_min: Option<Weight> = None;
+        let mut wsum: Weight = 0;
+        // Counts every live soft, zero-weight included, to match the
+        // `inputs.len()` that `ensure_descent_enc` actually hands `gte_build`.
+        let mut live: usize = 0;
+        for i in 0..self.softs.len() {
+            if self.hardened_sels.contains(&self.soft_selectors[i]) {
+                continue;
+            }
+            live += 1;
+            let w = self.soft_weights[i];
+            if w == 0 {
+                continue;
+            }
+            wsum = wsum.saturating_add(w);
+            w_min = Some(match w_min {
+                None => w,
+                Some(m) => m.min(w),
+            });
+        }
+        let Some(w_min) = w_min else {
+            return DESCENT_KICK_GAP;
+        };
+        // `ensure_descent_enc` builds at `cap = ub - preproc_cost`; the total
+        // live weight bounds the outputs a GTE can ever emit for that cap.
+        let projected_outs = self.ub.saturating_sub(self.preproc_cost).min(wsum);
+        if live > GTE_CHEAP_INPUTS || projected_outs > GTE_CHEAP_OUTS {
+            return DESCENT_KICK_GAP;
+        }
+        DESCENT_KICK_GAP.max(w_min.saturating_mul(self.tuning.lsu_min_gap_units))
+    }
+
+    /// The live residual objective (`active ∪ pool`) at ANY weight shape, as
+    /// `(selector, residual weight)` pairs with selectors in POSITIVE form.
+    ///
+    /// Generalises the retired `uniform_residual_objective`, which bailed the
+    /// moment two live weights differed. That bail was an ENCODING restriction
+    /// (its consumer is a counting totalizer, which can only count), never a
+    /// soundness one — and it excluded exactly the mixed-weight families the
+    /// residual cap pays off on.
+    ///
+    /// Dropped terms — hardened selectors (satisfied in every remaining model)
+    /// and zero-weight entries — only make the encoded `Σ` SMALLER, which is
+    /// the safe direction for `(★)` in [`Self::descent_residual_cap`]: a
+    /// smaller `Σ` weakens the cut but can never exclude a cheaper model.
+    /// A selector seen twice is therefore kept ONCE at its SMALLEST weight
+    /// (defensive: `activate_level` moves entries out of `pool` into `active`,
+    /// so nothing is in both today) — double-counting a term would INFLATE `Σ`
+    /// past what `(★)` licenses, which is the unsound direction.
+    fn residual_objective(&self) -> Vec<(Literal, Weight)> {
+        let mut terms: Vec<(Literal, Weight)> =
+            Vec::with_capacity(self.active.len() + self.pool.len());
         for (&sel, &w) in self
             .active
             .iter()
@@ -4462,18 +5673,471 @@ impl OllEngine {
             if w == 0 || self.hardened_sels.contains(&sel) {
                 continue;
             }
-            match w0 {
-                None => w0 = Some(w),
-                Some(prev) if prev == w => {}
-                _ => return None,
-            }
-            sels.push(sel);
+            terms.push((sel, w));
         }
         // `active` is a HashMap: sort so the encoding cannot depend on hash
-        // iteration order.
-        sels.sort_unstable();
-        sels.dedup();
-        w0.filter(|&w| w > 0 && !sels.is_empty()).map(|w| (sels, w))
+        // iteration order. Ties sort by weight ASCENDING, so the dedup below —
+        // which keeps the first entry of each run — keeps the smallest weight.
+        terms.sort_unstable();
+        terms.dedup_by_key(|(sel, _)| *sel);
+        terms
+    }
+
+    /// #descent-residual: the EXCLUSIVE cap for a residual cut, `ub - lb`.
+    /// `None` means "no residual cut" — the descent then runs on its exact
+    /// original-objective encoding alone, exactly as it did before this lever.
+    ///
+    /// [SOUND-CRITICAL] THE INVARIANT THAT MAKES `ub - lb` A VALID CAP.
+    ///
+    /// OLL maintains, for every model `A` of the hard clauses (canonically
+    /// extended to the auxiliary variables — see the last paragraph), the exact
+    /// cost identity spelled out in full on `harden_residual_mass`:
+    ///
+    /// ```text
+    ///   cost(A) = lb
+    ///           + Σ_{sel ∈ active ∪ pool} w_sel · [sel falsified in A]      (Σ)
+    ///           + Σ_t Σ_j (w0_t − W_{t,j}) · [v_t >= j]                 (ladder)
+    ///           + Σ_{queued cores} w_min · (v − 1)                        (#wce)
+    /// ```
+    ///
+    /// The last two groups are NONNEGATIVE — mass conservation on each
+    /// totalizer's bound ladder makes `w0_t − W_{t,j}` a sum of current
+    /// residuals, and `v >= 1` on a queued core because it was UNSAT when
+    /// extracted. Dropping them leaves the only thing this cap needs:
+    ///
+    /// ```text
+    ///   Σ  <=  cost(A) − lb                   for every model A.           (★)
+    /// ```
+    ///
+    /// So asserting `Σ <= ub − lb − 1` excludes ONLY models with
+    /// `cost(A) >= ub`, i.e. models no better than a solution this engine has
+    /// already built and recorded. Every optimal model survives, and an UNSAT
+    /// answer under the cap is a COMPLETE proof that `ub` is optimal — which is
+    /// the whole point: the closing UNSAT call stops re-deriving from scratch
+    /// the `lb` OLL has already paid cores for.
+    ///
+    /// WHAT WOULD BREAK IT.
+    ///  1. `lb` OVER-ESTIMATED. `(★)` is an inequality about the CURRENT `lb`;
+    ///     if any accounting path ever charges `lb` more than it removes from
+    ///     the residual, the cap is too small, the closing call returns UNSAT
+    ///     and the engine claims an optimum it has not got — a WRONG ANSWER,
+    ///     which is disqualifying. `lb > ub` is arithmetically impossible (`ub`
+    ///     is the cost of a model this engine actually built, hence ACHIEVABLE,
+    ///     and a lower bound cannot exceed an achievable cost), so it is
+    ///     checked below and FAILS CLOSED — the residual cap disarms for the
+    ///     rest of the run and the descent reverts to the exact
+    ///     original-objective encoding. Same discipline as the
+    ///     `CORE-MINE-ABANDONED` fail-safe: an unsolved instance costs one
+    ///     solve, a wrong `s OPTIMUM FOUND` costs the competition.
+    ///  2. `effective_lb()` IN PLACE OF `lb`. `boost_lb` is an EXTERNAL lift
+    ///     from the LP packing dual: it is not a term of the identity and does
+    ///     not shrink the residual, so `ub − effective_lb()` is NOT a valid cap
+    ///     even though it is a valid termination test. Use the plain `lb`.
+    ///  3. ENCODING A TERM TWICE, OR ABOVE ITS RESIDUAL WEIGHT. Both inflate
+    ///     the encoded `Σ` relative to `(★)`; `residual_objective` dedups and
+    ///     keeps the smallest weight for exactly this reason. Encoding FEWER
+    ///     terms, or at LOWER weights, is always safe — it only weakens the cut.
+    ///  4. DERIVING THE BOUND FROM A MODEL instead of from `ub`. `(★)` is an
+    ///     inequality, not an equality: a model with the same `Σ` can be
+    ///     strictly cheaper, so "beat the `Σ` of the model I just found" is
+    ///     invalid here even though it is valid for an exact encoding. One of
+    ///     the two bugs behind the ten wrong answers this lever was reverted
+    ///     for the first time (see [`ResidualBound`]).
+    ///  5. CLAMPING AN UNREPRESENTABLE BOUND INTO RANGE. A cap larger than the
+    ///     encoding can express is VACUOUS and must simply not be asserted; the
+    ///     other of those two bugs. `residual_units` returns `None` for it,
+    ///     `gte_build`'s capped sums match no output for it, and
+    ///     `assert_sum_le` returns early on it — three encodings, none of which
+    ///     may be "fixed" with a `.min(width)`.
+    ///
+    /// WHAT THE CUT DOES TO THE REST OF THE ENGINE. Nothing new. It excludes
+    /// only models costing at least the incumbent OF THE DAY it was built, and
+    /// `ub` only falls, so its excluded set stays inside "cost >= the current
+    /// incumbent" — the engine-wide invariant hardening already lives under,
+    /// and the one the LP-boost lane and solve()'s empty-core arm rely on
+    /// (`run_lp_boost`'s soundness note spells out those conditional
+    /// semantics). So cores extracted after a cut is installed carry the same
+    /// meaning they always did, and a hard-UNSAT still means "the incumbent is
+    /// optimal", not "the formula is unsatisfiable".
+    ///
+    /// CANONICAL EXTENSION. The selector definitions and totalizers are
+    /// half-encoded (soft satisfied ⇒ selector MAY be true; `>= j` inputs
+    /// violated ⇒ `out_j` true), so a SAT model may inflate `Σ` by setting
+    /// those auxiliaries spuriously. Harmless in this direction: every
+    /// assignment to the original variables extends to the EXACT auxiliary
+    /// values, and it is that extension `(★)` is stated for — so no assignment
+    /// of cost `< ub` is lost, which is precisely the property the cap needs.
+    /// Same argument the `DescentEnc` doc comment makes for the
+    /// original-objective encodings.
+    fn descent_residual_cap(&mut self) -> Option<Weight> {
+        if !descent_residual_enabled() || self.residual_exhausted {
+            return None;
+        }
+        // No incumbent yet: nothing achievable to cap against. (The descent
+        // entry gate already requires `best_model.is_some()`; belt and braces.)
+        if self.ub == Weight::MAX || self.best_model.is_none() {
+            return None;
+        }
+        if self.lb > self.ub {
+            // [SOUND-CRITICAL] F4-style fail-safe; see (1) above.
+            self.stats.descent_residual_abandoned =
+                self.stats.descent_residual_abandoned.saturating_add(1);
+            eprintln!(
+                "c DESCENT-RESIDUAL-ABANDONED: lb {} exceeded reached cost ub {} — \
+                 residual accounting is inconsistent; disarming the residual \
+                 descent cap and falling back to the original objective",
+                self.lb, self.ub
+            );
+            self.residual_exhausted = true;
+            return None;
+        }
+        // `cap == 0` means `ub <= lb`: the incumbent is already provably
+        // optimal and the caller's `effective_lb() >= ub` test owns that exit.
+        // Asserting a zero cap here would be a contradiction, not a bound.
+        (self.ub - self.lb > 0).then(|| self.ub - self.lb)
+    }
+
+    /// #descent-residual: build a fresh [`ResidualBound`] when one is warranted.
+    ///
+    /// Called at every descent entry, AFTER an exact encoding is in hand. Two
+    /// reasons to (re)build rather than only tighten: the cap is
+    /// `ub - lb_at_build`, so only a rebuild can bank the `lb` OLL has paid
+    /// since — "the query shrinks as OLL works" — and the residual objective
+    /// itself has been reformulated in the meantime, so a fresh cut is stated
+    /// over the sum selectors the newest cores are about.
+    ///
+    /// Each cut is independently sound and the old ones stay in the solver
+    /// (they only ever excluded models costing at least the incumbent of the
+    /// day), so rebuilding is free of correctness conditions — it is bounded
+    /// purely to stop a long run piling on clauses: a rebuild needs the cap to
+    /// have HALVED, which caps the count logarithmically, and
+    /// `RESIDUAL_MAX_BUILDS` backstops that.
+    fn refresh_residual_bound(&mut self) {
+        let Some(cap_r) = self.descent_residual_cap() else {
+            return;
+        };
+        if let Some(rb) = &self.residual_bound {
+            if cap_r.saturating_mul(2) > rb.last_cap {
+                return;
+            }
+        }
+        if self.residual_builds >= RESIDUAL_MAX_BUILDS {
+            return;
+        }
+        let terms = self.residual_objective();
+        // Same input ceiling the original-objective encodings use: an oversized
+        // residual simply leaves the exact descent to work alone.
+        if terms.is_empty() || terms.len() > GTE_CHEAP_INPUTS {
+            if debug_trace() && !terms.is_empty() {
+                eprintln!(
+                    "c descent: residual objective too wide ({} live selectors) — no residual cut",
+                    terms.len(),
+                );
+            }
+            return;
+        }
+        // VACUOUS: no assignment can reach the cap, so there is nothing to
+        // forbid. Detected here rather than after building an encoding for it.
+        let mass = terms
+            .iter()
+            .fold(Weight::MIN, |acc, &(_, w)| acc.saturating_add(w));
+        if mass < cap_r {
+            return;
+        }
+        let lb_at_build = self.lb;
+        let guard = self.descent_guard;
+        // Uniform residual weights: the counting totalizer, much the cheapest
+        // encoding of the three. Mixed weights fall back to the weighted pair
+        // below rather than away from a residual cut entirely — that
+        // restriction is what kept this lever off CSG, causal-discovery and
+        // css-refactoring, the families it is worth the most on.
+        // `force_adder` means the same thing here as for the exact encoding —
+        // skip the cheaper encodings so the brute-force nets exercise the adder
+        // arm, which tiny instances never reach through the budget path.
+        let uniform_w = {
+            let mut it = terms.iter().map(|&(_, w)| w);
+            let first = it.next().unwrap_or(0);
+            (first > 0 && it.all(|w| w == first) && !self.tuning.force_adder).then_some(first)
+        };
+        let enc = if let Some(w) = uniform_w {
+            match Self::residual_units(cap_r, w, terms.len()) {
+                Some(units) if terms.len().saturating_mul(units) <= 10_000_000 => {
+                    let indicators: Vec<Literal> =
+                        terms.iter().map(|&(s, _)| s.negated()).collect();
+                    let mut tot = TotNode::build(&indicators);
+                    let next_var = &mut self.next_var;
+                    let mut fresh = |sat: &mut SatSolver| {
+                        let var = sat.new_var();
+                        *next_var = var.id() + 1;
+                        sat.set_phase(var, false);
+                        Literal::positive(var)
+                    };
+                    tot.extend(units, &mut self.sat, &mut fresh, guard);
+                    let mut clause = vec![tot.outs[units - 1].negated()];
+                    if let Some(g) = guard {
+                        clause.push(g.negated());
+                    }
+                    self.sat.add_clause(clause);
+                    if debug_trace() {
+                        eprintln!(
+                            "c descent: RESIDUAL cut = totalizer over {} selectors \
+                             (w={w} cap={cap_r} units={units} lb={lb_at_build} ub={})",
+                            terms.len(),
+                            self.ub,
+                        );
+                    }
+                    Some(ResidualBoundEnc::Tot {
+                        tot,
+                        w,
+                        last_k: units,
+                    })
+                }
+                // Unrepresentable (vacuous) or oversized: no cut. NEVER clamped
+                // into range — that is failure mode (5) at the cap site.
+                _ => None,
+            }
+        } else {
+            let indicators: Vec<(Literal, Weight)> =
+                terms.iter().map(|&(sel, w)| (sel.negated(), w)).collect();
+            let next_var = &mut self.next_var;
+            let mut fresh = |sat: &mut SatSolver| {
+                let var = sat.new_var();
+                *next_var = var.id() + 1;
+                sat.set_phase(var, false);
+                Literal::positive(var)
+            };
+            let mut out_budget: i64 = 400_000;
+            let mut clause_budget: i64 = 4_000_000;
+            let gte = if self.tuning.force_adder {
+                None
+            } else {
+                gte_build(
+                    &indicators,
+                    cap_r,
+                    &mut self.sat,
+                    &mut fresh,
+                    guard,
+                    &mut out_budget,
+                    &mut clause_budget,
+                )
+            };
+            match gte {
+                Some(outs) => {
+                    // No clamp: a `cap_r` no output reaches leaves
+                    // `forbidden_from == outs.len()` and forbids nothing.
+                    let forbidden_from = outs.partition_point(|&(v, _)| v < cap_r);
+                    for &(_, lit) in &outs[forbidden_from..] {
+                        let mut clause = vec![lit.negated()];
+                        if let Some(g) = guard {
+                            clause.push(g.negated());
+                        }
+                        self.sat.add_clause(clause);
+                    }
+                    if debug_trace() {
+                        eprintln!(
+                            "c descent: RESIDUAL cut = GTE over {} selectors ({} outs, \
+                             cap={cap_r} lb={lb_at_build} ub={})",
+                            indicators.len(),
+                            outs.len(),
+                            self.ub,
+                        );
+                    }
+                    Some(ResidualBoundEnc::Gte {
+                        outs,
+                        forbidden_from,
+                    })
+                }
+                None => {
+                    // GTE over budget (the partial Tseitin clauses it left are
+                    // definitional — every assignment extends to satisfy them,
+                    // so they exclude no model). Fall back to the adder, which
+                    // is where the original objective ends up on exactly the
+                    // families this cut matters most for.
+                    let bits = adder_build(&indicators, &mut self.sat, &mut fresh, guard);
+                    // No clamp: `assert_sum_le` returns early when the bound
+                    // exceeds what these sum bits can represent.
+                    assert_sum_le(&mut self.sat, &bits, cap_r - 1, guard);
+                    if debug_trace() {
+                        eprintln!(
+                            "c descent: RESIDUAL cut = adder over {} selectors ({} sum bits, \
+                             cap={cap_r} lb={lb_at_build} ub={})",
+                            indicators.len(),
+                            bits.len(),
+                            self.ub,
+                        );
+                    }
+                    Some(ResidualBoundEnc::Adder { bits })
+                }
+            }
+        };
+        if let Some(enc) = enc {
+            self.residual_builds = self.residual_builds.saturating_add(1);
+            self.residual_bound = Some(ResidualBound {
+                enc,
+                terms,
+                lb_at_build,
+                last_cap: cap_r,
+            });
+        }
+    }
+
+    /// #descent-residual: re-assert the residual cut at the current `ub`.
+    ///
+    /// The bound is `ub - lb_at_build` and comes ONLY from `ub` — never from a
+    /// model, which for a relaxation would be unsound (see (4) at the cap site).
+    /// A bound that cannot tighten, or that the encoding cannot represent, adds
+    /// nothing: it is left alone, never clamped into range.
+    fn tighten_residual_bound(&mut self) {
+        if self.residual_exhausted {
+            return;
+        }
+        // Taken out so the encoding can be mutated while `self.sat` /
+        // `self.next_var` are borrowed.
+        let Some(mut rb) = self.residual_bound.take() else {
+            return;
+        };
+        let cap_r = self.ub.saturating_sub(rb.lb_at_build);
+        if cap_r > 0 && cap_r < rb.last_cap {
+            rb.last_cap = cap_r;
+            let guard = self.descent_guard;
+            match &mut rb.enc {
+                ResidualBoundEnc::Tot { tot, w, last_k } => {
+                    if let Some(units) = Self::residual_units(cap_r, *w, rb.terms.len()) {
+                        if units < *last_k {
+                            *last_k = units;
+                            let next_var = &mut self.next_var;
+                            let mut fresh = |sat: &mut SatSolver| {
+                                let var = sat.new_var();
+                                *next_var = var.id() + 1;
+                                sat.set_phase(var, false);
+                                Literal::positive(var)
+                            };
+                            tot.extend(units, &mut self.sat, &mut fresh, guard);
+                            let mut clause = vec![tot.outs[units - 1].negated()];
+                            if let Some(g) = guard {
+                                clause.push(g.negated());
+                            }
+                            self.sat.add_clause(clause);
+                        }
+                    }
+                }
+                ResidualBoundEnc::Gte {
+                    outs,
+                    forbidden_from,
+                } => {
+                    let lo = outs.partition_point(|&(v, _)| v < cap_r);
+                    for &(_, lit) in &outs[lo..*forbidden_from] {
+                        let mut clause = vec![lit.negated()];
+                        if let Some(g) = guard {
+                            clause.push(g.negated());
+                        }
+                        self.sat.add_clause(clause);
+                    }
+                    *forbidden_from = lo.min(*forbidden_from);
+                }
+                ResidualBoundEnc::Adder { bits } => {
+                    assert_sum_le(&mut self.sat, bits, cap_r - 1, guard);
+                }
+            }
+        }
+        self.residual_bound = Some(rb);
+    }
+
+    /// DEBUG-ONLY net for `(★)` (see [`Self::descent_residual_cap`]): the
+    /// residual `Σ` evaluated on the CANONICAL extension of `model`, which is
+    /// the only assignment `(★)` is stated for.
+    ///
+    /// A SAT model's RAW `Σ` is the wrong quantity to assert on. Both families
+    /// of auxiliary are half-encoded — a soft's relaxation literal may be true
+    /// while its clause holds (only `¬C ⇒ relax` is asserted), and a totalizer
+    /// output may be true with fewer than `j` violated inputs (only
+    /// `v >= j ⇒ out_j` is asserted) — so the raw `Σ` is an OVER-estimate and a
+    /// raw assertion FALSE-ALARMS. Measured: on the cluster and lp-boost
+    /// brute-force nets it fires with the whole excess attributable to
+    /// relaxation literals set true over satisfied clauses (e.g. `Σ=2049`,
+    /// `cost-lb=1056`, one spurious `w=993` term; removing it lands exactly on
+    /// the budget). Neither direction is a soundness problem: an inflated `Σ`
+    /// on the model the solver HAPPENED to return says nothing about whether a
+    /// cheaper assignment survives the cut, and the canonical extension of
+    /// every such assignment does survive it.
+    ///
+    /// So resolve each term exactly instead:
+    ///   * original soft selector -> falsified iff its CLAUSE is unsatisfied;
+    ///   * sum selector `¬out_j` of totalizer `t` -> falsified iff at least `j`
+    ///     of `t`'s leaves are canonically true (a leaf is the indicator
+    ///     `¬sel` of a selector created before `t`, so the recursion is over a
+    ///     finite DAG and memoizes);
+    ///   * anything else, or past the depth cap -> counted as SATISFIED.
+    ///     Under-counting only weakens the assertion; it can never invent a
+    ///     failure.
+    #[cfg(debug_assertions)]
+    fn canonical_sigma(
+        &self,
+        terms: impl Iterator<Item = (Literal, Weight)>,
+        model: &[bool],
+    ) -> Weight {
+        let mut memo: HashMap<Literal, bool> = HashMap::new();
+        let mut sigma: Weight = 0;
+        for (sel, w) in terms {
+            if self.canonical_falsified(sel, model, 0, &mut memo) {
+                sigma = sigma.saturating_add(w);
+            }
+        }
+        sigma
+    }
+
+    /// Exact value of "selector `sel` is falsified" under the canonical
+    /// extension of `model`. See [`Self::canonical_sigma`].
+    #[cfg(debug_assertions)]
+    fn canonical_falsified(
+        &self,
+        sel: Literal,
+        model: &[bool],
+        depth: usize,
+        memo: &mut HashMap<Literal, bool>,
+    ) -> bool {
+        if let Some(&v) = memo.get(&sel) {
+            return v;
+        }
+        if depth > 64 {
+            return false;
+        }
+        let val = if let Some(&i) = self.sel_to_soft.get(&sel) {
+            !self
+                .softs
+                .get(i as usize)
+                .iter()
+                .any(|&lit| model.get(lit.variable().index()).copied() == Some(lit.is_positive()))
+        } else if let Some(&SumRef { tot, bound }) = self.sums.get(&sel) {
+            let mut leaves: Vec<Literal> = Vec::new();
+            Self::tot_leaves(&self.totalizers[tot], &mut leaves);
+            let violated = leaves
+                .iter()
+                .filter(|&&leaf| self.canonical_falsified(leaf.negated(), model, depth + 1, memo))
+                .count();
+            violated >= bound
+        } else {
+            false
+        };
+        memo.insert(sel, val);
+        val
+    }
+
+    /// Input literals of a totalizer, in tree order. Leaves are the size-1
+    /// nodes whose single output IS the input literal (see [`TotNode::build`]).
+    #[cfg(debug_assertions)]
+    fn tot_leaves(node: &TotNode, out: &mut Vec<Literal>) {
+        match (node.left.as_deref(), node.right.as_deref()) {
+            (None, None) => out.push(node.outs[0]),
+            (l, r) => {
+                if let Some(l) = l {
+                    Self::tot_leaves(l, out);
+                }
+                if let Some(r) = r {
+                    Self::tot_leaves(r, out);
+                }
+            }
+        }
     }
 
     /// Test shim for [`Self::residual_units`] (an associated fn on a private
@@ -4558,16 +6222,38 @@ impl OllEngine {
         );
     }
 
-    /// Build (once) the best-fitting descent encoding for this instance:
+    /// Build (once) the descent encoding for this instance, plus the
+    /// #descent-residual side constraint that strengthens it.
+    ///
+    /// The two are INDEPENDENT. `select_descent_enc` picks the EXACT encoding
+    /// of the original objective — that is what makes every SAT model strictly
+    /// improve `ub`, so the descent's walk keeps working. `refresh_residual_bound`
+    /// then adds a redundant cut over the REFORMULATED residual objective at the
+    /// far tighter cap `ub - lb`, which is what the closing UNSAT call needs.
+    /// See `ResidualBound` for why this is additive rather than a replacement.
+    fn ensure_descent_enc(&mut self) -> bool {
+        if !self.select_descent_enc() {
+            return false;
+        }
+        self.refresh_residual_bound();
+        true
+    }
+
+    /// Pick (once) the best-fitting EXACT descent encoding for this instance:
     /// totalizer for uniform weights, GTE for small mixed-weight instances,
     /// adder network otherwise. Returns false when none is available.
-    fn ensure_descent_enc(&mut self) -> bool {
+    fn select_descent_enc(&mut self) -> bool {
         if self.descent.is_some() {
             return true;
         }
-        if self.descent_unavailable {
+        if !self.descent_reachable() {
             return false;
         }
+        // #cold-core-descent D6: the size budgets below are state-dependent, so
+        // declining on one must NOT poison `descent_unavailable`. Record the
+        // signature instead; `descent_reachable` re-opens the gate once the
+        // residual has strictly shrunk.
+        let size_sig = (self.hardened_sels.len(), self.ub);
         // A/B runs on both MSE 2024 tracks showed guarding the descent
         // clauses behind an activation literal costs more (weaker
         // propagation inside the descent) than it saves in OLL cleanliness;
@@ -4584,50 +6270,6 @@ impl OllEngine {
         if soft_idx.is_empty() {
             self.descent_unavailable = true;
             return false;
-        }
-        // #descent-residual: prefer the reformulated residual objective when
-        // its live weights are uniform — its cap (`ub - lb`) is never looser
-        // than the original objective's and is dramatically tighter once OLL
-        // has paid cores into `lb`.
-        if descent_residual_enabled() && !self.residual_exhausted {
-            if let Some((sels, wr)) = self.uniform_residual_objective() {
-                let target_r = self.ub.saturating_sub(self.lb);
-                if let Some(units) = Self::residual_units(target_r, wr, sels.len()) {
-                    if sels.len().saturating_mul(units) <= 10_000_000 {
-                        let indicators: Vec<Literal> = sels.iter().map(|s| s.negated()).collect();
-                        let mut tot = TotNode::build(&indicators);
-                        let next_var = &mut self.next_var;
-                        let mut fresh = |sat: &mut SatSolver| {
-                            let var = sat.new_var();
-                            *next_var = var.id() + 1;
-                            sat.set_phase(var, false);
-                            Literal::positive(var)
-                        };
-                        tot.extend(units, &mut self.sat, &mut fresh, guard);
-                        let mut clause = vec![tot.outs[units - 1].negated()];
-                        if let Some(g) = guard {
-                            clause.push(g.negated());
-                        }
-                        self.sat.add_clause(clause);
-                        if debug_trace() {
-                            eprintln!(
-                                "c descent: RESIDUAL totalizer over {} selectors (w={wr} cap={target_r} units={units} lb={} ub={})",
-                                indicators.len(),
-                                self.lb,
-                                self.ub,
-                            );
-                        }
-                        self.descent = Some(DescentEnc::ResidualTot {
-                            tot,
-                            w: wr,
-                            sels,
-                            lb_at_build: self.lb,
-                            last_k: units,
-                        });
-                        return true;
-                    }
-                }
-            }
         }
         let uniform_w = {
             let mut it = soft_idx.iter().map(|&i| self.soft_weights[i]);
@@ -4659,7 +6301,10 @@ impl OllEngine {
                 });
                 return true;
             }
-            self.descent_unavailable = true;
+            // SIZE decline (#cold-core-descent D6), not a permanent one:
+            // `soft_idx` shrinks with every hardened soft and `gap_units`
+            // falls with every ub improvement.
+            self.descent_size_declined = Some(size_sig);
             return false;
         }
 
@@ -4668,7 +6313,9 @@ impl OllEngine {
             .map(|&i| (self.soft_selectors[i].negated(), self.soft_weights[i]))
             .collect();
         if inputs.is_empty() || inputs.len() > 10_000 {
-            self.descent_unavailable = true;
+            // SIZE decline (#cold-core-descent D6): `inputs` is the live
+            // residual, so hardening can bring this under the budget later.
+            self.descent_size_declined = Some(size_sig);
             return false;
         }
         let cap = self.ub.saturating_sub(self.preproc_cost);
@@ -4679,6 +6326,85 @@ impl OllEngine {
         }
 
         if inputs.len() <= 10_000 && !self.tuning.force_adder && !self.tuning.force_cluster {
+            // #dpw-descent: DECIDE BEFORE EMITTING. Both sizes are computed by
+            // closed-form predictors that never touch the solver — `dpw_size`
+            // from the bucket shape, `gte_size` as an exact mirror of
+            // `gte_build`'s own recursion and budget bails. So the loser costs
+            // no variables, no clauses and no rollback, and `gte_size`
+            // declining is by construction the same statement as `gte_build`
+            // declining.
+            //
+            // DPW is ADDITIONAL, never a replacement: it is taken only where
+            // the GTE would have built AND is at least `DPW_MIN_ADVANTAGE`
+            // times bigger. Where the GTE declines on budget, today's
+            // cluster/adder fallback is left exactly as it was — extending DPW
+            // into that regime is a separate, separately measurable change.
+            if dpw_enabled() {
+                // `cap` is `ub - preproc_cost`; the descent asserts
+                // `cost < ub`, i.e. violated weight <= cap - 1, so the loosest
+                // bound the structure will ever carry is `cap - 1`.
+                let k_init = cap - 1;
+                let live_weights: Vec<Weight> =
+                    inputs.iter().map(|&(_, w)| w).filter(|&w| w > 0).collect();
+                let dpw_predicted = (!live_weights.is_empty())
+                    .then(|| dpw_size(&live_weights, k_init, DPW_VAR_BUDGET, DPW_CLAUSE_BUDGET))
+                    .flatten();
+                if let Some(dpw_predicted) = dpw_predicted {
+                    let mut probe_outs: i64 = 400_000;
+                    let mut probe_clauses: i64 = 4_000_000;
+                    let gte_predicted = gte_size(&inputs, cap, &mut probe_outs, &mut probe_clauses);
+                    let take = if self.tuning.force_dpw {
+                        true
+                    } else {
+                        gte_predicted.is_some_and(|(_, gte_clauses, _)| {
+                            dpw_beats_gte(dpw_predicted.clauses, gte_clauses)
+                        })
+                    };
+                    if take {
+                        let next_var = &mut self.next_var;
+                        let mut fresh = |sat: &mut SatSolver| {
+                            let var = sat.new_var();
+                            *next_var = var.id() + 1;
+                            sat.set_phase(var, false);
+                            Literal::positive(var)
+                        };
+                        if let Some(enc) =
+                            DpwEnc::build(&inputs, k_init, &mut self.sat, &mut fresh, guard)
+                        {
+                            debug_assert_eq!(
+                                enc.size, dpw_predicted,
+                                "DPW predictor disagreed with the emitted build; the \
+                                 budget gate was decided on a fiction",
+                            );
+                            if debug_trace() {
+                                let gte_note = match gte_predicted {
+                                    Some((v, c, o)) => {
+                                        format!("GTE would be {v} vars / {c} clauses / {o} outs")
+                                    }
+                                    None => "GTE declines on budget".to_string(),
+                                };
+                                eprintln!(
+                                    "c descent: DPW over {} softs ({} levels, 2^{} top \
+                                     granularity, {} top outs, {} vars, {} clauses, cap {}) \
+                                     [{gte_note}]",
+                                    inputs.len(),
+                                    enc.levels(),
+                                    enc.levels() - 1,
+                                    enc.size.top_width,
+                                    enc.size.vars,
+                                    enc.size.clauses,
+                                    cap,
+                                );
+                            }
+                            // NO bound clauses here, by design: the bound is an
+                            // assumption vector rebuilt every descent round.
+                            self.descent = Some(DescentEnc::Dpw { enc, k_last: None });
+                            return true;
+                        }
+                    }
+                }
+            }
+
             let next_var = &mut self.next_var;
             let mut fresh = |sat: &mut SatSolver| {
                 let var = sat.new_var();
@@ -4839,7 +6565,32 @@ impl OllEngine {
     /// hard bound excluding costs >= the new incumbent. Returns
     /// `Some(outcome)` on a terminal answer, `None` when the slice expired
     /// (caller resumes OLL; the encoding and bounds persist).
+    ///
+    /// #cold-core-descent D1: the descent walks the UB side and never calls
+    /// `process_core`, so no core can arrive here BY CONSTRUCTION. The drought
+    /// clock is therefore stopped for the whole slice — charging descent time
+    /// as "core discovery has gone cold" lets a descent slice manufacture the
+    /// very drought that justifies the next, longer entry, a self-triggering
+    /// ratchet. The discipline lives HERE rather than at the call site so it
+    /// cannot be lost by a future caller.
     fn descend(
+        &mut self,
+        deadline: Instant,
+        should_stop: &dyn Fn() -> bool,
+        on_upper_bound: &mut dyn FnMut(Weight),
+    ) -> Option<OllOutcome> {
+        self.pause_core_drought();
+        let outcome = self.descend_slice(deadline, should_stop, on_upper_bound);
+        if outcome.is_none() {
+            // Slice expired and OLL resumes: the pre-descent drought is still
+            // real evidence, so the clock CONTINUES rather than restarting.
+            self.resume_core_drought();
+        }
+        outcome
+    }
+
+    /// The descent slice proper. Call [`Self::descend`], not this.
+    fn descend_slice(
         &mut self,
         deadline: Instant,
         should_stop: &dyn Fn() -> bool,
@@ -4856,7 +6607,24 @@ impl OllEngine {
             self.stats.sat_calls = self.stats.sat_calls.saturating_add(1);
             self.stats.lsu_steps = self.stats.lsu_steps.saturating_add(1);
             let slice_stop = || should_stop() || Instant::now() >= deadline;
-            let assumptions: Vec<Literal> = self.descent_guard.into_iter().collect();
+            let mut assumptions: Vec<Literal> = self.descent_guard.into_iter().collect();
+            // #dpw-descent: THE ONE PLACE the watchdog's bound literals may
+            // appear. Every other `DescentEnc` states its bound as hard
+            // clauses; DPW cannot, because the tare constant is non-monotone
+            // in `k`. Recomputed from the CURRENT `ub` each round, so a round
+            // that improved the incumbent tightens for free.
+            //
+            // The bound is `violated weight <= target - 1`, matching the GTE
+            // arm's "forbid sums >= cap" exactly. An empty bound part means
+            // VACUOUS — the structure cannot represent a violation of `k`, so
+            // every model already costs `< ub` and the next round is
+            // guaranteed to improve. It must never be clamped into range.
+            if let Some(DescentEnc::Dpw { enc, .. }) = self.descent.as_ref() {
+                let target = self.ub.saturating_sub(self.preproc_cost);
+                if target > 0 {
+                    assumptions.extend(enc.assumptions(target - 1));
+                }
+            }
             let result = self
                 .sat
                 .solve_with_assumptions_interruptible(&assumptions, &slice_stop)
@@ -4884,76 +6652,33 @@ impl OllEngine {
                     if target == 0 {
                         return Some(self.optimal());
                     }
+                    // #descent-residual [SOUND-CRITICAL, debug builds]: the
+                    // relaxation's defining inequality `(★)` (see
+                    // `descent_residual_cap`), checked against a REAL model
+                    // rather than argued on paper. The first version of this
+                    // lever shipped a valid proof and ten wrong answers, and
+                    // the brute-force suite passed it because its instances
+                    // never enter the regime where the bound bites. Lives here,
+                    // ahead of the `as_mut()` borrow below, because it needs
+                    // `&self` for the canonical evaluation.
+                    #[cfg(debug_assertions)]
+                    {
+                        if let Some(rb) = self.residual_bound.as_ref() {
+                            let sigma = self.canonical_sigma(rb.terms.iter().copied(), &model);
+                            assert!(
+                                sigma <= cost.saturating_sub(rb.lb_at_build),
+                                "residual identity violated: Σ={sigma} > cost({cost}) - \
+                                 lb_at_build({}); the residual descent cut is UNSOUND \
+                                 on this instance",
+                                rb.lb_at_build,
+                            );
+                        }
+                    }
+                    // #descent-residual: re-assert the redundant residual cut at
+                    // the new `ub`, alongside the exact tighten below.
+                    self.tighten_residual_bound();
                     // Tighten the bound below the fresh model's cost.
                     match self.descent.as_mut().expect("descent encoding present") {
-                        DescentEnc::ResidualTot {
-                            tot,
-                            w,
-                            sels,
-                            lb_at_build,
-                            last_k,
-                        } => {
-                            // Bound derived ONLY from `ub` — never from the
-                            // model just found. For an EXACT encoding "beat
-                            // this model" is valid; for a relaxation it is not,
-                            // because a model with the same Σ can be cheaper.
-                            // The relaxation's defining inequality, asserted on
-                            // every real model rather than argued on paper. The
-                            // first version of this lever shipped a valid proof
-                            // and ten wrong answers; the 41-test brute-force
-                            // suite passed it, because its instances never enter
-                            // the regime where the bound bites. This catches a
-                            // violation at the first model instead of at the
-                            // next benchmark.
-                            debug_assert!(
-                                {
-                                    let sigma = sels
-                                        .iter()
-                                        .filter(|&&sl| {
-                                            model.get(sl.variable().index()).copied()
-                                                != Some(sl.is_positive())
-                                        })
-                                        .count()
-                                        as Weight
-                                        * *w;
-                                    sigma <= cost.saturating_sub(*lb_at_build)
-                                },
-                                "residual identity violated: Σ > cost - lb_at_build",
-                            );
-                            let target_r = self.ub.saturating_sub(*lb_at_build);
-                            match Self::residual_units(target_r, *w, sels.len()) {
-                                Some(units) if units < *last_k => {
-                                    *last_k = units;
-                                    let next_var = &mut self.next_var;
-                                    let mut fresh = |sat: &mut SatSolver| {
-                                        let var = sat.new_var();
-                                        *next_var = var.id() + 1;
-                                        sat.set_phase(var, false);
-                                        Literal::positive(var)
-                                    };
-                                    tot.extend(units, &mut self.sat, &mut fresh, guard);
-                                    let mut clause = vec![tot.outs[units - 1].negated()];
-                                    if let Some(g) = guard {
-                                        clause.push(g.negated());
-                                    }
-                                    self.sat.add_clause(clause);
-                                }
-                                _ => {
-                                    // Cannot tighten (or the bound became
-                                    // vacuous): this relaxation is spent. Fall
-                                    // back to the exact original-objective
-                                    // encoding, the only one that can certify.
-                                    if debug_trace() {
-                                        eprintln!(
-                                            "c descent: residual bound spent (last_k={last_k}) -> exact encoding",
-                                        );
-                                    }
-                                    self.residual_exhausted = true;
-                                    self.descent = None;
-                                    return None;
-                                }
-                            }
-                        }
                         DescentEnc::Tot { tot, w, soft_idx } => {
                             // Count violations over the residual softs the
                             // encoding covers; hardened softs are satisfied
@@ -5013,7 +6738,7 @@ impl OllEngine {
                             // would forbid "every member violated", a model that
                             // can still be cheaper than the incumbent. That is
                             // exactly the mistake that made #descent-residual
-                            // produce ten wrong answers (see `ResidualTot`);
+                            // produce ten wrong answers (see `ResidualBound`);
                             // it is unreachable here only because this path is
                             // gated behind `tuning.force_cluster` (default OFF).
                             // A vacuous bound falls through to the exact-adder
@@ -5096,6 +6821,21 @@ impl OllEngine {
                                 assert_sum_le(&mut self.sat, &bits, target - 1, guard);
                             }
                         }
+                        DescentEnc::Dpw { enc: _, k_last } => {
+                            // ZERO clauses — the whole reason the encoding
+                            // exists. The four (generally p) assumption
+                            // literals rebuilt at the top of the loop carry
+                            // the new bound; `sat.add_clause` must NOT be
+                            // called here, and committing the tare as units
+                            // would be unsound because `T*` is non-monotone
+                            // in `k`.
+                            let k = target - 1;
+                            debug_assert!(
+                                k_last.is_none_or(|prev| k < prev),
+                                "descent round did not tighten: k {k} vs {k_last:?}",
+                            );
+                            *k_last = Some(k);
+                        }
                     }
                 }
                 AssumeResult::Unsat(..) => {
@@ -5155,6 +6895,8 @@ impl OllEngine {
         self.stats.strat_levels = self.stats.strat_levels.saturating_add(1);
         self.activate_stratum(self.level);
 
+        self.pay_mined_cores();
+
         // Sum selectors created since the last SAT answer. They are not
         // assumed yet ("totalizer delay"): the solver keeps discovering
         // disjoint cores among the remaining selectors without fighting the
@@ -5182,6 +6924,8 @@ impl OllEngine {
         // #fold-descent-kick: one-shot descent engagement after a clique
         // fold lands lb within the endgame band (see the probe block).
         let mut descent_kick = false;
+        // #cold-core-descent: one-shot trace of the rate signal (see the gate).
+        let mut cold_signal_traced = false;
 
         // Exhaust the band set immediately: each UNSAT probe proves one more
         // forced violation among the band members and lifts lb by band_min.
@@ -5320,16 +7064,13 @@ impl OllEngine {
             // reversible KICK path (10s slice; OLL resumes on expiry) and
             // honors descent_not_before so an unproductive slice cannot
             // re-enter for 15s.
-            // #descent-gap-tile: raise the kick cap to meet the organic
-            // `gap_ok` floor so the two entry mechanisms tile the gap range.
-            // Only the uniform-weight arm of `gap_ok` has a floor (the mixed
-            // arm degenerates to `ub > lb`), so only that arm leaves a hole.
-            let kick_gap_cap = match (descent_gap_tile_enabled(), self.residual_uniform_weight()) {
-                (true, Some(w)) => {
-                    DESCENT_KICK_GAP.max(w.saturating_mul(self.tuning.lsu_min_gap_units))
-                }
-                _ => DESCENT_KICK_GAP,
-            };
+            // The kick bar is SCALE-RELATIVE (see `descent_kick_gap_cap`): a
+            // flat `ub - lb <= 32` is a dimensional error against a track whose
+            // optima span ten orders of magnitude, and it shuts the kick for
+            // the entire run on 44% of the addressable set. This subsumes the
+            // retired `#descent-gap-tile` flag, whose widening only reached the
+            // uniform-weight arm and so was inert on mixed-weight families.
+            let kick_gap_cap = self.descent_kick_gap_cap();
             if !descent_kick
                 && self.best_model.is_some()
                 && self.ub.saturating_sub(self.effective_lb()) <= kick_gap_cap
@@ -5372,24 +7113,90 @@ impl OllEngine {
                     );
                 }
             }
-            if self.best_model.is_some()
-                && (descent_kick
-                    || (self.stats.cores_found >= self.tuning.lsu_min_cores
-                        && oll_stalling
-                        && gap_ok
-                        && Instant::now() >= descent_not_before))
-                && self.softs.len() <= 50_000
-                && !self.descent_unavailable
-            {
-                let kick_entry = descent_kick;
+            // #cold-core-descent: the RATE arm of the organic gate's core
+            // conjunct. Computed unconditionally (a handful of comparisons) so
+            // the trace below reports the signal even in the
+            // `AY_AB_MAXSAT_COLD_DESCENT=0` leg — that is what makes the A/B
+            // legible: leg A shows when the signal WOULD have fired, leg B
+            // shows the descent that followed it.
+            let cores_cold = self.core_discovery_cold(started);
+            // The rate arm with the organic gate's remaining conjuncts — i.e.
+            // "the gate is open on rate evidence alone".
+            //
+            // NOT conjoined with `oll_stalling`, and that is a measured choice,
+            // not an oversight. The value gate asks whether lb is moving; this
+            // arm asks whether CORES are arriving, and an instance can pass the
+            // first by a hair while failing the second completely. Traced on
+            // af-synthesis_wt-af-synthesis_stb_50_120_5 at 900s: no core after
+            // #16 at t=15.0, the next loop iteration lands 70s later, and there
+            // `oll_stalling` is FALSE because the window's lb gain (3) just
+            // clears gap/12 (32/12 = 2.66) — 70 seconds without a core, held out
+            // of the gate by three units of lb. Conjoining the two makes the rate
+            // arm unreachable on exactly the family it was built for.
+            let cold_ready = cores_cold
+                && gap_ok
+                && self.best_model.is_some()
+                && Instant::now() >= descent_not_before;
+            if debug_trace() && !cold_signal_traced && cold_ready {
+                // The first instant the RATE arm opens the gate. Printed even in
+                // the `AY_AB_MAXSAT_COLD_DESCENT=0` leg (the predicate itself is
+                // hatch-free) so an A/B shows when the arm WOULD have fired.
+                cold_signal_traced = true;
+                eprintln!(
+                    "c cold-core signal: cores={} search_cores={} min_cores={} drought_ms={} \
+                     bar_ms={} median_ms={} window={} enabled={} lb={} ub={}",
+                    self.stats.cores_found,
+                    self.core_search_cores,
+                    self.tuning.lsu_min_cores,
+                    self.core_drought().as_millis(),
+                    self.cold_core_bar_ms(),
+                    self.core_gap_median_ms,
+                    self.core_gaps_ms.len(),
+                    cold_core_descent_enabled(),
+                    self.effective_lb(),
+                    self.ub,
+                );
+            }
+            let arm = classify_descent_arm(
+                self.best_model.is_some(),
+                cold_core_descent_enabled(),
+                cold_ready,
+                descent_kick,
+                self.stats.cores_found >= self.tuning.lsu_min_cores
+                    && oll_stalling
+                    && gap_ok
+                    && Instant::now() >= descent_not_before,
+            );
+            if arm != DescentArm::None && self.softs.len() <= 50_000 && self.descent_reachable() {
+                let kick_entry = arm == DescentArm::Kick;
                 descent_kick = false;
-                // #wce flush (c): the descent is a one-way commit — give it
-                // a consistent, fully materialized encoding, and let the
-                // flush exhausts' lb/ub motion shape the encoding built
-                // below. `!descent_unavailable` above keeps the pre-flush
-                // gate equivalent to the old `ensure_descent_enc()` outcome
-                // on instances that can never descend, so those don't get
-                // their pending batches drained every stalling iteration.
+                // #cold-core-descent D9: name the arm that ACTUALLY opened the
+                // gate. Labelling by core count (the first cut) reports every
+                // cold-rate entry on an instance that has also passed
+                // `lsu_min_cores` as a `count` entry, which is exactly the
+                // attribution the planned corpus sweep depends on.
+                if debug_trace() {
+                    eprintln!(
+                        "c descent entry: arm={} cores={} min_cores={} drought_ms={} bar_ms={}",
+                        match arm {
+                            DescentArm::Kick => "kick",
+                            DescentArm::Cold => "cold-rate",
+                            DescentArm::Count => "count",
+                            DescentArm::None => unreachable!("gate is open"),
+                        },
+                        self.stats.cores_found,
+                        self.tuning.lsu_min_cores,
+                        self.core_drought().as_millis(),
+                        self.cold_core_bar_ms(),
+                    );
+                }
+                // #wce flush (c): give the descent a consistent, fully
+                // materialized encoding, and let the flush exhausts' lb/ub
+                // motion shape the encoding built below. `descent_reachable()`
+                // above keeps the pre-flush gate equivalent to the
+                // `ensure_descent_enc()` outcome on instances that cannot
+                // currently descend, so those don't get their pending batches
+                // drained every stalling iteration.
                 if !self.flush_pending(
                     &mut suspended,
                     true,
@@ -5436,8 +7243,21 @@ impl OllEngine {
                     // cannot own the rest of the run with lb frozen. A
                     // productive one still runs to completion via the same
                     // "improved ⇒ another slice" rule the kicks use.
-                    let organic_slice = descent_organic_slice_enabled();
-                    let bounded = kick_entry || organic_slice;
+                    //
+                    // #cold-core-descent D5: the COLD arm is bounded too, and
+                    // unconditionally. It carries the WEAKEST evidence of the
+                    // three — no core count, no lb-stall test, no gap cap
+                    // beyond `gap_ok` — so handing it the one-way commit gave
+                    // the least-evidenced arm the most irreversible treatment.
+                    // The one-way commit freezes lb for the rest of the budget
+                    // (`descend` only ever moves ub), and on the slow-walk
+                    // families the rate arm is most likely to misfire on
+                    // (rna-alignment, protein_ins) the core walk is the
+                    // PRODUCTIVE path. A dry slice hands control back; a
+                    // converging one still runs to completion under the same
+                    // "improved ⇒ another slice" rule. Escalating a cold entry
+                    // to a one-way commit is a change that needs its own
+                    // paired A/B and its own evidence, not a default.
                     // Budget-scaled when a deadline is known, fixed otherwise
                     // (budget-blind callers keep their previous behaviour).
                     let organic_len = match self.budget_remaining() {
@@ -5455,13 +7275,19 @@ impl OllEngine {
                             .clamp(DESCENT_KICK_SLICE, ORGANIC_DESCENT_SLICE_MAX),
                         _ => DESCENT_KICK_SLICE,
                     };
+                    let slice = descent_slice_len(
+                        arm,
+                        descent_organic_slice_enabled(),
+                        kick_len,
+                        organic_len,
+                    );
+                    let bounded = slice.is_some();
+                    // (`descend` stops the drought clock for the slice —
+                    // #cold-core-descent D1.)
                     let outcome = loop {
-                        let deadline = if kick_entry {
-                            Instant::now() + kick_len
-                        } else if organic_slice {
-                            Instant::now() + organic_len
-                        } else {
-                            Instant::now() + Duration::from_hours(8760)
+                        let deadline = match slice {
+                            Some(len) => Instant::now() + len,
+                            None => Instant::now() + Duration::from_hours(8760),
                         };
                         let ub_before = self.ub;
                         let outcome = self.descend(deadline, should_stop, on_upper_bound);
@@ -5575,7 +7401,13 @@ impl OllEngine {
                 // climit/WCE stratification discipline: an unconditional
                 // weighted leg regressed -47 (drmx/frb/haplotyping/metro
                 // across 14 families).
+                // #core-mine: `pay_mined_cores` can fill `pending_relax` before
+                // the first SAT call, and `run_am1_probe` opens with
+                // `debug_assert!(self.pending_relax.is_empty())`. The other
+                // probe site already carries this guard; without it here, any
+                // mineable instance panics in debug/test builds.
                 if self.active.len() <= EAGER_PROBE_MAX_ACTIVE
+                    && self.pending_relax.is_empty()
                     && (!self.lp_eligible || self.level <= 1)
                 {
                     let failed_before = self.stats.am1_probe_failed;
@@ -5730,6 +7562,7 @@ impl OllEngine {
                     self.level = self.next_level();
                     self.stats.strat_levels = self.stats.strat_levels.saturating_add(1);
                     self.activate_stratum(self.level);
+                    self.pay_mined_cores();
                     self.harden();
                     // #maxsat-am1-probe + #frb-bmo-probe-after-solve: request
                     // an AM1 probe pass, but run it only AFTER the next SAT
@@ -5814,7 +7647,9 @@ impl OllEngine {
                             None => OllOutcome::Unsatisfiable,
                         };
                     }
-                    let new_sums = self.process_core(&core);
+                    let lb_pre = self.lb;
+                    let new_sums = self.process_core(&core, CoreOrigin::Search);
+                    self.record_sat_core(&core, lb_pre);
                     suspended.extend(new_sums.iter().copied());
 
                     // Exhaust the freshest sum under a budget capped to a
@@ -6055,6 +7890,7 @@ mod lsu_tests {
                 force_adder: false,
                 abstraction_min_cores: 0,
                 force_cluster: false,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Auto,
                 // #tot-eqs pinned ON so the reverse-direction clauses are exercised
                 // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6169,6 +8005,7 @@ mod lsu_tests {
                 force_adder: false,
                 abstraction_min_cores: 0,
                 force_cluster: false,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Auto,
                 // #tot-eqs pinned ON so the reverse-direction clauses are exercised
                 // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6196,6 +8033,230 @@ mod lsu_tests {
         assert!(
             lsu_exercised > 0,
             "aggressive tuning must actually drive instances through the GTE descent",
+        );
+    }
+
+    /// #dpw-descent END-TO-END. The same mixed-weight fixture as
+    /// `random_cross_check_gte_aggressive`, with `force_dpw` pinning the
+    /// watchdog descent in place of the GTE, cross-checked against weighted
+    /// brute force.
+    ///
+    /// This is the net for the INTEGRATION rather than the encoding (which
+    /// `crate::dpw`'s own nets cover exhaustively): the bound lives entirely
+    /// in the assumption vector rebuilt each round, so a target computed from
+    /// the wrong quantity, a bound left stale after an `ub` improvement, or a
+    /// tighten arm that quietly stopped cutting all show up here as a cost
+    /// mismatch or a hang.
+    ///
+    /// Kill mutation (`descent_bound_too_strong`): in `descend_slice`, change
+    /// the DPW assumption injection `enc.assumptions(target - 1)` to
+    /// `enc.assumptions(target.saturating_sub(2))`. Measured: seed 19 then
+    /// reports cost 10 against a brute-force optimum of 9 — a WRONG ANSWER,
+    /// which is the direction that disqualifies at MSE, off a one-line change
+    /// to the bound.
+    ///
+    /// (The mirror-image slip `enc.assumptions(target)` is NOT caught by this
+    /// test, and that is the honest situation rather than a gap worth closing
+    /// here: an over-LOOSE bound cannot make the descent claim an optimum it
+    /// has not got, it only makes the descent stop cutting, and OLL still
+    /// proves the instance by core enumeration. Release builds lose a lever,
+    /// not an answer. Debug builds do catch it — measured — on
+    /// `DpwEnc::assumptions`'s `k <= k_init` assertion, since the first
+    /// descent round asks for exactly `k_init + 1`.)
+    #[test]
+    fn random_cross_check_dpw_aggressive() {
+        let mut dpw_exercised = 0u64;
+        for seed in 0..900u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(13));
+            let num_vars = 3 + rng.below(6) as u32;
+            let num_hard = rng.below(6) as usize;
+            let num_soft = 1 + rng.below(12) as usize;
+
+            let gen_clause = |rng: &mut Lcg| -> Vec<i32> {
+                let len = 1 + rng.below(3) as usize;
+                (0..len)
+                    .map(|_| {
+                        let v = 1 + rng.below(num_vars as u64) as i32;
+                        if rng.below(2) == 0 {
+                            v
+                        } else {
+                            -v
+                        }
+                    })
+                    .collect()
+            };
+
+            let hard: Vec<Vec<i32>> = (0..num_hard).map(|_| gen_clause(&mut rng)).collect();
+            let soft: Vec<Vec<i32>> = (0..num_soft).map(|_| gen_clause(&mut rng)).collect();
+            // Mixed weights across several bit-widths so `p` (and with it the
+            // tare vector and the carry chain) varies seed to seed. Uniform
+            // weights never reach here: they are claimed by the count
+            // totalizer well before the mixed-weight block.
+            let weights: Vec<u64> = {
+                let w_max = [3u64, 9, 17, 33][rng.below(4) as usize];
+                (0..num_soft).map(|_| 1 + rng.below(w_max)).collect()
+            };
+
+            let clause_sat = |clause: &[i32], bits: u64| {
+                clause.iter().any(|&lit| {
+                    let var = lit.unsigned_abs();
+                    let val = (bits >> (var - 1)) & 1 == 1;
+                    (lit > 0) == val
+                })
+            };
+            let mut expected: Option<u64> = None;
+            for bits in 0..(1u64 << num_vars) {
+                if hard.iter().any(|c| !clause_sat(c, bits)) {
+                    continue;
+                }
+                let cost: u64 = soft
+                    .iter()
+                    .zip(&weights)
+                    .filter(|(c, _)| !clause_sat(c, bits))
+                    .map(|(_, w)| *w)
+                    .sum();
+                expected = Some(expected.map_or(cost, |b: u64| b.min(cost)));
+            }
+
+            let mut hard_store = ClauseStore::new();
+            for c in &hard {
+                hard_store.push_from_iter(c.iter().map(|&l| Literal::from(l)));
+            }
+            let mut soft_store = ClauseStore::new();
+            for c in &soft {
+                soft_store.push_from_iter(c.iter().map(|&l| Literal::from(l)));
+            }
+            let mut engine = OllEngine::new(num_vars + 1, hard_store, soft_store, weights.clone());
+            engine.set_tuning(OllTuning {
+                lsu_min_cores: 0,
+                lsu_min_gap_units: 0,
+                lsu_stall_ms_per_core: 0,
+                force_adder: false,
+                abstraction_min_cores: 0,
+                force_cluster: false,
+                force_dpw: true,
+                lp_boost: LpBoostMode::Auto,
+                tot_eqs: Some(true),
+                core_clause: Some(true),
+            });
+
+            let outcome = engine.solve(&|| false, &mut |_| {});
+            // Not every seed reaches the watchdog: the count totalizer claims
+            // any instance whose LIVE residual has become uniform-weight
+            // (hardening can produce that from a mixed fixture), and an
+            // instance with no gap never builds a descent at all. The bar
+            // below is that the path is genuinely exercised, in the style of
+            // `random_cross_check_cluster_aggressive`.
+            if matches!(engine.descent, Some(DescentEnc::Dpw { .. })) {
+                dpw_exercised += 1;
+            }
+            // What must NEVER happen: `force_dpw` reaching the mixed-weight
+            // block and still landing on the GTE. The watchdog either builds
+            // or the instance never got that far.
+            assert!(
+                !matches!(engine.descent, Some(DescentEnc::Gte { .. })),
+                "seed {seed}: force_dpw fell through to the GTE\nweights: {weights:?}",
+            );
+            match (outcome, expected) {
+                (OllOutcome::Optimal { cost, .. }, Some(exp)) => {
+                    assert_eq!(
+                        cost, exp,
+                        "seed {seed}: DPW-aggressive cost {cost} != brute force {exp}\nhard: {hard:?}\nsoft: {soft:?}\nweights: {weights:?}",
+                    );
+                }
+                (OllOutcome::Unsatisfiable, None) => {}
+                (got, exp) => panic!(
+                    "seed {seed}: {got:?} vs brute force {exp:?}\nhard: {hard:?}\nsoft: {soft:?}",
+                ),
+            }
+        }
+        assert!(
+            dpw_exercised > 50,
+            "force_dpw must actually drive instances through the watchdog \
+             descent: only {dpw_exercised} of 900",
+        );
+    }
+
+    /// #dpw-descent SELECTION. With the production gate (no `force_dpw`), the
+    /// watchdog may only displace a GTE it is `DPW_MIN_ADVANTAGE` times
+    /// smaller than — DPW is a strictly weaker propagator, so a marginal size
+    /// win is not a reason to take it. Checked directly on the predictors,
+    /// which is what `select_descent_enc` decides on.
+    ///
+    /// Kill mutation (`advantage_ignored`): in [`dpw_beats_gte`], change
+    /// `dpw_clauses.saturating_mul(DPW_MIN_ADVANTAGE) <= gte_clauses` to
+    /// `dpw_clauses <= gte_clauses` (DPW is 51 clauses against the GTE's 54 on
+    /// the small fixture, so dropping the margin flips it).
+    #[test]
+    fn dpw_selection_requires_a_decisive_size_win() {
+        // The real af-synthesis shape (170 unit softs, weights 1..9, cap 115):
+        // the family DPW exists for.
+        let hist: [(Weight, usize); 9] = [
+            (1, 17),
+            (2, 20),
+            (3, 20),
+            (4, 16),
+            (5, 15),
+            (6, 18),
+            (7, 22),
+            (8, 23),
+            (9, 19),
+        ];
+        let mut af_synthesis: Vec<Weight> = Vec::new();
+        for (w, count) in hist {
+            for _ in 0..count {
+                af_synthesis.push(w);
+            }
+        }
+        // GTE size is ORDER-SENSITIVE — its balanced split gives subtrees far
+        // fewer distinct sums when the weights arrive sorted (45,341 clauses
+        // here) than in any realistic order (117,870-120,363 over five random
+        // permutations; 118,460 in the instance's own file order, which is the
+        // order `select_descent_enc` actually hands `gte_build`). Shuffle, so
+        // the fixture is not measuring an artefact of how it was constructed.
+        {
+            let mut rng = Lcg(0x5EED);
+            for i in (1..af_synthesis.len()).rev() {
+                af_synthesis.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+        }
+
+        let decide = |weights: &[Weight], cap: Weight| -> Option<(usize, usize, bool)> {
+            let inputs: Vec<(Literal, Weight)> = weights
+                .iter()
+                .map(|&w| (Literal::positive(Variable::new(1)), w))
+                .collect();
+            let dpw = dpw_size(weights, cap - 1, DPW_VAR_BUDGET, DPW_CLAUSE_BUDGET)?;
+            let mut ob = 400_000i64;
+            let mut cb = 4_000_000i64;
+            let (_, gte_clauses, _) = gte_size(&inputs, cap, &mut ob, &mut cb)?;
+            Some((
+                dpw.clauses,
+                gte_clauses,
+                dpw_beats_gte(dpw.clauses, gte_clauses),
+            ))
+        };
+
+        let (dpw_c, gte_c, take) = decide(&af_synthesis, 115).expect("both encodings fit");
+        assert!(
+            take,
+            "af-synthesis_stb_50_120_5 is the target shape: DPW {dpw_c} vs GTE \
+             {gte_c} clauses must select the watchdog",
+        );
+        assert!(
+            gte_c >= dpw_c * 6,
+            "the family's measured advantage is 6.0x-11.0x; got {}x (DPW {dpw_c}, \
+             GTE {gte_c})",
+            gte_c / dpw_c.max(1),
+        );
+
+        // A tiny mixed-weight instance: GTE is cheap here and DPW's advantage
+        // is asymptotic in the cap, so today's encoding must be kept.
+        let tiny: Vec<Weight> = vec![1, 2, 3, 4, 5, 6];
+        let (dpw_c, gte_c, take) = decide(&tiny, 8).expect("both encodings fit");
+        assert!(
+            !take,
+            "a small cap must keep the GTE (DPW {dpw_c} vs GTE {gte_c})",
         );
     }
 
@@ -6278,6 +8339,7 @@ mod lsu_tests {
                 force_adder: false,
                 abstraction_min_cores: 0,
                 force_cluster: true,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Auto,
                 // #tot-eqs pinned ON so the reverse-direction clauses are exercised
                 // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6385,6 +8447,7 @@ mod lsu_tests {
                 force_adder: true,
                 abstraction_min_cores: 0,
                 force_cluster: false,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Auto,
                 // #tot-eqs pinned ON so the reverse-direction clauses are exercised
                 // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6444,6 +8507,7 @@ mod lsu_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Off,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6461,6 +8525,65 @@ mod lsu_tests {
             0,
             "descent must not engage before lsu_min_cores cores are processed",
         );
+    }
+
+    /// #descent-residual [SOUND-CRITICAL]. `residual_objective` feeds the cut's
+    /// `Σ`, and `(★)` only licenses `Σ <= cost - lb` for terms taken ONCE at
+    /// their residual weight. Encoding a selector twice, or above its residual,
+    /// inflates `Σ` and starts excluding models CHEAPER than the incumbent —
+    /// i.e. wrong answers. Dropping terms, or taking a lower weight, only
+    /// weakens the cut. So the dedup keeps one entry per selector at the
+    /// SMALLEST weight seen, and hardened / zero-weight terms are dropped.
+    #[test]
+    fn residual_objective_dedups_a_selector_at_its_smallest_weight() {
+        let mut soft_store = ClauseStore::new();
+        soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
+        let mut engine = OllEngine::new(6, ClauseStore::new(), soft_store, vec![1u64]);
+        let (a, b, c, d) = (
+            Literal::from(2i32),
+            Literal::from(3i32),
+            Literal::from(4i32),
+            Literal::from(5i32),
+        );
+        engine.active.clear();
+        engine.pool.clear();
+        engine.hardened_sels.clear();
+        // `a` in both stores at different weights (defensive: activate_level
+        // moves entries, so nothing is in both today).
+        engine.active.insert(a, 40);
+        engine.pool.push((a, 7));
+        engine.active.insert(b, 5);
+        // Dropped: zero residual weight, and hardened (satisfied in every
+        // remaining model).
+        engine.active.insert(c, 0);
+        engine.active.insert(d, 9);
+        engine.hardened_sels.insert(d);
+
+        let terms = engine.residual_objective();
+        assert_eq!(
+            terms.iter().filter(|&&(s, _)| s == a).count(),
+            1,
+            "a selector must be encoded at most once: {terms:?}",
+        );
+        assert_eq!(
+            terms.iter().find(|&&(s, _)| s == a).map(|&(_, w)| w),
+            Some(7),
+            "a duplicated selector must take its SMALLEST weight: {terms:?}",
+        );
+        assert_eq!(
+            terms.iter().find(|&&(s, _)| s == b).map(|&(_, w)| w),
+            Some(5)
+        );
+        assert!(
+            !terms.iter().any(|&(s, _)| s == c),
+            "zero-weight terms carry no cost: {terms:?}",
+        );
+        assert!(
+            !terms.iter().any(|&(s, _)| s == d),
+            "hardened selectors are satisfied in every remaining model: {terms:?}",
+        );
+        // Sorted, so the encoding cannot depend on `active`'s hash order.
+        assert!(terms.windows(2).all(|w| w[0].0 < w[1].0), "{terms:?}");
     }
 }
 
@@ -6494,6 +8617,7 @@ mod level_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Auto,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6696,6 +8820,7 @@ mod wce_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Off,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -6835,6 +8960,7 @@ mod minimize_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Off,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -7001,7 +9127,7 @@ mod minimize_tests {
             );
             // Downstream wiring: the lb payment and the WCE queue entry use
             // the POST-minimization w_min.
-            engine.process_core(&out);
+            engine.process_core(&out, CoreOrigin::Search);
             assert_eq!(
                 engine.lb, w_hi,
                 "seed {seed}: lb must be paid at the post-minimization w_min",
@@ -7134,6 +9260,7 @@ mod lp_boost_tests {
                 // original and the pure-original store fills up.
                 abstraction_min_cores: u64::MAX,
                 force_cluster: false,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Force,
                 // #tot-eqs pinned ON so the reverse-direction clauses are exercised
                 // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -7191,6 +9318,7 @@ mod lp_boost_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Auto,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -7296,6 +9424,561 @@ mod lp_boost_tests {
         tri.lp_cores.push(vec![0, 2]);
         assert_eq!(tri.lp_certified_bound(&[0.5, 0.5, 0.5]), 1);
     }
+
+    /// The kick gap bar is scale-relative, and its floor is the old absolute
+    /// constant. Three properties, in the order they protect something:
+    ///
+    /// 1. It is NEVER below `DESCENT_KICK_GAP`. That is the structural reason
+    ///    this change cannot take a descent entry away from an instance that
+    ///    had one, i.e. it cannot un-solve any of the 334 currently solved.
+    /// 2. It measures the gap in the finest granularity the residual objective
+    ///    can move by — the MINIMUM live weight — and hardened softs are not
+    ///    live, matching what `ensure_descent_enc` will actually encode over.
+    /// 3. It does NOT widen where the projected encoding is the wide adder
+    ///    rather than the cheap GTE, because there the extra alternation is
+    ///    pure duty-cycle tax with no descent to show for it.
+    #[test]
+    fn descent_kick_gap_bar_is_scale_relative_and_never_narrows() {
+        let mk = |weights: Vec<Weight>| {
+            let mut soft_store = ClauseStore::new();
+            for i in 1..=weights.len() as i32 {
+                soft_store.push_from_iter([i].iter().map(|&l| Literal::from(l)));
+            }
+            OllEngine::new(
+                weights.len() as u32 + 1,
+                ClauseStore::new(),
+                soft_store,
+                weights,
+            )
+        };
+
+        // Mixed weights {7, 5, 5}: min live weight 5, tiny objective, so the
+        // descent projection is a cheap GTE and the bar scales to 5 * 128.
+        // No weight dominates the rest (7 < 5 + 5), so #maxsat-bmo-promote
+        // leaves the raw soft indices this white-box fixture relies on alone.
+        let mut engine = mk(vec![7, 5, 5]);
+        let units = engine.tuning.lsu_min_gap_units;
+        assert_eq!(engine.descent_kick_gap_cap(), 5 * units);
+        assert!(engine.descent_kick_gap_cap() >= DESCENT_KICK_GAP);
+
+        // Hardened softs are satisfied in every remaining model, so they leave
+        // the residual: the granularity becomes the weight-7 soft's.
+        engine.hardened_sels.insert(engine.soft_selectors[1]);
+        engine.hardened_sels.insert(engine.soft_selectors[2]);
+        assert_eq!(engine.descent_kick_gap_cap(), 7 * units);
+
+        // Everything hardened => no live granularity to speak of => the floor.
+        engine.hardened_sels.insert(engine.soft_selectors[0]);
+        assert_eq!(engine.descent_kick_gap_cap(), DESCENT_KICK_GAP);
+
+        // Weights whose live mass blows the GTE output budget project onto the
+        // propagation-dead wide adder. Widening there would buy alternation and
+        // no descent, so the bar stays absolute — note the scaled bar would
+        // have been 300_000 * 128, i.e. this is not a coincidence of clamping.
+        let wide = mk(vec![500_000, 300_000, 300_000]);
+        assert!(500_000 + 300_000 + 300_000 > GTE_CHEAP_OUTS);
+        assert_eq!(wide.descent_kick_gap_cap(), DESCENT_KICK_GAP);
+
+        // The A/B escape restores the pre-2026-08-02 absolute bar. It reads the
+        // process environment through a OnceLock, so this asserts the default
+        // (unset => scale-relative) rather than flipping it mid-process.
+        assert!(!kick_gap_abs_enabled(), "escape hatch must default OFF");
+    }
+
+    /// #cold-core-descent: the tuned constants, pinned to LITERALS.
+    ///
+    /// Stating an expectation in terms of the constant it is meant to pin
+    /// (`assert_eq!(bar, COLD_CORE_MIN_DROUGHT.as_millis())`) is a tautology
+    /// that survives any retuning, so three of the four constants were
+    /// effectively unpinned. Every number below is written out, so changing a
+    /// tuned value is a deliberate act that must edit this test too.
+    #[test]
+    fn cold_core_tuned_constants_are_pinned() {
+        assert_eq!(COLD_CORE_WINDOW, 16, "trailing rate-baseline window");
+        assert_eq!(COLD_CORE_MIN_SAMPLE, 8, "minimum search-derived intervals");
+        assert_eq!(
+            COLD_CORE_DROUGHT_MULT, 12,
+            "multiple of the own-rate median"
+        );
+        assert_eq!(
+            COLD_CORE_MIN_DROUGHT,
+            Duration::from_secs(30),
+            "absolute floor under the relative bar (one organic descent slice)",
+        );
+        assert_eq!(
+            COLD_CORE_MIN_ELAPSED,
+            Duration::from_secs(20),
+            "no rate entry inside the opening of a run",
+        );
+        // The window must leave room for the minimum sample, or the gate can
+        // never open.
+        assert!(COLD_CORE_WINDOW >= COLD_CORE_MIN_SAMPLE);
+    }
+
+    /// #cold-core-descent. The rate gate's whole job is to be RELATIVE: the
+    /// same 30s drought must read as a collapse on an instance that was mining
+    /// cores in milliseconds and as ordinary progress on one that pays seconds
+    /// per core. The second half is the safety half — rna-alignment and
+    /// protein_ins win by walking cores slowly, and a premature entry there
+    /// would lose instances AY solves today — so it is asserted as tightly as
+    /// the firing half.
+    ///
+    /// It also asserts that the relative term BINDS. Under the shipped first-N
+    /// baseline it did not: measured over every core of 117 runs it bound on 1
+    /// of 63 traces, and there by 2.5%, so `cold_core_bar_ms` was in practice
+    /// the flat 30s floor while its doc claimed adaptivity.
+    ///
+    /// Also pins the brakes that keep the gate off the opening of a run: a
+    /// minimum interval sample, a minimum elapsed time, an incumbent to
+    /// improve, and the `lsu_min_cores == u64::MAX` "descents never engage"
+    /// tuning sentinel.
+    #[test]
+    fn cold_core_gate_measures_the_drought_against_the_instances_own_rate() {
+        // An engine with an incumbent and a synthetic search history: `n`
+        // intervals of `gap_ms`, then a drought of exactly `drought` running
+        // right now.
+        let mk = |gap_ms: u64, n: usize, drought: Duration| {
+            let mut soft_store = ClauseStore::new();
+            for i in 1..=3i32 {
+                soft_store.push_from_iter([i].iter().map(|&l| Literal::from(l)));
+            }
+            // {7,5,5}: no weight dominates the rest, so #maxsat-bmo-promote
+            // leaves this white-box fixture alone.
+            let mut engine = OllEngine::new(4, ClauseStore::new(), soft_store, vec![7, 5, 5]);
+            engine.best_model = Some(vec![false; 4]);
+            let last = Instant::now() - drought;
+            let base = last - Duration::from_millis(gap_ms * n as u64);
+            for i in 0..=n {
+                engine.note_search_core(base + Duration::from_millis(gap_ms * i as u64));
+            }
+            engine
+        };
+        let started = |elapsed: Duration| Instant::now() - elapsed;
+        let run = Duration::from_secs(300);
+
+        // Cheap cores (200ms trailing median): 12 * 200ms is a lull, not a
+        // collapse, so the absolute floor is the binding bar. 30_000 written
+        // out, not `COLD_CORE_MIN_DROUGHT.as_millis()`.
+        let fast = mk(200, 16, Duration::from_secs(5));
+        assert_eq!(fast.core_gap_median_ms, 200);
+        assert_eq!(fast.cold_core_bar_ms(), 30_000);
+        assert!(
+            !fast.core_discovery_cold(started(run)),
+            "a 5s lull on a 200ms-median instance is not a collapse",
+        );
+        assert!(
+            mk(200, 16, Duration::from_secs(45)).core_discovery_cold(started(run)),
+            "225x the instance's own interval must read as cold",
+        );
+
+        // Expensive cores (5s trailing median, the rna-alignment/protein_ins
+        // shape): the RELATIVE term takes over and the floor goes inert.
+        let slow = mk(5_000, 16, Duration::from_secs(30));
+        assert_eq!(slow.core_gap_median_ms, 5_000);
+        assert_eq!(
+            slow.cold_core_bar_ms(),
+            60_000,
+            "the bar must scale with the instance's own median interval",
+        );
+        assert!(
+            slow.cold_core_bar_ms() > 30_000,
+            "the relative term must actually BIND on a slow-walk instance — a \
+             bar that is the 30s floor everywhere is a constant wearing an \
+             adaptive comment",
+        );
+        assert!(
+            !slow.core_discovery_cold(started(run)),
+            "30s without a core is ordinary on a 5s-per-core instance: firing \
+             here is the premature entry that costs the slow-walk families",
+        );
+        assert!(
+            mk(5_000, 16, Duration::from_secs(90)).core_discovery_cold(started(run)),
+            "18x its own interval is a collapse even on a slow instance",
+        );
+
+        // Brakes, all with written-out numbers.
+        assert!(
+            !mk(200, 7, Duration::from_secs(300)).core_discovery_cold(started(run)),
+            "must not fire on 7 observed intervals (the minimum sample is 8)",
+        );
+        assert!(
+            mk(200, 8, Duration::from_secs(300)).core_discovery_cold(started(run)),
+            "8 intervals is the minimum sample, so the gate is live there",
+        );
+        assert!(
+            !mk(200, 16, Duration::from_secs(300))
+                .core_discovery_cold(started(Duration::from_secs(10))),
+            "must not enter 10s into a run (the opening floor is 20s)",
+        );
+        let mut no_incumbent = mk(200, 16, Duration::from_secs(300));
+        no_incumbent.best_model = None;
+        assert!(
+            !no_incumbent.core_discovery_cold(started(run)),
+            "no incumbent => nothing for the descent to improve",
+        );
+        let mut never = mk(200, 16, Duration::from_secs(300));
+        never.tuning.lsu_min_cores = u64::MAX;
+        assert!(
+            !never.core_discovery_cold(started(run)),
+            "u64::MAX is the tuning sentinel for 'descents never engage'",
+        );
+
+        // Default-ON escape hatch, read through a OnceLock (assert the
+        // default rather than flipping the process environment mid-test).
+        assert!(cold_core_descent_enabled(), "lever must default ON");
+    }
+
+    /// #cold-core-descent: the rate baseline must TRACK THE RECENT WALK, not
+    /// the opening burst.
+    ///
+    /// The first cut kept only the FIRST 64 intervals, on the argument that a
+    /// baseline over all intervals drifts upward as discovery decelerates and
+    /// so cancels itself. Measured, that cure was worse: on this corpus the
+    /// opening cores fall out of propagation-level conflicts in milliseconds
+    /// almost everywhere, so the baseline was ~0 and the relative term never
+    /// bound — the gate was the flat 30s floor.
+    ///
+    /// A TRAILING window cannot cancel itself, because a drought contributes no
+    /// interval until a core actually arrives: the moment discovery stops, the
+    /// baseline freezes and the drought grows past it. Both halves are asserted
+    /// here.
+    #[test]
+    fn cold_core_rate_baseline_tracks_the_recent_walk_not_the_opening_burst() {
+        let mut soft_store = ClauseStore::new();
+        soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
+        let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
+        engine.best_model = Some(vec![false; 2]);
+        let mut at = Instant::now() - Duration::from_secs(3_600);
+
+        // A fast opening fills the window: 16 intervals of 500ms.
+        for _ in 0..=16 {
+            engine.note_search_core(at);
+            at += Duration::from_millis(500);
+        }
+        assert_eq!(engine.core_gaps_ms.len(), 16);
+        assert_eq!(engine.core_gap_median_ms, 500);
+        assert_eq!(
+            engine.cold_core_bar_ms(),
+            30_000,
+            "the floor binds while the walk is fast",
+        );
+
+        // Then the walk decelerates to 40s per core. The baseline MUST follow
+        // it: if it stayed at the opening burst the bar would still be 30s, and
+        // a 31s gap on a 40s-per-core walk would read as a collapse.
+        for _ in 0..16 {
+            at += Duration::from_secs(40);
+            engine.note_search_core(at);
+        }
+        assert_eq!(
+            engine.core_gaps_ms.len(),
+            16,
+            "the window stays capped at COLD_CORE_WINDOW",
+        );
+        assert_eq!(
+            engine.core_gap_median_ms, 40_000,
+            "the baseline must track the RECENT walk, not the opening burst",
+        );
+        assert_eq!(engine.cold_core_bar_ms(), 480_000);
+        engine.pause_core_drought_at(at + Duration::from_secs(60));
+        assert!(
+            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(3_600)),
+            "60s without a core on a 40s-per-core walk is one slow step, not a \
+             collapse — this is the brake that protects rna-alignment",
+        );
+
+        // Anti-self-cancellation: once cores STOP, no further interval is
+        // recorded, so the baseline freezes and the drought overtakes it.
+        engine.core_drought = Duration::from_secs(600);
+        engine.core_drought_since = None;
+        assert_eq!(
+            engine.core_gap_median_ms, 40_000,
+            "a drought contributes no interval, so it cannot raise its own bar",
+        );
+        assert!(
+            engine.core_discovery_cold(Instant::now() - Duration::from_secs(3_600)),
+            "10 minutes with no core against a 40s walk is a collapse",
+        );
+    }
+
+    /// #cold-core-descent D1: the drought clock must not run while the engine
+    /// is inside a descent slice.
+    ///
+    /// No core can arrive in `descend` — it walks the ub side and never calls
+    /// `process_core` — so charging its wall time as "core discovery has gone
+    /// cold" lets a descent slice MANUFACTURE the drought that justifies the
+    /// next, longer entry. The 300s span below is exactly that ratchet: with it
+    /// charged the drought is 329s and the arm fires; with the clock stopped it
+    /// is the 29s of OLL time that genuinely failed to produce a core, and the
+    /// arm stays shut.
+    #[test]
+    fn cold_core_drought_clock_stops_across_a_descent_slice() {
+        let mut soft_store = ClauseStore::new();
+        soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
+        let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
+        engine.best_model = Some(vec![false; 2]);
+        let mut at = Instant::now() - Duration::from_secs(1_000);
+        // 16 intervals of 200ms => bar is the 30s floor. `at` ends ON the last
+        // arrival, so the offsets below are measured from it exactly.
+        engine.note_search_core(at);
+        for _ in 0..16 {
+            at += Duration::from_millis(200);
+            engine.note_search_core(at);
+        }
+        assert_eq!(engine.cold_core_bar_ms(), 30_000);
+
+        // 25s of OLL search with no core, then a 300s descent slice, then 4s
+        // more of OLL: 29s of core-searching time, under the 30s bar.
+        engine.pause_core_drought_at(at + Duration::from_secs(25));
+        engine.resume_core_drought_at(at + Duration::from_secs(325));
+        engine.pause_core_drought_at(at + Duration::from_secs(329));
+        assert_eq!(
+            engine.core_drought(),
+            Duration::from_secs(29),
+            "the 300s descent slice must contribute nothing to the drought",
+        );
+        assert!(
+            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(1_000)),
+            "a descent slice must not manufacture the drought that justifies \
+             the next entry",
+        );
+
+        // The clock is stopped, not dead: 2s more of OLL crosses the bar.
+        engine.resume_core_drought_at(at + Duration::from_secs(329));
+        engine.pause_core_drought_at(at + Duration::from_secs(331));
+        assert_eq!(engine.core_drought(), Duration::from_secs(31));
+        assert!(
+            engine.core_discovery_cold(Instant::now() - Duration::from_secs(1_000)),
+            "31s of genuine core-searching time is past the 30s bar",
+        );
+    }
+
+    /// #cold-core-descent D3: the minimum-sample brake must not be satisfiable
+    /// by BATCHED core payments.
+    ///
+    /// `pay_mined_cores` and the AM1 probe's failed-selector loop call
+    /// `process_core` back-to-back over an already-computed list, so 8
+    /// "intervals" can be recorded in microseconds without a single SAT call —
+    /// handing the gate a "this instance was streaming cores" baseline built
+    /// entirely out of bookkeeping, and satisfying `COLD_CORE_MIN_SAMPLE` on an
+    /// instance that has searched for nothing.
+    #[test]
+    fn cold_core_rate_sample_ignores_batched_core_payments() {
+        let mk = || {
+            let mut soft_store = ClauseStore::new();
+            for i in 1..=24i32 {
+                soft_store.push_from_iter([i].iter().map(|&l| Literal::from(l)));
+            }
+            let mut engine = OllEngine::new(32, ClauseStore::new(), soft_store, vec![1; 24]);
+            for i in 1..=24i32 {
+                engine.active.insert(Literal::from(i), 1);
+            }
+            engine.level = 1;
+            engine
+        };
+
+        // 12 batch payments, back-to-back, exactly as the batch sites do.
+        let mut batched = mk();
+        for i in 1..=12i32 {
+            batched.process_core(&[Literal::from(i)], CoreOrigin::Batch);
+        }
+        assert_eq!(batched.stats.cores_found, 12, "batch cores still count");
+        assert_eq!(batched.core_search_cores, 0);
+        assert!(
+            batched.core_gaps_ms.is_empty(),
+            "batched payments must contribute no rate intervals",
+        );
+        assert!(
+            !batched.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
+            "the minimum-sample brake must not be satisfiable by bookkeeping",
+        );
+
+        // The same 12 cores arriving from search DO set the baseline.
+        let mut searched = mk();
+        for i in 1..=12i32 {
+            searched.process_core(&[Literal::from(i)], CoreOrigin::Search);
+        }
+        assert_eq!(searched.core_search_cores, 12);
+        assert_eq!(
+            searched.core_gaps_ms.len(),
+            11,
+            "n search cores give n-1 intervals",
+        );
+    }
+
+    /// #cold-core-descent D4: a stratification level change must reset the
+    /// drought.
+    ///
+    /// A level change legitimately pauses core discovery — the previous
+    /// stratum ran out of assumable selectors and the next one has not been
+    /// searched yet — and the rate gate cannot tell that apart from discovery
+    /// collapsing. Without the reset the arm can take the entry before the
+    /// fresh stratum has had a single chance to produce a core.
+    #[test]
+    fn cold_core_level_activation_resets_the_drought() {
+        let mut soft_store = ClauseStore::new();
+        soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
+        let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
+        engine.best_model = Some(vec![false; 2]);
+        let mut at = Instant::now() - Duration::from_secs(600);
+        for _ in 0..=16 {
+            engine.note_search_core(at);
+            at += Duration::from_millis(200);
+        }
+        engine.core_drought = Duration::from_secs(300);
+        engine.core_drought_since = None;
+        assert!(
+            engine.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
+            "precondition: the gate is open before the level change",
+        );
+
+        engine.activate_stratum(1);
+        assert!(
+            engine.core_drought() < Duration::from_secs(1),
+            "a stratum activation must clear the accumulated drought",
+        );
+        assert!(
+            engine.core_drought_since.is_some(),
+            "and leave the clock running for the new stratum",
+        );
+        assert!(
+            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
+            "the arm must not commit before the fresh stratum has had a chance",
+        );
+    }
+
+    /// #cold-core-descent D7: the descent entry gate's WIRING, not just the
+    /// predicates it consumes.
+    ///
+    /// Before `classify_descent_arm` existed, all three of the one-line
+    /// mutations that undo this lever left the suite green: dropping the cold
+    /// arm from the entry disjunction, forcing `cold_entry = false`, and
+    /// reverting `kick_entry = descent_kick && !cold_entry` to
+    /// `kick_entry = descent_kick`. Each is now a test failure.
+    #[test]
+    fn descent_arm_classification_pins_the_gate_wiring() {
+        use DescentArm::{Cold, Count, Kick, None as NoArm};
+        // (incumbent, cold_enabled, cold_ready, kick_armed, count_ready)
+        let cases: &[(bool, bool, bool, bool, bool, DescentArm)] = &[
+            // The rate arm opens the gate on its own — this is the lever.
+            (true, true, true, false, false, Cold),
+            // PRECEDENCE: with a kick armed in the same iteration the cold arm
+            // still wins, so the entry gets the longer (still reversible)
+            // slice instead of a 10s kick slice.
+            (true, true, true, true, false, Cold),
+            (true, true, true, true, true, Cold),
+            // Kill switch off => bit-identical to the pre-lever gate.
+            (true, false, true, false, false, NoArm),
+            (true, false, true, true, false, Kick),
+            (true, false, true, false, true, Count),
+            // The other arms are untouched.
+            (true, true, false, true, false, Kick),
+            (true, true, false, true, true, Kick),
+            (true, true, false, false, true, Count),
+            (true, true, false, false, false, NoArm),
+            // No incumbent: nothing for the descent to improve, every arm shut.
+            (false, true, true, true, true, NoArm),
+        ];
+        for &(incumbent, enabled, cold, kick, count, want) in cases {
+            assert_eq!(
+                classify_descent_arm(incumbent, enabled, cold, kick, count),
+                want,
+                "incumbent={incumbent} cold_enabled={enabled} cold_ready={cold} \
+                 kick={kick} count={count}",
+            );
+        }
+    }
+
+    /// #cold-core-descent D5: the cold arm gets a REVERSIBLE slice.
+    ///
+    /// It carries the weakest evidence of the three arms (no core count, no
+    /// lb-stall test, no gap cap beyond `gap_ok`), and the one-way commit
+    /// freezes lb for the rest of the budget because `descend` only ever moves
+    /// ub. On rna-alignment and protein_ins — the families a rate misfire is
+    /// most likely on — the slow core walk is the PRODUCTIVE path, so an
+    /// unbounded commit there forfeits instances AY solves today.
+    #[test]
+    fn cold_descent_entry_takes_a_reversible_slice() {
+        let kick = Duration::from_secs(10);
+        let organic = Duration::from_secs(120);
+
+        // The cold arm is bounded REGARDLESS of #descent-organic-slice, and at
+        // the organic length: its evidence earns a longer slice than a kick,
+        // not an irrevocable one.
+        for organic_slice in [false, true] {
+            assert_eq!(
+                descent_slice_len(DescentArm::Cold, organic_slice, kick, organic),
+                Some(organic),
+                "cold entry must be reversible with organic_slice={organic_slice}",
+            );
+        }
+        // Kicks keep their measured slice.
+        assert_eq!(
+            descent_slice_len(DescentArm::Kick, false, kick, organic),
+            Some(kick),
+        );
+        // The historical count arm is untouched: one-way unless
+        // #descent-organic-slice is on.
+        assert_eq!(
+            descent_slice_len(DescentArm::Count, false, kick, organic),
+            None,
+            "the count arm's one-way commit is the measured status quo",
+        );
+        assert_eq!(
+            descent_slice_len(DescentArm::Count, true, kick, organic),
+            Some(organic),
+        );
+    }
+
+    /// #cold-core-descent D6: a SIZE decline must not permanently forfeit the
+    /// descent.
+    ///
+    /// `select_descent_enc`'s budgets are state-dependent — the residual soft
+    /// set shrinks as softs harden, and the cap falls as the incumbent improves
+    /// — so an encoding too large at t=25s can fit at t=200s. The rate arm
+    /// fires EARLIER than the count arm by construction, i.e. exactly when the
+    /// encoding is at its largest, so poisoning the sticky `descent_unavailable`
+    /// flag on a size decline is how an early entry loses the descent for the
+    /// whole run.
+    #[test]
+    fn descent_size_decline_is_retried_when_the_residual_shrinks() {
+        let mut soft_store = ClauseStore::new();
+        for i in 1..=3i32 {
+            soft_store.push_from_iter([i].iter().map(|&l| Literal::from(l)));
+        }
+        let mut engine = OllEngine::new(4, ClauseStore::new(), soft_store, vec![7, 5, 5]);
+        engine.ub = 100;
+        assert!(engine.descent_reachable(), "no decline recorded yet");
+
+        // A size decline at the current (hardened, ub) signature.
+        engine.descent_size_declined = Some((engine.hardened_sels.len(), engine.ub));
+        assert!(
+            !engine.descent_reachable(),
+            "nothing has changed, so re-running the build would decline again",
+        );
+
+        // A better incumbent shrinks the cap: re-try.
+        engine.ub = 99;
+        assert!(
+            engine.descent_reachable(),
+            "a lower ub shrinks the encoding — the decline must be re-tried",
+        );
+
+        // So does hardening a soft.
+        engine.ub = 100;
+        engine.hardened_sels.insert(engine.soft_selectors[0]);
+        assert!(
+            engine.descent_reachable(),
+            "a hardened soft shrinks the residual — re-try",
+        );
+
+        // The PERMANENT flag still short-circuits everything.
+        engine.descent_unavailable = true;
+        assert!(
+            !engine.descent_reachable(),
+            "descent_unavailable stays sticky for the structural declines",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7344,6 +10027,7 @@ mod abstraction_tests {
                 force_adder: false,
                 abstraction_min_cores: u64::MAX,
                 force_cluster: false,
+                force_dpw: false,
                 lp_boost: LpBoostMode::Off,
                 tot_eqs,
                 core_clause: Some(false),
@@ -7404,6 +10088,7 @@ mod abstraction_tests {
             force_adder: false,
             abstraction_min_cores: 0,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Auto,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -7412,6 +10097,24 @@ mod abstraction_tests {
             tot_eqs: Some(true),
             core_clause: Some(true),
         });
+        // #core-mine SUPERSEDES abstraction on this fixture, so clear the mined
+        // batch to keep this test measuring what it is named for.
+        //
+        // The fixture is 8 unit softs with every hard clause ternary over their
+        // negations — i.e. 100% mineable, the exact shape `#core-mine` targets.
+        // With mining live, those cores are paid at install and the in-loop
+        // `form_abstraction_sets()` never sees the core traffic it forms from,
+        // so `abstraction_sets` stays 0. The COST assertion below still passes
+        // either way (mining reaches the same optimum more cheaply), so this is
+        // a capability-coverage question, not a soundness one — but the
+        // abstraction path must stay tested, and silently letting this assert
+        // lapse would retire it.
+        //
+        // Worth noting for the campaign: abstraction (`cgss_abst_cg` scores 415
+        // using it) and `#core-mine` compete for the same structure. Production
+        // has abstraction OFF by default (`abstraction_min_cores = u64::MAX`),
+        // so mining is currently the only lane exploiting this shape.
+        engine.mined_cores.clear();
 
         match engine.solve(&|| false, &mut |_| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 6),
@@ -7453,6 +10156,7 @@ mod am1_probe_tests {
             force_adder: false,
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
+            force_dpw: false,
             lp_boost: LpBoostMode::Off,
             // #tot-eqs pinned ON so the reverse-direction clauses are exercised
             // wherever the fixture has >= 2 distinct soft weights. Production also
@@ -7510,6 +10214,93 @@ mod am1_probe_tests {
         engine.set_tuning(am1_probe_tuning());
         let outcome = engine.solve(&|| false, &mut |_| {});
         (outcome, engine.stats().clone())
+    }
+
+    /// #core-mine SOUNDNESS NET — the invariant is ALL-MEMBERS-ACTIVE, not
+    /// disjointness, and this test is the executable form of that claim.
+    ///
+    /// The hazard: a not-all-true clause has NO valid proper subset.
+    /// `(!s1|!s2|!s3)` does not entail `(!s1|!s2)`. So if a mined core is
+    /// SHRUNK when a member is exhausted — the idiom `relax_am1_clique` uses
+    /// legitimately, because every subset of an at-most-one set is still
+    /// at-most-one — `lb` is charged for weight the absent member no longer
+    /// carries, and `s OPTIMUM FOUND` fires above the true optimum.
+    ///
+    /// Minimal witness, from the adversarial review of `#core-mine`:
+    ///   hard (!x1 | !x2);  softs (x1)=7 (x2)=2;  OPTIMUM = 2
+    /// `adapt_am1` spends x2 to zero first. Shrinking the mined core to {x1}
+    /// then pays lb = 2 + 5 = 7 — the #stale-core wrong answer recorded in this
+    /// file (privilege-escalation-task-54: reported 20, optimum 19).
+    #[test]
+    fn core_mine_never_pays_above_the_optimum() {
+        // (a) the exact witness from the review
+        let (outcome, _) = run(2, &[vec![-1, -2]], &[vec![1], vec![2]], vec![7, 2]);
+        match outcome {
+            OllOutcome::Optimal { cost, .. } => assert_eq!(
+                cost, 2,
+                "mined core was shrunk: lb charged for an exhausted member"
+            ),
+            other => panic!("expected Optimal(2), got {other:?}"),
+        }
+
+        // (b) randomized net over small mineable instances. Every hard clause
+        // is built ENTIRELY from negated unit-soft literals, so #core-mine
+        // fires on all of them; overlapping cores, mixed weights and multiple
+        // strata are exactly the conditions under which an over-payment would
+        // appear. Brute force is ground truth.
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200u32 {
+            let n = 3 + (next() % 4) as usize; // 3..6 vars, all unit softs
+            let weights: Vec<u64> = (0..n).map(|_| 1 + next() % 9).collect();
+            let softs: Vec<Vec<i32>> = (1..=n as i32).map(|v| vec![v]).collect();
+            let nclauses = 1 + (next() % 5) as usize;
+            let mut hard: Vec<Vec<i32>> = Vec::new();
+            for _ in 0..nclauses {
+                let k = 2 + (next() % 2) as usize; // arity 2..3
+                let mut c: Vec<i32> = Vec::new();
+                while c.len() < k.min(n) {
+                    let v = 1 + (next() % n as u64) as i32;
+                    if !c.contains(&-v) {
+                        c.push(-v);
+                    }
+                }
+                hard.push(c);
+            }
+            // brute-force optimum over all assignments
+            let mut best = u64::MAX;
+            for mask in 0u32..(1 << n) {
+                let val = |v: i32| (mask >> (v.unsigned_abs() as usize - 1)) & 1 == 1;
+                if hard
+                    .iter()
+                    .any(|c| c.iter().all(|&l| if l > 0 { !val(l) } else { val(l) }))
+                {
+                    continue; // hard clause falsified
+                }
+                let cost: u64 = (0..n)
+                    .filter(|&i| (mask >> i) & 1 == 0)
+                    .map(|i| weights[i])
+                    .sum();
+                best = best.min(cost);
+            }
+            if best == u64::MAX {
+                continue; // hards unsatisfiable; not the property under test
+            }
+            let (outcome, _) = run(n as u32, &hard, &softs, weights.clone());
+            if let OllOutcome::Optimal { cost, .. } = outcome {
+                assert_eq!(
+                    cost, best,
+                    "case {case}: hard={hard:?} weights={weights:?} — AY reported \
+                     {cost}, brute force says {best}. A cost ABOVE the optimum is \
+                     an over-paid lower bound."
+                );
+            }
+        }
     }
 
     /// 300-seed brute-force net for the UP-probe AM1 pass (#maxsat-am1-probe).

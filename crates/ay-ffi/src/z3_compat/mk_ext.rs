@@ -44,28 +44,22 @@ use std::slice;
 use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, FuncDecl, Sort, Term};
 use num_bigint::BigInt;
 
+use super::quantifiers::{mk_quantifier_const, mk_quantifier_db, QuantifierMetadataInput};
+
 use super::{
-    alloc_sort, cache_dt_func_decl_with_symbol, cache_func_decl, cache_func_decl_with_symbol,
-    ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
-    ffi_read_bounded_text, ffi_try_declare_function, record_ast_sort, require_term_ast_or_return,
-    require_term_asts_or_return, term_to_ast, DatatypeOp, SymbolKey, Z3Context, Z3_ast,
-    Z3_constructor, Z3_context, Z3_func_decl, Z3_mk_exists, Z3_mk_exists_const, Z3_mk_forall,
-    Z3_mk_forall_const, Z3_mk_solver, Z3_pattern, Z3_solver, Z3_sort, Z3_string, Z3_symbol,
-    AY_MAX_CHAR, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    activate_finite_set_sat_gate, alloc_sort, cache_dt_func_decl_with_symbol, cache_func_decl,
+    cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
+    ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, finite_set_engine_public_sort,
+    public_ast_sort, record_ast_sort, record_reachable_finite_set_axiom,
+    require_term_ast_or_return, require_term_asts_or_return, sort_mentions_finite_set, term_to_ast,
+    DatatypeOp, SymbolKey, Z3Context, Z3_ast, Z3_constructor, Z3_context, Z3_func_decl,
+    Z3_mk_solver, Z3_pattern, Z3_solver, Z3_sort, Z3_string, Z3_symbol, AY_MAX_CHAR,
+    MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
-
-/// Read the name from a `Z3_symbol`, or `None` if null.
-///
-/// # Safety
-/// `s` must be null or a valid symbol handle from a prior AY FFI allocation.
-unsafe fn read_symbol_name(s: Z3_symbol) -> Option<String> {
-    // SAFETY: forwarded to `read_symbol_key` under the same contract.
-    unsafe { read_symbol_key(s) }.map(|key| key.semantic_name())
-}
 
 /// Read the exact caller-visible symbol identity.
 ///
@@ -78,39 +72,6 @@ unsafe fn read_symbol_key(s: Z3_symbol) -> Option<SymbolKey> {
     // SAFETY: `s` null-checked above; a valid AY symbol handle kept alive by the
     // owning context (single-threaded per context).
     Some(unsafe { (*s).key.clone() })
-}
-
-/// Attach the optional `:qid` / `:skolemid` symbols to a just-built quantifier
-/// `ast`. No-op when both are null or `ast` is 0 / not a quantifier. Pure
-/// instantiation-hint metadata — never changes the asserted formula's semantics.
-///
-/// # Safety
-/// `c` must be a valid context pointer; `qid`/`skid`, when non-null, valid symbols.
-unsafe fn attach_quantifier_ids(c: Z3_context, ast: Z3_ast, qid: Z3_symbol, skid: Z3_symbol) {
-    if ast == 0 {
-        return;
-    }
-    // SAFETY: symbols null-checked inside `read_symbol_name`.
-    let qname = unsafe { read_symbol_name(qid) };
-    let sname = unsafe { read_symbol_name(skid) };
-    if qname.is_none() && sname.is_none() {
-        return;
-    }
-    // SAFETY: `c` is valid per contract; `ffi_guard_ast` null-checks it and
-    // isolates panics.
-    unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let term =
-                require_term_ast_or_return!(ctx, ast, "attach_quantifier_ids", "quantifier", ast);
-            if let Some(n) = &qname {
-                ctx.solver.set_quantifier_id(term, n);
-            }
-            if let Some(n) = &sname {
-                ctx.solver.set_skolem_id(term, n);
-            }
-            ast
-        });
-    }
 }
 
 /// Declare a datatype on the solver and allocate its sort handle.
@@ -290,12 +251,29 @@ pub unsafe extern "C" fn Z3_mk_select_n(
             let mut acc = require_term_ast_or_return!(ctx, a, "Z3_mk_select_n", "array", 0);
             let indices =
                 require_term_asts_or_return!(ctx, &index_asts, "Z3_mk_select_n indices", 0);
-            for idx in indices {
+            let mut public_sort = public_ast_sort(ctx, a, acc);
+            for (&index_ast, idx) in index_asts.iter().zip(indices) {
+                let Sort::Array(array_sort) = &public_sort else {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg =
+                        Some("Z3_mk_select_n: public operand sort is not an Array".to_string());
+                    return 0;
+                };
+                let index_sort = public_ast_sort(ctx, index_ast, idx);
+                if index_sort != array_sort.index_sort {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some(format!(
+                        "Z3_mk_select_n: public index sort {index_sort} differs from array domain {}",
+                        array_sort.index_sort
+                    ));
+                    return 0;
+                }
+                let next_sort = array_sort.element_sort.clone();
                 acc = ctx.solver.select(acc, idx);
+                public_sort = next_sort;
             }
-            let result_sort = ctx.solver.sort_of(acc);
             let out = term_to_ast(ctx, acc);
-            record_ast_sort(ctx, out, result_sort);
+            record_ast_sort(ctx, out, public_sort);
             out
         })
     }
@@ -341,20 +319,46 @@ pub unsafe extern "C" fn Z3_mk_store_n(
             let indices =
                 require_term_asts_or_return!(ctx, &index_asts, "Z3_mk_store_n indices", 0);
             let mut val = require_term_ast_or_return!(ctx, v, "Z3_mk_store_n", "value", 0);
+            let base_public_sort = public_ast_sort(ctx, a, base);
+            let mut selected_public_sort = base_public_sort.clone();
             // prefix[k] = select(...select(a, i0)..., i_{k-1}); prefix[0] = a.
             let mut prefix = Vec::with_capacity(indices.len() + 1);
             prefix.push(base);
-            for &idx in &indices {
+            for (&index_ast, &idx) in index_asts.iter().zip(&indices) {
+                let Sort::Array(array_sort) = &selected_public_sort else {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg =
+                        Some("Z3_mk_store_n: public operand sort is not an Array".to_string());
+                    return 0;
+                };
+                let index_sort = public_ast_sort(ctx, index_ast, idx);
+                if index_sort != array_sort.index_sort {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some(format!(
+                        "Z3_mk_store_n: public index sort {index_sort} differs from array domain {}",
+                        array_sort.index_sort
+                    ));
+                    return 0;
+                }
+                let next_sort = array_sort.element_sort.clone();
                 let sel = ctx.solver.select(prefix[prefix.len() - 1], idx);
                 prefix.push(sel);
+                selected_public_sort = next_sort;
+            }
+            let value_public_sort = public_ast_sort(ctx, v, val);
+            if value_public_sort != selected_public_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_store_n: public value sort {value_public_sort} differs from array range {selected_public_sort}"
+                ));
+                return 0;
             }
             // Build inside-out: val_{n} = v; val_k = store(prefix[k], i_k, val_{k+1}).
             for k in (0..indices.len()).rev() {
                 val = ctx.solver.store(prefix[k], indices[k], val);
             }
-            let result_sort = ctx.solver.sort_of(val);
             let out = term_to_ast(ctx, val);
-            record_ast_sort(ctx, out, result_sort);
+            record_ast_sort(ctx, out, base_public_sort);
             out
         })
     }
@@ -396,26 +400,39 @@ pub unsafe extern "C" fn Z3_mk_array_ext(c: Z3_context, arg1: Z3_ast, arg2: Z3_a
             let a = require_term_ast_or_return!(ctx, arg1, "Z3_mk_array_ext", "left array", 0);
             let b = require_term_ast_or_return!(ctx, arg2, "Z3_mk_array_ext", "right array", 0);
             // Both arguments must be arrays of the SAME sort (Z3 contract).
-            let (sort_a, sort_b) = (ctx.solver.sort_of(a), ctx.solver.sort_of(b));
-            let Sort::Array(arr) = &sort_a else {
-                ctx.last_error = Z3_SORT_ERROR;
-                ctx.error_msg = Some(format!("Z3_mk_array_ext: expected arrays, got {sort_a:?}"));
-                return 0;
-            };
-            if sort_a != sort_b {
+            let (public_a, public_b) =
+                (public_ast_sort(ctx, arg1, a), public_ast_sort(ctx, arg2, b));
+            let Sort::Array(public_array) = &public_a else {
                 ctx.last_error = Z3_SORT_ERROR;
                 ctx.error_msg = Some(format!(
-                    "Z3_mk_array_ext: array sorts differ ({sort_a:?} vs {sort_b:?})"
+                    "Z3_mk_array_ext: expected public Array operands, got {public_a}"
+                ));
+                return 0;
+            };
+            if public_a != public_b {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_array_ext: public array sorts differ ({public_a} vs {public_b})"
                 ));
                 return 0;
             }
-            let index_sort = arr.index_sort.clone();
+            let engine_sort = finite_set_engine_public_sort(ctx, &public_a);
+            if ctx.solver.sort_of(a) != engine_sort || ctx.solver.sort_of(b) != engine_sort {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_array_ext: engine array sort does not match the public signature"
+                        .to_string(),
+                );
+                return 0;
+            }
+            let index_sort = public_array.index_sort.clone();
             if let Some(&cached) = ctx.array_ext_cache.get(&(a, b)) {
                 return cached; // same pair → identical witness (Z3 parity)
             }
             // Fresh witness index, registered so it carries a model value.
             let name = format!("!ay.array-ext!{}", ctx.array_ext_cache.len());
-            let k = ctx.solver.declare_const(&name, index_sort.clone());
+            let engine_index_sort = finite_set_engine_public_sort(ctx, &index_sort);
+            let k = ctx.solver.declare_const(&name, engine_index_sort);
             // Background axiom: a != b => select(a,k) != select(b,k).
             let sel_a = ctx.solver.select(a, k);
             let sel_b = ctx.solver.select(b, k);
@@ -424,9 +441,11 @@ pub unsafe extern "C" fn Z3_mk_array_ext(c: Z3_context, arg1: Z3_ast, arg2: Z3_a
             let a_ne_b = ctx.solver.not(a_eq_b);
             let sel_ne = ctx.solver.not(sel_eq);
             let axiom = ctx.solver.implies(a_ne_b, sel_ne);
-            ctx.background_axioms.push(axiom);
-            ctx.clear_decision_check_artifacts();
             let ast = term_to_ast(ctx, k);
+            record_reachable_finite_set_axiom(ctx, k, axiom);
+            if sort_mentions_finite_set(ctx, &index_sort) {
+                activate_finite_set_sat_gate(ctx, k, "Z3_mk_array_ext");
+            }
             record_ast_sort(ctx, ast, index_sort);
             ctx.array_ext_cache.insert((a, b), ast);
             ast
@@ -1382,38 +1401,31 @@ pub unsafe extern "C" fn Z3_mk_quantifier(
 ) -> Z3_ast {
     // SAFETY: forwards the caller's pointers unchanged to the shared builder.
     unsafe {
-        if is_forall {
-            Z3_mk_forall(
-                c,
+        mk_quantifier_db(
+            c,
+            is_forall,
+            QuantifierMetadataInput {
                 weight,
-                num_patterns,
-                patterns,
-                num_decls,
-                sorts,
-                decl_names,
-                body,
-            )
-        } else {
-            Z3_mk_exists(
-                c,
-                weight,
-                num_patterns,
-                patterns,
-                num_decls,
-                sorts,
-                decl_names,
-                body,
-            )
-        }
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
+            num_patterns,
+            patterns,
+            num_decls,
+            sorts,
+            decl_names,
+            body,
+        )
     }
 }
 
 /// De-Bruijn quantifier with extra E-matching hints.
 ///
 /// Same de-Bruijn path as [`Z3_mk_quantifier`]; `quantifier_id`, `skolem_id`,
-/// and `no_patterns` only affect instantiation strategy/completeness — never the
-/// asserted formula's semantics — so ignoring them is sound. `weight` is also a
-/// soundly-ignored hint.
+/// and `no_patterns` affect instantiation strategy/completeness, never the
+/// asserted formula's logical semantics. AY retains them for introspection and
+/// rejects hash-cons metadata conflicts fail-closed.
 ///
 /// # Safety
 /// All pointers must satisfy the `Z3_mk_forall`/`Z3_mk_exists` contracts.
@@ -1434,36 +1446,41 @@ pub unsafe extern "C" fn Z3_mk_quantifier_ex(
     decl_names: *const Z3_symbol,
     body: Z3_ast,
 ) -> Z3_ast {
-    // no_patterns is a soundly-dropped instantiation hint; qid/skid are recorded.
-    let _ = (num_no_patterns, no_patterns);
-    // SAFETY: forwards the caller's pointers unchanged to the shared builder, then
-    // records the optional :qid / :skolemid metadata on the resulting quantifier.
+    // SAFETY: the bounded pointer copy and symbol reads follow this entry
+    // point's caller contract; the shared builder authenticates every AST.
     unsafe {
-        let ast = if is_forall {
-            Z3_mk_forall(
-                c,
-                weight,
-                num_patterns,
-                patterns,
-                num_decls,
-                sorts,
-                decl_names,
-                body,
-            )
+        if !ffi_count_within_limit(c, "quantifier no-pattern expressions", num_no_patterns) {
+            return 0;
+        }
+        if num_no_patterns > 0 && no_patterns.is_null() {
+            return ffi_guard_ast(c, |ctx| {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("quantifier no-pattern array is null with a nonzero count".to_string());
+                0
+            });
+        }
+        let no_pattern_asts = if num_no_patterns == 0 {
+            Vec::new()
         } else {
-            Z3_mk_exists(
-                c,
-                weight,
-                num_patterns,
-                patterns,
-                num_decls,
-                sorts,
-                decl_names,
-                body,
-            )
+            slice::from_raw_parts(no_patterns, num_no_patterns as usize).to_vec()
         };
-        attach_quantifier_ids(c, ast, quantifier_id, skolem_id);
-        ast
+        mk_quantifier_db(
+            c,
+            is_forall,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: read_symbol_key(quantifier_id),
+                skolem_id: read_symbol_key(skolem_id),
+                no_pattern_asts: &no_pattern_asts,
+            },
+            num_patterns,
+            patterns,
+            num_decls,
+            sorts,
+            decl_names,
+            body,
+        )
     }
 }
 
@@ -1491,11 +1508,21 @@ pub unsafe extern "C" fn Z3_mk_quantifier_const(
 ) -> Z3_ast {
     // SAFETY: forwards the caller's pointers unchanged to the shared builder.
     unsafe {
-        if is_forall {
-            Z3_mk_forall_const(c, weight, num_bound, bound, num_patterns, patterns, body)
-        } else {
-            Z3_mk_exists_const(c, weight, num_bound, bound, num_patterns, patterns, body)
-        }
+        mk_quantifier_const(
+            c,
+            is_forall,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: None,
+                skolem_id: None,
+                no_pattern_asts: &[],
+            },
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
     }
 }
 
@@ -1503,7 +1530,8 @@ pub unsafe extern "C" fn Z3_mk_quantifier_const(
 ///
 /// Same const-list path as [`Z3_mk_quantifier_const`]; `quantifier_id`,
 /// `skolem_id`, and `no_patterns` are instantiation hints that never change the
-/// asserted formula's semantics and are dropped. `weight` is also dropped.
+/// asserted formula's semantics. AY retains them using the same constant-binder
+/// terms as the body and rejects hash-cons metadata conflicts fail-closed.
 ///
 /// # Safety
 /// All pointers must satisfy the `Z3_mk_forall_const`/`Z3_mk_exists_const`
@@ -1524,18 +1552,40 @@ pub unsafe extern "C" fn Z3_mk_quantifier_const_ex(
     no_patterns: *const Z3_ast,
     body: Z3_ast,
 ) -> Z3_ast {
-    // no_patterns is a soundly-dropped instantiation hint; qid/skid are recorded.
-    let _ = (num_no_patterns, no_patterns);
-    // SAFETY: forwards the caller's pointers unchanged to the shared builder, then
-    // records the optional :qid / :skolemid metadata on the resulting quantifier.
+    // SAFETY: the bounded pointer copy and symbol reads follow this entry
+    // point's caller contract; the shared builder authenticates every AST.
     unsafe {
-        let ast = if is_forall {
-            Z3_mk_forall_const(c, weight, num_bound, bound, num_patterns, patterns, body)
+        if !ffi_count_within_limit(c, "quantifier no-pattern expressions", num_no_patterns) {
+            return 0;
+        }
+        if num_no_patterns > 0 && no_patterns.is_null() {
+            return ffi_guard_ast(c, |ctx| {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("quantifier no-pattern array is null with a nonzero count".to_string());
+                0
+            });
+        }
+        let no_pattern_asts = if num_no_patterns == 0 {
+            Vec::new()
         } else {
-            Z3_mk_exists_const(c, weight, num_bound, bound, num_patterns, patterns, body)
+            slice::from_raw_parts(no_patterns, num_no_patterns as usize).to_vec()
         };
-        attach_quantifier_ids(c, ast, quantifier_id, skolem_id);
-        ast
+        mk_quantifier_const(
+            c,
+            is_forall,
+            QuantifierMetadataInput {
+                weight,
+                quantifier_id: read_symbol_key(quantifier_id),
+                skolem_id: read_symbol_key(skolem_id),
+                no_pattern_asts: &no_pattern_asts,
+            },
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
     }
 }
 
@@ -1844,12 +1894,27 @@ pub unsafe extern "C" fn Z3_mk_set_subset(c: Z3_context, arg1: Z3_ast, arg2: Z3_
         ffi_guard_ast(c, |ctx| {
             let a = require_term_ast_or_return!(ctx, arg1, "Z3_mk_set_subset", "left set", 0);
             let b = require_term_ast_or_return!(ctx, arg2, "Z3_mk_set_subset", "right set", 0);
-            let elem_sort = match ctx.solver.sort_of(a) {
-                Sort::Array(arr) => arr.index_sort.clone(),
+            let left_public = public_ast_sort(ctx, arg1, a);
+            let right_public = public_ast_sort(ctx, arg2, b);
+            let elem_sort = match &left_public {
+                Sort::Array(arr)
+                    if arr.element_sort == Sort::Bool && right_public == left_public =>
+                {
+                    match ctx.solver.sort_of(a) {
+                        Sort::Array(engine_array) => engine_array.index_sort,
+                        _ => {
+                            ctx.last_error = Z3_SORT_ERROR;
+                            ctx.error_msg =
+                                Some("Z3_mk_set_subset: malformed lowered set backing".to_string());
+                            return 0;
+                        }
+                    }
+                }
                 other => {
                     ctx.last_error = Z3_SORT_ERROR;
                     ctx.error_msg = Some(format!(
-                        "Z3_mk_set_subset: expected a set (Array elem Bool), got {other:?}"
+                        "Z3_mk_set_subset: expected equal public legacy set sorts, got \
+                         {other:?} and {right_public:?}"
                     ));
                     return 0;
                 }

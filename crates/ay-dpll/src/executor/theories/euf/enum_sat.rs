@@ -318,7 +318,21 @@ impl Executor {
                 // UNSAT to the general lane (slower, proof-carrying). SAT
                 // results need no refutation proof — self-check certifies
                 // them by model evaluation — so only UNSAT falls through.
-                if self.produce_proofs_enabled() {
+                //
+                // The predicate is `is_producing_proofs` — "did the CALLER ask
+                // for a proof artifact" — NOT `produce_proofs_enabled`, which
+                // only says the internal tracker is recording and is therefore
+                // ALWAYS true on the public path (`begin_public_solve` turns it
+                // on for every decision so the mandatory UNSAT certificate
+                // cannot be switched off; see `produce_proofs_enabled`'s doc
+                // comment). Gated on the tracker, this fallthrough fired
+                // unconditionally and the lane could never answer `unsat`
+                // (#enum-sat-lane-dead-unsat). Nothing is weakened: the UNSAT
+                // still flows through `solve_and_store_model_full`, which
+                // materializes the proof envelope, and the mandatory
+                // certification funnel still has to accept it or the verdict
+                // degrades to `unknown`.
+                if self.is_producing_proofs() {
                     self.last_statistics
                         .set_string("solver.enum_sat_lane", "fallback-proof");
                     self.pending_sat_unknown_reason = None;

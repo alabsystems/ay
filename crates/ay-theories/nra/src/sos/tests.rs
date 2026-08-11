@@ -369,7 +369,11 @@ fn end_to_end_sum_of_squares_unsat_carries_certificate() {
     let rendered = solver
         .render_sos_unsat_certificate("t1")
         .expect("certificate renders");
-    assert!(rendered.contains(":rule nra_positivstellensatz"));
+    // The emitted step must be a rule the Alethe checker implements; the
+    // Positivstellensatz payload survives as line comments.
+    assert!(rendered.contains(":rule hole"));
+    assert!(!rendered.contains(":rule nra_positivstellensatz"));
+    assert!(rendered.contains("; ay-nra Positivstellensatz certificate"));
 }
 
 #[test]
@@ -404,7 +408,7 @@ fn render_alethe_contains_rule_and_rhs() {
     let (constraints, cert) = linear_farkas_setup();
     assert_eq!(cert.verify(&constraints), Ok(()));
     let s = cert.render_alethe("t42", |t| format!("x{}", t.0));
-    assert!(s.contains(":rule nra_positivstellensatz"));
+    assert!(s.contains(":rule hole"));
     assert!(s.contains(":rhs -1"));
     assert!(s.contains("(cl)"));
     // A rational multiplier renders as (/ n d).

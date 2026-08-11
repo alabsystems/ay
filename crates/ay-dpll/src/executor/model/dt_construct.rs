@@ -127,8 +127,37 @@ pub(super) fn dt_canonical_string(mv: &ModelValue) -> String {
         ModelValue::Int(i) => format_bigint(i),
         ModelValue::Real(r) => format_rational(r),
         ModelValue::BitVec { width, value } => format_bitvec(value, *width),
+        ModelValue::FloatingPoint {
+            sign,
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+        } => format!(
+            "(#fp {} {} {} {} {})",
+            u8::from(*sign),
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits
+        ),
         ModelValue::Str(s) => string_literal(s),
         ModelValue::Uninterpreted(tok) => tok.clone(),
+        // Injective over the triple that determines the value: which root of
+        // which polynomial, and which element of that extension.
+        ModelValue::Algebraic(a) => {
+            let poly = |cs: &[num_rational::BigRational]| {
+                cs.iter().map(format_rational).collect::<Vec<_>>().join(",")
+            };
+            let (lo, hi) = a.interval();
+            format!(
+                "(root-obj [{}] ({} {}) [{}])",
+                poly(a.minimal_polynomial()),
+                format_rational(lo),
+                format_rational(hi),
+                poly(a.representation())
+            )
+        }
         ModelValue::Array(av) => {
             let mut s = format!("(#arr {}", dt_canonical_string(&av.default));
             for (k, v) in &av.store {
@@ -176,7 +205,12 @@ fn mv_to_eval(mv: &ModelValue) -> EvalValue {
             let converted: Vec<EvalValue> = elems.iter().map(mv_to_eval).collect();
             EvalValue::Seq(converted)
         }
-        ModelValue::Array(_) => EvalValue::Unknown,
+        // Not pinnable. `EvalValue` has no algebraic variant, so pinning one
+        // would require collapsing it to a rational -- which is exactly the
+        // lossy step that loses `sqrt(2)`. Fail closed, as FP and arrays do.
+        ModelValue::FloatingPoint { .. } | ModelValue::Array(_) | ModelValue::Algebraic(_) => {
+            EvalValue::Unknown
+        }
     }
 }
 

@@ -77,6 +77,51 @@ impl FarkasAnnotation {
     pub fn is_valid(&self) -> bool {
         self.coefficients.iter().all(|c| *c >= Rational64::from(0))
     }
+
+    /// Rebind position-indexed coefficients from `source_clause` to
+    /// `target_clause` by literal identity.
+    ///
+    /// SAT watched-literal movement and clause normalization may permute or
+    /// deduplicate a clause without changing it. Coefficients for duplicate
+    /// source literals are summed; the sum is placed on the first target
+    /// occurrence and later duplicates receive zero. A source literal may be
+    /// dropped only when its merged coefficient is zero. Target-only literals
+    /// are sound weakening rows and receive zero. Any other mismatch declines.
+    #[must_use]
+    pub fn rebind_by_literal(
+        &self,
+        source_clause: &[TermId],
+        target_clause: &[TermId],
+    ) -> Option<Self> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        if self.coefficients.len() != source_clause.len() {
+            return None;
+        }
+        if source_clause == target_clause {
+            return Some(self.clone());
+        }
+
+        let zero = Rational64::from(0);
+        let mut by_literal: BTreeMap<TermId, Rational64> = BTreeMap::new();
+        for (&literal, coefficient) in source_clause.iter().zip(self.coefficients.iter()) {
+            *by_literal.entry(literal).or_insert(zero) += *coefficient;
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut rebound = Vec::with_capacity(target_clause.len());
+        for &literal in target_clause {
+            if seen.insert(literal) {
+                rebound.push(by_literal.remove(&literal).unwrap_or(zero));
+            } else {
+                rebound.push(zero);
+            }
+        }
+        if by_literal.values().any(|coefficient| *coefficient != zero) {
+            return None;
+        }
+        Some(Self::new(rebound))
+    }
 }
 
 /// LIA-specific proof annotation for integer arithmetic theory lemmas.
@@ -345,6 +390,19 @@ pub enum TheoryLemmaKind {
     /// Uses Alethe rule `eq_transitive`
     EufTransitive,
 
+    /// EUF reflexivity: `(cl (= a a))`. Uses Alethe rule `eq_reflexive`.
+    ///
+    /// The degenerate case of a transitivity conflict: when a refuted
+    /// disequality's two sides are the SAME term, the connecting chain is
+    /// empty and there is no transitivity to state. Emitting that as
+    /// [`Self::EufTransitive`] produced a ONE-literal `eq_transitive` clause,
+    /// which the strict checker rejects outright ("EufTransitive clause must
+    /// have at least 2 literals") — so the refutation was correct but
+    /// uncertifiable, and mandatory certification degraded it to `unknown`.
+    /// Reflexivity is a rule in its own right and its clause is legitimately a
+    /// unit, so the conflict is stated as what it actually is.
+    EufReflexive,
+
     /// EUF congruence: `(cl (not (= a x)) ... (= (f a) (f x)))`
     /// Uses Alethe rule `eq_congruent`
     EufCongruent,
@@ -360,6 +418,19 @@ pub enum TheoryLemmaKind {
     /// LIA: may include cutting planes or GCD reasoning
     /// Uses Alethe rule `lia_generic`
     LiaGeneric,
+
+    /// Euclidean integer-remainder range theorem.
+    ///
+    /// The clause is exactly `(cl (not (= (mod x d) r)))` (equality
+    /// orientation may be swapped), where `d` and `r` are integer constants,
+    /// `d != 0`, and `r` lies outside `0 <= r < |d|`.  AY's strict checker
+    /// independently validates the complete schema; a variable/zero divisor,
+    /// an in-range remainder, or any other shape is rejected fail-closed.
+    ///
+    /// Alethe has no general symbolic `mod`-range rule, so this internal
+    /// certificate renders as an honest `hole` on that wire rather than being
+    /// mislabeled as `lia_generic`.
+    LiaModRange,
 
     /// Bitvector bit-blasting (legacy, no gate info).
     /// Uses Alethe rule `bv_bitblast`.
@@ -424,6 +495,91 @@ pub enum TheoryLemmaKind {
     /// Uses Alethe rule `read_over_write_chain`. Validated by `ay-proof`
     /// `validate_array_row_chain` (exact schema; fail-closed).
     ArrayRowChain,
+
+    /// Folded congruence for the model-default operator on a constant array.
+    ///
+    /// ```text
+    /// (cl (not (= A (store* ((as const (Array I E)) v))))
+    ///     (= (default A) v))
+    /// ```
+    ///
+    /// `store*` is a bounded, cycle-free chain of exactly well-sorted stores.
+    /// Equality and clause orientations may be swapped, but the array, fill,
+    /// and sorts must match exactly. AY's strict checker independently
+    /// validates this schema. The pinned external Alethe checker has no rule
+    /// for the non-standard `default` operator, so Alethe export refuses this
+    /// internal certificate instead of emitting `trust` or a false rule name.
+    ArrayDefaultConst,
+
+    /// Set cardinality is non-negative: `(<= 0 (set.card s))` for any set `s`.
+    ///
+    /// Universally valid for every set term, with no side conditions -- a set
+    /// has a non-negative number of elements whatever it contains. AY injects
+    /// this bridge axiom for every `set.card` term it sees, and because the
+    /// axiom is solver-generated rather than authored it cannot stay an
+    /// `Assume` in the refutation; without a kind of its own it was rewritten
+    /// to `hole`, which made every `set.card` refutation externally uncheckable
+    /// even though the rest of the proof checked.
+    ///
+    /// AY's strict checker validates the schema itself. Like
+    /// [`Self::ArrayDefaultConst`], the pinned external Alethe checker has no
+    /// rule for the non-standard `set.card` operator, so Alethe export refuses
+    /// this internal certificate rather than emitting a false rule name.
+    SetCardNonNegative,
+
+    /// Set cardinality membership lower bound:
+    /// `(ite (member x s) (<= 1 (set.card s)) (<= 0 (set.card s)))`.
+    ///
+    /// Universally valid: a set with a known member has at least one element,
+    /// and the else branch is the unconditional non-negativity bound. The set
+    /// under the membership test and the set under the cardinality must be the
+    /// SAME term -- that identity is the whole content of the axiom, and
+    /// dropping it would licence `x ∈ s => |t| >= 1` for an unrelated `t`.
+    ///
+    /// Like [`Self::SetCardNonNegative`], checkable only by AY's native strict
+    /// checker; the pinned external Alethe checker has no `set.card` rule.
+    SetCardMemberLowerBound,
+
+    /// The empty set has cardinality zero: `(= (set.card e) 0)` where `e` is
+    /// SYNTACTICALLY empty -- a `set.empty` application, or the constant array
+    /// whose fill is `false`.
+    ///
+    /// The fill must be exactly `false`. A `true` fill is the UNIVERSAL set,
+    /// whose cardinality is the index sort's size (infinite over `Int`), so a
+    /// schema that ignored the fill would licence `|universe| = 0` and let a
+    /// refutation be built out of nothing.
+    ///
+    /// Only the syntactic form is covered. A set that is empty only by virtue
+    /// of an assertion (`(= s (as set.empty ...))`) is NOT licensed here --
+    /// that needs problem context this checker does not receive.
+    SetCardEmpty,
+
+    /// Cardinality lower bound from a counted membership tree:
+    ///
+    /// ```text
+    /// (ite (member i1 s) (ite (member i2 s) (<= 2 (set.card s)) (<= 1 ...))
+    ///                    (ite (member i2 s) (<= 1 (set.card s)) (<= 0 ...)))
+    /// ```
+    ///
+    /// Each leaf bounds the cardinality below by the number of memberships
+    /// that hold on the path to it, which is valid because a set containing
+    /// `k` DISTINCT elements has at least `k` of them.
+    ///
+    /// Distinctness is the load-bearing side condition, and it is why the
+    /// schema requires every index to be an integer LITERAL with pairwise
+    /// distinct values: two variable indices could denote the same element, so
+    /// counting them separately would licence `|{x}| >= 2`.
+    SetCardMemberCount,
+
+    /// `(= (set.card s) 0)` where the PROBLEM asserts `s` empty.
+    ///
+    /// Unlike [`Self::SetCardEmpty`] this is NOT a tautology: the set is empty
+    /// only by virtue of an assertion, so the schema alone cannot license it.
+    /// Accepted against a registry built from the problem's TOP-LEVEL asserted
+    /// equalities, closed to a fixpoint -- the same shape of whole-proof
+    /// provenance [`Self::ArrayExtensionality`] uses. No problem assertions
+    /// means no evidence, and the lemma fails closed.
+    SetCardEmptyByAssertion,
 
     /// Array extensionality axiom.
     ///
@@ -527,6 +683,23 @@ pub enum TheoryLemmaKind {
     /// without them this kind fails closed in strict mode).
     DatatypeSelectorProject,
 
+    /// Datatype tester evaluation on a constructor application. The positive
+    /// unit `(cl (is-C (C a_0 .. a_n)))` is valid for the matching
+    /// constructor, while `(cl (not (is-C (D ...))))` is valid when `C` and
+    /// `D` are distinct constructors of the same datatype. Uses AY's
+    /// `dt_tester` rule and is validated by `ay-proof` against the datatype
+    /// constructor registry; without that registry strict mode fails closed.
+    DatatypeTesterEval,
+
+    /// Bounded exact tautology over a pure total-order / term-ITE fragment.
+    /// Numeric leaves are at most six Int or Real variables; numeric terms may
+    /// only select such leaves through `ite`, and Boolean structure may only
+    /// compare them or combine comparisons propositionally. Truth therefore
+    /// depends solely on the variables' finite total preorder. `ay-proof`
+    /// enumerates every preorder representative and rejects constants,
+    /// arithmetic, UFs, unsupported Boolean atoms, or an oversized formula.
+    OrderIteTautology,
+
     /// Boolean tautology: a propositional/Boolean clause TRUE under every
     /// assignment of its bounded variables (e.g. `(= (not (not p)) p)`,
     /// `(= (and p p) p)`). Uses Alethe rule `bool_tautology`; validated by
@@ -572,6 +745,69 @@ pub enum TheoryLemmaKind {
     /// the closed schemas and rejects every partial/extra variant.
     FpRoundingModeDomain,
 
+    /// Floating-point forward rounding-error refutation: the clause is the
+    /// disjunction of the NEGATED premises of an FP forward-error UNSAT — the
+    /// `fp.isNormal` input facts, the `fp.to_real` magnitude bounds, and the
+    /// refuted rounding-error goal comparison (e.g.
+    /// `(>= (- (fp.to_real DAG) MIRROR) c)` over an RNE `fp.add/sub/mul/neg`
+    /// dag). Uses Alethe rule `fp_forward_error`; validated by `ay-proof`,
+    /// which independently re-derives the whole analysis from the clause in
+    /// exact rational arithmetic: it re-mines the normality + magnitude
+    /// enclosures, re-checks the RNE-only and no-overflow side conditions,
+    /// re-runs the half-ulp (`r(M) = 2^(max(k-1,emin)-sb)`) enclosure/error
+    /// propagation, re-normalizes the goal polynomial against the exact
+    /// mirror, and accepts ONLY if the certified bound strictly contradicts
+    /// the claim constant (fail-closed on anything unrecognized). The variant
+    /// carries no payload on purpose — nothing about it is load-bearing for
+    /// soundness; the checker re-derives everything from the clause.
+    FpForwardError,
+
+    /// Pure nonlinear-real-arithmetic refutation by bounded exact-rational
+    /// interval propagation (HC4-style contract/evaluate).
+    ///
+    /// The claim: the NEGATION of this clause is a conjunction of polynomial
+    /// sign constraints (`<`, `<=`, `>`, `>=`, `=`, and negated-equality)
+    /// over Real/Int-sorted terms, at least one monomial is genuinely
+    /// nonlinear (total degree >= 2), and the checker's OWN bounded
+    /// exact-rational interval-propagation kernel refutes the conjunction —
+    /// proving it has no real solution, so the clause is valid in the theory
+    /// of reals. Int-sorted variables are relaxed to range over R
+    /// (R-infeasible implies Z-infeasible), and any non-whitelisted Real/Int
+    /// application is abstracted as an opaque universally-quantified leaf.
+    ///
+    /// The variant carries NO payload on purpose: `ay-proof` re-decides the
+    /// whole refutation from the clause terms alone, so there is nothing to
+    /// forge. Any shape, sort, budget, or precision surprise fails closed
+    /// (reject), never open. Alethe has no rule for this internal
+    /// certificate, so it renders as an honest `hole` on that wire.
+    NraIntervalUnsat,
+
+    /// Pure nonlinear-real-arithmetic refutation of a UNIVARIATE polynomial
+    /// constraint system by the checker's own exact Sturm-based cell
+    /// decomposition.
+    ///
+    /// The claim: the NEGATION of this clause is a conjunction of polynomial
+    /// sign constraints in exactly ONE variable (opaque leaves included),
+    /// at least one monomial has degree >= 2, and the checker's OWN
+    /// `BigRational` Sturm decision (square-free parts, root isolation with
+    /// Cauchy bounds, algebraic at-root sign determination via gcd chains,
+    /// sign-invariant cell scan) proves the conjunction infeasible over the
+    /// reals — the complete univariate case analysis, valid at irrational
+    /// roots too, so the clause is valid in the theory of reals.
+    ///
+    /// One documented widening (shared with [`Self::NraIntervalUnsat`]): a
+    /// conjunct that normalizes to a FALSE constant refutes the conjunction
+    /// outright, and is accepted before the one-variable shape check — such
+    /// a clause may be multivariate. The refutation is the false constant
+    /// itself, so soundness is unaffected.
+    ///
+    /// The variant carries NO payload on purpose: `ay-proof` re-decides the
+    /// whole refutation from the clause terms alone. Any shape, sort,
+    /// degree, or budget surprise fails closed (reject), never open. Alethe
+    /// has no rule for this internal certificate, so it renders as an honest
+    /// `hole` on that wire.
+    NraUnivariateUnsat,
+
     /// Generic/unspecified (uses `trust` rule)
     #[default]
     Generic,
@@ -595,15 +831,23 @@ impl TheoryLemmaKind {
     pub fn alethe_rule(&self) -> &'static str {
         match self {
             Self::EufTransitive => "eq_transitive",
+            Self::EufReflexive => "eq_reflexive",
             Self::EufCongruent => "eq_congruent",
             Self::EufCongruentPred => "eq_congruent_pred",
             Self::LraFarkas => "la_generic",
             Self::LiaGeneric => "lia_generic",
+            Self::LiaModRange => "lia_mod_range",
             Self::BvBitBlast | Self::BvBitBlastGate { .. } => "bv_bitblast",
             Self::ArraySelectStore { index_eq: true } => "read_over_write_pos",
             Self::ArraySelectStore { index_eq: false } => "read_over_write_neg",
             Self::ArrayStorePermutation => "store_permutation",
             Self::ArrayRowChain => "read_over_write_chain",
+            Self::ArrayDefaultConst => "array_default_const",
+            Self::SetCardNonNegative => "set_card_non_negative",
+            Self::SetCardMemberLowerBound => "set_card_member_lower_bound",
+            Self::SetCardEmpty => "set_card_empty",
+            Self::SetCardMemberCount => "set_card_member_count",
+            Self::SetCardEmptyByAssertion => "set_card_empty_by_assertion",
             Self::ArrayExtensionality => "extensionality",
             Self::FpToBv { .. } => "fp_to_bv",
             Self::StringLengthAxiom => "string_length",
@@ -614,13 +858,38 @@ impl TheoryLemmaKind {
             Self::RegexIntersectEmpty => "regex_intersect_empty",
             Self::DatatypeDistinct => "dt_distinct",
             Self::DatatypeSelectorProject => "dt_project",
+            Self::DatatypeTesterEval => "dt_tester",
+            Self::OrderIteTautology => "order_ite_tautology",
             Self::BoolTautology => "bool_tautology",
             Self::IteSame => "ite_same",
             Self::FpClassification { .. } => "fp_classification",
             Self::FpRoundingModeDomain => "fp_rm_domain",
+            Self::FpForwardError => "fp_forward_error",
+            Self::NraIntervalUnsat => "nra_interval_unsat",
+            Self::NraUnivariateUnsat => "nra_univariate_unsat",
             Self::Generic => "trust",
             Self::RoundingModeDomain => "fp_rounding_mode_domain",
         }
+    }
+
+    /// The rule name that may be written into an emitted Alethe proof.
+    ///
+    /// [`Self::alethe_rule`] is the *internal* identity and keeps returning
+    /// `"trust"` for [`Self::Generic`] and the theory-specific names
+    /// (`dt_distinct`, `read_over_write_pos`, `string_length`, …) that AY's
+    /// own classifiers, dedup keys and `#8821` diagnostics match on. This
+    /// method is the *wire* identity: kinds the Alethe checker does not
+    /// implement render as `hole`, which the checker accepts as an honest
+    /// unproved step, instead of an unknown rule name that voids the whole
+    /// certificate.
+    ///
+    /// This does not hide anything from AY's soundness gates, which read the
+    /// proof IR: `terminal_trust` flags `AletheRule::Hole` and
+    /// `TheoryLemmaKind::is_trust()` identically, and `is_trust()` below is
+    /// unchanged.
+    #[must_use]
+    pub fn alethe_wire_rule(&self) -> &str {
+        wire_rule_name(self.alethe_rule())
     }
 
     /// True if this theory lemma kind exports as `trust` in Alethe format.
@@ -641,6 +910,11 @@ impl TheoryLemmaKind {
 /// instead of the generic `assume + or` pattern.
 #[derive(Debug, Clone)]
 pub struct TheoryLemmaProof {
+    /// The lemma clause in the exact order used when its positional
+    /// annotations were produced. SAT watched-literal movement may permute a
+    /// traced copy, so consumers must rebind annotations by literal identity
+    /// rather than zipping them with the trace order.
+    pub clause: Vec<TermId>,
     /// The kind of theory lemma (determines the Alethe rule)
     pub kind: TheoryLemmaKind,
     /// Optional Farkas coefficients for arithmetic theories
@@ -704,7 +978,10 @@ pub enum ProofStep {
     },
 }
 
-pub use crate::alethe::AletheRule;
+pub use crate::alethe::{
+    is_checkable_alethe_rule, wire_rule_name, AletheRule, CHECKABLE_ALETHE_RULES,
+    UNPROVED_STEP_RULE,
+};
 
 /// Proof step identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -81,6 +81,30 @@ impl fmt::Display for SExpr {
     }
 }
 
+/// Whether a bare symbol would fail to lex back as the SAME single symbol.
+///
+/// This is the *structural* half of SMT-LIB's quoting rule only. It covers the
+/// empty symbol, a leading digit, and any character outside the simple-symbol
+/// alphabet — the cases that actually corrupt a response:
+///
+/// ```text
+/// |a b|  bare -> `a b`  splits into TWO tokens, changing the list's arity
+/// |(|    bare -> `(`    opens a list, leaving the response unbalanced
+/// ```
+///
+/// It deliberately omits the reserved-word half of `ay_core::quote_symbol`,
+/// because a raw render emits those words in operator position where quoting
+/// them changes the term.
+fn raw_symbol_needs_quoting(name: &str) -> bool {
+    // SMT-LIB simple-symbol alphabet: alphanumerics plus this punctuation set.
+    const EXTRA: &[char] = &[
+        '+', '-', '/', '*', '=', '%', '?', '!', '.', '$', '_', '~', '&', '^', '<', '>', '@',
+    ];
+    name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || name.contains(|c: char| !c.is_ascii_alphanumeric() && !EXTRA.contains(&c))
+}
+
 impl SExpr {
     /// Check if this is a symbol with the given name
     #[must_use]
@@ -123,7 +147,40 @@ impl SExpr {
     /// elaborator) to avoid needing dual-prefix workarounds.
     pub fn to_raw_string(&self) -> String {
         match self {
-            Self::Symbol(s) => s.clone(),
+            // Re-quote. The lexer STRIPS the `|…|` delimiters when it builds a
+            // `Symbol`, so echoing the bare name does not round-trip: `|a b|`
+            // came back as `a b`, which changes the arity of the enclosing list,
+            // and `|(|` came back as a bare `(`, which makes the whole response
+            // unbalanced and unreadable to any s-expression parser:
+            //
+            //   (get-value (|a b|))   z3: ((|a b| false))   was: ((a b false))
+            //   (get-value (|(|))     z3: ((|(| false))     was: ((( false))
+            //
+            // Quoted only when the bare text would not LEX BACK as one symbol.
+            // Deliberately NOT `ay_core::quote_symbol`, which also quotes the
+            // reserved words: a raw render puts `forall`, `exists`, `let`, `as`,
+            // `_`, `!`, `par` and `match` in OPERATOR position, where `|forall|`
+            // is a different term than `forall` and breaks the form outright.
+            // (A user symbol genuinely named `forall` is indistinguishable here
+            // because the lexer discards the delimiters — a pre-existing
+            // round-trip limitation of `SExpr`, not one introduced by quoting.)
+            Self::Symbol(s) => {
+                if raw_symbol_needs_quoting(s) {
+                    let mut quoted = String::with_capacity(s.len() + 2);
+                    quoted.push('|');
+                    for character in s.chars() {
+                        // Z3 5.0.0 accepts `\|` and `\\` inside quoted symbols.
+                        if matches!(character, '|' | '\\') {
+                            quoted.push('\\');
+                        }
+                        quoted.push(character);
+                    }
+                    quoted.push('|');
+                    quoted
+                } else {
+                    s.clone()
+                }
+            }
             Self::Keyword(k) => k.clone(),
             Self::Numeral(n) => n.clone(),
             Self::Decimal(d) => d.clone(),
@@ -343,34 +400,55 @@ impl<'a> SExprParser<'a> {
             None => Err(self.error_at_current("Unexpected end of input")),
             Some(Err(())) => Err(self.error_at_current("Invalid token")),
             Some(Ok(token)) => {
-                let result = match token {
-                    Token::Symbol(s) => SExpr::Symbol((*s).to_string()),
-                    Token::Keyword(k) => SExpr::Keyword((*k).to_string()),
-                    Token::Numeral(n) => SExpr::Numeral((*n).to_string()),
-                    Token::Decimal(d) => SExpr::Decimal((*d).to_string()),
-                    Token::Hexadecimal(h) => SExpr::Hexadecimal((*h).to_string()),
-                    Token::Binary(b) => SExpr::Binary((*b).to_string()),
-                    Token::String(s) => {
-                        let contents = &s[1..s.len() - 1];
-                        // Fail closed on a literal we cannot represent exactly.
-                        // Substituting a replacement character (or dropping the
-                        // escape) would change the string's length and silently
-                        // flip every str.len/membership verdict mentioning it.
-                        match unescape_string_contents(contents) {
-                            Ok(decoded) => SExpr::String(decoded),
-                            Err(err) => return Err(self.error_at_current(err.to_string())),
+                let result =
+                    match token {
+                        Token::Symbol(s) => SExpr::Symbol((*s).to_string()),
+                        Token::Keyword(k) => SExpr::Keyword((*k).to_string()),
+                        Token::Numeral(n) => SExpr::Numeral((*n).to_string()),
+                        Token::Decimal(d) => SExpr::Decimal((*d).to_string()),
+                        Token::Hexadecimal(h) => SExpr::Hexadecimal((*h).to_string()),
+                        Token::Binary(b) => SExpr::Binary((*b).to_string()),
+                        Token::String(s) => {
+                            let contents = &s[1..s.len() - 1];
+                            if let Some(character) = contents
+                                .chars()
+                                .find(|&character| !is_smtlib_string_character(character))
+                            {
+                                return Err(self.error_at_current(format!(
+                                    "string literal contains forbidden character U+{:04X}",
+                                    u32::from(character)
+                                )));
+                            }
+                            // Fail closed on a literal we cannot represent exactly.
+                            // Substituting a replacement character (or dropping the
+                            // escape) would change the string's length and silently
+                            // flip every str.len/membership verdict mentioning it.
+                            match unescape_string_contents(contents) {
+                                Ok(decoded) => SExpr::String(decoded),
+                                Err(err) => return Err(self.error_at_current(err.to_string())),
+                            }
                         }
-                    }
-                    Token::QuotedSymbol(s) => {
-                        let inner = &s[1..s.len() - 1];
-                        SExpr::Symbol(inner.to_string())
-                    }
-                    Token::True => SExpr::True,
-                    Token::False => SExpr::False,
-                    Token::LParen | Token::RParen => {
-                        return Err(self.error_at_current("Expected atom, got parenthesis"))
-                    }
-                };
+                        Token::QuotedSymbol(s) => {
+                            let inner = &s[1..s.len() - 1];
+                            match unescape_quoted_symbol_contents(inner) {
+                                Ok(decoded) => SExpr::Symbol(decoded),
+                                Err(character) => {
+                                    return Err(self.error_at_current(format!(
+                                        "quoted symbol contains forbidden character U+{:04X}",
+                                        u32::from(character)
+                                    )))
+                                }
+                            }
+                        }
+                        Token::True => SExpr::True,
+                        Token::False => SExpr::False,
+                        Token::InvalidLeadingZeroNumeral => return Err(self.error_at_current(
+                            "numerals and the integer part of decimals may not have leading zeros",
+                        )),
+                        Token::LParen | Token::RParen => {
+                            return Err(self.error_at_current("Expected atom, got parenthesis"))
+                        }
+                    };
                 self.advance();
                 Ok(result)
             }
@@ -414,6 +492,51 @@ impl<'a> SExprParser<'a> {
         }
         Ok(result)
     }
+}
+
+fn is_smtlib_white_space(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | ' ')
+}
+
+fn is_smtlib_printable(character: char) -> bool {
+    matches!(character, '\u{20}'..='\u{7e}') || u32::from(character) >= 0x80
+}
+
+fn is_smtlib_string_character(character: char) -> bool {
+    is_smtlib_white_space(character) || is_smtlib_printable(character)
+}
+
+fn is_smtlib_quoted_symbol_character(character: char) -> bool {
+    (is_smtlib_white_space(character) || is_smtlib_printable(character))
+        && !matches!(character, '|' | '\\')
+}
+
+/// Decode Z3 5.0.0 quoted-symbol escapes. `\|` and `\\` denote the escaped
+/// character; a backslash before any other printable character is retained,
+/// matching Z3's scanner rather than silently changing the identifier.
+fn unescape_quoted_symbol_contents(contents: &str) -> Result<String, char> {
+    let mut decoded = String::with_capacity(contents.len());
+    let mut characters = contents.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escaped = characters.next().ok_or('\\')?;
+            if matches!(escaped, '|' | '\\') {
+                decoded.push(escaped);
+            } else {
+                if !is_smtlib_white_space(escaped) && !is_smtlib_printable(escaped) {
+                    return Err(escaped);
+                }
+                decoded.push('\\');
+                decoded.push(escaped);
+            }
+        } else {
+            if !is_smtlib_quoted_symbol_character(character) {
+                return Err(character);
+            }
+            decoded.push(character);
+        }
+    }
+    Ok(decoded)
 }
 
 /// Parse a string into a single S-expression

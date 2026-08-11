@@ -15,7 +15,7 @@
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{quote_symbol, string_literal, Sort, TermId};
-use ay_frontend::OptionValue;
+use ay_frontend::{AuthoredAssertionRef, OptionValue};
 
 use crate::executor::model::EvalValue;
 use crate::executor_format::{format_bigint, format_rational, format_sort, format_symbol};
@@ -166,18 +166,35 @@ impl Executor {
 
     /// Get current assertions for get-assertions command
     pub(super) fn assertions(&self) -> String {
-        if self.ctx.assertions.is_empty() {
+        let authored = self.ctx.authored_assertions_for_display();
+        if authored.is_empty() {
             return "()".to_string();
         }
 
-        let formatted: Vec<String> = self
-            .ctx
-            .assertions
-            .iter()
-            .map(|&term_id| self.format_term(term_id))
+        let formatted: Vec<String> = authored
+            .into_iter()
+            .map(|assertion| match assertion {
+                AuthoredAssertionRef::Parsed(parsed) => {
+                    super::proof_surface_syntax::format_authored_frontend_term(parsed)
+                }
+                AuthoredAssertionRef::Elaborated(term_id) => self.format_term(term_id),
+            })
             .collect();
 
         format!("({})", formatted.join("\n "))
+    }
+
+    /// Return the Simplify-style labels attached to the last solver result.
+    ///
+    /// AY does not currently mint Simplify labels, so the available result is
+    /// the empty label list. Matching Z3's availability rule still matters:
+    /// the query is valid only after `sat` or `unknown`, never before a check
+    /// or after `unsat`.
+    pub(super) fn labels(&self) -> String {
+        match self.last_result {
+            Some(SolveResult::Sat | SolveResult::Unknown) => "(labels)".to_string(),
+            _ => "(error \"labels are not available\")".to_string(),
+        }
     }
 
     /// Serialize the CURRENT assertion stack as a self-contained SMT-LIB2
@@ -535,9 +552,14 @@ impl Executor {
             TermData::Const(Constant::Int(n)) => format_bigint(n),
             TermData::Const(Constant::Rational(r)) => format_rational(&r.0),
             TermData::Const(Constant::String(s)) => string_literal(s),
+            // A BV numeral's printed form encodes its width, so this MUST go
+            // through the canonical printer: `#x` is well-formed only at widths
+            // that are a multiple of 4. Open-coding hex here (with a
+            // `div_ceil(4)` digit count) printed e.g. a `(_ BitVec 5)` value 17
+            // as `#x11`, which reparses as `(_ BitVec 8)`. This is the printer
+            // behind the Z3-compat C API's `Z3_ast_to_string`.
             TermData::Const(Constant::BitVec { value, width }) => {
-                let hex_width = (*width as usize).div_ceil(4);
-                format!("#x{:0>width$}", value.to_str_radix(16), width = hex_width)
+                crate::executor_format::format_bitvec(value, *width)
             }
             TermData::Not(inner) => format!("(not {})", self.format_term(*inner)),
             TermData::Ite(cond, then_br, else_br) => format!(
@@ -752,6 +774,7 @@ impl Executor {
         let saved_clausification_proofs = self.last_clausification_proofs.take();
         let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
         let saved_proof_check_result = self.proof_check_result.take();
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_proof_problem_assertion_provenance =
@@ -777,6 +800,7 @@ impl Executor {
         self.last_clausification_proofs = saved_clausification_proofs;
         self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
         self.quant_expansion_records = saved_quant_expansion_records;
+        self.ematching_proof_records = saved_ematching_proof_records;
         self.proof_check_result = saved_proof_check_result;
         self.proof_check_ok = saved_proof_check_ok;
         self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;
@@ -884,6 +908,7 @@ impl Executor {
         let saved_clausification_proofs = self.last_clausification_proofs.take();
         let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
         let saved_proof_check_result = self.proof_check_result.take();
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_proof_problem_assertion_provenance =
@@ -908,6 +933,7 @@ impl Executor {
         self.last_clausification_proofs = saved_clausification_proofs;
         self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
         self.quant_expansion_records = saved_quant_expansion_records;
+        self.ematching_proof_records = saved_ematching_proof_records;
         self.proof_check_result = saved_proof_check_result;
         self.proof_check_ok = saved_proof_check_ok;
         self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;

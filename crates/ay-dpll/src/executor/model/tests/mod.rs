@@ -27,7 +27,9 @@ pub(crate) use super::*;
 
 mod array_completion;
 mod array_witness_soundness;
+mod cert_default_row_key;
 mod cross_base_witness_defchase;
+mod dt_element_canon_gate;
 mod dt_recursive_model_faithfulness;
 mod eval_term_bitvec_array;
 mod eval_term_bv_compound;

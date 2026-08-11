@@ -19,6 +19,8 @@ mod fp_conversions;
 mod fp_forward_error;
 #[path = "group_fp/fp_guard_and_minmax.rs"]
 mod fp_guard_and_minmax;
+#[path = "group_fp/fp_indexed_special_constants.rs"]
+mod fp_indexed_special_constants;
 #[path = "group_fp/fp_integration.rs"]
 mod fp_integration;
 #[path = "group_fp/fp_model_extraction.rs"]

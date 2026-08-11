@@ -37,7 +37,19 @@ impl Executor {
             if let TermData::App(ref sym, ref args) = self.ctx.terms.get(term).clone() {
                 match sym.name() {
                     "=" if args.len() == 2 => {
-                        if matches!(self.ctx.terms.sort(args[0]), Sort::Array(..)) {
+                        // BOTH sides, not just the left. Every consumer of
+                        // `array_eq_pairs` builds `select(other, k)` /
+                        // `store(other, i, v)` from the OPPOSITE side of the
+                        // equality, which is well-sorted only if that side is an
+                        // array of the same sort. Checking `args[0]` alone let an
+                        // `(= t:Array u:Int)` pair through; `mk_select` on a
+                        // non-array falls back to `Bool`, so the congruence builder
+                        // then called `mk_eq(Int, Bool)` and tripped
+                        // `BUG: mk_eq expects same sort` — killing the entire solve
+                        // with `(:reason-unknown "internal solver error")`.
+                        if matches!(self.ctx.terms.sort(args[0]), Sort::Array(..))
+                            && self.ctx.terms.sort(args[0]) == self.ctx.terms.sort(args[1])
+                        {
                             array_eq_pairs.push((term, args[0], args[1]));
                         }
                     }
@@ -206,6 +218,30 @@ impl Executor {
                 if sym.name() == "=" && args.len() == 2 {
                     let lhs = args[0];
                     let rhs = args[1];
+                    // Both sides must carry the SAME sort before either can seed a
+                    // store-congruence entry.
+                    //
+                    // `add_store_value_congruence_axioms` builds
+                    // `select(other_side, store_index)` and equates it with the
+                    // store's VALUE. That is well-sorted only if `other_side` is an
+                    // array of the store's sort. Nothing established that here, and
+                    // a term store reached by this scan can hold an `App("=", [a, b])`
+                    // whose sides disagree — `mk_select` on a non-array falls back to
+                    // `Bool`, so the builder then called `mk_eq(Int, Bool)` and hit
+                    // `BUG: mk_eq expects same sort`, killing the whole solve with
+                    // `(:reason-unknown "internal solver error")`.
+                    //
+                    // Measured on the `qf_auflia_shadowed_store_value_requires_
+                    // distinct_outer_index_8871` repro: the entry was
+                    // `(= t4:Int t54:Array(Int,Int))`, giving `sel:Bool` against
+                    // `store_value:Int`.
+                    //
+                    // Skipping such an entry loses nothing: an axiom relating a
+                    // store's value to a `select` of a non-array is meaningless, so
+                    // the only thing this suppresses is the crash.
+                    if self.ctx.terms.sort(lhs) != self.ctx.terms.sort(rhs) {
+                        continue;
+                    }
                     if let TermData::App(lsym, largs) = self.ctx.terms.get(lhs) {
                         if lsym.name() == "store" && largs.len() == 3 {
                             self.cached_store_eqs

@@ -565,3 +565,74 @@ fn linear_identity_rejects_nonidentities() {
         "x = 5 is NOT an identity"
     );
 }
+
+// ---- Euclidean `mod` constant-range validation ----
+
+fn mod_range_clause(
+    terms: &mut TermStore,
+    dividend: TermId,
+    divisor: TermId,
+    remainder: TermId,
+) -> Vec<TermId> {
+    let modulus = raw2(terms, "mod", dividend, divisor, Sort::Int);
+    let equality = raw2(terms, "=", modulus, remainder, Sort::Bool);
+    vec![terms.mk_not_raw(equality)]
+}
+
+#[test]
+fn mod_range_accepts_exact_out_of_range_constants() {
+    use super::lia::validate_lia_mod_range;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("mod-x", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let neg_three = terms.mk_int(BigInt::from(-3));
+    let four = terms.mk_int(BigInt::from(4));
+    let neg_one = terms.mk_int(BigInt::from(-1));
+
+    let above = mod_range_clause(&mut terms, x, three, four);
+    assert!(
+        validate_lia_mod_range(&terms, &above).is_ok(),
+        "(mod x 3) cannot equal 4"
+    );
+    let below = mod_range_clause(&mut terms, x, neg_three, neg_one);
+    assert!(
+        validate_lia_mod_range(&terms, &below).is_ok(),
+        "Euclidean (mod x -3) cannot equal -1"
+    );
+}
+
+#[test]
+fn mod_range_rejects_every_non_theorem_shape() {
+    use super::lia::validate_lia_mod_range;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("mod-x", Sort::Int);
+    let d = terms.mk_var("mod-d", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let two = terms.mk_int(BigInt::from(2));
+    let three = terms.mk_int(BigInt::from(3));
+
+    let in_range = mod_range_clause(&mut terms, x, three, two);
+    assert!(
+        validate_lia_mod_range(&terms, &in_range).is_err(),
+        "(mod x 3) = 2 is satisfiable"
+    );
+    let zero_divisor = mod_range_clause(&mut terms, x, zero, two);
+    assert!(
+        validate_lia_mod_range(&terms, &zero_divisor).is_err(),
+        "mod by zero has no Euclidean range certificate"
+    );
+    let variable_divisor = mod_range_clause(&mut terms, x, d, three);
+    assert!(
+        validate_lia_mod_range(&terms, &variable_divisor).is_err(),
+        "a variable divisor is outside the certified lane"
+    );
+
+    let modulus = raw2(&mut terms, "mod", x, three, Sort::Int);
+    let positive_equality = raw2(&mut terms, "=", modulus, two, Sort::Bool);
+    assert!(
+        validate_lia_mod_range(&terms, &[positive_equality]).is_err(),
+        "the theorem must have negated-equality polarity"
+    );
+}

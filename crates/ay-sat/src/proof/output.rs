@@ -4,9 +4,11 @@
 
 //! Unified proof output facade that abstracts over DRAT and LRAT formats.
 
-use super::{BoxedWriter, DratWriter, LratWriter};
+use super::{BoxedWriter, DratWriter, LratBoundedResourceFailure, LratWriter};
 use crate::literal::Literal;
 use std::io::{self, Write};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// Unified proof output that can be either DRAT or LRAT format.
 ///
@@ -50,6 +52,21 @@ impl ProofOutput {
         Self::Lrat(LratWriter::new_binary(
             BoxedWriter::new(writer),
             num_original_clauses,
+        ))
+    }
+
+    /// Create binary LRAT output with a hard in-memory pending-deletion cap.
+    pub(crate) fn lrat_binary_bounded(
+        writer: impl Write + Send + 'static,
+        num_original_clauses: u64,
+        max_pending_deletions: usize,
+        interrupt: Arc<AtomicBool>,
+    ) -> Self {
+        Self::Lrat(LratWriter::new_binary_bounded(
+            BoxedWriter::new(writer),
+            num_original_clauses,
+            max_pending_deletions,
+            interrupt,
         ))
     }
 
@@ -144,6 +161,36 @@ impl ProofOutput {
         match self {
             Self::Drat(_) => Ok(()),
             Self::Lrat(w) => w.add_with_id(clause_id, clause, hints),
+        }
+    }
+
+    /// Emit a bounded-producer prevalidated positive-RUP addition.
+    pub(crate) fn add_bounded_prevalidated_rup(
+        &mut self,
+        clause: &[Literal],
+        hints: &[u64],
+    ) -> io::Result<u64> {
+        match self {
+            Self::Drat(writer) => {
+                writer.add(clause)?;
+                Ok(0)
+            }
+            Self::Lrat(writer) => writer.add_bounded_prevalidated_rup(clause, hints),
+        }
+    }
+
+    /// Emit a pre-assigned bounded-producer positive-RUP addition.
+    pub(crate) fn add_with_id_bounded_prevalidated_rup(
+        &mut self,
+        clause_id: u64,
+        clause: &[Literal],
+        hints: &[i64],
+    ) -> io::Result<()> {
+        match self {
+            Self::Drat(_) => Ok(()),
+            Self::Lrat(writer) => {
+                writer.add_with_id_bounded_prevalidated_rup(clause_id, clause, hints)
+            }
         }
     }
 
@@ -243,6 +290,14 @@ impl ProofOutput {
         match self {
             Self::Drat(w) => w.has_io_error(),
             Self::Lrat(w) => w.has_io_error(),
+        }
+    }
+
+    /// Typed failure from bounded LRAT storage outside the byte writer.
+    pub(crate) fn lrat_bounded_resource_failure(&self) -> Option<LratBoundedResourceFailure> {
+        match self {
+            Self::Drat(_) => None,
+            Self::Lrat(writer) => writer.bounded_resource_failure(),
         }
     }
 

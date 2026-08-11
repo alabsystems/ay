@@ -53,6 +53,7 @@ mod engine_ext;
 mod engine_local;
 mod ffi_guards;
 pub(crate) use ffi_guards::*;
+mod finite_sets;
 mod fixedpoint;
 mod fixedpoint_ext;
 mod fixedpoint_ext2;
@@ -86,6 +87,10 @@ mod tactics;
 mod terms;
 
 #[cfg(test)]
+mod bv_numeral_radix_tests;
+#[cfg(test)]
+mod finite_sets_tests;
+#[cfg(test)]
 mod rec_def_ffi_tests;
 #[cfg(test)]
 mod tests;
@@ -103,6 +108,7 @@ pub use context::*;
 pub use datatypes::*;
 pub use engine_ext::*;
 pub use engine_local::*;
+pub use finite_sets::*;
 pub use fixedpoint::*;
 pub use fixedpoint_ext::*;
 pub use fixedpoint_ext2::*;
@@ -703,8 +709,24 @@ pub const Z3_OP_BLSHR: c_uint = 0x429;
 pub const Z3_OP_BASHR: c_uint = 0x42a;
 pub const Z3_OP_ROTATE_LEFT: c_uint = 0x42b;
 pub const Z3_OP_ROTATE_RIGHT: c_uint = 0x42c;
-// Uninterpreted — one of the last entries in the upstream enum (0xB02E = 45102).
-pub const Z3_OP_UNINTERPRETED: c_uint = 0xb02e;
+// Finite sets (Z3 5.0.0 plugin theory).
+pub const Z3_OP_FINITE_SET_EMPTY: c_uint = 0xc000;
+pub const Z3_OP_FINITE_SET_SINGLETON: c_uint = 0xc001;
+pub const Z3_OP_FINITE_SET_UNION: c_uint = 0xc002;
+pub const Z3_OP_FINITE_SET_INTERSECT: c_uint = 0xc003;
+pub const Z3_OP_FINITE_SET_DIFFERENCE: c_uint = 0xc004;
+pub const Z3_OP_FINITE_SET_IN: c_uint = 0xc005;
+pub const Z3_OP_FINITE_SET_SIZE: c_uint = 0xc006;
+pub const Z3_OP_FINITE_SET_SUBSET: c_uint = 0xc007;
+pub const Z3_OP_FINITE_SET_MAP: c_uint = 0xc008;
+pub const Z3_OP_FINITE_SET_FILTER: c_uint = 0xc009;
+pub const Z3_OP_FINITE_SET_RANGE: c_uint = 0xc00a;
+pub const Z3_OP_FINITE_SET_EXT: c_uint = 0xc00b;
+pub const Z3_OP_FINITE_SET_MAP_INVERSE: c_uint = 0xc00c;
+// Z3 5.0.0 tail values. Keep these exact: bindings use the numeric ABI.
+pub const Z3_OP_INTERNAL: c_uint = 0xc00d;
+pub const Z3_OP_RECURSIVE: c_uint = 0xc00e;
+pub const Z3_OP_UNINTERPRETED: c_uint = 0xc00f;
 
 /// Z3_error_code values
 pub const Z3_OK: c_uint = 0;
@@ -735,6 +757,39 @@ pub const Z3_EXCEPTION: c_uint = 12;
 pub(crate) enum DecisionOwnerFamily {
     Solver,
     Optimize,
+}
+
+/// Complete C-API-visible quantifier hint identity for one hash-consed term.
+/// AY's core term identity intentionally excludes these heuristic attributes,
+/// so a second constructor may reuse the term only when this signature is
+/// exactly equal. Conflicting metadata is rejected instead of overwriting the
+/// first public AST's introspection state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuantifierFfiMetadata {
+    pub(crate) weight: c_uint,
+    pub(crate) quantifier_id: Option<SymbolKey>,
+    pub(crate) skolem_id: Option<SymbolKey>,
+    pub(crate) no_patterns: Vec<Term>,
+}
+
+impl QuantifierFfiMetadata {
+    fn is_default(&self) -> bool {
+        self.weight == 1
+            && self.quantifier_id.is_none()
+            && self.skolem_id.is_none()
+            && self.no_patterns.is_empty()
+    }
+}
+
+impl Default for QuantifierFfiMetadata {
+    fn default() -> Self {
+        Self {
+            weight: 1,
+            quantifier_id: None,
+            skolem_id: None,
+            no_patterns: Vec::new(),
+        }
+    }
 }
 
 /// Internal context state
@@ -794,6 +849,45 @@ pub struct Z3Context {
     pub(crate) next_ffi_fresh_id: u64,
     /// Track sorts associated with AST handles for sort queries
     pub(crate) ast_sorts: Vec<Option<Sort>>,
+    /// Public Z3 5.0.0 finite-set sort identity -> public element sort.
+    pub(crate) finite_set_sorts: HashMap<Sort, Sort>,
+    /// Canonical public element sort -> finite-set sort identity.
+    pub(crate) finite_set_sorts_by_basis: HashMap<Sort, Sort>,
+    /// Per-term finite-set decision provenance. Decision gates are derived
+    /// from the current handle's reachable goal, never from unrelated ASTs
+    /// constructed elsewhere in this context.
+    pub(crate) finite_set_term_provenance: HashMap<Term, FiniteSetTermProvenance>,
+    /// Finite-set witness axioms keyed by the public term whose semantics they
+    /// define. Only axioms reachable from the current goal are installed.
+    pub(crate) finite_set_reachable_axioms: HashMap<Term, Vec<Term>>,
+    /// Publicly typed bound-variable terms for quantifiers built through the C
+    /// API. Their AST sort side-table entries preserve FiniteSet identity even
+    /// though the quantifier's engine binder sorts are lowered arrays.
+    pub(crate) quantifier_public_bound_terms: HashMap<Term, Vec<Term>>,
+    /// Parsed quantifiers do not expose their elaborator-private bound term
+    /// identities. Preserve their public binder sorts directly.
+    pub(crate) parsed_quantifier_public_bound_sorts: HashMap<Term, Vec<Sort>>,
+    /// Z3 C-API quantifier priority weights keyed by the retained quantifier
+    /// term. The weight is an instantiation hint, not logical semantics, but
+    /// stock consumers expect it to round-trip through
+    /// `Z3_get_quantifier_weight`.
+    pub(crate) quantifier_weights: HashMap<Term, c_uint>,
+    /// Explicit `:no-pattern` expressions supplied through the extended C
+    /// quantifier constructors. They affect instantiation strategy only, but
+    /// stock API introspection requires exact round-trip metadata.
+    pub(crate) quantifier_no_patterns: HashMap<Term, Vec<Term>>,
+    /// Atomic signature guarding the two side maps above plus the core qid and
+    /// skolemid maps against hash-consed metadata aliasing.
+    pub(crate) quantifier_ffi_metadata: HashMap<Term, QuantifierFfiMetadata>,
+    /// Public finite-set applications retained over their engine witnesses.
+    pub(crate) finite_set_apps: HashMap<Term, FiniteSetApp>,
+    /// Exact characteristic-array meaning of each retained application.
+    pub(crate) finite_set_app_backings: HashMap<Term, Term>,
+    /// Z3-style hash-consing for retained finite-set applications.
+    pub(crate) finite_set_app_cache: HashMap<FiniteSetAppKey, Term>,
+    /// Public signatures for declarations whose engine signature lowers a
+    /// finite-set sort to its characteristic-array representation.
+    pub(crate) finite_set_decl_signatures: HashMap<String, (Vec<Sort>, Sort)>,
     /// Arena for heap-allocated handles — freed on context deletion (#5498).
     pub(crate) sort_cache: Vec<*mut SortHandle>,
     pub(crate) func_decl_cache: Vec<*mut FuncDeclHandle>,
@@ -1120,6 +1214,18 @@ pub(crate) fn ensure_cross_context_translation_semantics(
     if !source.transitive_closure_regs.is_empty() {
         missing.push("transitive-closure registrations/verifier state");
     }
+    // Quantifier attributes are AST-local. The metadata-transfer walk below
+    // rejects them only when their quantifier is reachable from a requested
+    // root; inspecting the whole source context here would poison unrelated
+    // translations. The public-bound maps are likewise populated for every C
+    // quantifier and are not, by themselves, evidence of FiniteSet use.
+    if !source.finite_set_sorts.is_empty()
+        || !source.finite_set_apps.is_empty()
+        || !source.finite_set_term_provenance.is_empty()
+        || !source.finite_set_reachable_axioms.is_empty()
+    {
+        missing.push("FiniteSet public sorts/applications and decision gates");
+    }
     if missing.is_empty() {
         return true;
     }
@@ -1158,6 +1264,70 @@ fn sort_contains(root: &Sort, needle: &Sort) -> bool {
     }
 }
 
+fn sort_mentions_datatype(sort: &Sort) -> bool {
+    match sort {
+        Sort::Datatype(_) => true,
+        Sort::Array(array) => {
+            sort_mentions_datatype(&array.index_sort) || sort_mentions_datatype(&array.element_sort)
+        }
+        Sort::Seq(element) => sort_mentions_datatype(element),
+        _ => false,
+    }
+}
+
+/// Canonical observable `(name, sort)` pairs for C-constructed quantifier
+/// binders. Bound terms are metadata-only and need not occur in the logical
+/// DAG, so both their public symbol identity and AST sort side table must take
+/// part in translation collision checks.
+fn public_bound_term_descriptors(
+    context: &Z3Context,
+    quantifier: Term,
+    bounds: &[Term],
+) -> Option<Vec<(SymbolKey, Sort)>> {
+    let engine_bounds = context.solver.quantifier_bound_vars(quantifier)?;
+    if engine_bounds.len() != bounds.len() {
+        return None;
+    }
+    Some(
+        bounds
+            .iter()
+            .zip(engine_bounds)
+            .map(|(&bound, (engine_name, engine_sort))| {
+                let symbol = context
+                    .ffi_const_metadata
+                    .get(&bound)
+                    .map(|(_, symbol)| symbol.clone())
+                    .unwrap_or(SymbolKey::String(engine_name));
+                let sort = lookup_ast_sort(context, term_to_ast(context, bound))
+                    .cloned()
+                    .unwrap_or(engine_sort);
+                (symbol, sort)
+            })
+            .collect(),
+    )
+}
+
+/// Canonical observable `(name, sort)` pairs for parsed quantifier binders.
+/// Parsed SMT-LIB names are string symbols in the core binder vector; only
+/// their public sorts require a separate side table.
+fn parsed_public_bound_descriptors(
+    context: &Z3Context,
+    quantifier: Term,
+    public_sorts: &[Sort],
+) -> Option<Vec<(SymbolKey, Sort)>> {
+    let engine_bounds = context.solver.quantifier_bound_vars(quantifier)?;
+    if engine_bounds.len() != public_sorts.len() {
+        return None;
+    }
+    Some(
+        engine_bounds
+            .into_iter()
+            .zip(public_sorts)
+            .map(|((name, _), sort)| (SymbolKey::String(name), sort.clone()))
+            .collect(),
+    )
+}
+
 /// Carry C-API declaration/display identity alongside a translated term DAG.
 ///
 /// `Solver::translate_terms_from` faithfully rebuilds core nodes, whose private
@@ -1185,6 +1355,10 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
         .collect();
     let mut relevant_names = std::collections::HashSet::new();
     let mut relevant_sorts = std::collections::HashSet::new();
+    let mut relevant_map_functions = std::collections::HashSet::new();
+    let mut quantifier_public_bound_copies: HashMap<Term, (Vec<Term>, Vec<Sort>)> = HashMap::new();
+    let mut parsed_quantifier_public_bound_sort_copies: HashMap<Term, Vec<Sort>> = HashMap::new();
+    let mut source_public_bound_descriptors: HashMap<Term, Vec<(SymbolKey, Sort)>> = HashMap::new();
     while let Some((source_term, target_term)) = stack.pop() {
         if let Some(existing) = pairs.insert(source_term, target_term) {
             if existing != target_term {
@@ -1199,13 +1373,158 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
 
         relevant_sorts.insert(source.solver.term_sort(source_term));
         match source.solver.term_kind(source_term) {
-            TermKind::App { name, .. } | TermKind::Var { name } => {
+            TermKind::App { name, .. } => {
+                if let Some(function) = name
+                    .strip_prefix("map[")
+                    .and_then(|name| name.strip_suffix(']'))
+                {
+                    relevant_map_functions.insert(function.to_string());
+                    // `map[f]` captures the mapped declaration by its private
+                    // core name even though `f` is not a child term. Include
+                    // that hidden dependency in the ordinary declaration
+                    // identity/signature preflight, or two contexts can reuse
+                    // the same private name for different public functions.
+                    relevant_names.insert(function.to_string());
+                }
+                relevant_names.insert(name);
+            }
+            TermKind::Var { name } => {
                 relevant_names.insert(name);
             }
             _ => {}
         }
         if let Some(vars) = source.solver.quantifier_bound_vars(source_term) {
-            relevant_sorts.extend(vars.into_iter().map(|(_, sort)| sort));
+            relevant_sorts.extend(vars.iter().map(|(_, sort)| sort.clone()));
+            if !source
+                .quantifier_public_bound_terms
+                .contains_key(&source_term)
+                && !source
+                    .parsed_quantifier_public_bound_sorts
+                    .contains_key(&source_term)
+            {
+                // A tactic/native-produced quantifier can legitimately have no
+                // FFI side-table entry. Its observable fallback is still exact:
+                // string binder names plus core sorts. Record it so translation
+                // cannot silently borrow different target-side metadata from a
+                // hash-consed quantifier.
+                source_public_bound_descriptors.insert(
+                    target_term,
+                    vars.into_iter()
+                        .map(|(name, sort)| (SymbolKey::String(name), sort))
+                        .collect(),
+                );
+            }
+        }
+
+        // C-API binder terms are public-AST metadata rather than children of
+        // the core quantifier node. Graft even unused binders explicitly, then
+        // feed them through this same lockstep walk so their exact SymbolKey,
+        // declaration identity, and sort metadata receive the ordinary
+        // transactional collision checks below.
+        if let Some(source_bounds) = source.quantifier_public_bound_terms.get(&source_term) {
+            let target_bounds = target
+                .solver
+                .translate_terms_from(&source.solver, source_bounds);
+            if source_bounds.len() != target_bounds.len() {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "quantifier public-bound count changed during copy",
+                );
+            }
+            let public_sorts: Vec<Sort> = source_bounds
+                .iter()
+                .map(|&bound| {
+                    lookup_ast_sort(source, term_to_ast(source, bound))
+                        .cloned()
+                        .unwrap_or_else(|| source.solver.term_sort(bound))
+                })
+                .collect();
+            let Some(descriptors) =
+                public_bound_term_descriptors(source, source_term, source_bounds)
+            else {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "quantifier public-bound metadata does not match its core binders",
+                );
+            };
+            if source_public_bound_descriptors
+                .get(&target_term)
+                .is_some_and(|existing| existing != &descriptors)
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "source quantifier has conflicting public-bound representations",
+                );
+            }
+            source_public_bound_descriptors
+                .entry(target_term)
+                .or_insert(descriptors);
+            if quantifier_public_bound_copies
+                .get(&target_term)
+                .is_some_and(|(existing_bounds, existing_sorts)| {
+                    existing_bounds != &target_bounds || existing_sorts != &public_sorts
+                })
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "shared translated quantifier has different public-bound metadata",
+                );
+            }
+            stack.extend(
+                source_bounds
+                    .iter()
+                    .copied()
+                    .zip(target_bounds.iter().copied()),
+            );
+            relevant_sorts.extend(public_sorts.iter().cloned());
+            quantifier_public_bound_copies
+                .entry(target_term)
+                .or_insert((target_bounds, public_sorts));
+        }
+        if let Some(public_sorts) = source
+            .parsed_quantifier_public_bound_sorts
+            .get(&source_term)
+        {
+            let Some(descriptors) =
+                parsed_public_bound_descriptors(source, source_term, public_sorts)
+            else {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "parsed quantifier public-bound metadata does not match its core binders",
+                );
+            };
+            if source_public_bound_descriptors
+                .get(&target_term)
+                .is_some_and(|existing| existing != &descriptors)
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "source quantifier has conflicting public-bound representations",
+                );
+            }
+            source_public_bound_descriptors
+                .entry(target_term)
+                .or_insert(descriptors);
+            if parsed_quantifier_public_bound_sort_copies
+                .get(&target_term)
+                .is_some_and(|existing| existing != public_sorts)
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "shared translated quantifier has different parsed public-bound sorts",
+                );
+            }
+            relevant_sorts.extend(public_sorts.iter().cloned());
+            parsed_quantifier_public_bound_sort_copies
+                .entry(target_term)
+                .or_insert_with(|| public_sorts.clone());
         }
 
         let source_children = source.solver.term_children(source_term);
@@ -1242,6 +1561,151 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
                     "quantifier triggers changed during copy",
                 );
             }
+        }
+    }
+
+    // The term-store graft preserves datatype-shaped sorts but does not replay
+    // the declaration into the target executor's datatype registry. Publishing
+    // such a term would let logic detection and datatype axioms treat it as an
+    // ordinary uninterpreted sort. Reject the translation until declarations
+    // can be replayed transactionally together with their exact C identities.
+    if relevant_sorts.iter().any(sort_mentions_datatype) {
+        return translation_metadata_error(
+            target,
+            operation,
+            "reachable datatype declarations cannot yet be translated transactionally",
+        );
+    }
+
+    // Quantifier hints are keyed by core Term today. Non-default attributes
+    // still cannot be remapped because no-pattern terms are metadata-only, but
+    // a DEFAULT quantifier must nevertheless install an exact default latch in
+    // the destination. Otherwise a target `_ex` constructor could attach qid,
+    // skolemid, or a different weight to the same hash-consed term and
+    // retroactively change the translated AST's public introspection.
+    let mut quantifier_metadata_copies = Vec::new();
+    for (source_term, target_term) in &pairs {
+        if !matches!(
+            source.solver.term_kind(*source_term),
+            TermKind::Forall | TermKind::Exists
+        ) {
+            continue;
+        }
+        let metadata = source
+            .quantifier_ffi_metadata
+            .get(source_term)
+            .cloned()
+            .unwrap_or_default();
+        if !metadata.is_default()
+            || source.solver.quantifier_id(*source_term).is_some()
+            || source.solver.skolem_id(*source_term).is_some()
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "quantifier weight/qid/skolemid/no-pattern attributes cannot be translated without changing public AST identity",
+            );
+        }
+        if target
+            .quantifier_ffi_metadata
+            .get(target_term)
+            .is_some_and(|existing| existing != &metadata)
+            || target
+                .quantifier_weights
+                .get(target_term)
+                .is_some_and(|weight| *weight != metadata.weight)
+            || target
+                .quantifier_no_patterns
+                .get(target_term)
+                .is_some_and(|patterns| !patterns.is_empty())
+            || target.solver.quantifier_id(*target_term).is_some()
+            || target.solver.skolem_id(*target_term).is_some()
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated quantifier has different target metadata",
+            );
+        }
+        quantifier_metadata_copies.push((*target_term, metadata));
+    }
+
+    // Public binder identity is part of a quantifier AST's observable C-API
+    // contract. Preflight both the quantifier-to-binder association and every
+    // binder's public sort side-table before committing any metadata.
+    for (quantifier, source_descriptors) in &source_public_bound_descriptors {
+        if let Some(target_bounds) = target.quantifier_public_bound_terms.get(quantifier) {
+            let Some(target_descriptors) =
+                public_bound_term_descriptors(target, *quantifier, target_bounds)
+            else {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "target quantifier public-bound metadata does not match its core binders",
+                );
+            };
+            if &target_descriptors != source_descriptors {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "translated quantifier has different public-bound name/sort metadata",
+                );
+            }
+        }
+        if let Some(target_sorts) = target.parsed_quantifier_public_bound_sorts.get(quantifier) {
+            let Some(target_descriptors) =
+                parsed_public_bound_descriptors(target, *quantifier, target_sorts)
+            else {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "target parsed quantifier metadata does not match its core binders",
+                );
+            };
+            if &target_descriptors != source_descriptors {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "translated quantifier has different parsed public-bound name/sort metadata",
+                );
+            }
+        }
+    }
+    for (quantifier, (bounds, public_sorts)) in &quantifier_public_bound_copies {
+        if target
+            .quantifier_public_bound_terms
+            .get(quantifier)
+            .is_some_and(|existing| existing != bounds)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated quantifier has different public-bound terms",
+            );
+        }
+        for (&bound, public_sort) in bounds.iter().zip(public_sorts) {
+            if lookup_ast_sort(target, term_to_ast(target, bound))
+                .is_some_and(|existing| existing != public_sort)
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "translated quantifier bound has a different public sort",
+                );
+            }
+        }
+    }
+    for (quantifier, public_sorts) in &parsed_quantifier_public_bound_sort_copies {
+        if target
+            .parsed_quantifier_public_bound_sorts
+            .get(quantifier)
+            .is_some_and(|existing| existing != public_sorts)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated parsed quantifier has different public-bound sorts",
+            );
         }
     }
 
@@ -1387,6 +1851,35 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
         }
     }
 
+    // Array-map terms capture the mapped declaration by name. Translation
+    // rebuilds the core `map[f]` node without re-running `Z3_mk_map`, so copy
+    // the exact signature latch transactionally. A missing source signature or
+    // a different target signature must fail closed; otherwise a later map
+    // under the same name could alias a different function and fabricate
+    // select-map semantics.
+    let mut map_signature_copies = Vec::with_capacity(relevant_map_functions.len());
+    for name in relevant_map_functions {
+        let Some(decl) = source.map_fn_sigs.get(&name).cloned() else {
+            return translation_metadata_error(
+                target,
+                operation,
+                "reachable array-map term has no authenticated function signature",
+            );
+        };
+        if target
+            .map_fn_sigs
+            .get(&name)
+            .is_some_and(|existing| existing != &decl)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated array-map function name has a different target signature",
+            );
+        }
+        map_signature_copies.push((name, decl));
+    }
+
     for (term, identity, symbol, sort) in const_copies {
         target
             .ffi_const_metadata
@@ -1407,6 +1900,27 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
     }
     for (sort, symbol) in sort_copies {
         target.ffi_sort_symbols.insert(sort, symbol);
+    }
+    for (quantifier, (bounds, public_sorts)) in quantifier_public_bound_copies {
+        for (&bound, public_sort) in bounds.iter().zip(public_sorts) {
+            let ast = term_to_ast(target, bound);
+            record_ast_sort(target, ast, public_sort);
+        }
+        target
+            .quantifier_public_bound_terms
+            .insert(quantifier, bounds);
+    }
+    for (quantifier, public_sorts) in parsed_quantifier_public_bound_sort_copies {
+        target
+            .parsed_quantifier_public_bound_sorts
+            .insert(quantifier, public_sorts);
+    }
+    for (name, decl) in map_signature_copies {
+        target.map_fn_sigs.insert(name, decl);
+    }
+    for (term, metadata) in quantifier_metadata_copies {
+        target.quantifier_weights.insert(term, metadata.weight);
+        target.quantifier_ffi_metadata.insert(term, metadata);
     }
     target.next_ffi_fresh_id = target.next_ffi_fresh_id.max(source.next_ffi_fresh_id);
     true
@@ -1517,6 +2031,9 @@ pub struct FuncDeclHandle {
     /// testers/selectors carry the right DT semantics), instead of building a
     /// generic uninterpreted application. `None` for ordinary func_decls.
     pub(crate) dt_op: Option<DatatypeOp>,
+    /// Finite-set builtin provenance. A user UF may legally have the same
+    /// display name and must remain `Z3_OP_UNINTERPRETED`.
+    pub(crate) finite_set_op: Option<FiniteSetOp>,
 }
 
 /// Identifies a datatype operator backing a [`FuncDeclHandle`] (#phase3-dt).
@@ -1571,6 +2088,7 @@ pub(crate) struct DeclAstKey {
     pub(crate) decl: FuncDecl,
     pub(crate) params: Vec<c_int>,
     pub(crate) dt_op: DtOpKind,
+    pub(crate) finite_set_op: Option<FiniteSetOp>,
 }
 
 /// Internal state for a `Z3_solver` handle.
@@ -1732,15 +2250,14 @@ pub struct TacticHandle {
 ///
 /// A Z3 *simplifier* is a preprocessing transformer — like a tactic, but attached
 /// to a solver so it runs incrementally before each `check-sat`. AY realizes each
-/// simplifier over its real preprocess passes ([`ay_dpll`]'s `preprocess/`)
-/// through the SAME name→transform mapping the tactic surface uses
-/// ([`ay_dpll::api::Tactic::from_apply`]), so this handle just wraps an
-/// [`ay_dpll::api::Tactic`].
+/// simplifier over a verdict-preserving [`ay_dpll::api::Tactic`]. The exact Z3
+/// 5.0.0 name-to-pass matrix lives in `simplifiers.rs`: names with an aligned AY
+/// pass use it, and names whose rewrite is not implemented yet use the
+/// equivalence-preserving identity tactic.
 ///
 /// Only VERDICT-PRESERVING simplifiers can be constructed here: `Z3_mk_simplifier`
-/// recognizes a curated set of real AY preprocess-pass names and returns NULL with
-/// `Z3_INVALID_ARG` for any unknown name — it NEVER maps an unknown name to a
-/// silent identity that would pretend to be the requested transform. The
+/// recognizes exactly Z3 5.0.0's 37-name registry and returns NULL with
+/// `Z3_INVALID_ARG` for any other name. The
 /// `and-then` combinator only ever composes simplifiers built this way, so the
 /// whole tree stays verdict-preserving; attaching it via
 /// `Z3_solver_add_simplifier` therefore never changes a solver's SAT/UNSAT answer.
@@ -1777,6 +2294,10 @@ pub struct OptimizeScopeMarker {
     pub(crate) soft_len: usize,
     /// `tracked.len()` at push.
     pub(crate) tracked_len: usize,
+    /// `public_objectives.len()` at push.
+    pub(crate) public_objective_len: usize,
+    /// `parsed_soft_public_terms.len()` at push.
+    pub(crate) parsed_soft_public_len: usize,
 }
 
 /// Publicly admitted outcome of the last optimize decision query.
@@ -1818,6 +2339,12 @@ pub struct OptimizeHandle {
     /// Soft constraints asserted through this handle (index-aligned with the
     /// solver-side soft list, which this handle is the sole owner of).
     pub(crate) softs: Vec<SoftRecord>,
+    /// Public roots of parsed soft constraints, aligned with the frontend's
+    /// parsed-soft list and used for FiniteSet reachability gates.
+    pub(crate) parsed_soft_public_terms: Vec<Term>,
+    /// Public objective roots, aligned with every registered objective
+    /// (programmatic and parsed) in the aliased solver.
+    pub(crate) public_objectives: Vec<Term>,
     /// Model realizing the optimum found by the last `Z3_optimize_check`.
     pub(crate) last_model: Option<Model>,
     /// The last publicly admitted check outcome. This is the authority for
@@ -2126,12 +2653,12 @@ pub const Z3_PK_STRING: c_uint = 4;
 pub const Z3_PK_OTHER: c_uint = 5;
 pub const Z3_PK_INVALID: c_uint = 6;
 
-// Z3_parameter_kind values (mirrors z3_api.h's `Z3_parameter_kind` enum, verified
-// against z3 4.15.4). These classify a function declaration's indexed parameters
-// (`Z3_get_decl_parameter_kind`). AY only produces INTEGER indexed parameters
-// (e.g. `(_ extract h l)`, `(_ sign_extend n)`), so `Z3_get_decl_parameter_kind`
-// returns `Z3_PARAMETER_INT` for every in-range parameter; the remaining kinds are
-// declared for source compatibility and completeness of the enum.
+// Z3_parameter_kind values (mirrors Z3 5.0.0's `Z3_parameter_kind` enum).
+// These classify a function declaration's parameters
+// (`Z3_get_decl_parameter_kind`). Indexed operators such as
+// `(_ extract h l)` use INTEGER parameters; finite-set `set.empty` carries one
+// SORT parameter. The remaining kinds are declared for source compatibility
+// and completeness of the enum.
 pub const Z3_PARAMETER_INT: c_uint = 0;
 #[allow(dead_code)]
 pub const Z3_PARAMETER_DOUBLE: c_uint = 1;
@@ -2564,17 +3091,36 @@ pub(crate) fn ffi_try_declare_function(
     domain: &[Sort],
     range: &Sort,
 ) -> Result<FuncDecl, ay_dpll::api::SolverError> {
+    if domain
+        .iter()
+        .any(|sort| has_unsupported_finite_set_datatype_embedding(ctx, sort))
+        || has_unsupported_finite_set_datatype_embedding(ctx, range)
+    {
+        return Err(ay_dpll::api::SolverError::InvalidArgument {
+            operation: "declare_fun",
+            message: "a datatype containing FiniteSet fields cannot be lowered without changing \
+                      the datatype identity"
+                .to_string(),
+        });
+    }
     let key = (symbol.clone(), domain.to_vec(), range.clone());
     if let Some(decl) = ctx.ffi_func_decls.get(&key) {
         return Ok(decl.clone());
     }
 
     let semantic_name = ffi_function_semantic_name(ctx, symbol, domain, range);
+    let engine_domain: Vec<Sort> = domain
+        .iter()
+        .map(|sort| finite_set_engine_public_sort(ctx, sort))
+        .collect();
+    let engine_range = finite_set_engine_public_sort(ctx, range);
     match ctx
         .solver
-        .try_declare_fun(&semantic_name, domain, range.clone())
+        .try_declare_fun(&semantic_name, &engine_domain, engine_range)
     {
         Ok(decl) => {
+            ctx.finite_set_decl_signatures
+                .insert(semantic_name, (domain.to_vec(), range.clone()));
             ctx.ffi_func_decls.insert(key, decl.clone());
             Ok(decl)
         }
@@ -2597,39 +3143,13 @@ pub(crate) fn ffi_try_declare_function(
 /// deliberately excluded: rewriting an overloaded declaration there could
 /// invalidate the certificate. String literals are copied verbatim;
 /// replacements happen only on complete SMT-LIB symbol tokens.
-pub(crate) fn ffi_surface_text(ctx: &Z3Context, rendered: &str) -> String {
-    let mut replacements: HashMap<String, String> = HashMap::new();
-    for (internal, symbol) in &ctx.ffi_decl_symbols {
-        replacements.insert(
-            ay_core::quote_symbol(internal),
-            ay_core::quote_symbol(&symbol.display_name()),
-        );
-    }
-    for (sort, symbol) in &ctx.ffi_sort_symbols {
-        let internal = match sort {
-            Sort::Uninterpreted(name) | Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => {
-                Some(name)
-            }
-            Sort::Datatype(dt) => Some(&dt.name),
-            _ => None,
-        };
-        if let Some(internal) = internal {
-            replacements.insert(
-                ay_core::quote_symbol(internal),
-                ay_core::quote_symbol(&symbol.display_name()),
-            );
-        }
-    }
-    for (internal, symbol) in ctx.ffi_const_metadata.values() {
-        replacements.insert(
-            ay_core::quote_symbol(internal),
-            ay_core::quote_symbol(&symbol.display_name()),
-        );
-    }
+pub(crate) fn apply_surface_replacements(
+    rendered: &str,
+    replacements: &HashMap<String, String>,
+) -> String {
     if replacements.is_empty() {
         return rendered.to_string();
     }
-
     let bytes = rendered.as_bytes();
     let mut out = String::with_capacity(rendered.len());
     let mut i = 0;
@@ -2672,6 +3192,46 @@ pub(crate) fn ffi_surface_text(ctx: &Z3Context, rendered: &str) -> String {
         out.push_str(replacements.get(token).map_or(token, String::as_str));
     }
     out
+}
+
+/// Project ordinary private C-API declaration/sort identities, excluding the
+/// retained FiniteSet application layer.
+pub(crate) fn ffi_surface_text_base(ctx: &Z3Context, rendered: &str) -> String {
+    let mut replacements: HashMap<String, String> = HashMap::new();
+    for (internal, symbol) in &ctx.ffi_decl_symbols {
+        replacements.insert(
+            ay_core::quote_symbol(internal),
+            ay_core::quote_symbol(&symbol.display_name()),
+        );
+    }
+    for (sort, symbol) in &ctx.ffi_sort_symbols {
+        let internal = match sort {
+            Sort::Uninterpreted(name) | Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => {
+                Some(name)
+            }
+            Sort::Datatype(dt) => Some(&dt.name),
+            _ => None,
+        };
+        if let Some(internal) = internal {
+            replacements.insert(
+                ay_core::quote_symbol(internal),
+                ay_core::quote_symbol(&symbol.display_name()),
+            );
+        }
+    }
+    for (internal, symbol) in ctx.ffi_const_metadata.values() {
+        replacements.insert(
+            ay_core::quote_symbol(internal),
+            ay_core::quote_symbol(&symbol.display_name()),
+        );
+    }
+    apply_surface_replacements(rendered, &replacements)
+}
+
+pub(crate) fn ffi_surface_text(ctx: &Z3Context, rendered: &str) -> String {
+    let base = ffi_surface_text_base(ctx, rendered);
+    let replacements = finite_set_surface_replacements(ctx);
+    apply_surface_replacements(&base, &replacements)
 }
 
 /// Z3's `max_char` (`zstring::max_char` = `0x2FFFF`): the largest SMT-LIB
@@ -2773,6 +3333,20 @@ pub(crate) fn lookup_ast_sort(ctx: &Z3Context, ast: Z3_ast) -> Option<&Sort> {
 /// Allocate a sort handle and register it in the context arena (#5498).
 /// Assigns a stable semantic sort ID: same `Sort` value → same ID within
 /// this context (#6580).
+///
+/// Handles are HASH-CONSED per context: asking twice for the same `Sort`
+/// returns the same `Z3_sort` pointer. Z3 sorts are AST nodes in a
+/// hash-consing manager, so `Z3_mk_real_sort(c) == Z3_mk_real_sort(c)` and
+/// `Z3_get_sort(c, real_numeral) == Z3_mk_real_sort(c)` hold there, and C
+/// consumers written against Z3 compare sorts with `==`. Minting a fresh box
+/// per call made every such comparison false.
+///
+/// `Sort` derives structural `Eq`/`Hash`, so two handles that this pass
+/// collapses carry byte-identical payloads and every `(*s).sort` reader is
+/// unaffected. `sort_ast_handles[sort_id]` was already the canonical handle;
+/// this only makes it the ONLY one, so `sort_cache` now holds exactly one
+/// owning pointer per sort id and `Drop`'s `drain_arena` still frees each box
+/// exactly once.
 pub(crate) fn alloc_sort(ctx: &mut Z3Context, sort: Sort) -> Z3_sort {
     let sort_id = if let Some(&id) = ctx.sort_ids.get(&sort) {
         id
@@ -2782,23 +3356,22 @@ pub(crate) fn alloc_sort(ctx: &mut Z3Context, sort: Sort) -> Z3_sort {
         ctx.sort_ids.insert(sort.clone(), id);
         id
     };
-    let handle = Box::into_raw(Box::new(SortHandle { sort, sort_id }));
-    ctx.sort_cache.push(handle);
-    // Register the SORT-AST decode slot for this semantic id (first handle
-    // wins; all handles of one id carry the same `Sort` value). This is the
-    // single sort-allocation path, so `sort_ast_handles` cannot desync from
-    // `sort_ids`.
+    // This is the single sort-allocation path, so `sort_ast_handles` cannot
+    // desync from `sort_ids`.
     let idx = sort_id as usize;
     if idx >= ctx.sort_ast_handles.len() {
         ctx.sort_ast_handles.resize(idx + 1, ptr::null_mut());
-    }
-    if ctx.sort_ast_handles[idx].is_null() {
-        ctx.sort_ast_handles[idx] = handle;
     }
     debug_assert!(
         ctx.sort_ast_handles.len() <= ctx.next_sort_id as usize + 1,
         "sort_ast_handles must track sort_id assignment"
     );
+    if !ctx.sort_ast_handles[idx].is_null() {
+        return ctx.sort_ast_handles[idx];
+    }
+    let handle = Box::into_raw(Box::new(SortHandle { sort, sort_id }));
+    ctx.sort_cache.push(handle);
+    ctx.sort_ast_handles[idx] = handle;
     handle
 }
 
@@ -2889,6 +3462,7 @@ pub(crate) unsafe fn func_decl_handle_to_ast(ctx: &mut Z3Context, d: Z3_func_dec
             decl: (*d).decl.clone(),
             params: (*d).params.clone(),
             dt_op: DtOpKind::of((*d).dt_op.as_ref()),
+            finite_set_op: (*d).finite_set_op,
         }
     };
     let idx = if let Some(&i) = ctx.decl_ast_ids.get(&key) {
@@ -2980,6 +3554,7 @@ pub(crate) fn cache_func_decl_with_params(
         symbol,
         params,
         dt_op: None,
+        finite_set_op: None,
         decl_id,
     }));
     ctx.func_decl_cache.push(handle);
@@ -3101,6 +3676,7 @@ pub(crate) fn cache_dt_func_decl(
         symbol,
         params: Vec::new(),
         dt_op: Some(dt_op),
+        finite_set_op: None,
         decl_id,
     }));
     ctx.func_decl_cache.push(handle);

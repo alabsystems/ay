@@ -409,9 +409,10 @@ fn test_arrays_z3_438_sound() {
 ///
 /// Fix: `add_array_default_congruence_axioms` asserts the array tautology
 /// `a = b => default(a) = default(b)`. Here `default(store(const 0, k, v))`
-/// folds to `default(const 0) = 0` and `default(const 1) = 1`, so the
-/// consequent `(= 0 1)` is `false` and the clause collapses to the unit
-/// `(not (= lhs rhs))`, refuting the equality. z3 returns `unsat`; AY must too.
+/// is related by the large/infinite-carrier store axiom to
+/// `default(const 0) = 0`, while `default(const 1) = 1`; the consequent is
+/// therefore false and refutes the array equality. Z3 returns `unsat`; AY must
+/// too. (Small finite carriers use Z3's shared-epsilon rule instead.)
 ///
 /// This is orthogonal to the `select`-over-`ite` Shannon-lift on the array-EUF
 /// route (which only rewrites `(select (ite c A B) i)`): this reproducer has no

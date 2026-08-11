@@ -1658,7 +1658,7 @@ fn surface_summary_expands_partial_rows_with_numbers() {
     let checks = vec![
         AuditCheck::pass("basic_smt_transcript", "ok"),
         AuditCheck::pass("z3_param_discovery_smoke", "ok"),
-        AuditCheck::pass("unsupported_z3_option_smoke", "ok"),
+        AuditCheck::pass("z3_tactic_catalog_smoke", "ok"),
     ];
     let proof_inventory = vec![ProofInventoryRow::fail(
         "smt_alethe_external_replay",
@@ -1711,7 +1711,7 @@ fn c_api_ffi_surface_reports_native_smoke_without_overclaiming() {
     let checks = vec![
         AuditCheck::pass("basic_smt_transcript", "ok"),
         AuditCheck::pass("z3_param_discovery_smoke", "ok"),
-        AuditCheck::pass("unsupported_z3_option_smoke", "ok"),
+        AuditCheck::pass("z3_tactic_catalog_smoke", "ok"),
         AuditCheck::pass(C_API_FFI_SMOKE_ID, "command passed"),
     ];
     let proof_inventory = Vec::new();
@@ -1750,7 +1750,7 @@ fn models_surface_uses_default_model_validation_smoke() {
     let checks = vec![
             AuditCheck::pass("basic_smt_transcript", "ok"),
             AuditCheck::pass("z3_param_discovery_smoke", "ok"),
-            AuditCheck::pass("unsupported_z3_option_smoke", "ok"),
+            AuditCheck::pass("z3_tactic_catalog_smoke", "ok"),
             AuditCheck::fail(
                 SMT_MODEL_VALIDATION_SMOKE_ID,
                 "model_validation_tests_passed=15/16; failed=1; model_checked_count=15; invalid_model_count=0; capability_failures=1; failing_tests=smt_soundness_gate::auflira::test_gate_qf_auflira_sat_validates_model",

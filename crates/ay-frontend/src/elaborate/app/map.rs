@@ -21,7 +21,11 @@
 //!   -> `(select m k)`).
 //! - `(map.dom m)` : Array(K, Bool) — domain array pushed through the
 //!   constructors (empty -> const-false, insert -> `store(dom m') k' true`,
-//!   remove -> `store(dom m') k' false`, var -> opaque `(map.dom m)`).
+//!   remove -> `store(dom m') k' false`, var -> a REGISTERED domain-carrier
+//!   constant, never an application, so `(get-model)` publishes the domain and
+//!   the model gate can evaluate a membership read — see
+//!   [`Context::map_domain_carrier`], which also explains the `ite` chain that
+//!   keeps `m = n ⇒ dom(m) = dom(n)` once the application is gone).
 //! - `(map.contains_key m k)` : Bool -> `(select (map.dom m) k)`.
 //! - `(map.subset m n)` : Bool — opaque; reflexivity decided natively, the
 //!   subset<->key obligations injected by the executor.
@@ -38,7 +42,16 @@
 use ay_core::term::TermData;
 use ay_core::{Sort, Symbol, TermId};
 
-use super::super::{Context, ElaborateError, Result};
+use super::super::{Context, ElaborateError, PublicSort, Result, SymbolInfo};
+
+/// Registered name of a map's PUBLISHED domain carrier: the constant a
+/// `(get-model)` witness prints so the model pins `map.dom` / `map.contains_key`.
+const DOMAIN_CARRIER_PREFIX: &str = "__ay_map_dom!";
+
+/// Registered name of the free array behind a domain carrier. Suppressed from
+/// `(get-model)`: it is an encoding artifact, and the carrier above already
+/// prints the domain it stands for.
+const DOMAIN_FREE_PREFIX: &str = "__ay_map_dom_free!";
 
 /// Out-of-fragment / higher-order map operators emitted as opaque apps.
 const MAP_OPAQUE_OPS: &[&str] = &[
@@ -202,13 +215,163 @@ impl Context {
                 let false_t = self.terms.false_term();
                 self.terms.mk_const_array(key_sort, false_t)
             }
-            // Variable / opaque map: the opaque domain projection.
-            _ => {
-                let key_sort = self.map_key_sort(map);
-                let dom_sort = Sort::array(key_sort, Sort::Bool);
-                self.terms
-                    .mk_app(Symbol::named("map.dom"), vec![map], dom_sort)
-            }
+            // Variable / opaque map: the published domain carrier.
+            _ => self.map_domain_carrier(map),
+        }
+    }
+
+    /// The domain carrier of an opaque map term: a REGISTERED array constant,
+    /// not an application, so a `sat` witness actually pins the domain.
+    ///
+    /// ## The defect this closes
+    ///
+    /// `(map.dom m)` used to be emitted as an application. `(get-model)` prints
+    /// `define-fun` entries for declared symbols, so a `(Map K V)` witness
+    /// published only its value array — the domain appeared nowhere — and the
+    /// independent model gate, asked to evaluate `(select (map.dom m) k)`,
+    /// correctly refused: *"model commits no value for this application of
+    /// `map.dom`"*. Every domain-touching `sat` was therefore published as
+    /// `unknown`; measured at HEAD, `(assert (map.contains_key m 5))` alone was
+    /// `unknown`, as was the `subset_consistent_with_witness_is_sat` test. That
+    /// is the "solver right, MODEL absent, gate correctly refuses" class, so the
+    /// fix belongs in the witness and never in the gate.
+    ///
+    /// The limitation is not map-specific: `(select (f m) k)` for a declared
+    /// `f : (Array Int Int) -> (Array Int Bool)` is `unknown` in QF_AUFLIA for
+    /// exactly the same reason. The map lane sidesteps it by not needing an
+    /// array-returning application at all — a registered constant is an ordinary
+    /// model leaf, which both the printer and the gate's evaluator handle.
+    ///
+    /// ## Why a bare fresh constant would be WRONG
+    ///
+    /// Carrying `dom` as an application bought EUF congruence for free:
+    /// `m = n ⇒ dom(m) = dom(n)`. That is load-bearing, because `(= m n)` at Map
+    /// sort is value-carrier equality, and
+    ///
+    /// ```smt2
+    /// (assert (= m n)) (assert (map.contains_key m 1))
+    /// (assert (not (map.contains_key n 1)))
+    /// ```
+    ///
+    /// is `unsat` at HEAD *because* of it. Independent carriers alone make that
+    /// `sat` — a wrong answer bought with a better-looking model. So the carrier
+    /// is not a bare constant but that congruence, spelled out structurally: an
+    /// `ite` chain testing `m` against every map that already owns a carrier,
+    ///
+    /// ```smt2
+    /// (ite (= m m1) c1 (ite (= m m2) c2 ... free))
+    /// ```
+    ///
+    /// which resolves to the carrier of the FIRST map `m` equals, and to its own
+    /// free array otherwise. Each chain is built once and registered, so a later
+    /// map extends the relation by testing against the earlier ones rather than
+    /// by rewriting their chains — every pair is still covered, from the later
+    /// side. Equal maps therefore pick the same first match and share a carrier,
+    /// while distinct maps stay independent: congruence, no over-constraint.
+    ///
+    /// Doing this structurally rather than as injected axioms is what keeps it
+    /// honest. `has_map_ops` fires only on `map.`-prefixed APPLICATION symbols,
+    /// so once these projections are gone a `contains_key`-only query no longer
+    /// routes to QF_MAPLIA — an axiom injected by the map theory solver would
+    /// simply not run, and the wrong `sat` above would escape. The `ite` chain is
+    /// part of the term, so it binds under every logic and every solver, and the
+    /// gate can check it: it is `ite`, array equality, and constants.
+    fn map_domain_carrier(&mut self, map: TermId) -> TermId {
+        let key_sort = self.map_key_sort(map);
+        let dom_sort = Sort::array(key_sort, Sort::Bool);
+
+        // A user `(declare-fun map.dom ((Array K V)) (Array K Bool))` is the
+        // documented activation route for the native map solver, and it makes
+        // `(map.dom m)` a symbol with the USER's meaning. Leave that spelling
+        // untouched — giving the direct application and the `contains_key`
+        // reduction different carriers would let them disagree.
+        if self.has_symbol_binding("map.dom") {
+            return self
+                .terms
+                .mk_app(Symbol::named("map.dom"), vec![map], dom_sort);
+        }
+
+        let carrier_name = Self::domain_carrier_name(DOMAIN_CARRIER_PREFIX, &self.terms, map);
+        // One carrier per map term, for every occurrence: the chain below grows
+        // as later maps appear, so rebuilding it would hand two occurrences of
+        // `(map.dom m)` two unrelated domains.
+        if let Some(existing) = self.symbols.get(&carrier_name).and_then(|info| info.term) {
+            return existing;
+        }
+
+        // The free array this map falls back to when it equals no earlier map.
+        // Registered so the model pins it (the chain reads through it), and
+        // suppressed from `(get-model)` because the carrier prints the domain.
+        let free_name = Self::domain_carrier_name(DOMAIN_FREE_PREFIX, &self.terms, map);
+        let free = self
+            .terms
+            .mk_fresh_named_var(free_name.clone(), dom_sort.clone());
+        self.register_domain_symbol(free_name.clone(), free, &dom_sort);
+        self.internal_symbols.insert(free_name);
+
+        // Earlier carriers, oldest first, restricted to maps of the SAME sort —
+        // `(= m n)` is well-sorted only then, so any other pair is congruence
+        // that can never fire.
+        let map_sort = self.terms.sort(map).clone();
+        let mut earlier: Vec<(TermId, TermId)> = self
+            .symbols
+            .iter()
+            .filter_map(|(name, info)| {
+                let suffix = name.strip_prefix(DOMAIN_CARRIER_PREFIX)?;
+                let id: u32 = suffix.rsplit_once('!')?.1.parse().ok()?;
+                let earlier_map = TermId(id);
+                (*self.terms.sort(earlier_map) == map_sort)
+                    .then(|| info.term.map(|carrier| (earlier_map, carrier)))?
+            })
+            .collect();
+        earlier.sort_unstable();
+
+        // Fold from the back so the FIRST (oldest) match wins: equal maps agree
+        // on which one that is, which is what makes the relation transitive.
+        let mut carrier = free;
+        for (earlier_map, earlier_carrier) in earlier.into_iter().rev() {
+            let same_map = self.terms.mk_eq(map, earlier_map);
+            carrier = self.terms.mk_ite(same_map, earlier_carrier, carrier);
+        }
+
+        self.register_domain_symbol(carrier_name, carrier, &dom_sort);
+        carrier
+    }
+
+    /// Register one solver-minted domain symbol as a nullary constant, so it is
+    /// collected as a solvable variable, resolves in `get-value`, and is
+    /// published by `(get-model)` unless separately suppressed.
+    fn register_domain_symbol(&mut self, name: String, term: TermId, sort: &Sort) {
+        self.track_scoped_symbol(&name);
+        self.symbols.insert(
+            name,
+            SymbolInfo {
+                term: Some(term),
+                sort: sort.clone(),
+                arg_sorts: vec![],
+                public_sort: PublicSort::from_engine(sort),
+                public_arg_sorts: vec![],
+                internal_name: None,
+            },
+        );
+    }
+
+    /// Name of a minted domain symbol for `map`: `<prefix><label>!<term id>`.
+    ///
+    /// The `__ay_` prefix is rejected by `is_reserved_symbol`, so no user
+    /// declaration can occupy one of these or be clobbered by one. The term id
+    /// is always the LAST `!`-separated segment, because the congruence chain
+    /// recovers the map it belongs to by parsing it back — a name that omitted
+    /// it made every non-`Var` map (an `ite` over two maps, say) invisible to
+    /// later chains, and `(map.contains_key (ite c m n) 1)` with `c` true and
+    /// `(not (map.contains_key m 1))` answered `sat` instead of `unsat`. The
+    /// id also keeps two declarations of one surface name — distinct `Var`s
+    /// sharing that name — from sharing a domain. The label rides along so the
+    /// published witness reads as the domain OF something.
+    fn domain_carrier_name(prefix: &str, terms: &ay_core::TermStore, map: TermId) -> String {
+        match terms.get(map) {
+            TermData::Var(name, _) => format!("{prefix}{name}!{}", map.0),
+            _ => format!("{prefix}term!{}", map.0),
         }
     }
 

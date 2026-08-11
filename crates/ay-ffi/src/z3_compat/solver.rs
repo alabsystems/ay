@@ -22,11 +22,11 @@ use super::{
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
-    require_term_ast, require_term_asts, term_to_ast, transfer_cross_context_ffi_metadata,
-    DecisionOwnerFamily, ModelHandle, SolverCheckOutcome, Z3Context, Z3SolverHandle, Z3_ast,
-    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_params, Z3_solver, Z3_sort, Z3_string,
-    Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF,
-    Z3_OK,
+    finite_set_decision_gate, reachable_finite_set_axioms, require_term_ast, require_term_asts,
+    term_to_ast, transfer_cross_context_ffi_metadata, DecisionOwnerFamily, FiniteSetDecisionGate,
+    ModelHandle, SolverCheckOutcome, Z3Context, Z3SolverHandle, Z3_ast, Z3_ast_vector, Z3_context,
+    Z3_func_decl, Z3_model, Z3_params, Z3_solver, Z3_sort, Z3_string, Z3_symbol, Z3_EXCEPTION,
+    Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 /// Translate a `VerifiedSolveResult` into the Z3 C API lbool return value,
@@ -109,6 +109,38 @@ fn solve_lbool_from_consumer_acceptance(
             Z3_L_UNDEF
         }
     }
+}
+
+/// Apply finite-set obligations derived from one concrete decision goal.
+///
+/// A finite-set binder invalidates both polarities of the unrestricted-array
+/// relaxation. An arbitrary finite-set value only invalidates SAT; UNSAT is
+/// preserved by the over-approximation.
+pub(crate) fn apply_finite_set_decision_gate(
+    ctx: &mut Z3Context,
+    lbool: c_int,
+    gate: &FiniteSetDecisionGate,
+    operation: &str,
+) -> c_int {
+    if let Some(reason) = &gate.quantifier_reason {
+        ctx.last_error = Z3_OK;
+        ctx.error_msg = Some(format!(
+            "{operation}: finite-set decision result is not certified: {reason}; \
+             returning unknown fail-closed"
+        ));
+        return Z3_L_UNDEF;
+    }
+    if lbool == Z3_L_TRUE {
+        if let Some(reason) = &gate.arbitrary_reason {
+            ctx.last_error = Z3_OK;
+            ctx.error_msg = Some(format!(
+                "{operation}: finite-set SAT result is not certified: {reason}; \
+                 returning unknown fail-closed"
+            ));
+            return Z3_L_UNDEF;
+        }
+    }
+    lbool
 }
 
 /// Exercise the FFI rejection mapping without exporting a constructor that can
@@ -443,6 +475,24 @@ pub(crate) fn assert_background_axioms(
     Ok(())
 }
 
+/// Install finite-set witness definitions reachable from this decision goal.
+///
+/// These axioms are context-owned semantic metadata, but unlike the ordinary
+/// theory-global axioms they are not relevant to sibling handles or unused AST
+/// terms. Call this after loading the current goal, beside
+/// [`assert_background_axioms`].
+pub(crate) fn assert_reachable_finite_set_axioms(
+    ctx: &mut Z3Context,
+    roots: &[Term],
+) -> Result<(), String> {
+    for term in reachable_finite_set_axioms(ctx, roots) {
+        if let Err(error) = ctx.solver.try_assert_term(term) {
+            return Err(format!("{error}"));
+        }
+    }
+    Ok(())
+}
+
 /// How the current decision query relates to the context's recursive
 /// definitions (`Z3_add_rec_def`), decided per check by
 /// [`ay_dpll::api::Solver::try_expand_rec_defs`].
@@ -608,6 +658,10 @@ pub(crate) unsafe fn check_solver_handle(
     // defining axioms; ANY failure => residual mode: original problem + the
     // axioms, and a SAT verdict is demoted to UNKNOWN below (fail-closed).
     let mut lemmas: Vec<Term> = extra_lemmas.to_vec();
+    let mut finite_set_roots = goal.clone();
+    finite_set_roots.extend(effective.iter().copied());
+    finite_set_roots.extend(lemmas.iter().copied());
+    let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
     let mut rec_mode = RecDefMode::None;
     // `(expanded, original)` pairs for translating an engine unsat core over
     // EXPANDED assumptions back to the caller's original assumption terms.
@@ -697,6 +751,12 @@ pub(crate) unsafe fn check_solver_handle(
         record_unknown(ctx, handle);
         return Z3_L_UNDEF;
     }
+    if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
+        ctx.last_error = Z3_EXCEPTION;
+        ctx.error_msg = Some(e);
+        record_unknown(ctx, handle);
+        return Z3_L_UNDEF;
+    }
     // User-propagator consequence lemmas (see `propagate::user_propagator_check`):
     // each is the consumer's theory axiom `(∧ justification) ⇒ conseq`, trusted
     // exactly as Z3 trusts propagator lemmas. NOT part of the handle's
@@ -758,6 +818,7 @@ pub(crate) unsafe fn check_solver_handle(
     // even after another handle's later check overwrites the engine state.
     handle.last_statistics = Some(ctx.solver.statistics().clone());
     let mut lbool = solve_lbool_with_acceptance(ctx, verified);
+    lbool = apply_finite_set_decision_gate(ctx, lbool, &finite_set_gate, "Z3_solver_check");
     // Transitive-closure SAT gate: the background axioms for a
     // `Z3_mk_transitive_closure` predicate are only PARTIAL (a least fixed
     // point is not finitely FO-axiomatizable), so an engine SAT could rest on
@@ -868,13 +929,21 @@ pub(crate) fn parse_solver_transaction(
     ctx.decision_engine_poisoned = Some(format!(
         "{operation}: parse transaction was interrupted before completion"
     ));
-    match ctx.solver.parse_smtlib2(input) {
-        Ok(terms) => {
-            ctx.decision_engine_poisoned = None;
-            ctx.last_error = Z3_OK;
-            ctx.error_msg = None;
-            Some(terms)
-        }
+    match ctx.solver.parse_smtlib2_z3_5(input) {
+        Ok(batch) => match super::retain_parsed_finite_set_batch(ctx, batch) {
+            Ok(retained) => {
+                ctx.decision_engine_poisoned = None;
+                ctx.last_error = Z3_OK;
+                ctx.error_msg = None;
+                Some(retained.assertions)
+            }
+            Err(error) => {
+                ctx.poison_decision_engine(format!(
+                    "{operation}: parsed public FiniteSet metadata could not be retained: {error}"
+                ));
+                None
+            }
+        },
         Err(e) => {
             ctx.poison_decision_engine(format!(
                 "{operation}: parse execution failed after semantic mutation may have begun: {e}"
@@ -1874,6 +1943,10 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
             else {
                 return Z3_L_UNDEF;
             };
+            let mut finite_set_roots = goal.clone();
+            finite_set_roots.extend(base_original.iter().copied());
+            finite_set_roots.extend(vars_original.iter().copied());
+            let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
             let mut goal = goal;
             let mut base = base_original.clone();
             let mut vars_probe = vars_original.clone();
@@ -1946,13 +2019,25 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
                 ctx.error_msg = Some(e);
                 return Z3_L_UNDEF;
             }
+            if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(e);
+                return Z3_L_UNDEF;
+            }
             // Baseline satisfiability under the assumptions.
             let baseline = if base.is_empty() {
                 ctx.solver.check_sat()
             } else {
                 ctx.solver.check_sat_assuming(&base)
             };
-            match solve_lbool_with_acceptance(ctx, baseline) {
+            let baseline = solve_lbool_with_acceptance(ctx, baseline);
+            let baseline = apply_finite_set_decision_gate(
+                ctx,
+                baseline,
+                &finite_set_gate,
+                "Z3_solver_get_consequences",
+            );
+            match baseline {
                 Z3_L_FALSE => {
                     ctx.last_error = Z3_OK;
                     return Z3_L_FALSE;

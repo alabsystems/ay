@@ -286,6 +286,47 @@ fn test_satcomp_timeout_policy_uses_unknown_success_exit() {
     );
 }
 
+/// A deadline that fires AFTER a decisive verdict reached stdout must not
+/// contradict it. Measured at build.6432 on
+/// `QF_BV/…RWS__Example_11.txt.smt2` (AY decides it in 30-90s), at `-T:10`:
+/// stdout `sat`, stderr `(:reason-unknown "timeout")`, exit 124 — three
+/// mutually inconsistent statements, and a correct answer reported as a
+/// failure. z3 on the same budget prints `unknown` and exits 0, so AY produced
+/// the BETTER answer and reported it worse. Six files in the 2026-08-02
+/// corpus-wide sweep carry this signature.
+#[test]
+fn timeout_after_a_decisive_verdict_neither_contradicts_it_nor_fails_the_run() {
+    // Decisive verdict already published: neutral note, success exit.
+    let (note, code) = timeout_exit_policy(true, false, false);
+    assert_eq!(code, 0, "a published decisive verdict is not a failed run");
+    let note = note.expect("the overrun is still worth noting");
+    assert!(
+        !String::from_utf8_lossy(note).contains("reason-unknown"),
+        "`:reason-unknown` describes an `unknown`; emitting it over a decisive \
+         verdict contradicts stdout. got {:?}",
+        String::from_utf8_lossy(note)
+    );
+
+    // No decisive verdict: unchanged. This is a genuine failure to decide.
+    assert_eq!(
+        timeout_exit_policy(false, false, false),
+        (Some(&b"(:reason-unknown \"timeout\")\n"[..]), 124)
+    );
+    // The SAT-competition grammar is unchanged in both directions.
+    assert_eq!(
+        timeout_exit_policy(false, true, false),
+        (Some(&b"c timeout\n"[..]), 0)
+    );
+    assert_eq!(timeout_exit_policy(true, true, false).1, 0);
+
+    // An abandoned export already printed its own `(error ...)`; a timeout note
+    // on top would be a second, conflicting explanation. Exit stays non-zero
+    // even when a decisive verdict was published, because the artifact the run
+    // promised was not produced.
+    assert_eq!(timeout_exit_policy(true, false, true), (None, 124));
+    assert_eq!(timeout_exit_policy(false, false, true), (None, 124));
+}
+
 #[test]
 fn test_satcomp_timeout_policy_requires_known_wrapper_token() {
     assert!(
@@ -299,6 +340,51 @@ fn test_satcomp_timeout_policy_requires_known_wrapper_token() {
     assert!(is_sat_competition_wrapper_token(
         "satcomp-variant-default-lrat-v1"
     ));
+}
+
+#[test]
+fn test_satcomp_wrapper_token_accepts_every_route_and_proof_format() {
+    // The submission script composes `<route>-<proof_format>-v1` and defaults
+    // to `drat`, so rejecting the drat products cost the SHIPPED submission its
+    // competition timeout code (exit 0 for UNKNOWN) on every timed-out
+    // instance -- it fell back to 124 exactly as if no wrapper were set.
+    for route in SAT_COMPETITION_WRAPPER_ROUTES {
+        for format in SAT_COMPETITION_WRAPPER_PROOF_FORMATS {
+            let token = format!("{route}-{format}-v1");
+            assert!(
+                is_sat_competition_wrapper_token(&token),
+                "{token} is composable by prepare_sat26_submission.sh"
+            );
+        }
+    }
+
+    // Preserved from the exact-match era: trimmed and case-insensitive.
+    assert!(is_sat_competition_wrapper_token(
+        "  MAIN-REGULAR-DEFAULT-DRAT-V1  "
+    ));
+}
+
+#[test]
+fn test_satcomp_wrapper_token_rejects_non_composable_values() {
+    // Widening the predicate to a route x format product must not turn it into
+    // a prefix match: each axis still has to land on a known value.
+    for token in [
+        "main-regular-default-v1",        // no proof format
+        "main-regular-default-lrat",      // no version suffix
+        "main-regular-default-lrat-v2",   // wrong version
+        "main-regular-default-cdcl-v1",   // unknown proof format
+        "bogus-route-default-drat-v1",    // unknown route
+        "main-regular-default-drat-v1-x", // trailing junk
+        "-drat-v1",                       // empty route
+        "drat-v1",
+        "-v1",
+        "",
+    ] {
+        assert!(
+            !is_sat_competition_wrapper_token(token),
+            "{token:?} is not composable and must not change timeout grammar"
+        );
+    }
 }
 
 #[test]
@@ -404,6 +490,26 @@ fn test_preprocess_bare_dash_does_not_disturb_z3_in_or_stdin() {
     // A file literally named `-` after `--` is preserved verbatim (escape hatch).
     let escaped = preprocess_args(strings(&["ay", "solve", "--", "-"]));
     assert_eq!(escaped, strings(&["ay", "solve", "--", "-"]));
+}
+
+#[test]
+fn z3_optimization_input_modes_are_routed_instead_of_rejected() {
+    assert_eq!(
+        preprocess_args(strings(&["ay", "-wcnf", "-in"])),
+        strings(&["ay", "solve", "--z3-input-mode=wcnf", "--incremental"])
+    );
+    assert_eq!(
+        preprocess_args(strings(&["ay", "-lp", "problem.lp"])),
+        strings(&["ay", "solve", "--z3-input-mode=lp", "problem.lp"])
+    );
+    assert_eq!(
+        preprocess_args(strings(&["ay", "problem.opb"])),
+        strings(&["ay", "solve", "--z3-input-mode=opb", "problem.opb"])
+    );
+    assert_eq!(
+        preprocess_args(strings(&["ay", "-pbo", "-in"])),
+        strings(&["ay", "solve", "--z3-input-mode=opb", "--incremental"])
+    );
 }
 
 #[test]
@@ -679,7 +785,11 @@ fn test_default_drat_proof_path_cnf_file_case_insensitive() {
 fn test_default_drat_proof_path_dimacs_extension() {
     let file = PathBuf::from("bench/foo.dimacs");
     let path = default_drat_proof_path(Some(&file)).expect(".dimacs should get default path");
-    assert_eq!(path, "bench/foo.dimacs.drat");
+    // Build the expectation through `Path` too: the certificate is a sibling of
+    // the input, and `set_file_name` renders the separator in the platform's
+    // own form (`bench\foo...` on Windows), which is not a behaviour difference.
+    let expected = PathBuf::from("bench").join("foo.dimacs.drat");
+    assert_eq!(path, expected.to_string_lossy());
 }
 
 #[test]
@@ -979,4 +1089,163 @@ fn test_solve_session_crash_description_unix() {
     assert!(solve_session_crash_description(&ExitStatus::from_raw(0)).is_none());
     assert!(solve_session_crash_description(&ExitStatus::from_raw(1 << 8)).is_none());
     assert!(solve_session_crash_description(&ExitStatus::from_raw(124 << 8)).is_none());
+}
+
+/// The memory watchdog polls until the budget is breached, then signals the
+/// cooperative stop and waits out the grace period before its caller
+/// hard-exits. This is the escalation that makes `--memory` enforceable when
+/// no solver thread reaches a cancellation checkpoint.
+#[test]
+fn memory_watchdog_signals_then_waits_out_the_grace_period() {
+    let mut polls = 0_u32;
+    let mut slept: Vec<Duration> = Vec::new();
+    let breached = std::cell::Cell::new(false);
+
+    run_memory_watchdog(
+        || {
+            polls += 1;
+            polls > 3
+        },
+        Duration::from_millis(100),
+        Duration::from_secs(2),
+        || breached.set(true),
+        |waited| slept.push(waited),
+    );
+
+    assert!(
+        breached.get(),
+        "the cooperative stop must fire on the first breach"
+    );
+    assert_eq!(polls, 4, "the watchdog polls until the budget is breached");
+    assert_eq!(
+        slept,
+        vec![
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        ],
+        "one sleep per under-budget poll, then the grace period"
+    );
+}
+
+/// A run that is already over budget when the watchdog arms escalates without
+/// waiting a full poll interval first.
+#[test]
+fn memory_watchdog_escalates_immediately_when_already_over_budget() {
+    let mut slept: Vec<Duration> = Vec::new();
+    let breached = std::cell::Cell::new(false);
+
+    run_memory_watchdog(
+        || true,
+        Duration::from_millis(100),
+        Duration::from_secs(2),
+        || breached.set(true),
+        |waited| slept.push(waited),
+    );
+
+    assert!(breached.get());
+    assert_eq!(
+        slept,
+        vec![Duration::from_secs(2)],
+        "no poll sleep before the breach is observed"
+    );
+}
+
+/// A memout and a timeout both emit the required `unknown` verdict, but carry
+/// distinct `:reason-unknown` payloads so a harness can tell them apart.
+#[test]
+fn memout_and_timeout_share_the_verdict_but_not_the_reason() {
+    for wrapper in [false, true] {
+        assert_eq!(
+            memory_stdout_line_for_sat_competition_wrapper(wrapper),
+            timeout_stdout_line_for_sat_competition_wrapper(wrapper),
+            "resource exhaustion must emit the same unknown verdict grammar"
+        );
+        assert_ne!(
+            memory_stderr_line_for_sat_competition_wrapper(wrapper),
+            timeout_stderr_line_for_sat_competition_wrapper(wrapper),
+            "a memout must be distinguishable from a timeout"
+        );
+    }
+    assert_eq!(
+        memory_stderr_line_for_sat_competition_wrapper(false),
+        b"(:reason-unknown \"memout\")\n",
+        "SMT-LIB runs report Z3's memout reason"
+    );
+}
+
+/// The Z3-compatible path must be supervised. It is the path every benchmark
+/// harness drives, and while it was excluded it was the one path on which a
+/// crashing solve produced no verdict at all. Its empty-stderr contract is kept
+/// by suppressing the session markers instead — see `eprint_session_marker`.
+#[test]
+fn z3_mode_solves_are_supervised() {
+    assert!(solve_session_needs_wrapper(&strings(&[
+        "ay",
+        "solve",
+        "--z3-mode",
+        "in.smt2"
+    ])));
+    assert!(solve_session_needs_wrapper(&strings(&[
+        "ay",
+        "solve",
+        "--z3-mode",
+        "--memory",
+        "8576",
+        "--incremental"
+    ])));
+}
+
+/// The exclusions that remain are the ones the supervisor genuinely cannot
+/// honor: an in-flight CNF export whose generation it cannot authenticate after
+/// an abort, and the flags whose machine-readable stderr it would corrupt.
+#[test]
+fn export_and_machine_readable_paths_stay_unsupervised() {
+    for flag in [
+        "--dump-bv-cnf",
+        "--features",
+        "--stats-json",
+        "--z3-parameter-request",
+        "--z3-catalog-request",
+        "--unsupported-z3-option",
+    ] {
+        assert!(
+            !solve_session_needs_wrapper(&strings(&["ay", "solve", flag, "in.smt2"])),
+            "{flag} must stay unsupervised"
+        );
+    }
+}
+
+/// `--z3-mode` has to be visible to `main` *before* the fork, or the pre-fork
+/// `c ay.session.start` marker escapes onto a transcript that must be empty.
+/// That includes the flag being injected because argv[0] was `z3`.
+#[test]
+fn z3_mode_is_detected_before_the_fork_including_argv0_injection() {
+    assert!(solve_z3_mode_requested(&strings(&[
+        "ay",
+        "solve",
+        "--z3-mode",
+        "in.smt2"
+    ])));
+    assert!(!solve_z3_mode_requested(&strings(&[
+        "ay", "solve", "in.smt2"
+    ])));
+
+    // argv[0] of `z3` injects the flag during preprocessing; the pre-fork check
+    // reads the PREPROCESSED args, so an injected flag counts like an explicit
+    // one and the marker is suppressed on that path too.
+    let processed = preprocess_args(strings(&["/usr/local/bin/z3", "in.smt2"]));
+    assert!(
+        solve_z3_mode_requested(&processed),
+        "argv0-injected --z3-mode must be seen pre-fork, got {processed:?}"
+    );
+
+    // Past `--`, a literal `--z3-mode` is an operand, not a flag.
+    assert!(!solve_z3_mode_requested(&strings(&[
+        "ay",
+        "solve",
+        "--",
+        "--z3-mode"
+    ])));
 }

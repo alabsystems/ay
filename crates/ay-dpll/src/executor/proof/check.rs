@@ -222,7 +222,9 @@ impl Executor {
                 }
                 // Remaining: array ROW-same (bare-trust reconstruction),
                 // strings/BV/FP (surface-rewrite-trivialized / non-tautology
-                // lemmas) — need lemma reconstruction first. See memory
+                // lemmas) — need lemma reconstruction first. `FpForwardError`
+                // is strict-checked analytically by `ay-proof`, but does not yet
+                // have a Lean firewall emitter. See memory
                 // `project_formally_verifying_ay`.
                 _ => None,
             }
@@ -652,18 +654,17 @@ impl Executor {
             }
         }
 
-        // Floating-point RNE DOT-PRODUCT forward-error proof emission is
-        // deliberately disabled. `AySoundness.FpBridge` now proves the rational
-        // side end to end (the half-ULP bridge, `IsF64` representability under
-        // the independent `FpUnderflow.decodeFin` decode, chained finiteness of
-        // the six intermediates, and the composed conflict), but the residual
-        // identification of SMT-LIB `fp.mul`/`fp.add` RNE with the bridge's
-        // `NearestF64` spec is hand-argued and outside the kernel. The hook
-        // below therefore still declines every threshold, including guard2's
-        // 2.0. Its FORMAT gate is live regardless: the third argument carries
-        // the declared floating-point formats, without which the emitter could
-        // not tell this UNSAT `Float64` benchmark from its SATISFIABLE
-        // `Float32` clone (their parsed assertion terms are byte-identical).
+        // Floating-point binary64 RNE DOT-PRODUCT forward-error refutation.
+        // `AySoundness.FpBridge.guard_claim_no_model` is quantified over the
+        // IEEE-754 round-to-nearest SPECIFICATION — a relational `NearestF64`
+        // hypothesis per operation — so the certificate never mentions ay's
+        // bit-blaster and stays valid even if the blaster is wrong. The residual
+        // step is a reading of SMT-LIB's `fp.mul`/`fp.add` semantics, stated in
+        // full in the emitter's doc comment. The FORMAT gate is load-bearing:
+        // the third argument carries the declared floating-point formats,
+        // without which the emitter could not tell this UNSAT `Float64`
+        // benchmark from its SATISFIABLE `Float32` clone (their parsed
+        // assertion terms are byte-identical).
         if let Some(lean) =
             crate::executor::lean_firewall::emit_fp_dot_error_bound_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
@@ -1319,6 +1320,17 @@ impl Executor {
                 if !problem.contains(&assertion) {
                     problem.push(assertion);
                 }
+            }
+        }
+        // #pareto-terminal-obligation — a Pareto terminal `(check-sat)` refutes
+        // `authored AND blocking`, so the blocking conjuncts are part of the
+        // question being decided rather than facts borrowed from nowhere. The
+        // slot is empty for every other query and is writable only by
+        // `declare_pareto_front_exhaustion_extension`, which rebuilds its terms
+        // from the executor's own objectives.
+        for extension in self.declared_obligation_extension() {
+            if !problem.contains(&extension) {
+                problem.push(extension);
             }
         }
         problem

@@ -436,6 +436,8 @@ fn reduce_selectors_rec(
 /// Intermediate results from the E-matching phase.
 pub(super) struct EmatchingSummary {
     pub instantiations: Vec<TermId>,
+    /// Union of exact quantifier roots that E-matching processed across rounds.
+    pub instantiated_quantifiers: HashSet<TermId>,
     /// Exact source/binding records for proof-producing instances of
     /// unconditionally asserted foralls.
     pub unconditional_forall_instantiations: Vec<crate::ematching::ForallInstantiationProvenance>,
@@ -492,82 +494,26 @@ pub(super) struct CegqiPreparation {
     pub cegqi_state: Vec<(TermId, CegqiInstantiator)>,
 }
 
-/// Red zone / segment size for `stacker::maybe_grow` in
-/// [`collect_entailed_foralls`] (mirrors `ematching::collect_quantifiers`).
-const ENTAILED_STACK_RED_ZONE: usize = 32 * 1024;
-const ENTAILED_STACK_SIZE: usize = 1024 * 1024;
-
 /// (#p2-diag-position) Collect, in deterministic assertion order, the universal
 /// quantifiers that are ENTAILED as NNF CONJUNCTS of `term` under the given
 /// `positive` polarity — the SOUND candidate set for
 /// [`Executor::add_diagonal_forall_instances`], whose instances are asserted as
 /// top-level conjuncts.
 ///
-/// The walk descends ONLY through connectives that preserve conjunct-hood:
-///  * positive `and` (each arg is entailed),
-///  * negative `or`  (`¬(a ∨ b) ≡ ¬a ∧ ¬b`),
-///  * negative `=>`  (`¬(a₁ ⇒ … ⇒ aₙ) ≡ a₁ ∧ … ∧ aₙ₋₁ ∧ ¬aₙ`, right-assoc),
-///  * `not` (flips polarity).
-///
-/// It collects a positive `Forall` directly, and a negative `Exists` as its
-/// minted NNF-dual `forall x. ¬body` (same construction as
-/// `ematching::collect_quantifiers`, so the diagonal pass keeps refuting
-/// `(assert (not (exists ((x U) (y U)) (not (s x y)))))` — fuzzer Class B).
-///
-/// It STOPS at every other position — positive `or`/`=>`, both-polarity `ite`,
-/// `xor`, `=`, quantifier bodies, `let`, uninterpreted apps — because a
-/// quantifier reachable only past one of those is NOT entailed by the
-/// assertion; conjoining its instances manufactured the a12/t1–t3/u2 wrong
-/// `unsat` verdicts. Dropping a candidate is always fail-safe here: the
-/// diagonal pass only ADDS instances, so a smaller candidate set can never
-/// create a wrong verdict — at worst a refutation is found later or not at all
-/// (sound `unknown`).
+/// This is a thin alias for the CANONICAL predicate
+/// [`crate::ematching::collect_entailed_foralls`]. It used to be a second,
+/// byte-identical copy; the two were merged when the same entailment condition
+/// became the soundness gate for the E-matching / enumerative / MBQI
+/// instantiation lanes as well (#auflia-disjunct-forall-false-unsat). Keep ONE
+/// implementation: a divergence between "entailed enough for the diagonal pass"
+/// and "entailed enough to instantiate" would be a silent soundness hole.
 pub(super) fn collect_entailed_foralls(
     terms: &mut TermStore,
     term: TermId,
     positive: bool,
     out: &mut Vec<TermId>,
 ) {
-    stacker::maybe_grow(ENTAILED_STACK_RED_ZONE, ENTAILED_STACK_SIZE, || {
-        match terms.get(term).clone() {
-            TermData::Forall(..) => {
-                if positive {
-                    out.push(term);
-                }
-                // Negative forall = existential: not entailed as a universal.
-            }
-            TermData::Exists(vars, body, triggers) => {
-                if !positive {
-                    // NNF: NOT(exists x. phi) is the entailed universal
-                    // forall x. NOT(phi).
-                    let neg_body = terms.mk_not(body);
-                    let converted = terms.mk_forall_with_triggers(vars, neg_body, triggers);
-                    out.push(converted);
-                }
-            }
-            TermData::Not(inner) => {
-                collect_entailed_foralls(terms, inner, !positive, out);
-            }
-            TermData::App(sym, args) => {
-                let name = sym.name();
-                if (positive && name == "and") || (!positive && name == "or") {
-                    for arg in args {
-                        collect_entailed_foralls(terms, arg, positive, out);
-                    }
-                } else if !positive && name == "=>" && !args.is_empty() {
-                    // ¬(a₁ ⇒ … ⇒ aₙ) ≡ a₁ ∧ … ∧ aₙ₋₁ ∧ ¬aₙ (right-assoc n-ary).
-                    let last = args.len() - 1;
-                    for (i, arg) in args.into_iter().enumerate() {
-                        collect_entailed_foralls(terms, arg, i < last, out);
-                    }
-                }
-                // Every other App (positive or / =>, xor, =, uninterpreted, …):
-                // STOP — nothing below is an entailed conjunct.
-            }
-            // ite (either polarity), let, atoms, leaves: STOP (fail-safe).
-            _ => {}
-        }
-    }) // stacker::maybe_grow
+    crate::ematching::collect_entailed_foralls(terms, term, positive, out);
 }
 
 impl Executor {
@@ -618,14 +564,40 @@ impl Executor {
             .as_ref()
             .map(classify_ematching_proof_sources)
             .unwrap_or_default();
+        let direct_indices: HashMap<TermId, usize> = self
+            .proof_problem_assertion_provenance
+            .as_ref()
+            .map(|provenance| {
+                provenance
+                    .original_problem_assertions
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, term)| (term, index))
+                    .collect()
+            })
+            .unwrap_or_default();
         for record in records {
             if direct_sources.contains(&record.quantifier) {
-                let _ = self.proof_tracker.add_forall_instantiated_assertion(
+                let registered = self.proof_tracker.add_forall_instantiated_assertion(
                     &mut self.ctx.terms,
                     record.quantifier,
                     &record.binding,
                     record.instance,
                 );
+                if registered.is_some() {
+                    if let Some(&assertion_index) = direct_indices.get(&record.quantifier) {
+                        let proof_record = super::super::EmatchingProofRecord {
+                            assertion_index,
+                            quantifier: record.quantifier,
+                            binding: record.binding.clone(),
+                            instance: record.instance,
+                        };
+                        if !self.ematching_proof_records.contains(&proof_record) {
+                            self.ematching_proof_records.push(proof_record);
+                        }
+                    }
+                }
             } else if let Some(&source) = normalized_sources.get(&record.quantifier) {
                 let _ = self
                     .proof_tracker
@@ -797,17 +769,53 @@ impl Executor {
                                 folded_instances.push((vals, folded));
                             }
                         }
-                        let instances = folded_instances;
-                        if !instances.is_empty() {
-                            self.quant_expansion_records.push(
-                                crate::executor::QuantExpansionRecord {
-                                    original: a,
-                                    assertion_index: idx,
-                                    expanded: ground,
-                                    instances,
-                                },
-                            );
-                        }
+                        // (#bv-forall-const-expansion) The record is pushed even
+                        // when EVERY instance folded away. Two different things
+                        // live in this struct and they must not be conflated:
+                        //
+                        //   * `instances` is proof-export PAYLOAD — the conjuncts
+                        //     a `forall_inst` derivation can re-derive. A constant
+                        //     instance has nothing to derive, so dropping it is
+                        //     right (and `plan_quant_consequence` skips `Const`
+                        //     instances again on its own side).
+                        //   * the record's EXISTENCE is the authenticated fact
+                        //     that this exact authored `forall` was replaced in
+                        //     place by the canonical finite-domain expansion.
+                        //     `result_mapping`'s BV full-domain recognizer reads
+                        //     precisely that fact ("capability is not evidence")
+                        //     before granting `bv_quantifier_full_domain_proof`.
+                        //
+                        // Gating the record on a non-empty payload silently
+                        // withdrew the authentication for exactly the expansions
+                        // that discharged the quantifier COMPLETELY. Measured at
+                        // cbb3157aeb with the release binary:
+                        //
+                        //   ∀x:BV8. (0 <u x ∨ f(x) = 0)  -> sat      (z3: sat)
+                        //   ∀x:BV8. (0 <u x ∨ x = 0)     -> unknown  (z3: sat)
+                        //
+                        // Same guard, same expansion range `[0,0]`, same solver
+                        // route; the only difference is that the second one's
+                        // single instance `(= #x00 #x00)` constant-folds to
+                        // `true`, so the payload emptied and the record vanished.
+                        // The guard-range early return (`hi < lo`, folded to
+                        // `true` with no recorded instance at all) lost it the
+                        // same way.
+                        //
+                        // Restoring the record cannot loosen the SAT certificate:
+                        // the recognizer independently re-runs the canonical
+                        // expander on the authored assertion and additionally
+                        // requires a non-nested all-BV-binder `forall` plus full
+                        // E-matching coverage, and this site still requires
+                        // `recorded_ground == ground` (the recording expansion
+                        // reproduced the exact replacement term). It only stops
+                        // discarding evidence the pass already produced.
+                        self.quant_expansion_records
+                            .push(crate::executor::QuantExpansionRecord {
+                                original: a,
+                                assertion_index: idx,
+                                expanded: ground,
+                                instances: folded_instances,
+                            });
                     }
                 }
             }
@@ -1637,6 +1645,7 @@ impl Executor {
         let mut seen_instantiations: HashSet<TermId> =
             assertions_for_round.iter().copied().collect();
         let mut all_instantiations = Vec::new();
+        let mut all_instantiated_quantifiers = HashSet::default();
         let mut all_unconditional_forall_instantiations = Vec::new();
         let mut seen_forall_instantiations = HashSet::default();
         let mut has_uninstantiated = false;
@@ -1666,6 +1675,7 @@ impl Executor {
             let round_reached_limit = ematching_result.reached_limit;
             let round_has_uninstantiated = ematching_result.has_uninstantiated;
             let round_uninstantiated_quantifiers = ematching_result.uninstantiated_quantifiers;
+            all_instantiated_quantifiers.extend(ematching_result.instantiated_quantifiers);
             let round_forall_instantiations = ematching_result.unconditional_forall_instantiations;
             instances_created += ematching_result.instantiations.len() as u64;
             all_unconditional_forall_roots.extend(ematching_result.unconditional_forall_roots);
@@ -1740,6 +1750,7 @@ impl Executor {
 
         EmatchingSummary {
             instantiations: all_instantiations,
+            instantiated_quantifiers: all_instantiated_quantifiers,
             unconditional_forall_instantiations: all_unconditional_forall_instantiations,
             has_uninstantiated,
             uninstantiated_quantifiers,
@@ -1964,6 +1975,14 @@ impl Executor {
         // one-shot saturation loop on recursive axiom families (#7883).
         let enum_seed_assertions = self.ctx.assertions.clone();
 
+        // (#auflia-disjunct-forall-false-unsat) The universals the CURRENT
+        // assertion set actually ENTAILS. Computed over the pre-CEGQI snapshot —
+        // i.e. the same set the caller collected `quantifiers` from, and BEFORE
+        // `flatten_and_strip_quantifiers` deletes every quantified assertion.
+        // Only these may have a ground instance conjoined (see the gate below).
+        let entailed_foralls: HashSet<TermId> =
+            crate::ematching::entailed_forall_set(&mut self.ctx.terms, &enum_seed_assertions);
+
         // #forall-bare-bool wrong-SAT: snapshot the genuine (non-CE) assertions
         // that exist BEFORE any CE lemma is pushed below, together with their
         // flattened AND-conjuncts. A CE lemma built by `create_ce_lemma` negates
@@ -2000,12 +2019,29 @@ impl Executor {
             let is_forall = matches!(self.ctx.terms.get(quant), TermData::Forall(..));
             let is_triggerless_cegqi_forall =
                 !has_triggers && is_forall && is_cegqi_candidate(&self.ctx.terms, quant);
+            // (#auflia-disjunct-forall-false-unsat) A `forall` the assertion set
+            // does NOT ENTAIL — one reachable only under a positive `or`/`=>` or
+            // an `ite` — must not be instantiated here either. `enumerative_
+            // instantiation` below pushes `body[t/x]` straight into
+            // `ctx.assertions` as a top-level conjunct, and its own doc comment
+            // states the false premise ("sound because every instantiation of a
+            // universally quantified formula is implied by the formula" — implied
+            // by the FORMULA, yes; by the PROBLEM, only when the problem entails
+            // the formula). This lane independently reproduced the six
+            // 20170829-Rodin false-`unsat`s: gating E-matching alone flipped only
+            // 3 of 6, because the enumerative lane re-derived the same fabricated
+            // literal from the same disjunct-position `forall`. The excluded
+            // quantifier falls through to the fail-closed routing below, which
+            // records it as unhandled so no SAT certificate can grant on it
+            // either.
+            let quant_is_entailed_forall = !is_forall || entailed_foralls.contains(&quant);
             // A `forall` marked "E-matching only" (`mark_no_mbqi`, e.g. the
             // Hilbert-`choose` witness axiom) is EXCLUDED from CEGQI synthesis
             // instantiation, exactly as it is from MBQI. It falls through to the
             // fail-closed routing below, so it is discharged only by E-matching
             // on a ground trigger (an established witness), matching Verus.
             let should_process = !self.ctx.terms.is_no_mbqi(quant)
+                && quant_is_entailed_forall
                 && (is_triggerless_cegqi_forall
                     || (ematching_has_uninstantiated
                         && ematching_uninstantiated_quantifiers.contains(&quant)));
@@ -2239,6 +2275,7 @@ impl Executor {
             let inst_count = ematching_result.instantiations.len() as u64;
             let summary = EmatchingSummary {
                 instantiations: ematching_result.instantiations,
+                instantiated_quantifiers: ematching_result.instantiated_quantifiers,
                 unconditional_forall_instantiations: ematching_result
                     .unconditional_forall_instantiations,
                 has_uninstantiated: ematching_result.has_uninstantiated,

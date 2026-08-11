@@ -134,6 +134,9 @@ benchmarks/chc-comp/
 # Large CHC-COMP corpora fetched on demand (see scripts/chccomp_harness.py BENCH_ROOT)
 benchmarks/chc/chc-comp26-benchmarks/
 benchmarks/chc/chc-comp25-benchmarks/
+# SMT-LIB corpus fetched on demand by `ay-z3-parity fetch` (438k files, and some
+# divisions carry non-commercial benchmark licenses — never vendored/committed)
+benchmarks/smtlib-all/
 # Competitor solver sources cloned for algorithm study (never vendored/committed)
 reference/competitors/
 benchmarks/smtcomp/
@@ -270,6 +273,11 @@ benchmarks/sat/unsat/*.drat
 *.alethe.tmp-*
 *.lean4.tmp-*
 *.chccert.tmp-*
+# The CHC certificate writer takes a lock beside the artifact as a DOT-prefixed
+# sibling: `.<input>.chccert.ay-chc.lock`. The `*.smt2.chccert` rule above does
+# not match it (the name continues past `.chccert`), so without this line every
+# test run that touches a `benchmarks/smt` fixture leaves untracked files behind.
+.*.chccert.ay-chc.lock
 *.pbp.tmp-*
 *.proof-artifact.json.tmp.*
 chc-obligations/
@@ -356,3 +364,13 @@ the development design notes*.log
 the development design notes*.jsonl
 # Competitor SOURCE checkouts (for design comparison; large, upstream-owned)
 .competitors/src/
+
+# Corpus guard. The BASELINE is committed -- it is the shared contract, and a
+# change of expectations should be a reviewable diff. These two are NOT:
+#   the development design notes          per-run logs and JSON, machine-local
+#   the development design notes  the local measurement series; appended every
+#     run, so tracking it would leave the tree dirty every single morning and
+#     turn an ordinary rebase into a conflict. Commit it deliberately if you
+#     want the trend shared.
+the development design notes
+the development design notes

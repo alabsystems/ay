@@ -139,9 +139,12 @@ thread_local! {
 }
 
 fn check_script(script: &str) -> String {
-    let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
+    // The script carries its own `(set-logic …)`; `try_new` dispatches one too,
+    // so build with the declared logic and strip the command.
+    let (logic, script) = crate::api::split_leading_set_logic(script, Logic::QfLia);
+    let mut solver = Solver::try_new(logic).expect("QF_LIA supported");
     solver
-        .parse_smtlib2(script)
+        .parse_smtlib2(&script)
         .expect("verification script parses");
     let r = solver.check_sat();
     if r.is_sat() {
@@ -1179,7 +1182,9 @@ struct ProofShape {
 /// Returns the proof shape plus Some on a *verified* Craig interpolant.
 fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<SpikeOutcome>) {
     VERIFY_RESOURCE_LIMITED.with(|f| f.set(false));
-    let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
+    let (logic, src) = crate::api::split_leading_set_logic(src, Logic::QfLia);
+    let src = src.as_ref();
+    let mut solver = Solver::try_new(logic).expect("QF_LIA supported");
     solver.set_produce_proofs(true);
     // The preprocessing variable substitution must be off for proof-based
     // interpolation (see module docs). Solver-local option (with the
@@ -1548,7 +1553,9 @@ fn test_interpolation_builtin_repro_all_strengths_verify() {
         .checked_sub(1)
         .expect("mini repro must contain an A and B partition");
 
-    let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
+    let (logic, src) = crate::api::split_leading_set_logic(src, Logic::QfLia);
+    let src = src.as_ref();
+    let mut solver = Solver::try_new(logic).expect("QF_LIA supported");
     solver.set_produce_proofs(true);
     solver.set_option(":ay-proof-no-varsubst", "true");
     let asserts: Vec<Term> = solver.parse_smtlib2(src).expect("repro parses");

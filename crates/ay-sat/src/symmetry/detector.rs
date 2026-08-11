@@ -50,6 +50,15 @@ pub(crate) struct DetectorStats {
     pub(crate) pairs_detected: u64,
     /// Number of orbits (connected components of swap graph) detected.
     pub(crate) orbits_detected: u64,
+    /// Refined colour classes with at least two variables — the raw supply of
+    /// symmetry the refinement found, before any budget is applied.
+    pub(crate) groups_nontrivial: u64,
+    /// Non-trivial classes dropped because they exceed `max_group_size`. A
+    /// non-zero count here means detection found symmetry and then threw it
+    /// away, which reads identically to "no symmetry" in every other counter.
+    pub(crate) groups_over_budget: u64,
+    /// Size of the largest non-trivial class.
+    pub(crate) largest_group: u64,
 }
 
 impl SymmetryDetector {
@@ -82,7 +91,14 @@ impl SymmetryDetector {
         let mut verified_swaps: Vec<BinarySwap> = Vec::new();
 
         for variables in groups.into_values() {
+            if variables.len() >= 2 {
+                stats.groups_nontrivial += 1;
+                stats.largest_group = stats.largest_group.max(variables.len() as u64);
+            }
             if variables.len() < 2 || variables.len() > self.max_group_size {
+                if variables.len() > self.max_group_size {
+                    stats.groups_over_budget += 1;
+                }
                 continue;
             }
             for i in 0..variables.len() {
@@ -737,8 +753,92 @@ fn encode_perm_lex_leader_sr(
 /// pivot-only PR witness `[pivot]` (i.e. the on-wire form `lit lit 0`), which
 /// `dsr-trim` accepts identically to a bare `lit 0` RAT line.
 pub(crate) fn detect_php_aux_free_sr(clauses: &[Vec<Literal>]) -> Option<Vec<LexClause>> {
-    let matrix = detect_php_matrix(clauses)?;
-    Some(build_php_aux_free_sr(&matrix))
+    if let Some(matrix) = detect_php_matrix(clauses) {
+        return Some(build_php_aux_free_sr(&matrix));
+    }
+    // `detect_php_matrix` demands the WHOLE formula be one pigeonhole matrix, so
+    // a formula that is several variable-disjoint pigeonholes is rejected even
+    // though each part is recognisable. Every `chnl` instance is exactly two
+    // disjoint PHPs: `chnl-040x041` is 80 AMO cliques of size 41 and 82
+    // all-positive width-40 clauses, i.e. (P=41,H=40) twice. Pooled it looks
+    // like P=82 against H=40 and fails the shape test.
+    //
+    // Soundness: a pigeon swap confined to one component is the identity on
+    // every other variable, so it is still an automorphism of the FULL formula
+    // and its units stay redundant there. And refuting any one component
+    // refutes the conjunction. Confirmed externally: the 1638 SR units derived
+    // from a single component of `chnl-040x041` verify against the full
+    // two-component CNF (`s VERIFIED UNSAT`).
+    // Cheap pre-filter before the split. `detect_php_matrix` accepts only
+    // all-positive ALO clauses and binary all-negative AMO clauses; a formula
+    // containing anything else cannot have a pigeonhole component that the
+    // split would find, because a component inherits its clauses whole.
+    //
+    // This scan is O(clauses) with no allocation, and it matters: without it
+    // the split below clones every clause of every formula whose PHP detection
+    // failed — i.e. almost all of them — which took the ay-sat suite from 132 s
+    // to 697 s when this route went default-on.
+    if !clauses.iter().all(|c| {
+        (c.len() >= 2 && c.iter().all(|l| l.is_positive()))
+            || (c.len() == 2 && c.iter().all(|l| !l.is_positive()))
+    }) {
+        return None;
+    }
+    let parts = split_variable_disjoint(clauses)?;
+    let mut out = Vec::new();
+    for part in &parts {
+        if let Some(matrix) = detect_php_matrix(part) {
+            out.extend(build_php_aux_free_sr(&matrix));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Partition `clauses` into variable-disjoint groups, or `None` if there is only
+/// one (in which case the caller has already tried it whole).
+///
+/// Union-find over variables, then bucket the clauses by their root. Returns
+/// `None` for the degenerate cases so callers can stay on the fast path.
+fn split_variable_disjoint(clauses: &[Vec<Literal>]) -> Option<Vec<Vec<Vec<Literal>>>> {
+    let max_var = clauses
+        .iter()
+        .flat_map(|c| c.iter())
+        .map(|l| l.variable().index())
+        .max()?;
+    let mut parent: Vec<u32> = (0..=max_var as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize]; // path halving
+            x = parent[x as usize];
+        }
+        x
+    }
+    for clause in clauses {
+        let mut it = clause.iter().map(|l| l.variable().index() as u32);
+        let Some(first) = it.next() else { continue };
+        let mut ra = find(&mut parent, first);
+        for v in it {
+            let rb = find(&mut parent, v);
+            if ra != rb {
+                parent[rb as usize] = ra;
+                ra = find(&mut parent, ra);
+            }
+        }
+    }
+    let mut bucket_of: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut parts: Vec<Vec<Vec<Literal>>> = Vec::new();
+    for clause in clauses {
+        let Some(first) = clause.first() else {
+            continue;
+        };
+        let root = find(&mut parent, first.variable().index() as u32);
+        let idx = *bucket_of.entry(root).or_insert_with(|| {
+            parts.push(Vec::new());
+            parts.len() - 1
+        });
+        parts[idx].push(clause.clone());
+    }
+    (parts.len() >= 2).then_some(parts)
 }
 
 /// Recognise a pure pigeonhole matrix in `clauses` and return it as
@@ -774,8 +874,17 @@ fn detect_php_matrix(clauses: &[Vec<Literal>]) -> Option<Vec<Vec<Variable>>> {
 
     let p = alo.len();
     let h = alo.first()?.len();
-    if p < 3 || h < 2 || p != h + 1 {
-        return None; // pigeonhole requires P = H + 1, with at least 2 holes
+    if p < 3 || h < 2 || p < h + 1 {
+        // Pigeonhole needs MORE pigeons than holes; P = H + 1 is merely the
+        // tight case. P > H + 1 is a strictly easier instance and the aux-free
+        // SR construction covers it unchanged, because it iterates all P rows.
+        //
+        // An earlier attempt at this relaxation was refuted, but what it
+        // actually did was TRUNCATE the matrix to h + 1 rows — that discards
+        // pigeons and breaks the diagonal RAT units. Keeping every row instead
+        // produces a certificate dsr-trim accepts: php_11_8 (P=11, H=8) checks
+        // as `s VERIFIED UNSAT`.
+        return None;
     }
     if alo.iter().any(|row| row.len() != h) {
         return None; // ragged rows: not a matrix
@@ -896,8 +1005,8 @@ fn build_php_aux_free_sr(matrix: &[Vec<Variable>]) -> Vec<LexClause> {
     let p = matrix.len(); // P = H + 1 pigeons (rows 0..=H)
     let h = matrix.first().map_or(0, Vec::len); // H holes (cols 0..H-1)
     let mut out: Vec<LexClause> = Vec::new();
-    if p < 3 || h < 2 || p != h + 1 {
-        return out;
+    if p < 3 || h < 2 || p < h + 1 {
+        return out; // see detect_php_matrix: P >= H + 1, untruncated
     }
 
     for hole in 0..h - 1 {

@@ -5,6 +5,65 @@
 use super::*;
 
 #[test]
+fn leading_zero_numerals_and_decimals_are_rejected() {
+    for source in ["00", "0123", "00.1", "01.25"] {
+        let error = parse_sexp(source).expect_err("leading zero must be rejected");
+        assert!(
+            error.message.contains("leading zeros"),
+            "unexpected error for {source:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn quoted_symbols_decode_z3_500_escapes_and_reject_control_characters() {
+    let source = "|a\u{000b}b|";
+    let error = parse_sexp(source).expect_err("forbidden quoted-symbol character");
+    assert!(
+        error
+            .message
+            .contains("quoted symbol contains forbidden character"),
+        "unexpected error for {source:?}: {error}"
+    );
+    assert_eq!(
+        parse_sexp(r"|a\|b|").expect("escaped pipe"),
+        SExpr::Symbol("a|b".to_string())
+    );
+    assert_eq!(
+        parse_sexp(r"|a\\b|").expect("escaped backslash"),
+        SExpr::Symbol(r"a\b".to_string())
+    );
+    assert_eq!(
+        parse_sexp(r"|a\b|").expect("backslash before ordinary character"),
+        SExpr::Symbol(r"a\b".to_string())
+    );
+    for symbol in ["||", "a|b", r"a\b"] {
+        let expression = SExpr::Symbol(symbol.to_string());
+        let printed = expression.to_string();
+        assert_eq!(
+            parse_sexp(&printed).expect("escaped symbol must round-trip"),
+            expression
+        );
+    }
+    assert_eq!(
+        parse_sexp("|line one\nline two é|").expect("legal quoted symbol"),
+        SExpr::Symbol("line one\nline two é".to_string())
+    );
+}
+
+#[test]
+fn strings_reject_non_whitespace_control_characters() {
+    let error = parse_sexp("\"a\u{000b}b\"").expect_err("vertical tab is not legal");
+    assert!(error
+        .message
+        .contains("string literal contains forbidden character"));
+    assert_eq!(
+        parse_sexp("\"line one\nline two é\"").expect("legal string"),
+        SExpr::String("line one\nline two é".to_string())
+    );
+}
+
+#[test]
 fn test_parse_symbol() {
     let sexp = parse_sexp("foo").unwrap();
     assert_eq!(sexp, SExpr::Symbol("foo".to_string()));
@@ -463,33 +522,23 @@ fn test_round_trip_reserved_symbol() {
     assert_eq!(sexp2, sexp);
 }
 
-/// Verify sanitized symbols from quote_symbol can be parsed (#1841)
+/// Verify Z3 5.0.0 quoted-symbol escapes preserve symbol identity.
 #[test]
-fn test_sanitized_symbol_parseable() {
+fn test_escaped_symbol_round_trip() {
     use ay_core::quote_symbol;
 
-    // quote_symbol sanitizes | and \ to _ before quoting
-    let quoted = quote_symbol("a|b");
-    assert_eq!(quoted, "|a_b|");
-
-    // Parser should accept the sanitized output
-    let sexp = parse_sexp(&quoted).unwrap();
-    assert_eq!(sexp, SExpr::Symbol("a_b".to_string()));
-
-    // The symbol name changed from "a|b" to "a_b" - this is expected
-    // (sanitization is a lossy one-way operation per #1841)
-
-    // Test backslash sanitization
-    let quoted2 = quote_symbol(r"x\y");
-    assert_eq!(quoted2, "|x_y|");
-    let sexp2 = parse_sexp(&quoted2).unwrap();
-    assert_eq!(sexp2, SExpr::Symbol("x_y".to_string()));
-
-    // Multiple invalid chars
-    let quoted3 = quote_symbol(r"a|b\c|d");
-    assert_eq!(quoted3, "|a_b_c_d|");
-    let sexp3 = parse_sexp(&quoted3).unwrap();
-    assert_eq!(sexp3, SExpr::Symbol("a_b_c_d".to_string()));
+    for (symbol, quoted) in [
+        ("a|b", r"|a\|b|"),
+        (r"x\y", r"|x\\y|"),
+        (r"a|b\c|d", r"|a\|b\\c\|d|"),
+    ] {
+        let output = quote_symbol(symbol);
+        assert_eq!(output, quoted);
+        assert_eq!(
+            parse_sexp(&output).unwrap(),
+            SExpr::Symbol(symbol.to_string())
+        );
+    }
 }
 
 #[test]

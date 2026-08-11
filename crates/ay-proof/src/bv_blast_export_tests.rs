@@ -119,6 +119,237 @@ fn serde_round_trip() {
     back.validate().expect("deserialized proof still validates");
 }
 
+fn replay_limits_for(proof: &BvBlastProof) -> BvBlastValidateLimits {
+    BvBlastValidateLimits {
+        deadline: None,
+        max_vars: proof.vars.len(),
+        max_bit_lemmas: proof.bit_lemmas.len(),
+        max_clauses: proof.clauses.len(),
+        max_clause_literals: proof
+            .clauses
+            .iter()
+            .map(|clause| clause.lits.len())
+            .max()
+            .unwrap_or(0),
+        max_original_literals: proof.clauses.iter().map(|clause| clause.lits.len()).sum(),
+        max_resolution_steps: proof.refutation.steps.len(),
+        max_derived_literals: proof
+            .refutation
+            .steps
+            .iter()
+            .map(|step| step.clause.len())
+            .sum(),
+        max_work: u64::MAX,
+    }
+}
+
+#[test]
+fn bounded_replay_accepts_an_exported_certificate() {
+    let proof = export_bv_blast_proof(SliceObligation::identical_at(BvOp::Sub, 8)).expect("export");
+    proof
+        .validate_with_limits(&replay_limits_for(&proof))
+        .expect("a valid certificate must pass finite structural limits");
+}
+
+#[test]
+fn bounded_replay_rejects_repeated_large_premise_work() {
+    let mut proof =
+        export_bv_blast_proof(SliceObligation::identical_at(BvOp::Add, 8)).expect("export");
+    let repeated = proof
+        .clauses
+        .iter_mut()
+        .find(|clause| matches!(clause.provenance, ClauseProvenance::BitLemmaCnf { .. }))
+        .expect("gate clause");
+    let original = repeated.lits.clone();
+    for _ in 0..128 {
+        repeated.lits.extend_from_slice(&original);
+    }
+    // Clause semantics and resolution are set-based, so repetition does not
+    // invalidate the proof. It must nevertheless be charged before replay.
+    proof
+        .validate()
+        .expect("duplicate literals preserve the clause set");
+
+    let mut limits = replay_limits_for(&proof);
+    limits.max_work = 64;
+    assert!(matches!(
+        proof.validate_with_limits(&limits),
+        Err(BvBlastValidateError::ResourceLimit {
+            resource: "validation work",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn bounded_replay_rejects_an_already_expired_deadline() {
+    let proof = export_bv_blast_proof(SliceObligation::identical_at(BvOp::Xor, 8)).expect("export");
+    let mut limits = replay_limits_for(&proof);
+    limits.deadline = Some(Instant::now());
+    assert_eq!(
+        proof.validate_with_limits(&limits),
+        Err(BvBlastValidateError::DeadlineExceeded)
+    );
+}
+
+#[test]
+fn malformed_resolution_premise_arity_is_rejected_by_serde() {
+    let proof = export_bv_blast_proof(SliceObligation::identical_at(BvOp::Xor, 2)).expect("export");
+    let mut json = serde_json::to_value(proof).expect("serialize");
+    json["refutation"]["steps"][0]["premises"] = serde_json::json!([0]);
+    serde_json::from_value::<BvBlastProof>(json)
+        .expect_err("the fixed `[u32; 2]` premise type must reject arity one");
+}
+
+#[test]
+fn noncanonical_resolution_step_id_is_rejected() {
+    let mut proof =
+        export_bv_blast_proof(SliceObligation::identical_at(BvOp::Xor, 2)).expect("export");
+    proof.refutation.steps[0].id = u32::MAX;
+    assert!(matches!(
+        proof.validate(),
+        Err(BvBlastValidateError::NonCanonicalResolutionStepId { index: 0, .. })
+    ));
+}
+
+fn small_native_certificate() -> BvBlastProof {
+    export_bv_blast_proof(SliceObligation::identical_at(BvOp::Xor, 2)).expect("export")
+}
+
+#[test]
+fn native_replay_rejects_unknown_version_and_noncanonical_lemma_id() {
+    let mut wrong_version = small_native_certificate();
+    wrong_version.format_version = FORMAT_VERSION + 1;
+    assert!(matches!(
+        wrong_version.validate(),
+        Err(BvBlastValidateError::UnsupportedFormatVersion { .. })
+    ));
+
+    let mut wrong_id = small_native_certificate();
+    wrong_id.bit_lemmas[0].id = u32::MAX;
+    assert!(matches!(
+        wrong_id.validate(),
+        Err(BvBlastValidateError::NonCanonicalBitLemmaId { index: 0, .. })
+    ));
+}
+
+#[test]
+fn native_replay_rejects_double_definition_cycle_and_undefined_gate() {
+    let mut double_definition = small_native_certificate();
+    let mut duplicate = double_definition.bit_lemmas[0].clone();
+    duplicate.id = double_definition.bit_lemmas.len() as u32;
+    double_definition.bit_lemmas.push(duplicate);
+    assert!(matches!(
+        double_definition.validate(),
+        Err(BvBlastValidateError::DuplicateGateOutput { .. })
+    ));
+
+    let mut cycle = small_native_certificate();
+    cycle.bit_lemmas[0].ins[0] = cycle.bit_lemmas[0].out;
+    assert!(matches!(
+        cycle.validate(),
+        Err(BvBlastValidateError::GateInputNotDefined { lemma: 0, .. })
+    ));
+
+    let mut undefined = small_native_certificate();
+    let var = undefined.vars.roles.len() as u32;
+    undefined.vars.roles.push(VarRole::Aux { bit: 0 });
+    assert_eq!(
+        undefined.validate(),
+        Err(BvBlastValidateError::MissingGateDefinition { var })
+    );
+}
+
+#[test]
+fn native_replay_rejects_malformed_disequality_provenance() {
+    let mut wrong_polarity = small_native_certificate();
+    let disequality = wrong_polarity
+        .clauses
+        .iter_mut()
+        .find(|clause| matches!(clause.provenance, ClauseProvenance::Disequality))
+        .expect("disequality");
+    disequality.lits[0].neg = false;
+    assert!(matches!(
+        wrong_polarity.validate(),
+        Err(BvBlastValidateError::MalformedDisequality { .. })
+    ));
+
+    let mut missing = small_native_certificate();
+    missing
+        .clauses
+        .iter_mut()
+        .find(|clause| matches!(clause.provenance, ClauseProvenance::Disequality))
+        .expect("disequality")
+        .lits
+        .pop();
+    assert!(matches!(
+        missing.validate(),
+        Err(BvBlastValidateError::MalformedDisequality { .. })
+    ));
+
+    let mut extra_clause = small_native_certificate();
+    let mut duplicate = extra_clause
+        .clauses
+        .iter()
+        .find(|clause| matches!(clause.provenance, ClauseProvenance::Disequality))
+        .expect("disequality")
+        .clone();
+    duplicate.id = extra_clause.clauses.len() as u32;
+    extra_clause.clauses.push(duplicate);
+    assert!(matches!(
+        extra_clause.validate(),
+        Err(BvBlastValidateError::MalformedDisequality { .. })
+    ));
+}
+
+#[test]
+fn native_replay_rejects_missing_extra_or_non_xnor_biteq() {
+    let mut missing = small_native_certificate();
+    let missing_position = missing
+        .vars
+        .roles
+        .iter()
+        .position(|role| matches!(role, VarRole::BitEq { bit: 1 }))
+        .expect("BitEq bit 1");
+    missing.vars.roles[missing_position] = VarRole::Aux { bit: 1 };
+    assert!(matches!(
+        missing.validate(),
+        Err(BvBlastValidateError::MalformedBitEqLayout { .. })
+    ));
+
+    let mut extra = small_native_certificate();
+    let extra_var = extra.vars.roles.len() as u32;
+    extra.vars.roles.push(VarRole::BitEq { bit: 2 });
+    extra.bit_lemmas.push(BitLemma {
+        id: extra.bit_lemmas.len() as u32,
+        kind: BitLemmaKind::ConstFalse,
+        out: extra_var,
+        ins: Vec::new(),
+    });
+    assert!(matches!(
+        extra.validate(),
+        Err(BvBlastValidateError::MalformedBitEqLayout { .. })
+    ));
+
+    let mut wrong_gate = small_native_certificate();
+    let bit_eq_var = wrong_gate
+        .vars
+        .roles
+        .iter()
+        .position(|role| matches!(role, VarRole::BitEq { bit: 0 }))
+        .expect("BitEq bit 0") as u32;
+    let lemma = wrong_gate
+        .bit_lemmas
+        .iter_mut()
+        .find(|lemma| lemma.out == bit_eq_var)
+        .expect("BitEq definition");
+    lemma.kind = BitLemmaKind::And2;
+    assert!(matches!(
+        wrong_gate.validate(),
+        Err(BvBlastValidateError::MalformedBitEqLayout { .. })
+    ));
+}
+
 /// The disequality clause must be present exactly once and reference one ¬BitEq per
 /// output bit.
 #[test]

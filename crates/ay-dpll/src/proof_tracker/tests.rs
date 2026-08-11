@@ -1189,8 +1189,8 @@ fn test_record_theory_conflict_unsat_with_invalid_integer_farkas_stays_lia_gener
         Some(ProofStep::TheoryLemma { kind, .. }) => {
             assert_eq!(
                 *kind,
-                TheoryLemmaKind::LraFarkas,
-                "shape-only Farkas check accepts [1, 0] as valid (zero coeff = unused constraint)",
+                TheoryLemmaKind::LiaGeneric,
+                "an annotation that does not derive contradiction must not gain Farkas authority",
             );
         }
         other => panic!("expected TheoryLemma step, got {other:?}"),

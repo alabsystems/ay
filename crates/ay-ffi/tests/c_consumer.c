@@ -730,6 +730,7 @@ static int test_fixedpoint(void) {
 
     Z3_symbol x_sym = Z3_mk_string_symbol(ctx, "x");
     Z3_ast x = Z3_mk_const(ctx, x_sym, int_sort);
+    Z3_app x_app = Z3_to_app(ctx, x);
     Z3_ast zero = Z3_mk_int(ctx, 0, int_sort);
     Z3_ast one = Z3_mk_int(ctx, 1, int_sort);
     Z3_ast ten = Z3_mk_int(ctx, 10, int_sort);
@@ -738,7 +739,7 @@ static int test_fixedpoint(void) {
     Z3_ast x_eq_0 = Z3_mk_eq(ctx, x, zero);
     Z3_ast inv_x = Z3_mk_app(ctx, inv, 1, &x);
     Z3_ast init_body = Z3_mk_implies(ctx, x_eq_0, inv_x);
-    Z3_ast init_rule = Z3_mk_forall_const(ctx, 0, 1, &x, 0, NULL, init_body);
+    Z3_ast init_rule = Z3_mk_forall_const(ctx, 0, 1, &x_app, 0, NULL, init_body);
     Z3_fixedpoint_add_rule(ctx, fp, init_rule, NULL);
 
     // transition: forall x. (=> (and (inv x) (< x 10)) (inv (+ x 1)))
@@ -750,7 +751,7 @@ static int test_fixedpoint(void) {
     Z3_ast x_plus_1 = Z3_mk_add(ctx, 2, add_args);
     Z3_ast inv_xp1 = Z3_mk_app(ctx, inv, 1, &x_plus_1);
     Z3_ast trans_body = Z3_mk_implies(ctx, trans_ante, inv_xp1);
-    Z3_ast trans_rule = Z3_mk_forall_const(ctx, 0, 1, &x, 0, NULL, trans_body);
+    Z3_ast trans_rule = Z3_mk_forall_const(ctx, 0, 1, &x_app, 0, NULL, trans_body);
     Z3_fixedpoint_add_rule(ctx, fp, trans_rule, NULL);
 
     // UNSAFE query: (and (inv qx) (> qx 5)) is reachable.
@@ -773,11 +774,11 @@ static int test_fixedpoint(void) {
     int safe_res = Z3_fixedpoint_query(ctx, fp, safe_goal);
     assert(safe_res == Z3_L_FALSE);
 
-    Z3_string answer = Z3_fixedpoint_get_answer(ctx, fp);
+    Z3_ast answer = Z3_fixedpoint_get_answer(ctx, fp);
     assert(answer != NULL);
-    assert(strcmp(answer, "unsat") == 0);
+    assert(strcmp(Z3_ast_to_string(ctx, answer), "false") == 0);
 
-    Z3_string dump = Z3_fixedpoint_to_string(ctx, fp);
+    Z3_string dump = Z3_fixedpoint_to_string(ctx, fp, 0, NULL);
     assert(dump != NULL && strstr(dump, "declare-rel inv") != NULL);
 
     Z3_fixedpoint_dec_ref(ctx, fp);

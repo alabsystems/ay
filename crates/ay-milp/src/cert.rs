@@ -113,6 +113,9 @@ pub enum CertificateError {
         /// Human-readable structural failure.
         msg: String,
     },
+    /// A resource-bounded verifier reached its absolute deadline.
+    #[error("certificate verification deadline exceeded")]
+    DeadlineExceeded,
     /// The combined linear form has a nonzero coefficient where the identity
     /// requires zero (Farkas) or the objective coefficient (optimality).
     #[error("combined linear form does not match on column {col}")]
@@ -158,8 +161,27 @@ impl FarkasCertificate {
     /// Independently verify this certificate against `model` using exact
     /// arithmetic. No solver state is consulted.
     pub fn verify(&self, model: &Model) -> Result<(), CertificateError> {
-        let combo = combine(&self.multipliers, model)?;
-        Self::check_contradiction(&combo)
+        let mut unlimited = |_| Ok(());
+        self.verify_with_work_inner(model, &mut unlimited)
+    }
+
+    pub(crate) fn verify_with_work<F>(
+        &self,
+        model: &Model,
+        work: &mut F,
+    ) -> Result<(), CertificateError>
+    where
+        F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+    {
+        self.verify_with_work_inner(model, work)
+    }
+
+    fn verify_with_work_inner<F>(&self, model: &Model, work: &mut F) -> Result<(), CertificateError>
+    where
+        F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+    {
+        let combo = combine_with_work_inner(&self.multipliers, model, work)?;
+        Self::check_contradiction_with_work(&combo, work)
     }
 
     /// As [`Self::verify`], but with the model's COLUMN bounds replaced by
@@ -180,7 +202,21 @@ impl FarkasCertificate {
     /// The Farkas identity: every combined coefficient exactly zero, combined
     /// constant strictly negative (`0 >= positive` after re-orientation).
     fn check_contradiction(combo: &Combination) -> Result<(), CertificateError> {
+        let mut unlimited = |_| Ok(());
+        Self::check_contradiction_with_work(combo, &mut unlimited)
+    }
+
+    fn check_contradiction_with_work<F>(
+        combo: &Combination,
+        work: &mut F,
+    ) -> Result<(), CertificateError>
+    where
+        F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+    {
         for (col, coeff) in combo.coeffs.iter().enumerate() {
+            if col & 0xff == 0 {
+                work(0x100.min(combo.coeffs.len().saturating_sub(col)))?;
+            }
             if !coeff.is_zero() {
                 return Err(CertificateError::CoefficientMismatch { col });
             }
@@ -227,12 +263,54 @@ impl OptimalityCertificate {
     /// `Σ coeff_i · oriented_i == objective − bound` (Minimize) or
     /// `== bound − objective` (Maximize).
     pub fn verify(&self, model: &Model) -> Result<(), CertificateError> {
-        let combo = combine(&self.multipliers, model)?;
+        let mut unlimited = |_| Ok(());
+        self.verify_with_work_inner(model, &mut unlimited)
+    }
+
+    /// Resource-bounded twin of [`Self::verify`] for speculative solver
+    /// routes.  The ordinary public replay remains unchanged; this entry only
+    /// adds cooperative checks against one already-pinned absolute deadline.
+    pub(crate) fn verify_with_deadline(
+        &self,
+        model: &Model,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), CertificateError> {
+        let mut bounded = |_| {
+            if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                Err(CertificateError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        self.verify_with_work_inner(model, &mut bounded)
+    }
+
+    pub(crate) fn verify_with_work<F>(
+        &self,
+        model: &Model,
+        work: &mut F,
+    ) -> Result<(), CertificateError>
+    where
+        F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+    {
+        self.verify_with_work_inner(model, work)
+    }
+
+    fn verify_with_work_inner<F>(&self, model: &Model, work: &mut F) -> Result<(), CertificateError>
+    where
+        F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+    {
+        work(1)?;
+        let combo = combine_with_work_inner(&self.multipliers, model, work)?;
         // Accumulate (not assign) so a duplicated column sums, exactly as
         // `combine` builds the multiplier side — otherwise an objective with
         // repeated columns would be checked against only its last entry.
+        work(model.num_cols())?;
         let mut want = vec![BigRational::zero(); model.num_cols()];
-        for &(c, ref a) in &self.objective {
+        for (index, &(c, ref a)) in self.objective.iter().enumerate() {
+            if index & 0xff == 0 {
+                work(0x100.min(self.objective.len().saturating_sub(index)))?;
+            }
             let slot = want
                 .get_mut(c as usize)
                 .ok_or(CertificateError::CoefficientMismatch { col: c as usize })?;
@@ -242,15 +320,122 @@ impl OptimalityCertificate {
             }
         }
         for (col, (combined, wanted)) in combo.coeffs.iter().zip(&want).enumerate() {
+            if col & 0xff == 0 {
+                work(0x100.min(combo.coeffs.len().saturating_sub(col)))?;
+            }
             if combined != wanted {
                 return Err(CertificateError::CoefficientMismatch { col });
             }
         }
+        work(1)?;
         let want_const = match self.sense {
             Sense::Minimize => -self.bound.clone(),
             Sense::Maximize => self.bound.clone(),
         };
         if combo.constant == want_const {
+            Ok(())
+        } else {
+            Err(CertificateError::ConstantMismatch)
+        }
+    }
+
+    /// Verify a BOUND LEAF: prove that no point of `model` lying inside the box
+    /// `col_lb`/`col_ub` has objective better than `z_star`.
+    ///
+    /// This is the dual-side counterpart of
+    /// [`FarkasCertificate::verify_with_col_bounds`]. A Farkas leaf says "this
+    /// region is EMPTY"; a bound leaf says "this region cannot BEAT `z_star`".
+    /// Together with a checked primal witness attaining `z_star`, a tree whose
+    /// every leaf is one or the other proves OPTIMALITY — with no cutoff row and
+    /// no objective lattice, so it applies to models with continuous columns.
+    ///
+    /// # Soundness: DERIVE, never READ
+    ///
+    /// Weak duality makes the arithmetic sound for ANY multipliers, so the only
+    /// way to forge a bound leaf is to make the checker read a FACT from the
+    /// emitter instead of deriving it. An adversarial review found five such
+    /// holes in the obvious design; each is closed here, and the closure is the
+    /// reason this is a separate function rather than a flag on
+    /// [`Self::verify_with_work`]:
+    ///
+    /// * **The box is a PARAMETER, never recorded.** Callers must pass a box
+    ///   they reconstructed themselves from the model's own column bounds
+    ///   intersected with the branch path. Recording it is the fatal forgery:
+    ///   with `x in [0,10]` integer, `y` continuous, row `y - x <= 0`, minimise
+    ///   `-y`, a single leaf recording `x in [0,0]` "proves" `obj >= 0` while the
+    ///   true optimum is `-10`. Direction is what makes this safe: pricing over
+    ///   too LOOSE a box fails the coefficient identity (false reject), while too
+    ///   TIGHT a box would be a false ACCEPT. Pinned by
+    ///   `a_bound_leaf_cannot_forge_optimality_by_shrinking_the_box`.
+    /// * **`z_star` is a PARAMETER**, threaded from the verdict the primal
+    ///   witness is pinned to. Recording it per leaf lets a forger write a small
+    ///   value in the block and a large one on the verdict line.
+    /// * **The objective is read from `model`**, never from a certificate field.
+    ///   [`Self::verify_with_work_inner`] builds its target from
+    ///   `self.objective`, so a record carrying an EMPTY objective and a zero
+    ///   bound verifies against every model; that is correct for a standalone
+    ///   optimality certificate, which is checked against its own claim, and
+    ///   wrong for a leaf, which is checked against the model.
+    /// * **The objective OFFSET is applied.** `Outcome::Optimal.value` includes
+    ///   it and the multiplier algebra excludes it. With offset `-100` and
+    ///   `z_star = 50`, a leaf whose linear bound is `60` passes a naive
+    ///   `60 >= 50` while the region can hold a point of objective `-40`.
+    /// * **Inequality, not equality.** A standalone certificate checks its bound
+    ///   EXACTLY; a leaf only needs to dominate `z_star`, so a leaf that proves
+    ///   MORE than required must still pass.
+    ///
+    /// The fifth hole — type conflation — cannot be closed here: a bound leaf
+    /// must never be reachable as a `tree_cert::TreeNode`, because that type's
+    /// `Ok(())` MEANS "the model has no feasible point". Keeping this function
+    /// out of `TreeNode` is the fix, and is why no variant was added there.
+    pub(crate) fn verify_bound_leaf(
+        multipliers: &[Multiplier],
+        model: &Model,
+        col_lb: &[Option<BigRational>],
+        col_ub: &[Option<BigRational>],
+        z_star: &BigRational,
+    ) -> Result<(), CertificateError> {
+        let combo = combine_bounded(multipliers, model, Some((col_lb, col_ub)))?;
+        let sense = model.sense();
+
+        // (c) THE OBJECTIVE COMES FROM THE MODEL. Same accumulation and the same
+        // zero-proxy rule as `Model::objective_value_at`, so a column with an
+        // exact override that rounded to 0.0 in advice is still counted.
+        let mut want = vec![BigRational::zero(); model.num_cols()];
+        for (j, spec) in model.cols.iter().enumerate() {
+            if spec.obj != 0.0 || model.exact_obj.contains_key(&(j as u32)) {
+                let a = model.obj_coeff_exact_at(j as u32, spec.obj);
+                match sense {
+                    Sense::Minimize => want[j] += a,
+                    Sense::Maximize => want[j] -= a,
+                }
+            }
+        }
+        for (col, (combined, wanted)) in combo.coeffs.iter().zip(&want).enumerate() {
+            if combined != wanted {
+                return Err(CertificateError::CoefficientMismatch { col });
+            }
+        }
+
+        // The combination establishes `want . x >= -combo.constant` over the box.
+        // In the Minimize frame `want` IS the objective, so the region's linear
+        // objective is bounded below by `-combo.constant`; in the Maximize frame
+        // `want` is its negation, so the objective is bounded ABOVE by
+        // `combo.constant`.
+        //
+        // (d) THE OFFSET IS APPLIED so the comparison happens in the same frame
+        // as `Outcome::Optimal.value` and the primal witness.
+        // `combine_bounded` works in `ay_lra::rational::Rational`; the model's
+        // offset and the caller's `z_star` are `BigRational`. Convert INTO the
+        // combination's type (`From<BigRational> for Rational`, rational.rs:665)
+        // so the comparison is exact on both sides -- never through f64.
+        let offset = Rational::from(model.obj_offset_exact());
+        let target = Rational::from(z_star.clone());
+        let dominates = match sense {
+            Sense::Minimize => (-combo.constant.clone()) + offset >= target,
+            Sense::Maximize => combo.constant.clone() + offset <= target,
+        };
+        if dominates {
             Ok(())
         } else {
             Err(CertificateError::ConstantMismatch)
@@ -300,6 +485,39 @@ pub struct CertifiedRow {
 }
 
 impl CertifiedRow {
+    /// Materialize the valid lower row proved by a positive combination of
+    /// model facts.
+    ///
+    /// This is the projection primitive used by decomposition lanes: after a
+    /// Farkas proof against a fixed master assignment, callers may remove the
+    /// assignment-only bound facts and retain the remaining combination as a
+    /// globally valid row.  The combination is recomputed here against the
+    /// caller's original model; no coefficient or constant supplied by the
+    /// decomposition is trusted.
+    pub(crate) fn from_multipliers(
+        model: &Model,
+        multipliers: Vec<Multiplier>,
+    ) -> Result<Self, CertificateError> {
+        let combo = combine(&multipliers, model)?;
+        let coeffs = combo
+            .coeffs
+            .iter()
+            .enumerate()
+            .filter(|(_, coeff)| !coeff.is_zero())
+            .map(|(column, coeff)| (column as u32, coeff.to_big()))
+            .collect();
+        let row = Self {
+            coeffs,
+            lb: -combo.constant.to_big(),
+            multipliers,
+        };
+        // Keep this constructor proof-producing rather than proposal-producing:
+        // every returned value has passed the same independent identity check
+        // exposed by the public verifier.
+        row.verify(model)?;
+        Ok(row)
+    }
+
     /// Independently verify the derivation against `model`.
     pub fn verify(&self, model: &Model) -> Result<(), CertificateError> {
         let combo = combine(&self.multipliers, model)?;
@@ -440,7 +658,19 @@ struct Combination {
 /// Accumulate `Σ coeff_i · oriented_i` exactly. Errors on nonpositive
 /// multipliers, references to infinite bounds, or out-of-range facts.
 fn combine(multipliers: &[Multiplier], model: &Model) -> Result<Combination, CertificateError> {
-    combine_bounded(multipliers, model, None)
+    let mut unlimited = |_| Ok(());
+    combine_bounded_with_work(multipliers, model, None, &mut unlimited)
+}
+
+fn combine_with_work_inner<F>(
+    multipliers: &[Multiplier],
+    model: &Model,
+    work: &mut F,
+) -> Result<Combination, CertificateError>
+where
+    F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+{
+    combine_bounded_with_work(multipliers, model, None, work)
 }
 
 /// [`combine`], with the model's column bounds optionally OVERRIDDEN by
@@ -453,6 +683,20 @@ fn combine_bounded(
     model: &Model,
     col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
 ) -> Result<Combination, CertificateError> {
+    let mut unlimited = |_| Ok(());
+    combine_bounded_with_work(multipliers, model, col_bounds, &mut unlimited)
+}
+
+fn combine_bounded_with_work<F>(
+    multipliers: &[Multiplier],
+    model: &Model,
+    col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
+    work: &mut F,
+) -> Result<Combination, CertificateError>
+where
+    F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+{
+    work(1)?;
     if let Some((lbs, ubs)) = col_bounds {
         let expected = model.num_cols();
         if lbs.len() != expected || ubs.len() != expected {
@@ -464,9 +708,11 @@ fn combine_bounded(
         }
     }
 
+    work(model.num_cols())?;
     let mut coeffs = vec![Rational::zero(); model.num_cols()];
     let mut constant = Rational::zero();
     for (index, m) in multipliers.iter().enumerate() {
+        work(1)?;
         if !m.coeff.is_positive() {
             return Err(CertificateError::NonpositiveMultiplier { index });
         }
@@ -492,7 +738,10 @@ fn combine_bounded(
                 } else {
                     -&multiplier
                 };
-                for &(c, a) in row_coeffs {
+                for (entry, &(c, a)) in row_coeffs.iter().enumerate() {
+                    if entry & 0xff == 0 {
+                        work(0x100.min(row_coeffs.len().saturating_sub(entry)))?;
+                    }
                     if c as usize >= model.num_cols() {
                         return Err(CertificateError::MalformedModel {
                             index,
@@ -822,6 +1071,105 @@ mod tests {
             fact: FactRef::ColBound { col, side },
             coeff: BigRational::one(),
         }
+    }
+
+    /// The forgery from the design review, built as a MUST-REJECT.
+    ///
+    /// `x in [0,10]` integer, `y` continuous in `[0,10]`, row `y - x <= 0`,
+    /// minimise `-y`. The true optimum is `-10` at `x = y = 10`. On the SHRUNKEN
+    /// box `x in [0,0]` the row forces `y <= 0`, so `-y >= 0` really is provable
+    /// — and a certificate that RECORDED that box would verify while the model's
+    /// optimum is `-10`.
+    ///
+    /// `verify_bound_leaf` takes the box as a PARAMETER precisely so this cannot
+    /// happen: the same multipliers must be rejected when priced at the model's
+    /// own bounds. If this test ever passes on the true box, the design is
+    /// forgeable.
+    fn forgery_model() -> (Model, Vec<Multiplier>) {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 10.0);
+        let y = model.add_col(0.0, 10.0);
+        model.cols[x.index()].obj = 0.0;
+        model.cols[y.index()].obj = -1.0;
+        // y - x <= 0
+        let row = model.add_row(f64::NEG_INFINITY, 0.0, &[(y, 1.0), (x, -1.0)]);
+        // -y >= 0  follows from  (y - x <= 0)  plus  (x <= 0):
+        //   1*(y - x <= 0) + 1*(x <= 0)  =>  y <= 0  =>  -y >= 0
+        let mult = vec![row_multiplier(row), col_multiplier(x, BoundSide::Upper)];
+        (model, mult)
+    }
+
+    #[test]
+    fn a_bound_leaf_cannot_forge_optimality_by_shrinking_the_box() {
+        let (model, mult) = forgery_model();
+        let n = model.num_cols();
+        let zero = BigRational::zero();
+
+        // The forger's box: x pinned to 0. Here the multipliers DO prove
+        // `objective >= 0`, which is the whole danger.
+        let mut lb = vec![Some(BigRational::zero()); n];
+        let mut ub = vec![Some(BigRational::from_integer(BigInt::from(10))); n];
+        ub[0] = Some(BigRational::zero());
+        assert!(
+            OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &zero).is_ok(),
+            "the shrunken box must really admit the proof -- otherwise this test \
+             is not exercising the forgery it claims to"
+        );
+
+        // The model's OWN box, which is what a verifier reconstructs. The same
+        // multipliers must now fail: `x <= 10` cannot force `y <= 0`.
+        lb[0] = Some(BigRational::zero());
+        ub[0] = Some(BigRational::from_integer(BigInt::from(10)));
+        let priced_at_truth =
+            OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &zero);
+        assert!(
+            priced_at_truth.is_err(),
+            "FORGEABLE: multipliers valid only on a shrunken box were accepted at \
+             the model's true bounds -- the box must never come from the certificate"
+        );
+    }
+
+    #[test]
+    fn a_bound_leaf_applies_the_objective_offset() {
+        // Offset is the difference between the multiplier algebra's frame and
+        // `Outcome::Optimal.value`. With offset -100, a linear bound of 0 means
+        // the region's true objective is bounded by -100, which does NOT dominate
+        // z* = 0.
+        let (mut model, mult) = forgery_model();
+        let n = model.num_cols();
+        let lb = vec![Some(BigRational::zero()); n];
+        let mut ub = vec![Some(BigRational::from_integer(BigInt::from(10))); n];
+        ub[0] = Some(BigRational::zero());
+        let zero = BigRational::zero();
+        assert!(OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &zero).is_ok());
+
+        model.set_objective_offset(-100.0);
+        assert!(
+            OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &zero).is_err(),
+            "an offset of -100 drops the region's objective to -100 and must no \
+             longer dominate z* = 0"
+        );
+    }
+
+    #[test]
+    fn a_bound_leaf_accepts_a_bound_strictly_STRONGER_than_z_star() {
+        // A standalone OptimalityCertificate checks its bound for EQUALITY. A
+        // leaf only has to DOMINATE z*, so proving more than required must pass.
+        let (model, mult) = forgery_model();
+        let n = model.num_cols();
+        let lb = vec![Some(BigRational::zero()); n];
+        let mut ub = vec![Some(BigRational::from_integer(BigInt::from(10))); n];
+        ub[0] = Some(BigRational::zero());
+        let weaker = BigRational::from_integer(BigInt::from(-5));
+        assert!(
+            OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &weaker).is_ok(),
+            "a leaf proving objective >= 0 must dominate z* = -5"
+        );
+        let stronger = BigRational::one();
+        assert!(
+            OptimalityCertificate::verify_bound_leaf(&mult, &model, &lb, &ub, &stronger).is_err(),
+            "a leaf proving only objective >= 0 must NOT dominate z* = 1"
+        );
     }
 
     fn model_with_malformed_row_column() -> (Model, Row) {

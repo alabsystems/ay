@@ -23,8 +23,8 @@ use num_traits::{Signed, Zero};
 use super::{
     cache_ast_vector, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
     ffi_guard_const_ptr_keep_error, ffi_guard_ptr, ffi_guard_uint, ffi_guard_uint_keep_error,
-    ffi_guard_void, require_ast_handle, require_term_ast_or_return, Z3_ast, Z3_ast_vector,
-    Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS, MAX_FFI_DECIMAL_PRECISION,
+    ffi_guard_void, render_finite_set_ast, require_ast_handle, require_term_ast_or_return, Z3_ast,
+    Z3_ast_vector, Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS, MAX_FFI_DECIMAL_PRECISION,
     Z3_INVALID_ARG, Z3_OP_ABS, Z3_OP_ADD, Z3_OP_AND, Z3_OP_BADD, Z3_OP_BAND, Z3_OP_BASHR,
     Z3_OP_BLSHR, Z3_OP_BMUL, Z3_OP_BNEG, Z3_OP_BNOT, Z3_OP_BOR, Z3_OP_BSDIV, Z3_OP_BSHL,
     Z3_OP_BSMOD, Z3_OP_BSREM, Z3_OP_BSUB, Z3_OP_BUDIV, Z3_OP_BUREM, Z3_OP_BXOR, Z3_OP_CONCAT,
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                 }
                 // SAFETY: non-null handles in `sort_ast_handles` are live
                 // arena allocations owned by this context (enclosing unsafe).
-                let text = super::ffi_surface_text(ctx, &format!("{}", (*handle).sort));
+                let text = super::render_public_sort(ctx, &(*handle).sort);
                 return cache_string(ctx, text);
             }
             // Func-decl-AST handles (from Z3_func_decl_to_ast): z3 renders the
@@ -232,15 +232,23 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                     .as_ref()
                     .map(super::SymbolKey::display_name)
                     .unwrap_or_else(|| decl.name().to_string());
+                let (domain, range) = ctx
+                    .finite_set_decl_signatures
+                    .get(decl.name())
+                    .cloned()
+                    .unwrap_or_else(|| (decl.domain().to_vec(), decl.range().clone()));
                 let mut text = format!("(declare-fun {} (", ay_core::quote_symbol(&display_name));
-                for (i, s) in decl.domain().iter().enumerate() {
+                for (i, s) in domain.iter().enumerate() {
                     if i > 0 {
                         text.push(' ');
                     }
-                    text.push_str(&format!("{s}"));
+                    text.push_str(&super::render_public_sort(ctx, s));
                 }
-                text.push_str(&format!(") {})", decl.range()));
+                text.push_str(&format!(") {})", super::render_public_sort(ctx, &range)));
                 let text = super::ffi_surface_text(ctx, &text);
+                return cache_string(ctx, text);
+            }
+            if let Some(text) = render_finite_set_ast(ctx, a) {
                 return cache_string(ctx, text);
             }
             // Ordinary term: render the real s-expression via the solver's
@@ -366,8 +374,11 @@ pub unsafe extern "C" fn Z3_get_decl_kind(_c: Z3_context, d: Z3_func_decl) -> c_
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(_c, Z3_OP_UNINTERPRETED, |_ctx| {
-            let decl = &(*d).decl;
-            operator_name_to_decl_kind(decl.name())
+            if let Some(op) = (*d).finite_set_op {
+                op.decl_kind()
+            } else {
+                operator_name_to_decl_kind((*d).decl.name())
+            }
         })
     }
 }

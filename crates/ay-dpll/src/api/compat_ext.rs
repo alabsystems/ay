@@ -618,9 +618,13 @@ impl Solver {
     // =========================================================================
 
     /// Build `(default a)` — the else-case value of array `a`. Result sort is
-    /// `a`'s element sort. Exposes `TermArena::mk_array_default` (which folds
-    /// `default(const v) = v`, `default(lambda x. body) = body`,
-    /// `default(store a i v) = default(a)`). Backs `Z3_mk_array_default`.
+    /// `a`'s element sort. Exposes `TermArena::mk_array_default`, which folds
+    /// constant arrays, array maps, and binder-independent lambdas. A dependent
+    /// lambda default remains opaque, matching Z3 5.0.0's observable behavior.
+    /// Store defaults are intentionally preserved for the solver: a unit carrier
+    /// yields the stored value, a finite carrier smaller than 2^14 uses selects
+    /// at a shared epsilon, and a large/infinite carrier preserves the base
+    /// default. Backs `Z3_mk_array_default`.
     #[must_use]
     pub fn array_default(&mut self, array: Term) -> Term {
         Term(self.terms_mut().mk_array_default(array.0))

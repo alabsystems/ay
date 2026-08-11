@@ -43,6 +43,11 @@ pub struct MaxSatStats {
     pub cardinality_constraints: u64,
     /// Number of UNSAT cores processed
     pub cores_found: u64,
+    /// #core-mine: incremented when the mined-core pass detected that `lb`
+    /// exceeded an already-REACHED cost and abandoned itself. Non-zero means
+    /// the accounting is inconsistent and must be investigated — it is the
+    /// fail-safe that turns a would-be wrong answer into a lost solve.
+    pub core_mine_abandoned: u64,
     /// Number of soft clauses hardened via bound reasoning
     pub hardened: u64,
     /// Number of successful core-exhaustion probes (forced extra violations)
@@ -90,6 +95,12 @@ pub struct MaxSatStats {
     /// Extracted core disjunctions pinned permanently into the hard formula
     /// (#core-clause)
     pub core_clauses_added: u64,
+    /// #descent-residual: incremented when the residual descent cap refused to
+    /// arm because `lb` exceeded an already-REACHED cost. Non-zero means the
+    /// residual accounting is inconsistent and must be investigated — it is the
+    /// fail-safe (sibling of `core_mine_abandoned`) that turns a would-be wrong
+    /// answer into a slower, exact-encoding descent.
+    pub descent_residual_abandoned: u64,
 }
 
 /// MAX-SAT Solver
@@ -109,6 +120,11 @@ pub struct MaxSatSolver {
     next_var: u32,
     /// Statistics (populated by solve)
     stats: MaxSatStats,
+    /// #core-mine evidence from the last solve, for certificate emission only.
+    paid_mined_cores: Vec<crate::oll::PaidMinedCore>,
+    /// SAT-call core evidence from the last solve, for certificate emission
+    /// only. Same write-only rule as `paid_mined_cores`.
+    paid_sat_cores: Vec<crate::oll::PaidSatCore>,
     /// Best (cost, model) seen by the last interrupted solve, if any
     best: Option<(Weight, Vec<bool>)>,
     /// Wall-clock deadline for the whole solve, when the caller knows one.
@@ -124,6 +140,8 @@ impl MaxSatSolver {
             soft_weights: Vec::new(),
             next_var: 1,
             stats: MaxSatStats::default(),
+            paid_mined_cores: Vec::new(),
+            paid_sat_cores: Vec::new(),
             best: None,
             deadline: None,
         }
@@ -173,6 +191,25 @@ impl MaxSatSolver {
         self.soft_weights.push(weight);
     }
 
+    /// Mined cores the last solve charged, as proof evidence.
+    ///
+    /// Write-only (see `ay::maxsat_proof`): this exists so a certificate can
+    /// name the lower bound's derivation. No caller may turn it into a verdict.
+    pub fn paid_mined_cores(&self) -> &[crate::oll::PaidMinedCore] {
+        &self.paid_mined_cores
+    }
+
+    /// Cores returned by SAT calls that the last solve charged, as proof
+    /// evidence.
+    ///
+    /// Write-only (see `ay::maxsat_proof`). These are REFUTATIONS, not input
+    /// rows: the emitter must justify each one for itself before it may state
+    /// it, and drops the ones it cannot. No caller may turn this into a
+    /// verdict.
+    pub fn paid_sat_cores(&self) -> &[crate::oll::PaidSatCore] {
+        &self.paid_sat_cores
+    }
+
     /// Get solver statistics
     pub fn stats(&self) -> &MaxSatStats {
         &self.stats
@@ -219,6 +256,8 @@ impl MaxSatSolver {
         engine.set_deadline(self.deadline);
         let outcome = engine.solve(should_stop, on_upper_bound);
         self.stats = engine.stats().clone();
+        self.paid_mined_cores = engine.take_paid_mined_cores();
+        self.paid_sat_cores = engine.take_paid_sat_cores();
         self.best = None;
 
         match outcome {

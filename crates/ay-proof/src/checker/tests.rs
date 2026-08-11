@@ -1631,11 +1631,18 @@ fn test_strict_not_ite2_valid() {
 }
 
 mod array_chain_axiom_tests;
+mod array_default_axiom_tests;
 mod array_ext_axiom_tests;
 mod boolean_coverage_tests;
 mod boolean_negation_coverage_tests;
+mod candidate_backtracking_tests;
+mod chain_resolution_ambiguity_tests;
 mod datatype_axiom_tests;
+mod equiv_negation_shape_tests;
 mod euf_coverage_tests;
+mod forall_inst_normal_form_tests;
+mod hole_deferral_tests;
+mod ite_negation_shape_tests;
 mod lra_farkas_coverage_tests;
 mod or_coverage_tests;
 mod theory_forgery_tests;

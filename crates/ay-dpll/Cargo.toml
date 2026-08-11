@@ -22,6 +22,10 @@ jit = ["dep:ay-jit"]
 # OFF by default so production/dependent builds get the incremental perf win;
 # enable for verification: `cargo test -p ay-dpll --features ematching-differential`.
 ematching-differential = []
+# Narrow friend surface used by the Z3 compatibility crate.  This keeps
+# translation-state plumbing out of the ordinary native Solver API while
+# allowing the separate `ay-ffi` crate to exercise the real latch end to end.
+z3-compat-internals = []
 
 [dependencies]
 ay-core.workspace = true

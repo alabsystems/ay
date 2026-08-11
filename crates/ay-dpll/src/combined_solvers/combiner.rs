@@ -3177,7 +3177,14 @@ impl TheorySolver for TheoryCombiner<'_> {
         }
         if let Some(lra) = &self.lra {
             const PHASE_EPOCH_MIN_ATOMS: usize = 8192;
-            if lra.registered_atom_count() < PHASE_EPOCH_MIN_ATOMS {
+            let atoms = lra.registered_atom_count();
+            if atoms < PHASE_EPOCH_MIN_ATOMS {
+                // FORGONE COST. The floor's claim is that below it the O(atoms)
+                // re-scan is not the wall. Size proxies the scan's PER-CALL cost and
+                // says nothing about how often it is called, so charge the atoms this
+                // refusal sends back through the scan (SIZE_GATE_ANTIPATTERN.md lists
+                // this constant as unaudited, and as DUPLICATED into ay-lia).
+                ay_core::forgone::charge(ay_core::forgone::PHASE_EPOCH_COMBINER, atoms as u64);
                 return None;
             }
             return lra.phase_hint_epoch();

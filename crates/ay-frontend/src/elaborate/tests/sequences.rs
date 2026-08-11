@@ -102,11 +102,27 @@ fn test_elaborate_seq_foldl() {
 }
 
 #[test]
-fn test_elaborate_seq_mapi() {
+fn test_elaborate_seq_mapi_rejects_binary_array_function() {
     let input = r#"
             (declare-const f (Array Int Int))
             (declare-const s (Seq Int))
             (assert (= (seq.len (seq.mapi f 0 s)) (seq.len s)))
+        "#;
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0]).unwrap();
+    ctx.process_command(&commands[1]).unwrap();
+    let error = ctx.process_command(&commands[2]).unwrap_err();
+    assert!(matches!(error, ElaborateError::SortMismatch { .. }));
+}
+
+#[test]
+fn test_elaborate_seq_mapi_with_two_argument_lambda() {
+    let input = r#"
+            (declare-const s (Seq Int))
+            (assert (=
+                (seq.len (seq.mapi (lambda ((i Int) (x Int)) x) 0 s))
+                (seq.len s)))
         "#;
     let commands = parse(input).unwrap();
     let mut ctx = Context::new();

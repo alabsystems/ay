@@ -337,6 +337,22 @@ fn detect(model: &Model) -> Option<MarketSplit> {
     let nc = model.num_cols();
     let nr = model.num_rows();
     if nr == 0 || nr > MAX_ROWS || nc == 0 || nc > MAX_COLS {
+        // FORGONE COST. The lattice lane is the ONLY device that proves the
+        // market-split family, and the doc names its own casualty: "pk1 has 45 > 24
+        // rows" — an arithmetic disqualification, where every other exclusion it lists
+        // is structural and permanent. `market_share_structure` (bab.rs) independently
+        // classifies pk1 as the same family. Neither cap has an env override.
+        //
+        // CROSS-GUARDED so each counter reads a narrow population: rows-above-ceiling
+        // on a column-tight model, and columns-above-ceiling on a row-tight one. A HIT
+        // DOES NOT CERTIFY FAMILY MEMBERSHIP — only the post-compile counter does; read
+        // this one as an upper bound, by mean-rows (mean-cols) per hit.
+        if nr > MAX_ROWS && nc != 0 && nc <= MAX_COLS {
+            crate::sepstat::gate_charge(crate::sepstat::GATE_LATTICE_FRONT_ROWS, nr as u64);
+        }
+        if nc > MAX_COLS && nr != 0 && nr <= MAX_ROWS {
+            crate::sepstat::gate_charge(crate::sepstat::GATE_LATTICE_FRONT_COLS, nc as u64);
+        }
         return None;
     }
     // Column census: every column is a fixed column, a free bounded-integer
@@ -598,6 +614,19 @@ fn detect(model: &Model) -> Option<MarketSplit> {
     // Append the synthetic slack columns to the lattice.
     let n = n0.checked_add(synth.len())?;
     if n > MAX_COLS {
+        // FORGONE COST. The ONLY site in this lane that certifies market-split family
+        // membership before refusing: control reaches here past the column census, the
+        // continuous-slack uniqueness test, row compilation, integer-hull tightening
+        // and the objective-purity loop. So every hit is an in-family model refused on
+        // SIZE ALONE.
+        //
+        // EXPECT ZERO, and that is the point. `n0 <= nc <= MAX_COLS` (the front door
+        // enforced it) and `synth.len() <= MAX_ROWS`, so `n <= 184` and reaching
+        // `n > 160` needs `n0 >= 137` plus inequality rows compiling to slacks — the
+        // historical all-equality markshare shape has `synth = 0` and can never get
+        // here. A genuinely wide in-family model dies at the FRONT door, where
+        // membership is unknown; that is what GATE_LATTICE_FRONT_COLS counts.
+        crate::sepstat::gate_charge(crate::sepstat::GATE_LATTICE_POST_COLS, n as u64);
         return None;
     }
     let mut lo: Vec<i64> = int_cols.iter().map(|&j| col_lo[j]).collect();
@@ -1442,8 +1471,14 @@ impl Engine {
                 t_val.elapsed().as_secs_f64()
             );
         }
-        // Exact GSO of the reduced basis.
-        let (bstar_q, cnorm_q, mu_q) = gso_exact(&k, deadline)?;
+        // Exact GSO of the reduced basis. `gso_exact` speaks `BigInt` because the
+        // root reformulation feeds it a kernel basis that has no `i64` promise;
+        // the market-split basis is `i64` by construction and widens for free.
+        let k_big: Vec<Vec<BigInt>> = k
+            .iter()
+            .map(|row| row.iter().copied().map(BigInt::from).collect())
+            .collect();
+        let (bstar_q, cnorm_q, mu_q) = gso_exact(&k_big, deadline)?;
         let cnorm_i: Vec<Interval> = cnorm_q
             .iter()
             .map(Interval::from_rational)
@@ -3306,6 +3341,15 @@ fn col_hnf(
 /// Shared by the market-split face solver ([`Engine::particular`]) and the
 /// root kernel reformulation ([`reformulate_kernel`]); they differ only in how
 /// they obtained `d`.
+///
+/// ⚠ THE REPRESENTATIVE THIS RETURNS IS NOT SMALL. `U`'s entries are the
+/// unimodular multipliers the Hermite reduction happened to accumulate, so
+/// `|x|` is O(det) and has nothing to do with the model's box — MEASURED at
+/// ~5.9·10¹⁵ against a `[0,5]` box. Every caller must reduce it modulo the
+/// kernel lattice before using it for anything numeric: `Engine::particular`'s
+/// callers pipe it through [`Engine::babai`], and [`reformulate_kernel`] through
+/// [`translate_near_box`] (S4 there). Using it raw is a WRONG-ANSWER bug, not a
+/// performance one.
 fn hnf_particular(
     hh: &[Vec<BigInt>],
     u: &[Vec<BigInt>],
@@ -4418,7 +4462,7 @@ fn bkz(
 /// their squared norms, and `μ[i][j]` (i>j).
 #[allow(clippy::type_complexity)]
 fn gso_exact(
-    basis: &[Vec<i64>],
+    basis: &[Vec<BigInt>],
     deadline: Instant,
 ) -> Option<(
     Vec<Vec<BigRational>>,
@@ -4444,11 +4488,11 @@ fn gso_exact(
             return None;
         }
         let mut bi = Vec::with_capacity(dim);
-        for (k, &x) in basis[i].iter().enumerate() {
+        for (k, x) in basis[i].iter().enumerate() {
             if k % GSO_DEADLINE_POLL_OPS == 0 && Instant::now() >= deadline {
                 return None;
             }
-            bi.push(BigRational::from(BigInt::from(x)));
+            bi.push(BigRational::from(x.clone()));
         }
         let mut v = bi.clone();
         for j in 0..i {
@@ -4536,6 +4580,162 @@ fn as_exact_f64(v: &BigRational) -> Option<f64> {
         return None;
     }
     (BigRational::from_float(f).as_ref() == Some(v)).then_some(f)
+}
+
+/// The BOX TARGET the AHL translation aims `x_p` at, one entry per member of
+/// `C`: the midpoint when the column is boxed on both sides, the finite side
+/// when it is boxed on one, and `0` when it is free. Deterministic, and the only
+/// place the reformulation's notion of "near the box" is defined.
+///
+/// A one-sided column contributes its finite side rather than `0` because that
+/// side is the only thing that becomes a ROW — aiming at it drives the emitted
+/// `lo_j − x_p[j]` toward zero, which is the number this whole step exists to
+/// keep small. (`ej` is exactly that shape: `x₀ ≥ 1`, `x₁,x₂ ≥ 0`, no upper
+/// bounds, so the target is `(1,0,0)`.)
+fn box_target(model: &Model, cols_c: &[usize]) -> Option<Vec<BigRational>> {
+    let two = BigRational::from(BigInt::from(2));
+    cols_c
+        .iter()
+        .map(|&j| {
+            let (l, u) = model.col_bounds(Col(j as u32));
+            match (l.is_finite(), u.is_finite()) {
+                (true, true) => Some((exact(l)? + exact(u)?) / &two),
+                (true, false) => exact(l),
+                (false, true) => exact(u),
+                (false, false) => Some(BigRational::zero()),
+            }
+        })
+        .collect()
+}
+
+/// THE AARDAL–HURKENS–LENSTRA TRANSLATION STEP:
+/// `x_p ← x_p − B·round(B⁺·(x_p − t))`, i.e. subtract the lattice vector nearest
+/// `x_p − t` so the coset representative sits NEAR THE BOX instead of wherever
+/// the Hermite solve happened to leave it.
+///
+/// # Why this is not cosmetic
+///
+/// [`hnf_particular`] returns `U·[z;0]`, whose entries are O(det) — driven by the
+/// unimodular multipliers, not by the model. MEASURED on a 2×4 equality block
+/// with coefficients ~5·10⁴ over a `[0,5]` box, the untranslated `x_p` sits
+/// ~5.9·10¹⁵ from the box, and EVERY number the reformulation emits inherits
+/// that scale: the bound-row right-hand sides `lo_j − x_p[j]`, the folded row
+/// shifts `Σ a_j·x_p[j]`, and `const_delta = c_C·x_p`, which the reduced
+/// objective then has to cancel back down to an answer of magnitude 9. In
+/// `[2^52, 2^53)` the `f64` ULP is EXACTLY 1 — the granularity of the answer
+/// itself — so the reduced LP is being asked to resolve the optimum inside its
+/// own rounding error. Every such number is individually `as_exact_f64`-clean;
+/// it is the CANCELLATION between them that is destroyed, which is why the S2
+/// fail-closed rule never fires and the whole failure is silent.
+///
+/// # The computation, and why it is exact
+///
+/// `B` is `d × |C|` and not square, so `B⁺` is a pseudo-inverse and the honest
+/// statement of `round(B⁺ v)` is "the integer coefficient vector of a lattice
+/// point near `v`" — a CVP instance. Babai's nearest-plane algorithm on the
+/// LLL-reduced basis is the standard answer and is EXACT when the
+/// Gram–Schmidt coefficients are kept rational, which is what [`gso_exact`]
+/// hands back. Sweeping `i = d−1 … 0`, take `c_i = ⟨v, b*_i⟩ / ‖b*_i‖²` and
+/// subtract `round(c_i)·b_i`. NO FLOAT ENTERS THE DERIVATION OF `x_p`; the
+/// rounding is [`round_rat`] (ties up), so the result is a deterministic
+/// function of `(x_p, B, t)`.
+///
+/// The component of `x_p − t` orthogonal to `span(B) = ker(A)` is untouchable by
+/// construction — it is the distance from the box target to the affine set
+/// `{A x = b}`, which no choice of representative can shrink. That residue is
+/// itself O(box) whenever the model has an integer point in its box (the point
+/// witnesses it), so the bound this step actually delivers is
+/// `‖x_p − t‖ ≤ 2^{d/2}·dist(t, x_p + L)`, Babai's LLL approximation factor
+/// against the best representative that exists.
+///
+/// Returns `None` on a shape mismatch or an expired deadline; the caller
+/// DECLINES the reformulation rather than shipping an untranslated `x_p`.
+fn translate_near_box(
+    xp: &[BigInt],
+    basis: &[Vec<BigInt>],
+    target: &[BigRational],
+    deadline: Instant,
+) -> Option<Vec<BigInt>> {
+    let n = xp.len();
+    if target.len() != n || basis.iter().any(|b| b.len() != n) {
+        return None;
+    }
+    let d = basis.len();
+    if d == 0 {
+        return Some(xp.to_vec());
+    }
+    let (bstar, cnorm, _mu) = gso_exact(basis, deadline)?;
+    // `v := x_p − t` is RATIONAL (a two-sided box has a half-integral midpoint);
+    // `x_p` itself never leaves ℤ, because every vector subtracted from it below
+    // is an integer multiple of an integer basis vector.
+    let mut v: Vec<BigRational> = xp
+        .iter()
+        .zip(target)
+        .map(|(x, t)| BigRational::from(x.clone()) - t)
+        .collect();
+    let mut w = vec![BigInt::zero(); d];
+    for i in (0..d).rev() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let mut num = BigRational::zero();
+        for k in 0..n {
+            if !v[k].is_zero() && !bstar[i][k].is_zero() {
+                num += &v[k] * &bstar[i][k];
+            }
+        }
+        let q = round_rat(&(num / &cnorm[i]));
+        if q.is_zero() {
+            continue;
+        }
+        let qr = BigRational::from(q.clone());
+        for k in 0..n {
+            if !basis[i][k].is_zero() {
+                let t = &qr * BigRational::from(basis[i][k].clone());
+                v[k] -= t;
+            }
+        }
+        w[i] = q;
+    }
+    let mut out = xp.to_vec();
+    for (i, q) in w.iter().enumerate() {
+        if q.is_zero() {
+            continue;
+        }
+        for (k, o) in out.iter_mut().enumerate() {
+            if !basis[i][k].is_zero() {
+                *o -= &basis[i][k] * q;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `A x == b` over `BigInt`, exactly. Used to re-check the particular solution
+/// BOTH as [`hnf_particular`] returns it and again after the translation of
+/// [`translate_near_box`] — `A·B = 0` makes the translation an identity on this
+/// property for any integer `w`, so a failure here is a BUG in the translation
+/// (or the basis), and the caller declines. That single check is what makes a
+/// botched translation impossible to ship.
+fn satisfies_exactly(a: &[Vec<BigInt>], b: &[BigInt], x: &[BigInt]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(arow, bi)| {
+            let mut dot = BigInt::zero();
+            for (av, xv) in arow.iter().zip(x) {
+                if !av.is_zero() && !xv.is_zero() {
+                    dot += av * xv;
+                }
+            }
+            dot == *bi
+        })
+}
+
+/// `max |v_i|`, the magnitude number the translation is judged on.
+fn max_abs_big(v: &[BigInt]) -> BigInt {
+    v.iter()
+        .map(|x| x.magnitude().clone().into())
+        .max()
+        .unwrap_or_else(BigInt::zero)
 }
 
 /// Exact rank over ℚ of an integer matrix, by rational Gaussian elimination.
@@ -4869,6 +5069,20 @@ impl KernelPostsolve {
 ///   `z` with identical rational content, and an infinite side becomes no row.
 ///   By S1 the correspondence is a bijection, so no integer point of the
 ///   original box is added or removed.
+/// * **S4 — the representative is near the box.** S1–S3 constrain the reduced
+///   feasible SET; they say nothing about the SCALE of the numbers written on
+///   it, and `x_p` sets that scale for all of them. [`hnf_particular`] returns
+///   whichever coset representative the Hermite solve lands on, whose entries
+///   are O(det); MEASURED, that is ~5.9·10¹⁵ against a `[0,5]` box, which puts
+///   `const_delta` in `[2^52, 2^53)` where the `f64` ULP is 1 and makes the
+///   reduced LP resolve the objective at the granularity of the answer. Every
+///   individual number stays `as_exact_f64`-clean, so S2 never fires and a wrong
+///   `Optimal` comes back SILENTLY. [`translate_near_box`] moves `x_p` to the
+///   representative nearest the box ([`box_target`]) by exact Babai
+///   nearest-plane, and the SAME exact `A x = b` check that guards
+///   [`hnf_particular`] runs again on the result: `A·B = 0` makes that an
+///   identity for any integer translation, so a failure is a bug in the
+///   translation and the reformulation declines.
 ///
 /// An inexact-coefficient model is declined wholesale (same fail-closed rule as
 /// `presolve.rs:87` and `detect` above): the reasoning below reads the public
@@ -4877,9 +5091,35 @@ impl KernelPostsolve {
 ///
 /// Returns the reduced model and its postsolve, or `None`.
 pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolve)> {
+    reformulate_kernel_inner(model, true)
+}
+
+/// TEST SEAM — the reformulation with the ISOLATION GATE RELAXED. Not reachable
+/// from a shipped build: [`reformulate_kernel`] is the only production entry and
+/// it always passes `require_isolated = true`.
+///
+/// It exists because the two models that exposed the missing translation step
+/// are of the NON-ISOLATED shape (a surviving row touches `C`, so the folded
+/// shift `Σ a_j·x_p[j]` is nonzero and carries `x_p`'s magnitude into a row that
+/// stays in the model). On the isolated shape that shift is identically zero,
+/// which is the whole reason the defect was unreachable — so a regression test
+/// that can only see the isolated shape cannot see the defect either. Widening
+/// the shipped gate is a separate, measured decision; this only lets the tests
+/// look at the arithmetic.
+#[cfg(test)]
+pub(crate) fn reformulate_kernel_nonisolated_for_test(
+    model: &Model,
+) -> Option<(Model, KernelPostsolve)> {
+    reformulate_kernel_inner(model, false)
+}
+
+fn reformulate_kernel_inner(
+    model: &Model,
+    require_isolated: bool,
+) -> Option<(Model, KernelPostsolve)> {
     use num_integer::Integer;
 
-    if std::env::var_os("AY_MILP_NO_KERNEL_REFORM").is_some() || model.has_inexact_coeffs() {
+    if crate::tune::on(crate::tune::Knob::NoKernelReform) || model.has_inexact_coeffs() {
         return None;
     }
     let deadline = Instant::now() + std::time::Duration::from_secs(KERNEL_REFORM_SECS);
@@ -4910,10 +5150,22 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
             in_c[c as usize] = true;
         }
     }
+    // `cols_c` hoisted above the |E| test so the census can isolate the population the
+    // |E| cap UNIQUELY excludes. Behaviour-identical: both branches return None, and
+    // `cols_c` depends only on `in_c`/`nc`, which are final above.
+    let cols_c: Vec<usize> = (0..nc).filter(|&j| in_c[j]).collect();
     if e_rows.is_empty() || e_rows.len() > KERNEL_MAX_ROWS {
+        // FORGONE COST. AHL reformulation is a confirmed verdict producer (ej: 235,008
+        // nodes / 28.9s with the dual bound stuck at 1, versus 5 nodes reformulated).
+        // KERNEL_MAX_ROWS' doc is a bare restatement and silently inherits the sibling
+        // |C| cap's cubic-BigInt rationale — but every cost named there is cubic in
+        // |C|, which the NEXT test already bounds. Charge only "|C| fits, |E| does
+        // not", which drops the set-partition shapes the |C| cap would decline anyway.
+        if !e_rows.is_empty() && !cols_c.is_empty() && cols_c.len() <= KERNEL_MAX_COLS {
+            crate::sepstat::gate_charge(crate::sepstat::GATE_KERNEL_MAX_ROWS, e_rows.len() as u64);
+        }
         return None;
     }
-    let cols_c: Vec<usize> = (0..nc).filter(|&j| in_c[j]).collect();
     if cols_c.is_empty() || cols_c.len() > KERNEL_MAX_COLS {
         return None;
     }
@@ -4924,13 +5176,15 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
     for &i in &e_rows {
         is_e[i] = true;
     }
-    for i in 0..nr {
-        if is_e[i] {
-            continue;
-        }
-        let (coeffs, _, _) = model.row(Row(i as u32));
-        if coeffs.iter().any(|&(c, _)| in_c[c as usize]) {
-            return None;
+    if require_isolated {
+        for i in 0..nr {
+            if is_e[i] {
+                continue;
+            }
+            let (coeffs, _, _) = model.row(Row(i as u32));
+            if coeffs.iter().any(|&(c, _)| in_c[c as usize]) {
+                return None;
+            }
         }
     }
     // APPLICABILITY: "the box does not bound the equalities". Either some column
@@ -5016,20 +5270,12 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
     if d == 0 {
         return None; // the equalities pin x_C outright: nothing to re-coordinate
     }
-    let xp = hnf_particular(&mm, &u, m, n, rank, &bbig, deadline)?;
+    let xp_raw = hnf_particular(&mm, &u, m, n, rank, &bbig, deadline)?;
     // Independent re-check of the particular solution: `A x_p == b` exactly.
     // Cheap, and it means a bug in the HNF solve cannot shift the whole feasible
     // set by a constant.
-    for (arow, bi) in abig.iter().zip(&bbig) {
-        let mut dot = BigInt::zero();
-        for (a, x) in arow.iter().zip(&xp) {
-            if !a.is_zero() && !x.is_zero() {
-                dot += a * x;
-            }
-        }
-        if dot != *bi {
-            return None;
-        }
+    if !satisfies_exactly(&abig, &bbig, &xp_raw) {
+        return None;
     }
     let k0: Vec<Vec<BigInt>> = (0..d)
         .map(|t| (0..n).map(|i| u[i][rank + t].clone()).collect())
@@ -5037,6 +5283,25 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
     let basis = lll(k0.clone(), deadline)?;
     if !kernel_basis_is_same_lattice(&abig, &k0, &basis, n, deadline) {
         return None; // S1(a) + S1(b)
+    }
+
+    // ---- S4 — THE AHL TRANSLATION, `x_p ← x_p − B·round(B⁺(x_p − t))` -----
+    // `hnf_particular` returns the representative the Hermite solve lands on,
+    // whose magnitude is O(det) and has nothing to do with the model; every
+    // number emitted below is `x_p` plus something box-sized, so an untranslated
+    // `x_p` sets the SCALE of the entire reduced model. See
+    // [`translate_near_box`] for the measurement and for why the resulting f64
+    // cancellation is silent rather than fail-closed.
+    //
+    // Soundness is by `A·B = 0`: subtracting an integer combination of kernel
+    // vectors moves `x_p` inside its own coset, so the map `z ↦ x_p + B z` covers
+    // exactly the same set — only the labelling of `z` changes. That is asserted
+    // rather than argued: the SAME exact `A x == b` check runs again on the
+    // translated point, and a failure declines the reformulation outright.
+    let target = box_target(model, &cols_c)?;
+    let xp = translate_near_box(&xp_raw, &basis, &target, deadline)?;
+    if !satisfies_exactly(&abig, &bbig, &xp) {
+        return None; // S4: a botched translation is not shippable
     }
 
     let xp_q: Vec<BigRational> = xp.iter().cloned().map(BigRational::from).collect();
@@ -5047,6 +5312,7 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
 
     // ---- THE REDUCED MODEL, with S2 fail-closed on every folded number ----
     let mut out = Model::new();
+    out.inherit_ft_adoption_solve_latch(model);
     let mut map: Vec<Option<Col>> = vec![None; nc];
     for j in 0..nc {
         if in_c[j] {
@@ -5210,6 +5476,76 @@ pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolv
             out.num_rows(),
             out.num_cols(),
         );
+        // THE MAGNITUDE MEASUREMENT the translation exists for, raw vs
+        // translated, on the three families of number that carry `x_p` into the
+        // reduced model. Reported side by side because "the reduced model is
+        // O(box) rather than O(det)" is the only evidence that S4 does anything;
+        // if these do not shrink, the translation is wrong.
+        let emitted = |x: &[BigRational]| -> (BigRational, BigRational, BigRational) {
+            let mut bound_rhs = BigRational::zero();
+            let mut fold_shift = BigRational::zero();
+            let bump = |acc: &mut BigRational, v: BigRational| {
+                let a = v.abs();
+                if a > *acc {
+                    *acc = a;
+                }
+            };
+            for (p, &j) in cols_c.iter().enumerate() {
+                let (l, ub) = model.col_bounds(Col(j as u32));
+                for side in [l, ub] {
+                    if side.is_finite() {
+                        if let Some(q) = exact(side) {
+                            bump(&mut bound_rhs, q - &x[p]);
+                        }
+                    }
+                }
+            }
+            for i in 0..nr {
+                if is_e[i] {
+                    continue;
+                }
+                let (coeffs, _, _) = model.row(Row(i as u32));
+                let mut shift = BigRational::zero();
+                for &(c, a) in coeffs {
+                    if in_c[c as usize] {
+                        if let Some(q) = exact(a) {
+                            shift += q * &x[pos[c as usize]];
+                        }
+                    }
+                }
+                bump(&mut fold_shift, shift);
+            }
+            let mut cd = BigRational::zero();
+            for j in 0..nc {
+                if in_c[j] {
+                    if let Some(q) = exact(model.obj_coeff(Col(j as u32))) {
+                        cd += q * &x[pos[j]];
+                    }
+                }
+            }
+            (bound_rhs, fold_shift, cd.abs())
+        };
+        let raw_q: Vec<BigRational> = xp_raw.iter().cloned().map(BigRational::from).collect();
+        let (rb, rf, rc) = emitted(&raw_q);
+        let (tb, tf, tc) = emitted(&xp_q);
+        let f = |v: &BigRational| v.to_f64().unwrap_or(f64::INFINITY);
+        eprintln!(
+            "AY_MILP_TRACE kernel-reform-magnitude: max|x_p| {:.6e} -> {:.6e}; \
+             bound-rhs {:.6e} -> {:.6e}; folded-shift {:.6e} -> {:.6e}; \
+             |const_delta| {:.6e} -> {:.6e}",
+            BigRational::from(max_abs_big(&xp_raw))
+                .to_f64()
+                .unwrap_or(f64::INFINITY),
+            BigRational::from(max_abs_big(&xp))
+                .to_f64()
+                .unwrap_or(f64::INFINITY),
+            f(&rb),
+            f(&tb),
+            f(&rf),
+            f(&tf),
+            f(&rc),
+            f(&tc),
+        );
     }
 
     Some((
@@ -5275,12 +5611,6 @@ mod tests {
                     .map(|col| BigInt::from(if row == col { 1 } else { 0 }))
                     .collect()
             })
-            .collect()
-    }
-
-    fn i64_identity(dim: usize) -> Vec<Vec<i64>> {
-        (0..dim)
-            .map(|row| (0..dim).map(|col| if row == col { 1 } else { 0 }).collect())
             .collect()
     }
 
@@ -5613,7 +5943,7 @@ mod tests {
 
     #[test]
     fn gso_and_lll_decline_immediately_after_deadline() {
-        let exact_basis = i64_identity(3);
+        let exact_basis = bigint_identity(3);
         let float_basis = bigint_identity(3);
         let expired = Instant::now();
 
@@ -7228,7 +7558,27 @@ mod tests {
 mod kernel_reform_tests {
     use super::*;
     use crate::model::{Col, Model, Sense};
+    use ay_test_support::env::lock_env;
     use std::time::Duration;
+
+    /// EVERY SOLVING TEST IN THIS MODULE TAKES THE ENVIRONMENT LOCK, and it is not
+    /// because any of them mutates the environment. `lock_env` serialises
+    /// MUTATORS; it does nothing for a READER, and a solve is a reader of a couple
+    /// of dozen `AY_*` names. Sibling tests in this binary legitimately set knobs
+    /// around their own solves (`bab::tests::solve_node_capped` installs
+    /// `AY_MILP_MAX_NODES` while it runs, exactly as its doc says), and a solve on
+    /// another thread inside that window silently inherits the cap.
+    ///
+    /// That is not hypothetical here: with the cap leaked in, this module's
+    /// differential saw `Feasible { incumbent_only: true, dual_bound: None }` on a
+    /// three-column model — a tree stopped at node 0 — and the seed it landed on
+    /// moved between runs (65, then 66), which is the signature of a race and not
+    /// of a model. Joining the same lock puts these readers and those writers in
+    /// one order. It costs suite wall time and buys a suite whose failures mean
+    /// something.
+    fn solve_lock() -> std::sync::MutexGuard<'static, ()> {
+        lock_env()
+    }
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
@@ -7259,6 +7609,7 @@ mod kernel_reform_tests {
     /// feasible for the ORIGINAL model at exactly that objective value.
     #[test]
     fn ej_is_proven_optimal_at_25508_in_the_reformulated_frame() {
+        let _env = solve_lock();
         let m = ej_model();
         let (reduced, post) = reformulate_kernel(&m).expect("ej is exactly this shape");
         // One equality over three columns of rank 1: two new columns, and they
@@ -7301,15 +7652,21 @@ mod kernel_reform_tests {
     /// its `expand_kernel_outcome` are exercised end to end: the value comes back
     /// in the caller's frame, the witness in the caller's column space.
     ///
-    /// `with_tree_cert_leaves(0)` IS LOAD-BEARING AND IS NOT A TEST CONVENIENCE.
-    /// Every structural reduction in `bab.rs` (dedup, singleton substitution, and
-    /// now this one) lives behind `opts.tree_cert_leaves == 0`, because a
-    /// reduced-frame certificate cannot verify against the caller's model and is
-    /// stripped — and `SolveOpts` DEFAULTS that field to 256 (`opts.rs:537`). So
-    /// on default options the reformulation is never reached, and `ej` is still
-    /// lost. See the note on `crate::bab::expand_kernel_outcome`.
+    /// `with_tree_cert_leaves(0)` USED TO BE LOAD-BEARING AND NO LONGER IS. This
+    /// reduction — and duplicate-column dedup — was gated on
+    /// `opts.tree_cert_leaves == 0` at its `bab::solve_milp` call site, because
+    /// neither one's TREE lifts: the kernel's splits are on `z` columns, so
+    /// `z_t <= k` pulled back through `x_C = x_p + B z` is a lattice disjunction
+    /// `TreeNode` cannot express. `SolveOpts` DEFAULTS that field to 256, so on
+    /// default options the reformulation was never reached and `ej` was still lost.
+    /// The gates are now decoupled from capture (`bab::cert_decouple_enabled`,
+    /// `bab::harvest_tree_cert_by_resolve`), which is what makes the sibling test
+    /// `ej_is_proven_on_default_options` below possible; this one keeps the explicit
+    /// `0` so the pre-decoupling path stays covered too. See the note on
+    /// `crate::bab::expand_kernel_outcome`.
     #[test]
     fn ej_is_proven_through_the_public_solve_entry() {
+        let _env = solve_lock();
         let m = ej_model();
         let opts = SolveOpts::new()
             .with_tree_cert_leaves(0)
@@ -7325,6 +7682,38 @@ mod kernel_reform_tests {
                 assert!(m.check_point(&model_values).is_ok());
             }
             other => panic!("expected Optimal 25508 from the public entry, got {other:?}"),
+        }
+    }
+
+    /// THE POINT OF THE DECOUPLING, as one assertion: `ej` on DEFAULT options.
+    ///
+    /// `SolveOpts::new()` arms tree-certificate capture (`tree_cert_leaves` 256),
+    /// and that alone used to switch the reformulation off — so this exact solve
+    /// returned `Unknown` after burning the whole budget on 271,642 nodes with the
+    /// dual bound stuck at 1. Nothing about `ej` is infeasible, so there was never
+    /// a tree certificate on offer to justify the trade; the artifact slot the
+    /// reduction was surrendered for cannot be filled by an `Optimal` verdict at
+    /// all (`tree_cert` lives on `Outcome::Infeasible` and nowhere else).
+    ///
+    /// A 30 s limit and not a tight one: what is being asserted is the REDUCTION
+    /// firing, and the reformulated instance proves in 3 nodes, so a failure here
+    /// means the gate stopped firing rather than that the box was slow.
+    #[test]
+    fn ej_is_proven_on_default_options() {
+        let _env = solve_lock();
+        let m = ej_model();
+        let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+        match crate::bab::solve_milp(&m, &opts) {
+            Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            } => {
+                assert_eq!(value, int(25508));
+                assert_eq!(model_values.len(), 3);
+                assert!(m.check_point(&model_values).is_ok());
+            }
+            other => panic!("expected Optimal 25508 on DEFAULT options, got {other:?}"),
         }
     }
 
@@ -7394,6 +7783,1074 @@ mod kernel_reform_tests {
         assert_eq!(
             sorted_image, sorted_brute,
             "the reformulated feasible set must be exactly the original one"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // S4 — THE AHL TRANSLATION STEP `x_p ← x_p − B·round(B⁺(x_p − t))`
+    //
+    // THE EXISTING SUITE IS BLIND TO THIS CLASS OF DEFECT AND SO IS THE 40-
+    // INSTANCE CORPUS: 433 lib tests and a full corpus run were green with the
+    // translation missing entirely. What the missing step breaks is not the
+    // reduced FEASIBLE SET — that is provably intact — but the SCALE of the
+    // numbers written on it, and no assertion about verdicts on the shapes the
+    // shipped gate admits can see that. Hence the three tests below: a magnitude
+    // bound with a PROOF behind it, the two models from the review that actually
+    // returned a wrong `Optimal`, and a brute-force differential wide enough to
+    // have found the defect on its own.
+    // ---------------------------------------------------------------------
+
+    /// `ceil(√x)` for a non-negative `BigInt`, exactly.
+    fn isqrt_ceil(x: &BigInt) -> BigInt {
+        let r = num_integer::Roots::sqrt(x);
+        if &r * &r == *x {
+            r
+        } else {
+            r + BigInt::one()
+        }
+    }
+
+    fn norm_sq(v: &[BigInt]) -> BigInt {
+        v.iter().map(|x| x * x).sum()
+    }
+
+    /// Re-run the reformulation's own front half so the RAW (untranslated)
+    /// `x_p` — the thing that used to ship — is observable next to the translated
+    /// one. Returns `(x_p_raw, x_p_translated, B)`.
+    fn raw_and_translated_xp(
+        a: &[Vec<i64>],
+        b: &[i64],
+        target: &[BigRational],
+    ) -> (Vec<BigInt>, Vec<BigInt>, Vec<Vec<BigInt>>) {
+        let m = a.len();
+        let n = a[0].len();
+        let abig: Vec<Vec<BigInt>> = a
+            .iter()
+            .map(|r| r.iter().copied().map(BigInt::from).collect())
+            .collect();
+        let bbig: Vec<BigInt> = b.iter().copied().map(BigInt::from).collect();
+        let (u, rank, mm) = col_hnf(&abig, m, n, deadline()).expect("column HNF");
+        let raw =
+            hnf_particular(&mm, &u, m, n, rank, &bbig, deadline()).expect("an integer solution");
+        assert!(
+            satisfies_exactly(&abig, &bbig, &raw),
+            "the raw particular solution must already solve A x = b"
+        );
+        let d = n - rank;
+        let k0: Vec<Vec<BigInt>> = (0..d)
+            .map(|t| (0..n).map(|i| u[i][rank + t].clone()).collect())
+            .collect();
+        let basis = lll(k0, deadline()).expect("LLL");
+        let tr = translate_near_box(&raw, &basis, target, deadline()).expect("translation");
+        assert!(
+            satisfies_exactly(&abig, &bbig, &tr),
+            "S4: the translated x_p must STILL satisfy A x = b exactly"
+        );
+        (raw, tr, basis)
+    }
+
+    /// THE MAGNITUDE TEST, with the bound it asserts actually proved rather than
+    /// eyeballed.
+    ///
+    /// Babai's nearest-plane sweep leaves `x_p − t = Σ μ_i·b*_i + r` with every
+    /// `|μ_i| ≤ ½`, where `r` is the component orthogonal to `span(B) = ker(A)`.
+    /// `r` is not a property of the representative at all — for ANY `x*` with
+    /// `A x* = b`, `x* − x_p ∈ ker(A)`, so `x*− t` has the SAME orthogonal
+    /// component and `‖r‖ ≤ ‖x*− t‖`. With `‖b*_i‖ ≤ ‖b_i‖` that gives the exact,
+    /// checkable statement
+    ///
+    /// ```text
+    ///   ‖x_p − t‖ ≤ ½·√(Σ‖b_i‖²) + ‖x*− t‖     for any feasible x*
+    /// ```
+    ///
+    /// which this asserts over `BigInt` (squared, in half-units, with `√` taken
+    /// as `ceil√`). Taking `x*` to be a brute-force point INSIDE THE BOX makes
+    /// the right-hand side O(box) + O(reduced basis) — which is what "near the
+    /// box" means and is the whole content of the step.
+    ///
+    /// The equality block is `fz135`'s: coefficients ~5·10⁴ over a `[0,5]⁴` box.
+    /// MEASURED: the raw `x_p` has max entry 5.9·10¹⁵ and MISSES this bound by
+    /// eleven orders of magnitude; the translated one has max entry 5 and meets
+    /// it. Both halves are asserted, so the test cannot pass with the step
+    /// disabled.
+    #[test]
+    fn the_translation_pulls_x_p_from_o_det_down_to_o_box() {
+        let a = vec![
+            vec![-11051i64, 23397, -25319, -12664],
+            vec![-14689, 50015, -19553, -24374],
+        ];
+        let b = vec![-136042i64, -131964];
+        // t = box midpoints of `[0,5]⁴`, i.e. 5/2 each.
+        let half = BigRational::new(BigInt::from(5), BigInt::from(2));
+        let target = vec![half.clone(), half.clone(), half.clone(), half];
+        let (raw, tr, basis) = raw_and_translated_xp(&a, &b, &target);
+
+        // A brute-force feasible point of the equality block inside the box —
+        // the `x*` the bound is stated against.
+        let mut xstar: Option<Vec<i64>> = None;
+        'outer: for p0 in 0..=5i64 {
+            for p1 in 0..=5i64 {
+                for p2 in 0..=5i64 {
+                    for p3 in 0..=5i64 {
+                        let p = [p0, p1, p2, p3];
+                        if a.iter().zip(&b).all(|(row, &rhs)| {
+                            row.iter().zip(&p).map(|(c, v)| c * v).sum::<i64>() == rhs
+                        }) {
+                            xstar = Some(p.to_vec());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        let xstar = xstar.expect("the fixture's equality block has a point in its box");
+
+        // Everything below is in HALF-UNITS (`2·(x − t)`), which clears the ½ in
+        // the midpoints and keeps the whole comparison in ℤ.
+        let dbl = |x: &[BigInt]| -> Vec<BigInt> {
+            x.iter()
+                .zip(&target)
+                .map(|(v, t)| {
+                    let q = BigRational::from(v.clone()) * BigInt::from(2) - t * BigInt::from(2);
+                    assert!(
+                        q.is_integer(),
+                        "2·(x − t) is integral for a half-integral t"
+                    );
+                    q.to_integer()
+                })
+                .collect()
+        };
+        let u_tr = norm_sq(&dbl(&tr));
+        let u_raw = norm_sq(&dbl(&raw));
+        let s_x = norm_sq(&dbl(&xstar
+            .iter()
+            .copied()
+            .map(BigInt::from)
+            .collect::<Vec<_>>()));
+        let s_b: BigInt = basis.iter().map(|v| norm_sq(v)).sum();
+        // (½√S + ‖x*−t‖)² in half-units: U ≤ S + Sx + 2·√(S·Sx).
+        let bound = &s_b + &s_x + BigInt::from(2) * isqrt_ceil(&(&s_b * &s_x));
+
+        println!(
+            "S4 magnitude: max|x_p| raw={} translated={} bound_sq={bound} \
+             raw_sq={u_raw} translated_sq={u_tr}",
+            max_abs_big(&raw),
+            max_abs_big(&tr),
+        );
+        assert!(
+            u_tr <= bound,
+            "translated x_p must satisfy the Babai bound: {u_tr} > {bound}"
+        );
+        assert!(
+            max_abs_big(&tr) <= BigInt::from(5),
+            "on this block the translated x_p lands INSIDE the [0,5] box; got {}",
+            max_abs_big(&tr)
+        );
+        // NON-VACUITY: the untranslated representative misses the same bound by
+        // orders of magnitude. If this ever stops holding the fixture has gone
+        // stale and the test above proves nothing.
+        assert!(
+            u_raw > bound,
+            "the raw x_p is supposed to VIOLATE the bound; the fixture is stale"
+        );
+        assert!(
+            max_abs_big(&raw) > BigInt::from(10).pow(12),
+            "the raw x_p is supposed to be astronomically far from the box; got {}",
+            max_abs_big(&raw)
+        );
+    }
+
+    /// `fz135` from the adversarial review, verbatim. MAXIMIZE, a 2×4 equality
+    /// block with ~5·10⁴ coefficients over `[0,5]`, and two surviving rows that
+    /// TOUCH `C` — the non-isolated shape, which is why it needs the test seam.
+    ///
+    /// With the translation missing this model reported `Optimal −10` against a
+    /// true optimum of `−9`: a feasible point, a worse value, and `Trust`
+    /// unbothered. The mechanism is entirely arithmetic — `const_delta` ran at
+    /// −6.77·10¹⁵, inside `[2^52, 2^53)` where the `f64` ULP is exactly 1, so the
+    /// reduced LP was resolving the objective at the granularity of the answer.
+    /// Build a fixture from the review: integral columns with `[0, up_j]` boxes,
+    /// an objective, and rows given as `(lo, up, terms)` with `None` for an
+    /// infinite side.
+    fn review_fixture(
+        ups: &[i64],
+        obj: &[i64],
+        sense: Sense,
+        rows: &[(Option<i64>, Option<i64>, &[(usize, i64)])],
+    ) -> Model {
+        let mut m = Model::new();
+        let cols: Vec<Col> = ups.iter().map(|&u| m.add_int_col(0.0, u as f64)).collect();
+        for &(lo, up, terms) in rows {
+            let t: Vec<(Col, f64)> = terms.iter().map(|&(j, a)| (cols[j], a as f64)).collect();
+            m.add_row(
+                lo.map_or(f64::NEG_INFINITY, |v| v as f64),
+                up.map_or(f64::INFINITY, |v| v as f64),
+                &t,
+            );
+        }
+        let o: Vec<(Col, f64)> = obj
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c != 0)
+            .map(|(j, &c)| (cols[j], c as f64))
+            .collect();
+        m.set_objective(&o, sense);
+        m
+    }
+
+    /// `fz135` from the adversarial review, verbatim. MAXIMIZE, a 2x4 equality
+    /// block with ~5e4 coefficients over `[0,5]`, and two surviving rows that
+    /// TOUCH `C` -- the non-isolated shape, which is why it needs the test seam.
+    ///
+    /// With the translation missing this model reported `Optimal -10` against a
+    /// true optimum of `-9`: a feasible point, a worse value, and `Trust`
+    /// unbothered. The mechanism is entirely arithmetic -- `const_delta` ran at
+    /// -6.77e15, inside `[2^52, 2^53)` where the `f64` ULP is exactly 1, so the
+    /// reduced LP was resolving the objective at the granularity of the answer.
+    fn fz135() -> Model {
+        review_fixture(
+            &[5, 5, 5, 5, 3, 2],
+            &[-1, -5, -12, 0, 13, 1],
+            Sense::Maximize,
+            &[
+                (
+                    Some(-136042),
+                    Some(-136042),
+                    &[(0, -11051), (1, 23397), (2, -25319), (3, -12664)],
+                ),
+                (
+                    Some(-131964),
+                    Some(-131964),
+                    &[(0, -14689), (1, 50015), (2, -19553), (3, -24374)],
+                ),
+                (Some(-10), None, &[(1, -3), (2, -1), (5, -1)]),
+                (
+                    Some(-42),
+                    None,
+                    &[(0, -7), (1, -7), (2, -4), (4, 3), (5, -8)],
+                ),
+            ],
+        )
+    }
+
+    /// `fz2169` from the same review: MINIMIZE, a 2x4 block over `[0,4]`, three
+    /// surviving rows touching `C`. Reported `Optimal 20` against a true optimum
+    /// of `15`.
+    fn fz2169() -> Model {
+        review_fixture(
+            &[4, 4, 4, 4, 2, 2],
+            &[20, 12, -11, -18, -2, -5],
+            Sense::Minimize,
+            &[
+                (
+                    Some(-243560),
+                    Some(-243560),
+                    &[(0, 33989), (1, -46812), (2, -49007), (3, -29035)],
+                ),
+                (
+                    Some(-26654),
+                    Some(-26654),
+                    &[(0, 8009), (1, -24511), (2, 12216), (3, -6898)],
+                ),
+                (Some(1), None, &[(0, -5), (3, 8), (4, 2)]),
+                (None, Some(18), &[(1, 3), (2, 1), (4, 7), (5, -2)]),
+                (Some(-12), None, &[(0, 1), (3, -7), (4, 6), (5, -3)]),
+            ],
+        )
+    }
+
+    /// Enumerate every integer point of `model`'s (finite, integral) box and
+    /// return the best objective value among the feasible ones, plus the count of
+    /// feasible points. The reference the reformulation is judged against.
+    fn brute_force_optimum(model: &Model) -> (Option<BigRational>, usize) {
+        let nc = model.num_cols();
+        let mut lo = Vec::with_capacity(nc);
+        let mut up = Vec::with_capacity(nc);
+        for j in 0..nc {
+            let (l, u) = model.col_bounds(Col(j as u32));
+            assert!(l.is_finite() && u.is_finite(), "brute force needs a box");
+            lo.push(l as i64);
+            up.push(u as i64);
+        }
+        let mut pt = lo.clone();
+        let mut best: Option<BigRational> = None;
+        let mut feasible = 0usize;
+        let maximize = model.sense() == Sense::Maximize;
+        loop {
+            let vals: Vec<BigRational> = pt.iter().map(|&v| int(v)).collect();
+            if model.check_point(&vals).is_ok() {
+                feasible += 1;
+                let v = model.objective_value_at(&vals);
+                let better = match &best {
+                    None => true,
+                    Some(b) => {
+                        if maximize {
+                            v > *b
+                        } else {
+                            v < *b
+                        }
+                    }
+                };
+                if better {
+                    best = Some(v);
+                }
+            }
+            let mut k = 0;
+            loop {
+                if k == nc {
+                    return (best, feasible);
+                }
+                pt[k] += 1;
+                if pt[k] <= up[k] {
+                    break;
+                }
+                pt[k] = lo[k];
+                k += 1;
+            }
+        }
+    }
+
+    /// Solve `model` through the reformulation (with the isolation gate relaxed
+    /// by the test seam) and return the caller-frame optimum, asserting the
+    /// widened witness is feasible for the ORIGINAL model at exactly that value.
+    fn reformulated_optimum(model: &Model) -> Option<BigRational> {
+        let (reduced, post) = reformulate_kernel_nonisolated_for_test(model)?;
+        let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+        match crate::bab::solve_milp(&reduced, &opts) {
+            Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            } => {
+                let full = post.widen(&model_values);
+                let recovered = value + post.const_delta();
+                assert!(
+                    model.check_point(&full).is_ok(),
+                    "the widened witness must be feasible for the ORIGINAL model: {full:?}"
+                );
+                assert_eq!(
+                    model.objective_value_at(&full),
+                    recovered,
+                    "the witness's objective must BE the reported value"
+                );
+                Some(recovered)
+            }
+            Outcome::Infeasible { .. } => None,
+            other => panic!("reduced model gave {other:?}"),
+        }
+    }
+
+    /// `fz135`: reformulated answer must EQUAL the brute-force optimum. With the
+    /// translation missing this returns `−10` for a true `−9`.
+    #[test]
+    fn review_fixture_fz135_agrees_with_brute_force() {
+        let _env = solve_lock();
+        let m = fz135();
+        let (brute, feasible) = brute_force_optimum(&m);
+        assert!(feasible > 0, "the fixture must be feasible");
+        assert_eq!(brute, Some(int(-9)), "the review's recorded true optimum");
+        assert_eq!(
+            reformulated_optimum(&m),
+            brute,
+            "fz135: the reformulated optimum must equal the brute-force optimum"
+        );
+    }
+
+    /// `fz2169`: same, MINIMIZE. With the translation missing this returns `20`
+    /// for a true `15`.
+    #[test]
+    fn review_fixture_fz2169_agrees_with_brute_force() {
+        let _env = solve_lock();
+        let m = fz2169();
+        let (brute, feasible) = brute_force_optimum(&m);
+        assert!(feasible > 0, "the fixture must be feasible");
+        assert_eq!(brute, Some(int(15)), "the review's recorded true optimum");
+        assert_eq!(
+            reformulated_optimum(&m),
+            brute,
+            "fz2169: the reformulated optimum must equal the brute-force optimum"
+        );
+    }
+
+    /// SplitMix64 — a deterministic generator, so a failing seed in the
+    /// differential below is reproducible verbatim.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in `[lo, hi]`.
+        fn range(&mut self, lo: i64, hi: i64) -> i64 {
+            let span = (hi - lo + 1) as u64;
+            lo + (self.next() % span) as i64
+        }
+
+        fn nonzero(&mut self, mag: i64) -> i64 {
+            let v = self.range(-mag, mag);
+            if v == 0 {
+                mag
+            } else {
+                v
+            }
+        }
+    }
+
+    /// A random model of THE SHAPE THAT EXPOSES THE DEFECT: an integral equality
+    /// block whose coefficients (~10⁴–10⁵) dwarf the box, plus surviving rows
+    /// that touch `C`. The equality right-hand side is generated as `A·pt` for a
+    /// `pt` inside the box, so the block always has a solution there and the
+    /// instance is rarely trivially infeasible.
+    fn random_exposing_model(seed: u64) -> Model {
+        let mut r = SplitMix(seed);
+        let ncc = r.range(3, 4) as usize;
+        let nsurv = r.range(1, 2) as usize;
+        let cap = r.range(4, 5);
+        let mut m = Model::new();
+        let c_cols: Vec<Col> = (0..ncc).map(|_| m.add_int_col(0.0, cap as f64)).collect();
+        let s_cols: Vec<Col> = (0..nsurv).map(|_| m.add_int_col(0.0, 2.0)).collect();
+        let pt: Vec<i64> = (0..ncc).map(|_| r.range(0, cap)).collect();
+
+        let ne = if ncc == 3 { 1 } else { r.range(1, 2) as usize };
+        for _ in 0..ne {
+            let coeffs: Vec<i64> = (0..ncc).map(|_| r.nonzero(60_000)).collect();
+            let rhs: i64 = coeffs.iter().zip(&pt).map(|(a, p)| a * p).sum();
+            let terms: Vec<(Col, f64)> = c_cols
+                .iter()
+                .zip(&coeffs)
+                .map(|(&c, &a)| (c, a as f64))
+                .collect();
+            m.add_row(rhs as f64, rhs as f64, &terms);
+        }
+        // Surviving rows, deliberately NON-ISOLATED: each touches at least one
+        // member of `C`, which is what carries `x_p` into a row that stays.
+        for _ in 0..r.range(1, 2) {
+            let mut terms: Vec<(Col, f64)> = Vec::new();
+            let mut base = 0i64;
+            for (j, &c) in c_cols.iter().enumerate() {
+                if r.range(0, 9) < 5 {
+                    let a = r.nonzero(9);
+                    terms.push((c, a as f64));
+                    base += a * pt[j];
+                }
+            }
+            if terms.is_empty() {
+                let a = r.nonzero(9);
+                terms.push((c_cols[0], a as f64));
+                base += a * pt[0];
+            }
+            for &c in &s_cols {
+                if r.range(0, 9) < 8 {
+                    let a = r.nonzero(9);
+                    terms.push((c, a as f64));
+                    base += a;
+                }
+            }
+            let slack = r.range(0, 7);
+            if r.range(0, 1) == 0 {
+                m.add_row(f64::NEG_INFINITY, (base + slack) as f64, &terms);
+            } else {
+                m.add_row((base - slack) as f64, f64::INFINITY, &terms);
+            }
+        }
+        let obj: Vec<(Col, f64)> = c_cols
+            .iter()
+            .chain(&s_cols)
+            .map(|&c| (c, r.range(-20, 20) as f64))
+            .collect();
+        let sense = if r.range(0, 1) == 0 {
+            Sense::Minimize
+        } else {
+            Sense::Maximize
+        };
+        m.set_objective(&obj, sense);
+        m
+    }
+
+    /// THE DIFFERENTIAL THAT WOULD HAVE FOUND THIS. Hundreds of random models of
+    /// the exposing shape, each brute-forced over its whole box and each solved
+    /// through the reformulation; the optimum must MATCH and the reduced feasible
+    /// set must be in exact bijection with the original.
+    ///
+    /// The review needed 2,856 models to see two wrong answers because it was
+    /// sampling BOTH shapes; the generator here only builds the exposing one, and
+    /// with the translation disabled the very first hundred seeds disagree.
+    #[test]
+    fn randomised_brute_force_differential_over_the_exposing_shape() {
+        let _env = solve_lock();
+        let mut fired = 0usize;
+        let mut disagreements: Vec<u64> = Vec::new();
+        for seed in 0..400u64 {
+            let m = random_exposing_model(seed);
+            let Some((reduced, post)) = reformulate_kernel_nonisolated_for_test(&m) else {
+                continue;
+            };
+            fired += 1;
+            let (brute, feasible) = brute_force_optimum(&m);
+
+            // (1) THE FEASIBLE SET, as an exact BIJECTION. Enumerate the
+            // integer points of the `C` box that satisfy the equality block,
+            // enumerate `z` over a range far wider than the box can reach, and
+            // assert the two sets are EQUAL and the map injective. The `z` range
+            // is only usable BECAUSE `x_p` now sits near the box — with the
+            // untranslated representative the box lives at `z ~ 10^15` and no
+            // finite enumeration would find it.
+            let d = post.z.len();
+            if d <= 2 {
+                let cbox: Vec<(i64, i64)> = post
+                    .cols_c
+                    .iter()
+                    .map(|&j| {
+                        let (l, u) = m.col_bounds(Col(j as u32));
+                        (l as i64, u as i64)
+                    })
+                    .collect();
+                let mut brute_c: Vec<Vec<i64>> = Vec::new();
+                let mut pt: Vec<i64> = cbox.iter().map(|&(l, _)| l).collect();
+                loop {
+                    if post.e_rows.iter().all(|&ri| {
+                        let (coeffs, rlo, _) = m.row(Row(ri as u32));
+                        let lhs: f64 = coeffs
+                            .iter()
+                            .map(|&(c, a)| {
+                                a * pt[post
+                                    .cols_c
+                                    .iter()
+                                    .position(|&j| j == c as usize)
+                                    .expect("an E row's support is exactly C")]
+                                    as f64
+                            })
+                            .sum();
+                        lhs == rlo
+                    }) {
+                        brute_c.push(pt.clone());
+                    }
+                    let mut k = 0;
+                    loop {
+                        if k == cbox.len() {
+                            break;
+                        }
+                        pt[k] += 1;
+                        if pt[k] <= cbox[k].1 {
+                            break;
+                        }
+                        pt[k] = cbox[k].0;
+                        k += 1;
+                    }
+                    if k == cbox.len() {
+                        break;
+                    }
+                }
+
+                let mut image: Vec<Vec<i64>> = Vec::new();
+                let span = 60i64;
+                let mut zv = vec![-span; d];
+                loop {
+                    let mut reduced_pt = vec![BigRational::zero(); reduced.num_cols()];
+                    for (t, &zc) in post.z.iter().enumerate() {
+                        reduced_pt[zc.index()] = int(zv[t]);
+                    }
+                    let full = post.widen(&reduced_pt);
+                    let xc: Vec<i64> = post
+                        .cols_c
+                        .iter()
+                        .map(|&j| {
+                            assert!(full[j].is_integer(), "x_p + Bz is integral");
+                            full[j].to_integer().to_i64().expect("small after S4")
+                        })
+                        .collect();
+                    if xc.iter().zip(&cbox).all(|(&v, &(l, u))| v >= l && v <= u) {
+                        image.push(xc);
+                    }
+                    let mut k = 0;
+                    loop {
+                        if k == d {
+                            break;
+                        }
+                        zv[k] += 1;
+                        if zv[k] <= span {
+                            break;
+                        }
+                        zv[k] = -span;
+                        k += 1;
+                    }
+                    if k == d {
+                        break;
+                    }
+                }
+                let mut sorted = image.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(
+                    sorted.len(),
+                    image.len(),
+                    "seed {seed}: two z widened to the same x_C -- not injective"
+                );
+                brute_c.sort_unstable();
+                assert_eq!(
+                    sorted, brute_c,
+                    "seed {seed}: the reduced feasible set is not the original one"
+                );
+            }
+
+            // (2) THE OPTIMUM.
+            let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+            match crate::bab::solve_milp(&reduced, &opts) {
+                Outcome::Optimal {
+                    value,
+                    model_values,
+                    ..
+                } => {
+                    let full = post.widen(&model_values);
+                    let recovered = value + post.const_delta();
+                    assert!(
+                        m.check_point(&full).is_ok(),
+                        "seed {seed}: widened witness infeasible for the original model"
+                    );
+                    if brute.as_ref() != Some(&recovered) {
+                        disagreements.push(seed);
+                    }
+                }
+                Outcome::Infeasible { .. } => {
+                    if feasible != 0 {
+                        disagreements.push(seed);
+                    }
+                }
+                other => panic!("seed {seed}: reduced model gave {other:?}"),
+            }
+        }
+        println!(
+            "S4 differential: {fired} models fired, {} wrong",
+            disagreements.len()
+        );
+        assert!(
+            fired >= 100,
+            "the generator must actually exercise the reformulation; fired={fired}"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "reformulated optimum disagrees with brute force on seeds {disagreements:?}"
+        );
+    }
+
+    /// A random model of THE SHAPE THE SHIPPED GATE ADMITS: an **isolated**
+    /// integral equality block whose coefficients (~10⁴–10⁵) dwarf a small box,
+    /// plus surviving rows that touch only columns OUTSIDE `C`.
+    ///
+    /// The generator above builds the NON-ISOLATED shape and can only be solved
+    /// through the `#[cfg(test)]` seam. This one is the shape production actually
+    /// sees, so its models go through the ordinary public entry — which is the
+    /// point: root reductions are no longer gated on `tree_cert_leaves == 0`, so
+    /// this call site is reachable on DEFAULT options for the first time and every
+    /// model here is one the shipped engine will now really reformulate.
+    ///
+    /// Half the seeds anchor the equality's right-hand side on a point INSIDE the
+    /// box (so the block is satisfiable there and the instance is usually
+    /// feasible); the other half anchor it outside. An outside anchor keeps an
+    /// integer solution in `ℤ^C` — so `hnf_particular` still succeeds and the gate
+    /// still fires — while usually leaving the BOX empty. Both halves matter: the
+    /// feasible one checks the optimum, and the infeasible one is the only way the
+    /// tree-certificate harvest (`bab::harvest_tree_cert_by_resolve`) is exercised
+    /// at all, since `tree_cert` exists on no other `Outcome` variant.
+    fn random_isolated_model(seed: u64) -> Model {
+        let mut r = SplitMix(seed);
+        let ncc = r.range(2, 4) as usize;
+        let nsurv = r.range(1, 2) as usize;
+        let cap = r.range(3, 5);
+        let mut m = Model::new();
+        let c_cols: Vec<Col> = (0..ncc).map(|_| m.add_int_col(0.0, cap as f64)).collect();
+        let s_cols: Vec<Col> = (0..nsurv).map(|_| m.add_int_col(0.0, 2.0)).collect();
+        let inside = r.range(0, 1) == 0;
+        let pt: Vec<i64> = (0..ncc)
+            .map(|_| {
+                if inside {
+                    r.range(0, cap)
+                } else {
+                    r.range(cap + 1, cap + 6)
+                }
+            })
+            .collect();
+        let s_pt: Vec<i64> = (0..nsurv).map(|_| r.range(0, 2)).collect();
+
+        // One equality for `ncc <= 3` and up to two for `ncc == 4`, so the kernel
+        // always has dimension `d >= 1` and the reduced model is not the empty
+        // frame.
+        let ne = if ncc <= 3 { 1 } else { r.range(1, 2) as usize };
+        for _ in 0..ne {
+            let coeffs: Vec<i64> = (0..ncc).map(|_| r.nonzero(60_000)).collect();
+            let rhs: i64 = coeffs.iter().zip(&pt).map(|(a, p)| a * p).sum();
+            let terms: Vec<(Col, f64)> = c_cols
+                .iter()
+                .zip(&coeffs)
+                .map(|(&c, &a)| (c, a as f64))
+                .collect();
+            m.add_row(rhs as f64, rhs as f64, &terms);
+        }
+        // Surviving rows over `s_cols` ONLY. A surviving row touching any member of
+        // `C` is exactly what `require_isolated` (`reformulate_kernel_inner`)
+        // refuses, and refusing it is NOT what this change touches — the admitted
+        // set is identical to before. Keeping the generator inside the gate is
+        // therefore deliberate: a campaign over models the engine declines proves
+        // nothing about the engine.
+        for _ in 0..r.range(1, 2) {
+            let mut terms: Vec<(Col, f64)> = Vec::new();
+            let mut base = 0i64;
+            for (j, &c) in s_cols.iter().enumerate() {
+                let a = r.nonzero(9);
+                terms.push((c, a as f64));
+                base += a * s_pt[j];
+            }
+            let slack = r.range(0, 7);
+            if r.range(0, 1) == 0 {
+                m.add_row(f64::NEG_INFINITY, (base + slack) as f64, &terms);
+            } else {
+                m.add_row((base - slack) as f64, f64::INFINITY, &terms);
+            }
+        }
+        let obj: Vec<(Col, f64)> = c_cols
+            .iter()
+            .chain(&s_cols)
+            .map(|&c| (c, r.range(-20, 20) as f64))
+            .collect();
+        let sense = if r.range(0, 1) == 0 {
+            Sense::Minimize
+        } else {
+            Sense::Maximize
+        };
+        m.set_objective(&obj, sense);
+        m
+    }
+
+    /// What one campaign run found: how many generated models the SHIPPED gate
+    /// admitted, how many were instead claimed by the market-split device before
+    /// the reformulation could be reached, how many infeasible verdicts came back
+    /// carrying a VERIFYING tree certificate, and every seed that disagreed.
+    struct IsolatedCampaign {
+        generated: usize,
+        admitted: usize,
+        market_split: usize,
+        infeasible: usize,
+        verified_certs: usize,
+        disagreements: Vec<u64>,
+    }
+
+    /// Run the campaign over `seeds`. Every admitted model is solved through the
+    /// PUBLIC entry on DEFAULT options and judged against brute force over its
+    /// whole box.
+    fn isolated_shape_campaign(seeds: std::ops::Range<u64>) -> IsolatedCampaign {
+        let mut c = IsolatedCampaign {
+            generated: 0,
+            admitted: 0,
+            market_split: 0,
+            infeasible: 0,
+            verified_certs: 0,
+            disagreements: Vec::new(),
+        };
+        for seed in seeds {
+            let m = random_isolated_model(seed);
+            c.generated += 1;
+            // `solve_milp_advised_with_prefix` tries the market-split device and
+            // the GF(2) parity device before the reformulation, so a model either
+            // of those claims is not evidence about this call site. Counted rather
+            // than filtered, so the report can say whether it ever happened.
+            if detect(&m).is_some() {
+                c.market_split += 1;
+                continue;
+            }
+            if reformulate_kernel(&m).is_none() {
+                continue;
+            }
+            c.admitted += 1;
+            let (brute, feasible) = brute_force_optimum(&m);
+            let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+            match crate::bab::solve_milp(&m, &opts) {
+                Outcome::Optimal {
+                    value,
+                    model_values,
+                    ..
+                } => {
+                    let witness_ok = m.check_point(&model_values).is_ok()
+                        && m.objective_value_at(&model_values) == value;
+                    if !witness_ok || brute.as_ref() != Some(&value) {
+                        c.disagreements.push(seed);
+                    }
+                }
+                Outcome::Infeasible { tree_cert, .. } => {
+                    c.infeasible += 1;
+                    if feasible != 0 {
+                        c.disagreements.push(seed);
+                    }
+                    // THE HARVEST, judged by the real verifier. The reduced tree is
+                    // not a statement about this model, so what must come back is
+                    // the CALLER-frame tree the re-solve captured — or nothing.
+                    if let Some(t) = tree_cert {
+                        if t.verify(&m).is_ok() {
+                            c.verified_certs += 1;
+                        } else {
+                            c.disagreements.push(seed);
+                        }
+                    }
+                }
+                other => c.disagreements.push(seed_of_unexpected(seed, &other)),
+            }
+        }
+        c
+    }
+
+    /// A non-`Optimal`/`Infeasible` verdict on a fully-boxed 3-to-6 column model
+    /// is itself a failure; funnel it into the disagreement list with its verdict
+    /// printed rather than panicking mid-campaign, so one bad seed does not hide
+    /// the other 2,000 results.
+    fn seed_of_unexpected(seed: u64, outcome: &Outcome) -> u64 {
+        println!("seed {seed}: unexpected verdict {outcome:?}");
+        seed
+    }
+
+    /// ⚠ **THE CAMPAIGN THAT GUARDS THE NEWLY-REACHABLE LANE.**
+    ///
+    /// Root reductions used to be gated on `opts.tree_cert_leaves == 0`, a field
+    /// that defaults to 256 — so the kernel reformulation was unreachable on
+    /// default options and had almost no production exposure. Decoupling the two
+    /// makes it reachable for the first time, and the last time this lane's gate
+    /// was widened it shipped a SILENT WRONG ANSWER: `OPTIMAL` at a
+    /// worse-than-true optimum (fz135 −10 for a true −9, fz2169 20 for 15),
+    /// through 433 lib tests and a 40-instance corpus run. What caught it was a
+    /// random-model campaign, and nothing else did.
+    ///
+    /// So the same campaign runs here, against the shape production now really
+    /// admits, through the public entry, on default options. The in-suite run is
+    /// 400 seeds; `randomised_isolated_shape_matches_brute_force_full` is the
+    /// 2,600-seed version kept `#[ignore]`d for the size of its bill.
+    ///
+    /// The firing rate is asserted, not assumed. A campaign whose generator never
+    /// reaches the reformulation proves nothing, and that failure mode is silent.
+    #[test]
+    fn randomised_isolated_shape_matches_brute_force() {
+        let _env = solve_lock();
+        let c = isolated_shape_campaign(0..400);
+        println!(
+            "isolated-shape campaign: {} generated, {} admitted by the shipped gate, \
+             {} claimed by market-split, {} infeasible, {} verifying tree certificates, \
+             {} disagreements",
+            c.generated,
+            c.admitted,
+            c.market_split,
+            c.infeasible,
+            c.verified_certs,
+            c.disagreements.len()
+        );
+        assert!(
+            c.admitted >= 200,
+            "the generator must actually reach the reformulation; admitted={}",
+            c.admitted
+        );
+        assert!(
+            c.infeasible >= 20,
+            "the infeasible half must actually be infeasible, or the harvest is untested; \
+             infeasible={}",
+            c.infeasible
+        );
+        // NON-VACUITY OF THE HARVEST. A reduced-frame tree is never lifted for the
+        // kernel (there is no `KernelPostsolve::lift_tree_cert`), so every
+        // certificate counted here was bought by `bab::harvest_tree_cert_by_resolve`
+        // re-solving the caller's own model, and every one was checked by the real
+        // whole-tree verifier against that model. Zero here would mean the campaign
+        // is silently testing verdicts only.
+        assert!(
+            c.verified_certs > 0,
+            "no infeasible verdict carried a verifying tree certificate — the harvest \
+             is not being exercised"
+        );
+        assert!(
+            c.disagreements.is_empty(),
+            "the shipped kernel path disagrees with brute force on seeds {:?}",
+            c.disagreements
+        );
+    }
+
+    /// THE OTHER HALF OF THE ADMITTED SET: a random model of the **`ej` family**,
+    /// where applicability comes from an INFINITE column side rather than from
+    /// coefficients outgrowing the box.
+    ///
+    /// The two halves are not the same test. `reformulate_kernel_inner`'s
+    /// applicability check is a disjunction — `any_infinite_side ||
+    /// coefficients_outgrow_the_box` — and the branches build DIFFERENT reduced
+    /// models: an infinite side contributes NO bound row, which is what leaves the
+    /// new `z` columns free, and free `z` is the property the whole reformulation
+    /// rests on. A campaign over boxed models never builds one.
+    ///
+    /// Every equality coefficient is POSITIVE and every `C` column is `x >= 0`, so
+    /// `a·x = b` with `b >= 0` implies `x_j <= b / a_j`: the model is unbounded as
+    /// DECLARED (which is what the gate reads) and finite in truth, so a ground
+    /// truth exists. The objective is nonnegative under Minimize for the same
+    /// reason — it must be bounded below for `Optimal` to be the right verdict.
+    fn random_unbounded_model(seed: u64) -> (Model, Vec<Col>, Vec<i64>, i64) {
+        let mut r = SplitMix(seed);
+        let mut m = Model::new();
+        let c_cols: Vec<Col> = (0..3).map(|_| m.add_int_col(0.0, f64::INFINITY)).collect();
+        let s_cols: Vec<Col> = (0..2).map(|_| m.add_int_col(0.0, 2.0)).collect();
+        let coeffs: Vec<i64> = (0..3).map(|_| r.range(7, 60)).collect();
+        let pt: Vec<i64> = (0..3).map(|_| r.range(0, 2)).collect();
+        let rhs: i64 = coeffs.iter().zip(&pt).map(|(a, p)| a * p).sum();
+        let terms: Vec<(Col, f64)> = c_cols
+            .iter()
+            .zip(&coeffs)
+            .map(|(&c, &a)| (c, a as f64))
+            .collect();
+        m.add_row(rhs as f64, rhs as f64, &terms);
+        // Isolated surviving row, over `s_cols` only.
+        let s_pt: Vec<i64> = (0..2).map(|_| r.range(0, 2)).collect();
+        let sterms: Vec<(Col, f64)> = s_cols.iter().map(|&c| (c, r.nonzero(9) as f64)).collect();
+        let base: i64 = sterms
+            .iter()
+            .zip(&s_pt)
+            .map(|((_, a), p)| *a as i64 * p)
+            .sum();
+        m.add_row(f64::NEG_INFINITY, (base + r.range(0, 5)) as f64, &sterms);
+        // Nonnegative costs on `C` under Minimize: the objective must be bounded
+        // below or `Optimal` is not the right verdict and the comparison is void.
+        let mut obj: Vec<(Col, f64)> = c_cols.iter().map(|&c| (c, r.range(0, 20) as f64)).collect();
+        obj.extend(s_cols.iter().map(|&c| (c, r.range(-20, 20) as f64)));
+        m.set_objective(&obj, Sense::Minimize);
+        (m, c_cols, coeffs, rhs)
+    }
+
+    /// The ground truth for [`random_unbounded_model`]: enumerate the equality's
+    /// solutions directly (two free coordinates, the third forced) rather than a
+    /// box the model does not declare, and take the best objective over the
+    /// surviving rows' own small box.
+    fn unbounded_family_optimum(
+        m: &Model,
+        c_cols: &[Col],
+        coeffs: &[i64],
+        rhs: i64,
+    ) -> Option<BigRational> {
+        let mut best: Option<BigRational> = None;
+        let n = m.num_cols();
+        // The generator lays the three `C` columns down first and the two
+        // surviving ones after, so 3 and 4 below are the `s` columns. Pinned
+        // rather than assumed.
+        assert_eq!(n, 5, "random_unbounded_model builds exactly 3 + 2 columns");
+        let mut x0 = 0i64;
+        while coeffs[0] * x0 <= rhs {
+            let mut x1 = 0i64;
+            while coeffs[0] * x0 + coeffs[1] * x1 <= rhs {
+                let rem = rhs - coeffs[0] * x0 - coeffs[1] * x1;
+                if rem % coeffs[2] == 0 {
+                    let x2 = rem / coeffs[2];
+                    // The two `s` columns, whole box.
+                    for s0 in 0..=2i64 {
+                        for s1 in 0..=2i64 {
+                            let mut pt = vec![BigRational::zero(); n];
+                            pt[c_cols[0].index()] = int(x0);
+                            pt[c_cols[1].index()] = int(x1);
+                            pt[c_cols[2].index()] = int(x2);
+                            pt[3] = int(s0);
+                            pt[4] = int(s1);
+                            if m.check_point(&pt).is_ok() {
+                                let v = m.objective_value_at(&pt);
+                                if best.as_ref().is_none_or(|b| v < *b) {
+                                    best = Some(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                x1 += 1;
+            }
+            x0 += 1;
+        }
+        best
+    }
+
+    /// ⚠ **THE SAME CAMPAIGN OVER THE `ej` FAMILY** — declared-unbounded columns,
+    /// free `z`, no bound rows. This is the sub-shape with the least production
+    /// exposure of anything in the engine, and it is the one the decoupling turns
+    /// on by default.
+    #[test]
+    fn randomised_unbounded_family_matches_enumeration() {
+        let _env = solve_lock();
+        let mut admitted = 0usize;
+        let mut disagreements: Vec<u64> = Vec::new();
+        for seed in 0..600u64 {
+            let (m, c_cols, coeffs, rhs) = random_unbounded_model(seed);
+            if detect(&m).is_some() || reformulate_kernel(&m).is_none() {
+                continue;
+            }
+            admitted += 1;
+            let truth = unbounded_family_optimum(&m, &c_cols, &coeffs, rhs);
+            let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+            match crate::bab::solve_milp(&m, &opts) {
+                Outcome::Optimal {
+                    value,
+                    model_values,
+                    ..
+                } => {
+                    let witness_ok = m.check_point(&model_values).is_ok()
+                        && m.objective_value_at(&model_values) == value;
+                    if !witness_ok || truth.as_ref() != Some(&value) {
+                        disagreements.push(seed);
+                    }
+                }
+                Outcome::Infeasible { .. } => {
+                    if truth.is_some() {
+                        disagreements.push(seed);
+                    }
+                }
+                other => {
+                    println!("seed {seed}: unexpected verdict {other:?}");
+                    disagreements.push(seed);
+                }
+            }
+        }
+        println!(
+            "unbounded-family campaign: {admitted} admitted, {} disagreements",
+            disagreements.len()
+        );
+        assert!(
+            admitted >= 400,
+            "the generator must reach the reformulation; admitted={admitted}"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "the shipped kernel path disagrees with enumeration on seeds {disagreements:?}"
+        );
+    }
+
+    /// The full 2,600-seed run of the campaign above. `#[ignore]`d only for its
+    /// wall-clock bill — it is the arm the soundness claim actually rests on and
+    /// is meant to be run whenever this lane is touched:
+    /// `cargo test --release -p ay-milp -- --ignored isolated_shape`.
+    #[test]
+    #[ignore = "full adversarial campaign; run explicitly when the kernel lane changes"]
+    fn randomised_isolated_shape_matches_brute_force_full() {
+        let _env = solve_lock();
+        let c = isolated_shape_campaign(0..2_600);
+        println!(
+            "isolated-shape campaign (FULL): {} generated, {} admitted by the shipped gate, \
+             {} claimed by market-split, {} infeasible, {} verifying tree certificates, \
+             {} disagreements",
+            c.generated,
+            c.admitted,
+            c.market_split,
+            c.infeasible,
+            c.verified_certs,
+            c.disagreements.len()
+        );
+        assert!(
+            c.admitted >= 2_000,
+            "the campaign must exercise at least 2,000 admitted models; admitted={}",
+            c.admitted
+        );
+        assert!(
+            c.disagreements.is_empty(),
+            "the shipped kernel path disagrees with brute force on seeds {:?}",
+            c.disagreements
         );
     }
 

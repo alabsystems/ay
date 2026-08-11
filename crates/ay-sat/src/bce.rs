@@ -80,7 +80,11 @@ impl BCE {
     /// Create a new BCE engine for n variables
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
-            occ: BCEOccList::new(num_vars),
+            // Sized on first use by the BCE entry point, which calls
+            // `ensure_num_vars` before rebuilding. `OccList::new(n)` commits
+            // 128 resident bytes per variable, on every instance, whether or
+            // not BCE ever runs.
+            occ: BCEOccList::new(0),
             stats: BCEStats::default(),
             checked: Vec::new(),
             occ_buf: Vec::new(),

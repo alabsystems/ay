@@ -363,9 +363,6 @@ impl SosCertificate {
     /// variable's print name.
     pub(crate) fn render_alethe(&self, step: &str, name: impl Fn(TermId) -> String) -> String {
         let mut out = String::new();
-        out.push_str("(step ");
-        out.push_str(step);
-        out.push_str(" (cl) :rule nra_positivstellensatz :args (\n");
         // Basis.
         out.push_str("  (:basis");
         for m in &self.basis {
@@ -400,8 +397,29 @@ impl SosCertificate {
             }
         }
         out.push_str(")\n");
-        out.push_str(&format!("  (:rhs {})\n))", render_rat(&self.rhs)));
-        out
+        out.push_str(&format!("  (:rhs {})", render_rat(&self.rhs)));
+
+        // `nra_positivstellensatz` is AY's own calculus, not Alethe's: no
+        // Alethe checker implements it, and a step naming it is not a weaker
+        // proof but *no* proof — carcara answers `unknown rule` / `invalid`
+        // for the whole document. The Gram matrix, multipliers and rhs are
+        // still the whole point of this certificate, so they are preserved
+        // verbatim as SMT-LIB line comments (which every Alethe parser skips)
+        // and the step itself is the honest `hole`.
+        let mut doc = String::new();
+        doc.push_str(
+            "; ay-nra Positivstellensatz certificate (replayable, but not an Alethe rule)\n",
+        );
+        for line in out.lines() {
+            doc.push_str("; ");
+            doc.push_str(line);
+            doc.push('\n');
+        }
+        doc.push_str(&format!(
+            "(step {step} (cl) :rule {})",
+            ay_core::UNPROVED_STEP_RULE
+        ));
+        doc
     }
 
     /// One-line human summary (for the NRA debug channel).

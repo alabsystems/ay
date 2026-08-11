@@ -404,6 +404,23 @@ fn check_separator_cover_complete(
         .map(|(index, var)| (var, index))
         .collect();
     let expected_lits = separator_vars.len();
+    // Guard the shift. `separator_vars` is parsed from a sidecar JSON file, so
+    // its length is attacker/user controlled: at 64 the shift is UB (debug
+    // panic, release shift-amount masking to `1 << 0 == 1`), and a cover of a
+    // SINGLE assignment would then satisfy the completeness check below and be
+    // accepted as a complete separator cover.
+    //
+    // The bound is deliberately far below 64: the check requires enumerating
+    // every one of `2^expected_lits` assignments as distinct masks, so anything
+    // past ~30 cannot be satisfied by a real sidecar anyway. Same shape as the
+    // guard `encode_xor_row_to_cnf` documents for `1usize << k`.
+    const MAX_SEPARATOR_VARS: usize = 30;
+    if expected_lits > MAX_SEPARATOR_VARS {
+        return reject(format!(
+            "separator_vars has {expected_lits} variables, exceeding the \
+             {MAX_SEPARATOR_VARS}-variable cover-enumeration bound"
+        ));
+    }
     let full_count = 1u64 << expected_lits;
     let mut masks = BTreeSet::new();
 

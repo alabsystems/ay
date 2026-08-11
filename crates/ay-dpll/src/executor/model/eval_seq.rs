@@ -76,6 +76,84 @@ impl Executor {
     /// EXISTS but does not resolve, we keep returning `None` (fail-closed):
     /// guessing against an unresolved length constraint could re-feed to
     /// `unsat`.
+    /// Length-PINNED witness for a Seq variable, for the sequence-carrier
+    /// completion pass.
+    ///
+    /// Returns a witness ONLY when the model already DETERMINES the length —
+    /// exactly the situation in which that pass's arbitrary "next unused
+    /// length" would CONTRADICT the model it is completing. Two such cases:
+    ///
+    /// * a `(seq.len v)` term exists AND the model resolves it; or
+    /// * NO `(seq.len v)` term exists, but a constant `(seq.nth v k)` does —
+    ///   a read at index `k` forces `len > k`, so the "next unused length"
+    ///   (frequently 0) puts the read out of range (#7656).
+    ///
+    /// `None` (no length term AND no constant read, or an unresolved length)
+    /// leaves the existing distinct-length class materialization untouched, so
+    /// equality-only classes keep their distinctness witness.
+    ///
+    /// WHY THIS EXISTS. `complete_uninterpreted_sort_model` assigns Seq classes
+    /// distinct lengths 0,1,2,… ignoring `(seq.len v)` entirely, and commits
+    /// them. Once committed, `evaluate_term(v)` is no longer `Unknown`, so `v`
+    /// is never treated as a gap and the gap path that would call
+    /// `reconstruct_seq_from_len_nth` never runs. The published witness then
+    /// falsifies the very `(= (seq.len v) N)` in the problem, and the strict
+    /// `sequences` oracle CORRECTLY refutes it — a computed `sat` published as
+    /// `unknown`. Measured: `t` committed as `[]` where the model pinned
+    /// `(seq.len t) = 3`.
+    ///
+    /// CANDIDATE ONLY, exactly the status of `reconstruct_seq_from_len_nth`:
+    /// the strict and independent gates re-validate whatever this shapes, so a
+    /// wrong inference can only remain `unknown`, never mint a wrong `sat`.
+    pub(super) fn length_pinned_seq_witness(
+        &self,
+        model: &Model,
+        seq_var: TermId,
+    ) -> Option<EvalValue> {
+        if !matches!(self.ctx.terms.get(seq_var), TermData::Var(..)) {
+            return None;
+        }
+        // A POINT-READ-REDUCED variable carries its length in the fresh
+        // `__ay_plen!<v>` symbol, never in the `(seq.len v)` term the
+        // preconditions below consult. Under `--self-check` the ORIGINAL
+        // assertion window is restored (see the QF_Seq deferral in
+        // `check_sat`), so `(seq.len v)` exists in the term store again while
+        // the model still pins only the proxy: `seq_len_term_exists` says
+        // "true", `seq_len_model_value` says "None", and the precondition
+        // bails — dropping the class to completion's arbitrary "next unused
+        // length" of 0. The published witness is then the EMPTY sequence and
+        // the strict `sequences` oracle rejects the very assertion the real
+        // witness satisfies (`seq.len(a) > 100` => unknown under self-check
+        // while the default mode emits a correct 101-element model).
+        //
+        // Try the reduced reconstruction FIRST. This is not a new inference:
+        // it is the identical call `reconstruct_seq_from_len_nth` already
+        // makes as its own first step, so a variable that passes the
+        // preconditions reaches exactly the value it reached before. It
+        // returns `None` for any variable that was not point-read-reduced (no
+        // such fresh symbols exist), so every ordinary class is still governed
+        // by the preconditions, and it stays fail-closed when the proxy length
+        // is unpinned. Candidate only — both gates re-validate it.
+        if let Some(v) = self.reconstruct_point_read_seq(model, seq_var) {
+            return Some(v);
+        }
+        if self.seq_len_term_exists(seq_var) {
+            // A length constraint exists: it must RESOLVE, else stay
+            // fail-closed (guessing against it could re-feed to `unsat`).
+            self.seq_len_model_value(model, seq_var)?;
+        } else {
+            // Length syntactically unconstrained. A constant `(seq.nth v k)`
+            // still forces `len > k`, so the arbitrary "next unused length"
+            // contradicts the model here exactly as a resolved `seq.len` would.
+            // `reconstruct_seq_from_len_nth` then takes its own minimal
+            // covering length `1 + max k`. With NO constant read either, the
+            // length really is free — return `None` so equality-only classes
+            // keep their distinct-length distinctness witness.
+            self.max_constant_seq_nth_index(seq_var)?;
+        }
+        self.reconstruct_seq_from_len_nth(model, seq_var)
+    }
+
     pub(super) fn reconstruct_seq_from_len_nth(
         &self,
         model: &Model,

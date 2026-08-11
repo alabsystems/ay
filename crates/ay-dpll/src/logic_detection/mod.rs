@@ -32,6 +32,8 @@ pub(crate) enum LogicCategory {
     QfLia,
     /// QF_NIA: Quantifier-free non-linear integer arithmetic
     QfNia,
+    /// QF_EIA: Quantifier-free integer arithmetic with exponentiation
+    QfEia,
     /// QF_NRA: Quantifier-free non-linear real arithmetic
     QfNra,
     /// QF_NIRA: Quantifier-free non-linear mixed integer/real arithmetic

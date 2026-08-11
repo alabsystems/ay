@@ -153,3 +153,145 @@ fn seq_array_definition_equality_evaluates_true_under_model() {
         "the definitional equality must ground-evaluate to true under the model"
     );
 }
+
+/// The same resolution with DISTINCT index and element sorts.
+///
+/// Every other test in this file uses `(Array Int Int)`, where the two sorts
+/// coincide — so passing them to `array_leaf` in the wrong order is invisible.
+/// z3 = sat.
+#[test]
+fn array_valued_uf_resolves_with_distinct_index_and_element_sorts() {
+    let (_exec, verdict) = solve(
+        "(set-logic ALL)\
+         (declare-sort Elem 0)\
+         (declare-fun v () Elem)\
+         (declare-fun g (Elem) (Array Int Bool))\
+         (check-sat-assuming ((= ((as const (Array Int Bool)) false) (g v))))",
+    );
+    assert_eq!(verdict, "sat", "an Int-indexed, Bool-valued array UF app");
+}
+
+/// The BitVec-indexed `select` READ over an array-valued UF application that a
+/// const-array defines. z3 = `sat`.
+///
+/// WAS a pinned known gap (`..._is_a_known_gap`): AY answered `unknown` because
+/// the model COMPLETION never learned the application's asserted value.
+/// `collect_array_completion_graph` classified an array equality as a
+/// definition only when one side was a bare `TermData::Var`, so
+/// `(= (const-array 7) (g v))` — App vs App — was dropped, and `(g v)` fell
+/// back to a reads-derived guess. Measured with `AY_DEBUG_STRICT_ORACLE=1`, the
+/// published interpretation came out
+/// `default: "0", stores: [("#x3", "0")]`, the read evaluated to `0`, and the
+/// strict `arrays` oracle rejected assertion 1 as definitively false. (The
+/// independent gate was clean throughout: `AY_G3_GATE_DUMP` reported
+/// `n_false=0 n_uneval=0`.)
+///
+/// FIX (#opaque-array-app-def): an OPAQUE array-valued UF application is a
+/// definition target too, under a congruence filter. See
+/// `collect_array_completion_graph`.
+#[test]
+fn array_valued_uf_select_over_bitvec_index_resolves_through_its_definition() {
+    let (_exec, verdict) = solve(BITVEC_CONST_DEF_WITH_SELECT);
+    assert_eq!(verdict, "sat", "z3 = sat");
+}
+
+/// The pinned input behind the test above, shared with the non-vacuity pin.
+const BITVEC_CONST_DEF_WITH_SELECT: &str = "(set-logic ALL)\
+     (declare-sort Elem 0)\
+     (declare-fun v () Elem)\
+     (declare-fun g (Elem) (Array (_ BitVec 4) Int))\
+     (assert (= ((as const (Array (_ BitVec 4) Int)) 7) (g v)))\
+     (assert (= (select (g v) #x3) 7))\
+     (check-sat)";
+
+/// NON-VACUITY for the test above: the `sat` must rest on the gate actually
+/// EVALUATING the read to the definitional value, not on the read having become
+/// unevaluable (which would also stop the strict oracle rejecting).
+///
+/// Pins the reconstructed leaf directly: `(select (g v) #x3)` must
+/// ground-evaluate to `7` under the emitted model. A completion that published
+/// the pre-fix `default 0` interpretation evaluates it to `0` and fails here;
+/// so does one that publishes nothing at all (`EvalValue::Unknown`).
+#[test]
+fn bitvec_indexed_uf_select_evaluates_to_its_definitional_value_under_model() {
+    let (exec, verdict) = solve(BITVEC_CONST_DEF_WITH_SELECT);
+    assert_eq!(verdict, "sat");
+    let model = exec.last_model.as_ref().expect("sat retains its model");
+    // The read is the second operand of the second assertion.
+    let read = exec
+        .ctx
+        .terms
+        .term_ids()
+        .find(|&term| match exec.ctx.terms.get(term) {
+            TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
+                matches!(exec.ctx.terms.get(args[0]), TermData::App(f, _) if f.name() == "g")
+            }
+            _ => false,
+        })
+        .expect("the (select (g v) #x3) term is interned");
+    eval_memo_clear();
+    let value = exec.evaluate_term(model, read);
+    assert!(
+        matches!(&value, EvalValue::Rational(r) if *r == BigRational::from(BigInt::from(7))),
+        "the read must evaluate to the const-array's 7, got {value:?}"
+    );
+}
+
+/// SOUNDNESS twin of `seq_array_conflicting_definitions_never_sat` at the
+/// BitVec-indexed shape the fix above newly resolves: two definitions of the
+/// SAME application are jointly UNSAT (`const 0 != const 1`).
+#[test]
+fn bitvec_indexed_uf_conflicting_definitions_never_sat() {
+    let (_exec, verdict) = solve(
+        "(set-logic ALL)\
+         (declare-sort Elem 0)\
+         (declare-fun v () Elem)\
+         (declare-fun g (Elem) (Array (_ BitVec 4) Int))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 0) (g v)))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 1) (g v)))\
+         (check-sat)",
+    );
+    assert_ne!(verdict, "sat", "conflicting definitions are jointly UNSAT");
+}
+
+/// SOUNDNESS twin of `seq_array_congruent_apps_with_different_definitions_never_sat`
+/// at the BitVec-indexed shape: `v = w` forces `g(v) = g(w)`, so binding them to
+/// DIFFERENT const-arrays is jointly UNSAT. This is exactly the hazard the
+/// congruence filter in `collect_array_completion_graph` fail-closes on —
+/// two same-symbol applications make it refuse BOTH definitions.
+#[test]
+fn bitvec_indexed_uf_congruent_apps_with_different_definitions_never_sat() {
+    let (_exec, verdict) = solve(
+        "(set-logic ALL)\
+         (declare-sort Elem 0)\
+         (declare-fun v () Elem)\
+         (declare-fun w () Elem)\
+         (declare-fun g (Elem) (Array (_ BitVec 4) Int))\
+         (assert (= v w))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 0) (g v)))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 1) (g w)))\
+         (check-sat)",
+    );
+    assert_ne!(
+        verdict, "sat",
+        "congruence makes the definitions jointly UNSAT"
+    );
+}
+
+/// SOUNDNESS twin of `seq_array_definition_conflicting_point_fact_never_sat` at
+/// the BitVec-indexed shape: the newly-published definitional interpretation
+/// must REFUTE a contradicting read, never launder it.
+/// `select(const-array 0, #x3) = 0 != 7`.
+#[test]
+fn bitvec_indexed_uf_definition_conflicting_point_fact_never_sat() {
+    let (_exec, verdict) = solve(
+        "(set-logic ALL)\
+         (declare-sort Elem 0)\
+         (declare-fun v () Elem)\
+         (declare-fun g (Elem) (Array (_ BitVec 4) Int))\
+         (assert (= ((as const (Array (_ BitVec 4) Int)) 0) (g v)))\
+         (assert (= (select (g v) #x3) 7))\
+         (check-sat)",
+    );
+    assert_ne!(verdict, "sat", "the point fact contradicts the definition");
+}

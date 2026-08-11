@@ -15,6 +15,9 @@ name = "ay_lrat_check"
 path = "src/lib.rs"
 
 [dependencies]
+# Non-optional on purpose: this crate ships a bin target, and every bin must
+# be able to arm the kernel memory bound (see crates/ay-sys/src/govern.rs).
+ay-sys.workspace = true
 thiserror = { workspace = true }
 ay-core.workspace = true
 ay-proof-common.workspace = true

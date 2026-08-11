@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated lia integration tests for ay-dpll.
-//! Groups 28 test modules into a single binary to reduce link time.
+//! Groups 36 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -57,6 +57,12 @@ mod lia_soundness_4993;
 mod lia_transitive_equality_2737;
 #[path = "group_lia/lia_unknown_recovery_4785.rs"]
 mod lia_unknown_recovery_4785;
+#[path = "group_lia/lira_big_m_relu_5947.rs"]
+mod lira_big_m_relu_5947;
+#[path = "group_lia/lira_cross_sort_soundness.rs"]
+mod lira_cross_sort_soundness;
+#[path = "group_lia/lira_multi_var_cross_sort.rs"]
+mod lira_multi_var_cross_sort;
 #[path = "group_lia/lira_to_int_5944.rs"]
 mod lira_to_int_5944;
 #[path = "group_lia/lira_to_int_cross_sort_6217.rs"]
@@ -73,5 +79,7 @@ mod qf_lia_ite_completeness_4003;
 mod qflia_p0_canaries_8707;
 #[path = "group_lia/qflia_regression_8736.rs"]
 mod qflia_regression_8736;
+#[path = "group_lia/symbolic_mod_uf_model_gap.rs"]
+mod symbolic_mod_uf_model_gap;
 #[path = "group_lia/symbolic_rem_soundness.rs"]
 mod symbolic_rem_soundness;

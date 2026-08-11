@@ -438,9 +438,118 @@ impl CongruenceClosure {
 
         // Alternating unit-propagation + equivalence-propagation loop.
         // CaDiCaL congruence.cpp:4848-4896.
+        //
+        // MEMORY BOUND. This fixpoint had none, and merges schedule further
+        // merges while growing the per-gate input vectors, so it can generate
+        // work faster than it drains: measured on the SAT-COMP 2026 instance
+        // `post-cbmc-aes-ee-r2` (a 33 MB file that 28 of 31 official solvers
+        // solve) it grew at ~0.7 GB/s to 82.75 GB, straight past `--memory`.
+        // `--memory` could not stop it because `poll_process_memory_limit` is
+        // gated on a CONFLICT cadence and is only called from the search loop,
+        // so nothing consults the limit while preprocessing runs.
+        //
+        // Consulting `ay_sys::process_memory_exceeded()` uses the operator's
+        // ACTUAL configured limit rather than an invented constant, and the
+        // exit is `Ok`, never `Err` — `Err` here carries a `Literal` and means
+        // "contradiction found", so exiting through it would be reported as
+        // UNSAT. A partial closure is sound: every equivalence and unit already
+        // in `equivalence_edges` / `uf` was derived by a real congruence merge,
+        // and stopping between merges simply discovers fewer of them.
+        // Iterations before the memory check engages at all. A healthy
+        // congruence closure converges in far fewer than this; only a runaway
+        // fixpoint — one generating work faster than it drains — gets here. This
+        // is the pass-LOCAL signal the bound needs: keying purely off the
+        // process footprint fired on instances whose large clause database was
+        // legitimate and congruence was earning its keep, costing 9 solved
+        // instances on the official 400 (104 -> 95).
+        const CONGRUENCE_RUNAWAY_ITERATIONS: u64 = 200_000;
+        // `AY_SAT_CONGRUENCE_MEMORY_BOUND=0` compiles the bound out at runtime,
+        // so one binary can carry both arms of a paired A/B. It exists because
+        // the bound's price is genuinely unsettled: the full-400 delta against
+        // an unbounded build (104 -> 95) sits inside the +/-8 borderline churn
+        // measured between comparable runs, and re-shaping the bound recovered
+        // only 1 of the 24 affected instances. Separate builds compared across
+        // separate runs cannot resolve that; arms inside ONE sweep can.
+        let bound_enabled = {
+            use std::sync::OnceLock;
+            static F: OnceLock<bool> = OnceLock::new();
+            *F.get_or_init(|| {
+                // DEFAULT OFF, by measurement. Two paired full-400 A/Bs at
+                // 300 s (both arms inside ONE sweep, so machine drift cannot
+                // masquerade as the effect) put the bound's price at a
+                // consistent 3-4 solved instances:
+                //
+                //   rep 1   bound 94   no-bound  97
+                //   rep 2   bound 96   no-bound 100
+                //
+                // against a between-rep drift of only 2-3, and PAR-2 worse with
+                // it in both reps. Meanwhile the bound is INERT on the very
+                // instance that motivated it: `post-cbmc-aes-ee-r2`'s 82.75 GB
+                // runaway is no longer reproducible, because the XOR emission
+                // budget and the preprocessing memory poll now catch it first.
+                // So it was paying a real price to defend against a problem that
+                // no longer exists.
+                //
+                // The mechanism is kept, not deleted: if a future change
+                // reintroduces an unbounded congruence fixpoint, setting
+                // `AY_SAT_CONGRUENCE_MEMORY_BOUND=1` restores the guard without
+                // re-deriving it. Re-measure before making it default again.
+                std::env::var("AY_SAT_CONGRUENCE_MEMORY_BOUND")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            })
+        };
+        let mut budget_ticks: u64 = 0;
         loop {
+            // Poll on a coarse cadence; the call reads a cached limit but the
+            // footprint query is a syscall on some platforms.
+            budget_ticks = budget_ticks.wrapping_add(1);
+            // Engage only at the operator's declared limit — never earlier.
+            //
+            // This threshold is load-bearing and was calibrated by measurement,
+            // not by reasoning about the mechanism, because the mechanism
+            // reasoning was wrong twice:
+            //
+            //   50 % -> cost **24** solved instances on the official 400
+            //           (104 -> 80), while driving memory losses to zero.
+            //   85 % -> still cost 16 of those 24.
+            //
+            // Congruence earns its memory on ordinary instances, so ANY
+            // fraction below the limit taxes healthy solves to defend against a
+            // pathological few. `process_memory_exceeded()` (95 %, the same
+            // signal the solver's own interrupt uses) leaves normal instances
+            // untouched and does the one job actually needed: stop a runaway
+            // from going FAR past the declared limit — the observed case was a
+            // 33 MB input reaching 82.75 GB, which can take the machine down.
+            if bound_enabled
+                && budget_ticks > CONGRUENCE_RUNAWAY_ITERATIONS
+                && budget_ticks % 64 == 0
+                && ay_sys::process_memory_exceeded()
+            {
+                self.stats.memory_abandoned_closures =
+                    self.stats.memory_abandoned_closures.saturating_add(1);
+                break;
+            }
             // Phase A: drain all pending units.
+            //
+            // The budget check has to live HERE as well as at the outer loop
+            // top: this inner drain can run for a very long time without
+            // returning, and it is where the growth actually happens, so an
+            // outer-loop-only check never fires in time.
             while let Some(unit_lit) = units_to_propagate.pop_front() {
+                budget_ticks = budget_ticks.wrapping_add(1);
+                if bound_enabled
+                    && budget_ticks > CONGRUENCE_RUNAWAY_ITERATIONS
+                    && budget_ticks % 64 == 0
+                    && ay_sys::process_memory_exceeded()
+                {
+                    self.stats.memory_abandoned_closures =
+                        self.stats.memory_abandoned_closures.saturating_add(1);
+                    units_to_propagate.clear();
+                    schedule.clear();
+                    break;
+                }
                 for &polarity in &[unit_lit, unit_lit ^ 1] {
                     if polarity >= num_lits {
                         continue;

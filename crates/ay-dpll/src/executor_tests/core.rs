@@ -11,6 +11,127 @@ use ay_frontend::parse;
 use ay_frontend::sexp::parse_sexp;
 
 #[test]
+fn smtlib27_polymorphic_identity_declaration_is_satisfiable() {
+    let commands = parse(
+        r#"
+        (set-logic UF)
+        (declare-sort-parameter A)
+        (declare-fun id (A) A)
+        (assert (forall ((x A)) (= (id x) x)))
+        (check-sat)
+        "#,
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    assert_eq!(executor.execute_all(&commands).unwrap(), vec!["sat"]);
+}
+
+#[test]
+fn smtlib27_sort_parameter_is_global_across_push_pop_and_reset_assertions() {
+    let commands = parse(
+        r#"
+        (set-logic UF)
+        (set-option :global-declarations false)
+        (push 1)
+        (declare-sort-parameter A)
+        (pop 1)
+        (reset-assertions)
+        (assert (forall ((x A)) (= x x)))
+        (check-sat)
+        "#,
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    assert_eq!(executor.execute_all(&commands).unwrap(), vec!["sat"]);
+}
+
+#[test]
+fn smtlib27_bool_vs_int_schematic_cardinality_example() {
+    let bool_only = parse(
+        r#"
+        (set-logic UF)
+        (declare-sort-parameter A)
+        (assert (forall ((x A) (y A) (z A))
+                  (or (= x y) (= x z) (= y z))))
+        (check-sat)
+        "#,
+    )
+    .expect("Bool fixture parses");
+    let with_int = parse(
+        r#"
+        (set-logic UFLIA)
+        (declare-sort-parameter A)
+        (assert (forall ((x A) (y A) (z A))
+                  (or (= x y) (= x z) (= y z))))
+        (check-sat)
+        "#,
+    )
+    .expect("Int fixture parses");
+
+    let mut bool_executor = Executor::new();
+    assert_eq!(
+        bool_executor.execute_all(&bool_only).unwrap(),
+        vec!["sat"],
+        "Bool has cardinality two"
+    );
+    let mut int_executor = Executor::new();
+    assert_eq!(
+        int_executor.execute_all(&with_int).unwrap(),
+        vec!["unsat"],
+        "the required Int instance has cardinality greater than two"
+    );
+}
+
+#[test]
+fn smtlib27_unbounded_sort_constructor_universe_fails_closed() {
+    let commands = parse(
+        r#"
+        (set-logic QF_AX)
+        (declare-sort-parameter A)
+        (assert (forall ((x A)) (= x x)))
+        (check-sat)
+        "#,
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    assert_eq!(executor.execute_all(&commands).unwrap(), vec!["unknown"]);
+    assert_eq!(executor.unknown_reason(), Some(UnknownReason::Unsupported));
+}
+
+#[test]
+fn smtlib27_polymorphic_definition_survives_reset_assertions() {
+    let commands = parse(
+        r#"
+        (set-logic UF)
+        (declare-sort-parameter X)
+        (define-fun id ((x X)) X x)
+        (reset-assertions)
+        (assert (not (= (id true) true)))
+        (check-sat)
+        "#,
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    assert_eq!(executor.execute_all(&commands).unwrap(), vec!["unsat"]);
+}
+
+#[test]
+fn smtlib27_polymorphic_definition_over_infinite_sort_universe_fails_closed() {
+    let commands = parse(
+        r#"
+        (set-logic QF_AX)
+        (declare-sort-parameter X)
+        (define-fun id ((x X)) X x)
+        (check-sat)
+        "#,
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    assert_eq!(executor.execute_all(&commands).unwrap(), vec!["unknown"]);
+    assert_eq!(executor.unknown_reason(), Some(UnknownReason::Unsupported));
+}
+
+#[test]
 fn test_executor_simple_sat() {
     let input = r#"
         (set-logic QF_UF)

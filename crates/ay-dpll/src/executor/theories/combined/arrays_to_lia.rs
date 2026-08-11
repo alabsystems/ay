@@ -951,6 +951,20 @@ impl Executor {
                             }
                         }
                         *term = rewritten;
+                    } else if Self::is_set_card_non_negative_axiom(&self.ctx.terms, rewritten) {
+                        // ... except the set-cardinality bridge axiom, whose
+                        // schema AY's strict checker validates on its own
+                        // (`(<= 0 (set.card s))` holds for every set). Demoting
+                        // it left every `set.card` refutation externally
+                        // uncheckable even though the surrounding steps
+                        // (`la_generic`, `ite_pos2`, resolution) all checked.
+                        *step = ProofStep::TheoryLemma {
+                            theory: "sets".to_string(),
+                            clause: vec![rewritten],
+                            farkas: None,
+                            kind: TheoryLemmaKind::SetCardNonNegative,
+                            lia: None,
+                        };
                     } else {
                         // Not a problem assertion: a saturation axiom,
                         // definitional guard, or ROW-unrolled original —

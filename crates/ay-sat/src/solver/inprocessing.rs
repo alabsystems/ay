@@ -116,6 +116,25 @@ pub(super) enum FactorSkipReason {
     NoNewMarks,
 }
 
+impl FactorSkipReason {
+    /// Dense index for per-reason counting.
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::DisabledFlag => 0,
+            Self::IntervalNotDue => 1,
+            Self::DelayGuard => 2,
+            Self::ThresholdDelay => 3,
+            Self::NoNewMarks => 4,
+        }
+    }
+
+    /// Stable tag for `--stats`, in `index()` order.
+    pub(super) const TAGS: [&'static str; FactorSkipReason::COUNT] =
+        ["disabled", "interval", "delay", "threshold", "no-marks"];
+
+    pub(super) const COUNT: usize = 5;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HtrSkipReason {
     DisabledFlag,
@@ -306,6 +325,9 @@ impl Solver {
             "BUG: collect_level0_garbage at decision level {}",
             self.decision_level,
         );
+        if self.solve_deadline_expired() || self.is_interrupted() {
+            return false;
+        }
         // #lra-inc-engine (S3): the incremental QF_LRA engine lane keeps the
         // arena APPEND-ONLY so every check-sat's reset stays on the
         // state-preserving incremental path. This DESTRUCTIVE sweep (deleting
@@ -333,7 +355,9 @@ impl Solver {
         // materialize new level-0 unit proofs that later explicit-only hint
         // collection needs to see immediately.
         if self.cold.lrat_enabled {
-            self.materialize_level0_unit_proofs();
+            if !self.materialize_level0_unit_proofs_interruptible() {
+                return false;
+            }
         }
 
         // Per-clause BVE occ notifications (#8364) replace the old bulk
@@ -521,7 +545,10 @@ impl Solver {
                 }
 
                 if self.cold.lrat_enabled {
-                    self.materialize_level0_unit_proofs();
+                    if !self.materialize_level0_unit_proofs_interruptible() {
+                        deadline_truncated = true;
+                        break;
+                    }
                 }
 
                 // Scan literals for level-0 assignments. Literals are copied into

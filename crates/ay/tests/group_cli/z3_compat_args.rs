@@ -18,6 +18,14 @@ impl Drop for CleanupGuard {
     }
 }
 
+struct DirectoryCleanupGuard(PathBuf);
+
+impl Drop for DirectoryCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
 }
@@ -38,6 +46,12 @@ fn write_temp(contents: &str, extension: &str) -> (PathBuf, CleanupGuard) {
     let (path, cleanup) = temp_path(extension);
     std::fs::write(&path, contents).expect("write temp input");
     (path, cleanup)
+}
+
+fn temp_dir() -> (PathBuf, DirectoryCleanupGuard) {
+    let (path, _) = temp_path("dir");
+    std::fs::create_dir(&path).expect("create temporary directory");
+    (path.clone(), DirectoryCleanupGuard(path))
 }
 
 fn write_dash_prefixed_temp(contents: &str, extension: &str) -> (PathBuf, CleanupGuard) {
@@ -122,8 +136,18 @@ fn run_ay_stdin_with_args(
 }
 
 fn run_program_stdin(program: &str, input: &str, ay_child: bool) -> std::process::Output {
+    run_program_stdin_with_args(program, &[], input, ay_child)
+}
+
+fn run_program_stdin_with_args(
+    program: &str,
+    args: &[&str],
+    input: &str,
+    ay_child: bool,
+) -> std::process::Output {
     let mut command = Command::new(program);
     command
+        .args(args)
         .arg("-in")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -149,6 +173,40 @@ fn run_installed_z3(input: &str) -> Option<std::process::Output> {
         return None;
     }
     Some(run_program_stdin(z3, input, false))
+}
+
+fn parameter_inventory_from_listing(listing: &str) -> (Vec<String>, Vec<String>) {
+    let mut module: Option<String> = None;
+    let mut modules = Vec::new();
+    let mut parameters = Vec::new();
+    for line in listing.lines() {
+        if line == "Global parameters" {
+            module = Some(String::new());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[module] ") {
+            let name = rest.split([',', ' ']).next().expect("module name");
+            module = Some(name.to_string());
+            modules.push(name.to_string());
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("    ") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once(" (") else {
+            continue;
+        };
+        let Some(module) = module.as_deref() else {
+            continue;
+        };
+        parameters.push(if module.is_empty() {
+            name.to_string()
+        } else {
+            format!("{module}.{name}")
+        });
+    }
+    modules.dedup();
+    (modules, parameters)
 }
 
 #[test]
@@ -194,7 +252,7 @@ fn question_mark_alias_prints_help() {
     );
     assert!(
         stdout.contains("-tactics[:NAME]"),
-        "expected unsupported Z3 catalog flags in help, got: {stdout}"
+        "expected Z3 catalog flags in help, got: {stdout}"
     );
 }
 
@@ -453,7 +511,7 @@ fn invalid_verbosity_alias_is_rejected_explicitly() {
 
 #[test]
 #[timeout(30_000)]
-fn parameter_listing_alias_prints_supported_z3_subset() {
+fn parameter_listing_alias_prints_z3_500_database() {
     let output = Command::new(ay_binary())
         .arg("-p")
         .output()
@@ -461,7 +519,7 @@ fn parameter_listing_alias_prints_supported_z3_subset() {
 
     assert!(
         output.status.success(),
-        "-p should print supported Z3-style params: {}",
+        "-p should print the complete Z3 5.0.0 parameter database: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -490,7 +548,7 @@ fn parameter_listing_alias_prints_supported_z3_subset() {
 
 #[test]
 #[timeout(30_000)]
-fn parameter_description_alias_prints_descriptions() {
+fn parameter_description_alias_prints_z3_descriptions() {
     let output = Command::new(ay_binary())
         .arg("-pd")
         .output()
@@ -498,7 +556,7 @@ fn parameter_description_alias_prints_descriptions() {
 
     assert!(
         output.status.success(),
-        "-pd should print supported Z3-style param descriptions: {}",
+        "-pd should print the complete Z3 5.0.0 parameter descriptions: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -507,14 +565,14 @@ fn parameter_description_alias_prints_descriptions() {
         "expected timeout description: {stdout}"
     );
     assert!(
-        stdout.contains("print ay statistics when set to true"),
+        stdout.contains("enable/disable statistics"),
         "expected stats description: {stdout}"
     );
 }
 
 #[test]
 #[timeout(30_000)]
-fn trace_param_description_alias_prints_compat_noop_contract() {
+fn trace_param_description_alias_matches_z3() {
     let output = Command::new(ay_binary())
         .arg("-pp:trace_file_name")
         .output()
@@ -522,13 +580,13 @@ fn trace_param_description_alias_prints_compat_noop_contract() {
 
     assert!(
         output.status.success(),
-        "-pp:trace_file_name should describe the supported trace-file compatibility param: {}",
+        "-pp:trace_file_name should match the Z3 5.0.0 parameter description: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("trace_file_name") && stdout.contains("accepted as a compatibility no-op"),
-        "expected trace_file_name no-op description: {stdout}"
+        stdout.contains("trace_file_name") && stdout.contains("trace out file name"),
+        "expected exact trace_file_name description: {stdout}"
     );
 }
 
@@ -542,7 +600,7 @@ fn parameter_module_alias_prints_supported_module() {
 
     assert!(
         output.status.success(),
-        "-pm:fp should print the supported fp compatibility subset: {}",
+        "-pm:fp should print the complete Z3 5.0.0 fp module: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -566,7 +624,7 @@ fn parameter_module_list_alias_prints_supported_modules() {
 
     assert!(
         output.status.success(),
-        "-pm should print supported Z3-style compatibility modules: {}",
+        "-pm should print every Z3 5.0.0 parameter module: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -598,7 +656,7 @@ fn parameter_description_lookup_alias_prints_one_param() {
 
     assert!(
         output.status.success(),
-        "-pp:timeout should print a supported parameter description: {}",
+        "-pp:timeout should print the Z3 5.0.0 parameter description: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -613,28 +671,280 @@ fn parameter_description_lookup_alias_prints_one_param() {
 }
 
 #[test]
-#[timeout(30_000)]
-fn unsupported_z3_tactic_catalog_is_rejected_explicitly() {
-    for flag in ["-tactics", "-tactics:ctx-solver-simplify"] {
-        let output = Command::new(ay_binary())
+#[timeout(60_000)]
+fn z3_500_parameter_and_markdown_discovery_is_byte_exact() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+
+    for flag in ["-p", "-pd", "-pm", "-pmmd", "-p:ignored", "-pd:ignored"] {
+        let expected = Command::new(z3)
             .arg(flag)
             .output()
+            .unwrap_or_else(|error| panic!("spawn z3 {flag}: {error}"));
+        let actual = Command::new(ay_binary())
+            .arg(flag)
+            .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+            .output()
             .unwrap_or_else(|error| panic!("spawn ay {flag}: {error}"));
-
-        assert!(
-            !output.status.success(),
-            "{flag} should be rejected until ay exposes a real tactic catalog"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("unsupported Z3 option '{flag}'")),
-            "expected explicit unsupported-option error for {flag}: {stderr}"
-        );
-        assert!(
-            stderr.contains("tactic catalog"),
-            "expected honest tactic catalog diagnostic for {flag}: {stderr}"
-        );
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
     }
+
+    let listing = Command::new(z3).arg("-p").output().expect("spawn z3 -p");
+    let listing = String::from_utf8(listing.stdout).expect("Z3 -p is UTF-8");
+    let (modules, parameters) = parameter_inventory_from_listing(&listing);
+    assert_eq!(modules.len(), 21);
+    assert_eq!(parameters.len(), 678);
+
+    for module in modules.iter().map(String::as_str).chain(["global"]) {
+        for prefix in ["-pm:", "-pmmd:"] {
+            if prefix == "-pm:" && module == "global" {
+                continue;
+            }
+            let flag = format!("{prefix}{module}");
+            let expected = Command::new(z3)
+                .arg(&flag)
+                .output()
+                .expect("spawn z3 module help");
+            let actual = Command::new(ay_binary())
+                .arg(&flag)
+                .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+                .output()
+                .expect("spawn ay module help");
+            assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+            assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+            assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+        }
+    }
+
+    const NULL_DEFAULTS: &[&str] = &[
+        "fp.print_aig",
+        "fp.spacer.logic",
+        "fp.spacer.trace_file",
+        "nlsat.known_sat_assignment_file_name",
+        "opt.solution_prefix",
+        "sat.drat.file",
+        "sat.inprocess.out",
+        "smt.logic",
+        "smt.mbqi.id",
+        "solver.cancel_backup_file",
+        "solver.proof.log",
+        "solver.smtlib2_log",
+        "tactic.default_tactic",
+    ];
+    for parameter in parameters {
+        let flag = format!("-pp:{parameter}");
+        let actual = Command::new(ay_binary())
+            .arg(&flag)
+            .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+            .output()
+            .expect("spawn ay parameter help");
+        if NULL_DEFAULTS.contains(&parameter.as_str()) {
+            assert!(
+                actual.status.success(),
+                "AY must safely render Z3's null-default crash case {parameter}"
+            );
+            assert!(
+                String::from_utf8_lossy(&actual.stdout).contains("default value:  "),
+                "safe null-default record for {parameter}"
+            );
+            continue;
+        }
+        let expected = Command::new(z3)
+            .arg(&flag)
+            .output()
+            .expect("spawn z3 parameter help");
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+    }
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_parameter_errors_normalization_and_terminal_order_are_exact() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+    for args in [
+        vec!["-pp"],
+        vec!["-pp:"],
+        vec!["-pp:no-such"],
+        vec!["-pp:no.such"],
+        vec!["-pp:smt.no-such"],
+        vec!["-pp:SMT.RANDOM-SEED"],
+        vec!["-pp:well-sorted-check"],
+        vec!["-pp:proof-mode"],
+        vec!["-pm:no-such"],
+        vec!["-pmmd:no-such"],
+        vec!["-p", "-tactics"],
+        vec!["-tactics", "-p"],
+    ] {
+        let expected = Command::new(z3)
+            .args(&args)
+            .output()
+            .expect("spawn z3 parameter control");
+        let actual = Command::new(ay_binary())
+            .args(&args)
+            .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+            .output()
+            .expect("spawn ay parameter control");
+        assert_eq!(actual.status.code(), expected.status.code(), "{args:?}");
+        assert_eq!(actual.stdout, expected.stdout, "{args:?} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{args:?} stderr");
+    }
+}
+
+#[test]
+#[timeout(30_000)]
+fn explicit_z3_mode_help_and_version_are_byte_exact_but_ay_help_is_preserved() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+    for flag in ["-h", "-?", "--help", "-version", "--version", "-v", "-V"] {
+        let expected = Command::new(z3)
+            .arg(flag)
+            .output()
+            .expect("spawn z3 metadata");
+        let actual = Command::new(ay_binary())
+            .args(["--z3-mode", flag])
+            .output()
+            .expect("spawn ay Z3 metadata");
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+    }
+
+    let ordinary = Command::new(ay_binary())
+        .arg("-?")
+        .output()
+        .expect("spawn ay help");
+    assert!(ordinary.status.success());
+    assert!(String::from_utf8_lossy(&ordinary.stdout).contains("AY: A proof-oriented"));
+    assert_ne!(
+        ordinary.stdout,
+        Command::new(z3)
+            .arg("-?")
+            .output()
+            .expect("spawn z3 help")
+            .stdout
+    );
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_500_catalogs_and_all_detailed_profiles_are_byte_exact() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+
+    for (catalog_flag, detail_prefix) in [
+        ("-tactics", Some("-tactics:")),
+        ("-probes", None),
+        ("-simplifiers", Some("-simplifiers:")),
+    ] {
+        let expected = run_program_stdin_with_args(z3, &[catalog_flag], "", false);
+        let actual = run_program_stdin_with_args(ay_binary(), &[catalog_flag], "", true);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{catalog_flag}"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "{catalog_flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{catalog_flag} stderr");
+
+        let Some(detail_prefix) = detail_prefix else {
+            continue;
+        };
+        let catalog = String::from_utf8(expected.stdout).expect("Z3 catalog is UTF-8");
+        for line in catalog.lines() {
+            let name = line
+                .strip_prefix("- ")
+                .and_then(|rest| rest.split_once(' '))
+                .map(|(name, _)| name)
+                .expect("Z3 catalog line has a name and description");
+            let flag = format!("{detail_prefix}{name}");
+            let expected = run_program_stdin_with_args(z3, &[&flag], "", false);
+            let actual = run_program_stdin_with_args(ay_binary(), &[&flag], "", true);
+            assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+            assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+            assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+
+            if detail_prefix == "-tactics:" {
+                let markdown_flag = format!("-tacticsmd:{name}");
+                let expected = run_program_stdin_with_args(z3, &[&markdown_flag], "", false);
+                let actual = run_program_stdin_with_args(ay_binary(), &[&markdown_flag], "", true);
+                assert_eq!(
+                    actual.status.code(),
+                    expected.status.code(),
+                    "{markdown_flag}"
+                );
+                assert_eq!(actual.stdout, expected.stdout, "{markdown_flag} stdout");
+                assert_eq!(actual.stderr, expected.stderr, "{markdown_flag} stderr");
+            }
+        }
+    }
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_catalog_unknown_names_probe_suffix_and_no_input_semantics_match() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+
+    for flag in [
+        "-tactics:no-such-tactic",
+        "-simplifiers:no-such-simplifier",
+        "-probes:size",
+    ] {
+        let expected = run_program_stdin_with_args(z3, &[flag], "", false);
+        let actual = run_program_stdin_with_args(ay_binary(), &[flag], "", true);
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+    }
+
+    for flag in [
+        "-tactics",
+        "-tactics:simplify",
+        "-tacticsmd:simplify",
+        "-probes",
+        "-simplifiers",
+    ] {
+        let expected = Command::new(z3)
+            .arg(flag)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn z3 {flag}: {error}"));
+        let actual = Command::new(ay_binary())
+            .arg(flag)
+            .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn ay {flag}: {error}"));
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+    }
+
+    let expected = Command::new(z3)
+        .arg("-tacticsmd")
+        .output()
+        .expect("spawn z3");
+    let actual = Command::new(ay_binary())
+        .arg("-tacticsmd")
+        .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+        .output()
+        .expect("spawn ay");
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
 }
 
 #[test]
@@ -642,20 +952,7 @@ fn unsupported_z3_tactic_catalog_is_rejected_explicitly() {
 fn unsupported_z3_help_surface_flags_are_rejected_explicitly() {
     for (flag, expected) in [
         ("-dl", "Datalog input is not supported"),
-        ("-wcnf", "Weighted CNF DIMACS is not supported"),
-        ("-lp", "Flag-style CPLEX LP parsing is not supported"),
         ("-log", "Z3 log input is not supported"),
-        ("-probes", "ay does not implement Z3 probes"),
-        ("-simplifiers", "does not expose Z3's simplifier catalog"),
-        (
-            "-simplifiers:ctx-simplify",
-            "does not expose Z3's simplifier catalog",
-        ),
-        (
-            "-pmmd:fp",
-            "Markdown Z3 parameter listings are not supported",
-        ),
-        ("-pp", "option argument (-pp:name) is missing"),
     ] {
         let output = Command::new(ay_binary())
             .arg(flag)
@@ -680,7 +977,7 @@ fn unsupported_z3_help_surface_flags_are_rejected_explicitly() {
 
 #[test]
 #[timeout(30_000)]
-fn unsupported_z3_input_mode_is_rejected_with_suggestion() {
+fn explicit_opb_flag_matches_exact_z3_500_rejection() {
     let (input, _cleanup) = write_temp("* #variable= 1 #constraint= 1\n+1 x1 >= 1 ;\n", "opb");
     let output = Command::new(ay_binary())
         .arg("-opb")
@@ -688,19 +985,59 @@ fn unsupported_z3_input_mode_is_rejected_with_suggestion() {
         .output()
         .expect("spawn ay -opb FILE");
 
-    assert!(
-        !output.status.success(),
-        "-opb flag-style parsing should be rejected explicitly"
-    );
+    assert_eq!(output.status.code(), Some(109));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unsupported Z3 option '-opb'"),
-        "expected explicit unsupported-option error: {stderr}"
+        stderr.contains("Error: invalid command line option: -opb"),
+        "expected the exact Z3 5.0.0 command-line rejection: {stderr}"
     );
     assert!(
-        stderr.contains("ay pb solve FILE"),
-        "expected pb subcommand suggestion: {stderr}"
+        stderr.contains("For usage information: z3 -h"),
+        "expected the exact Z3 usage hint: {stderr}"
     );
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_optimization_stdin_modes_match_exact_reference() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+    for (flag, input) in [
+        ("-wcnf", "p wcnf 1 1 2\n1 1 0\n"),
+        (
+            "-pbo",
+            "* #variable= 1 #constraint= 1\nmin: +1 x1;\n+1 x1 >= 1;\n",
+        ),
+        ("-lp", "minimize\nx\nsubject to\nx >= 2\nend\n"),
+    ] {
+        let expected = run_program_stdin_with_args(z3, &[flag], input, false);
+        let actual = run_program_stdin_with_args(ay_binary(), &[flag], input, true);
+        assert_eq!(actual.status.code(), expected.status.code(), "{flag}");
+        assert_eq!(actual.stdout, expected.stdout, "{flag} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{flag} stderr");
+    }
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_opb_extension_dispatch_matches_exact_reference() {
+    let z3 = "/opt/homebrew/bin/z3";
+    if !Path::new(z3).is_file() {
+        return;
+    }
+    let input = "* #variable= 1 #constraint= 1\nmin: +1 x1;\n+1 x1 >= 1;\n";
+    let (path, _cleanup) = write_temp(input, "opb");
+    let expected = Command::new(z3).arg(&path).output().expect("spawn z3 OPB");
+    let actual = Command::new(ay_binary())
+        .arg(&path)
+        .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+        .output()
+        .expect("spawn ay OPB");
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
 }
 
 #[test]
@@ -1449,6 +1786,34 @@ fn smt_pop_underflow_is_recoverable_but_nonzero_like_z3() {
 
 #[test]
 #[timeout(30_000)]
+fn reset_assertions_empties_the_stack_by_default_unlike_z3() {
+    // The other half of the deliberate split: AY's DEFAULT surface follows
+    // SMT-LIB 2.7, where `(reset-assertions)` empties the assertion stack to
+    // level zero. z3 retains the level instead, and AY reproduces that only
+    // under the drop-in surface. Without this test the default could drift to
+    // z3's behavior unnoticed, since every other assertion here targets z3.
+    let script = "(set-option :print-success true)
+(push)
+(reset-assertions)
+(get-info :assertion-stack-levels)
+(pop)
+(exit)
+";
+
+    let output = run_stdin(script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(:assertion-stack-levels 0)"),
+        "SMT-LIB 2.7 empties the stack to level 0 by default: {stdout}"
+    );
+    assert!(
+        stdout.contains("invalid pop command"),
+        "the pop is invalid once the stack is empty: {stdout}"
+    );
+}
+
+#[test]
+#[timeout(30_000)]
 fn smt_reset_assertions_keeps_visible_scopes_like_z3() {
     let script = "(set-option :print-success true)
 (push)
@@ -1462,7 +1827,10 @@ fn smt_reset_assertions_keeps_visible_scopes_like_z3() {
 (exit)
 ";
 
-    let output = run_stdin(script);
+    // Z3's surface -- see `smt_assertion_stack_levels_track_visible_scopes_like_z3`.
+    // Under SMT-LIB 2.7 the `(reset-assertions)` here drops the pushed level, so
+    // the second `(pop)` is genuinely invalid; under z3 it is not.
+    let output = run_ay_stdin_with_args(&["--z3-mode"], script, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -2280,7 +2648,12 @@ fn smt_assertion_stack_levels_track_visible_scopes_like_z3() {
 (exit)
 ";
 
-    let output = run_stdin(script);
+    // Z3's surface, not AY's default: `(reset-assertions)` RETAINS the public
+    // assertion-stack level in z3, while SMT-LIB 2.7 empties it to zero. AY
+    // implements the standard by default and z3's behavior under the drop-in
+    // surface (`--z3-mode`, or an `argv[0]` of `z3`), so a "like z3" assertion
+    // belongs on that surface. The default is pinned separately below.
+    let output = run_ay_stdin_with_args(&["--z3-mode"], script, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -4140,22 +4513,42 @@ fn trace_key_value_params_are_accepted_as_noops() {
 
     let z3 = "/opt/homebrew/bin/z3";
     if Path::new(z3).is_file() {
+        // Z3 5.0.0 accepts the Boolean trace parameter on its command line,
+        // but (despite listing the string parameter under `-p`) treats
+        // `trace_file_name=...` as a second input path and rejects it. AY's
+        // acceptance of the filename spelling is therefore an intentional
+        // compatibility extension, not a claimed exact-oracle behavior.
+        let (z3_working_dir, _z3_working_dir_cleanup) = temp_dir();
+        let z3_trace_enabled = Command::new(z3)
+            .arg("trace=true")
+            .arg(&input)
+            .current_dir(z3_working_dir)
+            .output()
+            .expect("spawn installed z3 trace=true");
+        let z3_trace_stdout = String::from_utf8_lossy(&z3_trace_enabled.stdout);
+        let z3_trace_stderr = String::from_utf8_lossy(&z3_trace_enabled.stderr);
+        assert!(
+            z3_trace_enabled.status.success(),
+            "installed z3 should accept trace=true; stdout={z3_trace_stdout}, stderr={z3_trace_stderr}"
+        );
+        assert!(
+            z3_trace_stdout.lines().any(|line| line == "sat"),
+            "installed z3 should solve the input after trace=true: {z3_trace_stdout}"
+        );
+
         let (z3_trace_path, _z3_trace_cleanup) = temp_path("log");
         let z3_output = Command::new(z3)
-            .arg("trace=true")
             .arg(format!("trace_file_name={}", z3_trace_path.display()))
             .arg(&input)
             .output()
-            .expect("spawn installed z3 trace=true trace_file_name=PATH");
+            .expect("spawn installed z3 trace_file_name=PATH");
         let z3_stdout = String::from_utf8_lossy(&z3_output.stdout);
         let z3_stderr = String::from_utf8_lossy(&z3_output.stderr);
         assert!(
-            z3_output.status.success(),
-            "installed z3 should accept trace params; stdout={z3_stdout}, stderr={z3_stderr}"
-        );
-        assert!(
-            z3_stdout.lines().any(|line| line == "sat"),
-            "installed z3 should solve the input after trace params: {z3_stdout}"
+            !z3_output.status.success()
+                && z3_stderr.contains("input file was already specified")
+                && z3_stderr.contains("trace_file_name="),
+            "Z3 5.0.0 trace_file_name command-line behavior changed; stdout={z3_stdout}, stderr={z3_stderr}"
         );
     }
 }
@@ -4413,10 +4806,28 @@ fn piped_in_continues_after_parse_error() {
     for args in [&["--z3-mode"][..], &[][..]] {
         let output = run_ay_stdin_with_args(args, script, true);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let combined = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // z3 reports an unknown command as `unsupported` on stdout with a
+        // stderr comment naming it -- never `(error ...)`, and it does not fail
+        // the run. Measured on the oracle for this exact script:
+        //
+        //     stdout: unsupported / sat / ((x 1))
+        //     stderr: ; foobar line: 4 position: 11
+        //     exit:   0
+        //
+        // Position 11 is the `)` closing `(foobar bad)`; z3's column counter is
+        // 0-based on every line after the first.
         assert!(
-            combined.contains("error"),
-            "expected an error for the bad command (args={args:?}): {combined}"
+            stdout.contains("unsupported"),
+            "the bad command must be `unsupported` (args={args:?}): {stdout}"
+        );
+        assert!(
+            stderr.contains("; foobar line: 4 position: 11"),
+            "expected z3's unsupported-command diagnostic (args={args:?}): {stderr}"
+        );
+        assert!(
+            !stdout.contains("(error"),
+            "an unknown command must not raise (error ...) (args={args:?}): {stdout}"
         );
         assert!(
             stdout.contains("sat"),
@@ -4504,4 +4915,37 @@ fn z3_mode_get_info_version_is_consistent_z3_version() {
     let output = run_ay_stdin_with_args(&["--z3-mode"], "(get-info :version)\n", true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, "(:version \"5.0.0\")\n", "got: {stdout}");
+}
+
+#[test]
+#[timeout(30_000)]
+fn z3_mode_uses_z3_500_finite_set_typing_without_removing_native_set_extension() {
+    let legacy_set_script = "(set-logic ALL)\n\
+        (declare-const s (Set Int))\n\
+        (assert (= s (set.singleton 1)))\n\
+        (check-sat)\n";
+
+    let native = run_ay_stdin_with_args(&[], legacy_set_script, true);
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    let native_stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        native.status.success(),
+        "native AY legacy Set extension regressed:\nstdout: {native_stdout}\nstderr: {native_stderr}"
+    );
+    assert!(
+        !native_stdout.contains("(error") && !native_stderr.contains("error"),
+        "native AY legacy Set extension must remain available:\nstdout: {native_stdout}\nstderr: {native_stderr}"
+    );
+
+    let z3_mode = run_ay_stdin_with_args(&["--z3-mode"], legacy_set_script, true);
+    let z3_stdout = String::from_utf8_lossy(&z3_mode.stdout);
+    let z3_stderr = String::from_utf8_lossy(&z3_mode.stderr);
+    assert!(
+        !z3_mode.status.success(),
+        "Z3 mode must reject the Set/FiniteSet mismatch accepted by AY's native extension"
+    );
+    assert!(
+        z3_stdout.contains("FiniteSet") || z3_stderr.contains("FiniteSet"),
+        "Z3-mode diagnostic must identify the distinct FiniteSet type:\nstdout: {z3_stdout}\nstderr: {z3_stderr}"
+    );
 }

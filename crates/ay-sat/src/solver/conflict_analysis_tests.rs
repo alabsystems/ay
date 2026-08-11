@@ -2755,6 +2755,44 @@ fn test_append_lrat_unit_chain_after_materialization_skips_bfs_dependencies() {
 }
 
 #[test]
+fn materialize_level0_unit_proofs_honors_expired_solve_deadline() {
+    let proof = ProofOutput::lrat_text(Vec::new(), 0);
+    let mut solver: Solver = Solver::with_proof_output(2, proof);
+    let support = Literal::positive(Variable(0));
+    let target = Literal::positive(Variable(1));
+
+    let support_idx = solver.add_clause_db(&[support], false);
+    let support_ref = ClauseRef(support_idx as u32);
+    let support_id = solver.clause_id(support_ref);
+    let reason_idx = solver.add_clause_db(&[target, support.negated()], false);
+    let reason_ref = ClauseRef(reason_idx as u32);
+
+    solver.trail = vec![support, target];
+    solver.trail_lim.clear();
+    solver.var_data[support.variable().index()].level = 0;
+    solver.var_data[support.variable().index()].trail_pos = 0;
+    solver.var_data[support.variable().index()].reason = support_ref.0;
+    solver.var_data[target.variable().index()].level = 0;
+    solver.var_data[target.variable().index()].trail_pos = 1;
+    solver.var_data[target.variable().index()].reason = reason_ref.0;
+    assign_test_lit(&mut solver, support);
+    assign_test_lit(&mut solver, target);
+    solver.record_unit_proof_id_for_lit(support, support_id);
+
+    solver.set_solve_deadline(Some(ay_core::time::Instant::now()));
+    let started = std::time::Instant::now();
+    assert!(!solver.materialize_level0_unit_proofs_interruptible());
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "expired deadline must stop LRAT unit materialization promptly"
+    );
+    assert_eq!(solver.cold.lrat_level0_unit_materialize_cursor, 0);
+    assert_eq!(solver.cold.level0_proof_id[target.variable().index()], 0);
+    assert_eq!(solver.unit_proof_id[target.variable().index()], 0);
+}
+
+#[test]
 fn test_append_lrat_unit_chain_strict_fast_path_ignores_level0_proof_id() {
     let mut solver: Solver = Solver::new(2);
     solver.enable_lrat();

@@ -33,6 +33,17 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$REPO/scripts/lib/veripb_verdict.sh"
 
+# The checker PIN is the single source of truth for WHICH VeriPB a certified
+# claim is made against; scripts/ci/pb_certified_gate.sh reads the same file.
+PIN_FILE="$REPO/ci/veripb.pin"
+[ -r "$PIN_FILE" ] || { echo "ERROR: missing checker pin: $PIN_FILE" >&2; exit 2; }
+. "$PIN_FILE"
+for _required in VERIPB_REPO VERIPB_COMMIT VERIPB_PATCH VERIPB_PATCH_SHA256 \
+                 VERIPB_SOUNDNESS_DIR; do
+    eval "_value=\${$_required:-}"
+    [ -n "$_value" ] || { echo "ERROR: $PIN_FILE does not set $_required" >&2; exit 2; }
+done
+
 BIN=${AY_PB_BIN:-"$REPO/target/release/ay-pb"}
 [ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN (cargo build -p ay-pb --release)" >&2; exit 2; }
 
@@ -55,20 +66,47 @@ if [ -z "$VERIPB" ]; then
     done
 fi
 if [ -z "$VERIPB" ]; then
-    CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"
-    VERIPB="$CACHE/VeriPB/target/release/veripb"
+    # Build the PINNED checker: the pinned commit with the reviewed patch
+    # applied, in a directory keyed by both. This used to `git clone --depth 1`
+    # the upstream default branch and build whatever it got — an UNPINNED,
+    # UNPATCHED checker, which is precisely the binary the pin exists to
+    # exclude. That build passes the self-test battery below and still answers
+    # `s VERIFIED UNSATISFIABLE` for satisfiable formulas (see
+    # ci/veripb-soundness/03 and 04), so the gate would have certified AY's
+    # answers against a checker known to give wrong verdicts.
+    CACHE="${VERIPB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb}"
+    actual_patch_sha=$(sha256_file "$REPO/$VERIPB_PATCH" 2>/dev/null || true)
+    if [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
+        echo "ERROR: $VERIPB_PATCH does not match VERIPB_PATCH_SHA256 in $PIN_FILE" >&2
+        echo "       pin:  $VERIPB_PATCH_SHA256" >&2
+        echo "       file: ${actual_patch_sha:-<unreadable>}" >&2
+        exit 2
+    fi
+    BUILD_ID="${VERIPB_COMMIT}-$(printf '%s' "$VERIPB_PATCH_SHA256" | cut -c1-12)"
+    BUILD_DIR="$CACHE/$BUILD_ID"
+    VERIPB="$BUILD_DIR/target/release/veripb"
     if [ ! -x "$VERIPB" ]; then
-        echo "== building official VeriPB checker into $CACHE"
+        echo "== building pinned checker ($VERIPB_COMMIT + $(basename "$VERIPB_PATCH")) into $BUILD_DIR"
         mkdir -p "$CACHE"
-        [ -d "$CACHE/VeriPB" ] || git clone --quiet --depth 1 \
-            https://gitlab.com/MIAOresearch/software/VeriPB.git "$CACHE/VeriPB"
-        (cd "$CACHE/VeriPB" && cargo build --release --quiet)
+        [ -d "$BUILD_DIR" ] || git clone --quiet "$VERIPB_REPO" "$BUILD_DIR"
+        git -C "$BUILD_DIR" checkout --quiet "$VERIPB_COMMIT"
+        got=$(git -C "$BUILD_DIR" rev-parse HEAD)
+        [ "$got" = "$VERIPB_COMMIT" ] || {
+            echo "ERROR: checkout landed on $got, pin says $VERIPB_COMMIT" >&2
+            exit 2
+        }
+        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
+        (cd "$BUILD_DIR" && cargo build --release --quiet)
     fi
 fi
 echo "checker: $("$VERIPB" --version 2>&1 | head -1 || echo "$VERIPB")"
 
-# Prove the binary is a proof checker before believing a single verdict.
+# Prove the binary BEHAVES like a proof checker before believing a verdict...
 veripb_require_self_test "$VERIPB"
+# ...and that it is a CORRECT one. The self-test battery alone does not
+# establish that: published VeriPB 3.0.2 passes all six of its probes and still
+# contradicts the truth on all six fixtures below.
+veripb_require_soundness "$VERIPB" "$REPO/$VERIPB_SOUNDNESS_DIR"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ay-cert-ci.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT

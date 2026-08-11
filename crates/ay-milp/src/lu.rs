@@ -4067,3 +4067,36 @@ mod tests {
         assert_eq!(btran_before, btran_after, "rejected update changed BTRAN");
     }
 }
+
+/// Force every lazily-cached environment read in this module to happen NOW.
+///
+/// # The race this closes
+///
+/// `tune.rs` states the property the crate is supposed to have: *"The environment
+/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
+/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
+/// of the crate: 8 accessors here cache their value in a `OnceLock` and call
+/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
+/// happens to reach them — at an arbitrary point, on an arbitrary thread.
+///
+/// That is the exact hazard `EngineEconomics` was built to remove.
+/// the development design notes records the consumer's mitigation:
+/// it *"rewrites the same constant values before every window solve"*, so a
+/// `set_var` on one thread can land while another thread is mid-solve taking its
+/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
+/// is `unsafe` in edition 2024.
+///
+/// Priming collapses those windows into ONE, at solve entry, before any worker is
+/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
+/// It only moves *when* they are read, from "scattered across the solve" to "once,
+/// at a point the caller controls".
+pub(crate) fn prime_env() {
+    let _ = count_sort_enabled();
+    let _ = ft_fast_update();
+    let _ = ft_growth_tol_override();
+    let _ = ftran_fast();
+    let _ = ftrannz_fast();
+    let _ = lu_max_fill_nnz();
+    let _ = lu_solve_stats();
+    let _ = spike_arm();
+}

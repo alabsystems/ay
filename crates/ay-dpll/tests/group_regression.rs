@@ -23,6 +23,12 @@ mod false_unsat_20var_bb;
 mod false_unsat_6242;
 #[path = "group_regression/false_unsat_array_ite_store_index.rs"]
 mod false_unsat_array_ite_store_index;
+#[path = "group_regression/false_unsat_auflia_disjunct_forall.rs"]
+mod false_unsat_auflia_disjunct_forall;
+#[path = "group_regression/false_unsat_auflia_exists_eq.rs"]
+mod false_unsat_auflia_exists_eq;
+#[path = "group_regression/false_unsat_auflia_rodin.rs"]
+mod false_unsat_auflia_rodin;
 #[path = "group_regression/false_unsat_large_coeff_ite.rs"]
 mod false_unsat_large_coeff_ite;
 #[path = "group_regression/false_unsat_to_int_mod_hnf.rs"]

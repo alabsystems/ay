@@ -77,7 +77,12 @@ impl Subsumer {
             occs: Vec::new(),
             bins: Vec::new(),
             noccs: Vec::new(),
-            full_occs: OccList::new(num_vars),
+            // Sized on first use: `OccList::add_clause` grows to cover each
+            // literal it sees, and `get` is bounds-safe, so nothing has to
+            // pre-size this. Eagerly it costs ~128 resident bytes per
+            // variable at solver construction, on every instance, whether or
+            // not this engine ever runs.
+            full_occs: OccList::new(0),
         }
     }
 

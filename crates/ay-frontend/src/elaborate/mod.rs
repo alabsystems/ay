@@ -72,9 +72,10 @@ pub(crate) const INTERNAL_SYMBOL_PREFIX: &str = "__ay_";
 /// member forgery; that was FALSE — its `validate_datatype_names` only checks
 /// the static reserved table at datatype-declaration time. Both post-hoc
 /// `declare-fun is-Cons`/`hd` forgeries were confirmed wrong-UNSATs before the
-/// dynamic gates above were added.) Also not listed: bare collection words
-/// (`union`, `member`, `subset`, …) that AY matches ONLY in dotted form
-/// (`set.union`), which are legitimate user-symbol names.
+/// dynamic gates above were added.) Bare Z3 array-plugin set aliases (`union`,
+/// `intersection`, `setminus`, `complement`, `subset`) are structurally matched
+/// only after declared-symbol resolution. They therefore remain legitimate
+/// user-symbol names and are classified as `declared-shadowed` below.
 #[rustfmt::skip]
 pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
     // ---- Arrays (term/array.rs, app/core.rs, indexed.rs as-array) ----
@@ -108,6 +109,11 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
     // (`set.subset` is declaration-activated — see EXCLUDED_DECLARABLE_OP_NAMES.)
     "set.union", "set.inter", "set.minus", "set.member", "set.card",
     "set.singleton", "set.insert", "set.remove", "set.complement",
+    // Z3 5.0.0 FiniteSet spellings. `set.union`, `set.singleton`,
+    // `set.subset`, and qualified `set.empty` are shared with the vocabulary
+    // above; the remaining names are Z3-5-specific aliases/operators.
+    "set.in", "set.size", "set.intersect", "set.difference",
+    "set.map", "set.filter", "set.range",
     // ---- Multisets (elaborate/app/multiset.rs) ----
     // ALL fourteen ops from multiset.rs, including the pointwise/higher-order
     // arm at multiset.rs:110-118 (forging those conflates with the builtin —
@@ -137,9 +143,9 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
     // ---- Regular expressions (elaborate/app/strings.rs) ----
     "re.*", "re.+", "re.++", "re.all", "re.allchar", "re.comp", "re.diff",
     "re.inter", "re.none", "re.opt", "re.range", "re.union", "re.loop", "re.to_re",
-    // ---- Char theory (elaborate/app/strings.rs) — desugars to Int on the code point ----
+    // ---- Char theory (elaborate/app/strings.rs) — character terms lower to Int code points ----
     // (z3 has char.<= but not char.<, so char.< is intentionally absent.)
-    "char.to_int", "char.<=", "char.is_digit",
+    "char.to_int", "char.<=", "char.is_digit", "char.to_bv", "char.from_bv",
     // ---- Qualified-(as)-path names (elaborate/qualified.rs) ----
     // `elaborate_qualified_app` matches these names BEFORE its declared-symbol
     // fallback, so a user `declare-fun` of one was silently conflated with the
@@ -196,17 +202,18 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 ///   binder of a `(match …)` default case. It is not an operator and is never
 ///   elaborated as an application head, so it cannot conflate.
 ///
-/// * `"declared-shadowed"` — `const`, the constant-array qualified identifier
-///   `((as const (Array ..)) v)`. It stays declarable because real-world
-///   QF_UF benchmarks legitimately declare it (the B-method CLEARSY
+/// * `"declared-shadowed"` — structurally recognized operators whose dispatcher
+///   is reached only after declared-symbol resolution. This includes `const`,
+///   the constant-array qualified identifier `((as const (Array ..)) v)`, and
+///   Z3's legacy array-plugin set aliases (`union`, `intersection`, `setminus`,
+///   `complement`, `subset`). They stay declarable because Z3 gives a user
+///   declaration precedence over these builtin spellings. Real-world QF_UF
+///   benchmarks also legitimately declare `const` (the B-method CLEARSY
 ///   regression fixtures declare `(declare-fun |const| (U U) U)` — reserving
-///   it broke `test_clearsy_00307/00310_full_instance_matches_z3`). Instead
-///   its `qualified.rs` arm is GUARDED on `const` not being a declared
-///   symbol: once declared, both bare applications and `(as const <sort>)`
-///   resolve to the user symbol (a plain uninterpreted application — nothing
-///   in the term layer matches bare `const` structurally), so the forged-
-///   builtin conflation (rc_const_as wrong-UNSAT) is closed by shadowing
-///   rather than by reservation.
+///   it broke `test_clearsy_00307/00310_full_instance_matches_z3`). The
+///   dispatcher guards ensure that once declared, these names resolve to the
+///   user symbol, closing builtin conflation by shadowing rather than by
+///   reservation.
 ///
 /// * `"declaration-activated"` — AY-extension collection predicates whose
 ///   `declare-fun` IS the documented activation route for the native
@@ -239,10 +246,14 @@ pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, &str)] = &[
     // SMT-LIB Core connectives (elaborate/app/core.rs)
     ("and", "map-target"), ("or", "map-target"), ("not", "map-target"),
     ("xor", "map-target"), ("=>", "map-target"), ("implies", "map-target"),
-    ("=", "map-target"), ("distinct", "map-target"), ("ite", "map-target"),
+    ("&&", "map-target"), ("||", "map-target"),
+    ("=", "map-target"), ("equals", "map-target"), ("equiv", "map-target"),
+    ("iff", "map-target"), ("distinct", "map-target"),
+    ("ite", "map-target"), ("if", "map-target"), ("if_then_else", "map-target"),
     // Ints/Reals operators (elaborate/app/arithmetic.rs, app/core.rs)
     ("+", "map-target"), ("-", "map-target"), ("*", "map-target"),
-    ("/", "map-target"), ("^", "map-target"), ("div", "map-target"),
+    ("/", "map-target"), ("^", "map-target"), ("~", "map-target"),
+    ("**", "map-target"), ("div", "map-target"),
     ("mod", "map-target"), ("rem", "map-target"), ("abs", "map-target"),
     ("min", "map-target"), ("max", "map-target"),
     ("<", "map-target"), ("<=", "map-target"), (">", "map-target"),
@@ -273,6 +284,13 @@ pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, &str)] = &[
     // Constant-array qualified identifier: declarable (CLEARSY benchmarks do);
     // its qualified.rs arm defers to the declared symbol (see doc above).
     ("const", "declared-shadowed"),
+    // Z3 array-plugin set aliases: a declaration shadows the builtin before
+    // app/set.rs dispatch, exactly as in Z3 5.0.0 (see doc above).
+    ("union", "declared-shadowed"),
+    ("intersection", "declared-shadowed"),
+    ("setminus", "declared-shadowed"),
+    ("complement", "declared-shadowed"),
+    ("subset", "declared-shadowed"),
     // Declaration-activated collection theory ops (see doc comment above):
     // deductive-checks declares these to trigger the native solver; misuse fails
     // closed (probed).
@@ -474,6 +492,13 @@ pub struct SymbolInfo {
     pub sort: Sort,
     /// Argument sorts (empty for constants)
     pub arg_sorts: Vec<Sort>,
+    /// Public SMT-LIB result sort before implementation lowering.
+    ///
+    /// Z3 5.0.0's `(FiniteSet T)` remains distinct here even though the engine
+    /// carries it as `(Array T Bool)`.
+    pub public_sort: PublicSort,
+    /// Public SMT-LIB argument sorts before implementation lowering.
+    pub public_arg_sorts: Vec<PublicSort>,
     /// Instance-specific INTERNAL symbol name to use when building the term,
     /// when it differs from the user-facing surface name. This is set for
     /// monomorphized parametric-datatype members and for every ordinary
@@ -518,6 +543,16 @@ pub struct SoftAssertion {
     pub id: Option<String>,
 }
 
+/// Public typing policy for historically shared `set.*` spellings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FiniteSetTypingMode {
+    /// Preserve AY's pre-Z3-5 legacy `Set` extensions.
+    #[default]
+    LegacyCompatible,
+    /// Match Z3 5.0.0: shared constructors are `FiniteSet`-only.
+    Z3_5Strict,
+}
+
 /// Maximum recursion depth for define-fun-rec expansion (#8622).
 /// Prevents unbounded stack/heap growth from mutually recursive definitions.
 const MAX_FUN_EXPANSION_DEPTH: usize = 1000;
@@ -526,6 +561,123 @@ const OPTION_GLOBAL_DECLARATIONS: &str = "global-declarations";
 const OPTION_GLOBAL_DECLS: &str = "global-decls";
 
 type FunctionDefinition = (Vec<(String, Sort)>, Sort, ParsedTerm);
+
+/// How to render one solver-invented single-constructor FIELD constant as
+/// SMT-LIB text an external proof checker can read: a selector application over
+/// the DECLARED parent constant (`s_!left` -> `(left s_)`).
+///
+/// WHY. Eager single-constructor datatype elimination (`build_const_term`,
+/// `declarations.rs`) replaces a declared constant `s_` of a product sort with
+/// `(Record_left_center_right s_!left s_!center s_!right)` over per-field
+/// constants it invents. Those names exist ONLY inside AY — the problem file
+/// declares `s_`, not `s_!left` — so an exported Alethe certificate that names
+/// them is unreadable to a checker, which builds its symbol table from the
+/// ORIGINAL `.smt2`. Measured on
+/// `QF_DT/20230720-blocksworld/blocksworld_from_0_0_8_to_1_3_4_negated_goal_bmc_2`:
+/// 14 distinct invented names in 26,366 occurrences, and a declaration preamble
+/// with ZERO `(declare-fun ...)` lines (the auxiliary-declaration pass computes
+/// the problem scope from AY's own ELABORATED assertions, which already contain
+/// the invented names, so every one looks problem-declared). carcara 1.1.0 then
+/// died in the PARSER, before checking a single rule:
+///   `[ERROR] parser error: identifier 's_tmp___!left' is not defined`
+///
+/// Declaring the invented names in the preamble instead would be WRONG: the
+/// document would become a proof about fresh constants rather than about the
+/// problem's `s_`. Rendering them as what they ARE needs no declaration at all
+/// — `left` is a real selector, in scope from `declare-datatypes`, and `s_` is
+/// declared by the problem at the right sort (verified against carcara 1.1.0:
+/// a selector application is accepted even when that application appears
+/// NOWHERE in the problem text).
+///
+/// The record is keyed by `TermId` and built ONLY where the constants are
+/// minted, never by inspecting a spelling: this problem file also declares the
+/// USER symbols `c!0`, `c!1`, `c!2`, which a split-on-`!` rule would rewrite
+/// into the nonsense `(0 c)`.
+#[derive(Clone, Debug)]
+struct DtFieldSurface {
+    /// The composed rendering, e.g. `(top (right s_))` at nesting depth 2.
+    /// Built by passing the parent's rendering DOWN the recursion (the child is
+    /// minted before any of the parent's bookkeeping runs, so it cannot be
+    /// looked up afterwards).
+    rendering: String,
+    /// Surface name of the DECLARED constant at the root of the chain.
+    root_surface: String,
+    /// Private core identity of an overloaded root. `None` is the first
+    /// declaration, whose core identity is its surface name.
+    root_internal_name: Option<String>,
+    /// Exact elaborated result sort selected by a qualified root.
+    root_sort: Sort,
+    /// Whether `rendering` starts with an `(as root sort)` qualification.
+    /// Unqualified overloaded roots remain unsafe and are withheld.
+    qualified_root: bool,
+    /// Positional constructor-argument indices from the root's bound term down
+    /// to this field. Used at export time to re-derive — not merely assume —
+    /// that `rendering` still denotes this exact term.
+    path: Vec<usize>,
+    /// Surface selector names occurring in `rendering`. Re-checked at export
+    /// time for shadowing, which is a property of LATER commands.
+    selectors: Vec<String>,
+}
+
+/// A user declaration whose rank mentions global SMT-LIB 2.7 sort parameters.
+/// It denotes a family of ordinary monomorphic declarations.
+#[derive(Debug, Clone)]
+struct PolymorphicDeclaration {
+    name: String,
+    argument_sorts: Vec<crate::command::Sort>,
+    result_sort: crate::command::Sort,
+    parameters: Vec<String>,
+    global: bool,
+}
+
+/// An authored assertion containing global schematic sort parameters.
+#[derive(Debug, Clone)]
+struct PolymorphicAssertion {
+    term: ParsedTerm,
+    parameters: Vec<String>,
+    /// Definition axioms survive `reset-assertions`; authored `assert`
+    /// commands do not.
+    persistent_definition: bool,
+}
+
+#[derive(Debug, Clone)]
+enum AuthoredAssertion {
+    Concrete {
+        term: TermId,
+        parsed_index: Option<usize>,
+        /// Compact provenance retained when the optional parsed AST is not.
+        /// A canonical `false` TermId alone cannot distinguish literal source
+        /// `false` from an arbitrary formula that elaborated to false.
+        source_is_literal_false: bool,
+    },
+    Schematic(ParsedTerm),
+}
+
+/// Whether the authored source is literally `false` (modulo annotations), or
+/// the reserved native-API placeholder whose exact TermId is the entire source
+/// obligation. Proof consumers additionally require that TermId to be false.
+fn authored_source_is_literal_false(term: &ParsedTerm) -> bool {
+    let mut term = term;
+    while let ParsedTerm::Annotated(inner, _) = term {
+        term = inner;
+    }
+    matches!(term, ParsedTerm::Const(crate::command::Constant::False))
+        || matches!(term, ParsedTerm::Symbol(name) if name == "__ay_api_assertion__")
+}
+
+/// One authored assertion in source order, ready for `get-assertions` display.
+///
+/// Ordinary assertions normally retain their parsed surface tree.  When that
+/// optional high-memory proof aid is disabled, callers still receive the exact
+/// elaborated term as a sound fallback.  Schematic SMT-LIB 2.7 assertions have
+/// no single elaborated term, so their authored surface tree is authoritative.
+#[derive(Debug, Clone, Copy)]
+pub enum AuthoredAssertionRef<'a> {
+    /// Original parsed surface syntax.
+    Parsed(&'a ParsedTerm),
+    /// Elaborated fallback for a non-schematic assertion.
+    Elaborated(TermId),
+}
 
 /// Elaboration context
 // Trust: `Clone` lets an independent UNSAT re-discharge rebuild a fresh `Executor`
@@ -560,12 +712,34 @@ pub struct Context {
     next_overload_identity: u64,
     /// Sort definitions: name -> sort
     sort_defs: HashMap<String, Sort>,
+    /// Public identities for zero-arity sort synonyms.
+    ///
+    /// `sort_defs` stores engine lowerings and therefore cannot distinguish
+    /// `(FiniteSet T)` from `(Array T Bool)`.
+    public_sort_defs: HashMap<String, PublicSort>,
     /// Parameterized sort synonyms (`(define-sort Name (T..) body)`, arity > 0):
     /// name -> (type-parameter names, un-elaborated body template). Kept as a
     /// template (not eagerly elaborated) so each ground use `(Name A1 .. An)`
     /// can substitute the parameters and elaborate the body — see
     /// `elaborate/sorts.rs`. The 0-arity case stays in `sort_defs`.
     parametric_sort_defs: HashMap<String, (Vec<String>, crate::command::Sort)>,
+    /// Global schematic sort parameters declared by SMT-LIB 2.7 scripts.
+    sort_parameters: ay_core::kani_compat::DetHashSet<String>,
+    /// Schematic `declare-fun` / `declare-const` families.
+    polymorphic_declarations: Vec<PolymorphicDeclaration>,
+    /// Internal guard while registering one concrete family member.
+    instantiating_polymorphic_declaration: bool,
+    /// Authored assertions instantiated at each satisfiability check.
+    polymorphic_assertions: Vec<PolymorphicAssertion>,
+    /// User `assert` commands in source order, excluding definition axioms and
+    /// query-local schematic instances.
+    authored_assertions: Vec<AuthoredAssertion>,
+    /// Concrete assertion instances appended for the current query.
+    materialized_polymorphic_assertions: usize,
+    /// Whether the current query contains every required schematic instance.
+    polymorphic_instantiation_complete: bool,
+    /// Suppress name-keyed macro adoption for a concrete family member.
+    elaborating_polymorphic_instance: bool,
     /// Names of parameterized sort synonyms currently mid-expansion. Guards
     /// against a self- or mutually-recursive `define-sort` (malformed per
     /// SMT-LIB; z3 rejects it as an unknown sort) infinite-looping the lazy
@@ -641,10 +815,33 @@ pub struct Context {
     /// instance-mangled datatype members and ordinary declaration overloads,
     /// so serialization/model output never leaks private identities.
     dt_internal_surface: HashMap<String, String>,
+    /// Surface rendering of each solver-invented single-constructor FIELD
+    /// constant, keyed by the exact `TermId` `build_const_term` minted for it
+    /// (see [`DtFieldSurface`] for why this exists and what it is read for).
+    dt_field_surface: HashMap<TermId, DtFieldSurface>,
     /// Current logic
     logic: Option<String>,
+    /// Enforce the language declared by the 25 official SMT-LIB 2.7 logics.
+    ///
+    /// The library keeps its historical permissive default because embedders
+    /// use `set-logic` as a solver-selection upper bound.  The ordinary AY
+    /// SMT-LIB CLI enables this policy; the explicit Z3 compatibility surface
+    /// leaves it disabled because Z3 accepts a wider overlay language.
+    strict_logic_compliance: bool,
+    /// Whether the logic was set by a `(set-logic ...)` in the COMMAND STREAM,
+    /// as opposed to being installed by an API constructor.
+    ///
+    /// z3 draws exactly this line: "the logic has already been set" is PARSER
+    /// state, so `Z3_mk_solver_for_logic` / `SolverFor(...)` does not count as a
+    /// `set-logic` and a subsequently parsed script may still carry one — even
+    /// one naming a DIFFERENT logic. Keying the guard on `logic.is_some()`
+    /// conflated the two and rejected the first `(set-logic ...)` of every
+    /// script handed to an API-constructed solver.
+    logic_set_by_command: bool,
     /// Assertions (internal normalized form)
     pub assertions: Vec<TermId>,
+    /// Finite-set provenance aligned one-for-one with `assertions`.
+    assertion_finite_set_metadata: Vec<PublicAssertionMetadata>,
     /// Assertions in their original parsed form (before internal normalization)
     ///
     /// This is used to align exported proofs with the surface syntax of the input file.
@@ -672,8 +869,12 @@ pub struct Context {
     retain_parsed_assertions: bool,
     /// Optimization objectives (from maximize/minimize)
     objectives: Vec<Objective>,
+    /// Public-sort metadata aligned with `objectives`.
+    objective_finite_set_metadata: Vec<PublicAssertionMetadata>,
     /// Soft (weighted) constraints from `(assert-soft ...)`
     soft_constraints: Vec<SoftAssertion>,
+    /// Public-sort metadata aligned with `soft_constraints`.
+    soft_finite_set_metadata: Vec<PublicAssertionMetadata>,
     /// Scope stack for push/pop
     scopes: Vec<ScopeFrame>,
     /// Whether this session ever processed a `push`, `pop`, or
@@ -690,8 +891,21 @@ pub struct Context {
     native_global_declaration: bool,
     /// Solver options (keyword -> value)
     options: HashMap<String, OptionValue>,
+    /// Z3's `:numeral-as-real` parser mode. When enabled, an otherwise
+    /// unconstrained numeral token is elaborated as a Real constant instead of
+    /// an Int constant.
+    numeral_as_real: bool,
+    /// Whether Z3-style implicit Bool/Int/Real coercions are enabled.
+    /// Controlled by the `:int-real-coercions` SMT-LIB option.
+    int_real_coercions: bool,
     /// Named formulas: name -> term_id (for get-assignment and get-unsat-core)
     named_terms: HashMap<String, TermId>,
+    /// Z3 debug-command global AST slots (`dbg-set` / `dbg-pp-var`).
+    ///
+    /// The authored spelling is retained because these commands inspect the
+    /// parser AST before AY's eager solver rewrites. Storing a lowered
+    /// `TermId` would turn e.g. `(and true false)` into `false` on replay.
+    z3_debug_exprs: HashMap<String, String>,
     /// Current depth of define-fun-rec expansion (#8622)
     fun_expansion_depth: usize,
     /// Set (only) while elaborating the direct function argument of a
@@ -741,6 +955,8 @@ pub struct Context {
     /// error (the coercible set is exactly {Bool, Int, Real}). Opt-in only
     /// (`set_lenient_sort_coercions`), e.g. for the #5115 zero-extension tests.
     lenient_sort_coercions: bool,
+    /// Public typing policy for Z3 5 finite-set spellings.
+    finite_set_typing_mode: FiniteSetTypingMode,
 }
 
 /// Value for a solver option
@@ -780,6 +996,12 @@ struct ScopeFrame {
     fun_defs: Vec<String>,
     /// Parametric datatype templates declared in this scope
     parametric_datatypes: Vec<String>,
+    /// Number of authored polymorphic assertions before this scope.
+    polymorphic_assertion_count: usize,
+    /// Number of user `assert` commands before this scope.
+    authored_assertion_count: usize,
+    /// Schematic declarations introduced in this scope.
+    polymorphic_declarations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -870,7 +1092,16 @@ impl Context {
             overloaded_symbols: HashMap::default(),
             next_overload_identity: 0,
             sort_defs: HashMap::default(),
+            public_sort_defs: HashMap::default(),
             parametric_sort_defs: HashMap::default(),
+            sort_parameters: ay_core::kani_compat::DetHashSet::default(),
+            polymorphic_declarations: Vec::new(),
+            instantiating_polymorphic_declaration: false,
+            polymorphic_assertions: Vec::new(),
+            authored_assertions: Vec::new(),
+            materialized_polymorphic_assertions: 0,
+            polymorphic_instantiation_complete: true,
+            elaborating_polymorphic_instance: false,
             expanding_sort_synonyms: Vec::new(),
             fun_defs: HashMap::default(),
             adopted_macro_interps: HashMap::default(),
@@ -886,24 +1117,34 @@ impl Context {
             parametric_datatypes: HashMap::default(),
             parametric_instance_args: HashMap::default(),
             dt_internal_surface: HashMap::default(),
+            dt_field_surface: HashMap::default(),
             logic: None,
+            strict_logic_compliance: false,
+            logic_set_by_command: false,
             assertions: Vec::new(),
+            assertion_finite_set_metadata: Vec::new(),
             assertions_parsed: Vec::new(),
             retain_parsed_assertions: true,
             objectives: Vec::new(),
+            objective_finite_set_metadata: Vec::new(),
             soft_constraints: Vec::new(),
+            soft_finite_set_metadata: Vec::new(),
             scopes: Vec::new(),
             scope_commands_used: false,
             check_sat_commands: 0,
             native_global_declaration: false,
             options,
+            numeral_as_real: false,
+            int_real_coercions: true,
             named_terms: HashMap::default(),
+            z3_debug_exprs: HashMap::default(),
             fun_expansion_depth: 0,
             multivar_lambda_curry_allowed: false,
             uses_multiset: false,
             uses_set: false,
             special_relations: HashMap::default(),
             lenient_sort_coercions: false,
+            finite_set_typing_mode: FiniteSetTypingMode::default(),
         }
     }
 
@@ -918,6 +1159,21 @@ impl Context {
     /// [`set_lenient_sort_coercions`](Self::set_lenient_sort_coercions)).
     pub fn lenient_sort_coercions(&self) -> bool {
         self.lenient_sort_coercions
+    }
+
+    /// Select public typing for Z3 5.0.0 finite-set spellings.
+    ///
+    /// API adapters implementing Z3's parser select
+    /// [`FiniteSetTypingMode::Z3_5Strict`]. The default retains AY's older
+    /// textual `Set` extension for compatibility.
+    pub fn set_finite_set_typing_mode(&mut self, mode: FiniteSetTypingMode) {
+        self.finite_set_typing_mode = mode;
+    }
+
+    /// Current finite-set public typing policy.
+    #[must_use]
+    pub fn finite_set_typing_mode(&self) -> FiniteSetTypingMode {
+        self.finite_set_typing_mode
     }
 
     /// Whether the elaborated problem uses any `multiset.*` operator.
@@ -975,9 +1231,104 @@ impl Context {
         self.logic = Some(logic);
     }
 
+    /// Install the logic the way an API CONSTRUCTOR does: the logic takes
+    /// effect, but no `(set-logic ...)` is recorded as having been seen in the
+    /// COMMAND STREAM, so a script parsed afterwards may still carry its own —
+    /// including one naming a different logic.
+    ///
+    /// This mirrors z3, where "the logic has already been set" is parser state:
+    /// `Z3_mk_solver_for_logic` / `SolverFor(L)` does not touch it, and a
+    /// subsequently parsed `(set-logic M)` is accepted even when `M != L`.
+    /// Going through `Command::SetLogic` here instead would mark the origin and
+    /// reject the first `(set-logic ...)` of every script the caller parses.
+    ///
+    /// # Errors
+    /// Propagates the same validation `Command::SetLogic` performs.
+    pub fn set_initial_logic(&mut self, logic: &str) -> Result<()> {
+        self.validate_logic_sort_parameter_conflicts(logic)?;
+        self.logic = Some(logic.to_string());
+        self.refresh_polymorphic_declarations()?;
+        Ok(())
+    }
+
+    /// Select whether official SMT-LIB logic declarations are enforced as
+    /// language boundaries instead of being treated only as routing hints.
+    pub fn set_strict_logic_compliance(&mut self, strict: bool) {
+        self.strict_logic_compliance = strict;
+    }
+
     /// Get the parsed assertions (original surface syntax).
     pub fn assertions_parsed(&self) -> &[ParsedTerm] {
         &self.assertions_parsed
+    }
+
+    /// Return user-authored assertions in source order for `get-assertions`.
+    ///
+    /// Query-local monomorphic instances of schematic assertions are
+    /// intentionally absent: SMT-LIB asks for the authored assertion stack,
+    /// before elaboration and independently of whether `check-sat` has run.
+    pub fn authored_assertions_for_display(&self) -> Vec<AuthoredAssertionRef<'_>> {
+        if self.authored_assertions.is_empty() {
+            // Native API clients can append TermIds without a surface command.
+            // Preserve the historical useful fallback for that path.
+            return self
+                .assertions
+                .iter()
+                .copied()
+                .map(AuthoredAssertionRef::Elaborated)
+                .collect();
+        }
+        self.authored_assertions
+            .iter()
+            .map(|assertion| match assertion {
+                AuthoredAssertion::Concrete {
+                    term, parsed_index, ..
+                } => parsed_index
+                    .and_then(|index| self.assertions_parsed.get(index))
+                    .map_or(AuthoredAssertionRef::Elaborated(*term), |parsed| {
+                        AuthoredAssertionRef::Parsed(parsed)
+                    }),
+                AuthoredAssertion::Schematic(parsed) => AuthoredAssertionRef::Parsed(parsed),
+            })
+            .collect()
+    }
+
+    /// Exact elaborated terms introduced by authored, concrete `assert`
+    /// commands, in source order.
+    ///
+    /// This deliberately has no fallback to the mutable solver assertion
+    /// stack: that stack may also contain transient axioms and preprocessing
+    /// artifacts.  Schematic assertions likewise have no single concrete term
+    /// until query-local instantiation and are omitted.
+    #[doc(hidden)]
+    pub fn concrete_authored_assertion_terms(&self) -> Vec<TermId> {
+        self.authored_assertions
+            .iter()
+            .filter_map(|assertion| match assertion {
+                AuthoredAssertion::Concrete { term, .. } => Some(*term),
+                AuthoredAssertion::Schematic(_) => None,
+            })
+            .collect()
+    }
+
+    /// Exact terms whose authored source was literally `false`.
+    ///
+    /// This compact provenance survives parsed-AST retention being disabled,
+    /// where keeping only the canonical TermId would conflate literal false
+    /// with every source formula that constant-folded to false.
+    #[doc(hidden)]
+    pub fn concrete_authored_literal_false_terms(&self) -> Vec<TermId> {
+        self.authored_assertions
+            .iter()
+            .filter_map(|assertion| match assertion {
+                AuthoredAssertion::Concrete {
+                    term,
+                    source_is_literal_false: true,
+                    ..
+                } => Some(*term),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Nullary (`()`-parameter) `define-fun` macro bodies as `(name, body)`
@@ -1127,10 +1478,36 @@ impl Context {
     /// [`Self::set_retain_parsed_assertions`] and the `retain_parsed_assertions`
     /// field docs (prefix-alignment invariant).
     pub fn add_assertion_with_parsed(&mut self, term: TermId, parsed: ParsedTerm) {
-        if self.retain_parsed_assertions && self.assertions_parsed.len() == self.assertions.len() {
+        let source_is_literal_false = authored_source_is_literal_false(&parsed);
+        let parsed_index = self.push_assertion_stacks(term, parsed);
+        self.authored_assertions.push(AuthoredAssertion::Concrete {
+            term,
+            parsed_index,
+            source_is_literal_false,
+        });
+    }
+
+    /// Push a solver-generated query-local assertion without changing the
+    /// authored `(get-assertions)` history.
+    ///
+    /// This is public only for the solver crate. The caller must restore the
+    /// assertion stacks with [`Self::truncate_assertions`] on every exit path.
+    #[doc(hidden)]
+    pub fn add_transient_assertion_with_parsed(&mut self, term: TermId, parsed: ParsedTerm) {
+        self.push_assertion_stacks(term, parsed);
+    }
+
+    fn push_assertion_stacks(&mut self, term: TermId, parsed: ParsedTerm) -> Option<usize> {
+        let parsed_index = (self.retain_parsed_assertions
+            && self.assertions_parsed.len() == self.assertions.len())
+        .then_some(self.assertions_parsed.len());
+        if parsed_index.is_some() {
             self.assertions_parsed.push(parsed);
         }
         self.assertions.push(term);
+        self.assertion_finite_set_metadata
+            .push(PublicAssertionMetadata::default());
+        parsed_index
     }
 
     /// Configure whether `assert` retains original parsed ASTs for proof
@@ -1152,6 +1529,8 @@ impl Context {
     /// Add an optimization objective.
     pub fn add_objective(&mut self, objective: Objective) {
         self.objectives.push(objective);
+        self.objective_finite_set_metadata
+            .push(PublicAssertionMetadata::default());
     }
 
     /// Get the soft (weighted) constraints from `(assert-soft ...)`.
@@ -1162,6 +1541,8 @@ impl Context {
     /// Add a soft (weighted) constraint.
     pub(crate) fn add_soft_constraint(&mut self, soft: SoftAssertion) {
         self.soft_constraints.push(soft);
+        self.soft_finite_set_metadata
+            .push(PublicAssertionMetadata::default());
     }
 
     /// Atomically replace the active soft-constraint set, returning the prior
@@ -1267,6 +1648,125 @@ impl Context {
     pub fn dt_surface_name(&self, internal: &str) -> Option<&str> {
         self.dt_internal_surface.get(internal).map(String::as_str)
     }
+
+    /// Record how a freshly minted single-constructor field constant should be
+    /// rendered for external proof checkers (see [`DtFieldSurface`]).
+    fn record_dt_field_surface(&mut self, term: TermId, surface: DtFieldSurface) {
+        self.dt_field_surface.insert(term, surface);
+    }
+
+    /// `TermId` -> selector-application rendering for the solver-invented
+    /// single-constructor field constants, for use as Alethe printer term
+    /// overrides (see [`DtFieldSurface`] for the defect this repairs).
+    ///
+    /// Every entry is RE-VALIDATED here rather than trusted from mint time,
+    /// because both ways a rendering can go stale are created by LATER
+    /// commands, and printing a term as something it is not would mean the
+    /// checker verifies a different statement than the one AY proved:
+    ///
+    /// * **Rebinding.** `(push) (declare-const s Rec) (pop) (declare-const s
+    ///   Other)` leaves the OLD field terms alive in the store while `s` now
+    ///   names a different constant. The guard walks `path` from whatever `s`
+    ///   is bound to RIGHT NOW and keeps the entry only if the walk lands back
+    ///   on this exact `TermId` — so the rendering is re-derived, not assumed.
+    /// * **Shadowing.** An external checker's symbol table is FLAT and
+    ///   LAST-DECLARATION-WINS (measured on carcara 1.1.0). A selector name
+    ///   bound more than once may resolve to the other binding: loudly when the
+    ///   signatures differ, but SILENTLY when they match — the checker would
+    ///   then verify an application of an unrelated uninterpreted function and
+    ///   report `valid` for something that is not a proof about the datatype.
+    ///
+    /// Withholding costs nothing beyond the status quo: the term simply prints
+    /// as its bare invented name, which is exactly today's (already
+    /// unreadable) output — never a wrong answer.
+    #[must_use]
+    pub fn dt_field_surface_overrides(&self) -> HashMap<TermId, String> {
+        let mut overrides: HashMap<TermId, String> = HashMap::default();
+        if self.dt_field_surface.is_empty() {
+            return overrides;
+        }
+        let ambiguous = self.ambiguous_selector_names();
+        for (term, field) in &self.dt_field_surface {
+            if field
+                .selectors
+                .iter()
+                .any(|selector| ambiguous.contains(selector))
+            {
+                continue;
+            }
+            if self.field_term_at(field) != Some(*term) {
+                continue;
+            }
+            overrides.insert(*term, field.rendering.clone());
+        }
+        overrides
+    }
+
+    /// The term reached by following `field.path` (positional constructor-
+    /// argument indices) from the exact root declaration, or `None` if that
+    /// declaration is no longer present or the walk does not fit.
+    ///
+    /// An unqualified overloaded root is rejected outright. A qualified root
+    /// is safe only when result sort plus private identity select exactly one
+    /// current nullary declaration — the same resolution the checker applies
+    /// to `(as root sort)`.
+    fn field_term_at(&self, field: &DtFieldSurface) -> Option<TermId> {
+        let mut current = if field.qualified_root {
+            let candidates: &[SymbolInfo] = self
+                .overloaded_symbols
+                .get(&field.root_surface)
+                .map(Vec::as_slice)
+                .or_else(|| {
+                    self.symbols
+                        .get(&field.root_surface)
+                        .map(std::slice::from_ref)
+                })?;
+            let mut matches = candidates.iter().filter(|info| {
+                info.arg_sorts.is_empty()
+                    && info.sort == field.root_sort
+                    && info.internal_name.as_deref() == field.root_internal_name.as_deref()
+            });
+            let root = matches.next()?.term?;
+            if matches.next().is_some() {
+                return None;
+            }
+            root
+        } else {
+            if self.overloaded_symbols.contains_key(&field.root_surface) {
+                return None;
+            }
+            self.symbols.get(&field.root_surface)?.term?
+        };
+        for &index in &field.path {
+            let ay_core::TermData::App(_, args) = self.terms.get(current) else {
+                return None;
+            };
+            current = *args.get(index)?;
+        }
+        Some(current)
+    }
+
+    /// Surface selector names an external checker may not resolve to the
+    /// intended selector: reused by another registered constructor (including
+    /// a second instance of a parametric datatype), or also bound by a
+    /// `define-fun`. The reverse collision — a `declare-fun`/`declare-const`/
+    /// `define-fun` that takes over a name already registered as a datatype
+    /// member — cannot arise here: those paths reject it up front with
+    /// [`ElaborateError::DatatypeMemberCollision`] (#reserved-ops).
+    fn ambiguous_selector_names(&self) -> ay_core::kani_compat::DetHashSet<String> {
+        let mut counts: HashMap<String, usize> = HashMap::default();
+        for selectors in self.ctor_selector_info.values() {
+            for (selector, _) in selectors {
+                let surface = self.dt_surface_name(selector).unwrap_or(selector);
+                *counts.entry(surface.to_string()).or_insert(0) += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|(name, count)| *count > 1 || self.fun_defs.contains_key(name))
+            .map(|(name, _)| name)
+            .collect()
+    }
 }
 
 /// Result of processing a command that requires action
@@ -1303,10 +1803,14 @@ pub enum CommandResult {
     GetInfo(String),
     /// Need to get an option value
     GetOption(String),
+    /// Need to retrieve labels from the last solver result.
+    Labels,
     /// Need to get current assertions
     GetAssertions,
     /// Need to print a string (echo command)
     Echo(String),
+    /// Need to print a validated authored term without rewriting it.
+    Display(String),
     /// Need to get assignment of named formulas
     GetAssignment,
     /// Need to get unsatisfiable core
@@ -1334,7 +1838,14 @@ mod datatypes;
 mod declarations;
 pub use declarations::IntroKind;
 mod indexed;
+mod public_sorts;
+pub use public_sorts::{
+    FiniteSetOp, FiniteSetTermMetadata, PublicAssertionMetadata, PublicSort, PublicSymbolSignature,
+    PublicTermMetadata,
+};
+mod logic_policy;
 mod qualified;
+mod sort_parameters;
 mod sorts;
 mod term;
 

@@ -41,5 +41,8 @@ mod scope;
 mod tactics;
 
 pub use abduction::{PatchStrength, PatchSuggestion};
+pub use parse::{
+    ParsedPublicFormulaMetadata, ParsedPublicTermMetadata, ParsedSmtlib2Batch, ParsedSmtlib2Formula,
+};
 pub use scope::SolverScope;
 pub use tactics::{ApplyResult, Goal, Tactic, TacticFailure, TacticSolver};

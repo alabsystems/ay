@@ -83,6 +83,75 @@ pub(super) fn build_lra_model_from_fp_to_real(
     LraModel { values }
 }
 
+/// Publish the value chosen for `fp.to_real` at NaN or an infinity, where
+/// SMT-LIB leaves the result unspecified but total.
+///
+/// [`rewrite_fp_to_real_for_model`](super::rewrite_fp_to_real_for_model)
+/// replaced each such application with a fresh Real variable keyed on the FP
+/// value's SMT-LIB rendering, so the mixed subproblem CHOSE a value for it and
+/// congruent operands share one variable. That choice is part of the model, but
+/// it was only ever recorded against the substituted variable — the original
+/// `(fp.to_real x)` term stayed unpinned, so the independent gate, which
+/// re-checks the ORIGINAL assertions, could not evaluate it and reported a
+/// coverage gap on a witness the solver had legitimately found.
+///
+/// Copies the variable's value onto the application term. Nothing is invented:
+/// an application whose operand is missing from the FP model, or whose variable
+/// the mixed solve left unassigned, is passed over and stays unpinned.
+pub(super) fn pin_undefined_fp_to_real(
+    terms: &TermStore,
+    fp_model: &FpModel,
+    undef_vars: &HashMap<String, TermId>,
+    roots: &[TermId],
+    values: &mut HashMap<TermId, num_rational::BigRational>,
+) {
+    if undef_vars.is_empty() {
+        return;
+    }
+    let mut visited = HashSet::default();
+    let mut stack: Vec<TermId> = roots.to_vec();
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::App(sym, args) => {
+                if sym.name() == "fp.to_real" && args.len() == 1 {
+                    if let Some(fp_val) = fp_model.values.get(&args[0]) {
+                        // A rational value means the operand is finite, and the
+                        // rewrite substituted the exact value rather than a
+                        // variable — nothing unspecified to pin.
+                        if fp_val.to_rational().is_none() {
+                            if let Some(chosen) = undef_vars
+                                .get(&fp_val.to_smtlib())
+                                .and_then(|var| values.get(var))
+                                .cloned()
+                            {
+                                values.insert(term, chosen);
+                            }
+                        }
+                    }
+                }
+                stack.extend_from_slice(args);
+            }
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => {
+                stack.push(*c);
+                stack.push(*t);
+                stack.push(*e);
+            }
+            TermData::Let(bindings, body) => {
+                for (_, val) in bindings {
+                    stack.push(*val);
+                }
+                stack.push(*body);
+            }
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+            _ => {}
+        }
+    }
+}
+
 /// Recursively collect fp.to_real evaluations and Real variable assignments.
 fn collect_fp_to_real_values(
     terms: &TermStore,

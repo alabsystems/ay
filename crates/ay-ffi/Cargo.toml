@@ -19,7 +19,7 @@ default = []
 [dependencies]
 ay-chc.workspace = true
 ay-core.workspace = true
-ay-dpll.workspace = true
+ay-dpll = { workspace = true, features = ["z3-compat-internals"] }
 ay-frontend.workspace = true
 ay-nra.workspace = true
 ay-search.workspace = true

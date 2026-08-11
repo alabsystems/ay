@@ -21,9 +21,10 @@
 // "propagate-values" simplifiers) with every enumerated name buildable, and
 // Z3_is_as_array(plain const) == false. AY's registry is a documented SUBSET
 // of z3's, so counts are NOT compared — only that shared names appear and all
-// names are real. AY-only assertions: qid/skolem-id are the HONEST empty
-// symbol (AY does not track :qid/:skolemid), and Z3_get_as_array_func_decl is
-// an honest NULL + Z3_INVALID_ARG (AY models never emit as-array terms).
+// names are real. Quantifier IDs are checked both when unset and when
+// explicitly supplied, including preservation of integer-vs-string symbol
+// kind. AY-only assertions: Z3_get_as_array_func_decl is an honest NULL +
+// Z3_INVALID_ARG (AY models never emit as-array terms).
 
 #ifdef AY_TWIN_USE_Z3
 #include <z3.h>
@@ -93,22 +94,34 @@ int main(void) {
     Z3_pattern pat = Z3_mk_pattern(C, 1, &fx);
     CHECK_B(pat != NULL, 1, "mk_pattern non-null");
     Z3_ast body = Z3_mk_eq(C, fx, x);
-#ifdef AY_TWIN_USE_Z3
     Z3_app bound[1];
     bound[0] = Z3_to_app(C, x);
-#else
-    Z3_ast bound[1];
-    bound[0] = x;
-#endif
     Z3_ast q = Z3_mk_forall_const(C, 0, 1, bound, 1, &pat, body);
     CHECK_B(q != 0, 1, "forall_const built");
 
     // qid / skolem id: this quantifier was built WITHOUT :qid/:skolemid, so
     // the honest answer is the null symbol — libz3 returns exactly that, and
-    // AY (which does not track qid annotations at all) matches byte-for-byte.
+    // AY matches byte-for-byte.
     CHECK_B(Z3_get_quantifier_id(C, q) == NULL, 1, "unset qid -> null symbol (== libz3)");
     CHECK_B(Z3_get_quantifier_skolem_id(C, q) == NULL, 1,
             "unset skolem id -> null symbol (== libz3)");
+
+    // Explicit IDs retain the exact Z3_symbol kind and value. In particular,
+    // an integer symbol 7 is not a string symbol whose spelling happens to be
+    // "7" (or "s!7").
+    Z3_symbol integer_qid = Z3_mk_int_symbol(C, 7);
+    Z3_symbol string_skid = Z3_mk_string_symbol(C, "explicit-skid");
+    Z3_ast q_meta = Z3_mk_quantifier_const_ex(C, true, 2, integer_qid, string_skid,
+                                               1, bound, 0, NULL, 0, NULL, body);
+    CHECK_B(q_meta != 0, 1, "quantifier_const_ex built");
+    Z3_symbol got_qid = Z3_get_quantifier_id(C, q_meta);
+    Z3_symbol got_skid = Z3_get_quantifier_skolem_id(C, q_meta);
+    CHECK_I(Z3_get_symbol_kind(C, got_qid), Z3_INT_SYMBOL, "explicit qid kind is integer");
+    CHECK_I(Z3_get_symbol_int(C, got_qid), 7, "explicit integer qid value");
+    CHECK_I(Z3_get_symbol_kind(C, got_skid), Z3_STRING_SYMBOL,
+            "explicit skolemid kind is string");
+    CHECK_B(strcmp(Z3_get_symbol_string(C, got_skid), "explicit-skid") == 0, 1,
+            "explicit string skolemid value");
 
     // Pattern round-trip: 1 pattern, 1 term, and the term IS f(x).
     CHECK_I(Z3_get_quantifier_num_patterns(C, q), 1, "num_patterns == 1");

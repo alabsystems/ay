@@ -247,6 +247,51 @@ class ResourceAndRunIdentityTests(unittest.TestCase):
         self.assertEqual(inv.argv[-2:], ["3072", "input.smt2"])
         self.assertIn("--memory", inv.argv)
 
+    def test_jar_validator_receives_a_hard_heap_bound(self) -> None:
+        # Without -Xmx the JVM sizes its heap from PHYSICAL RAM, sibling-blind
+        # and deaf to the envelope recorded beside these rows — the budget was
+        # never enforced for a jar solver at all.
+        solver = harness.Solver("smtinterpol", Path("/tmp/si.jar"), "jar",
+                                java=Path("/usr/bin/java"))
+        with mock.patch.object(harness, "extract_2025_command",
+                               return_value=["archive/si.jar", "-w"]):
+            inv = harness.build_invocation(
+                solver, "sq", "QF_UF", "input.smt2", envelope(memlimit=4000)
+            )
+        self.assertIsNotNone(inv)
+        # JVM flags must precede -jar or they are passed to the application.
+        self.assertEqual(inv.argv[:3], ["/usr/bin/java", "-Xmx3200m", "-jar"])
+        # Sized BELOW the envelope: -Xmx bounds only the Java heap, while
+        # metaspace, thread stacks and GC structures live outside it.
+        self.assertLess(3200, 4000)
+
+    def test_jar_validator_without_a_budget_keeps_the_stock_invocation(self) -> None:
+        solver = harness.Solver("smtinterpol", Path("/tmp/si.jar"), "jar",
+                                java=Path("/usr/bin/java"))
+        with mock.patch.object(harness, "extract_2025_command",
+                               return_value=["archive/si.jar", "-w"]):
+            inv = harness.build_invocation(solver, "sq", "QF_UF", "input.smt2")
+        self.assertIsNotNone(inv)
+        self.assertEqual(inv.argv[:2], ["/usr/bin/java", "-jar"])
+
+    def test_z3_invocation_receives_its_own_memory_ceiling(self) -> None:
+        # z3 enforces -memory: in-process and reports unknown; that holds when
+        # an observer thread would be starved out by the same pressure.
+        solver = harness.Solver("z3", Path("/bin/true"), "z3")
+        inv = harness.build_invocation(
+            solver, "sq", "QF_UF", "input.smt2", envelope(memlimit=3072)
+        )
+        self.assertIsNotNone(inv)
+        self.assertEqual(inv.argv[1:], ["-memory:3072", "input.smt2"])
+
+    def test_plain_solver_has_no_memory_knob_to_receive(self) -> None:
+        solver = harness.Solver("other", Path("/bin/true"), "plain")
+        inv = harness.build_invocation(
+            solver, "sq", "QF_UF", "input.smt2", envelope(memlimit=3072)
+        )
+        self.assertIsNotNone(inv)
+        self.assertEqual(inv.argv, ["/bin/true", "input.smt2"])
+
     def test_scoring_rejects_full_envelope_timeout_and_corpus_mismatches(self) -> None:
         resource = envelope()
         records = {

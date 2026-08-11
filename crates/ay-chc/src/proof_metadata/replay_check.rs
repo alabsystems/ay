@@ -232,6 +232,14 @@ impl ChcPdrProofRun {
                         Some(remaining),
                     )
                 else {
+                    // Env-gated dump so the failing obligation is a runnable
+                    // reproducer instead of just a name in an error string.
+                    if let Ok(dir) = std::env::var("AY_CHC_DUMP_FAILED_REPLAY_OBLIGATION") {
+                        let path = format!("{dir}/{}.smt2", obligation.name);
+                        if std::fs::write(&path, &obligation.smtlib).is_ok() {
+                            eprintln!("[ay-chc] wrote failing replay obligation to {path}");
+                        }
+                    }
                     return Err(verification_error(format!(
                         "checked replay obligation {} did not produce a native strict-Alethe \
                          UNSAT certificate; staying metadata-only",
@@ -546,7 +554,14 @@ impl VerifiedChcResult {
         );
         match checked {
             Ok(checked) => checked.proof_run.metadata,
-            Err(_) => run.metadata,
+            Err(err) => {
+                // Fail-closed is correct, but silently discarding the reason
+                // made this undiagnosable: consumers see only a metadata-only
+                // transcript and cannot tell whether replay was disabled,
+                // starved of budget, or genuinely failed. Surface it.
+                eprintln!("[ay-chc] checked replay fell back to metadata-only: {err}");
+                run.metadata
+            }
         }
     }
 }

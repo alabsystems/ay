@@ -390,3 +390,217 @@ fn test_wfcegqi_batch_unsat_no_wrong_sat() {
     }
     assert!(wrong.is_empty(), "WRONG-SAT on UNSAT instances: {wrong:?}");
 }
+
+/// (#cegqi-attribution) FALSE-UNSAT on an ENTAILED inner forall.
+///
+/// `∀x. a(x) ⇒ ∀y. A[y] ≠ x` together with `a(k2)` is SATISFIABLE (z3: sat) —
+/// e.g. `k2:=0`, `a := λx. x=0`, `A := (as const) 1`. AY answered `unsat`.
+///
+/// Unlike the disjunction-position false-unsats fixed in cf0a5789b, the inner
+/// forall genuinely IS entailed (`a(k2) ∧ (¬a(k2) ∨ Q2) ⊨ Q2`) and the
+/// entailment gate correctly admits it. The failure is downstream: CEGQI asserts
+/// the quantifier's NEGATION as the CE lemma, the ground lane consumes that
+/// equality as a DEFINITIONAL substitution (`k2 := A[c]`), rewrites away the
+/// genuine assertion `a(k2)` and constant-folds the residue to a bare `false`.
+/// The CE strip in `disambiguate_cegqi_unsat_ext` then deletes the real
+/// assertions (they now mention the CE variable) and KEEPS the CE-derived
+/// `false`, so the "ground-minus-CE" probe re-solves `{true,false}` and reports
+/// a GLOBAL unsat — a conflict that depends ENTIRELY on the CE lemma, which per
+/// `cegqi/mod.rs` ("forall: UNSAT on CE lemma -> SAT") means the quantifier
+/// HOLDS.
+///
+/// `cegqi_probe_unsat_is_attributable` now requires the probe set to still carry
+/// every CE-free ground conjunct of the pre-instantiation snapshot; `(a k2)` is
+/// absent, so the UNSAT is unattributable and fails closed to Unknown.
+///
+/// Each variant below is the same semantic shape written differently, so the fix
+/// cannot be a syntactic special case. `sat` would also be correct here; only
+/// `unsat` is wrong.
+#[test]
+fn test_cegqi_entailed_inner_forall_never_unsat() {
+    let variants: &[(&str, &str)] = &[
+        (
+            "implies",
+            r#"
+            (set-logic AUFLIA)
+            (declare-fun a (Int) Bool)
+            (declare-fun k2 () Int)
+            (declare-fun A () (Array Int Int))
+            (assert (forall ((x Int)) (=> (a x) (forall ((y Int)) (not (= (select A y) x))))))
+            (assert (a k2))
+            (check-sat)
+        "#,
+        ),
+        (
+            "or_not",
+            r#"
+            (set-logic AUFLIA)
+            (declare-fun a (Int) Bool)
+            (declare-fun k2 () Int)
+            (declare-fun A () (Array Int Int))
+            (assert (forall ((x Int)) (or (not (a x)) (forall ((y Int)) (not (= (select A y) x))))))
+            (assert (a k2))
+            (check-sat)
+        "#,
+        ),
+        (
+            "nnf_not_and_exists",
+            r#"
+            (set-logic AUFLIA)
+            (declare-fun a (Int) Bool)
+            (declare-fun k2 () Int)
+            (declare-fun A () (Array Int Int))
+            (assert (forall ((x Int)) (not (and (a x) (exists ((y Int)) (= (select A y) x))))))
+            (assert (a k2))
+            (check-sat)
+        "#,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, input) in variants {
+        let commands = parse(input).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).unwrap();
+        let out = outputs.last().cloned().unwrap_or_default();
+        println!("CEGQI-ENTAILED-INNER {name} => {out}");
+        if out == "unsat" {
+            wrong.push(*name);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "WRONG-UNSAT on satisfiable entailed-inner-forall instances: {wrong:?}"
+    );
+}
+
+/// (#cegqi-attribution) Self-refutation control for the family above: AY itself
+/// answers `sat` once the witnessing interpretation is substituted in, so no
+/// external oracle is needed to show `unsat` is wrong. A model of the
+/// interpreted instance is a model of the uninterpreted one.
+#[test]
+fn test_cegqi_entailed_inner_forall_witness_is_sat() {
+    let input = r#"
+        (set-logic AUFLIA)
+        (define-fun a ((x Int)) Bool (= x 0))
+        (define-fun k2 () Int 0)
+        (define-fun A () (Array Int Int) ((as const (Array Int Int)) 1))
+        (assert (forall ((x Int)) (=> (a x) (forall ((y Int)) (not (= (select A y) x))))))
+        (assert (a k2))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "witnessed instance must stay SAT (this is the self-refutation control)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #satgate-vacuous-binder — regression tests for the mechanism that degraded
+// the control above.
+//
+// BISECT: `66538b006f` ("feat(parity): define exact Z3 5 replacement gate")
+// changed ONE condition in `apply_quantified_model_failclosed_gate`
+// (`crates/ay-dpll/src/executor/model/independent_gate.rs`):
+//
+//     -   if deferred_any && self.self_check {      // --self-check only
+//     +   if deferred_any {                         // every solve
+//
+// so a quantified conjunct the gate could not DECIDE started publishing
+// `unknown` instead of the solver's `sat`. Measured: the witness control above
+// answered `sat` at `e22fb87f0` / `03c7b6667` and `unknown` 5/5 at HEAD, with
+// `unknown.phase = "independent-model-check-gate"` and the `(deferred:` detail
+// unique to that site.
+//
+// ROOT CAUSE (measured with `AY_DEBUG_QMG=1`): the conjunct the gate receives
+// is `(forall ((x Int)) (or (forall ((y Int)) (not (= 1 x))) (not (= 0 x))))`
+// — `y` is VACUOUS (the const-array `select` already folded to `1`). Neither
+// decision route can handle a binder buried in the matrix: the prefix route
+// requires a quantifier-free matrix, and the general route's `deep_qe` refuses
+// a vacuous binder by design (`find_bound_var -> None` is not a proof of
+// non-occurrence there) and then fails closed on the residual quantifier.
+//
+// FIX: drop provably-vacuous binders inside the gate (`∀v.φ ≡ φ ≡ ∃v.φ` over
+// SMT-LIB's non-empty sorts — an unconditional equivalence), which lets the
+// gate MINT the certificate that was missing: the nested solve now refutes the
+// skolemized negation and the conjunct is `Confirmed`, not `Deferred`. The
+// fail-closed funnel itself is untouched — see the third test.
+
+/// Vacuous UNIVERSAL inner binder. Fails (`unknown`) without the
+/// #satgate-vacuous-binder drop: the gate cannot decide
+/// `∀x. x = 5 => ∀y. 1 < x + x` while `y` is in the way, so it defers and the
+/// post-`66538b006f` funnel publishes `unknown`. No arrays, so this isolates
+/// the binder mechanism from the const-array fold in the control above.
+#[test]
+fn test_quantified_gate_certifies_vacuous_inner_forall() {
+    let input = r#"
+        (set-logic AUFLIA)
+        (declare-fun c () Int)
+        (assert (> c 3))
+        (assert (forall ((x Int)) (=> (= x 5) (forall ((y Int)) (< 1 (+ x x))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "a vacuous inner FORALL must not stop the model gate from certifying \
+         a valid quantified conjunct (#satgate-vacuous-binder, 66538b006f)"
+    );
+}
+
+/// Same, EXISTENTIAL inner binder — the drop must cover both quantifiers
+/// (`∃v.φ ≡ φ` is the same non-empty-sort equivalence). Also `unknown` without
+/// the fix.
+#[test]
+fn test_quantified_gate_certifies_vacuous_inner_exists() {
+    let input = r#"
+        (set-logic AUFLIA)
+        (declare-fun c () Int)
+        (assert (> c 3))
+        (assert (forall ((x Int)) (=> (= x 5) (exists ((y Int)) (< 1 (+ x x))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "a vacuous inner EXISTS must not stop the model gate from certifying \
+         a valid quantified conjunct (#satgate-vacuous-binder, 66538b006f)"
+    );
+}
+
+/// GUARD: the fix must not become a blanket relaxation of the fail-closed
+/// funnel. The same shape with a LIVE inner binder — `y` really occurs, under
+/// an uninterpreted `f` the witness says nothing about — is exactly the case
+/// the gate exists for, and must still degrade to `unknown`. (Measured: HEAD
+/// `unknown`, fix `unknown`; disabling the gate site outright instead turns
+/// `crates/ay-dpll/tests/fixtures/ufbv_uf_completion_strict_leg_wrong_sat.smt2`
+/// — declared `unsat` — into a WRONG `sat`.)
+#[test]
+fn test_quantified_gate_still_failcloses_live_inner_binder() {
+    let input = r#"
+        (set-logic AUFLIA)
+        (declare-fun f (Int) Int)
+        (declare-fun c () Int)
+        (assert (> c 3))
+        (assert (forall ((x Int)) (=> (= x 5) (forall ((y Int)) (< (f y) (+ x x))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("unknown"),
+        "a LIVE inner binder is not vacuous: the gate must still fail closed \
+         rather than publish an uncertified `sat` (#satgate-vacuous-binder)"
+    );
+}

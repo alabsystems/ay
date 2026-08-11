@@ -205,6 +205,121 @@ fn test_get_assertions_after_pop() {
     );
 }
 
+#[test]
+fn get_assertions_preserves_schematic_surface_before_and_after_check() {
+    let input = r#"
+        (set-logic UF)
+        (declare-sort-parameter X)
+        (declare-fun id (X) X)
+        (assert (forall ((x X)) (! (= (id x) x) :pattern ((id x)))))
+        (get-assertions)
+        (check-sat)
+        (get-assertions)
+    "#;
+
+    let commands = parse(input).expect("schematic fixture parses");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("schematic fixture executes");
+
+    let authored = "((forall ((x X)) (! (= (id x) x) :pattern ((id x)))))";
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[0], authored);
+    assert_eq!(outputs[1], "sat");
+    assert_eq!(
+        outputs[2], authored,
+        "query-local Bool instances must not replace the authored assertion"
+    );
+}
+
+#[test]
+fn schematic_unsat_is_certified_on_first_and_repeated_checks() {
+    let input = r#"
+        (set-logic UF)
+        (declare-sort U 0)
+        (declare-sort-parameter X)
+        (assert (forall ((x X)) (distinct x x)))
+        (check-sat)
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("schematic UNSAT fixture parses");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("schematic UNSAT fixture executes");
+    assert_eq!(
+        outputs,
+        ["unsat", "unsat"],
+        "materialized instances must belong to each exact proof epoch"
+    );
+}
+
+#[test]
+fn get_assertions_keeps_authored_order_across_schematic_and_concrete_terms() {
+    let input = r#"
+        (set-logic UF)
+        (declare-sort-parameter X)
+        (assert true)
+        (assert (forall ((x X)) (= x x)))
+        (assert false)
+        (get-assertions)
+    "#;
+
+    let commands = parse(input).expect("mixed fixture parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("mixed fixture executes");
+    assert_eq!(outputs, ["(true\n (forall ((x X)) (= x x))\n false)"]);
+}
+
+#[test]
+fn get_assertions_excludes_transient_maxsmt_constraints() {
+    let input = r#"
+        (set-logic QF_UF)
+        (declare-const a Bool)
+        (assert a)
+        (assert-soft (not a) :weight 1)
+        (check-sat)
+        (get-assertions)
+    "#;
+
+    let commands = parse(input).expect("MaxSMT fixture parses");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("MaxSMT fixture executes");
+    let rendered = outputs.last().expect("get-assertions output");
+    assert_eq!(rendered, "(a)");
+    assert!(!rendered.contains("__ay_soft_internal__"));
+}
+
+#[test]
+fn get_assertions_excludes_transient_optimization_constraints() {
+    let input = r#"
+        (set-logic QF_LIA)
+        (declare-const x Int)
+        (assert (>= x 0))
+        (assert (<= x 1))
+        (maximize x)
+        (check-sat)
+        (get-assertions)
+    "#;
+
+    let commands = parse(input).expect("optimization fixture parses");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("optimization fixture executes");
+    let rendered = outputs.last().expect("get-assertions output");
+    assert!(!rendered.contains("__ay_opt_internal__"));
+    let parsed = parse_sexp(rendered).expect("assertions parse");
+    let SExpr::List(assertions) = &parsed else {
+        panic!("expected assertion list, got {rendered}");
+    };
+    assert_eq!(assertions.len(), 2, "only authored hard assertions remain");
+}
+
 // ========== get-assignment Tests ==========
 
 #[test]

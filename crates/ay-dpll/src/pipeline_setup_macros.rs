@@ -238,6 +238,11 @@ macro_rules! pipeline_incremental_setup {
             sat
         };
         $solver_out.ensure_num_vars(_pis_total_vars as usize);
+        // Rebind the exact public query's cooperative interrupt on every use.
+        // The SAT solver is persistent across SMT queries; retaining an older
+        // handle would either miss the current timeout or let a later-fired
+        // watchdog poison a subsequent query.
+        $solver_out.set_interrupt_handle($self.solve_interrupt.clone());
 
         // If solver was just created, run the init hook for scope synchronization
         if _pis_solver_is_new {
@@ -518,6 +523,7 @@ macro_rules! pipeline_build_unsat_proof_with_pop {
             $self.last_clause_trace = _bup_clause_trace;
             $self.last_clausification_proofs = Some(_bup_cp);
             $self.last_original_clause_theory_proofs = Some(_bup_tp);
+            $crate::pipeline_fns::record_var_map_provenance("setup", &$solver, _bup_vtm.len());
             $self.last_var_to_term = Some(_bup_vtm);
             $self.last_negations = Some(_bup_neg);
             $self.build_unsat_proof();
@@ -641,6 +647,7 @@ macro_rules! pipeline_inject_bound_axioms {
                     ay_core::TheorySolver::assert_literal(&mut check_lra, t1, !p1);
                     ay_core::TheorySolver::assert_literal(&mut check_lra, t2, !p2);
                     let check_result = ay_core::TheorySolver::check(&mut check_lra);
+                    drop(check_lra);
                     if matches!(check_result, ay_core::TheoryResult::Sat) {
                         _axiom_rejected += 1;
                         tracing::warn!(
@@ -657,7 +664,12 @@ macro_rules! pipeline_inject_bound_axioms {
                         continue;
                     }
                     let _ba_pair_farkas = match check_result {
-                        ay_core::TheoryResult::UnsatWithFarkas(conflict) => conflict.farkas,
+                        ay_core::TheoryResult::UnsatWithFarkas(conflict) => {
+                            $crate::pipeline_fns::rebind_bound_axiom_farkas(
+                                conflict,
+                                &[(t1, !p1), (t2, !p2)],
+                            )
+                        }
                         _ => None,
                     };
                     _ba_validated_pairs.push((t1, p1, t2, p2));

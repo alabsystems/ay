@@ -127,9 +127,18 @@ fn qf_lra_smtcomp_subset_matches_z3() -> Result<()> {
         return Ok(());
     }
 
+    // `benchmarks/smtcomp/` is gitignored (only two QF_LRA files are whitelisted),
+    // so a clean checkout has no corpus. Skip the individual benchmarks that are
+    // absent — a partial corpus still gets the full strict comparison — and
+    // report how many were skipped so a silently-empty run is visible.
     let mut failures = Vec::new();
+    let mut skipped = Vec::new();
     for (name, expected) in SMTCOMP_QF_LRA_CASES {
         let path = workspace_path(format!("benchmarks/smtcomp/QF_LRA/{name}"));
+        if !path.exists() {
+            skipped.push(*name);
+            continue;
+        }
         let z3_result = run_z3_file(&path, BENCHMARK_TIMEOUT_SECS)?;
         let ay_result = run_executor_file_with_timeout(&path, BENCHMARK_TIMEOUT_SECS)?;
 
@@ -146,11 +155,22 @@ fn qf_lra_smtcomp_subset_matches_z3() -> Result<()> {
         }
     }
 
+    if !skipped.is_empty() {
+        eprintln!(
+            "SKIP qf_lra_smtcomp_subset_matches_z3: {}/{} curated benchmarks not installed \
+             (gitignored smtcomp corpus); compared {}",
+            skipped.len(),
+            SMTCOMP_QF_LRA_CASES.len(),
+            SMTCOMP_QF_LRA_CASES.len() - skipped.len()
+        );
+    }
+
     assert!(
         failures.is_empty(),
-        "QF_LRA curated subset failures ({}/{} of 37):\n{}",
+        "QF_LRA curated subset failures ({}/{} compared, {} skipped as not installed):\n{}",
         failures.len(),
-        SMTCOMP_QF_LRA_CASES.len(),
+        SMTCOMP_QF_LRA_CASES.len() - skipped.len(),
+        skipped.len(),
         failures.join("\n")
     );
 
@@ -168,6 +188,13 @@ fn qf_lra_smtcomp_soundness_sweep() -> Result<()> {
     }
 
     let dir = workspace_path("benchmarks/smtcomp/QF_LRA");
+    if !dir.is_dir() {
+        eprintln!(
+            "SKIP qf_lra_smtcomp_soundness_sweep: corpus directory not found: {}",
+            dir.display()
+        );
+        return Ok(());
+    }
     let mut entries: Vec<_> = fs::read_dir(&dir)?
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "smt2"))
@@ -225,6 +252,14 @@ fn qf_lra_industrial_cooking12_matches_z3() -> Result<()> {
     }
 
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/constraints-cooking12.smt2");
+    // Gitignored smtcomp corpus — skip when not installed.
+    if !path.exists() {
+        eprintln!(
+            "SKIP qf_lra_industrial_cooking12_matches_z3: corpus benchmark not found: {}",
+            path.display()
+        );
+        return Ok(());
+    }
     let real_decls = count_real_declarations(&path)?;
     assert!(
         real_decls >= 50,

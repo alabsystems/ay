@@ -224,7 +224,7 @@ def test_acceptance_funcdecl(scope):
     assert f.domain(0).kind == "Int"
     assert f.domain(1).kind == "Real"
     assert f.range().kind == "Bool"
-    assert f.kind() == 45102  # Z3_OP_UNINTERPRETED
+    assert f.kind() == 49167  # Z3_OP_UNINTERPRETED (Z3 5.0.0)
     assert f.params() == []
     # The decl recovered from an application is the same declaration.
     app = f(z.Int("u"), z.Real("w"))
@@ -252,7 +252,7 @@ def test_declared_const_decl(scope):
     d = x.decl()
     assert d.name() == "x"
     assert d.arity() == 0
-    assert d.kind() == 45102  # a declared constant is a 0-arity uninterpreted decl
+    assert d.kind() == 49167  # a declared constant is a 0-arity uninterpreted decl
     assert x.num_args() == 0
     assert x.children() == []
     assert x.sexpr() == "x"

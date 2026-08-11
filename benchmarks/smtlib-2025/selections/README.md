@@ -50,6 +50,55 @@ recorded **36 errors** and OpenSMT (min-ucore) 32 — the 0-error discipline is
 itself worth points here, and AY's UC path cannot emit an invalid core by
 construction.
 
+## Quantified SingleQuery divisions — derived 2026-07-29
+
+All 7 quantified SQ divisions derived by exactly the procedure above, from the
+same pinned data already in `.competitors/smtcomp-io/data/` (no network needed).
+
+**Derivation validated first** by re-deriving `SingleQuery/QF_Datatypes.jsonl`
+with the same code: 552 rows, sat 161 / unsat 285 / unknown 106 — reproducing the
+table below exactly. The 0-error solver detection also independently reproduced
+the documented exclusions (SQ track: Amaya, COLIBRI, SMTInterpol, 1 error each).
+
+Division -> logic sets taken from `smtcomp/defs.py`'s `Track.SingleQuery` block
+(e.g. `Division.Bitvec: { Logic.BV }`).
+
+| Division | rows | official size | resolved on disk | expected split |
+|---|---:|---|---:|---|
+| Arith | 1666 | 1666 | 0 | unsat 984, sat 676, unknown 6 |
+| **Bitvec** | **1040** | **1040** | **1040** | unsat 762, sat 255, unknown 23 |
+| Equality | 4426 | 4426 | 0 | unsat 1252, sat 525, unknown 2649 |
+| Equality_LinearArith | 16936 | 16936 | 0 | unsat 12508, sat 1063, unknown 3365 |
+| Equality_MachineArith | 8931 | 8931 | 0 | unsat 5212, sat 1405, unknown 2314 |
+| Equality_NonLinearArith | 10232 | 10232 | 0 | unsat 6377, sat 792, unknown 3063 |
+| FPArith | 1849 | 1849 | 1808 | unsat 1212, sat 567, unknown 70 |
+
+Every row count matches the official division size recorded on the campaign
+board, which is the same cross-check used for `UnsatCore/QF_LinearIntArith`.
+
+**Corpora fetched 2026-07-29** (Zenodo 15493090: FPLRA, NIA, LIA, NRA, LRA,
+UFDT, UF — 94 MB total). Resolution now:
+
+| Division | rows | resolved | status |
+|---|---:|---:|---|
+| Arith | 1666 | 1666 | **RUNNABLE** |
+| Bitvec | 1040 | 1040 | **RUNNABLE** |
+| Equality | 4426 | 4426 | **RUNNABLE** |
+| FPArith | 1849 | 1849 | **RUNNABLE** |
+| Equality_LinearArith | 16936 | 0 | needs 10 logics |
+| Equality_MachineArith | 8931 | 0 | needs 19 logics |
+| Equality_NonLinearArith | 10232 | 0 | needs 8 logics |
+
+**Four quantified divisions went from never-scored to runnable for 94 MB.** The
+remaining three need 37 more logic corpora from the same record; they are the
+combination-heavy divisions (Equality+LinearArith / MachineArith /
+NonLinearArith) and are much larger.
+
+Bars to beat (official, sequential — re-measure same-metal per method rule #1):
+Arith Z3-alpha 1474/1666 · Bitvec cvc5 952/1040 · Equality cvc5 **1714/4426 =
+38.7%, the lowest quantified bar in the competition** · FPArith Bitwuzla
+1751/1849.
+
 ## `expected` field
 
 1. `status` from `benchmarks-2025.json.gz` when it is `sat`/`unsat`;

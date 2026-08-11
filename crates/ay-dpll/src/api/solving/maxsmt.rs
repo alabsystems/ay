@@ -112,6 +112,20 @@ impl Solver {
         self.executor.context().soft_constraints().len()
     }
 
+    /// Terms registered by parsed `(assert-soft ...)` commands.
+    ///
+    /// Compatibility adapters use this read-only snapshot to apply
+    /// term-reachability trust gates to the complete optimization goal.
+    #[must_use]
+    pub fn parsed_soft_constraint_terms(&self) -> Vec<Term> {
+        self.executor
+            .context()
+            .soft_constraints()
+            .iter()
+            .map(|soft| Term(soft.term))
+            .collect()
+    }
+
     /// Solve the API MaxSMT problem exactly when its weighted encoding is within
     /// the supported bound.
     ///
@@ -144,6 +158,8 @@ impl Solver {
         {
             self.clear_last_solve_state(true, false);
             self.record_native_replay_event(NativeReplayEventKind::CheckSat);
+            self.executor
+                .replace_last_result_with_unknown(UnknownReason::Unsupported);
             self.last_unknown_reason = Some(UnknownReason::Unsupported);
             return Ok(MaxSmtResult::unknown());
         }
@@ -180,6 +196,8 @@ impl Solver {
             .iter()
             .any(|soft| soft.group.is_some())
         {
+            self.executor
+                .replace_last_result_with_unknown(UnknownReason::Unsupported);
             self.last_unknown_reason = Some(UnknownReason::Unsupported);
             return Ok(MaxSmtResult::unknown());
         }
@@ -191,6 +209,8 @@ impl Solver {
         {
             Some(total) if total <= MAXSMT_EXACT_MAX_TOTAL_WEIGHT => total,
             Some(_) | None => {
+                self.executor
+                    .replace_last_result_with_unknown(UnknownReason::Incomplete);
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 return Ok(MaxSmtResult::unknown());
             }
@@ -289,6 +309,8 @@ impl Solver {
             // reporting. The native result type has no Approximate status, so
             // fail closed and expose neither that witness nor its upper bound.
             self.executor.begin_public_solve(false);
+            self.executor
+                .replace_last_result_with_unknown(UnknownReason::Incomplete);
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             return Ok(MaxSmtResult::unknown());
         }
@@ -325,6 +347,8 @@ impl Solver {
     /// Fail closed when executor accounting violates the native API contract.
     fn reject_inconsistent_maxsmt(&mut self, detail: String) -> MaxSmtResult {
         self.executor.begin_public_solve(false);
+        self.executor
+            .replace_last_result_with_unknown(UnknownReason::InternalError);
         self.last_unknown_reason = Some(UnknownReason::InternalError);
         self.last_executor_error = Some(detail);
         self.last_artifact_export_failure = None;

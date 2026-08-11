@@ -40,6 +40,7 @@
 use crate::decompose::DecomposeProofEmitContext;
 use crate::proof_manager::ProofAddKind;
 use crate::Literal;
+use ay_core::time::Instant;
 use std::io;
 
 use super::Solver;
@@ -233,6 +234,47 @@ impl Solver {
             self.cold.pending_forward_check = None;
         }
 
+        Ok(id)
+    }
+
+    /// Emit the bounded backward producer's terminal positive-RUP step.
+    ///
+    /// This intentionally bypasses the generic proof-manager hint
+    /// filtering/preflight path: the bounded producer has already enforced
+    /// positive, unique, live hints under its own count, byte, and deadline
+    /// limits. Keeping this as a distinct funnel prevents ordinary empty
+    /// clauses found during search from being mistaken for prevalidated
+    /// backward output merely because bounded reconstruction is configured.
+    pub(crate) fn proof_emit_bounded_terminal_rup(
+        &mut self,
+        hints: &[u64],
+        deadline: Option<Instant>,
+    ) -> io::Result<u64> {
+        #[cfg(debug_assertions)]
+        self.assert_proof_mode_stable();
+
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.cold.pending_forward_check.is_none(),
+            "BUG: previous prechecked clause (id={:?}) was never forward-checked",
+            self.cold.pending_forward_check
+        );
+
+        // The ordinary proof funnel registers LRAT-hinted derived clauses as
+        // originals with the structural forward checker. Preserve that
+        // bookkeeping without invoking its generic hint path.
+        if let Some(ref mut checker) = self.cold.forward_checker {
+            checker.add_original(&[]);
+        }
+
+        let id = if let Some(ref mut manager) = self.proof_manager {
+            manager.emit_bounded_empty_rup_step(hints, deadline)?
+        } else {
+            0
+        };
+        if id != 0 && self.cold.next_clause_id <= id {
+            self.cold.next_clause_id = id + 1;
+        }
         Ok(id)
     }
 

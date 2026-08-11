@@ -53,20 +53,22 @@ impl Context {
                 }
                 Ok(self.terms.mk_app(Symbol::named("seq.empty"), vec![], sort))
             }
-            // `(as set.empty (Set T))` is the empty set over the membership
-            // carrier `Array(T -> Bool)`: the constant-false array. This is
-            // sound and array-decidable: `select(empty, e) = false` for all `e`
-            // with no quantifier instantiation.
+            // `(as set.empty (Set T))` and Z3 5.0.0's
+            // `(as set.empty (FiniteSet T))` are the empty set over the
+            // membership carrier `Array(T -> Bool)`: the constant-false array.
+            // This is sound and array-decidable:
+            // `select(empty, e) = false` for all `e` with no quantifier
+            // instantiation.
             "set.empty" => {
                 self.expect_exact_arity("set.empty", &arg_ids, 0)?;
                 let index_sort = sort.array_index().cloned().ok_or_else(|| {
                     ElaborateError::InvalidConstant(format!(
-                        "set.empty requires a (Set T) / Array sort annotation, got: {sort:?}"
+                        "set.empty requires a (Set T), (FiniteSet T), or Array(_, Bool) sort annotation, got: {sort:?}"
                     ))
                 })?;
                 if sort.array_element() != Some(&Sort::Bool) {
                     return Err(ElaborateError::SortMismatch {
-                        expected: "(Set _) carried as (Array _ Bool)".to_string(),
+                        expected: "(Set _) / (FiniteSet _) carried as (Array _ Bool)".to_string(),
                         actual: sort.to_string(),
                     });
                 }
@@ -150,7 +152,7 @@ impl Context {
                     ))
                 })?;
                 let actual = self.terms.sort(arg_ids[0]).clone();
-                if actual == Sort::Int && expected == Sort::Real {
+                if self.int_real_coercions() && actual == Sort::Int && expected == Sort::Real {
                     arg_ids[0] = self.coerce_int_to_real(arg_ids[0]);
                 } else if actual != expected {
                     return Err(ElaborateError::SortMismatch {

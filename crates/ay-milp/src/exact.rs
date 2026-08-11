@@ -132,6 +132,9 @@ impl ExactLp {
         let mut upper: Vec<Option<Rational>> = Vec::with_capacity(total);
         let mut values: Vec<Rational> = Vec::with_capacity(total);
         for i in 0..n {
+            if i & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return None;
+            }
             let (lb, ub) = model.col_bounds(Col(i as u32));
             let lb = exact(lb).map(Rational::from_big);
             let ub = exact(ub).map(Rational::from_big);
@@ -158,12 +161,18 @@ impl ExactLp {
             // model. A rounded `f64` coefficient/bound is read from the
             // exact-rational side-store, so the rim produces Farkas/optimum
             // verdicts over the model the file actually wrote.
-            let terms: Vec<(u32, Rational)> = coeffs
-                .iter()
-                .map(|&(c, a)| (c, Rational::from_big(model.row_coeff_exact(r, c, a))))
-                .collect();
+            let mut terms = Vec::with_capacity(coeffs.len());
+            for (entry, &(c, a)) in coeffs.iter().enumerate() {
+                if entry & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+                    return None;
+                }
+                terms.push((c, Rational::from_big(model.row_coeff_exact(r, c, a))));
+            }
             let mut v = Rational::zero();
-            for (c, a) in &terms {
+            for (entry, (c, a)) in terms.iter().enumerate() {
+                if entry & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+                    return None;
+                }
                 v += a.clone() * values[*c as usize].clone();
             }
             lower.push(model.row_lb_exact(r, lb).map(Rational::from_big));
@@ -190,10 +199,23 @@ impl ExactLp {
 
     /// The current structural point, exact.
     pub(crate) fn structural_values(&self) -> Vec<BigRational> {
-        self.values[..self.n_structural]
-            .iter()
-            .map(Rational::to_big)
-            .collect()
+        let mut unlimited = |_| true;
+        self.structural_values_with_work(&mut unlimited)
+            .expect("unbounded exact point conversion")
+    }
+
+    pub(crate) fn structural_values_with_work<F>(&self, work: &mut F) -> Option<Vec<BigRational>>
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        let mut values = Vec::with_capacity(self.n_structural);
+        for (index, value) in self.values[..self.n_structural].iter().enumerate() {
+            if index & 0xff == 0 && !work(0x100.min(self.n_structural.saturating_sub(index))) {
+                return None;
+            }
+            values.push(value.to_big());
+        }
+        Some(values)
     }
 
     fn fact_of(&self, var: u32, side: BoundSide) -> FactRef {

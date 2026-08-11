@@ -14,6 +14,18 @@ fn proof_types_accessible_through_facade() {
 }
 
 #[test]
+fn checked_native_replay_proof_api_is_accessible_through_facade() {
+    let _ = crate::Solver::replay_native_replay_artifact_with_checked_proof
+        as fn(
+            &crate::NativeReplayArtifact,
+            std::time::Duration,
+        ) -> Result<
+            (crate::SolveDetails, Option<crate::UnsatProofArtifact>),
+            crate::SolverError,
+        >;
+}
+
+#[test]
 fn proof_types_accessible_through_api_module() {
     let _: fn() -> crate::api::ProofAcceptanceMode = || crate::api::ProofAcceptanceMode::Strict;
     let _: fn() -> Option<crate::api::StrictProofVerdict> = || None;

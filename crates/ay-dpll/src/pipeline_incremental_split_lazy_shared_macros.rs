@@ -90,7 +90,12 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 // Record structured theory proof (#6725) — mirrors no-split
                 // incremental path (pipeline_incremental_macros.rs:248).
                 let _sld_theory_proof = if $pe {
-                    Some(ay_core::TheoryLemmaProof {
+                    $crate::theory_inference::build_blocking_clause_terms(
+                        $neg.as_map(),
+                        &conflict_terms,
+                    )
+                    .map(|clause| ay_core::TheoryLemmaProof {
+                        clause,
                         kind: $crate::theory_inference::infer_theory_conflict_kind(
                             Some(&$self.ctx.terms),
                             $neg.as_map(),
@@ -219,8 +224,13 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 // Record structured theory proof with Farkas coefficients (#6725)
                 // — mirrors no-split incremental path (pipeline_incremental_macros.rs:321-327).
                 let _sld_theory_proof = if $pe {
-                    Some(if _sld_farkas_proof_valid {
+                    $crate::theory_inference::build_blocking_clause_terms(
+                        $neg.as_map(),
+                        &conflict.literals,
+                    )
+                    .map(|clause| if _sld_farkas_proof_valid {
                         ay_core::TheoryLemmaProof {
+                            clause,
                             kind: $crate::theory_inference::infer_theory_conflict_kind(
                                 Some(&$self.ctx.terms),
                                 $neg.as_map(),
@@ -232,6 +242,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         }
                     } else {
                         ay_core::TheoryLemmaProof {
+                            clause,
                             kind: $crate::theory_inference::infer_theory_conflict_kind(
                                 Some(&$self.ctx.terms),
                                 $neg.as_map(),
@@ -619,14 +630,21 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                             );
                         match kind {
                             ay_core::TheoryLemmaKind::Generic => {
-                                let _ = $self.proof_tracker.add_theory_lemma(terms);
+                                let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
                             }
                             _ => {
-                                let _ = $self.proof_tracker.add_theory_lemma_with_kind(terms, kind);
+                                let _ = $self
+                                    .proof_tracker
+                                    .add_theory_lemma_with_kind(terms.clone(), kind);
                             }
                         }
                         $lcp.push(None);
-                        $ltp.push(Some(ay_core::TheoryLemmaProof { kind, farkas: None , lia: None }));
+                        $ltp.push(Some(ay_core::TheoryLemmaProof {
+                            clause: terms,
+                            kind,
+                            farkas: None,
+                            lia: None,
+                        }));
                     }
                     $tl.push(lemma.clone());
                 }

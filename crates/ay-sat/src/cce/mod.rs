@@ -94,7 +94,15 @@ impl Cce {
     /// Create a new CCE engine for `num_vars` variables.
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
-            occ: OccList::new(num_vars),
+            // Sized on demand, not here. `OccList::new(n)` commits
+            // `vec![Vec::new(); 2n]` plus a per-literal `PosMap` — 128 resident
+            // bytes per variable — and CCE's entry point
+            // (`solver/inprocessing/cce.rs`) already calls `ensure_num_vars`
+            // immediately before `rebuild`, so nothing reads the list until it
+            // has been grown. Measured: this is 863 MB on a 6.7 M-variable
+            // SAT-COMP 2026 instance, committed before a clause is read on
+            // every instance whether or not CCE ever runs.
+            occ: OccList::new(0),
             local_vals: vec![0i8; num_vars * 2],
             covered: Vec::new(),
             intersection: Vec::new(),

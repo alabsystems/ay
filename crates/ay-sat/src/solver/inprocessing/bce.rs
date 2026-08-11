@@ -29,6 +29,11 @@ impl Solver {
         if !self.enter_inprocessing() {
             return;
         }
+        // BCE's occurrence list is sized here rather than at solver
+        // construction: `OccList::new(n)` costs 128 resident bytes per variable
+        // and BCE may never run. Idempotent — a length check after the first
+        // call. Mirrors the CCE entry point.
+        self.inproc.bce.ensure_num_vars(self.num_vars);
 
         // Defense-in-depth: BCE uses reconstruction stack (push_bce), so it
         // must not fire in incremental mode even if re-enabled via set_bce_enabled.

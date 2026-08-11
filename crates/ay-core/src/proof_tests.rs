@@ -40,6 +40,8 @@ fn theory_lemma_kind_alethe_rule_mapping() {
     );
     assert_eq!(TheoryLemmaKind::LraFarkas.alethe_rule(), "la_generic");
     assert_eq!(TheoryLemmaKind::LiaGeneric.alethe_rule(), "lia_generic");
+    assert_eq!(TheoryLemmaKind::LiaModRange.alethe_rule(), "lia_mod_range");
+    assert_eq!(TheoryLemmaKind::LiaModRange.alethe_wire_rule(), "hole");
     assert_eq!(TheoryLemmaKind::BvBitBlast.alethe_rule(), "bv_bitblast");
     assert_eq!(
         TheoryLemmaKind::BvBitBlastGate {

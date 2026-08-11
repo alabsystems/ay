@@ -19,8 +19,111 @@
 //!   and yields a usable model — the acceptance criterion.
 
 use super::super::*;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
+
+/// Frozen oracle captured from Z3 5.0.0's `Z3_get_simplifier_name`, in C API
+/// enumeration order. The CLI's `-simplifiers` display uses a different,
+/// sorted presentation order.
+/// This intentionally does not reuse `SUPPORTED_SIMPLIFIER_NAMES`: the test must
+/// fail if AY's production registry drifts from the reference catalog.
+const Z3_5_SIMPLIFIER_NAMES: &[&str] = &[
+    "bit2int",
+    "bit-blast",
+    "bv1-blast",
+    "cheap-fourier-motzkin",
+    "elim-term-ite",
+    "max-bv-sharing",
+    "pull-nested-quantifiers",
+    "push-app-ite-conservative",
+    "push-app-ite",
+    "ng-push-app-ite-conservative",
+    "ng-push-app-ite",
+    "randomizer",
+    "refine-injectivity",
+    "simplify",
+    "qe-light",
+    "card2bv",
+    "factor",
+    "propagate-ineqs",
+    "propagate-bv-bounds",
+    "bv-divrem-bounds",
+    "bv-slice",
+    "bvarray2uf",
+    "blast-term-ite",
+    "cofactor-term-ite",
+    "demodulator",
+    "der",
+    "distribute-forall",
+    "dom-simplify",
+    "elim-unconstrained",
+    "elim-predicates",
+    "fold-unfold",
+    "injectivity",
+    "propagate-values",
+    "reduce-args",
+    "solve-eqs",
+    "special-relations",
+    "euf-completion",
+];
+
+/// Freeze the operational pass matrix as well as the public catalog. Aliases
+/// must stay on the intended sound pass, and names without an aligned pass must
+/// remain conservative identities until a dedicated implementation replaces
+/// them.
+#[test]
+fn test_z3_5_simplifier_pass_matrix() {
+    for (name, pass) in [
+        ("bit-blast", "bit-blast"),
+        ("blast-term-ite", "blast-term-ite"),
+        ("cofactor-term-ite", "blast-term-ite"),
+        ("push-app-ite", "blast-term-ite"),
+        ("push-app-ite-conservative", "blast-term-ite"),
+        ("demodulator", "der"),
+        ("der", "der"),
+        ("distribute-forall", "distribute-forall"),
+        ("elim-term-ite", "elim-term-ite"),
+        ("propagate-bv-bounds", "propagate-ineqs"),
+        ("propagate-ineqs", "propagate-ineqs"),
+        ("propagate-values", "propagate-values"),
+        ("cheap-fourier-motzkin", "qe-light"),
+        ("qe-light", "qe-light"),
+        ("reduce-args", "reduce-args"),
+        ("card2bv", "flatten-and"),
+        ("dom-simplify", "flatten-and"),
+        ("simplify", "flatten-and"),
+        ("elim-unconstrained", "solve-eqs"),
+        ("fold-unfold", "solve-eqs"),
+        ("solve-eqs", "solve-eqs"),
+    ] {
+        let tactic = super::simplifier_from_name(name)
+            .unwrap_or_else(|e| panic!("{name} should resolve: {e}"));
+        assert_eq!(tactic.name(), pass, "{name} must map to {pass}");
+    }
+
+    for name in [
+        "bit2int",
+        "bv-divrem-bounds",
+        "bv-slice",
+        "bv1-blast",
+        "bvarray2uf",
+        "elim-predicates",
+        "euf-completion",
+        "factor",
+        "injectivity",
+        "max-bv-sharing",
+        "ng-push-app-ite",
+        "ng-push-app-ite-conservative",
+        "pull-nested-quantifiers",
+        "randomizer",
+        "refine-injectivity",
+        "special-relations",
+    ] {
+        let tactic = super::simplifier_from_name(name)
+            .unwrap_or_else(|e| panic!("{name} should resolve: {e}"));
+        assert_eq!(tactic.name(), "skip", "{name} must remain a sound identity");
+    }
+}
 
 /// Assert the LIA goal `{x = y + 1, y = 2, x > 2}` (SAT: x = 3) on `s`.
 /// Returns the `x` const AST for model checks.
@@ -65,7 +168,7 @@ unsafe fn assert_lia_unsat(ctx: Z3_context, s: Z3_solver) {
     }
 }
 
-/// Every supported simplifier name builds; a tactic-only control name and an
+/// Every Z3 5.0.0 simplifier name builds; AY-only/tactic-only names and an
 /// unknown name are honestly rejected with NULL + `Z3_INVALID_ARG`.
 #[test]
 fn test_mk_simplifier_supported_and_rejected_names() {
@@ -75,30 +178,27 @@ fn test_mk_simplifier_supported_and_rejected_names() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
-        for name in [
-            c"simplify".as_ptr(),
-            c"solve-eqs".as_ptr(),
-            c"propagate-values".as_ptr(),
-            c"qe-light".as_ptr(),
-            c"bit-blast".as_ptr(),
-            c"elim-and".as_ptr(),
-            c"nnf".as_ptr(),
-        ] {
-            let simp = Z3_mk_simplifier(ctx, name);
-            assert!(!simp.is_null(), "supported simplifier name should build");
+        assert_eq!(
+            SUPPORTED_SIMPLIFIER_NAMES, Z3_5_SIMPLIFIER_NAMES,
+            "production registry must exactly match Z3 5.0.0"
+        );
+        assert_eq!(SUPPORTED_SIMPLIFIER_NAMES.len(), 37);
+        for name in Z3_5_SIMPLIFIER_NAMES {
+            let cname = CString::new(*name).expect("reference name must be a valid C string");
+            let simp = Z3_mk_simplifier(ctx, cname.as_ptr());
+            assert!(!simp.is_null(), "Z3 5.0.0 simplifier {name} should build");
             assert_eq!(Z3_get_error_code(ctx), Z3_OK);
         }
 
-        // Tactic-only control primitives are NOT simplifiers: reject them (even
-        // though the tactic registry accepts them).
-        for name in [
-            c"skip".as_ptr(),
-            c"fail".as_ptr(),
-            c"split-clause".as_ptr(),
-            c"cnf".as_ptr(),
-        ] {
-            let bad = Z3_mk_simplifier(ctx, name);
-            assert!(bad.is_null(), "tactic-only name must not be a simplifier");
+        // `elim-and` and `nnf` were AY-only registry entries. They are tactics,
+        // but Z3 5.0.0 does not expose them as simplifiers.
+        for name in ["elim-and", "nnf", "skip", "fail", "split-clause", "cnf"] {
+            let cname = CString::new(name).expect("test name must be a valid C string");
+            let bad = Z3_mk_simplifier(ctx, cname.as_ptr());
+            assert!(
+                bad.is_null(),
+                "{name} is not a Z3 5.0.0 simplifier and must be rejected"
+            );
             assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
         }
 
@@ -109,6 +209,40 @@ fn test_mk_simplifier_supported_and_rejected_names() {
         let nul = Z3_mk_simplifier(ctx, null());
         assert!(nul.is_null());
         assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+
+        Z3_del_context(ctx);
+    }
+}
+
+/// Construction parity is not enough: every catalog entry must also be
+/// attachable and preserve an elementary UNSAT verdict. This exercises aliases
+/// and conservative identity implementations through the real solver path.
+#[test]
+fn test_every_z3_5_simplifier_preserves_boolean_smoke_verdict() {
+    // SAFETY: all handles are arena-owned by `ctx` and used single-threadedly.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        let bool_sort = Z3_mk_bool_sort(ctx);
+        let p = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"p".as_ptr()), bool_sort);
+        let not_p = Z3_mk_not(ctx, p);
+
+        for name in Z3_5_SIMPLIFIER_NAMES {
+            let cname = CString::new(*name).expect("reference name must be a valid C string");
+            let simplifier = Z3_mk_simplifier(ctx, cname.as_ptr());
+            assert!(!simplifier.is_null(), "{name} must build");
+            let plain = Z3_mk_solver(ctx);
+            let solver = Z3_solver_add_simplifier(ctx, plain, simplifier);
+            assert!(!solver.is_null(), "{name} must attach to a solver");
+            Z3_solver_assert(ctx, solver, p);
+            Z3_solver_assert(ctx, solver, not_p);
+            assert_eq!(
+                Z3_solver_check(ctx, solver),
+                Z3_L_FALSE,
+                "{name} must preserve the contradictory Boolean goal"
+            );
+        }
 
         Z3_del_context(ctx);
     }
@@ -185,19 +319,12 @@ fn test_simplifier_get_descr() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
-        for name in [
-            c"simplify".as_ptr(),
-            c"solve-eqs".as_ptr(),
-            c"propagate-values".as_ptr(),
-            c"qe-light".as_ptr(),
-            c"bit-blast".as_ptr(),
-            c"elim-and".as_ptr(),
-            c"nnf".as_ptr(),
-        ] {
-            let d = Z3_simplifier_get_descr(ctx, name);
+        for name in Z3_5_SIMPLIFIER_NAMES {
+            let cname = CString::new(*name).expect("reference name must be a valid C string");
+            let d = Z3_simplifier_get_descr(ctx, cname.as_ptr());
             assert!(
                 !d.is_null(),
-                "known simplifier name must have a description"
+                "Z3 5.0.0 simplifier {name} must have a description"
             );
             let s = CStr::from_ptr(d).to_string_lossy();
             assert!(!s.is_empty(), "description must be a non-empty real string");
@@ -369,10 +496,10 @@ fn test_simplifier_registry_enumeration() {
         let n = Z3_get_num_simplifiers(ctx);
         assert_eq!(
             n as usize,
-            SUPPORTED_SIMPLIFIER_NAMES.len(),
-            "enumerator must expose exactly the real registry"
+            Z3_5_SIMPLIFIER_NAMES.len(),
+            "enumerator must expose exactly Z3 5.0.0's 37 names"
         );
-        for (i, want) in SUPPORTED_SIMPLIFIER_NAMES.iter().enumerate() {
+        for (i, want) in Z3_5_SIMPLIFIER_NAMES.iter().enumerate() {
             let name = Z3_get_simplifier_name(ctx, i as c_uint);
             assert!(!name.is_null(), "simplifier name {i} must be non-null");
             let got = CStr::from_ptr(name)

@@ -13,10 +13,9 @@
 //! - Unsupported: a clause containing an out-of-fragment node (Int arithmetic)
 //!   returns `Unchecked` (fail-closed), never `Valid`.
 //! - Aggregation and skipping behave as documented.
-//! - End-to-end: a real UNSAT QF_BV proof is run through the checker. This pins
-//!   the finding that the live prover currently emits NO word-level BV
-//!   `TheoryLemma` steps (a single `trust` empty-clause step instead), so the BV
-//!   checker reports zero targeted steps — and never fabricates a `Valid`.
+//! - End-to-end: a real UNSAT QF_BV proof is run through the checker. The live
+//!   prover emits a strict `BvBitBlast` lemma, which the checker independently
+//!   validates.
 
 use super::*;
 use ay_core::{Proof, ProofStep, Symbol, TermStore, TheoryLemmaKind};
@@ -466,22 +465,33 @@ fn aggregate_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end against the live prover (documents the finding).
+// End-to-end against the live prover.
 // ---------------------------------------------------------------------------
 
 /// Fully end-to-end: drive the real `ay` solver on a small UNSAT QF_BV query,
 /// take the *actual* `Proof` and its backing `TermStore`, and run the BV
 /// checker over them.
 ///
-/// FINDING (documented, not papered over): for these QF_BV queries the live
-/// prover does NOT emit any word-level BV `TheoryLemma` step (it emits a single
-/// `trust` empty-clause step from the bit-blasted SAT refutation). So the BV
-/// semantic checker has zero *targeted* steps and reports vacuous validity for
-/// the BV fragment — it never fabricates a `Valid` for the trust step (that is
-/// the structural checker's job). This test pins both facts: no BV lemma steps
-/// appear, and the checker reports zero valid/invalid BV steps.
+/// The live prover reconstructs a strict `BvBitBlast` lemma from the
+/// bit-blasted refutation. This test pins that the semantic checker targets and
+/// independently validates that real proof step: exactly ONE word-level BV
+/// `TheoryLemma` appears, and the BV semantic checker DISCHARGES it.
+///
+/// HISTORY (why this assertion flipped, and why the flip is a strengthening):
+/// this test previously pinned the opposite — zero targeted steps and vacuous
+/// validity — which was a true finding when it was written, because the
+/// refutation then ended in a single `trust` empty-clause step from the
+/// bit-blasted SAT proof. `replace_with_exact_authored_bv_refutation` later
+/// promoted that trust step to an authored bit-blast lemma, so the proof became
+/// MORE certified and the old assertion started failing. Pinning "no lemma" now
+/// would pin the weaker, less-certified shape.
+///
+/// The checker still never fabricates a `Valid`: it reports one only for a step
+/// whose negation it discharged as UNSAT in a fresh solver, and `Unchecked` for
+/// anything outside the BV fragment. So "one VALID step" is a strictly stronger
+/// claim than "no steps".
 #[test]
-fn end_to_end_live_prover_emits_no_bv_theory_lemma() {
+fn end_to_end_live_prover_emits_valid_bv_bitblast_lemma() {
     use crate::api::{Logic, Solver};
 
     let mut solver = Solver::new(Logic::QfBv);
@@ -505,17 +515,41 @@ fn end_to_end_live_prover_emits_no_bv_theory_lemma() {
     let store = solver.proof_term_store();
     let report = check_bv_proof(proof, store);
 
-    // The live prover does not currently emit word-level BV theory lemmas for
-    // bit-blasted queries: the checker therefore has no targeted steps.
+    // The live prover emits ONE word-level BV theory lemma here, and the
+    // checker DISCHARGES it. This used to assert zero steps, which was a
+    // finding about the prover at the time rather than a requirement on it —
+    // the lemma arrived when `replace_with_exact_authored_bv_refutation`
+    // promoted what had been a TRUST step, so the proof got stronger, not
+    // weaker, and a test asserting "no lemma" would now be pinning the older,
+    // less-certified shape.
     assert_eq!(
         report.steps.len(),
-        0,
-        "expected no BV theory-lemma steps from the bit-blasted proof, got {report:?}"
+        1,
+        "expected exactly one strict BV bit-blast lemma, got {report:?}"
     );
-    // Vacuously sound for the BV fragment, and crucially never a fabricated Valid.
-    assert!(report.all_bv_steps_valid());
-    assert_eq!(report.valid_count(), 0);
-    assert_eq!(report.invalid_count(), 0);
+    assert_eq!(
+        report.steps[0].kind,
+        TheoryLemmaKind::BvBitBlast,
+        "the emitted lemma must be a strict bit-blast lemma: {report:?}"
+    );
+
+    // The part that actually matters, and the reason this is an upgrade rather
+    // than a relaxation: the verdict is EARNED. `check_bv_proof` reports
+    // `Valid` only for a step whose negation it discharged as UNSAT in a fresh
+    // solver, and reports `Unchecked` for anything outside the fragment — it
+    // never fabricates a `Valid`. So asserting one VALID step is a strictly
+    // stronger claim than asserting no steps at all.
+    assert_eq!(
+        report.steps[0].verdict,
+        BvStepVerdict::Valid,
+        "the lemma must be discharged, not merely present or Unchecked: {report:?}"
+    );
+    assert!(report.all_bv_steps_valid(), "{report:?}");
+    assert_eq!(report.valid_count(), 1, "{report:?}");
+    assert_eq!(report.invalid_count(), 0, "{report:?}");
+    // No step may be silently declined: a targeted-but-Unchecked step here
+    // would mean the checker could not model the prover's own lemma.
+    assert_eq!(report.unchecked_count(), 0, "{report:?}");
 }
 
 /// End-to-end with a constructed proof carrying a genuine UNSAT-derived BV

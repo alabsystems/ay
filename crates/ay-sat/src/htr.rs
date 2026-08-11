@@ -111,7 +111,11 @@ impl HTR {
     /// Create a new HTR engine for n variables
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
-            occ: HTROccList::new(num_vars),
+            // Sized on first use by the HTR entry point, which calls
+            // `ensure_num_vars` before rebuilding. `OccList::new(n)` commits
+            // 128 resident bytes per variable at solver construction whether or
+            // not HTR ever runs.
+            occ: HTROccList::new(0),
             stats: HTRStats::default(),
             num_vars,
             existing_binary: DetHashSet::default(),

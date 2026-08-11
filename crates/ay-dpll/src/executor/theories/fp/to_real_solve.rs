@@ -24,9 +24,9 @@ use super::super::super::Executor;
 use super::support::{is_pure_fp_assertion, partition_fp_assertions};
 use super::to_real::{
     build_fp_target_unit_clauses, build_lra_model_from_fp_to_real, choose_blocking_clause,
-    collect_fp_to_real_sites, extract_fp_to_real_targets, rational_to_f64,
-    rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars, FpEncoding, FpRefinementStep,
-    FpToRealSite, MixedSubproblemResult,
+    collect_fp_to_real_sites, extract_fp_to_real_targets, pin_undefined_fp_to_real,
+    rational_to_f64, rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars, FpEncoding,
+    FpRefinementStep, FpToRealSite, MixedSubproblemResult,
 };
 
 impl Executor {
@@ -264,6 +264,7 @@ impl Executor {
                     mixed_assertions,
                     sat_model,
                     tseitin_result,
+                    &undef_vars,
                 );
                 Ok(FpRefinementStep::Sat)
             }
@@ -431,6 +432,7 @@ impl Executor {
         mixed_assertions: &[TermId],
         sat_model: &[bool],
         tseitin_result: &ay_core::TseitinResult,
+        undef_vars: &HashMap<String, TermId>,
     ) {
         use super::super::super::model::Model;
 
@@ -442,6 +444,18 @@ impl Executor {
         for (k, v) in fp_to_real_vals.values {
             lra_model.values.entry(k).or_insert(v);
         }
+        // `fp.to_real` at NaN or an infinity is unspecified-but-total: the
+        // mixed solve chose its value against a substituted variable, and the
+        // ORIGINAL application term has to carry that same value for anything
+        // re-checking the original assertions to evaluate it.
+        let roots: Vec<TermId> = self.ctx.assertions.clone();
+        pin_undefined_fp_to_real(
+            &self.ctx.terms,
+            fp_model,
+            undef_vars,
+            &roots,
+            &mut lra_model.values,
+        );
 
         let term_to_var: HashMap<TermId, u32> = tseitin_result
             .term_to_var

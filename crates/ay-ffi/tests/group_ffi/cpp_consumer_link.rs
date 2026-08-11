@@ -31,11 +31,17 @@ fn find_static_lib() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root.join("target"));
 
-    let lib_path = target_dir.join(profile).join("libay_ffi.a");
-    if lib_path.exists() {
-        return Some(lib_path);
-    }
-    None
+    // `cargo test` leaves the staticlib under `<profile>/deps/`; only a plain
+    // `cargo build` hard-links it up into `<profile>/`. Check both so the real
+    // link+run path is exercised instead of silently degrading to the
+    // compile-only fallback (matches `capi_z3_500_additional_link.rs`).
+    let profile_dir = target_dir.join(profile);
+    [
+        profile_dir.join("libay_ffi.a"),
+        profile_dir.join("deps").join("libay_ffi.a"),
+    ]
+    .into_iter()
+    .find(|library| library.exists())
 }
 
 /// Pick a C++ compiler: $CXX if set, else clang++ (always present on macOS),
@@ -99,6 +105,9 @@ fn compile_and_link(
             "-lresolv",
             "-Wl,-no_warn_duplicate_libraries",
         ]);
+    }
+    if cfg!(target_os = "linux") {
+        cmd.arg("-ldl");
     }
     cmd.args(["-lpthread", "-lm"]);
 

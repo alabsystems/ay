@@ -155,6 +155,14 @@ impl LiveIdSet {
         self.bits.count_ones(..) == 0
     }
 
+    /// Iterate live IDs without allocating a temporary collection.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        let low_water = self.low_water;
+        self.bits
+            .ones()
+            .map(move |relative| low_water + relative as u64)
+    }
+
     /// Remove all ids.
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {

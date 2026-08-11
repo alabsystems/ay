@@ -197,6 +197,20 @@ impl TermStore {
     }
 
     /// Create or get a variable by name
+    /// The interned variable with this exact name, if one exists.
+    ///
+    /// Read-only counterpart to [`Self::mk_var`], which requires `&mut self`
+    /// and would CREATE the variable when absent. Callers that must not mint a
+    /// new binder — the model evaluator resolving a solver-internal name it did
+    /// not author — need the lookup without the side effect.
+    ///
+    /// Returns the first sort interned under the name; a name reused at two
+    /// sorts stores only the first here, exactly as `mk_var`'s cache does.
+    #[must_use]
+    pub fn find_var(&self, name: &str) -> Option<TermId> {
+        self.names.get(name).map(|(id, _)| *id)
+    }
+
     pub fn mk_var(&mut self, name: impl Into<String>, sort: Sort) -> TermId {
         let name = name.into();
 

@@ -317,6 +317,12 @@ pub(in crate::executor) struct QuantifierProcessingResult {
     /// result is a genuine `Sat` (or a validated model exists) — never for
     /// promoting a lower `Unknown` (#quantifier_consumer-arith wrong-SAT).
     pub quantifiers_supported_by_uf_completion_given_sat: bool,
+    /// A self-contained strict SAT certificate for an assertion set containing
+    /// only pairwise-distinct, pointwise-materializable UF definitions and no
+    /// ground assertions. Each head can be interpreted by its checked lambda
+    /// body, so this remains sound even when the nonlinear ground lane returns
+    /// `Unknown` and has no model to contribute.
+    pub strict_pointwise_uf_completion_without_ground: bool,
 }
 
 impl QuantifierProcessingResult {
@@ -344,6 +350,7 @@ impl QuantifierProcessingResult {
             unsafe_quantifiers_supported_by_uf_completion: false,
             quantifiers_supported_by_uf_completion: false,
             quantifiers_supported_by_uf_completion_given_sat: false,
+            strict_pointwise_uf_completion_without_ground: false,
         }
     }
 }
@@ -698,18 +705,13 @@ impl Executor {
             .as_ref()
             .is_some_and(QuantifierManager::has_deferred);
 
-        // 8. Collect quantifiers and track exists E-matching processing (#3593).
+        // 8. Collect the remaining quantifiers.
         let mut quantifiers: Vec<TermId> = Vec::new();
         for assertion in self.ctx.assertions.clone() {
             collect_quantifiers(&mut self.ctx.terms, assertion, &mut quantifiers);
         }
         quantifiers.sort_unstable_by_key(|term| term.index());
         quantifiers.dedup();
-
-        let ematching_has_exists = quantifiers.iter().any(|&q| {
-            matches!(self.ctx.terms.get(q), TermData::Exists(..))
-                && !ematching.uninstantiated_quantifiers.contains(&q)
-        });
 
         let unsafe_quantifiers: Vec<TermId> = quantifiers
             .iter()
@@ -749,6 +751,24 @@ impl Executor {
             && ground_assertions_supported_by_uf_completion
             && ground_assertions_consistent
             && forall_quantifiers_supported_by_uf_completion;
+        let mut strict_pointwise_heads = Vec::with_capacity(forall_quantifiers.len());
+        let strict_pointwise_uf_completion_without_ground = ground_assertions.is_empty()
+            && !forall_quantifiers.is_empty()
+            && forall_quantifiers.len() == quantifiers.len()
+            && forall_quantifiers.iter().copied().all(|quantifier| {
+                let Some(head) = self.pointwise_materializable_uf_definition_head(quantifier)
+                else {
+                    return false;
+                };
+                strict_pointwise_heads.push(head);
+                true
+            })
+            && {
+                strict_pointwise_heads.sort_unstable();
+                strict_pointwise_heads
+                    .windows(2)
+                    .all(|pair| pair[0] != pair[1])
+            };
         if std::env::var_os("AY_DEBUG_CERT").is_some() {
             eprintln!(
                 "CERT: nforall={} unsafe={} unsafe_ok={} ground_ok={} consistent={} forall_ok={} strict={}",
@@ -880,6 +900,22 @@ impl Executor {
                 (false, None)
             };
         let ematching_added = ematching_added || post_cegqi_added;
+        // Track actual E-matching provenance rather than inferring it from
+        // `quantifiers - uninstantiated_quantifiers`. `collect_quantifiers`
+        // performs NNF conversion and may mint a logically equivalent
+        // quantifier with a fresh TermId on each collection; comparing those
+        // independently collected IDs falsely classified untouched Exists as
+        // instantiated (#satgate-vacuous-binder). The direct per-round source
+        // set also covers the post-CEGQI pass, which the old inference omitted.
+        let ematching_has_exists = ematching
+            .instantiated_quantifiers
+            .iter()
+            .chain(
+                post_cegqi_ematching
+                    .iter()
+                    .flat_map(|summary| summary.instantiated_quantifiers.iter()),
+            )
+            .any(|&q| matches!(self.ctx.terms.get(q), TermData::Exists(..)));
         // Post-CEGQI E-matching may have resolved previously-uninstantiated quantifiers.
         let has_uninstantiated = post_cegqi_ematching
             .as_ref()
@@ -954,6 +990,7 @@ impl Executor {
                     && !quantifiers
                         .iter()
                         .any(|&q| matches!(self.ctx.terms.get(q), TermData::Exists(..))),
+            strict_pointwise_uf_completion_without_ground,
         }
     }
 }
@@ -1901,5 +1938,114 @@ pub(in crate::executor) fn collect_and_conjuncts(
                 collect_and_conjuncts(terms, arg, out);
             }
         }
+    }
+}
+
+/// Maximum split depth for [`collect_entailed_conjuncts`]. Beyond it the term
+/// is emitted whole — still entailed, just not split further.
+const MAX_ENTAILED_SPLIT_DEPTH: usize = 64;
+
+/// The conjunct-splitting shape of a term, computed under an IMMUTABLE borrow
+/// of the term store so the caller can then build negations mutably.
+enum EntailedSplit {
+    /// `(and a b …)` — every argument is entailed.
+    And(Vec<TermId>),
+    /// `(not (or a b …))` — every `(not a_i)` is entailed.
+    NotOr(Vec<TermId>),
+    /// `(not (=> a b))` — both `a` and `(not b)` are entailed.
+    NotImplies(TermId, TermId),
+    /// `(not (not a))` — `a` is entailed.
+    DoubleNegation(TermId),
+    /// Nothing to split: the term itself is the only conjunct.
+    Leaf,
+}
+
+fn classify_entailed_split(terms: &TermStore, term: TermId) -> EntailedSplit {
+    if let TermData::App(ay_core::Symbol::Named(ref name), args) = terms.get(term) {
+        if name == "and" {
+            return EntailedSplit::And(args.clone());
+        }
+    }
+    let TermData::Not(inner) = terms.get(term) else {
+        return EntailedSplit::Leaf;
+    };
+    match terms.get(*inner) {
+        TermData::App(ay_core::Symbol::Named(ref name), args) if name == "or" => {
+            EntailedSplit::NotOr(args.clone())
+        }
+        // `mk_implies` rewrites `=>` to `(or (not a) b)` at construction, so an
+        // App("=>") normally never reaches here. It is still handled because
+        // raw-interning paths (see `TermStore::subst`, which maps "=>"/"implies"
+        // back through `mk_implies`) prove such nodes can exist.
+        TermData::App(ay_core::Symbol::Named(ref name), args)
+            if (name == "=>" || name == "implies") && args.len() == 2 =>
+        {
+            EntailedSplit::NotImplies(args[0], args[1])
+        }
+        TermData::Not(double) => EntailedSplit::DoubleNegation(*double),
+        _ => EntailedSplit::Leaf,
+    }
+}
+
+/// NNF-aware top-level conjunct extraction (#nested-array-residue-rescue).
+///
+/// SOUNDNESS — the ONE property every caller depends on: every term written to
+/// `out` is a LOGICAL CONSEQUENCE of `term`. Each rule applied below is
+/// entailment-preserving,
+///
+/// ```text
+///   (and a b)      |= a      and |= b
+///   (not (or a b)) |= (not a) and |= (not b)
+///   (not (=> a b)) |= a      and |= (not b)
+///   (not (not a))  |= a
+/// ```
+///
+/// and every other shape is emitted WHOLE (a leaf), which is trivially entailed
+/// by itself. Consequently `term |= (and out…)`, and — the part that matters —
+/// the same holds for any SUBSET of `out`, because dropping conjuncts only
+/// weakens the conjunction. A caller may therefore refute a filtered subset and
+/// conclude that the original term is unsatisfiable.
+///
+/// The store is borrowed mutably because the `or` / `=>` rules must BUILD the
+/// negated component. `mk_not` normalizes what it builds (double negation, De
+/// Morgan, Boolean-ITE push-down); those are logical EQUIVALENCES, so they
+/// preserve the entailment above.
+///
+/// Distinct from [`collect_and_conjuncts`], which only descends `and` and
+/// serves CE-lemma disambiguation; that one is deliberately left untouched.
+pub(in crate::executor) fn collect_entailed_conjuncts(
+    terms: &mut TermStore,
+    term: TermId,
+    depth: usize,
+    limit: usize,
+    out: &mut Vec<TermId>,
+) {
+    // Emitting the unsplit term is always sound (it entails itself), so both
+    // budget guards degrade to "less splitting", never to a wrong conjunct.
+    if depth >= MAX_ENTAILED_SPLIT_DEPTH || out.len() >= limit {
+        out.push(term);
+        return;
+    }
+    match classify_entailed_split(terms, term) {
+        EntailedSplit::And(args) => {
+            for arg in args {
+                collect_entailed_conjuncts(terms, arg, depth + 1, limit, out);
+            }
+        }
+        EntailedSplit::NotOr(args) => {
+            for arg in args {
+                let negated = terms.mk_not(arg);
+                collect_entailed_conjuncts(terms, negated, depth + 1, limit, out);
+            }
+        }
+        EntailedSplit::NotImplies(lhs, rhs) => {
+            collect_entailed_conjuncts(terms, lhs, depth + 1, limit, out);
+            let negated = terms.mk_not(rhs);
+            collect_entailed_conjuncts(terms, negated, depth + 1, limit, out);
+        }
+        EntailedSplit::DoubleNegation(inner) => {
+            collect_entailed_conjuncts(terms, inner, depth + 1, limit, out);
+        }
+        EntailedSplit::Leaf => out.push(term),
     }
 }

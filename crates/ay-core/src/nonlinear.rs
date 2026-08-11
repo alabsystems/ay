@@ -10,7 +10,8 @@
 use crate::kani_compat::DetHashMap as HashMap;
 use crate::term::{Constant, Symbol, TermData, TermId, TermStore};
 use crate::TheoryLit;
-use num_traits::Zero;
+use num_rational::BigRational;
+use num_traits::{One, Zero};
 
 /// A tracked monomial representing a nonlinear product.
 #[derive(Debug, Clone)]
@@ -179,6 +180,51 @@ pub fn extract_sign_constraint(
     }
 }
 
+/// The rational value of `term` if it is a numeric literal, else `None`.
+///
+/// Handles `Int` and `Rational` literals and unary negation of either — SMT-LIB
+/// writes a negative literal as `(- 2)`, which is an `App`, not a `Const`.
+fn constant_value(terms: &TermStore, term: TermId) -> Option<BigRational> {
+    match terms.get(term) {
+        TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
+        TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
+        TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
+            constant_value(terms, args[0]).map(|c| -c)
+        }
+        _ => None,
+    }
+}
+
+/// True iff `term` is a `*` application carrying a constant factor other than 1.
+///
+/// `#nra-const-factor` / `#nia-const-factor` safety net. A monomial's `aux_var`
+/// must denote EXACTLY `product(vars)`; the theory collectors enforce that by
+/// refusing to register a scaled product. This predicate lets the consumer that
+/// would draw a FALSE conclusion from a scaled aux term fail closed even if that
+/// registration guard is ever broken again — `debug_assert!`s are compiled out
+/// of the release binary, so a release-only regression would otherwise be a
+/// silent wrong-`unsat`.
+fn has_non_unit_constant_factor(terms: &TermStore, term: TermId) -> bool {
+    let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
+        return false;
+    };
+    if name != "*" {
+        return false;
+    }
+    let mut saw_constant = false;
+    let mut product_is_one = true;
+    for &arg in args {
+        let value = constant_value(terms, arg);
+        if let Some(c) = value {
+            saw_constant = true;
+            if !c.is_one() {
+                product_is_one = false;
+            }
+        }
+    }
+    saw_constant && !product_is_one
+}
+
 /// Record a sign constraint for a subject term (variable or monomial).
 pub fn record_sign_constraint(
     terms: &TermStore,
@@ -189,11 +235,25 @@ pub fn record_sign_constraint(
     constraint: SignConstraint,
     assertion: TermId,
 ) {
+    // SOUNDNESS: the sign asserted about `subject` is transferred VERBATIM onto
+    // the monomial key. That step is valid only when `subject == product(vars)`.
+    // If `subject` is `c * product(vars)` the transfer is invalid — for `c < 0`
+    // it yields the exact NEGATION of the asserted fact (`-2*m <= 0` recorded as
+    // `m <= 0`), which excises genuine models and produces a wrong `unsat`.
+    // Fail closed rather than record a fact that does not follow.
     if let Some(vars) = aux_to_monomial.get(&subject).cloned() {
-        sign_constraints
-            .entry(vars)
-            .or_default()
-            .push((constraint, assertion));
+        let scaled_subject = has_non_unit_constant_factor(terms, subject);
+        debug_assert!(
+            !scaled_subject,
+            "#nra-const-factor: aux_to_monomial maps a SCALED term {subject:?} to \
+             {vars:?}; the registration guard has been broken"
+        );
+        if !scaled_subject {
+            sign_constraints
+                .entry(vars)
+                .or_default()
+                .push((constraint, assertion));
+        }
     }
     if matches!(terms.get(subject), TermData::Var(_, _)) {
         var_sign_constraints

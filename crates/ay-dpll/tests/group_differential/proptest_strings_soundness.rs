@@ -14,13 +14,13 @@
 //! AY returning "unknown" when Z3 is definite is a completeness gap,
 //! not a soundness issue.
 
+use ay_dpll::Executor;
+use ay_frontend::parse;
 use proptest::prelude::*;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use ay_dpll::Executor;
-use ay_frontend::parse;
 
 /// Small alphabet for constant generation — keeps formulas tractable.
 const ALPHABET: &[u8] = b"abcxyz";

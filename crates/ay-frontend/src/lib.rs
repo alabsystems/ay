@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-//! AY Frontend - SMT-LIB 2.6 parser and preprocessor
+//! AY Frontend - SMT-LIB 2.7 parser and preprocessor
 //!
 //! Parses SMT-LIB input and converts it to the internal representation.
 //!
@@ -41,8 +41,10 @@ pub use command::{
     SUPPORTED_TACTIC_NAMES,
 };
 pub use elaborate::{
-    is_reserved_op_name, is_reserved_symbol, CommandResult, Context, ElaborateError, IntroKind,
-    Objective, ObjectiveDirection, OptionValue, SoftAssertion, SymbolInfo,
+    is_reserved_op_name, is_reserved_symbol, AuthoredAssertionRef, CommandResult, Context,
+    ElaborateError, FiniteSetOp, FiniteSetTermMetadata, FiniteSetTypingMode, IntroKind, Objective,
+    ObjectiveDirection, OptionValue, PublicAssertionMetadata, PublicSort, PublicSymbolSignature,
+    PublicTermMetadata, SoftAssertion, SymbolInfo,
 };
 pub use parser::{parse, CommandStream, CommandStreamItem};
 pub use sexp::{ParseError, SExpr};

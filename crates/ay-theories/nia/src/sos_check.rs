@@ -328,7 +328,11 @@ mod tests {
         let rendered = solver
             .render_sos_unsat_certificate("t1")
             .expect("certificate renders");
-        assert!(rendered.contains(":rule nia_positivstellensatz"));
+        // The emitted step must be a rule the Alethe checker implements; the
+        // Positivstellensatz payload survives as line comments.
+        assert!(rendered.contains(":rule hole"));
+        assert!(!rendered.contains(":rule nia_positivstellensatz"));
+        assert!(rendered.contains("; ay-nia Positivstellensatz certificate"));
     }
 
     /// Mandatory test 2: `x² + y² < 2xy` is UNSAT via a certificate

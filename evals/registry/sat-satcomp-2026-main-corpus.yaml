@@ -5,6 +5,16 @@ description: >
   organizer's pinned selected_benchmarks.csv. Duplicate selected payloads are
   retained as distinct scored rows. AY and Z3 run on the same private input
   snapshots; this is a same-host corpus replay, not an official-hardware score.
+
+  WARNING (measured 2026-07-28): this corpus is NOT the set SAT-COMP 2026
+  scored. Only 20 of its 400 files are shared BY SHA-256 CONTENT HASH with the
+  official per-instance export at
+  https://satcompetition.github.io/2026/downloads/scores.csv (5.17 GB here vs
+  2.24 GB there), and the manifest holds 9 duplicate hashes. Results from this
+  eval must NOT be compared against published 2026 winner scores -- that would
+  compare AY on one set of formulas to the winners on another. Use
+  sat-satcomp-2026-main-official for any competition claim. Evidence table:
+  benchmarks/sat/satcomp2026-main/README.md
 owner: andrewyates.name@gmail.com
 competition: sat-comp
 scoring: sat-comp

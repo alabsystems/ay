@@ -77,7 +77,16 @@
 //! [`activate_caller`] installs it for the duration of one solve.
 //!
 //! The environment layer is read **once**, into [`EnvSnapshot`], and never
-//! again — so no accessor on the solve path touches `std::env`. An exported
+//! again — so no accessor **in this module** touches `std::env` on the solve path.
+//!
+//! ⚠ THAT IS A STATEMENT ABOUT THIS MODULE, NOT ABOUT THE CRATE, and it was
+//! previously written as though it were the latter. Measured: ay-milp holds **318
+//! live `env::var` calls outside this layer**, plus 90 `OnceLock`-cached ones
+//! (`bab::prime_env_all` forces the cached subset at solve entry; nothing can force
+//! the live ones). Bringing those under this snapshot is the outstanding `Config`
+//! migration, not a property the crate has today.
+//!
+//! An exported
 //! variable behaves exactly as it always has; mutating one mid-process and
 //! expecting a live solve to see it does not, which no shipped lane did.
 
@@ -144,6 +153,29 @@ pub(crate) enum Knob {
     PumpRestarts,
     /// Cap on committed pins in the terminal-salvage dive.
     DiveMaxPins,
+
+    // The REDUCTION knobs. These are not search economics: three of them gate
+    // transformations that change the model a verdict is proved against, and a
+    // consumer whose admission requires certificates needs to reach them by
+    // value, not by exporting a variable. `ny` cannot export one at all -- its
+    // policy forbids writing `AY_MILP_*` -- so before these existed it had no
+    // in-policy way to quarantine a reduction. Same negative spelling
+    // convention as the block above: the variable keeps its name, the public
+    // builder is positive-sense and does the single inversion.
+    /// Disable dual fixing by lock counting (`dualfix::dual_fix`). A WLOG
+    /// reduction: it preserves the ANSWER, not the feasible set.
+    NoDualfix,
+    /// Disable the AHL kernel reformulation (`lattice::reformulate_kernel`).
+    NoKernelReform,
+    /// Disable decoupling root reductions from certificate capture, restoring
+    /// the prior `tree_cert_leaves == 0` gating byte-identically.
+    NoCertDecouple,
+    /// Disable the zero-objective feasibility conflict class (nogood
+    /// propagation, nogood-guided branching, VSIDS).
+    NoFeasConflict,
+    /// Disable the cold-root LU band, restoring the historical eta-file cold
+    /// root byte-for-byte.
+    NoColdLu,
 }
 
 impl Knob {
@@ -171,10 +203,15 @@ impl Knob {
             Self::NoCuts => "AY_MILP_NO_CUTS",
             Self::PumpRestarts => "AY_MILP_PUMP_RESTARTS",
             Self::DiveMaxPins => "AY_MILP_DIVE_MAX_PINS",
+            Self::NoDualfix => "AY_MILP_NO_DUALFIX",
+            Self::NoKernelReform => "AY_MILP_NO_KERNEL_REFORM",
+            Self::NoCertDecouple => "AY_MILP_NO_CERT_DECOUPLE",
+            Self::NoFeasConflict => "AY_MILP_NO_FEAS_CONFLICT",
+            Self::NoColdLu => "AY_MILP_NO_COLD_LU",
         }
     }
 
-    const ALL: [Knob; 18] = [
+    const ALL: [Knob; 23] = [
         Self::GmiRounds,
         Self::RootCutsPerRound,
         Self::RootProbe,
@@ -193,6 +230,11 @@ impl Knob {
         Self::NoCuts,
         Self::PumpRestarts,
         Self::DiveMaxPins,
+        Self::NoDualfix,
+        Self::NoKernelReform,
+        Self::NoCertDecouple,
+        Self::NoFeasConflict,
+        Self::NoColdLu,
     ];
 
     const fn slot(self) -> usize {
@@ -215,6 +257,11 @@ impl Knob {
             Self::NoCuts => 15,
             Self::PumpRestarts => 16,
             Self::DiveMaxPins => 17,
+            Self::NoDualfix => 18,
+            Self::NoKernelReform => 19,
+            Self::NoCertDecouple => 20,
+            Self::NoFeasConflict => 21,
+            Self::NoColdLu => 22,
         }
     }
 }
@@ -633,6 +680,20 @@ fn caller_layer() -> Profile {
 /// worker call [`activate_caller`] with it on its own stack.
 pub(crate) fn caller_profile() -> Profile {
     caller_layer()
+}
+
+/// The CALLER layer's opinion about a flag knob, if it has one.
+///
+/// For a knob whose environment spelling is NOT plain presence (see
+/// `bab::cert_decouple_enabled`, where `0`/`off` mean "keep the default"),
+/// `on` would silently redefine what an operator's existing export means.
+/// This exposes just the caller layer so such a site can take a typed value
+/// first and otherwise fall through to its own established env parse.
+pub(crate) fn caller_flag(k: Knob) -> Option<bool> {
+    match caller_layer().get(k) {
+        Some(Setting::Flag(b)) => Some(b),
+        _ => None,
+    }
 }
 
 fn caller(k: Knob) -> Option<Setting> {
@@ -1630,4 +1691,89 @@ mod tests {
             );
         }
     }
+    /// THE PROPERTY THE REDUCTION KNOBS EXIST FOR: a typed caller value beats an
+    /// inherited `AY_MILP_*` export, in BOTH directions.
+    ///
+    /// Three of these gate transformations that change the model a verdict is
+    /// proved against. A consumer whose policy forbids exporting `AY_MILP_*`
+    /// (ny) previously had no way to quarantine one; the point of the typed
+    /// carrier is that its answer is not merely consulted but authoritative.
+    /// Asserting only "caller can turn it on" would pass even if the environment
+    /// silently won whenever it disagreed, so both directions are pinned.
+    #[test]
+    fn a_typed_reduction_setting_outranks_an_inherited_export() {
+        let _lock = lock_env();
+        for k in [
+            Knob::NoDualfix,
+            Knob::NoKernelReform,
+            Knob::NoFeasConflict,
+            Knob::NoColdLu,
+        ] {
+            // Environment says "disabled" (presence == on for these).
+            let _env = ScopedEnvVar::set(k.env(), "1");
+            {
+                let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
+                assert!(
+                    !on(k),
+                    "{}: a typed `false` must beat an inherited export",
+                    k.env()
+                );
+            }
+            // And with no caller opinion the export still applies, so the
+            // migration did not quietly strip operator control.
+            assert!(
+                on(k),
+                "{}: with no caller opinion the environment must still be honoured",
+                k.env()
+            );
+        }
+    }
+
+    /// The same property for the one knob deliberately NOT routed through `on`.
+    ///
+    /// `AY_MILP_NO_CERT_DECOUPLE`'s spelling is not plain presence — `0`/`off`
+    /// mean "keep the decoupling" — so it keeps its own env parse and consults
+    /// the caller layer first. That asymmetry is only safe if the typed value
+    /// still wins, which is what this pins.
+    #[test]
+    fn cert_decouple_takes_the_caller_layer_before_its_own_env_parse() {
+        let _lock = lock_env();
+        let k = Knob::NoCertDecouple;
+        let _env = ScopedEnvVar::set(k.env(), "1");
+        {
+            let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
+            assert_eq!(caller_flag(k), Some(false));
+        }
+        assert_eq!(
+            caller_flag(k),
+            None,
+            "with no caller opinion the site must fall through to its env parse"
+        );
+    }
 }
+
+/// Force [`EnvSnapshot`]'s one-shot capture to happen NOW.
+///
+/// The snapshot is `OnceLock`-backed and captured on FIRST USE, which without this
+/// is wherever the solve path first resolves a knob through this layer — the second
+/// of the two cached holes left by `bab::prime_env_all`. Priming it alongside the
+/// rest puts every environment read in the crate's cached set at one point the
+/// caller controls.
+///
+/// # Genuinely a no-op under `cfg(test)`
+///
+/// [`env_layer`] forks on `cfg(test)` and reads LIVE there, deliberately, so the
+/// crate's own `ScopedEnvVar` kill-switch coverage keeps working. An earlier
+/// version of this function said it was a no-op in test builds and then called
+/// `env_layer` anyway — 18 live `var_os` calls that stored nothing. Harmless, and
+/// the doc was still false; a review caught it. The `cfg` split below makes the
+/// sentence true rather than merely nearly-true.
+#[cfg(not(test))]
+pub(crate) fn prime_env() {
+    for k in Knob::ALL {
+        let _ = env_layer(k);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prime_env() {}

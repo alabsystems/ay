@@ -196,14 +196,42 @@ fn test_native_api_enum_initiation_bundle_recheck_strict() {
     }
 }
 
-/// FAIL-CLOSED: no syntactic complement and no linear certificate — an
-/// opaque nonlinear contradiction with a DISEQUALITY (Farkas cannot consume
-/// it, and no `p`/`(not p)` pair exists among the asserted conjuncts). The
-/// proof must keep its honest trust step and stay OUTSIDE the strict
-/// fragment — the rebuild must not fabricate a derivation.
+/// NO STRICT REBUILD, BUT A CERTIFIED VERDICT: no syntactic complement and no
+/// linear certificate — an opaque nonlinear contradiction with a DISEQUALITY
+/// (Farkas cannot consume it, and no `p`/`(not p)` pair exists among the
+/// asserted conjuncts). The rebuild still must not fabricate a derivation, and
+/// it does not: the exported proof keeps its honest unproved step and the
+/// strict checker keeps rejecting it.
+///
+/// WHY THE EXPECTATION MOVED (was: `unknown` + revoked artifacts).
+/// The query is GENUINELY UNSAT — `y = 3` forces `x = y*y = 9`, so `x != 9` is
+/// false — verified by inspection and confirmed by z3 (`unsat`). The old
+/// `unknown` was a CHECKER-COVERAGE downgrade, not a solver limit: AY computed
+/// the right answer and then discarded it at the publication funnel because
+/// `check_proof_strict` rejects `trust`/`hole` steps BY RULE NAME.
+///
+/// AY has since gained the deferred-trust discharge path
+/// (`Executor::discharge_trust_steps_for_certification`, twinned in
+/// `api::proofs::strict_verdict_with_deferred_trust`). It replaces "reject by
+/// name" with "verify": a fresh forged-UNSAT guard must not re-decide the
+/// problem as definitive SAT, every NON-trust step must still clear the full
+/// strict boundary, and each deferred trust clause must be independently
+/// discharged — here via the context-dependent fallback, which re-decides the
+/// ORIGINAL authored assertions in a fresh `Executor` and requires UNSAT. So
+/// the VERDICT is certified by an independent re-solve, and `unsat` publishes.
+///
+/// THE PROOF IS NOT EXTERNALLY CHECKABLE, and this test still pins that.
+/// The independent re-solve certifies the CONCLUSION, not the document: the
+/// exported certificate is unchanged and still terminates in
+/// `(step t1 (cl false) :rule hole)`. `check_proof_strict` must keep REJECTING
+/// it, so AY's own `--self-check` / `--strict-proofs` gate answers `unknown`
+/// for this query while default mode answers `unsat`. That divergence is the
+/// honest state of affairs, not a bug in this test. Should AY ever learn a real
+/// nonlinear proof rule for this shape, the strict-rejection assertion below is
+/// what will fire and demand this test be promoted.
 #[test]
 #[timeout(10_000)]
-fn test_nonlinear_diseq_contradiction_stays_fail_closed() {
+fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
     let script = r#"
         (set-option :produce-proofs true)
         (set-logic QF_NIA)
@@ -214,12 +242,39 @@ fn test_nonlinear_diseq_contradiction_stays_fail_closed() {
         (check-sat)
         (get-proof)
     "#;
-    let (exec, _alethe) = solve_unsat(script);
-    let proof = exec.last_proof().expect("last proof after UNSAT");
+    let commands = parse(script).expect("parse nonlinear script");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute nonlinear script");
+    // Genuinely UNSAT: y = 3 forces x = 9, contradicting `(not (= x 9))`.
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+
+    // The verdict is certified (independent re-solve), so the artifacts are
+    // published rather than revoked.
+    let proof = exec
+        .last_proof()
+        .expect("a certified UNSAT must publish its proof artifacts");
+    assert!(
+        outputs
+            .get(1)
+            .is_some_and(|output| !output.contains("proof is not available")),
+        "get-proof must succeed after certified publication: {outputs:?}"
+    );
+
+    // SOUNDNESS GUARD (the point of this test): the rebuild must NOT fabricate
+    // a strict derivation for a shape it cannot prove. The published document
+    // is honest about its gap — it retains an unproved step and the strict
+    // checker rejects it.
     let strict = check_proof_strict(proof, exec.terms());
     assert!(
-        !matches!(&strict, Ok(q) if q.trust_count == 0),
-        "nonlinear-diseq contradiction must stay OUTSIDE the verified strict \
-         fragment (fail-closed), got {strict:?}"
+        strict.is_err(),
+        "no strict certificate exists for this nonlinear shape; the checker \
+         must not accept a fabricated one: {strict:?}"
+    );
+    let alethe = outputs.get(1).expect("get-proof output");
+    assert!(
+        alethe.contains(":rule hole") || alethe.contains(":rule trust"),
+        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
     );
 }

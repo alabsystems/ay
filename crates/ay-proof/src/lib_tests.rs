@@ -7,6 +7,42 @@ use ay_core::{string_literal, AletheRule, Sort};
 
 // Note: quote_symbol tests are in ay-core::smtlib
 
+/// A problem scope covering every term the proof mentions.
+///
+/// The tests that use this are STEP-RENDERING tests: they assert on `(step
+/// ...)` text and say nothing about the declaration preamble. They used to
+/// pass `&[]` as `problem_assertions`, which put every symbol *outside*
+/// problem scope — and the exporter then opened the document with a
+/// `(declare-fun ...)` preamble that carcara rejects at line 0 (S2), so the
+/// text they asserted on could never have been checked by anything.
+///
+/// The exporter now DECLINES instead of emitting that preamble, so these
+/// tests must supply a scope that actually covers their symbols. The step
+/// rendering under test is unaffected.
+///
+/// Do NOT use this in a test whose subject is the assume-authority boundary
+/// (`validate_reachable_assumes_in_problem_scope`): folding every assume into
+/// the scope makes that check vacuous.
+fn scope_covering_proof(proof: &Proof) -> Vec<TermId> {
+    let mut scope = Vec::new();
+    for step in &proof.steps {
+        match step {
+            ProofStep::Assume(term) => scope.push(*term),
+            ProofStep::Resolution { clause, pivot, .. } => {
+                scope.extend(clause.iter().copied());
+                scope.push(*pivot);
+            }
+            ProofStep::TheoryLemma { clause, .. } => scope.extend(clause.iter().copied()),
+            ProofStep::Step { clause, args, .. } => {
+                scope.extend(clause.iter().copied());
+                scope.extend(args.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    scope
+}
+
 #[test]
 fn test_empty_proof() {
     let proof = Proof::new();
@@ -82,8 +118,13 @@ fn test_theory_lemma_generic() {
     proof.add_theory_lemma("EUF", vec![eq]);
 
     let output = export_alethe(&proof, &terms);
-    // Generic lemmas use "trust" rule
-    assert!(output.contains(":rule trust"));
+    // Generic lemmas are internally the "trust" kind, but `trust` is not an
+    // Alethe rule — emitting it made carcara reject the whole document as
+    // `invalid`. On the wire they are the spec's `hole`, which checks as
+    // *holey*; `TheoryLemmaKind::Generic.is_trust()` is unchanged, so the
+    // #8759 detector still sees the step.
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule trust"), "{output}");
     assert!(output.contains("(= a b)"));
 }
 
@@ -244,8 +285,17 @@ fn test_format_string_constant_uses_canonical_smtlib_literal() {
     );
 }
 
+/// S2: a proof free in symbols the problem does not declare is UNRENDERABLE.
+///
+/// This test previously asserted the opposite — that the exporter opens the
+/// document with `(declare-fun _mod_q_2 () Int)` and friends. MEASURED against
+/// carcara 1.1.0: an Alethe PROOF document admits no declaration command at
+/// any position, so every such document died at
+/// `parser error: unexpected token: 'declare-fun' (on line 0, column 1)`
+/// before a single rule was checked. The preamble was not a partial fix; it
+/// was what made the artifact uncheckable.
 #[test]
-fn test_export_alethe_with_problem_scope_declares_auxiliary_symbols_only() {
+fn test_export_alethe_with_problem_scope_declines_on_undeclarable_symbols() {
     let mut terms = TermStore::new();
     let user_a = terms.mk_var("a", Sort::Int);
     let user_b = terms.mk_var("b", Sort::Int);
@@ -263,15 +313,96 @@ fn test_export_alethe_with_problem_scope_declares_auxiliary_symbols_only() {
     proof.add_assume(r_eq, None);
     proof.add_assume(sk_eq, None);
 
-    let output = export_alethe_with_problem_scope(&proof, &terms, &[user_eq]);
-    assert!(output.contains("(declare-fun _mod_q_2 () Int)"), "{output}");
-    assert!(output.contains("(declare-fun _mod_r_3 () Int)"), "{output}");
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[user_eq], None)
+            .expect_err("symbols outside problem scope have no Alethe declaration form");
+    let AlethePrintError::UndeclarableProofSymbols { count, ref names } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    // Exactly the three out-of-scope symbols. `a` and `b` are declared by the
+    // problem file, so they are not what blocked the export and the count
+    // pins that they were not counted.
+    assert_eq!(count, 3, "{error}");
+    for aux in ["_mod_q_2", "_mod_r_3", "__ay_ext_diff_1_2"] {
+        assert!(names.contains(aux), "{error}");
+    }
+
+    // The infallible wrapper must not paper over it with a document either:
+    // whatever it returns, it must carry no declaration command and no step.
+    let rendered = export_alethe_with_problem_scope(&proof, &terms, &[user_eq]);
+    assert!(rendered.contains("UNVERIFIABLE PROOF"), "{rendered}");
+    assert!(!rendered.contains("(declare-"), "{rendered}");
+    assert!(!rendered.contains("(step "), "{rendered}");
+}
+
+/// The fail-closed decline must survive the STREAMING export too: the CLI
+/// writes `<input>.alethe` through the budgeted `..._to` sink, and a partial
+/// prefix followed by an error is exactly the artifact this class is about.
+#[test]
+fn test_streaming_export_declines_before_writing_any_bytes() {
+    let mut terms = TermStore::new();
+    let user_a = terms.mk_var("a", Sort::Int);
+    let aux = terms.mk_var("__ay_ext_diff!69", Sort::Int);
+    let user_eq = terms.mk_eq(user_a, user_a);
+    let aux_eq = terms.mk_eq(aux, user_a);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma("EUF", vec![aux_eq]);
+
+    let mut sink: Vec<u8> = Vec::new();
+    let err = try_export_alethe_with_problem_scope_overrides_and_budget_to(
+        &mut sink,
+        &proof,
+        &terms,
+        &[user_eq],
+        None,
+        None,
+    )
+    .expect_err("an undeclarable witness must decline");
     assert!(
-        output.contains("(declare-fun __ay_ext_diff_1_2 () Int)"),
-        "{output}"
+        matches!(
+            err,
+            AletheStreamError::Print(AlethePrintError::UndeclarableProofSymbols { .. })
+        ),
+        "{err}"
     );
-    assert!(!output.contains("(declare-fun a () Int)"), "{output}");
-    assert!(!output.contains("(declare-fun b () Int)"), "{output}");
+    assert!(
+        sink.is_empty(),
+        "declined export wrote {} bytes: {}",
+        sink.len(),
+        String::from_utf8_lossy(&sink)
+    );
+}
+
+/// The positive direction of S2: a document the exporter DOES produce must
+/// carry no declaration command anywhere.
+///
+/// The decline above only covers symbols the collector reports. This pins the
+/// stronger, checker-facing invariant on the success path — carcara rejects
+/// `(declare-fun` / `(declare-const` / `(declare-sort` / `(set-logic` at ANY
+/// position, so one such line makes an otherwise-checkable document
+/// uncheckable.
+#[test]
+fn test_successful_problem_scope_export_emits_no_declaration_command() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Bool);
+    let not_x = terms.mk_not(x);
+
+    let mut proof = Proof::new();
+    let a0 = proof.add_assume(x, None);
+    let a1 = proof.add_assume(not_x, None);
+    proof.add_resolution(Vec::new(), x, a0, a1);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[x, not_x], None)
+            .expect("all symbols are in problem scope");
+    assert!(output.contains("(assume t0 x)"), "{output}");
+    for forbidden in ["(declare-", "(set-", "(define-sort", "(check-sat"] {
+        assert!(
+            !output.contains(forbidden),
+            "emitted document contains `{forbidden}`, which no Alethe proof parser accepts:\n{output}"
+        );
+    }
 }
 
 #[test]
@@ -290,6 +421,53 @@ fn test_export_alethe_with_problem_scope_ignores_bound_auxiliary_names() {
         !output.contains("(declare-fun _mod_q_2 () Int)"),
         "bound quantifier variable must not be declared as a free symbol: {output}"
     );
+}
+
+/// Every proof-free symbol outside the problem scope must be REPORTED,
+/// whatever it is named — the collector must not silently drop families.
+///
+/// The collector used to see only names matching six hard-coded prefixes
+/// (`_mod_`, `_div_`, `__ay_`, `_sk_`, `sk_`, `skolem`). Internal symbols in
+/// any other family fell through, and the resulting document did not parse.
+/// Reproduced on QF_DT/20230720-blocksworld, where the eager datatype engine's
+/// field-split symbols reach the proof and carcara reports
+/// `identifier 's_tmp___!left' is not defined` before checking any rule.
+///
+/// The obligation is unchanged; only its discharge moved. Declaring the symbol
+/// was never a discharge (S2: carcara rejects the declaration itself), so the
+/// exporter now names it in a fail-closed decline.
+#[test]
+fn test_problem_scope_reports_internal_symbols_outside_the_prefix_allowlist() {
+    let mut terms = TermStore::new();
+    let user = terms.mk_var("s_", Sort::Int);
+    let other = terms.mk_var("t_", Sort::Int);
+    // A field-split symbol as the frontend mints them for a datatype-sorted
+    // constant (`declarations.rs`, `format!("{name}!{sel_name}")`): no
+    // recognizable prefix, and absent from the problem scope.
+    let field = terms.mk_var("s_tmp___!left", Sort::Int);
+    // NOTE: must be `(= s_ t_)`, not `(= s_ s_)` — the term store folds a
+    // reflexive equality to `true`, which would leave the problem scope EMPTY
+    // and make the second assertion below vacuous.
+    let user_goal = terms.mk_eq(user, other);
+    let split_eq = terms.mk_eq(field, user);
+
+    let mut proof = Proof::new();
+    proof.add_assume(split_eq, None);
+
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[user_goal], None)
+            .expect_err("an out-of-scope field-split symbol is unrenderable");
+    let AlethePrintError::UndeclarableProofSymbols { count, ref names } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert_eq!(
+        count, 1,
+        "the collector must SEE the prefix-less symbol, not drop it: {error}"
+    );
+    assert!(names.contains("s_tmp___!left"), "{error}");
+    // A problem-scope symbol is declared by the problem file and must never be
+    // the reason an export declines.
+    assert!(!names.contains("t_"), "{error}");
 }
 
 #[test]
@@ -422,7 +600,7 @@ fn test_try_export_alethe_fails_on_missing_lia_generic_annotation() {
 }
 
 #[test]
-fn test_try_export_alethe_fails_closed_on_array_extensionality() {
+fn test_export_alethe_lowers_array_extensionality_to_arrays_ext() {
     use ay_core::TheoryLemmaKind;
 
     let mut terms = TermStore::new();
@@ -446,6 +624,65 @@ fn test_try_export_alethe_fails_closed_on_array_extensionality() {
         lia: None,
     });
 
+    let output = try_export_alethe(&proof, &terms).expect("one-level extensionality is lowerable");
+    // The AY-private rule name must never reach an external checker.
+    assert!(
+        !output.contains(":rule extensionality"),
+        "unsupported external rule must never be emitted: {output}"
+    );
+    assert!(
+        output.contains(":rule arrays_ext"),
+        "extensionality must lower to Carcara's checked rule: {output}"
+    );
+    // The witness is rendered as Carcara's own epsilon term at EVERY
+    // occurrence, so it is neither declared nor mentioned as a constant.
+    let choice = "(choice ((x Int)) (or (= a b) (not (= (select a x) (select b x)))))";
+    assert!(output.contains(choice), "missing epsilon witness: {output}");
+    assert!(
+        !output.contains("__ext_diff_1_2"),
+        "witness constant survived the substitution: {output}"
+    );
+    assert!(
+        !output.contains("(declare-fun __ext_diff_1_2"),
+        "substituted witness must not be declared: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "(step t0 (cl (or (= a b) (not (= (select a {choice}) (select b {choice}))))) \
+             :rule resolution :premises (t0.r0 t0.o1))"
+        )) || output.contains("(step t0 (cl (or (= a b)"),
+        "final clause must keep AY's packed-or shape: {output}"
+    );
+}
+
+#[test]
+fn test_try_export_alethe_fails_closed_on_unrecognized_array_extensionality() {
+    use ay_core::TheoryLemmaKind;
+
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = terms.mk_var("a", array_sort.clone());
+    let b = terms.mk_var("b", array_sort);
+    let k = terms.mk_var("__ext_diff_1_2", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    // Two DIFFERENT read indices: not an extensionality clause at all, so no
+    // `arrays_ext` instance justifies it and the export must refuse.
+    let eq_ab = terms.mk_eq(a, b);
+    let sel_a = terms.mk_select(a, k);
+    let sel_b = terms.mk_select(b, j);
+    let sel_eq = terms.mk_eq(sel_a, sel_b);
+    let not_sel_eq = terms.mk_not(sel_eq);
+    let ext_clause = terms.mk_or(vec![eq_ab, not_sel_eq]);
+
+    let mut proof = Proof::new();
+    proof.add_step(ProofStep::TheoryLemma {
+        theory: "arrays".to_string(),
+        clause: vec![ext_clause],
+        farkas: None,
+        kind: TheoryLemmaKind::ArrayExtensionality,
+        lia: None,
+    });
+
     assert!(matches!(
         try_export_alethe(&proof, &terms),
         Err(AlethePrintError::UnsupportedArrayExtensionality { id }) if id == ProofId(0)
@@ -453,13 +690,49 @@ fn test_try_export_alethe_fails_closed_on_array_extensionality() {
 
     let output = export_alethe(&proof, &terms);
     assert!(
-        !output.contains(":rule extensionality"),
-        "unsupported external rule must never be emitted: {output}"
+        !output.contains(":rule extensionality") && !output.contains(":rule arrays_ext"),
+        "unjustified extensionality must never be emitted: {output}"
     );
     assert!(
         output.contains("UNVERIFIABLE PROOF") && output.contains("(error"),
         "infallible export must fail loudly: {output}"
     );
+}
+
+#[test]
+fn test_array_extensionality_refuses_capture_prone_witness() {
+    use ay_core::TheoryLemmaKind;
+
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    // A problem constant literally named `x` would be CAPTURED by the binder
+    // Carcara hard-codes in its epsilon term, so the lemma must fail closed.
+    let x = terms.mk_var("x", Sort::Int);
+    let base = terms.mk_var("base", array_sort.clone());
+    let value = terms.mk_var("v", Sort::Int);
+    let a = terms.mk_store(base, x, value);
+    let b = terms.mk_var("b", array_sort);
+    let k = terms.mk_var("__ext_diff_1_2", Sort::Int);
+    let eq_ab = terms.mk_eq(a, b);
+    let sel_a = terms.mk_select(a, k);
+    let sel_b = terms.mk_select(b, k);
+    let sel_eq = terms.mk_eq(sel_a, sel_b);
+    let not_sel_eq = terms.mk_not(sel_eq);
+    let ext_clause = terms.mk_or(vec![eq_ab, not_sel_eq]);
+
+    let mut proof = Proof::new();
+    proof.add_step(ProofStep::TheoryLemma {
+        theory: "arrays".to_string(),
+        clause: vec![ext_clause],
+        farkas: None,
+        kind: TheoryLemmaKind::ArrayExtensionality,
+        lia: None,
+    });
+
+    assert!(matches!(
+        try_export_alethe(&proof, &terms),
+        Err(AlethePrintError::UnsupportedArrayExtensionality { id }) if id == ProofId(0)
+    ));
 }
 
 #[test]
@@ -521,7 +794,7 @@ fn test_export_alethe_with_problem_scope_fails_loud_on_missing_farkas() {
         lia: None,
     });
 
-    let output = export_alethe_with_problem_scope(&proof, &terms, &[]);
+    let output = export_alethe_with_problem_scope(&proof, &terms, &scope_covering_proof(&proof));
     assert!(
         !output.contains("(step"),
         "emitted a (step ...) on unverifiable path: {output}"
@@ -552,10 +825,16 @@ fn test_try_export_alethe_generic_trust_is_still_allowed() {
     proof.add_theory_lemma("EUF", vec![eq]); // default kind = Generic
 
     let output = try_export_alethe(&proof, &terms)
-        .expect("Generic kind is a first-class :rule trust, not a silent downgrade");
+        .expect("Generic kind is a first-class unproved step, not a silent downgrade");
+    // Still a first-class, detector-visible unproved step — but written with
+    // the rule name the checker actually implements.
     assert!(
-        output.contains(":rule trust"),
-        "Generic kind should still emit trust: {output}"
+        output.contains(":rule hole"),
+        "Generic kind should still emit an honest hole: {output}"
+    );
+    assert!(
+        !output.contains(":rule trust"),
+        "must not emit a rule name no Alethe checker implements: {output}"
     );
 }
 
@@ -958,7 +1237,7 @@ fn test_cong_with_surface_order_reversal_uses_canonical_bridge() {
     let output = try_export_alethe_with_problem_scope_and_overrides(
         &proof,
         &terms,
-        &[eq_xy],
+        &scope_covering_proof(&proof),
         Some(&overrides),
     )
     .expect("exact order reversal has a certified congruence bridge");
@@ -998,7 +1277,7 @@ fn test_cong_bridge_rejects_non_equivalent_surface_order() {
     let error = try_export_alethe_with_problem_scope_and_overrides(
         &proof,
         &terms,
-        &[eq_xy],
+        &scope_covering_proof(&proof),
         Some(&overrides),
     )
     .expect_err("an unrelated order override must fail closed");
@@ -1037,9 +1316,13 @@ fn test_eq_congruent_bridge_repairs_exact_multiplication_operand_swap() {
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(left, "(+ (* 16 c) s)".to_string());
 
-    let output =
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
-            .expect("exact multiplication swap has an ACI congruence bridge");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect("exact multiplication swap has an ACI congruence bridge");
     assert!(
         output.contains("(step t0.ac (cl (= (* 16 c) (* c 16))) :rule aci_simp)"),
         "{output}"
@@ -1113,9 +1396,13 @@ fn test_surface_distinct_non_unit_resolution_mismatch_fails_closed() {
 
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(disequality, "(distinct x y)".to_string());
-    let error =
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
-            .expect_err("a non-unit distinct/equality surface pivot must not fall through");
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect_err("a non-unit distinct/equality surface pivot must not fall through");
     assert!(
         matches!(error, AlethePrintError::InvalidSurfaceStep { .. }),
         "{error}"
@@ -1133,7 +1420,7 @@ fn test_surface_distinct_non_unit_resolution_mismatch_fails_closed() {
     let error = try_export_alethe_with_problem_scope_and_overrides(
         &generic_proof,
         &terms,
-        &[],
+        &scope_covering_proof(&generic_proof),
         Some(&overrides),
     )
     .expect_err("a generic non-unit distinct/equality surface pivot must not fall through");
@@ -1197,8 +1484,13 @@ fn test_array_row1_uses_checked_arrays_idx_rule() {
         vec![row],
         TheoryLemmaKind::ArraySelectStore { index_eq: true },
     );
-    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-        .expect("unit ROW1 has a checked external rule");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("unit ROW1 has a checked external rule");
     assert!(
         output.contains("(step t0 (cl (= (select (store a i v) i) v)) :rule arrays_idx)"),
         "{output}"
@@ -1230,8 +1522,13 @@ fn test_array_conditional_reversed_row1_uses_congruence_subproof() {
         vec![guard, reversed_row],
         TheoryLemmaKind::ArraySelectStore { index_eq: true },
     );
-    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-        .expect("conditional reversed ROW1 has a checked external subproof");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("conditional reversed ROW1 has a checked external subproof");
 
     assert!(output.contains("(anchor :step t0)"), "{output}");
     assert!(output.contains("(assume t0.h (= i j))"), "{output}");
@@ -1298,9 +1595,13 @@ fn test_array_packed_conditional_row1_bridges_decimal_store_value() {
     );
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(select, "(select (store a i 1.5) 0)".to_string());
-    let output =
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
-            .expect("packed conditional ROW1 preserves its unit or-term");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect("packed conditional ROW1 preserves its unit or-term");
 
     assert!(
         output.contains("(step t0.val (cl (= 1.5 (/ 3.0 2.0))) :rule la_generic :args (1))"),
@@ -1349,9 +1650,13 @@ fn test_array_row1_rejects_inequivalent_numeric_store_override() {
     );
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(select, "(select (store a i 999.0) i)".to_string());
-    let error =
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
-            .expect_err("an inequivalent numeric store override must fail closed");
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect_err("an inequivalent numeric store override must fail closed");
     assert!(
         matches!(error, AlethePrintError::InvalidArrayStep { .. }),
         "{error}"
@@ -1371,8 +1676,13 @@ fn test_array_printer_empty_row_shapes_fail_closed_without_panic() {
             clause,
             TheoryLemmaKind::ArraySelectStore { index_eq: true },
         );
-        let error = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-            .expect_err("empty ROW shape must fail closed");
+        let error = try_export_alethe_with_problem_scope_and_overrides(
+            &proof,
+            &terms,
+            &scope_covering_proof(&proof),
+            None,
+        )
+        .expect_err("empty ROW shape must fail closed");
         assert!(
             matches!(error, AlethePrintError::InvalidArrayStep { .. }),
             "{error}"
@@ -1404,8 +1714,13 @@ fn test_array_row2_uses_checked_arrays_row_subproof() {
         vec![guard, row],
         TheoryLemmaKind::ArraySelectStore { index_eq: false },
     );
-    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-        .expect("guarded ROW2 has a checked external subproof");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("guarded ROW2 has a checked external subproof");
     assert!(output.contains("(anchor :step t0.sp)"), "{output}");
     assert!(output.contains("(assume t0.h (not (= i j)))"), "{output}");
     assert!(
@@ -1467,8 +1782,13 @@ fn test_array_row_chain_eval_lowers_to_arrays_row_and_idx() {
 
     let mut proof = Proof::new();
     proof.add_theory_lemma_with_kind("array", vec![g2, g3, row], TheoryLemmaKind::ArrayRowChain);
-    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-        .expect("row-chain evaluation has a checked external derivation");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("row-chain evaluation has a checked external derivation");
 
     assert!(!output.contains("read_over_write_chain"), "{output}");
     assert!(output.contains("(anchor :step t0.sp)"), "{output}");
@@ -1536,8 +1856,13 @@ fn test_array_row_chain_under_array_equality_uses_cong() {
 
     let mut proof = Proof::new();
     proof.add_theory_lemma_with_kind("array", vec![packed], TheoryLemmaKind::ArrayRowChain);
-    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
-        .expect("row chain under an array equality has a checked external derivation");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("row chain under an array equality has a checked external derivation");
 
     assert!(!output.contains("read_over_write_chain"), "{output}");
     assert!(
@@ -1614,10 +1939,18 @@ fn test_array_row_chain_non_compositional_surface_falls_back() {
         s2,
         "(let ((?v_0 (store a i1 e1))) (store ?v_0 i2 e2))".to_string(),
     );
-    let output =
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
-            .expect("fallback emission still produces a document");
-    assert!(output.contains(":rule read_over_write_chain"), "{output}");
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect("fallback emission still produces a document");
+    // The point of the fallback is that it must NOT claim a real array rule it
+    // cannot justify. `read_over_write_chain` is AY's kind name and not an
+    // Alethe rule either, so the wire form is the honest `hole`.
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule read_over_write_chain"), "{output}");
     assert!(!output.contains("arrays_row"), "{output}");
     assert!(!output.contains("arrays_idx"), "{output}");
 }
@@ -1778,4 +2111,1041 @@ fn distinct_symbols_at_distinct_sorts_still_export() {
     let output = try_export_alethe(&proof, &terms).expect("no name clash — must export");
     assert!(output.contains("(declare-fun p () A)"), "{output}");
     assert!(output.contains("(declare-fun r () B)"), "{output}");
+}
+
+// ---------------------------------------------------------------------------
+// Printed-shape gate repairs (D1 / D1b)
+//
+// A census over 167 non-datatype `:status unsat` instances found 36 INVALID
+// Alethe proofs; the largest class — 23 instances across QF_UFLIA (10),
+// QF_ALIA (4), QF_IDL (4), QF_LIA (2), QF_UFIDL (2) and ALIA (1) — is an
+// `and_pos` step whose `(not (and ...))` gate literal ships as its De Morgan
+// surface form, because two blockers defeat the printed-shape guard:
+//
+//   (A) the printed root is `(let ...)`, so `split_application(s, "and")`
+//       fails at its `strip_prefix("and")`;
+//   (B) the printed root is a left-nested BINARY `and` while `mk_and` flattens
+//       internally, so the printed arity (2) never equals the internal
+//       conjunct count (58).
+//
+// ... and its mirror image D1b, an `or_pos` whose printed gate is a nested
+// binary `or` ("expected 6 terms in 'or' term, got 2") — a shape that had NO
+// guard at all and shipped broken silently.
+// ---------------------------------------------------------------------------
+
+/// (A) A `let`-rooted surface override is bridged at the `assume`: the assume
+/// keeps the problem's spelling under a DERIVED id and the ORIGINAL id carries
+/// the eliminated form, so no downstream premise reference moves. Here the
+/// authored spelling survives elimination unchanged, so the equivalence is a
+/// genuine `refl`/`let` derivation with no trust hole.
+#[test]
+fn test_let_rooted_assume_bridges_to_a_certified_and_pos_gate() {
+    use ay_core::kani_compat::DetHashMap;
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    // AY's mk_not De Morganizes: this is the gate literal the clausifier stores.
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(and_term, "(let ((?v_0 q)) (and p ?v_0 r))".to_string());
+
+    let mut proof = Proof::new();
+    proof.add_assume(and_term, None);
+    proof.add_rule_step(
+        AletheRule::AndPos(0),
+        vec![demorgan, p],
+        vec![],
+        vec![and_term],
+    );
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[and_term],
+        Some(&overrides),
+    )
+    .expect("let-bridged assume must render");
+
+    // The assume still matches the problem premise verbatim, under `t0.a`.
+    assert!(
+        output.contains("(assume t0.a (let ((?v_0 q)) (and p ?v_0 r)))"),
+        "{output}"
+    );
+    // Certified arm: anchor + refl + `let` with NO `:premises` (carcara rejects
+    // a premise on an already-normal binding: "expected 0 premises, got 1").
+    assert!(
+        output.contains("(anchor :step t0.l :args ((:= ?v_0 q)))"),
+        "{output}"
+    );
+    assert!(
+        output.contains("(step t0.l.t1 (cl (= (and p ?v_0 r) (and p q r))) :rule refl)"),
+        "{output}"
+    );
+    assert!(output.contains(":rule let)"), "{output}");
+    assert!(!output.contains(":rule let :premises"), "{output}");
+    assert!(!output.contains(":rule hole"), "{output}");
+    // The ORIGINAL id concludes the eliminated unit clause.
+    assert!(
+        output.contains("(step t0 (cl (and p q r)) :rule resolution :premises (t0.e t0.l t0.a))"),
+        "{output}"
+    );
+    // ... and the gate is now the spec-shaped `(not (and ...))`, not the or-form.
+    assert!(
+        output.contains("(step t1 (cl (not (and p q r)) p) :rule and_pos :args (0))"),
+        "{output}"
+    );
+    assert!(!output.contains("(or (not p)"), "{output}");
+}
+
+/// The same bridge when the authored spelling does NOT survive elimination
+/// (AY normalizes commutative arguments and arithmetic): the single
+/// let-elimination equivalence degrades to a visible, countable `hole` instead
+/// of shipping an invalid proof. Everything downstream still gets the spec
+/// shape.
+#[test]
+fn test_let_rooted_assume_falls_back_to_a_single_hole_when_normalization_diverges() {
+    use ay_core::kani_compat::DetHashMap;
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // Authored operand order differs from AY's canonical order.
+    overrides.insert(and_term, "(let ((?v_0 q)) (and ?v_0 p r))".to_string());
+
+    let mut proof = Proof::new();
+    proof.add_assume(and_term, None);
+    proof.add_rule_step(
+        AletheRule::AndPos(0),
+        vec![demorgan, p],
+        vec![],
+        vec![and_term],
+    );
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[and_term],
+        Some(&overrides),
+    )
+    .expect("let-bridged assume must render");
+
+    assert!(
+        output.contains("(assume t0.a (let ((?v_0 q)) (and ?v_0 p r)))"),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "(step t0.l (cl (= (let ((?v_0 q)) (and ?v_0 p r)) (and p q r))) :rule hole)"
+        ),
+        "{output}"
+    );
+    // Exactly ONE hole: the let-elimination equivalence, nothing else.
+    assert_eq!(output.matches(":rule hole").count(), 1, "{output}");
+    assert!(
+        output.contains("(step t1 (cl (not (and p q r)) p) :rule and_pos :args (0))"),
+        "{output}"
+    );
+}
+
+/// (B) A printed LEFT-NESTED binary `and` over a flattened internal term is
+/// decomposed by the shared printed-nesting navigator: one genuine `and_pos`
+/// per printed node, resolved into the traced clause. The printed ROOT is
+/// untouched, so the resolution that consumes this gate against the assume is
+/// unaffected.
+#[test]
+fn test_nested_binary_and_gate_is_navigated_not_mis_indexed() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(and_term, "(and (and p q) r)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::AndPos(0),
+        clause: vec![demorgan, p],
+        premises: vec![],
+        args: vec![and_term],
+    };
+    let printed = printer.format_step(&step, ProofId(1)).unwrap();
+    assert_eq!(
+        printed,
+        "(step t1.g0 (cl (not (and (and p q) r)) (and p q)) :rule and_pos :args (0))\n\
+         (step t1.g1 (cl (not (and p q)) p) :rule and_pos :args (0))\n\
+         (step t1 (cl (not (and (and p q) r)) p) :rule resolution :premises (t1.g0 t1.g1))"
+    );
+}
+
+/// D1b: a printed NESTED binary `or` gate over a flattened internal or-term.
+/// carcara compares the gate's top-level arity against the clause tail length,
+/// so the re-nested surface spelling must be decomposed the same way.
+#[test]
+fn test_nested_binary_or_gate_is_decomposed_per_printed_node() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let b = terms.mk_var("b".to_string(), Sort::Bool);
+    let c = terms.mk_var("c".to_string(), Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b, c]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(or_term, "(or (or a b) c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, b, c],
+        premises: vec![],
+        args: vec![or_term],
+    };
+    let printed = printer.format_step(&step, ProofId(1)).unwrap();
+    assert_eq!(
+        printed,
+        "(step t1.g0 (cl (not (or (or a b) c)) (or a b) c) :rule or_pos)\n\
+         (step t1.g1 (cl (not (or a b)) a b) :rule or_pos)\n\
+         (step t1 (cl (not (or (or a b) c)) a b c) :rule resolution :premises (t1.g0 t1.g1))"
+    );
+}
+
+/// FAIL LOUD. When the printed shape holds neither the conjunct nor a
+/// navigable path to it, no `:args (i)` is safe: the step must NOT ship. A
+/// wrong proof is worse than no proof, so the printer raises and the caller's
+/// unverifiable-proof path fires.
+#[test]
+fn test_unnavigable_and_pos_gate_fails_loud_instead_of_shipping_a_wrong_index() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // The printed root mentions `q`, but `q` itself prints as `qq`, so no
+    // printed operand anywhere in the nesting is the extracted conjunct.
+    overrides.insert(and_term, "(and p q r)".to_string());
+    overrides.insert(q, "qq".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::AndPos(1),
+        clause: vec![demorgan, q],
+        premises: vec![],
+        args: vec![and_term],
+    };
+    let err = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("an unnavigable and_pos gate must not ship");
+    assert!(
+        format!("{err}").contains("and_pos"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The same guard on the `or_pos` side, which previously had none at all: a
+/// printed gate whose arity cannot reproduce the traced clause tail raises
+/// instead of emitting the arity error carcara reports as `invalid`.
+#[test]
+fn test_or_pos_gate_arity_mismatch_fails_loud() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let b = terms.mk_var("b".to_string(), Sort::Bool);
+    let c = terms.mk_var("c".to_string(), Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b, c]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // Printed arity 2 against a 3-literal clause tail: exactly the
+    // "expected N terms in 'or' term, got 2" rejection.
+    overrides.insert(or_term, "(or a b)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, b, c],
+        premises: vec![],
+        args: vec![or_term],
+    };
+    let err = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("an or_pos gate whose printed arity is wrong must not ship");
+    assert!(
+        format!("{err}").contains("or_pos"),
+        "unexpected error: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Skolem CONSTANTS are DEFINED as the Hilbert `choice` they denote — never
+// declared, and never guessed at (`TermStore::register_skolem_choice`,
+// `AlethePrinter::skolem_choice_definitions`).
+//
+// MEASURED on carcara 1.1.0: its proof grammar admits only `assume`, `step`,
+// `anchor` and `define-fun`, so a `(declare-fun ...)` ANYWHERE in the document
+// is `parser error: unexpected token: 'declare-fun' (on line 0, column 1)` and
+// nothing is checked. That is how the ALIA/piVC and QF_ALIA/ios exemplars
+// failed. It is also the wrong statement: `sk` is not an arbitrary fresh
+// constant, it is `εx. B`, and only `∃x. B ⟺ B[x := εx. B]` licenses the
+// substitution the proof performs.
+//
+// The contract every test below pins: DEFINE what has provenance, DECLINE the
+// rest. There is no declaration fallback, because falling back to a
+// declaration is precisely what makes the artifact unparseable.
+
+#[test]
+fn skolem_constant_is_defined_as_its_choice_term_not_declared() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let quantified = terms.mk_exists(vec![("x".to_string(), Sort::Int)], body);
+    let witness = terms.mk_var("sk!x_1", Sort::Int);
+    terms.mark_skolem_symbol("sk!x_1");
+    terms.register_skolem_choice(
+        witness,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body,
+        },
+    );
+    let instance = terms.mk_app(Symbol::named("P"), [witness], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_assume(quantified, None);
+    proof.add_rule_step(AletheRule::Hole, vec![instance], vec![], vec![]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[quantified], None)
+            .expect("export must succeed");
+    assert!(
+        output.contains("(define-fun sk!x_1 () Int (choice ((x Int)) (P x)))"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("(declare-"),
+        "a declared witness states something the proof cannot justify, and makes \
+         the document unparseable: {output}"
+    );
+}
+
+#[test]
+fn skolem_definitions_are_emitted_in_mint_order_so_a_body_may_name_an_earlier_one() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    // `exists x. exists y. R(x, y)`: the inner witness is minted second and its
+    // choice body mentions the outer one. Name order is the REVERSE of mint
+    // order here, so a preamble sorted by name would forward-reference.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let inner_body = terms.mk_app(Symbol::named("R"), [x, y], Sort::Bool);
+    let inner = terms.mk_exists(vec![("y".to_string(), Sort::Int)], inner_body);
+    let outer = terms.mk_exists(vec![("x".to_string(), Sort::Int)], inner);
+
+    let outer_witness = terms.mk_var("sk!zz_outer", Sort::Int);
+    terms.mark_skolem_symbol("sk!zz_outer");
+    terms.register_skolem_choice(
+        outer_witness,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body: inner,
+        },
+    );
+    let inner_after = terms.mk_app(Symbol::named("R"), [outer_witness, y], Sort::Bool);
+    let inner_witness = terms.mk_var("sk!aa_inner", Sort::Int);
+    terms.mark_skolem_symbol("sk!aa_inner");
+    terms.register_skolem_choice(
+        inner_witness,
+        SkolemChoice {
+            binder: "y".to_string(),
+            sort: Sort::Int,
+            body: inner_after,
+        },
+    );
+    let instance = terms.mk_app(
+        Symbol::named("R"),
+        [outer_witness, inner_witness],
+        Sort::Bool,
+    );
+
+    let mut proof = Proof::new();
+    proof.add_assume(outer, None);
+    proof.add_rule_step(AletheRule::Hole, vec![instance], vec![], vec![]);
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[outer], None)
+        .expect("export must succeed");
+    let outer_at = output
+        .find("(define-fun sk!zz_outer ")
+        .unwrap_or_else(|| panic!("outer witness must be defined: {output}"));
+    let inner_at = output
+        .find("(define-fun sk!aa_inner ")
+        .unwrap_or_else(|| panic!("inner witness must be defined: {output}"));
+    assert!(
+        outer_at < inner_at,
+        "a definition must precede every definition that names it: {output}"
+    );
+    assert!(
+        output.contains("(define-fun sk!aa_inner () Int (choice ((y Int)) (R sk!zz_outer y)))"),
+        "{output}"
+    );
+}
+
+/// REWRITTEN from `skolem_definition_is_withheld_when_its_body_names_an_unresolvable_symbol`,
+/// which asserted that the export falls back to `(declare-fun sk!x_ghost () Int)`.
+///
+/// That "fail-closed" path was fail-OPEN against the real checker: MEASURED,
+/// a declaration command anywhere makes the document `invalid` at line 0, so
+/// the fallback produced an artifact strictly worse than no artifact. The
+/// correct contract is to DECLINE.
+#[test]
+fn an_unresolvable_choice_body_declines_instead_of_falling_back_to_a_declaration() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    // The choice body mentions `ghost`, which the PROBLEM does not declare and
+    // no earlier definition introduces. Emitting the definition would spell a
+    // symbol the checker cannot resolve.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let ghost = terms.mk_var("ghost", Sort::Int);
+    let body = terms.mk_app(Symbol::named("R"), [x, ghost], Sort::Bool);
+    let witness = terms.mk_var("sk!x_ghost", Sort::Int);
+    terms.mark_skolem_symbol("sk!x_ghost");
+    terms.register_skolem_choice(
+        witness,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body,
+        },
+    );
+    let declared = terms.mk_var("k", Sort::Int);
+    let instance = terms.mk_app(Symbol::named("R"), [witness, declared], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![instance], vec![], vec![]);
+
+    let problem = terms.mk_app(Symbol::named("R"), [declared, declared], Sort::Bool);
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[problem], None)
+            .expect_err("an unresolvable choice body has no correct rendering");
+    let AlethePrintError::UndeclarableProofSymbols { count, ref names } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert_eq!(count, 1, "{error}");
+    assert!(names.contains("sk!x_ghost"), "{error}");
+
+    // And the infallible wrapper must not paper over it with a declaration.
+    let rendered = export_alethe_with_problem_scope(&proof, &terms, &[problem]);
+    assert!(!rendered.contains("(declare-"), "{rendered}");
+    assert!(!rendered.contains("define-fun sk!x_ghost"), "{rendered}");
+}
+
+#[test]
+fn a_witness_inlined_by_a_certified_skolem_step_is_neither_declared_nor_defined() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    // `sko_forall` already resugars this witness to an inline `choice` at every
+    // occurrence, so it is not a free symbol of the document. Defining it too
+    // would be a second, redundant spelling of the same term — and declining
+    // would throw away a document that is already correct.
+    let mut terms = TermStore::new();
+    let i = terms.mk_var("i", Sort::Int);
+    let p_i = terms.mk_app(Symbol::named("P"), [i], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("i".to_string(), Sort::Int)], p_i);
+    let witness = terms.mk_var("sk!i_dual", Sort::Int);
+    terms.mark_skolem_symbol("sk!i_dual");
+    let not_p_i = terms.mk_not_raw(p_i);
+    terms.register_skolem_choice(
+        witness,
+        SkolemChoice {
+            binder: "i".to_string(),
+            sort: Sort::Int,
+            body: not_p_i,
+        },
+    );
+    let instance = terms.mk_app(Symbol::named("P"), [witness], Sort::Bool);
+    let equality = terms.mk_app(Symbol::named("="), [quantified, instance], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Skolem, vec![equality], vec![], vec![witness]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[quantified], None)
+            .expect("a fully resugared witness needs no preamble at all");
+    assert!(!output.contains("declare-fun sk!i_dual"), "{output}");
+    assert!(!output.contains("define-fun sk!i_dual"), "{output}");
+    assert!(output.contains(":rule sko_forall"), "{output}");
+}
+
+/// REWRITTEN from `an_auxiliary_symbol_without_choice_provenance_still_gets_a_declaration`.
+///
+/// "Still gets a declaration" encoded the fail-OPEN behaviour as correct. A
+/// symbol with no recorded defining term has no `define-fun` form either, so
+/// the only honest outcomes are "resugar it" or "decline" — and this symbol is
+/// neither resugared nor definable.
+#[test]
+fn an_auxiliary_symbol_without_choice_provenance_declines_rather_than_declaring() {
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let aux = terms.mk_var("_mod_q_7", Sort::Int);
+    let k = terms.mk_var("k", Sort::Int);
+    let claim = terms.mk_app(Symbol::named("R"), [aux, k], Sort::Bool);
+    let problem = terms.mk_app(Symbol::named("R"), [k, k], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![claim], vec![], vec![]);
+
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[problem], None)
+            .expect_err("a symbol with no defining term cannot be introduced at all");
+    let AlethePrintError::UndeclarableProofSymbols { count, ref names } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert_eq!(count, 1, "{error}");
+    assert!(names.contains("_mod_q_7"), "{error}");
+}
+
+/// REWRITTEN from `skolem_definition_is_withheld_when_the_binder_name_is_a_problem_symbol`,
+/// which asserted a `(declare-fun sk!x_shadow () Int)` fallback.
+///
+/// Withholding the definition is still right — the binder is printed by NAME,
+/// so a problem symbol spelled the same way would be CAPTURED by it — but the
+/// consequence of withholding is a DECLINE, not a declaration.
+#[test]
+fn a_capturing_binder_declines_instead_of_falling_back_to_a_declaration() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let witness = terms.mk_var("sk!x_shadow", Sort::Int);
+    terms.mark_skolem_symbol("sk!x_shadow");
+    terms.register_skolem_choice(
+        witness,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body,
+        },
+    );
+    let instance = terms.mk_app(Symbol::named("P"), [witness], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![instance], vec![], vec![]);
+
+    // The PROBLEM declares its own `x` — the same spelling as the binder.
+    let problem = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[problem], None)
+            .expect_err("a binder that would capture a problem symbol must not be emitted");
+    let AlethePrintError::UndeclarableProofSymbols { ref names, .. } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert!(names.contains("sk!x_shadow"), "{error}");
+}
+
+/// (E) `define-fun` is a MACRO and identical bodies COLLAPSE.
+///
+/// MEASURED on carcara 1.1.0 with a two-line preamble
+/// `(define-fun sk1 () U (choice ((x U)) true))` /
+/// `(define-fun sk2 () U (choice ((x U)) true))`: the step
+/// `(step t2 (cl (= sk1 sk2)) :rule refl)` CHECKS and the document is `valid`
+/// — two distinct Skolem constants proved equal. Give them different bodies
+/// and the same step is rejected (`reflexivity failed`), so the shared body is
+/// the whole cause. Alpha-renaming the binder does not save it either:
+/// `(choice ((x U)) true)` and `(choice ((y U)) true)` also collapse.
+///
+/// So a definition must carry the witness's OWN defining predicate, and two
+/// witnesses must never end up with the same one. Here both witnesses were
+/// minted for bodies that render identically, so NEITHER may be defined.
+#[test]
+fn two_skolems_with_the_same_choice_body_are_never_both_defined() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    let mut terms = TermStore::new();
+    let k = terms.mk_var("k", Sort::Int);
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    // Two bodies that are alpha-variants: `(P x)` under binder `x`, and
+    // `(P y)` under binder `y`. Distinct TermIds, identical after the binder
+    // is normalized away — exactly the shape carcara identifies.
+    let body_x = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let body_y = terms.mk_app(Symbol::named("P"), [y], Sort::Bool);
+
+    let first = terms.mk_var("sk!a_1", Sort::Int);
+    terms.mark_skolem_symbol("sk!a_1");
+    terms.register_skolem_choice(
+        first,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body: body_x,
+        },
+    );
+    let second = terms.mk_var("sk!b_2", Sort::Int);
+    terms.mark_skolem_symbol("sk!b_2");
+    terms.register_skolem_choice(
+        second,
+        SkolemChoice {
+            binder: "y".to_string(),
+            sort: Sort::Int,
+            body: body_y,
+        },
+    );
+    let claim = terms.mk_app(Symbol::named("R"), [first, second], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![claim], vec![], vec![]);
+
+    // The problem must APPLY `P`, or the definitions would be withheld for the
+    // unrelated reason that `P` does not resolve — and this test would pass
+    // without the collapse guard existing at all.
+    let problem_r = terms.mk_app(Symbol::named("R"), [k, k], Sort::Bool);
+    let problem_p = terms.mk_app(Symbol::named("P"), [k], Sort::Bool);
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[problem_r, problem_p],
+        None,
+    )
+    .expect_err("two witnesses sharing a body must not both be defined");
+    let AlethePrintError::UndeclarableProofSymbols { count, ref names } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert_eq!(
+        count, 2,
+        "BOTH witnesses must be withheld — defining either one alone would still \
+         be correct, but defining both identifies them: {error}"
+    );
+    assert!(
+        names.contains("sk!a_1") && names.contains("sk!b_2"),
+        "{error}"
+    );
+}
+
+/// The control for the collapse guard: DIFFERENT bodies must still be defined.
+/// A guard that withheld everything would also "pass" the test above.
+#[test]
+fn two_skolems_with_different_choice_bodies_are_both_defined() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    let mut terms = TermStore::new();
+    let k = terms.mk_var("k", Sort::Int);
+    let x = terms.mk_var("x", Sort::Int);
+    let body_p = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let body_q = terms.mk_app(Symbol::named("Q"), [x], Sort::Bool);
+
+    let first = terms.mk_var("sk!a_1", Sort::Int);
+    terms.mark_skolem_symbol("sk!a_1");
+    terms.register_skolem_choice(
+        first,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body: body_p,
+        },
+    );
+    let second = terms.mk_var("sk!b_2", Sort::Int);
+    terms.mark_skolem_symbol("sk!b_2");
+    terms.register_skolem_choice(
+        second,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body: body_q,
+        },
+    );
+    let claim = terms.mk_app(Symbol::named("R"), [first, second], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![claim], vec![], vec![]);
+
+    // `P` and `Q` must be applied by the problem, or the preamble check would
+    // withhold both definitions for an unrelated reason.
+    let problem_r = terms.mk_app(Symbol::named("R"), [k, k], Sort::Bool);
+    let problem_p = terms.mk_app(Symbol::named("P"), [k], Sort::Bool);
+    let problem_q = terms.mk_app(Symbol::named("Q"), [k], Sort::Bool);
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[problem_r, problem_p, problem_q],
+        None,
+    )
+    .expect("distinct bodies are independently definable");
+    assert!(
+        output.contains("(define-fun sk!a_1 () Int (choice ((x Int)) (P x)))"),
+        "{output}"
+    );
+    assert!(
+        output.contains("(define-fun sk!b_2 () Int (choice ((x Int)) (Q x)))"),
+        "{output}"
+    );
+    assert!(!output.contains("(declare-"), "{output}");
+}
+
+/// (D) The preamble invariant is checked on the TEXT, not claimed about terms.
+///
+/// The term-level guard walks `Var` nodes only, so an application HEAD is
+/// invisible to it: a body `(choice ((x Int)) (P x))` whose `P` the problem
+/// never applies passes every term-level test and then ships a definition
+/// carcara rejects with `identifier 'P' is not defined`.
+///
+/// Re-parsing the emitted preamble with AY's own Alethe parser catches it, and
+/// the export declines. This test is the difference between the two: the ONLY
+/// thing separating it from `..._is_defined_as_its_choice_term_not_declared`
+/// is that the problem here does not mention `P`.
+#[test]
+fn a_definition_body_naming_an_unresolvable_function_declines() {
+    use ay_core::{SkolemChoice, Symbol};
+
+    let mut terms = TermStore::new();
+    let k = terms.mk_var("k", Sort::Int);
+    let x = terms.mk_var("x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+    let witness = terms.mk_var("sk!x_1", Sort::Int);
+    terms.mark_skolem_symbol("sk!x_1");
+    terms.register_skolem_choice(
+        witness,
+        SkolemChoice {
+            binder: "x".to_string(),
+            sort: Sort::Int,
+            body,
+        },
+    );
+    let claim = terms.mk_app(Symbol::named("R"), [witness, k], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Hole, vec![claim], vec![], vec![]);
+
+    // The problem applies `R`, never `P`. Every free VARIABLE of the body
+    // (just the binder) resolves, so only a check of the emitted text can
+    // catch this.
+    let problem = terms.mk_app(Symbol::named("R"), [k, k], Sort::Bool);
+    let error =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[problem], None)
+            .expect_err("a body naming an unresolvable function must not ship");
+    let AlethePrintError::UndeclarableProofSymbols { ref names, .. } = error else {
+        panic!("expected UndeclarableProofSymbols, got {error}");
+    };
+    assert!(names.contains("sk!x_1"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// carcara's `or` rule is POSITIONAL (`or_conclusion_in_premise_order`).
+//
+// MEASURED on carcara 1.1.0 with problem `(assert (or a b))`:
+//   premise `(or a b)`, conclusion `(cl b a)`
+//     -> checking failed on step 't1' with rule 'or':
+//        expected terms to be equal: 'a' and 'b'          => invalid
+//   premise `(or a b)`, conclusion `(cl a b)`             => accepted
+// It does not flatten either: a nested or-term gives
+//   "expected 2 terms in clause, got 3".
+//
+// AY's internal clause is a SET, so its order is whatever order the solver
+// built it in. Reordering the RENDERED clause is sound (an Alethe clause IS a
+// disjunction) and is the whole fix. This is what
+// QF_IDL/DTP/DTP_k2_n35_c210_s12 failed on:
+//   checking failed on step 't173516' with rule 'or':
+//   expected terms to be equal: '(<= 12 (+ x33 (- x8)))' and
+//   '(<= 40 (+ x26 (- x27)))'
+
+#[test]
+fn or_step_conclusion_is_reordered_into_the_premise_disjunct_order() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b]);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(or_term, None);
+    // The internal clause is the REVERSE permutation of the premise's
+    // disjuncts — exactly the shape carcara rejects.
+    proof.add_rule_step(AletheRule::Or, vec![b, a], vec![premise], vec![]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[or_term], None)
+            .expect("export must succeed");
+    assert!(
+        output.contains("(step t1 (cl a b) :rule or :premises (t0))"),
+        "the conclusion must be re-slotted into premise order: {output}"
+    );
+    assert!(
+        !output.contains("(cl b a)"),
+        "the rejected order must not survive: {output}"
+    );
+}
+
+#[test]
+fn an_already_ordered_or_step_is_left_byte_identical() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b]);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(or_term, None);
+    proof.add_rule_step(AletheRule::Or, vec![a, b], vec![premise], vec![]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[or_term], None)
+            .expect("export must succeed");
+    assert!(
+        output.contains("(step t1 (cl a b) :rule or :premises (t0))"),
+        "{output}"
+    );
+}
+
+/// Fail-closed direction: a clause that is NOT a permutation of the premise's
+/// disjuncts must be rendered exactly as it was, not force-fitted.
+///
+/// Re-slotting here would silently replace a literal, which is a wrong proof
+/// rather than a rejected one.
+#[test]
+fn a_non_permuted_or_clause_is_not_re_slotted() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b]);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(or_term, None);
+    // `c` is not among the premise's disjuncts.
+    proof.add_rule_step(AletheRule::Or, vec![c, a], vec![premise], vec![]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[or_term, c], None)
+            .expect("export must succeed");
+    assert!(
+        output.contains("(step t1 (cl c a) :rule or :premises (t0))"),
+        "a clause with an unmatched literal must be left alone: {output}"
+    );
+}
+
+/// A repeated disjunct must consume a distinct clause position per occurrence,
+/// so a multiset — not a set — is what gets matched.
+///
+/// Built with `mk_app` rather than `mk_or`, because `mk_or` normalizes a
+/// duplicated disjunct away and the shape under test would not survive.
+#[test]
+fn or_reordering_matches_repeated_disjuncts_as_a_multiset() {
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    // `(or b a b)`: `b` twice.
+    let or_term = terms.mk_app(Symbol::named("or"), [b, a, b], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(or_term, None);
+    proof.add_rule_step(AletheRule::Or, vec![a, b, b], vec![premise], vec![]);
+
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[or_term], None)
+            .expect("export must succeed");
+    assert!(
+        output.contains("(step t1 (cl b a b) :rule or :premises (t0))"),
+        "{output}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A `cong` whose PRINTED operands cannot be checked must DECLINE
+// (`surface_cong_has_uncheckable_operands`).
+//
+// MEASURED on carcara 1.1.0 with premise `(= x y)`:
+//   (= (g x) (f y))  -> functions don't match: 'g' and 'f'
+//   (= zzz (f y))    -> term is not an application or operation: 'zzz'
+//   (= zzz x)        -> term is not an application or operation: 'zzz'
+// all `invalid`.
+//
+// There is no honest repair. Emitting
+//   (step t1.s (cl (= (g x) (f x))) :rule hole)
+//   (step t1.c (cl (= (f x) (f y))) :rule cong :premises (t0))
+//   (step t1   (cl (= (g x) (f y))) :rule trans :premises (t1.s t1.c))
+// would turn `invalid` into `holey` while proving NOTHING about the two terms
+// — a hole proves anything. A holey verdict bought that way HIDES the defect,
+// which is worse than reporting it. This is the same dishonesty as the
+// `(cl false) :rule trust` stub the campaign removed.
+//
+// QF_LIA/.../SmallOperatingSystem-PT-MT8192DC2048/RC-12 is the live instance:
+//   checking failed on step 't12' with rule 'cong':
+//   operators don't match: 'and' and '<='
+
+#[test]
+fn a_cong_whose_printed_operands_have_different_heads_declines() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), [x], Sort::Int);
+    let f_y = terms.mk_app(Symbol::named("f"), [y], Sort::Int);
+    let conclusion = terms.mk_app(Symbol::named("="), [f_x, f_y], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(eq_xy, None);
+    proof.add_rule_step(AletheRule::Cong, vec![conclusion], vec![premise], vec![]);
+
+    // Elaboration simplified an authored `(g x)` down to `(f x)`; the surface
+    // override prints the authored spelling back, so the step equates a `g`
+    // application with an `f` application.
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(f_x, "(g x)".to_string());
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect_err("a printed congruence with different heads must fail closed");
+    let AlethePrintError::InvalidCongruenceStep { ref reason, .. } = error else {
+        panic!("expected InvalidCongruenceStep, got {error}");
+    };
+    assert!(
+        reason.contains("different operators"),
+        "unexpected reason: {reason}"
+    );
+}
+
+/// The BARE-ATOM case. A sibling guard that required BOTH sides to be
+/// applications let this through to the default rendering, which shipped
+/// `(step t1 (cl (= zzz (f y))) :rule cong :premises (t0))` — MEASURED
+/// `invalid`. An operand that is not a printed application fails the rule
+/// whatever the other side is.
+#[test]
+fn a_cong_whose_printed_operand_is_a_bare_atom_declines() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), [x], Sort::Int);
+    let f_y = terms.mk_app(Symbol::named("f"), [y], Sort::Int);
+    let conclusion = terms.mk_app(Symbol::named("="), [f_x, f_y], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(eq_xy, None);
+    proof.add_rule_step(AletheRule::Cong, vec![conclusion], vec![premise], vec![]);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(f_x, "zzz".to_string());
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect_err("a bare-atom congruence operand must fail closed");
+    let AlethePrintError::InvalidCongruenceStep { ref reason, .. } = error else {
+        panic!("expected InvalidCongruenceStep, got {error}");
+    };
+    assert!(
+        reason.contains("not a printed application"),
+        "unexpected reason: {reason}"
+    );
+}
+
+/// The guard must NOT manufacture a `hole`-plus-`trans` bridge for the shape it
+/// declines. A holey verdict bought with an unjustified hole hides the defect.
+#[test]
+fn the_declined_cong_shape_never_becomes_a_hole_bridge() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), [x], Sort::Int);
+    let f_y = terms.mk_app(Symbol::named("f"), [y], Sort::Int);
+    let conclusion = terms.mk_app(Symbol::named("="), [f_x, f_y], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(eq_xy, None);
+    proof.add_rule_step(AletheRule::Cong, vec![conclusion], vec![premise], vec![]);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(f_x, "(g x)".to_string());
+    let rendered = export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    );
+    assert!(rendered.contains("UNVERIFIABLE PROOF"), "{rendered}");
+    assert!(
+        !rendered.contains(":rule hole"),
+        "declining must not be converted into a manufactured hole: {rendered}"
+    );
+    assert!(
+        !rendered.contains(":rule trans"),
+        "declining must not be converted into a manufactured trans bridge: {rendered}"
+    );
+    assert!(!rendered.contains("(step "), "{rendered}");
+}
+
+/// The control: an ordinary same-operator congruence still renders. A guard
+/// that declined everything would also "pass" the tests above.
+#[test]
+fn an_ordinary_same_operator_cong_still_renders() {
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), [x], Sort::Int);
+    let f_y = terms.mk_app(Symbol::named("f"), [y], Sort::Int);
+    let conclusion = terms.mk_app(Symbol::named("="), [f_x, f_y], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(eq_xy, None);
+    proof.add_rule_step(AletheRule::Cong, vec![conclusion], vec![premise], vec![]);
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("a same-operator congruence is exactly what `cong` checks");
+    assert!(
+        output.contains("(step t1 (cl (= (f x) (f y))) :rule cong :premises (t0))"),
+        "{output}"
+    );
 }

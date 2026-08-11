@@ -38,7 +38,7 @@
 //! verdict.
 
 // #8529: Use deterministic hash sets in all builds.
-use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
 use super::super::Executor;
 use super::solve_harness::TheoryModels;
@@ -48,6 +48,12 @@ use crate::executor_types::{Result, SolveResult, UnknownReason};
 use ay_core::term::{Symbol, TermData, TermId};
 use ay_core::Sort;
 use ay_map::{OP_DOM, OP_SUBSET, OUT_OF_FRAGMENT_OPS};
+
+/// Registered-name prefixes of a published map domain carrier and of the free
+/// array behind it. Must match the minting site in `ay-frontend`'s
+/// `elaborate/app/map.rs`.
+const MAP_DOMAIN_CARRIER_PREFIX: &str = "__ay_map_dom!";
+const MAP_DOMAIN_FREE_PREFIX: &str = "__ay_map_dom_free!";
 
 impl Executor {
     /// Solve the native map theory (QF_MAP / QF_MAPLIA).
@@ -201,10 +207,20 @@ impl Executor {
     /// Sound implications restricted to present witnesses — never asserts subset
     /// positively, never quantifies over an unbounded key domain.
     fn collect_map_subset_axioms(&mut self) -> Vec<TermId> {
+        // Every array term that is part of some map's published domain, mapped
+        // to that map. The frontend no longer emits `(map.dom m)` as an
+        // application — it publishes a REGISTERED CONSTANT so a `sat` witness
+        // pins the domain (see `elaborate/app/map.rs`) — so a domain read is not
+        // recognisable from its shape any more, and this table is the only link
+        // back. Without it the obligations below found no `contains_key` reads
+        // and `subset(m,n) ∧ contains_key(m,k) ∧ ¬contains_key(n,k)` regressed
+        // from `unsat` to `unknown`.
+        let (carrier_of, domain_arrays) = self.map_domain_carriers();
+
         // Discover subset atoms, domain reads, and value reads.
         let mut subset_atoms: Vec<(TermId, TermId, TermId)> = Vec::new();
-        // (map, key, contains_term) for `(select (map.dom map) key)`.
-        let mut dom_reads: Vec<(TermId, TermId, TermId)> = Vec::new();
+        // (map, key, walked select) whose `contains_key` read is present.
+        let mut dom_read_keys: Vec<(TermId, TermId, TermId)> = Vec::new();
         // (map, key, get_term) for `(select map key)` over a value carrier.
         let mut value_reads: Vec<(TermId, TermId, TermId)> = Vec::new();
 
@@ -221,9 +237,12 @@ impl Executor {
                     } else if name == "select" && args.len() == 2 {
                         let array = args[0];
                         let key = args[1];
-                        if let Some(map) = self.dom_carrier_map(array) {
-                            // contains_key(map, key) = (select (map.dom map) key).
-                            dom_reads.push((map, key, term));
+                        if let Some(map) = domain_arrays
+                            .get(&array)
+                            .copied()
+                            .or_else(|| self.dom_carrier_map(array))
+                        {
+                            dom_read_keys.push((map, key, term));
                         } else if self.is_value_carrier(array) {
                             // get(map, key) = (select map key).
                             value_reads.push((array, key, term));
@@ -250,6 +269,28 @@ impl Executor {
 
         if subset_atoms.is_empty() {
             return Vec::new();
+        }
+
+        // Rebuild `contains_key(map, key)` from the map's carrier rather than
+        // reusing the `select` the walk happened to land on. A carrier can be an
+        // `ite` chain (the domain-congruence encoding), and `mk_select` lifts a
+        // select through an `ite` — so the walk sees the BRANCH reads,
+        // `(select free_n k)` and `(select carrier_m k)`, and never the whole
+        // membership term. Reconstructing through `mk_select` is hash-consed to
+        // the exact term the frontend built for `(map.contains_key map key)`,
+        // branches and all; pairing an obligation with a bare branch instead
+        // would constrain the wrong array.
+        let mut dom_reads: Vec<(TermId, TermId, TermId)> = Vec::new();
+        dom_read_keys.sort_unstable();
+        dom_read_keys.dedup();
+        for (map, key, walked) in dom_read_keys {
+            // A user-declared `map.dom` keeps the application shape, which the
+            // walk already landed on whole: use it unchanged.
+            let contains = match carrier_of.get(&map) {
+                Some(&carrier) => self.ctx.terms.mk_select(carrier, key),
+                None => walked,
+            };
+            dom_reads.push((map, key, contains));
         }
 
         let mut axioms = Vec::new();
@@ -294,7 +335,55 @@ impl Executor {
         axioms
     }
 
+    /// The published map domain carriers, as `(map -> carrier, domain array ->
+    /// map)`.
+    ///
+    /// The frontend registers each carrier under `__ay_map_dom!<label>!<map term
+    /// id>` and the free array behind it under `__ay_map_dom_free!<label>!<map
+    /// term id>` (see `elaborate/app/map.rs`); those names are the only
+    /// surviving link once the `(map.dom m)` application is gone. The `__ay_`
+    /// prefix is rejected for user declarations, so every name matched here was
+    /// minted by that code, and the map's term id is always the last `!`
+    /// segment.
+    ///
+    /// The second map covers the free arrays as well as the carriers, because a
+    /// carrier that is an `ite` chain never appears under a `select` — the
+    /// select is lifted into the branches, and the branch a read lands on may be
+    /// the free array. Recognising it is what tells us which map that read
+    /// belongs to.
+    fn map_domain_carriers(&self) -> (HashMap<TermId, TermId>, HashMap<TermId, TermId>) {
+        let mut carrier_of = HashMap::default();
+        let mut domain_arrays = HashMap::default();
+        for (name, info) in self.ctx.symbol_iter() {
+            let Some(term) = info.term else {
+                continue;
+            };
+            let carrier = if let Some(suffix) = name.strip_prefix(MAP_DOMAIN_CARRIER_PREFIX) {
+                Some((suffix, true))
+            } else {
+                name.strip_prefix(MAP_DOMAIN_FREE_PREFIX)
+                    .map(|suffix| (suffix, false))
+            };
+            let Some((suffix, is_carrier)) = carrier else {
+                continue;
+            };
+            let Some(id) = suffix.rsplit_once('!').and_then(|(_, id)| id.parse().ok()) else {
+                continue;
+            };
+            let map = TermId(id);
+            if is_carrier {
+                carrier_of.insert(map, term);
+            }
+            domain_arrays.insert(term, map);
+        }
+        (carrier_of, domain_arrays)
+    }
+
     /// The map argument of a domain carrier `(map.dom m)`, if `array` is one.
+    ///
+    /// Only a USER-declared `map.dom` still takes this shape; the builtin
+    /// projection is published as a constant and resolved through
+    /// [`Self::map_domain_carriers`].
     fn dom_carrier_map(&self, array: TermId) -> Option<TermId> {
         match self.ctx.terms.get(array) {
             TermData::App(Symbol::Named(name), args) if name == OP_DOM && args.len() == 1 => {

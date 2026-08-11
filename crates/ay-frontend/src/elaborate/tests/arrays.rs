@@ -461,7 +461,7 @@ fn test_elaborate_default_const_array() {
     );
 }
 
-/// Test default on store simplifies through to base array (#8534)
+/// Store defaults remain symbolic until the solver can inspect the carrier.
 #[test]
 fn test_elaborate_default_store() {
     let input = r#"
@@ -473,10 +473,12 @@ fn test_elaborate_default_store() {
         ctx.process_command(cmd).unwrap();
     }
     assert_eq!(ctx.assertions.len(), 1);
-    // default(store(const-array(7), 0, 99)) = default(const-array(7)) = 7
+    // The Int carrier ultimately preserves the base default, but that is an
+    // array-theory axiom.  The elaborator must not apply the same rewrite to a
+    // finite carrier, where Z3's default may be the stored value.
     assert!(
-        ctx.terms.is_true(ctx.assertions[0]),
-        "default(store(const-array(7), 0, 99)) = 7 should simplify to true"
+        !ctx.terms.is_true(ctx.assertions[0]),
+        "default(store(...)) must survive elaboration for carrier-sensitive solving"
     );
 }
 
@@ -597,25 +599,50 @@ fn indexed_array_map_rejects_same_domain_result_ambiguity() {
 }
 
 #[test]
-fn array_map_and_as_array_reject_defined_function_macros() {
-    for input in [
+fn defined_function_array_map_expands_pointwise() {
+    let commands = parse(
         "(define-fun f ((x Int)) Int (+ x 1)) \
          (declare-const a (Array Int Int)) \
-         (assert (= ((_ map f) a) a))",
+         (declare-const i Int) \
+         (assert (= (select ((_ map f) a) i) (+ (select a i) 1)))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+}
+
+#[test]
+fn defined_function_as_array_expands_to_lambda() {
+    let commands = parse(
         "(define-fun f ((x Int)) Int (+ x 1)) \
          (declare-const i Int) \
-         (assert (= (select (_ as-array f) i) (f i)))",
-    ] {
-        let commands = parse(input).unwrap();
-        let mut ctx = Context::new();
-        assert!(
-            commands
-                .iter()
-                .try_for_each(|command| ctx.process_command(command).map(|_| ()))
-                .is_err(),
-            "higher-order use of a definition must not turn it into a free UF: {input}"
-        );
+         (assert (= (select (_ as-array f) i) (+ i 1)))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
     }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+}
+
+#[test]
+fn defined_function_array_expansion_is_capture_avoiding() {
+    let commands = parse(
+        "(declare-const global Int) \
+         (define-fun f ((x Int)) Int (+ x global)) \
+         (declare-const i Int) \
+         (assert (let ((global 99)) (= (select (_ as-array f) i) (f i))))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
 }
 
 /// Test lambda array parsing and beta reduction on select (#8535)

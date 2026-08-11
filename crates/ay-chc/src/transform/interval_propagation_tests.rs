@@ -465,3 +465,62 @@ fn const_bigint_folds_pow2_trees() {
     );
     assert_eq!(const_bigint(&tree), Some(BigInt::from(1u128 << 64)));
 }
+
+/// The HCAI `lu.cmp` benchmark, vendored verbatim from CHC-COMP 2025; see
+/// `crates/ay-chc/tests/fixtures/chc_comp/README.md`.
+const HCAI_LU_CMP: &str = include_str!(
+    "../../tests/fixtures/chc_comp/hcai/svcomp/O0/O0_lu.cmp_true-unreach-call_000.smt2"
+);
+
+/// Guarded CNF from a real SeaHorn frontend must yield its loop-counter bounds.
+///
+/// This is the capability `70c7b90c9` added, pinned on the benchmark that
+/// motivated it. Before that commit `IntervalPropagator` had no Boolean
+/// reasoning: every arithmetic fact in `lu.cmp` sits under a guard disjunct
+/// (`(or (not g) (= x 0))`) with loop bounds expressed as reified comparisons
+/// (`(not (= (<= 6 h) g))` conjoined with a unit literal), so the pass derived
+/// no bound at all and the reduced LIA-array route returned `None`.
+///
+/// Asserted at the PASS level deliberately. The end-to-end route verdict is a
+/// wall-clock-budgeted property — the route clamps itself to
+/// `REDUCED_LIA_ARRAY_ROUTE_BUDGET` minus ~1.5s of reserves — so asserting it
+/// inside a 4000-test parallel suite makes a completeness claim hostage to
+/// machine load. The abstract invariant below is the capability itself, and it
+/// is stable: ~80ms unloaded and ~180ms against 24 saturated cores, against the
+/// pass's 8s budget.
+#[test]
+fn guarded_cnf_yields_lu_cmp_loop_counter_bounds() {
+    let problem = crate::parser::ChcParser::parse(HCAI_LU_CMP).expect("lu.cmp should parse");
+    let summary = crate::portfolio::PreprocessSummary::build(problem, false);
+    let transformed = &summary.transformed_problem;
+    let state = narrowed_fixpoint(transformed);
+
+    let bound_for = |needle: &str| -> Option<Interval> {
+        let predicate = transformed
+            .predicates()
+            .iter()
+            .find(|p| p.name.contains(needle))?;
+        state
+            .get(&predicate.id)
+            .and_then(|args| args.get(1).cloned())
+    };
+
+    // The outer loop guard `(not (= (<= 6 h) g))` with unit `g` bounds the
+    // counter; the body increments it once more before the guard is re-tested.
+    assert_eq!(
+        bound_for("main@_bb2"),
+        Some(Interval {
+            lo: Some(0.into()),
+            hi: Some(6.into())
+        }),
+        "lu.cmp main@_bb2 arg1 must be bounded [0,6]; state: {state:?}"
+    );
+    assert_eq!(
+        bound_for("main@_bb"),
+        Some(Interval {
+            lo: Some(0.into()),
+            hi: Some(7.into())
+        }),
+        "lu.cmp main@_bb arg1 must be bounded [0,7]; state: {state:?}"
+    );
+}

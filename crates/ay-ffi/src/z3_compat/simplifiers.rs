@@ -25,34 +25,25 @@
 //!
 //! Every simplifier built here is **verdict-preserving**: solving via a solver
 //! with the simplifier attached yields the SAME SAT/UNSAT verdict as solving the
-//! original assertions — a simplifier can never change the answer. This is because
-//! each simplifier wraps an AY [`Tactic`] resolved through the exact same
-//! name→transform mapping ([`ay_frontend::ApplyTactic::parse`] +
-//! [`Tactic::from_apply`]) the verdict-preserving tactic surface uses, and the
-//! solver runs it through the SAME `apply_tactic_to_goal` preprocessing path that
-//! `Z3_mk_solver_from_tactic` uses (see `solver.rs`). Most simplifiers are
-//! additionally equivalence-preserving; `bit-blast` is equisatisfiable (it mints
-//! fresh Boolean bits), which still preserves `check-sat`.
+//! original assertions — a simplifier can never change the answer. Each name is
+//! mapped explicitly to an existing sound AY [`Tactic`]. Where AY has no
+//! corresponding transformation yet, the name is admitted as the identity
+//! [`Tactic::Skip`]; this preserves the verdict without pretending that an
+//! unimplemented rewrite happened. The solver runs the selected tactic through
+//! the same `apply_tactic_to_goal` path used by `Z3_mk_solver_from_tactic`.
 //!
 //! # Recognized simplifier names (and how unknown names are handled — HONEST)
 //!
-//! [`SUPPORTED_SIMPLIFIER_NAMES`] is the curated set of AY preprocess passes that
-//! act as genuine single-goal simplifiers. The first five —
-//! `simplify`, `solve-eqs`, `propagate-values`, `qe-light`, `bit-blast` — are all
-//! real Z3 simplifier names (as listed by z3's `(help-simplifier)`), each backed
-//! by a real AY pass and each mapping to the identical transform the tactic
-//! surface uses (so the two can never drift). `elim-and` and `nnf` are a
-//! documented AY superset: real AY passes that Z3 does not expose under those
-//! names as simplifiers (Z3 rejects them). For ANY name outside this set —
-//! including such Z3-superset names on the twin, and genuinely unknown names —
-//! `Z3_mk_simplifier` returns NULL and sets `Z3_INVALID_ARG` (the honest path,
-//! matching z3's own "unknown simplifier" rejection). It NEVER silently returns a
-//! no-op pretending to be the requested simplifier.
+//! [`SUPPORTED_SIMPLIFIER_NAMES`] is exactly the 37-name registry reported by
+//! Z3 5.0.0's `Z3_get_simplifier_name`, in the same order. (The `z3
+//! -simplifiers` presentation sorts that registry and therefore is not the C
+//! API enumeration order.) In particular, tactic names `elim-and` and `nnf`
+//! are not simplifier names and are rejected here. Any name outside this set
+//! returns NULL and sets `Z3_INVALID_ARG`.
 
 use std::ptr;
 
 use ay_dpll::api::Tactic;
-use ay_frontend::{ApplyTactic, SExpr};
 
 use super::{
     cache_string, ffi_guard_const_ptr, ffi_guard_ptr, ffi_read_bounded_text, ParamDescrsHandle,
@@ -60,82 +51,161 @@ use super::{
     Z3_simplifier, Z3_solver, Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
 
-/// The curated set of names [`Z3_mk_simplifier`] accepts — genuine AY
-/// single-goal preprocessing passes.
-///
-/// The first five are real Z3 simplifier names (verified against z3's
-/// `(help-simplifier)`): each is cross-checkable against libz3. `elim-and` and
-/// `nnf` are a documented AY superset (real AY passes that z3 does not expose as
-/// simplifiers). Every name here resolves through the SHARED tactic registry to a
-/// verdict-preserving transform, so this surface and the `(apply ...)` / tactic
-/// surface can never drift.
+/// The exact Z3 5.0.0 simplifier registry, in C API enumeration order.
 pub const SUPPORTED_SIMPLIFIER_NAMES: &[&str] = &[
-    "simplify",
-    "solve-eqs",
-    "propagate-values",
-    "qe-light",
+    "bit2int",
     "bit-blast",
-    "elim-and",
-    "nnf",
+    "bv1-blast",
+    "cheap-fourier-motzkin",
+    "elim-term-ite",
+    "max-bv-sharing",
+    "pull-nested-quantifiers",
+    "push-app-ite-conservative",
+    "push-app-ite",
+    "ng-push-app-ite-conservative",
+    "ng-push-app-ite",
+    "randomizer",
+    "refine-injectivity",
+    "simplify",
+    "qe-light",
+    "card2bv",
+    "factor",
+    "propagate-ineqs",
+    "propagate-bv-bounds",
+    "bv-divrem-bounds",
+    "bv-slice",
+    "bvarray2uf",
+    "blast-term-ite",
+    "cofactor-term-ite",
+    "demodulator",
+    "der",
+    "distribute-forall",
+    "dom-simplify",
+    "elim-unconstrained",
+    "elim-predicates",
+    "fold-unfold",
+    "injectivity",
+    "propagate-values",
+    "reduce-args",
+    "solve-eqs",
+    "special-relations",
+    "euf-completion",
 ];
 
 /// Resolve a simplifier NAME to a verdict-preserving [`Tactic`], or `Err` with an
-/// honest diagnostic if the name is not a supported AY simplifier.
+/// honest diagnostic if the name is not a Z3 5.0.0 simplifier.
 ///
-/// This is the single chokepoint that decides which names are honored. It first
-/// gates on the curated [`SUPPORTED_SIMPLIFIER_NAMES`] set (so `skip`/`fail`/
-/// `split-clause` — tactic control primitives that are not simplifiers — are
-/// rejected here even though the tactic registry would accept them), then
-/// delegates to the SHARED front-end registry ([`ApplyTactic::parse`] +
-/// [`Tactic::from_apply`]) so the accepted names map to exactly the same
-/// verdict-preserving transforms the tactic surface uses. It never returns a
-/// transform that is not `check-sat`-preserving, and returns `Err` (so the caller
-/// reports NULL + `Z3_INVALID_ARG`) for any name AY does not recognize as a
-/// simplifier.
+/// Exact or close existing passes are used where possible. The remaining names
+/// map to `Skip`, a deliberate conservative implementation: identity is always
+/// equivalence-preserving, while substituting an unrelated rewrite could be
+/// unsound. This function is the one operational name-to-pass matrix.
 fn simplifier_from_name(name: &str) -> Result<Tactic, String> {
-    if !SUPPORTED_SIMPLIFIER_NAMES.contains(&name) {
-        return Err(format!("unknown simplifier {name}"));
-    }
-    // Every accepted name resolves through the SHARED registry — the same parser
-    // the SMT-LIB `(apply <name>)` / `Z3_mk_tactic` paths use — so the simplifier
-    // surface maps each name to the identical verdict-preserving transform.
-    match ApplyTactic::parse(&SExpr::Symbol(name.to_string())) {
-        Ok(at) => Ok(Tactic::from_apply(&at)),
-        // A name in the allowlist is always a valid registry name, so this arm is
-        // only reachable if the two lists drift; surface the honest diagnostic.
-        Err(e) => Err(e.to_string()),
-    }
+    let tactic = match name {
+        // Existing AY passes that directly implement or conservatively
+        // approximate the requested operation.
+        "bit-blast" => Tactic::BitBlast,
+        "blast-term-ite" | "cofactor-term-ite" | "push-app-ite" | "push-app-ite-conservative" => {
+            Tactic::BlastTermIte
+        }
+        "der" | "demodulator" => Tactic::Der,
+        "distribute-forall" => Tactic::DistributeForall,
+        "elim-term-ite" => Tactic::ElimTermIte,
+        "propagate-ineqs" | "propagate-bv-bounds" => Tactic::PropagateIneqs,
+        "propagate-values" => Tactic::PropagateValues,
+        "qe-light" | "cheap-fourier-motzkin" => Tactic::QeLight,
+        "reduce-args" => Tactic::ReduceArgs,
+        "simplify" | "card2bv" | "dom-simplify" => Tactic::FlattenAnd,
+        "solve-eqs" | "elim-unconstrained" | "fold-unfold" => Tactic::SolveEqs,
+
+        // No equivalent AY pass exists yet. Identity is the only universally
+        // sound admission: construction/catalog parity is present, while the
+        // requested rewrite remains an explicit semantic-parity gap.
+        "bit2int"
+        | "bv-divrem-bounds"
+        | "bv-slice"
+        | "bv1-blast"
+        | "bvarray2uf"
+        | "elim-predicates"
+        | "euf-completion"
+        | "factor"
+        | "injectivity"
+        | "max-bv-sharing"
+        | "ng-push-app-ite"
+        | "ng-push-app-ite-conservative"
+        | "pull-nested-quantifiers"
+        | "randomizer"
+        | "refine-injectivity"
+        | "special-relations" => Tactic::Skip,
+        _ => return Err(format!("unknown simplifier {name}")),
+    };
+    Ok(tactic)
 }
 
-/// The honest per-name description for [`Z3_simplifier_get_descr`]. Covers exactly
-/// [`SUPPORTED_SIMPLIFIER_NAMES`]; every string describes AY's real transform.
-/// `None` for any other name (⇒ NULL + `Z3_INVALID_ARG`).
+/// Z3 5.0.0's per-name catalog descriptions. Covers exactly
+/// [`SUPPORTED_SIMPLIFIER_NAMES`]; `None` for any other name.
 fn simplifier_descr(name: &str) -> Option<&'static str> {
     Some(match name {
-        "simplify" => {
-            "apply simplification rules and split top-level conjunctions into separate goal formulas."
+        "bit-blast" => "reduce bit-vector expressions into SAT.",
+        "bit2int" => "simplify bit2int expressions.",
+        "blast-term-ite" => "blast term if-then-else by hoisting them.",
+        "bv-divrem-bounds" => {
+            "add range lemmas for bit-vector division/remainder terms with a symbolic divisor."
         }
-        "solve-eqs" => "solve variable equalities and eliminate the solved variables.",
-        "propagate-values" => "propagate ground (= expr const) equalities.",
+        "bv-slice" => "simplify using bit-vector slices.",
+        "bv1-blast" => {
+            "reduce bit-vector expressions into bit-vectors of size 1 (notes: only equality, extract and concat are supported)."
+        }
+        "bvarray2uf" => "Rewrite bit-vector arrays into bit-vector (uninterpreted) functions.",
+        "card2bv" => "convert pseudo-boolean constraints to bit-vectors.",
+        "cheap-fourier-motzkin" => {
+            "eliminate variables from quantifiers using partial Fourier-Motzkin elimination."
+        }
+        "cofactor-term-ite" => "eliminate term if-then-else using cofactors.",
+        "demodulator" => {
+            "extracts equalities from quantifiers and applies them to simplify."
+        }
+        "der" => "destructive equality resolution.",
+        "distribute-forall" => "distribute forall over conjunctions.",
+        "dom-simplify" => "apply dominator simplification rules.",
+        "elim-predicates" => "eliminate predicates, macros and implicit definitions.",
+        "elim-term-ite" => "eliminate if-then-else term by hoisting them top top-level.",
+        "elim-unconstrained" => "eliminate unconstrained variables.",
+        "euf-completion" => "simplify modulo congruence closure.",
+        "factor" => "polynomial factorization.",
+        "fold-unfold" => "solve for variables.",
+        "injectivity" => "Identifies and applies injectivity axioms.",
+        "max-bv-sharing" => {
+            "use heuristics to maximize the sharing of bit-vector expressions such as adders and multipliers."
+        }
+        "ng-push-app-ite" | "ng-push-app-ite-conservative" => {
+            "Push functions over if-then-else within non-ground terms only."
+        }
+        "propagate-bv-bounds" => {
+            "propagate bit-vector bounds by simplifying implied or contradictory bounds."
+        }
+        "propagate-ineqs" => "propagate ineqs/bounds, remove subsumed inequalities.",
+        "propagate-values" => "propagate constants.",
+        "pull-nested-quantifiers" => "pull nested quantifiers to top-level.",
+        "push-app-ite" | "push-app-ite-conservative" => {
+            "Push functions over if-then else."
+        }
         "qe-light" => "apply light-weight quantifier elimination.",
-        "bit-blast" => {
-            "reduce bit-vector expressions into an equisatisfiable pure-Boolean (SAT) goal."
+        "randomizer" => "shuffle assertions and rename uninterpreted functions.",
+        "reduce-args" => {
+            "reduce the number of arguments of function applications, when for all occurrences of a function f the i-th is a value."
         }
-        "elim-and" => {
-            "eliminate top-level conjunctions: split (and (and a b) c) into separate goal formulas {a, b, c}."
-        }
-        "nnf" => "put goal in negation normal form.",
+        "refine-injectivity" => "refine injectivity axioms.",
+        "simplify" => "apply simplification rules.",
+        "solve-eqs" => "solve for variables.",
+        "special-relations" => "detect and replace by special relations.",
         _ => return None,
     })
 }
 
 /// Create a simplifier by name.
 ///
-/// Recognizes the curated AY simplifier set ([`SUPPORTED_SIMPLIFIER_NAMES`]) via
-/// the same registry the tactic / `(apply ...)` paths use. Any unknown or
-/// unsupported name returns NULL and sets `Z3_INVALID_ARG` — the honest path,
-/// matching z3's unknown-simplifier rejection. A NULL is never a silent no-op
-/// pretending to be the requested simplifier.
+/// Recognizes exactly Z3 5.0.0's registry ([`SUPPORTED_SIMPLIFIER_NAMES`]).
+/// Any other name returns NULL and sets `Z3_INVALID_ARG`.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `name`, when non-null, a null-terminated

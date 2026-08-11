@@ -1,0 +1,11 @@
+# Frozen training split for scripts/milp_joint_search.py.
+#
+# Membership was chosen before running the joint grid.  The rows cover different
+# model sizes and binary/mixed structures; this file records names only, never
+# expected solver outcomes.  Do not move a case between splits after observing a
+# result: replace both split files and start a new campaign instead.
+misc07
+qnet1
+nexp-50-20-1-1
+supportcase14
+mas76

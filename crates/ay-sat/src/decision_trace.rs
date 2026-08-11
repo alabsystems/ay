@@ -34,6 +34,30 @@ const TAG_RESULT: u8 = 8;
 
 const INITIALIZED_TRACE_BYTES: u64 = MAGIC.len() as u64 + 1;
 
+/// How a checked file can be reached for platform identity queries.
+///
+/// Every call site holds either the retained descriptor or the public pathname.
+/// Windows exposes neither the file identity nor the hard-link count through
+/// `Metadata` on stable (the accessors sit behind the perpetually unstable
+/// `windows_by_handle` feature, rust-lang/rust#63010), so the source is threaded
+/// through to `GetFileInformationByHandle` instead of read off the metadata.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum TraceFileRef<'a> {
+    Handle(&'a File),
+    Path(&'a Path),
+}
+
+#[cfg(windows)]
+impl TraceFileRef<'_> {
+    fn windows_info(self) -> io::Result<ay_sys::windows_fs::WindowsFileInfo> {
+        match self {
+            Self::Handle(file) => ay_sys::windows_fs::file_info(file),
+            Self::Path(path) => ay_sys::windows_fs::file_info_no_follow(path),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecisionTraceFileIdentity {
     #[cfg(unix)]
@@ -41,36 +65,39 @@ struct DecisionTraceFileIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial_number: Option<u32>,
+    volume_serial_number: u32,
     #[cfg(windows)]
-    file_index: Option<u64>,
+    file_index: u64,
     #[cfg(not(any(unix, windows)))]
     created: Option<std::time::SystemTime>,
 }
 
 impl DecisionTraceFileIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
+    fn resolve(metadata: &Metadata, source: TraceFileRef<'_>) -> io::Result<Self> {
         #[cfg(unix)]
         {
+            let _ = source;
             use std::os::unix::fs::MetadataExt as _;
-            Self {
+            Ok(Self {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            }
+            })
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt as _;
-            Self {
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
-            }
+            let _ = metadata;
+            let info = source.windows_info()?;
+            Ok(Self {
+                volume_serial_number: info.volume_serial_number,
+                file_index: info.file_index,
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Self {
+            let _ = source;
+            Ok(Self {
                 created: metadata.created().ok(),
-            }
+            })
         }
     }
 }
@@ -140,7 +167,11 @@ fn decision_trace_registry_error() -> io::Error {
     io::Error::other("decision-trace ownership registry is poisoned")
 }
 
-fn ensure_regular_single_link(metadata: &Metadata, path: &Path) -> io::Result<()> {
+fn ensure_regular_single_link(
+    metadata: &Metadata,
+    path: &Path,
+    source: TraceFileRef<'_>,
+) -> io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -152,6 +183,7 @@ fn ensure_regular_single_link(metadata: &Metadata, path: &Path) -> io::Result<()
     }
     #[cfg(unix)]
     {
+        let _ = source;
         use std::os::unix::fs::MetadataExt as _;
         if metadata.nlink() != 1 {
             return Err(io::Error::new(
@@ -166,16 +198,20 @@ fn ensure_regular_single_link(metadata: &Metadata, path: &Path) -> io::Result<()
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        if metadata.number_of_links().is_some_and(|links| links != 1) {
+        let links = source.windows_info()?.number_of_links;
+        if links != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "decision-trace output '{}' does not have exactly one hard link",
+                    "decision-trace output '{}' has {links} hard links; exactly one is required",
                     path.display()
                 ),
             ));
         }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = source;
     }
     Ok(())
 }
@@ -191,7 +227,7 @@ fn open_new_decision_trace(path: &Path) -> io::Result<File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    ensure_regular_single_link(&file.metadata()?, path)?;
+    ensure_regular_single_link(&file.metadata()?, path, TraceFileRef::Handle(&file))?;
     Ok(file)
 }
 
@@ -215,13 +251,13 @@ fn invalidate_failed_decision_trace_creation(path: &Path, file: &File) -> io::Re
         Err(error) => return Err(error),
     };
     let descriptor_metadata = file.metadata()?;
-    if DecisionTraceFileIdentity::from_metadata(&path_metadata)
-        != DecisionTraceFileIdentity::from_metadata(&descriptor_metadata)
+    if DecisionTraceFileIdentity::resolve(&path_metadata, TraceFileRef::Path(path))?
+        != DecisionTraceFileIdentity::resolve(&descriptor_metadata, TraceFileRef::Handle(file))?
     {
         return Ok(false);
     }
-    ensure_regular_single_link(&path_metadata, path)?;
-    ensure_regular_single_link(&descriptor_metadata, path)?;
+    ensure_regular_single_link(&path_metadata, path, TraceFileRef::Path(path))?;
+    ensure_regular_single_link(&descriptor_metadata, path, TraceFileRef::Handle(file))?;
     if path_metadata.len() != 0 || descriptor_metadata.len() != 0 {
         return Err(io::Error::other(format!(
             "failed decision-trace output '{}' was not fully invalidated",
@@ -251,16 +287,28 @@ fn create_initialized_decision_trace(path: &Path) -> io::Result<File> {
 fn validate_reserved_path(reserved: &ReservedDecisionTrace) -> io::Result<()> {
     let path_metadata = std::fs::symlink_metadata(&reserved.path)?;
     let descriptor_metadata = reserved.file.metadata()?;
-    let path_identity = DecisionTraceFileIdentity::from_metadata(&path_metadata);
-    let descriptor_identity = DecisionTraceFileIdentity::from_metadata(&descriptor_metadata);
+    let path_identity =
+        DecisionTraceFileIdentity::resolve(&path_metadata, TraceFileRef::Path(&reserved.path))?;
+    let descriptor_identity = DecisionTraceFileIdentity::resolve(
+        &descriptor_metadata,
+        TraceFileRef::Handle(&reserved.file),
+    )?;
     if path_identity != reserved.identity || descriptor_identity != reserved.identity {
         return Err(io::Error::other(format!(
             "decision-trace output '{}' was replaced after this run reserved it",
             reserved.path.display()
         )));
     }
-    ensure_regular_single_link(&path_metadata, &reserved.path)?;
-    ensure_regular_single_link(&descriptor_metadata, &reserved.path)?;
+    ensure_regular_single_link(
+        &path_metadata,
+        &reserved.path,
+        TraceFileRef::Path(&reserved.path),
+    )?;
+    ensure_regular_single_link(
+        &descriptor_metadata,
+        &reserved.path,
+        TraceFileRef::Handle(&reserved.file),
+    )?;
     Ok(())
 }
 
@@ -282,11 +330,12 @@ pub fn reserve_decision_trace(path: &str) -> io::Result<()> {
     }
     let file = create_initialized_decision_trace(&path)?;
     let metadata = file.metadata()?;
-    ensure_regular_single_link(&metadata, &path)?;
+    ensure_regular_single_link(&metadata, &path, TraceFileRef::Handle(&file))?;
+    let identity = DecisionTraceFileIdentity::resolve(&metadata, TraceFileRef::Handle(&file))?;
     *slot = Some(ReservedDecisionTrace {
         path,
         file,
-        identity: DecisionTraceFileIdentity::from_metadata(&metadata),
+        identity,
         claimed_by_solver: false,
     });
     Ok(())
@@ -1019,7 +1068,9 @@ fn read_reserved_terminal_outcome(
     identity: DecisionTraceFileIdentity,
 ) -> io::Result<Option<SolveOutcome>> {
     let (file, opened_metadata) = open_replay_file(path, REPLAY_LIMITS)?;
-    if DecisionTraceFileIdentity::from_metadata(&opened_metadata) != identity {
+    if DecisionTraceFileIdentity::resolve(&opened_metadata, TraceFileRef::Handle(&file))?
+        != identity
+    {
         return Err(io::Error::other(format!(
             "decision-trace output '{}' no longer names the file reserved by this run",
             path.display()
@@ -1032,21 +1083,24 @@ fn read_reserved_terminal_outcome(
     };
     let final_metadata = bounded.inner.metadata()?;
     ensure_regular_replay_file(&final_metadata, "after reserved-trace read")?;
-    ensure_regular_single_link(&final_metadata, path)?;
+    ensure_regular_single_link(&final_metadata, path, TraceFileRef::Handle(&bounded.inner))?;
     ensure_same_replay_file(
         &opened_metadata,
         &final_metadata,
         "while reading the reserved trace",
     )?;
-    if DecisionTraceFileIdentity::from_metadata(&final_metadata) != identity {
+    if DecisionTraceFileIdentity::resolve(&final_metadata, TraceFileRef::Handle(&bounded.inner))?
+        != identity
+    {
         return Err(io::Error::other(format!(
             "decision-trace output '{}' changed identity while it was validated",
             path.display()
         )));
     }
     let visible_metadata = std::fs::symlink_metadata(path)?;
-    ensure_regular_single_link(&visible_metadata, path)?;
-    if DecisionTraceFileIdentity::from_metadata(&visible_metadata) != identity {
+    ensure_regular_single_link(&visible_metadata, path, TraceFileRef::Path(path))?;
+    if DecisionTraceFileIdentity::resolve(&visible_metadata, TraceFileRef::Path(path))? != identity
+    {
         return Err(io::Error::other(format!(
             "decision-trace output '{}' was replaced while it was validated",
             path.display()

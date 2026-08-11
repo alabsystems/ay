@@ -12,14 +12,36 @@
 //! kernel reformulation ([`crate::lattice::reformulate_kernel`]). All three
 //! produce a model whose rows and columns are NOT the caller's, so a
 //! certificate proved against the reduced model names facts the caller's model
-//! does not have. Today every `expand_*` function in `bab.rs` therefore STRIPS
-//! the certificate — which is safe (a verdict without evidence is still a
-//! verdict) but is a loss: `SolveOpts::tree_cert_leaves` defaults to 256, so
-//! the reductions are skipped entirely on default options and the caller gets
-//! neither the reduction nor a reduced-frame certificate.
+//! does not have. The `expand_*` functions in `bab.rs` therefore either LIFT the
+//! certificate through this module or STRIP it — stripping is safe (a verdict
+//! without evidence is still a verdict) but it is a loss.
 //!
-//! Translating the certificate instead is what lets a reduction and a
-//! certificate coexist. This module is the shared frame for doing that, plus
+//! HOW EACH REDUCTION RELATES TO THE CERTIFICATE LANE, exactly (the call site is
+//! `bab::solve_milp`, and this list has been wrong in comments before — read the
+//! gates, they are three consecutive `if`s):
+//!
+//! * NONE OF THE THREE is gated on `tree_cert_leaves` any more. KERNEL and DEDUP
+//!   used to be (`if opts.tree_cert_leaves == 0` and `if opts.tree_cert_leaves == 0
+//!   && dedup_enabled()`), and since that field defaults to 256 both were off on
+//!   default options — two reductions surrendered for an artifact only an
+//!   `Outcome::Infeasible` can carry. They now run unconditionally and the artifact
+//!   is bought where it is possible: `bab::harvest_tree_cert_by_resolve` re-solves
+//!   the CALLER's model once, with capture armed, on Infeasible + a declined lift.
+//! * The TREE still does not survive the round trip for either of them — the
+//!   kernel's splits are on `z` columns, which `TreeNode` cannot express at all
+//!   (there is deliberately no `KernelPostsolve::lift_tree_cert`), and a dedup tree
+//!   splits only KEPT columns, so [`DedupLift::lift_tree_cert`] closes a leaf only
+//!   in the rare case it leans on lower bounds. What changed is the response to
+//!   that: a re-solve instead of a forfeited reduction.
+//! * SINGLETON substitution never was gated on `tree_cert_leaves`. Its only gate is
+//!   `if singleton_sub_enabled()` (`AY_MILP_SINGLETON_SUB=1`, default OFF for a
+//!   measured search regression that has nothing to do with certificates). It runs
+//!   under ARMED capture and `expand_singleton_outcome` lifts the tree leaf by leaf,
+//!   stripping only on a decline — so it needs no re-solve.
+//!
+//! Translating the certificate is still the FIRST answer, and it is what lets a
+//! reduction and a certificate coexist with no second solve at all: every ROOT
+//! certificate lifts here. This module is the shared frame for doing that, plus
 //! the kernel reformulation's own lift. It is written so the singleton and
 //! dedup lifts can reuse every piece.
 //!
@@ -59,7 +81,11 @@ use num_traits::{One, Signed, Zero};
 use crate::cert::{BoundSide, FactRef, FarkasCertificate, Multiplier, OptimalityCertificate};
 use crate::lattice::{KernelPostsolve, KernelRowOrigin};
 use crate::model::{exact, Col, Model, Row, Sense};
-use crate::presolve::{SingletonPostsolve, SingletonRowOrigin};
+use crate::presolve::{
+    BinaryComplementPostsolve, BinaryComplementRowOrigin, BinaryComplementSide,
+    ObjectiveSingletonPostsolve, ObjectiveSingletonRecovery, ObjectiveSingletonSide,
+    SingletonPostsolve, SingletonRowOrigin,
+};
 use crate::tree_cert::{MilpInfeasibilityCertificate, TreeNode};
 
 /// Solve `Σ_i mu_i · rows[i] = rhs` EXACTLY over ℚ, or return `None`.
@@ -1211,6 +1237,461 @@ impl ReducedFrame for SingletonPostsolve {
 }
 
 // ---------------------------------------------------------------------------
+// Binary equivalence/complement substitution's lift.
+// ---------------------------------------------------------------------------
+
+impl BinaryComplementPostsolve {
+    /// Lift a reduced-frame contradiction through the exact affine binary map.
+    pub(crate) fn lift_farkas(
+        &self,
+        reduced: &FarkasCertificate,
+        original: &Model,
+    ) -> Option<FarkasCertificate> {
+        let want = vec![BigRational::zero(); self.n_orig];
+        let multipliers = self.lift_multipliers(&reduced.multipliers, original, &want, None)?;
+        seal_farkas(multipliers, original)
+    }
+
+    /// Lift a bound on the reduced objective to the caller's objective.
+    ///
+    /// Each complement substitution contributes `c_j` to `const_delta` and
+    /// `-c_j` to its representative's coefficient, so the caller's linear form
+    /// is the reduced one plus that exact constant.  The model objective offset
+    /// remains present on both models and is deliberately not added here.
+    pub(crate) fn lift_optimality(
+        &self,
+        reduced: &OptimalityCertificate,
+        original: &Model,
+    ) -> Option<OptimalityCertificate> {
+        if original.num_cols() != self.n_orig || reduced.sense != original.sense() {
+            return None;
+        }
+        let (induced, replayed_delta) = self.induced_objective(original)?;
+        if replayed_delta != self.const_delta || !claims_the_objective(&reduced.objective, &induced)
+        {
+            return None;
+        }
+        let want = optimality_target(original, reduced.sense);
+        let multipliers = self.lift_multipliers(&reduced.multipliers, original, &want, None)?;
+        seal_optimality(
+            reduced.sense,
+            model_objective(original),
+            &reduced.bound + &self.const_delta,
+            multipliers,
+            original,
+        )
+    }
+
+    /// Lift a whole branch-and-bound refutation.
+    ///
+    /// Every reduced integral column is a literal surviving caller column.  A
+    /// component representative remains binary with the same `[0,1]` box, so a
+    /// split on it is the same split in both frames.  Eliminated component
+    /// members are determined by equality rows and need no independent split.
+    pub(crate) fn lift_tree_cert(
+        &self,
+        reduced: &MilpInfeasibilityCertificate,
+        original: &Model,
+    ) -> Option<MilpInfeasibilityCertificate> {
+        if original.num_cols() != self.n_orig {
+            return None;
+        }
+        lift_tree(reduced, original, self)
+    }
+
+    /// Translate reduced facts back to their original row/column facts, then
+    /// repair the coefficient residual with the defining binary equalities.
+    ///
+    /// A folded row is not literally the original linear form: eliminated
+    /// columns have been replaced by `x` or `1-x`, and its bound has moved by
+    /// the same constant.  On the equality manifold the two facts are equal.
+    /// Consequently their coefficient difference lies in the row space of the
+    /// spanning forest of defining equalities.  [`solve_row_combination`] finds
+    /// those multipliers exactly, and the final verifier seal checks both the
+    /// coefficients and the constant against the caller's actual model.
+    fn lift_multipliers(
+        &self,
+        reduced: &[Multiplier],
+        original: &Model,
+        want: &[BigRational],
+        col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
+    ) -> Option<Vec<Multiplier>> {
+        if original.num_cols() != self.n_orig
+            || want.len() != self.n_orig
+            || self.map.len() != self.n_orig
+        {
+            return None;
+        }
+        let reverse = reverse_column_map(&self.map)?;
+        let mut base = Vec::with_capacity(reduced.len() + self.defining_rows.len());
+        for multiplier in reduced {
+            if !multiplier.coeff.is_positive() {
+                return None;
+            }
+            let fact = match multiplier.fact {
+                FactRef::RowBound { row, side } => {
+                    let BinaryComplementRowOrigin { lower, upper } =
+                        *self.row_origin.get(row.index())?;
+                    let origin = match side {
+                        BoundSide::Lower => lower?,
+                        BoundSide::Upper => upper?,
+                    };
+                    if origin.row >= original.num_rows() {
+                        return None;
+                    }
+                    FactRef::RowBound {
+                        row: Row(u32::try_from(origin.row).ok()?),
+                        side: match origin.side {
+                            BinaryComplementSide::Lower => BoundSide::Lower,
+                            BinaryComplementSide::Upper => BoundSide::Upper,
+                        },
+                    }
+                }
+                FactRef::ColBound { col, side } => {
+                    let original_col = *reverse.get(col.index())?;
+                    FactRef::ColBound {
+                        col: Col(u32::try_from(original_col).ok()?),
+                        side,
+                    }
+                }
+            };
+            base.push(Multiplier {
+                fact,
+                coeff: multiplier.coeff.clone(),
+            });
+        }
+
+        let (coefficients, _constant) = combination_over_bounded(&base, original, col_bounds)?;
+        let need = want
+            .iter()
+            .enumerate()
+            .map(|(j, target)| Some(target - coefficients.get(j)?))
+            .collect::<Option<Vec<_>>>()?;
+        if need.iter().all(Zero::is_zero) {
+            return Some(base);
+        }
+        let equalities = self.equality_matrix(original)?;
+        let repair = solve_row_combination(&equalities, &need)?;
+        let mut signed = SignedFacts::new();
+        for (&row, coefficient) in self.defining_rows.iter().zip(repair) {
+            signed.push(
+                FactRef::RowBound {
+                    row: Row(u32::try_from(row).ok()?),
+                    side: BoundSide::Lower,
+                },
+                coefficient,
+            );
+        }
+        base.extend(signed.into_multipliers(original)?);
+        Some(base)
+    }
+
+    /// Re-read the independent defining equations from the caller's model.
+    fn equality_matrix(&self, original: &Model) -> Option<Vec<Vec<BigRational>>> {
+        if self.defining_rows.len() != self.recover.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.defining_rows.len());
+        for &row_index in &self.defining_rows {
+            if row_index >= original.num_rows() {
+                return None;
+            }
+            let row = Row(u32::try_from(row_index).ok()?);
+            let (coeffs, lb, ub) = original.row(row);
+            if !lb.is_finite() || !ub.is_finite() {
+                return None;
+            }
+            if original.row_lb_exact(row_index, lb)? != original.row_ub_exact(row_index, ub)? {
+                return None;
+            }
+            let mut dense = vec![BigRational::zero(); self.n_orig];
+            for &(column, coefficient) in coeffs {
+                *dense.get_mut(column as usize)? +=
+                    original.row_coeff_exact(row_index, column, coefficient);
+            }
+            out.push(dense);
+        }
+        Some(out)
+    }
+
+    /// Replay the objective fold independently of the reduced model builder.
+    fn induced_objective(
+        &self,
+        original: &Model,
+    ) -> Option<(BTreeMap<u32, BigRational>, BigRational)> {
+        if original.num_cols() != self.n_orig {
+            return None;
+        }
+        let recovery: BTreeMap<usize, _> = self
+            .recover
+            .iter()
+            .map(|entry| (entry.col, entry))
+            .collect();
+        if recovery.len() != self.recover.len() {
+            return None;
+        }
+        let mut induced = BTreeMap::<u32, BigRational>::new();
+        let mut delta = BigRational::zero();
+        for j in 0..self.n_orig {
+            let coefficient = original.obj_coeff(Col(j as u32));
+            let coefficient = original.obj_coeff_exact_at(j as u32, coefficient);
+            if coefficient.is_zero() {
+                continue;
+            }
+            if let Some(reduced_col) = self.map.get(j).copied().flatten() {
+                *induced
+                    .entry(reduced_col.0)
+                    .or_insert_with(BigRational::zero) += coefficient;
+                continue;
+            }
+            let entry = *recovery.get(&j)?;
+            let representative = self.map.get(entry.representative).copied().flatten()?;
+            if entry.complement {
+                delta += &coefficient;
+                *induced
+                    .entry(representative.0)
+                    .or_insert_with(BigRational::zero) -= coefficient;
+            } else {
+                *induced
+                    .entry(representative.0)
+                    .or_insert_with(BigRational::zero) += coefficient;
+            }
+        }
+        induced.retain(|_, coefficient| !coefficient.is_zero());
+        Some((induced, delta))
+    }
+}
+
+impl ReducedFrame for BinaryComplementPostsolve {
+    fn original_col(&self, reduced: Col) -> Option<Col> {
+        let original = *reverse_column_map(&self.map)?.get(reduced.index())?;
+        Some(Col(u32::try_from(original).ok()?))
+    }
+
+    fn lift_leaf(
+        &self,
+        leaf: &FarkasCertificate,
+        original: &Model,
+        lb: &[Option<BigRational>],
+        ub: &[Option<BigRational>],
+    ) -> Option<FarkasCertificate> {
+        let want = vec![BigRational::zero(); self.n_orig];
+        let multipliers =
+            self.lift_multipliers(&leaf.multipliers, original, &want, Some((lb, ub)))?;
+        let certificate = FarkasCertificate { multipliers };
+        certificate.verify_with_col_bounds(original, lb, ub).ok()?;
+        Some(certificate)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Objective-driven continuous singleton substitution's lift.
+// ---------------------------------------------------------------------------
+
+impl ObjectiveSingletonPostsolve {
+    pub(crate) fn lift_farkas(
+        &self,
+        reduced: &FarkasCertificate,
+        original: &Model,
+    ) -> Option<FarkasCertificate> {
+        seal_farkas(
+            self.map_multipliers(&reduced.multipliers, original)?,
+            original,
+        )
+    }
+
+    pub(crate) fn lift_optimality(
+        &self,
+        reduced: &OptimalityCertificate,
+        original: &Model,
+    ) -> Option<OptimalityCertificate> {
+        if original.num_cols() != self.n_orig || reduced.sense != original.sense() {
+            return None;
+        }
+        let (induced, replayed_delta) = self.induced_objective(original)?;
+        if replayed_delta != self.const_delta || !claims_the_objective(&reduced.objective, &induced)
+        {
+            return None;
+        }
+        let mut multipliers = self.map_multipliers(&reduced.multipliers, original)?;
+        for recovery in &self.recover {
+            self.recovery_matches_original(recovery, original)?;
+            let signed_coefficient = match reduced.sense {
+                Sense::Minimize => recovery.objective_coeff.clone(),
+                Sense::Maximize => -&recovery.objective_coeff,
+            };
+            let oriented_a = match recovery.side {
+                ObjectiveSingletonSide::Lower => recovery.a.clone(),
+                ObjectiveSingletonSide::Upper => -&recovery.a,
+            };
+            let coefficient = signed_coefficient / oriented_a;
+            if !coefficient.is_positive() {
+                return None;
+            }
+            multipliers.push(Multiplier {
+                fact: FactRef::RowBound {
+                    row: Row(u32::try_from(recovery.row).ok()?),
+                    side: match recovery.side {
+                        ObjectiveSingletonSide::Lower => BoundSide::Lower,
+                        ObjectiveSingletonSide::Upper => BoundSide::Upper,
+                    },
+                },
+                coeff: coefficient,
+            });
+        }
+        seal_optimality(
+            reduced.sense,
+            model_objective(original),
+            &reduced.bound + &self.const_delta,
+            multipliers,
+            original,
+        )
+    }
+
+    pub(crate) fn lift_tree_cert(
+        &self,
+        reduced: &MilpInfeasibilityCertificate,
+        original: &Model,
+    ) -> Option<MilpInfeasibilityCertificate> {
+        if original.num_cols() != self.n_orig {
+            return None;
+        }
+        lift_tree(reduced, original, self)
+    }
+
+    fn map_multipliers(&self, reduced: &[Multiplier], original: &Model) -> Option<Vec<Multiplier>> {
+        if original.num_cols() != self.n_orig || self.map.len() != self.n_orig {
+            return None;
+        }
+        let reverse = reverse_column_map(&self.map)?;
+        reduced
+            .iter()
+            .map(|multiplier| {
+                if !multiplier.coeff.is_positive() {
+                    return None;
+                }
+                let fact = match multiplier.fact {
+                    FactRef::RowBound { row, side } => {
+                        let original_row = *self.row_origin.get(row.index())?;
+                        if original_row >= original.num_rows() {
+                            return None;
+                        }
+                        FactRef::RowBound {
+                            row: Row(u32::try_from(original_row).ok()?),
+                            side,
+                        }
+                    }
+                    FactRef::ColBound { col, side } => {
+                        let original_col = *reverse.get(col.index())?;
+                        FactRef::ColBound {
+                            col: Col(u32::try_from(original_col).ok()?),
+                            side,
+                        }
+                    }
+                };
+                Some(Multiplier {
+                    fact,
+                    coeff: multiplier.coeff.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn recovery_matches_original(
+        &self,
+        recovery: &ObjectiveSingletonRecovery,
+        original: &Model,
+    ) -> Option<()> {
+        if recovery.col >= self.n_orig || recovery.row >= original.num_rows() {
+            return None;
+        }
+        let row = Row(u32::try_from(recovery.row).ok()?);
+        let (coeffs, lower, upper) = original.row(row);
+        let bound = match recovery.side {
+            ObjectiveSingletonSide::Lower => original.row_lb_exact(recovery.row, lower),
+            ObjectiveSingletonSide::Upper => original.row_ub_exact(recovery.row, upper),
+        }?;
+        if bound != recovery.b {
+            return None;
+        }
+        let mut found = false;
+        let mut rest = Vec::with_capacity(coeffs.len().saturating_sub(1));
+        for &(column, coefficient) in coeffs {
+            let coefficient = original.row_coeff_exact(recovery.row, column, coefficient);
+            if column as usize == recovery.col {
+                if found || coefficient != recovery.a {
+                    return None;
+                }
+                found = true;
+            } else {
+                rest.push((column as usize, coefficient));
+            }
+        }
+        (found && rest == recovery.rest).then_some(())
+    }
+
+    fn induced_objective(
+        &self,
+        original: &Model,
+    ) -> Option<(BTreeMap<u32, BigRational>, BigRational)> {
+        if original.num_cols() != self.n_orig {
+            return None;
+        }
+        let mut objective = (0..self.n_orig)
+            .map(|j| {
+                let coefficient = original.obj_coeff(Col(j as u32));
+                original.obj_coeff_exact_at(j as u32, coefficient)
+            })
+            .collect::<Vec<_>>();
+        let mut delta = BigRational::zero();
+        for recovery in &self.recover {
+            self.recovery_matches_original(recovery, original)?;
+            let coefficient = objective.get(recovery.col)?.clone();
+            if coefficient != recovery.objective_coeff || recovery.a.is_zero() {
+                return None;
+            }
+            for (column, row_coefficient) in &recovery.rest {
+                *objective.get_mut(*column)? -= &(&coefficient * row_coefficient) / &recovery.a;
+            }
+            delta += &(&coefficient * &recovery.b) / &recovery.a;
+            *objective.get_mut(recovery.col)? = BigRational::zero();
+        }
+        let mut induced = BTreeMap::new();
+        for (original_col, coefficient) in objective.into_iter().enumerate() {
+            if coefficient.is_zero() {
+                continue;
+            }
+            let reduced_col = self.map.get(original_col).copied().flatten()?;
+            *induced
+                .entry(reduced_col.0)
+                .or_insert_with(BigRational::zero) += coefficient;
+        }
+        induced.retain(|_, coefficient| !coefficient.is_zero());
+        Some((induced, delta))
+    }
+}
+
+impl ReducedFrame for ObjectiveSingletonPostsolve {
+    fn original_col(&self, reduced: Col) -> Option<Col> {
+        let original = *reverse_column_map(&self.map)?.get(reduced.index())?;
+        Some(Col(u32::try_from(original).ok()?))
+    }
+
+    fn lift_leaf(
+        &self,
+        leaf: &FarkasCertificate,
+        original: &Model,
+        lb: &[Option<BigRational>],
+        ub: &[Option<BigRational>],
+    ) -> Option<FarkasCertificate> {
+        let multipliers = self.map_multipliers(&leaf.multipliers, original)?;
+        let certificate = FarkasCertificate { multipliers };
+        certificate.verify_with_col_bounds(original, lb, ub).ok()?;
+        Some(certificate)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The duplicate-column dedup's lift.
 // ---------------------------------------------------------------------------
 
@@ -1463,6 +1944,21 @@ mod tests {
     use super::*;
     use crate::lattice::reformulate_kernel;
 
+    /// THE ENVIRONMENT LOCK, TAKEN BY READERS. Every test below that runs a real
+    /// solve takes it, and none of them mutates the environment: `lock_env`
+    /// serialises WRITERS, and a solve is a READER of a couple of dozen `AY_*`
+    /// names — it samples them once, at `solve_milp_in` entry. Sibling tests in
+    /// this binary set knobs around their own solves and hold them for the
+    /// duration (`bab::tests::solve_node_capped` installs `AY_MILP_MAX_NODES`,
+    /// exactly as its doc says), so a solve that STARTS inside that window
+    /// inherits the cap and reports `Feasible { incumbent_only: true }` where the
+    /// test demanded `Optimal`. Observed live: seven tests in this module at
+    /// `--test-threads=4`, all with an intact fixture and a capped tree. Joining
+    /// the same lock puts readers and writers in one order.
+    fn solve_lock() -> std::sync::MutexGuard<'static, ()> {
+        ay_test_support::env::lock_env()
+    }
+
     fn int(v: i64) -> BigRational {
         BigRational::from(BigInt::from(v))
     }
@@ -1656,6 +2152,7 @@ mod tests {
 
     #[test]
     fn optimality_round_trips_and_its_bound_is_the_caller_frame_optimum() {
+        let _env = solve_lock();
         let original = optimal_model();
         let (reduced, post) = reformulate_kernel(&original).expect("the model is this shape");
         let cert = reduced_optimality(&reduced);
@@ -1705,6 +2202,7 @@ mod tests {
     /// verifies nowhere or, worse, a bound off by the offset.
     #[test]
     fn the_objective_offset_stays_out_of_the_lifted_bound() {
+        let _env = solve_lock();
         let mut original = optimal_model();
         original.set_objective_offset(7.0);
         let (reduced, post) = reformulate_kernel(&original).expect("the model is this shape");
@@ -1895,6 +2393,299 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Binary equivalence/complement substitution's lift.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binary_complement_farkas_round_trips_to_the_caller_frame() {
+        let mut original = Model::new();
+        let x = original.add_binary_col();
+        let y = original.add_binary_col();
+        original.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
+        original.add_row(2.0, f64::INFINITY, &[(y, 1.0)]);
+
+        let (reduced, post) = crate::presolve::substitute_binary_complements(&original)
+            .expect("the complement equation fires");
+        assert_eq!(reduced.num_cols(), 1);
+        assert_eq!(reduced.num_rows(), 1);
+        // y >= 2 becomes x <= -1 after canonical sign normalization.  Its
+        // upper side plus x's lower bound
+        // combines to the constant -1.
+        let certificate = FarkasCertificate {
+            multipliers: vec![
+                Multiplier {
+                    fact: FactRef::RowBound {
+                        row: Row(0),
+                        side: BoundSide::Upper,
+                    },
+                    coeff: BigRational::one(),
+                },
+                Multiplier {
+                    fact: FactRef::ColBound {
+                        col: Col(0),
+                        side: BoundSide::Lower,
+                    },
+                    coeff: BigRational::one(),
+                },
+            ],
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+        assert!(certificate.verify(&original).is_err());
+
+        let lifted = post
+            .lift_farkas(&certificate, &original)
+            .expect("the exact equality repair must lift");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        assert!(lifted.multipliers.iter().any(|multiplier| matches!(
+            multiplier.fact,
+            FactRef::RowBound {
+                row: Row(0),
+                side: BoundSide::Upper
+            }
+        )));
+    }
+
+    #[test]
+    fn binary_complement_optimality_lifts_the_folded_constant() {
+        let mut original = Model::new();
+        let x = original.add_binary_col();
+        let y = original.add_binary_col();
+        original.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
+        original.set_objective(&[(x, 3.0), (y, 5.0)], Sense::Minimize);
+
+        let (reduced, post) = crate::presolve::substitute_binary_complements(&original)
+            .expect("the complement equation fires");
+        assert_eq!(*post.const_delta(), int(5));
+        assert_eq!(reduced.obj_coeff(Col(0)), -2.0);
+        let certificate = OptimalityCertificate {
+            sense: Sense::Minimize,
+            objective: vec![(0, int(-2))],
+            bound: int(-2),
+            multipliers: vec![Multiplier {
+                fact: FactRef::ColBound {
+                    col: Col(0),
+                    side: BoundSide::Upper,
+                },
+                coeff: int(2),
+            }],
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+
+        let lifted = post
+            .lift_optimality(&certificate, &original)
+            .expect("objective and equality repair must lift");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        assert_eq!(lifted.bound, int(3));
+        assert_eq!(lifted.objective, vec![(0, int(3)), (1, int(5))]);
+    }
+
+    #[test]
+    fn binary_complement_tree_lifts_every_leaf_and_preserves_the_split() {
+        let mut original = Model::new();
+        let x = original.add_binary_col();
+        let y = original.add_binary_col();
+        original.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
+        original.add_row(0.5, 0.5, &[(y, 1.0)]);
+
+        let (reduced, post) = crate::presolve::substitute_binary_complements(&original)
+            .expect("the complement equation fires");
+        // y = 1-x and y = 1/2 become x = 1/2 after canonical sign
+        // normalization.  At x<=0 the row's lower side contradicts the branch
+        // upper bound; at x>=1 its upper side contradicts the branch lower.
+        let leaf = |row_side, col_side| TreeNode::Leaf {
+            farkas: FarkasCertificate {
+                multipliers: vec![
+                    Multiplier {
+                        fact: FactRef::RowBound {
+                            row: Row(0),
+                            side: row_side,
+                        },
+                        coeff: BigRational::one(),
+                    },
+                    Multiplier {
+                        fact: FactRef::ColBound {
+                            col: Col(0),
+                            side: col_side,
+                        },
+                        coeff: BigRational::one(),
+                    },
+                ],
+            },
+        };
+        let certificate = MilpInfeasibilityCertificate {
+            root: TreeNode::Split {
+                col: Col(0),
+                cut: BigRational::zero(),
+                lo: Box::new(leaf(BoundSide::Lower, BoundSide::Upper)),
+                hi: Box::new(leaf(BoundSide::Upper, BoundSide::Lower)),
+            },
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+
+        let lifted = post
+            .lift_tree_cert(&certificate, &original)
+            .expect("both leaves must lift and seal");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        let TreeNode::Split { col, cut, .. } = lifted.root else {
+            panic!("the split skeleton survives");
+        };
+        assert_eq!(col, x);
+        assert_eq!(cut, BigRational::zero());
+    }
+
+    // -----------------------------------------------------------------------
+    // Objective-driven continuous singleton substitution's lift.
+    // -----------------------------------------------------------------------
+
+    /// `aggregate` is removed first, exposing `slack` as the next objective
+    /// singleton.  The reduced proof `min t >= 5` must become the caller-frame
+    /// proof `min aggregate >= 2`, including both defining rows and the folded
+    /// constant `-3`.
+    #[test]
+    fn objective_singleton_optimality_lifts_defining_rows_and_constant() {
+        let mut original = Model::new();
+        let slack = original.add_col(0.0, f64::INFINITY);
+        let t = original.add_int_col(5.0, 10.0);
+        let aggregate = original.add_col(0.0, f64::INFINITY);
+        original.add_row(f64::NEG_INFINITY, 3.0, &[(t, 1.0), (slack, -1.0)]);
+        original.add_row(f64::NEG_INFINITY, 0.0, &[(slack, 1.0), (aggregate, -1.0)]);
+        original.set_objective(&[(aggregate, 1.0)], Sense::Minimize);
+
+        let (reduced, post) = crate::presolve::substitute_objective_singletons(&original)
+            .expect("both objective singletons eliminate");
+        assert_eq!((reduced.num_rows(), reduced.num_cols()), (0, 1));
+        assert_eq!(*post.const_delta(), int(-3));
+        let certificate = OptimalityCertificate {
+            sense: Sense::Minimize,
+            objective: vec![(0, int(1))],
+            bound: int(5),
+            multipliers: vec![Multiplier {
+                fact: FactRef::ColBound {
+                    col: Col(0),
+                    side: BoundSide::Lower,
+                },
+                coeff: BigRational::one(),
+            }],
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+        assert!(certificate.verify(&original).is_err());
+
+        let lifted = post
+            .lift_optimality(&certificate, &original)
+            .expect("both defining row facts reattach exactly");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        assert_eq!(lifted.bound, int(2));
+        assert_eq!(lifted.objective, vec![(aggregate.0, int(1))]);
+        for row in [Row(0), Row(1)] {
+            assert!(lifted.multipliers.iter().any(|multiplier| matches!(
+                multiplier.fact,
+                FactRef::RowBound {
+                    row: cited,
+                    side: BoundSide::Upper
+                } if cited == row
+            )));
+        }
+    }
+
+    #[test]
+    fn objective_singleton_farkas_maps_surviving_facts() {
+        let mut original = Model::new();
+        let slack = original.add_col(0.0, f64::INFINITY);
+        let t = original.add_int_col(5.0, 10.0);
+        let aggregate = original.add_col(0.0, f64::INFINITY);
+        original.add_row(f64::NEG_INFINITY, 3.0, &[(t, 1.0), (slack, -1.0)]);
+        original.add_row(f64::NEG_INFINITY, 0.0, &[(slack, 1.0), (aggregate, -1.0)]);
+        original.add_row(f64::NEG_INFINITY, 4.0, &[(t, 1.0)]);
+        original.set_objective(&[(aggregate, 1.0)], Sense::Minimize);
+
+        let (reduced, post) = crate::presolve::substitute_objective_singletons(&original)
+            .expect("objective singleton reduction fires");
+        let certificate = FarkasCertificate {
+            multipliers: vec![
+                Multiplier {
+                    fact: FactRef::RowBound {
+                        row: Row(0),
+                        side: BoundSide::Upper,
+                    },
+                    coeff: BigRational::one(),
+                },
+                Multiplier {
+                    fact: FactRef::ColBound {
+                        col: Col(0),
+                        side: BoundSide::Lower,
+                    },
+                    coeff: BigRational::one(),
+                },
+            ],
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+        let lifted = post
+            .lift_farkas(&certificate, &original)
+            .expect("surviving facts map back to the caller");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        assert!(lifted.multipliers.iter().any(|multiplier| matches!(
+            multiplier.fact,
+            FactRef::RowBound {
+                row: Row(2),
+                side: BoundSide::Upper
+            }
+        )));
+    }
+
+    #[test]
+    fn objective_singleton_tree_lifts_leaves_and_split() {
+        let mut original = Model::new();
+        let slack = original.add_col(0.0, f64::INFINITY);
+        let t = original.add_int_col(5.0, 10.0);
+        let aggregate = original.add_col(0.0, f64::INFINITY);
+        original.add_row(f64::NEG_INFINITY, 3.0, &[(t, 1.0), (slack, -1.0)]);
+        original.add_row(f64::NEG_INFINITY, 0.0, &[(slack, 1.0), (aggregate, -1.0)]);
+        original.add_row(5.5, 5.5, &[(t, 1.0)]);
+        original.set_objective(&[(aggregate, 1.0)], Sense::Minimize);
+
+        let (reduced, post) = crate::presolve::substitute_objective_singletons(&original)
+            .expect("objective singleton reduction fires");
+        let leaf = |row_side, col_side| TreeNode::Leaf {
+            farkas: FarkasCertificate {
+                multipliers: vec![
+                    Multiplier {
+                        fact: FactRef::RowBound {
+                            row: Row(0),
+                            side: row_side,
+                        },
+                        coeff: BigRational::one(),
+                    },
+                    Multiplier {
+                        fact: FactRef::ColBound {
+                            col: Col(0),
+                            side: col_side,
+                        },
+                        coeff: BigRational::one(),
+                    },
+                ],
+            },
+        };
+        let certificate = MilpInfeasibilityCertificate {
+            root: TreeNode::Split {
+                col: Col(0),
+                cut: int(5),
+                lo: Box::new(leaf(BoundSide::Lower, BoundSide::Upper)),
+                hi: Box::new(leaf(BoundSide::Upper, BoundSide::Lower)),
+            },
+        };
+        assert_eq!(certificate.verify(&reduced), Ok(()));
+        let lifted = post
+            .lift_tree_cert(&certificate, &original)
+            .expect("both leaves map and seal in the caller frame");
+        assert_eq!(lifted.verify(&original), Ok(()));
+        let TreeNode::Split { col, cut, .. } = lifted.root else {
+            panic!("the split skeleton survives");
+        };
+        assert_eq!(col, t);
+        assert_eq!(cut, int(5));
+    }
+
+    // -----------------------------------------------------------------------
     // The singleton-column substitution's lift.
     // -----------------------------------------------------------------------
 
@@ -2024,6 +2815,7 @@ mod tests {
 
     #[test]
     fn singleton_optimality_round_trips_and_carries_the_folded_constant() {
+        let _env = solve_lock();
         let original = singleton_optimal_model();
         let (reduced, post) =
             crate::presolve::substitute_singletons(&original).expect("x is an eligible singleton");
@@ -2089,6 +2881,7 @@ mod tests {
     /// them easy to confuse.
     #[test]
     fn the_singleton_offset_stays_out_of_the_lifted_bound() {
+        let _env = solve_lock();
         let mut original = singleton_optimal_model();
         original.set_objective_offset(7.0);
         let (reduced, post) = crate::presolve::substitute_singletons(&original).expect("eligible");
@@ -2399,6 +3192,7 @@ mod tests {
 
     #[test]
     fn singleton_tree_certificate_round_trips_from_the_reduced_frame() {
+        let _env = solve_lock();
         let original = singleton_case_split_model();
 
         let (reduced, post) =
@@ -2442,6 +3236,8 @@ mod tests {
     /// armed.
     #[test]
     fn a_capturing_solve_that_fires_the_substitution_returns_liftable_evidence() {
+        // Already holds the lock in its own right (it MUTATES the environment);
+        // `solve_lock` is the same mutex and must not be taken twice.
         let _env_lock = ay_test_support::env::lock_env();
         let _on = ay_test_support::env::ScopedEnvVar::set("AY_MILP_SINGLETON_SUB", "1");
 
@@ -2547,6 +3343,7 @@ mod tests {
 
     #[test]
     fn dedup_optimality_round_trips_and_reattaches_the_merged_cost() {
+        let _env = solve_lock();
         let original = dedup_model(1.0, 3.0, 5.0, (f64::NEG_INFINITY, 1.0));
         let (reduced, map) = crate::bab::dedup_columns(&original).expect("b0 and b1 merge");
         let kept = map[0].expect("b0 kept");
@@ -2609,6 +3406,7 @@ mod tests {
     /// identity for the claimed bound then fails.
     #[test]
     fn a_dedup_bound_that_is_false_in_the_callers_frame_cannot_be_lifted() {
+        let _env = solve_lock();
         let mut original = Model::new();
         let b0 = original.add_binary_col();
         let b1 = original.add_binary_col();

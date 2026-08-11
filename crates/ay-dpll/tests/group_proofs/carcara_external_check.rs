@@ -42,6 +42,114 @@ const QF_UF_UNSAT: &str = r#"
 (check-sat)
 "#;
 
+const QF_UF_COMPOSED_AUTHORED_ROOT_UNSAT: &str = r#"
+(set-logic QF_UF)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const z Int)
+(assert (not (=> (and (= x y) (= y z)) (= x z))))
+(check-sat)
+"#;
+
+const QF_LIA_COMPOSED_AUTHORED_ROOT_UNSAT: &str = r#"
+(set-logic QF_LIA)
+(declare-const x Int)
+(declare-const y Int)
+(assert (not (=> (and (= x 2) (= y 3)) (= (+ x y) 5))))
+(check-sat)
+"#;
+
+const QF_AUFLIA_COMPOSED_ROW2_ROOT_UNSAT: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int Int))
+(declare-const i Int)
+(declare-const j Int)
+(declare-const v Int)
+(assert
+  (not
+    (=> (not (= i j))
+        (= (select (store a i v) j) (select a j)))))
+(check-sat)
+"#;
+
+const QF_LIA_LINEAR_AND_FOLD_UNSAT: &str = r#"
+(set-logic QF_LIA)
+(declare-fun x0 () Int)
+(declare-fun x1 () Int)
+(assert (and (<= (+ (* 1 x0) (* (- 1) x0)) (- 1))
+             (<= (+ (* 1 x1) (* 0 x0)) 0)))
+(check-sat)
+"#;
+
+const QF_LIA_LITERAL_FALSE_UNSAT: &str = r#"
+(set-logic QF_LIA)
+(assert false)
+(check-sat)
+"#;
+
+const QF_LIA_MOD_ASSUMING_UNSAT: &str = r#"
+(set-logic QF_LIA)
+(declare-const x Int)
+(assert (= (mod x 2) 0))
+(check-sat-assuming ((= (mod x 2) 1)))
+"#;
+
+// Carcara 1.1.0 does not expose `check-sat-assuming` literals as original
+// premises to its Alethe checker.  Replay the same active query scope as
+// assertions so the independent checker can authenticate every `assume`
+// command emitted for the query.  AY still produces the proof from the
+// `check-sat-assuming` problem above, so this does not weaken its per-query
+// authority boundary.
+const QF_LIA_MOD_ASSUMING_CARCARA_SCOPE: &str = r#"
+(set-logic QF_LIA)
+(declare-const x Int)
+(assert (= (mod x 2) 0))
+(assert (= (mod x 2) 1))
+(check-sat)
+"#;
+
+const QF_AUFLIA_LINEAR_ASSUMING_UNSAT: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int Int))
+(declare-const x Int)
+(assert (= (select a 0) x))
+(check-sat-assuming ((> x 0) (<= (select a 0) 0)))
+"#;
+
+const QF_AUFLIA_LINEAR_ASSUMING_CARCARA_SCOPE: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int Int))
+(declare-const x Int)
+(assert (= (select a 0) x))
+(assert (< 0 x))
+(assert (<= (select a 0) 0))
+(check-sat)
+"#;
+
+const QF_LRA_GUARDED_SPLIT_UNSAT: &str = r#"
+(set-logic QF_LRA)
+(declare-const gate Bool)
+(declare-const x Real)
+(declare-const y Real)
+(declare-const z Real)
+(assert (= x 1.0))
+(assert (= y 0.0))
+(assert (= z 1.0))
+(assert (not gate))
+(assert (or gate (not (= (+ x y) z))))
+(check-sat)
+"#;
+
+const QF_LIA_LET_LINEAR_AND_FOLD_UNSAT: &str = r#"
+(set-logic QF_LIA)
+(declare-fun x0 () Int)
+(declare-fun x1 () Int)
+(assert (let ((?v_0 (* 1 x0)) (?v_1 (* (- 1) x0)))
+  (and (<= (+ ?v_0 ?v_1) (- 1))
+       (<= (+ (* 1 x1) (* 0 x0)) 0))))
+(check-sat)
+"#;
+
 const QF_LIA_UNSAT: &str = r#"
 (set-logic QF_LIA)
 (declare-const x Int)
@@ -60,6 +168,14 @@ const QF_UFLIA_UNSAT: &str = r#"
 (assert (= y 5))
 (assert (= (f x) 10))
 (assert (= (f y) 20))
+(check-sat)
+"#;
+
+const AUFLIA_EMATCHING_FORALL_EQUALITY_UNSAT: &str = r#"
+(set-logic AUFLIA)
+(declare-fun f (Int) Int)
+(assert (forall ((x Int)) (! (> (f x) 0) :pattern ((f x)))))
+(assert (= (f 7) (- 1)))
 (check-sat)
 "#;
 
@@ -266,6 +382,7 @@ fn run_carcara(carcara: &Path, label: &str, problem: &str, proof: &str) -> bool 
     // these as unchecked holes but still validates all other proof structure.
     let output = std::process::Command::new(carcara)
         .arg("check")
+        .arg("--expand-let-bindings")
         .args(["--allowed-rules", "trust", "--"])
         .arg(&proof_path)
         .arg(&problem_path)
@@ -330,6 +447,7 @@ fn run_carcara_trust_free(carcara: &Path, label: &str, problem: &str, proof: &st
 
     let output = std::process::Command::new(carcara)
         .arg("check")
+        .arg("--expand-let-bindings")
         .arg("--")
         .arg(&proof_path)
         .arg(&problem_path)
@@ -402,6 +520,101 @@ fn test_carcara_trust_free_qf_uf() {
         run_carcara_trust_free(&carcara, "trust_free_qf_uf", QF_UF_UNSAT, &proof),
         "QF_UF proof must be trust-free verifiable by carcara"
     );
+}
+
+/// The direct E-matching proof lane must agree with the independent Alethe
+/// checker, including authored-forall surface binding and Farkas literal order.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_auflia_ematching_forall_equality() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "trust_free_auflia_ematching_forall_equality";
+    let proof = solve_unsat_and_get_proof(AUFLIA_EMATCHING_FORALL_EQUALITY_UNSAT, label);
+    assert!(!proof.contains(":rule trust"), "{proof}");
+    assert!(proof.contains(":rule forall_inst"), "{proof}");
+    assert!(proof.contains(":rule la_generic"), "{proof}");
+    assert!(
+        run_carcara_trust_free(
+            &carcara,
+            label,
+            AUFLIA_EMATCHING_FORALL_EQUALITY_UNSAT,
+            &proof,
+        ),
+        "AUFLIA E-matching proof must be verified without allowed trust"
+    );
+}
+
+/// Exercise exact Clean composed roots and linear fold-to-false source roots
+/// through the independent Alethe checker so a locally strict proof cannot
+/// mask a surface mismatch.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_composed_authored_roots() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+
+    let cases = [
+        (
+            "trust_free_qf_uf_composed_authored_root",
+            QF_UF_COMPOSED_AUTHORED_ROOT_UNSAT,
+            QF_UF_COMPOSED_AUTHORED_ROOT_UNSAT,
+        ),
+        (
+            "trust_free_qf_lia_composed_authored_root",
+            QF_LIA_COMPOSED_AUTHORED_ROOT_UNSAT,
+            QF_LIA_COMPOSED_AUTHORED_ROOT_UNSAT,
+        ),
+        (
+            "trust_free_qf_auflia_composed_row2_root",
+            QF_AUFLIA_COMPOSED_ROW2_ROOT_UNSAT,
+            QF_AUFLIA_COMPOSED_ROW2_ROOT_UNSAT,
+        ),
+        (
+            "trust_free_qf_lia_linear_and_fold",
+            QF_LIA_LINEAR_AND_FOLD_UNSAT,
+            QF_LIA_LINEAR_AND_FOLD_UNSAT,
+        ),
+        (
+            "trust_free_qf_lia_literal_false",
+            QF_LIA_LITERAL_FALSE_UNSAT,
+            QF_LIA_LITERAL_FALSE_UNSAT,
+        ),
+        (
+            "trust_free_qf_lia_mod_assuming",
+            QF_LIA_MOD_ASSUMING_UNSAT,
+            QF_LIA_MOD_ASSUMING_CARCARA_SCOPE,
+        ),
+        (
+            "trust_free_qf_auflia_linear_assuming",
+            QF_AUFLIA_LINEAR_ASSUMING_UNSAT,
+            QF_AUFLIA_LINEAR_ASSUMING_CARCARA_SCOPE,
+        ),
+        (
+            "trust_free_qf_lra_guarded_split",
+            QF_LRA_GUARDED_SPLIT_UNSAT,
+            QF_LRA_GUARDED_SPLIT_UNSAT,
+        ),
+        (
+            "trust_free_qf_lia_let_linear_and_fold",
+            QF_LIA_LET_LINEAR_AND_FOLD_UNSAT,
+            QF_LIA_LET_LINEAR_AND_FOLD_UNSAT,
+        ),
+    ];
+
+    for (label, solver_problem, carcara_problem) in cases {
+        let proof = solve_unsat_and_get_proof(solver_problem, label);
+        assert!(
+            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+            "{label}: composed-root proof must not contain unchecked rules:\n{proof}"
+        );
+        assert!(
+            run_carcara_trust_free(&carcara, label, carcara_problem, &proof),
+            "{label}: composed-root proof must be trust-free verifiable by carcara"
+        );
+    }
 }
 
 /// The exact QF_ABV regression must remain self-contained: the authored nested
@@ -538,6 +751,7 @@ fn test_carcara_qf_lia_harder_binary_ilp_unsat_valid() {
 }
 
 #[test]
+#[timeout(60_000)]
 fn test_qf_lia_ring_exported_assumes_match_original_premises() {
     let problem = std::fs::read_to_string(
         workspace_root().join("benchmarks/smt/QF_LIA/ring_2exp4_3vars_0ite_unsat.smt2"),
@@ -558,6 +772,15 @@ fn test_qf_lia_ring_exported_assumes_match_original_premises() {
             original_assertions.contains(term),
             "exported assume term is not an original SMT-LIB premise: {term}\n\
              original premises: {original_assertions:?}\nproof:\n{proof}"
+        );
+    }
+
+    if let Some(carcara) = require_carcara_or_skip() {
+        verify_alethe_with_carcara(
+            &carcara,
+            "qf_lia_ring_composed_divisibility",
+            &problem,
+            &proof,
         );
     }
 }
@@ -654,30 +877,63 @@ fn test_carcara_trust_free_multi_equality_diseq_split() {
 // Benchmark corpus Alethe external validation
 // ============================================================================
 
-/// Per-benchmark timeout for solving (seconds).
-/// Some benchmarks (e.g., 20-variable branch-and-bound) are too slow in debug
-/// mode. Benchmarks that exceed this limit are skipped, not failed.
+/// Per-benchmark timeout for solving and independent oracle classification.
 const PER_BENCHMARK_TIMEOUT_SECS: u64 = 10;
-const ALLOWED_CORPUS_SKIPS: &[&str] = &[
+
+/// Files whose names contain `false_unsat` (plus the historical Hamiltonian
+/// canary) are SAT regression inputs, not UNSAT proof obligations.  They were
+/// previously counted as generic "skips", which blurred the denominator of
+/// the external-proof gate.  Every row is checked against Z3 below.
+const ORACLE_SAT_CORPUS_ROWS: &[&str] = &[
     "QF_LIA_false_unsat_20var_bb",
     "QF_LIA_false_unsat_disjunction_6205",
     "QF_LIA_false_unsat_implication_6206",
     "QF_LIA_false_unsat_step2_6207",
     "QF_LIA_mini_hamiltonian_unsat",
+    "regression_false_unsat_cegqi_entailed_inner_forall",
+    "regression_false_unsat_cegqi_entailed_inner_forall_nnf",
+    "regression_false_unsat_cegqi_entailed_inner_forall_or_not",
+    "regression_false_unsat_cegqi_entailed_inner_forall_witness",
+];
+
+/// Independently oracle-confirmed UNSAT rows whose exact proof surfaces are
+/// not yet supported.  These are NOT counted as proof parity.  The gate below
+/// requires AY to return fail-closed `unknown` for every one; SAT, timeout,
+/// execution failure, or an unchecked proof is a hard failure.
+const ORACLE_UNSAT_UNSUPPORTED_ROWS: &[&str] = &[
+    "QF_ABV_csplit_repro_100selects_unsat",
+    "QF_ABV_csplit_repro_indirect_store_unsat",
+    "QF_ABV_csplit_repro_many_trivial_selects_unsat",
+    "QF_ABV_csplit_repro_store_chain_unsat",
+    "QF_ABV_csplit_repro_unsat",
+    "QF_LIA_ring_2exp12_3vars_deep_unsat",
     "QF_LIA_ring_2exp16_5vars_cascade_unsat",
     "QF_LIA_ring_2exp16_5vars_cascade_v2_unsat",
+    "QF_LIA_ring_2exp8_5vars_modular_unsat",
     "QF_NIA_simple_product_unsat",
+    "QF_UFLIA_unsat_congruence_to_lia",
 ];
 
 struct CorpusVerificationSummary {
     verified: usize,
     rejected_labels: Vec<String>,
-    skipped_labels: Vec<String>,
+    oracle_sat_labels: Vec<String>,
+    unsupported_unsat_labels: Vec<String>,
 }
 
-/// Try to solve a benchmark with a timeout. Returns `None` if solving takes
-/// too long, the problem is SAT, or proof generation fails.
-fn try_solve_with_timeout(content: &str, label: &str) -> Option<String> {
+enum CorpusSolve {
+    CertifiedProof(String),
+    Sat,
+    Unknown,
+}
+
+/// Solve one corpus row under the mandatory strict proof boundary.
+///
+/// Timeout, parse/execution failure, malformed proof output, and any result
+/// other than exact SAT/UNSAT/UNKNOWN fail loudly.  In particular there is no
+/// generic "skip" bucket: callers must classify SAT and unsupported UNSAT rows
+/// against the independent oracle and the explicit lists above.
+fn solve_corpus_with_timeout(content: &str, label: &str) -> CorpusSolve {
     // Strip (exit) command if present — we need to append (get-proof) after (check-sat).
     let content = content
         .lines()
@@ -686,13 +942,7 @@ fn try_solve_with_timeout(content: &str, label: &str) -> Option<String> {
         .join("\n");
 
     let script = format!("(set-option :produce-proofs true)\n{content}\n(get-proof)\n");
-    let commands = match parse(&script) {
-        Ok(cmds) => cmds,
-        Err(e) => {
-            eprintln!("{label}: parse error (skipping): {e}");
-            return None;
-        }
-    };
+    let commands = parse(&script).unwrap_or_else(|e| panic!("{label}: parse error: {e}"));
 
     let mut exec = Executor::new();
     let interrupt = Arc::new(AtomicBool::new(false));
@@ -715,41 +965,50 @@ fn try_solve_with_timeout(content: &str, label: &str) -> Option<String> {
     let _ = timer.join();
 
     if timed_out {
-        eprintln!("{label}: solving timed out ({PER_BENCHMARK_TIMEOUT_SECS}s limit, skipping)");
-        return None;
+        panic!("{label}: solving timed out ({PER_BENCHMARK_TIMEOUT_SECS}s limit)");
     }
 
-    let outputs = match outputs {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("{label}: execution error (skipping): {e}");
-            return None;
-        }
-    };
+    let outputs = outputs.unwrap_or_else(|e| panic!("{label}: execution error: {e}"));
 
-    // Check for UNSAT result
     let first = outputs.first().map(String::as_str);
-    if first != Some("unsat") {
-        eprintln!("{label}: result is {first:?}, not unsat (skipping)");
-        return None;
+    match first {
+        Some("sat") => return CorpusSolve::Sat,
+        Some("unknown") => return CorpusSolve::Unknown,
+        Some("unsat") => {}
+        _ => panic!("{label}: unexpected result {first:?}"),
     }
 
-    if outputs.len() < 2 {
-        eprintln!("{label}: no proof output after UNSAT (skipping)");
-        return None;
-    }
+    assert!(outputs.len() >= 2, "{label}: no proof output after UNSAT");
 
-    let proof = outputs.last().cloned()?;
-    if proof.trim().is_empty() {
-        eprintln!("{label}: empty proof output (skipping)");
-        return None;
-    }
-    if !proof.contains("(assume ") && !proof.contains("(step ") {
-        eprintln!("{label}: proof lacks Alethe commands (skipping)");
-        return None;
-    }
+    let proof = outputs.last().cloned().expect("checked output length");
+    assert!(!proof.trim().is_empty(), "{label}: empty proof output");
+    assert!(
+        proof.contains("(assume ") || proof.contains("(step "),
+        "{label}: proof lacks Alethe commands"
+    );
 
-    Some(proof)
+    CorpusSolve::CertifiedProof(proof)
+}
+
+fn z3_oracle_status(path: &Path, label: &str) -> String {
+    let output = std::process::Command::new("z3")
+        .arg(format!("-T:{PER_BENCHMARK_TIMEOUT_SECS}"))
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("{label}: Z3 is required to classify non-proof corpus rows independently: {e}")
+        });
+    assert!(
+        output.status.success(),
+        "{label}: Z3 oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Collect all `*unsat*.smt2` files from `benchmarks/smt/` subdirectories.
@@ -796,7 +1055,8 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
     let mut summary = CorpusVerificationSummary {
         verified: 0,
         rejected_labels: Vec::new(),
-        skipped_labels: Vec::new(),
+        oracle_sat_labels: Vec::new(),
+        unsupported_unsat_labels: Vec::new(),
     };
 
     for path in smt2_files {
@@ -804,12 +1064,46 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
         let content = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 
-        match try_solve_with_timeout(&content, &label) {
-            Some(proof) if run_carcara(carcara, &label, &content, &proof) => {
+        match solve_corpus_with_timeout(&content, &label) {
+            CorpusSolve::CertifiedProof(proof)
+                if run_carcara(carcara, &label, &content, &proof) =>
+            {
                 summary.verified += 1;
             }
-            Some(_) => summary.rejected_labels.push(label),
-            None => summary.skipped_labels.push(label),
+            CorpusSolve::CertifiedProof(_) => summary.rejected_labels.push(label),
+            CorpusSolve::Sat => {
+                assert!(
+                    ORACLE_SAT_CORPUS_ROWS.contains(&label.as_str()),
+                    "{label}: AY returned SAT for a corpus row not classified as oracle-SAT"
+                );
+                assert_eq!(
+                    z3_oracle_status(path, &label),
+                    "sat",
+                    "{label}: independent oracle disagrees with SAT classification"
+                );
+                summary.oracle_sat_labels.push(label);
+            }
+            CorpusSolve::Unknown => {
+                if ORACLE_SAT_CORPUS_ROWS.contains(&label.as_str()) {
+                    assert_eq!(
+                        z3_oracle_status(path, &label),
+                        "sat",
+                        "{label}: independent oracle disagrees with SAT classification"
+                    );
+                    summary.oracle_sat_labels.push(label);
+                } else {
+                    assert!(
+                        ORACLE_UNSAT_UNSUPPORTED_ROWS.contains(&label.as_str()),
+                        "{label}: unexpected fail-closed UNKNOWN; add proof support or an explicit oracle-backed classification"
+                    );
+                    assert_eq!(
+                        z3_oracle_status(path, &label),
+                        "unsat",
+                        "{label}: independent oracle disagrees with unsupported-UNSAT classification"
+                    );
+                    summary.unsupported_unsat_labels.push(label);
+                }
+            }
         }
     }
 
@@ -818,17 +1112,22 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
 
 fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary) {
     let rejected = summary.rejected_labels.len();
-    let skipped = summary.skipped_labels.len();
+    let oracle_sat = summary.oracle_sat_labels.len();
+    let unsupported = summary.unsupported_unsat_labels.len();
     let verified = summary.verified;
 
     eprintln!(
-        "Carcara corpus: {verified}/{total} verified, {rejected} rejected, {skipped} skipped"
+        "Carcara corpus: {verified} proofs verified, {rejected} rejected, \
+         {unsupported} oracle-UNSAT fail-closed unsupported, {oracle_sat} oracle-SAT non-obligations"
     );
     for label in &summary.rejected_labels {
         eprintln!("  REJECTED: {label}");
     }
-    for label in &summary.skipped_labels {
-        eprintln!("  SKIPPED: {label}");
+    for label in &summary.unsupported_unsat_labels {
+        eprintln!("  UNSUPPORTED (oracle UNSAT, AY UNKNOWN): {label}");
+    }
+    for label in &summary.oracle_sat_labels {
+        eprintln!("  NOT A PROOF OBLIGATION (oracle SAT): {label}");
     }
 
     assert_eq!(
@@ -836,35 +1135,41 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
         "Carcara must not reject any UNSAT benchmark proof: {:?}",
         summary.rejected_labels
     );
-    assert!(
-        summary
-            .skipped_labels
-            .iter()
-            .all(|label| ALLOWED_CORPUS_SKIPS.contains(&label.as_str())),
-        "Unexpected skipped benchmarks in Carcara corpus: {:?} (allowed: {ALLOWED_CORPUS_SKIPS:?})",
-        summary.skipped_labels
+    let actual_sat: BTreeSet<&str> = summary
+        .oracle_sat_labels
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_sat: BTreeSet<&str> = ORACLE_SAT_CORPUS_ROWS.iter().copied().collect();
+    assert_eq!(
+        actual_sat, expected_sat,
+        "oracle-SAT corpus classification drifted"
     );
-    assert!(
-        skipped <= ALLOWED_CORPUS_SKIPS.len(),
-        "Too many skipped benchmarks in Carcara corpus: {skipped}/{total} (allowed: {ALLOWED_CORPUS_SKIPS:?})"
+    let actual_unsupported: BTreeSet<&str> = summary
+        .unsupported_unsat_labels
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_unsupported: BTreeSet<&str> =
+        ORACLE_UNSAT_UNSUPPORTED_ROWS.iter().copied().collect();
+    assert_eq!(
+        actual_unsupported, expected_unsupported,
+        "oracle-UNSAT unsupported corpus classification drifted"
     );
     assert_eq!(
-        verified + skipped,
+        verified + unsupported + oracle_sat,
         total,
-        "Each benchmark must be either externally verified or explicitly skipped with allowlist coverage"
-    );
-
-    let minimum_verified = total.saturating_sub(ALLOWED_CORPUS_SKIPS.len());
-    assert!(
-        verified >= minimum_verified,
-        "Expected broad Carcara coverage; verified too few benchmarks: {verified}/{total} (minimum required: {minimum_verified}, allowed skips: {ALLOWED_CORPUS_SKIPS:?})"
+        "every corpus row must be externally proof-verified or independently oracle-classified"
     );
 }
 
 /// Exhaustive Carcara validation for all UNSAT SMT benchmarks.
 ///
 /// Solves each benchmark with proof generation, validates with Carcara.
-/// Benchmarks that are SAT, fail, or timeout are skipped (not failed).
+/// Oracle-SAT filename matches are excluded from the proof denominator. Every
+/// oracle-UNSAT row must either have a Carcara-verified proof or return exact
+/// fail-closed UNKNOWN under the explicit unsupported list; there is no generic
+/// skip path.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]

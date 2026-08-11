@@ -87,6 +87,12 @@ fn smtlib_symbol(name: &str) -> Option<String> {
 ///   from `Z3_mk_datatype`, which declares it; `Int`/`Bool`/`(Array …)`/… are
 ///   primitive), so nothing is done.
 fn declare_sort_into_solver(ctx: &mut Z3Context, sort: &Sort) -> Result<(), String> {
+    // FiniteSet handles use a context-private uninterpreted identity only on
+    // the C surface. Textual `(FiniteSet T)` is a built-in public sort and
+    // must not be re-declared under that private implementation name.
+    if super::finite_set_basis(ctx, sort).is_some() {
+        return Ok(());
+    }
     if let Sort::Uninterpreted(name) = sort {
         let sym = smtlib_symbol(name).ok_or_else(|| {
             format!("uninterpreted sort name {name:?} cannot be represented in SMT-LIB")
@@ -254,14 +260,30 @@ pub unsafe extern "C" fn Z3_parser_context_add_decl(
                 .as_ref()
                 .map(super::SymbolKey::display_name)
                 .unwrap_or_else(|| decl.name().to_string());
-            // Ensure an arity>0 signature is present (idempotent; a no-op when
-            // `Z3_mk_func_decl` already declared it). Arity-0 constants are left
-            // as-is to avoid rebinding their term (see module docs).
-            if decl.arity() > 0 {
-                if let Err(e) = ctx
-                    .solver
+            // Ensure the signature is present. Exact public metadata upgrades
+            // an existing lowered alias without rebinding its engine identity,
+            // including arity-zero FiniteSet constants.
+            let public_signature = ctx.finite_set_decl_signatures.get(decl.name()).cloned();
+            let registration = if let Some((domain, range)) = public_signature {
+                let public_domain = domain
+                    .iter()
+                    .map(|sort| super::frontend_public_sort(ctx, sort))
+                    .collect();
+                let public_range = super::frontend_public_sort(ctx, &range);
+                ctx.solver.try_register_native_public_function_alias(
+                    &display_name,
+                    &decl,
+                    public_domain,
+                    public_range,
+                )
+            } else if decl.arity() > 0 {
+                ctx.solver
                     .try_register_native_function_alias(&display_name, &decl)
-                {
+            } else {
+                Ok(())
+            };
+            if decl.arity() > 0 || ctx.finite_set_decl_signatures.contains_key(decl.name()) {
+                if let Err(e) = registration {
                     ctx.last_error = Z3_EXCEPTION;
                     ctx.error_msg = Some(format!("Z3_parser_context_add_decl: {e}"));
                     return;

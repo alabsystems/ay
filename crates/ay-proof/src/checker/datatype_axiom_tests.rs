@@ -71,6 +71,7 @@ fn validate(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -307,6 +308,7 @@ fn validate_project(
         ctor_selectors,
         None,
         None,
+        None,
     )
 }
 
@@ -407,6 +409,220 @@ fn project_rejects_selector_over_non_constructor() {
     let err = validate_project(&terms, vec![lit], Some(&sels))
         .expect_err("selector over a non-constructor must be rejected");
     assert!(matches!(err, ProofCheckError::InvalidTheoryLemma { .. }));
+}
+
+// ---- Datatype tester evaluation (`DatatypeTesterEval`) validation ----
+
+fn tester(terms: &mut TermStore, ctor_name: &str, value: TermId) -> TermId {
+    terms.mk_app(
+        Symbol::named(format!("is-{ctor_name}")),
+        vec![value],
+        Sort::Bool,
+    )
+}
+
+fn validate_tester(
+    terms: &TermStore,
+    clause: Vec<TermId>,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+) -> Result<(), ProofCheckError> {
+    validate_tester_with_selectors(terms, clause, dt_decls, None)
+}
+
+fn validate_tester_with_selectors(
+    terms: &TermStore,
+    clause: Vec<TermId>,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+) -> Result<(), ProofCheckError> {
+    let step = ProofStep::TheoryLemma {
+        theory: "DT".to_string(),
+        clause,
+        farkas: None,
+        kind: TheoryLemmaKind::DatatypeTesterEval,
+        lia: None,
+    };
+    let mut derived = Vec::new();
+    validate_step_with_datatypes(
+        terms,
+        &mut derived,
+        ProofId(0),
+        &step,
+        true,
+        dt_decls,
+        ctor_selectors,
+        None,
+        None,
+        None,
+    )
+}
+
+#[test]
+fn tester_accepts_matching_positive_and_distinct_negative() {
+    let mut terms = TermStore::new();
+    let red = ctor(&mut terms, "red", "Color");
+    let green = ctor(&mut terms, "green", "Color");
+    let is_red_red = tester(&mut terms, "red", red);
+    let is_red_green = tester(&mut terms, "red", green);
+    let not_is_red_green = terms.mk_not_raw(is_red_green);
+    let decls = two_datatypes();
+
+    validate_tester(&terms, vec![is_red_red], Some(&decls))
+        .expect("a constructor's own tester must evaluate true");
+    validate_tester(&terms, vec![not_is_red_green], Some(&decls))
+        .expect("another constructor's tester must evaluate false");
+    assert!(recognize_datatype_tester_eval(
+        &terms,
+        &[is_red_red],
+        &decls
+    ));
+    assert!(recognize_datatype_tester_eval(
+        &terms,
+        &[not_is_red_green],
+        &decls
+    ));
+}
+
+#[test]
+fn tester_rejects_wrong_polarity_cross_datatype_and_missing_registry() {
+    let mut terms = TermStore::new();
+    let red = ctor(&mut terms, "red", "Color");
+    let green = ctor(&mut terms, "green", "Color");
+    let on = ctor(&mut terms, "on", "Light");
+    let wrong_positive = tester(&mut terms, "red", green);
+    let matching = tester(&mut terms, "red", red);
+    let wrong_negative = terms.mk_not_raw(matching);
+    let cross_datatype = tester(&mut terms, "red", on);
+    let decls = two_datatypes();
+
+    for forged in [wrong_positive, wrong_negative, cross_datatype] {
+        validate_tester(&terms, vec![forged], Some(&decls))
+            .expect_err("forged datatype tester evaluation must fail closed");
+        assert!(!recognize_datatype_tester_eval(&terms, &[forged], &decls));
+    }
+    validate_tester(&terms, vec![matching], None)
+        .expect_err("tester evaluation without declarations must fail closed");
+}
+
+#[test]
+fn tester_rejects_unregistered_head_and_non_constructor_argument() {
+    let mut terms = TermStore::new();
+    let red = ctor(&mut terms, "red", "Color");
+    let unregistered = tester(&mut terms, "purple", red);
+    let value = terms.mk_var("value", Sort::Uninterpreted("Color".to_string()));
+    let non_constructor = tester(&mut terms, "red", value);
+    let decls = two_datatypes();
+
+    validate_tester(&terms, vec![unregistered], Some(&decls))
+        .expect_err("an unregistered tester head must be rejected");
+    validate_tester(&terms, vec![non_constructor], Some(&decls))
+        .expect_err("a tester over a non-constructor is not a concrete evaluation theorem");
+}
+
+#[test]
+fn tester_accepts_symbolic_exclusion_and_exact_exhaustiveness() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("value", Sort::Uninterpreted("Color".to_string()));
+    let is_red = tester(&mut terms, "red", value);
+    let is_green = tester(&mut terms, "green", value);
+    let not_red = terms.mk_not_raw(is_red);
+    let not_green = terms.mk_not_raw(is_green);
+    let decls = vec![(
+        "Color".to_string(),
+        vec!["red".to_string(), "green".to_string()],
+    )];
+    let selectors = vec![
+        ("red".to_string(), Vec::new()),
+        ("green".to_string(), Vec::new()),
+    ];
+
+    validate_tester(&terms, vec![not_red, not_green], Some(&decls))
+        .expect("distinct constructor testers on one symbolic value are exclusive");
+    validate_tester(&terms, vec![is_red, is_green], Some(&decls))
+        .expect("all constructors of Color form an exhaustive tester clause");
+
+    let red = ctor(&mut terms, "red", "Color");
+    let value_is_red = eq(&mut terms, value, red);
+    validate_tester_with_selectors(
+        &terms,
+        vec![is_green, value_is_red],
+        Some(&decls),
+        Some(&selectors),
+    )
+    .expect("two-constructor exhaustiveness may name a nullary sibling by equality");
+}
+
+#[test]
+fn tester_symbolic_schemas_reject_forged_or_incomplete_clauses() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Uninterpreted("Color".to_string()));
+    let y = terms.mk_var("y", Sort::Uninterpreted("Color".to_string()));
+    let is_red_x = tester(&mut terms, "red", x);
+    let is_green_x = tester(&mut terms, "green", x);
+    let is_green_y = tester(&mut terms, "green", y);
+    let not_red_x = terms.mk_not_raw(is_red_x);
+    let not_green_y = terms.mk_not_raw(is_green_y);
+    let decls = two_datatypes();
+
+    validate_tester(&terms, vec![not_red_x, not_green_y], Some(&decls))
+        .expect_err("tester exclusion over different subjects is not a theorem");
+    validate_tester(&terms, vec![is_red_x], Some(&decls))
+        .expect_err("one symbolic tester does not exhaust a two-constructor datatype");
+
+    let mut three = decls.clone();
+    three[0].1.push("blue".to_string());
+    validate_tester(&terms, vec![is_red_x, is_green_x], Some(&three))
+        .expect_err("omitting a registered constructor must fail closed");
+
+    let wrong_sort = terms.mk_var("wrong", Sort::Uninterpreted("Light".to_string()));
+    let red_wrong = tester(&mut terms, "red", wrong_sort);
+    let green_wrong = tester(&mut terms, "green", wrong_sort);
+    let not_red_wrong = terms.mk_not_raw(red_wrong);
+    let not_green_wrong = terms.mk_not_raw(green_wrong);
+    validate_tester(&terms, vec![not_red_wrong, not_green_wrong], Some(&decls))
+        .expect_err("tester exclusion must authenticate the subject datatype sort");
+
+    let two = vec![(
+        "Color".to_string(),
+        vec!["red".to_string(), "green".to_string()],
+    )];
+    let selectors = vec![
+        ("red".to_string(), Vec::new()),
+        ("green".to_string(), Vec::new()),
+    ];
+    let payload = terms.mk_int(1.into());
+    let forged_non_nullary = terms.mk_app(
+        Symbol::named("red"),
+        vec![payload],
+        Sort::Uninterpreted("Color".to_string()),
+    );
+    let x_is_forged = eq(&mut terms, x, forged_non_nullary);
+    validate_tester_with_selectors(
+        &terms,
+        vec![is_green_x, x_is_forged],
+        Some(&two),
+        Some(&selectors),
+    )
+    .expect_err("a non-nullary constructor lookalike must not enter the nullary lane");
+
+    let red_ctor = ctor(&mut terms, "red", "Color");
+    let x_is_red = eq(&mut terms, x, red_ctor);
+    let forged_arity = vec![
+        ("red".to_string(), vec!["payload".to_string()]),
+        ("green".to_string(), Vec::new()),
+    ];
+    validate_tester_with_selectors(
+        &terms,
+        vec![is_green_x, x_is_red],
+        Some(&two),
+        Some(&forged_arity),
+    )
+    .expect_err(
+        "a syntactically nullary constructor must still match declaration-backed arity metadata",
+    );
+
+    validate_tester_with_selectors(&terms, vec![is_green_x, x_is_red], Some(&two), None)
+        .expect_err("nullary exhaustiveness without constructor arity metadata must fail closed");
 }
 
 #[test]

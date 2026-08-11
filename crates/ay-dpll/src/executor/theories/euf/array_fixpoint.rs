@@ -75,6 +75,22 @@ impl ArrayAxiomPlan {
 }
 
 impl Executor {
+    /// Whether the active assertion/assumption roots contain an explicit
+    /// symbolic array-default term.  Such terms require the carrier-sensitive
+    /// default fixpoint even when the BV path's select-count throttle would
+    /// otherwise skip general array saturation.
+    pub(in crate::executor) fn has_symbolic_array_default_in_roots(
+        &self,
+        extra_roots: &[TermId],
+    ) -> bool {
+        self.ctx
+            .assertions
+            .iter()
+            .chain(extra_roots)
+            .copied()
+            .any(|root| contains_symbolic_array_default(&self.ctx.terms, root))
+    }
+
     /// Solve using combined EUF + Arrays theory.
     ///
     /// Uses `solve_incremental_split_loop_pipeline!` with `eager_extension: true`
@@ -922,6 +938,7 @@ impl Executor {
             // coexist. See `add_array_default_congruence_axioms` for the
             // soundness argument.
             self.add_array_default_congruence_axioms();
+            self.add_array_default_store_axioms();
             let _assertions_before_ext = self.ctx.assertions.len();
             self.add_array_extensionality_axioms_up_to(fixpoint_start_terms);
             total_ext_axioms += self.ctx.assertions.len() - _assertions_before_ext;
@@ -1328,6 +1345,12 @@ impl Executor {
                 break;
             }
             let n = self.ctx.terms.len();
+            // Keep array-default propagation in the lightweight QF_AX/BV
+            // driver too.  In particular, equality aliases must expose a
+            // relevant `default(store(..))` before the carrier-sensitive store
+            // axioms can fire.
+            self.add_array_default_congruence_axioms();
+            self.add_array_default_store_axioms();
             self.add_store_value_congruence_axioms();
             self.add_store_other_side_congruence_axioms();
             self.add_store_disjunctive_index_axioms();

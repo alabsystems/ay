@@ -43,6 +43,57 @@ impl Solver {
         self.mark_empty_clause_with_hints_and_trace(hints, Vec::new());
     }
 
+    /// Emit and record the bounded backward producer's terminal empty clause.
+    ///
+    /// Unlike [`Self::mark_empty_clause_with_hints`], this always emits a new
+    /// terminal addition. Backward reconstruction may have appended reserved
+    /// learned steps after an earlier empty marker, so only this successful
+    /// addition is allowed to establish the terminal-proof flags.
+    pub(super) fn mark_empty_clause_with_bounded_prevalidated_hints(
+        &mut self,
+        hints: &[u64],
+        deadline: Option<ay_core::time::Instant>,
+    ) -> std::io::Result<()> {
+        assert!(
+            self.cold.solution_witness.is_none(),
+            "BUG: derived empty clause (UNSAT) but a satisfying assignment was configured"
+        );
+
+        if !self.has_empty_clause {
+            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
+        }
+        self.has_empty_clause = true;
+
+        // A stale marker must not license UNSAT if this new terminal write
+        // fails after bounded learned steps have already been appended.
+        self.cold.empty_clause_in_proof = false;
+        self.cold.empty_clause_lrat_id = None;
+        let added_before = self
+            .proof_manager
+            .as_ref()
+            .map_or(0, ProofManager::added_count);
+        let clause_id = self.proof_emit_bounded_terminal_rup(hints, deadline)?;
+        let added_after = self
+            .proof_manager
+            .as_ref()
+            .map_or(added_before, ProofManager::added_count);
+        if clause_id == 0 || added_after != added_before.saturating_add(1) {
+            return Err(std::io::Error::other(
+                "bounded terminal LRAT addition was not recorded",
+            ));
+        }
+
+        self.cold.empty_clause_in_proof = true;
+        self.cold.empty_clause_lrat_id = Some(clause_id);
+        if self.cold.next_clause_id <= clause_id {
+            self.cold.next_clause_id = clause_id + 1;
+        }
+        if let Some(ref mut trace) = self.cold.clause_trace {
+            trace.add_clause_with_hints(clause_id, Vec::new(), false, Vec::new());
+        }
+        Ok(())
+    }
+
     /// Mark empty clause with both LRAT proof hints and clause-trace resolution
     /// hints attached atomically (#4435).
     pub(super) fn mark_empty_clause_with_hints_and_trace(
@@ -50,6 +101,11 @@ impl Solver {
         hints: &[u64],
         trace_hints: Vec<u64>,
     ) {
+        if self.cold.backward_proof_limits.is_some() {
+            self.mark_empty_clause_deferred_for_bounded_proof();
+            return;
+        }
+
         // Solution-guided debugging (#4615): if a known satisfying assignment
         // exists, deriving the empty clause is a soundness bug. CaDiCaL parity:
         // check_no_solution_after_learning_empty_clause.
@@ -137,6 +193,19 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// Record semantic UNSAT while deferring every proof/trace allocation to
+    /// bounded postsolve reconstruction.
+    pub(super) fn mark_empty_clause_deferred_for_bounded_proof(&mut self) {
+        assert!(
+            self.cold.solution_witness.is_none(),
+            "BUG: derived empty clause (UNSAT) but a satisfying assignment was configured"
+        );
+        if !self.has_empty_clause {
+            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
+        }
+        self.has_empty_clause = true;
     }
 
     /// Mark that an empty clause was derived (UNSAT) with no resolution hints.
@@ -237,7 +306,20 @@ impl Solver {
         }
 
         if self.cold.lrat_enabled {
-            self.mark_empty_clause_with_hints(&[clause_id]);
+            if let Some(deadline) = self
+                .cold
+                .backward_proof_limits
+                .as_ref()
+                .map(|limits| limits.deadline)
+            {
+                // This one-ID derivation is producer-prevalidated and already
+                // fully bounded. Emit it now because an original empty clause
+                // has no arena seed for postsolve reconstruction.
+                let _ =
+                    self.mark_empty_clause_with_bounded_prevalidated_hints(&[clause_id], deadline);
+            } else {
+                self.mark_empty_clause_with_hints(&[clause_id]);
+            }
         } else {
             self.mark_empty_clause();
         }

@@ -816,8 +816,11 @@ fn is_declaration_command(command: &Command) -> bool {
         command,
         Command::SetLogic(_)
             | Command::SetOption(_, _)
+            | Command::SetOptionAttribute(_)
             | Command::SetInfo(_, _)
+            | Command::SetInfoAttribute(_)
             | Command::DeclareSort(_, _)
+            | Command::DeclareSortParameter(_)
             | Command::DefineSort(_, _, _)
             | Command::DeclareDatatype(_, _)
             | Command::DeclareDatatypes(_, _)

@@ -15,6 +15,19 @@ fn rat(n: i64, d: i64) -> BigRational {
     BigRational::new(n.into(), d.into())
 }
 
+/// Options that pin the solve on NATIVE branch-and-bound, so the LP-relaxation
+/// Farkas lane this file is about is the lane that answers.
+///
+/// The exact structure-recognition routes settle these small binary models
+/// before an LP relaxation is built, refuting them with a PB decision DAG
+/// instead. That artifact is independently replayable and is tamper-tested per
+/// format in `tests/cert_io.rs` section (b2); what it is NOT is a
+/// `FarkasCertificate` on the `Outcome`. A test that asserts a Farkas must ask
+/// for the lane that makes one.
+fn native_opts() -> SolveOpts {
+    SolveOpts::new().with_structure_routing(false)
+}
+
 #[test]
 fn binary_feasibility_finds_witness() {
     let mut m = Model::new();
@@ -60,11 +73,29 @@ fn binary_lp_infeasibility_certified() {
     let y = m.add_binary_col();
     m.add_row(2.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
     m.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
-    let mut s = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    let mut s = BabSession::new(m.clone(), &native_opts()).unwrap();
     match s.check().unwrap() {
         Outcome::Infeasible { cert, .. } => {
             let cert = cert.expect("LP-relaxation conflict must be certified");
             cert.verify(&m).unwrap();
+        }
+        other => panic!("expected Infeasible, got {other:?}"),
+    }
+
+    // ... and under the SHIPPED default, where a routed lane owns it, the
+    // verdict must still arrive with evidence that replays against this model.
+    let mut routed = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    match routed.check().unwrap() {
+        Outcome::Infeasible { cert, tree_cert } => {
+            let on_outcome = cert.is_some() || tree_cert.is_some();
+            let on_session = routed.single_row_dp_infeasibility_certificate().is_some()
+                || routed.multi_row_bdd_infeasibility_certificate().is_some();
+            assert!(
+                on_outcome || on_session,
+                "the default posture returned a bare Infeasible: no Farkas, no \
+                 tree, no typed exact-reduction artifact. Nothing re-checks such \
+                 a verdict at the session boundary."
+            );
         }
         other => panic!("expected Infeasible, got {other:?}"),
     }
@@ -96,8 +127,23 @@ fn integer_infeasibility_reports_honestly_uncertified() {
     }
 }
 
-/// The same model under `require_certificates` degrades to Unknown —
-/// fail-closed, never a bare verdict when evidence was demanded.
+/// FAIL-CLOSED: under `require_certificates` a caller never receives a bare
+/// verdict. Either the verdict is withheld as `Unknown(CertificateUnavailable)`,
+/// or it arrives WITH evidence that replays against the caller's own model.
+///
+/// The original form of this test pinned the first branch only, because
+/// `x + y = 1/2` over binaries had no exportable proof at all. It does now —
+/// the single-row DP route refutes it succinctly and `ay-milp verify` exits 0 —
+/// so demanding `Unknown` here would demand that the engine THROW AWAY a real
+/// proof, which is strictly worse than the behaviour the test was written to
+/// protect.
+///
+/// What must not be relaxed is the disjunction itself. Widening this to
+/// `matches!(out, Outcome::Infeasible { .. })` would delete the guarantee at
+/// exactly the moment `Outcome` lost the ability to express it: `Infeasible`
+/// carries `cert`/`tree_cert` and nothing else, so a supplementally-proved
+/// verdict and a bare one are the same value. The proof lives on the session,
+/// and that is where this test looks.
 #[test]
 fn require_certificates_degrades_uncertified_verdicts() {
     let mut m = Model::new();
@@ -110,7 +156,111 @@ fn require_certificates_degrades_uncertified_verdicts() {
         Outcome::Unknown {
             reason: UnknownReason::CertificateUnavailable,
         } => {}
-        other => panic!("expected Unknown(CertificateUnavailable), got {other:?}"),
+        Outcome::Infeasible { cert, tree_cert } => {
+            let mut evidence = 0usize;
+            if let Some(cert) = &cert {
+                cert.verify(&m).expect("an admitted Farkas must replay");
+                evidence += 1;
+            }
+            if let Some(tree_cert) = &tree_cert {
+                tree_cert
+                    .verify(&m)
+                    .expect("an admitted tree cert must replay");
+                evidence += 1;
+            }
+            if let Some(artifact) = s.single_row_dp_infeasibility_certificate() {
+                ay_milp::verify_single_row_dp_infeasibility_certificate(&m, artifact)
+                    .expect("an admitted single-row DP artifact must replay");
+                evidence += 1;
+            }
+            if let Some(artifact) = s.multi_row_bdd_infeasibility_certificate() {
+                ay_milp::verify_multi_row_bdd_infeasibility_certificate(&m, artifact)
+                    .expect("an admitted multi-row BDD artifact must replay");
+                evidence += 1;
+            }
+            assert!(
+                evidence > 0,
+                "`require_certificates` admitted an INFEASIBLE with no \
+                 independently checkable evidence anywhere — that is the bare \
+                 verdict this test exists to forbid"
+            );
+        }
+        other => panic!(
+            "expected Unknown(CertificateUnavailable) or certified Infeasible, got {other:?}"
+        ),
+    }
+}
+
+/// The composed fail-closed invariant, over every infeasible shape this file
+/// builds and both routing postures: `require_certificates` must NEVER yield an
+/// `Infeasible` that no artifact backs.
+///
+/// The policy gate itself is proved directly by
+/// `session::certificate_policy_tests::full_policy_accepts_typed_side_refutations_only_when_named`
+/// (bare + `SupplementalProof::None` -> `Unknown(CertificateUnavailable)`).
+/// What THIS test adds is that no lane reaches the gate carrying a supplemental
+/// proof it did not earn — i.e. every early return that claims certificate
+/// posture really did publish a replayable artifact.
+///
+/// Deliberately does not assume any particular model is unprovable. Such a test
+/// goes vacuous the moment a new lane learns to prove the model, and then it
+/// asserts nothing while still looking like a fail-closed test.
+#[test]
+fn require_certificates_never_yields_an_unbacked_infeasible() {
+    let mut root_conflict = Model::new();
+    let a = root_conflict.add_binary_col();
+    let b = root_conflict.add_binary_col();
+    root_conflict.add_row(2.0, f64::INFINITY, &[(a, 1.0), (b, 1.0)]);
+    root_conflict.add_row(f64::NEG_INFINITY, 1.0, &[(a, 1.0), (b, 1.0)]);
+
+    let mut case_split = Model::new();
+    let c = case_split.add_binary_col();
+    let d = case_split.add_binary_col();
+    case_split.add_row(0.5, 0.5, &[(c, 1.0), (d, 1.0)]);
+
+    let mut inexact = Model::new();
+    let e = inexact.add_int_col(0.0, f64::INFINITY);
+    inexact.add_row(1.0, f64::INFINITY, &[(e, 0.1)]);
+    inexact.add_row(f64::NEG_INFINITY, 0.0, &[(e, 0.1)]);
+
+    for m in [root_conflict, case_split, inexact] {
+        for routing in [true, false] {
+            let opts = SolveOpts::new()
+                .with_require_certificates(true)
+                .with_structure_routing(routing);
+            let mut s = BabSession::new(m.clone(), &opts).unwrap();
+            let outcome = s.check().unwrap();
+            let Outcome::Infeasible { cert, tree_cert } = &outcome else {
+                continue; // Unknown / withheld is the other legal answer.
+            };
+            let mut backed = cert.is_some() || tree_cert.is_some();
+            if let Some(artifact) = s.single_row_dp_infeasibility_certificate() {
+                ay_milp::verify_single_row_dp_infeasibility_certificate(&m, artifact)
+                    .expect("a published single-row DP artifact must replay");
+                backed = true;
+            }
+            if let Some(artifact) = s.multi_row_bdd_infeasibility_certificate() {
+                ay_milp::verify_multi_row_bdd_infeasibility_certificate(&m, artifact)
+                    .expect("a published multi-row BDD artifact must replay");
+                backed = true;
+            }
+            if s.parity_infeasibility_certificate().is_some()
+                || s.hybrid_pb_lp_infeasibility_certificate().is_some()
+                || s.hybrid_integer_lift_infeasibility_certificate().is_some()
+                || s.network_design_infeasibility_certificate().is_some()
+                || s.open_domain_single_row_dp_infeasibility_certificate()
+                    .is_some()
+                || s.open_domain_multi_row_bdd_infeasibility_certificate()
+                    .is_some()
+            {
+                backed = true;
+            }
+            assert!(
+                backed,
+                "`require_certificates` returned an INFEASIBLE with no \
+                 independently checkable evidence (routing={routing}): {outcome:?}"
+            );
+        }
     }
 }
 
@@ -158,7 +308,9 @@ fn scoped_fix_col_partitions_and_restores() {
     let x = m.add_binary_col();
     let y = m.add_binary_col();
     m.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
-    let mut s = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    // The scoped conflict below is asserted to be Farkas-certifiable, which is
+    // a claim about the LP relaxation lane; see `native_opts`.
+    let mut s = BabSession::new(m.clone(), &native_opts()).unwrap();
 
     // Split x=0: y must be 1.
     s.push().unwrap();

@@ -132,6 +132,11 @@ pub struct EngineEconomics {
     cuts: Option<bool>,
     pump_restarts: Option<usize>,
     dive_max_pins: Option<usize>,
+    dual_fixing: Option<bool>,
+    kernel_reformulation: Option<bool>,
+    certificate_decoupling: Option<bool>,
+    feasibility_conflict: Option<bool>,
+    cold_root_lu: Option<bool>,
 }
 
 impl EngineEconomics {
@@ -290,6 +295,100 @@ impl EngineEconomics {
         self
     }
 
+    /// Run dual fixing by lock counting (`AY_MILP_NO_DUALFIX`).
+    ///
+    /// Default on for models with an identically-zero objective. This is a
+    /// **WLOG reduction, not a valid inequality**: it preserves the ANSWER, not
+    /// the feasible set ("if a solution exists, one exists with x_j at this
+    /// bound"). The UNSAT lane's tree certificate is bought back by re-solving
+    /// the caller's own model, so evidence survives — but a consumer that wants
+    /// the unreduced model proved directly turns it off here.
+    #[must_use]
+    pub fn with_dual_fixing(mut self, enabled: bool) -> Self {
+        self.dual_fixing = Some(enabled);
+        self
+    }
+
+    /// Run the AHL kernel reformulation (`AY_MILP_NO_KERNEL_REFORM`).
+    ///
+    /// Admits only the isolated shape. A consumer whose models could present an
+    /// equality block whose support is entirely integral, and who would rather
+    /// not rely on that gate, turns it off here.
+    #[must_use]
+    pub fn with_kernel_reformulation(mut self, enabled: bool) -> Self {
+        self.kernel_reformulation = Some(enabled);
+        self
+    }
+
+    /// Decouple root reductions from certificate capture
+    /// (`AY_MILP_NO_CERT_DECOUPLE`).
+    ///
+    /// Default on: reductions run even with capture armed, and the artifact is
+    /// harvested by re-solving the original model. Off restores the prior
+    /// coupling byte-identically — reductions are skipped whenever
+    /// [`SolveOpts::with_tree_cert_leaves`] is non-zero, which is the gate a
+    /// certificate-requiring consumer was implicitly relying on before.
+    #[must_use]
+    pub fn with_certificate_decoupling(mut self, enabled: bool) -> Self {
+        self.certificate_decoupling = Some(enabled);
+        self
+    }
+
+    /// Arm the zero-objective feasibility conflict class
+    /// (`AY_MILP_NO_FEAS_CONFLICT`).
+    ///
+    /// Default on. Nogood unit propagation, nogood-guided branching and VSIDS,
+    /// gated on the objective being identically zero rather than on model size.
+    /// Verdict-neutral search economics; measured 10.96x fewer nodes on that
+    /// class.
+    #[must_use]
+    pub fn with_feasibility_conflict(mut self, enabled: bool) -> Self {
+        self.feasibility_conflict = Some(enabled);
+        self
+    }
+
+    /// Route the COLD ROOT LP to the LU lane inside the measured row band
+    /// (`AY_MILP_NO_COLD_LU`).
+    ///
+    /// Default on for `m` in the band. Off restores the historical eta-file
+    /// cold root byte-for-byte. Verdict-neutral: it changes which optimal
+    /// vertex seeds the heuristic chain, and every exit is re-checked.
+    #[must_use]
+    pub fn with_cold_root_lu(mut self, enabled: bool) -> Self {
+        self.cold_root_lu = Some(enabled);
+        self
+    }
+
+    /// Whether dual fixing is explicitly configured for this solve.
+    #[must_use]
+    pub fn dual_fixing(&self) -> Option<bool> {
+        self.dual_fixing
+    }
+
+    /// Whether the kernel reformulation is explicitly configured.
+    #[must_use]
+    pub fn kernel_reformulation(&self) -> Option<bool> {
+        self.kernel_reformulation
+    }
+
+    /// Whether certificate decoupling is explicitly configured.
+    #[must_use]
+    pub fn certificate_decoupling(&self) -> Option<bool> {
+        self.certificate_decoupling
+    }
+
+    /// Whether the feasibility conflict class is explicitly configured.
+    #[must_use]
+    pub fn feasibility_conflict(&self) -> Option<bool> {
+        self.feasibility_conflict
+    }
+
+    /// Whether the cold-root LU band is explicitly configured.
+    #[must_use]
+    pub fn cold_root_lu(&self) -> Option<bool> {
+        self.cold_root_lu
+    }
+
     /// Whether the lattice detector is explicitly configured for this solve.
     #[must_use]
     pub fn lattice(&self) -> Option<bool> {
@@ -407,6 +506,21 @@ impl EngineEconomics {
         if let Some(v) = self.dive_max_pins {
             p = p.with(Knob::DiveMaxPins, Setting::Count(v));
         }
+        if let Some(v) = self.dual_fixing {
+            p = p.with(Knob::NoDualfix, Setting::Flag(!v));
+        }
+        if let Some(v) = self.kernel_reformulation {
+            p = p.with(Knob::NoKernelReform, Setting::Flag(!v));
+        }
+        if let Some(v) = self.certificate_decoupling {
+            p = p.with(Knob::NoCertDecouple, Setting::Flag(!v));
+        }
+        if let Some(v) = self.feasibility_conflict {
+            p = p.with(Knob::NoFeasConflict, Setting::Flag(!v));
+        }
+        if let Some(v) = self.cold_root_lu {
+            p = p.with(Knob::NoColdLu, Setting::Flag(!v));
+        }
         p
     }
 }
@@ -471,7 +585,9 @@ pub struct SolveOpts {
     /// exactly once under the solve's outer deadline. `None` disables the
     /// warm-only limit; it never extends the outer deadline.
     pub node_warm_time_limit: Option<Duration>,
-    /// Worker threads a session may use. Advice at L0 (single-threaded).
+    /// Worker threads a session may use. The exact PB optimization portfolio
+    /// consumes this budget when determinism is disabled; native branch-and-
+    /// bound remains single-threaded.
     pub threads: u32,
     /// When true (default), identical inputs give identical outcomes
     /// run-to-run.
@@ -484,13 +600,29 @@ pub struct SolveOpts {
     /// reported bare. Off by default: bare verdicts from the exact lanes are
     /// sound, just unevidenced.
     pub require_certificates: bool,
+    /// Admit the exact STRUCTURE-RECOGNITION routes (PB projection, direct
+    /// CNF, SAT/ReLU recovery, network design, open-domain, hybrid PB/LP) on
+    /// an ordinary native check. On by default.
+    ///
+    /// This exists so the native branch-and-bound lane — the only lane that
+    /// emits a root `FarkasCertificate` or a whole-tree
+    /// [`crate::MilpInfeasibilityCertificate`] — stays reachable and testable
+    /// on models a routed lane would otherwise claim first. Turning it off
+    /// never changes a verdict, only which engine (and therefore which proof
+    /// SHAPE) produces it. `AY_MILP_NO_STRUCTURE_ROUTE=1` forces it off
+    /// process-wide for A/B measurement.
+    pub structure_routing: bool,
     /// Bytes the branch-and-bound may RETAIN in its open node set (the
     /// dominant memory at scale: parked warm-start bases). Crossing half the
     /// budget stops new parked nodes from carrying warm hints; crossing the
     /// budget stops the frontier growing at all (depth-first from there, which
-    /// holds O(depth)). Running into the budget can cost time and can degrade
-    /// an exhausted search to `Feasible`/`Unknown` — never a wrong verdict.
-    /// `None` disables the guard.
+    /// holds O(depth)). The SAT/ReLU structure route also treats this as its
+    /// total logical plan-plus-proof envelope and declines before entering an
+    /// unmetered fallback. Allocator transients and SAT solver working state
+    /// still require the CLI/process RSS envelope documented by the harness.
+    /// Running into the budget can cost time and can degrade an exhausted
+    /// search to `Feasible`/`Unknown` — never a wrong verdict. `None` disables
+    /// these guards.
     pub memory_budget: Option<usize>,
     /// Leaf budget for capturing a whole-tree
     /// [`crate::MilpInfeasibilityCertificate`] on `Infeasible` verdicts from
@@ -517,6 +649,10 @@ pub struct SolveOpts {
     /// Per-solve search economics. Every field defaults to *no opinion*, so
     /// these options resolve exactly as they did before the carrier existed.
     pub(crate) engine: EngineEconomics,
+    /// Measurement-only fallback carrier for models rebuilt rather than
+    /// cloned during one top-level native MILP solve. Cleared when the
+    /// owning/nested `BabSession::check` returns.
+    pub(crate) ft_adoption_solve_latch: Option<crate::sepstat::FtAdoptionSolveLatch>,
 }
 
 impl Default for SolveOpts {
@@ -529,12 +665,14 @@ impl Default for SolveOpts {
             determinism: true,
             seed: 0,
             require_certificates: false,
+            structure_routing: true,
             memory_budget: Some(2 << 30), // 2 GiB
             tree_cert_leaves: 256,
             range_logical_triangular_crash: false,
             chain_distress_probe_iters: None,
             fixed_assignment_tree_warm_start: None,
             engine: EngineEconomics::new(),
+            ft_adoption_solve_latch: None,
         }
     }
 }
@@ -598,7 +736,21 @@ impl SolveOpts {
         self
     }
 
-    /// Set (or disable, with `None`) the open-set memory budget in bytes.
+    /// Admit or refuse the exact structure-recognition routes on an ordinary
+    /// native check.
+    ///
+    /// Refusing them pins the solve on native branch-and-bound, which is the
+    /// only lane that exports a root Farkas or a whole-tree case-split
+    /// certificate. Use it to test that lane directly, or to A/B a routed
+    /// answer against the general engine. See [`SolveOpts::structure_routing`].
+    #[must_use]
+    pub fn with_structure_routing(mut self, enabled: bool) -> Self {
+        self.structure_routing = enabled;
+        self
+    }
+
+    /// Set (or disable, with `None`) the open-set and routed logical memory
+    /// budget in bytes. See [`SolveOpts::memory_budget`].
     #[must_use]
     pub fn with_memory_budget(mut self, bytes: Option<usize>) -> Self {
         self.memory_budget = bytes;
@@ -707,6 +859,30 @@ impl SolveOpts {
     #[must_use]
     pub fn engine(&self) -> EngineEconomics {
         self.engine
+    }
+
+    pub(crate) fn ft_adoption_solve_latch(&self) -> Option<crate::sepstat::FtAdoptionSolveLatch> {
+        self.ft_adoption_solve_latch.clone()
+    }
+
+    pub(crate) fn set_ft_adoption_solve_latch(
+        &mut self,
+        latch: crate::sepstat::FtAdoptionSolveLatch,
+    ) {
+        self.ft_adoption_solve_latch = Some(latch);
+    }
+
+    #[must_use]
+    pub(crate) fn with_ft_adoption_solve_latch(
+        mut self,
+        latch: Option<crate::sepstat::FtAdoptionSolveLatch>,
+    ) -> Self {
+        self.ft_adoption_solve_latch = latch;
+        self
+    }
+
+    pub(crate) fn clear_ft_adoption_solve_latch(&mut self) {
+        self.ft_adoption_solve_latch = None;
     }
 
     /// The effective deadline as of `now`: the earlier of `deadline` and

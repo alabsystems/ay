@@ -39,14 +39,38 @@ use ay_dpll::api::Sort;
 
 use super::{
     alloc_sort, cache_string, ffi_count_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort, require_term_ast_or_return,
-    require_term_asts_or_return, term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG,
-    Z3_SORT_ERROR,
+    ffi_guard_ptr, ffi_guard_uint, finite_set_engine_public_sort, public_ast_sort, record_ast_sort,
+    require_term_ast_or_return, require_term_asts_or_return, term_to_ast, Z3Context, Z3_ast,
+    Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ============================================================================
 // Sets (modelled as Array<elem, Bool>, matching Z3)
 // ============================================================================
+
+fn legacy_set_sort(
+    ctx: &mut Z3Context,
+    operation: &str,
+    ast: Z3_ast,
+    term: ay_dpll::api::Term,
+) -> Option<(Sort, Sort)> {
+    let public = public_ast_sort(ctx, ast, term);
+    let Sort::Array(array) = &public else {
+        ctx.last_error = Z3_SORT_ERROR;
+        ctx.error_msg = Some(format!(
+            "{operation}: expected legacy (Set T)/(Array T Bool), got public sort {public}"
+        ));
+        return None;
+    };
+    if array.element_sort != Sort::Bool {
+        ctx.last_error = Z3_SORT_ERROR;
+        ctx.error_msg = Some(format!(
+            "{operation}: expected legacy (Set T)/(Array T Bool), got public sort {public}"
+        ));
+        return None;
+    }
+    Some((array.index_sort.clone(), public))
+}
 
 /// Create a set sort `(Set elem)`, i.e. the array sort `(Array elem Bool)`.
 ///
@@ -91,7 +115,8 @@ pub unsafe extern "C" fn Z3_mk_empty_set(c: Z3_context, domain: Z3_sort) -> Z3_a
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let f = ctx.solver.bool_const(false);
-            let t = ctx.solver.const_array(domain_sort.clone(), f);
+            let engine_domain = finite_set_engine_public_sort(ctx, &domain_sort);
+            let t = ctx.solver.const_array(engine_domain, f);
             let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::array(domain_sort.clone(), Sort::Bool));
             a
@@ -118,7 +143,8 @@ pub unsafe extern "C" fn Z3_mk_full_set(c: Z3_context, domain: Z3_sort) -> Z3_as
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let tt = ctx.solver.bool_const(true);
-            let t = ctx.solver.const_array(domain_sort.clone(), tt);
+            let engine_domain = finite_set_engine_public_sort(ctx, &domain_sort);
+            let t = ctx.solver.const_array(engine_domain, tt);
             let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::array(domain_sort.clone(), Sort::Bool));
             a
@@ -140,13 +166,20 @@ pub unsafe extern "C" fn Z3_mk_set_add(c: Z3_context, set: Z3_ast, elem: Z3_ast)
         ffi_guard_ast(c, |ctx| {
             let tt = ctx.solver.bool_const(true);
             let set_term = require_term_ast_or_return!(ctx, set, "Z3_mk_set_add", "set", 0);
-            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_add", "element", 0);
-            let t = ctx.solver.store(set_term, elem, tt);
-            let a = term_to_ast(ctx, t);
-            // The result is the same array (set) sort as the input set.
-            if let Some(sort) = lookup_ast_sort(ctx, set).cloned() {
-                record_ast_sort(ctx, a, sort);
+            let elem_term = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_add", "element", 0);
+            let Some((basis, set_sort)) = legacy_set_sort(ctx, "Z3_mk_set_add", set, set_term)
+            else {
+                return 0;
+            };
+            if public_ast_sort(ctx, elem, elem_term) != basis {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_set_add: element public sort differs from set basis".to_string());
+                return 0;
             }
+            let t = ctx.solver.store(set_term, elem_term, tt);
+            let a = term_to_ast(ctx, t);
+            record_ast_sort(ctx, a, set_sort);
             a
         })
     }
@@ -166,12 +199,20 @@ pub unsafe extern "C" fn Z3_mk_set_del(c: Z3_context, set: Z3_ast, elem: Z3_ast)
         ffi_guard_ast(c, |ctx| {
             let f = ctx.solver.bool_const(false);
             let set_term = require_term_ast_or_return!(ctx, set, "Z3_mk_set_del", "set", 0);
-            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_del", "element", 0);
-            let t = ctx.solver.store(set_term, elem, f);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, set).cloned() {
-                record_ast_sort(ctx, a, sort);
+            let elem_term = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_del", "element", 0);
+            let Some((basis, set_sort)) = legacy_set_sort(ctx, "Z3_mk_set_del", set, set_term)
+            else {
+                return 0;
+            };
+            if public_ast_sort(ctx, elem, elem_term) != basis {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg =
+                    Some("Z3_mk_set_del: element public sort differs from set basis".to_string());
+                return 0;
             }
+            let t = ctx.solver.store(set_term, elem_term, f);
+            let a = term_to_ast(ctx, t);
+            record_ast_sort(ctx, a, set_sort);
             a
         })
     }
@@ -189,9 +230,20 @@ pub unsafe extern "C" fn Z3_mk_set_member(c: Z3_context, elem: Z3_ast, set: Z3_a
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let set = require_term_ast_or_return!(ctx, set, "Z3_mk_set_member", "set", 0);
-            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_member", "element", 0);
-            let t = ctx.solver.select(set, elem);
+            let set_term = require_term_ast_or_return!(ctx, set, "Z3_mk_set_member", "set", 0);
+            let elem_term =
+                require_term_ast_or_return!(ctx, elem, "Z3_mk_set_member", "element", 0);
+            let Some((basis, _)) = legacy_set_sort(ctx, "Z3_mk_set_member", set, set_term) else {
+                return 0;
+            };
+            if public_ast_sort(ctx, elem, elem_term) != basis {
+                ctx.last_error = Z3_SORT_ERROR;
+                ctx.error_msg = Some(
+                    "Z3_mk_set_member: element public sort differs from set basis".to_string(),
+                );
+                return 0;
+            }
+            let t = ctx.solver.select(set_term, elem_term);
             let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
@@ -231,6 +283,9 @@ pub unsafe extern "C" fn Z3_mk_set_has_size(c: Z3_context, set: Z3_ast, k: Z3_as
             }
             let set_t = require_term_ast_or_return!(ctx, set, "Z3_mk_set_has_size", "set", 0);
             let k_t = require_term_ast_or_return!(ctx, k, "Z3_mk_set_has_size", "size", 0);
+            if legacy_set_sort(ctx, "Z3_mk_set_has_size", set, set_t).is_none() {
+                return 0;
+            }
             let set_sort = ctx.solver.sort_of(set_t);
             let Sort::Array(arr) = &set_sort else {
                 ctx.last_error = Z3_SORT_ERROR;
@@ -246,7 +301,7 @@ pub unsafe extern "C" fn Z3_mk_set_has_size(c: Z3_context, set: Z3_ast, k: Z3_as
                 ));
                 return 0;
             }
-            if ctx.solver.sort_of(k_t) != Sort::Int {
+            if public_ast_sort(ctx, k, k_t) != Sort::Int {
                 ctx.last_error = Z3_SORT_ERROR;
                 ctx.error_msg =
                     Some("Z3_mk_set_has_size: cardinality argument must be Int-sorted".to_string());

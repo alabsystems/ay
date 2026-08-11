@@ -484,6 +484,9 @@ impl Solver {
                 pre_scanned_search_binary_count = binary_count;
                 if let Some(conflict_ref) = binary_conflict {
                     self.flush_bcp_ticks::<MODE>(ticks);
+                    if MODE == bcp_mode::SEARCH {
+                        self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                    }
                     return Some(self.binary_conflict_finalize(conflict_ref, qhead_start));
                 }
                 if binary_count == watch_len {
@@ -1719,6 +1722,9 @@ impl Solver {
                     } else {
                         u32::MAX
                     };
+                    if MODE == bcp_mode::SEARCH {
+                        self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                    }
                     return Some(self.conflict_finalize(
                         false_lit,
                         clause_ref,
@@ -1835,11 +1841,17 @@ impl Solver {
             // during the binary watcher scan, finalize it now (#8043).
             if let Some(conflict_ref) = binary_conflict {
                 self.flush_bcp_ticks::<MODE>(ticks);
+                if MODE == bcp_mode::SEARCH {
+                    self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                }
                 return Some(self.binary_conflict_finalize(conflict_ref, qhead_start));
             }
         }
 
         self.num_propagations += (self.qhead - qhead_start) as u64;
+        if MODE == bcp_mode::SEARCH {
+            self.num_search_propagations += (self.qhead - qhead_start) as u64;
+        }
         self.flush_bcp_ticks::<MODE>(ticks);
         // Reason marks maintained incrementally by enqueue_bcp (#8100).
         self.no_conflict_until = self.trail.len();

@@ -230,6 +230,23 @@ fn out_of_fragment_set_filter_is_unknown() {
 }
 
 #[test]
+fn out_of_fragment_symbolic_set_range_is_unknown() {
+    let mut terms = TermStore::new();
+    let low = terms.mk_var("low", Sort::Int);
+    let high = terms.mk_var("high", Sort::Int);
+    let range = terms.mk_app(Symbol::named("set.range"), vec![low, high], set_sort());
+    let e = terms.mk_int(0.into());
+    let e_in_range = mk_member(&mut terms, e, range);
+
+    let mut solver = SetSolver::new(&terms);
+    solver.register_atom(e_in_range);
+    solver.assert_literal(e_in_range, true);
+
+    assert!(solver.is_out_of_fragment());
+    assert!(matches!(solver.check(), TheoryResult::Unknown));
+}
+
+#[test]
 fn out_of_fragment_complement_is_unknown() {
     // set.complement over an unbounded element domain is outside the fragment.
     let mut terms = TermStore::new();

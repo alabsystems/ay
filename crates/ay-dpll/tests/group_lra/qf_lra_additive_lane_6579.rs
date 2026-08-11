@@ -15,10 +15,10 @@
 //!
 //! Part of #6579.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use ay_dpll::{Executor, StatValue};
 use ay_frontend::parse;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// Compound-lane counter names exported by the LRA solver (#6579).
 const COMPOUND_STAT_KEYS: [&str; 4] = [
@@ -249,7 +249,17 @@ fn print_benchmark_stats(exec: &Executor, label: &str, rel_path: &str, result: &
 
 #[test]
 fn test_sc6_persistent_boundary_6579() {
-    let input = benchmark_input("benchmarks/smtcomp/QF_LRA/sc-6.induction3.cvc.smt2");
+    // `benchmarks/smtcomp/` is gitignored, so a clean checkout has no corpus.
+    // Skip when absent (same idiom as `test_measure_additive_lane_6579` below)
+    // rather than panicking in `benchmark_input`. Every assertion below is
+    // unchanged and still runs wherever the corpus is installed.
+    let rel_path = "benchmarks/smtcomp/QF_LRA/sc-6.induction3.cvc.smt2";
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if !repo_root.join(rel_path).exists() {
+        eprintln!("SKIP test_sc6_persistent_boundary_6579: corpus benchmark not found: {rel_path}");
+        return;
+    }
+    let input = benchmark_input(rel_path);
     let (exec, result) = solve_with_timeout_secs(&input, 30);
     let round_trips = int_stat(&exec, "dpll.round_trips");
     let simplex_sat = int_stat(&exec, "lra_simplex_sat");

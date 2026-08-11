@@ -17,7 +17,7 @@ use super::super::model::EvalValue;
 use super::super::Executor;
 use crate::cegqi::arith::ArithInstantiator;
 use crate::cegqi::CegqiInstantiator;
-use crate::executor_types::{Result, SolveResult, UnknownReason};
+use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use crate::logic_detection::LogicCategory;
 
@@ -67,7 +67,7 @@ impl Executor {
                     cegqi_state,
                 )
             {
-                self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+                self.record_unknown_from_origin(UnknownOrigin::CegqiRefinement);
                 return Some(Ok(SolveResult::Unknown));
             }
         }
@@ -146,7 +146,7 @@ impl Executor {
             return Some(result);
         }
 
-        self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+        self.record_unknown_from_origin(UnknownOrigin::CegqiRefinement);
         Some(Ok(SolveResult::Unknown))
     }
 

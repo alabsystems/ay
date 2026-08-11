@@ -618,17 +618,18 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     );
                                 match kind {
                                     ay_core::TheoryLemmaKind::Generic => {
-                                        let _ = $self.proof_tracker.add_theory_lemma(terms);
+                                        let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
                                     }
                                     _ => {
                                         let _ = $self
                                             .proof_tracker
-                                            .add_theory_lemma_with_kind(terms, kind);
+                                            .add_theory_lemma_with_kind(terms.clone(), kind);
                                     }
                                 }
                                 _islp_local_clausification_proofs.push(None);
                                 _islp_local_original_clause_theory_proofs.push(Some(
                                     ay_core::TheoryLemmaProof {
+                                        clause: terms,
                                         kind,
                                         farkas: None,
                                         lia: None,
@@ -817,17 +818,18 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                 );
                                             match kind {
                                                 ay_core::TheoryLemmaKind::Generic => {
-                                                    let _ = $self.proof_tracker.add_theory_lemma(terms);
+                                                    let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
                                                 }
                                                 _ => {
                                                     let _ = $self
                                                         .proof_tracker
-                                                        .add_theory_lemma_with_kind(terms, kind);
+                                                        .add_theory_lemma_with_kind(terms.clone(), kind);
                                                 }
                                             }
                                             _islp_local_clausification_proofs.push(None);
                                             _islp_local_original_clause_theory_proofs.push(Some(
                                                 ay_core::TheoryLemmaProof {
+                                                    clause: terms,
                                                     kind,
                                                     farkas: None,
                                                     lia: None,

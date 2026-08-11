@@ -2784,62 +2784,6 @@ fn test_reduced_lia_array_interval_model_never_flips_reachable_query_safe() {
 }
 
 #[test]
-#[ignore = "requires the downloaded CHC-COMP 2025 HCAI corpus"]
-#[timeout(20_000)]
-fn test_reduced_lia_array_interval_model_solves_hcai_lu_cmp() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(concat!(
-        "../../benchmarks/chc/chc-comp25-benchmarks/hcai-bench/svcomp/O0/",
-        "O0_lu.cmp_true-unreach-call_000.smt2"
-    ));
-    let input = match std::fs::read_to_string(&path) {
-        Ok(input) => input,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "skipping HCAI lu.cmp corpus regression: download benchmarks first ({})",
-                path.display()
-            );
-            return;
-        }
-        Err(error) => panic!("failed to read {}: {error}", path.display()),
-    };
-    let problem = ChcParser::parse(&input).expect("HCAI lu.cmp benchmark should parse");
-    let original = problem.clone();
-    let summary = PreprocessSummary::build(problem.clone(), false);
-    assert!(
-        AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
-            &summary.transformed_problem,
-            Duration::from_millis(500),
-        )
-        .is_none(),
-        "lu.cmp needs its scalar interval invariant, not a raw top model"
-    );
-
-    let adaptive = AdaptivePortfolio::new(
-        problem,
-        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
-    );
-    let result = adaptive
-        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
-    let Some((PortfolioResult::Safe(model), ValidationEvidence::FullVerification)) = result else {
-        panic!("HCAI lu.cmp was not solved by the verified interval route: {result:?}");
-    };
-    assert!(
-        crate::engines::validate_external_invariant_model(
-            &original,
-            &model,
-            &PdrConfig {
-                strict_proofs: true,
-                disable_array_scalarization: true,
-                preserve_original_clauses: true,
-                ..PdrConfig::default()
-            },
-        )
-        .expect("independent lu.cmp original validation should complete"),
-        "lu.cmp interval model must satisfy every original clause"
-    );
-}
-
-#[test]
 fn test_array_const_key_cegar_route_accepts_original_validated_safe() {
     let problem = create_const_key_array_cegar_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());

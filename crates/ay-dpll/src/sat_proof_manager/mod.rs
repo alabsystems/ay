@@ -36,10 +36,11 @@ pub(crate) struct SatProofManager<'a> {
     /// Term store for creating negations
     terms: &'a mut TermStore,
     /// Clausification proof annotations from Tseitin encoder (#6031).
-    /// Parallel to Tseitin clause order — the i-th original clause in the
-    /// trace corresponds to `clausification_proofs[i]`.
+    /// Parallel to original SAT clause IDs — clause ID `n` corresponds to
+    /// `clausification_proofs[n - 1]`, including reserved IDs for clauses the
+    /// SAT layer recognized as tautological and omitted from the trace.
     clausification_proofs: Option<&'a [Option<ClausificationProof>]>,
-    /// Original-clause theory proof annotations aligned by SAT trace order.
+    /// Original-clause theory proof annotations aligned by original clause ID.
     original_clause_theory_proofs: Option<&'a [Option<TheoryLemmaProof>]>,
     /// Theory lemma proof annotations (#6031 Phase 4).
     /// Keyed by normalized clause content (sorted TermIds) — when an original
@@ -49,6 +50,10 @@ pub(crate) struct SatProofManager<'a> {
     /// Number of learned clauses that fell back to Trust due to failed
     /// resolution hint reconstruction (#4585).
     trust_fallback_count: u32,
+    /// Trace entries dropped because `clause_to_terms` failed (introspection).
+    untranslatable_entries: u32,
+    unmapped_var_min: Option<u32>,
+    unmapped_var_max: Option<u32>,
     /// Remaining deterministic step budget for RUP replay (clause scans).
     /// `None` = unlimited. When it reaches `Some(0)`, `process_trace` bails
     /// out and returns `None` (best-effort synthesized-default certificates
@@ -87,6 +92,9 @@ impl<'a> SatProofManager<'a> {
             original_clause_theory_proofs: None,
             theory_lemma_proofs: None,
             trust_fallback_count: 0,
+            untranslatable_entries: 0,
+            unmapped_var_min: None,
+            unmapped_var_max: None,
             step_budget: None,
         }
     }
@@ -101,9 +109,18 @@ impl<'a> SatProofManager<'a> {
     /// When set, `add_original_clause_step` emits premiseless tautology rule
     /// steps (e.g., `and_pos`, `or_neg`) for annotated clauses instead of
     /// the generic `assume` + `or` pattern. Annotations are parallel to the
-    /// Tseitin clause order (i-th original clause matches annotations[i]).
+    /// original clause IDs (`id - 1` indexes this slice). Reserved IDs remain
+    /// represented so omitted tautologies cannot shift later annotations.
     pub(crate) fn set_clausification_proofs(&mut self, proofs: &'a [Option<ClausificationProof>]) {
         self.clausification_proofs = Some(proofs);
+    }
+
+    fn original_annotation_by_id<T>(
+        annotations: Option<&[Option<T>]>,
+        clause_id: u64,
+    ) -> Option<&T> {
+        let index = usize::try_from(clause_id.checked_sub(1)?).ok()?;
+        annotations?.get(index)?.as_ref()
     }
 
     /// Attach direct original-clause theory annotations for SAT reconstruction.
@@ -133,7 +150,21 @@ impl<'a> SatProofManager<'a> {
     /// - `neg(v)` -> explicit syntactic complement of that literal
     fn lit_to_term(&mut self, lit: Literal) -> Option<TermId> {
         let var_idx = lit.variable().index() as u32;
-        let term = *self.var_to_term.get(&var_idx)?;
+        let Some(&term) = self.var_to_term.get(&var_idx) else {
+            // Introspection: record the index range of variables absent from
+            // `var_to_term`. Comparing it with the mapped range says whether the
+            // unmapped vars sit ABOVE the mapped ones (allocated later, e.g. by
+            // solver-internal machinery) or are interleaved with them.
+            self.unmapped_var_min = Some(
+                self.unmapped_var_min
+                    .map_or(var_idx, |m: u32| m.min(var_idx)),
+            );
+            self.unmapped_var_max = Some(
+                self.unmapped_var_max
+                    .map_or(var_idx, |m: u32| m.max(var_idx)),
+            );
+            return None;
+        };
         let positive_term = self.normalize_positive_literal(term);
 
         if lit.is_positive() {
@@ -172,6 +203,51 @@ impl<'a> SatProofManager<'a> {
     /// Check whether clauses are equivalent up to ordering/duplication.
     fn clauses_equivalent(lhs: &[TermId], rhs: &[TermId]) -> bool {
         Self::normalize_clause(lhs) == Self::normalize_clause(rhs)
+    }
+
+    /// Rebind a position-indexed theory annotation to a traced clause by
+    /// literal identity. SAT watched-literal movement may reorder clauses, and
+    /// normalization may deduplicate them; a positional zip would silently
+    /// attach Farkas multipliers to the wrong inequalities.
+    ///
+    /// Duplicate source coefficients are merged by sum. The merged value is
+    /// placed on the first occurrence of that literal in the target order and
+    /// any later duplicates receive zero. A source literal may disappear only
+    /// when its merged coefficient is zero; target-only weakening literals are
+    /// likewise assigned zero. Every non-Farkas annotation requires exact
+    /// set-equivalence. Any other mismatch declines fail-closed.
+    fn rebind_theory_annotation(
+        annotation: &TheoryLemmaProof,
+        target_clause: &[TermId],
+    ) -> Option<TheoryLemmaProof> {
+        let has_cutting_plane_farkas = matches!(
+            annotation.lia.as_ref(),
+            Some(ay_core::LiaAnnotation::CuttingPlane(_))
+        );
+        if annotation.farkas.is_none()
+            && !has_cutting_plane_farkas
+            && !Self::clauses_equivalent(&annotation.clause, target_clause)
+        {
+            return None;
+        }
+
+        let rebound_farkas = match annotation.farkas.as_ref() {
+            Some(farkas) => Some(farkas.rebind_by_literal(&annotation.clause, target_clause)?),
+            None => None,
+        };
+        let mut rebound_lia = annotation.lia.clone();
+        if let Some(ay_core::LiaAnnotation::CuttingPlane(cutting_plane)) = rebound_lia.as_mut() {
+            cutting_plane.farkas = cutting_plane
+                .farkas
+                .rebind_by_literal(&annotation.clause, target_clause)?;
+        }
+
+        Some(TheoryLemmaProof {
+            clause: target_clause.to_vec(),
+            kind: annotation.kind,
+            farkas: rebound_farkas,
+            lia: rebound_lia,
+        })
     }
 
     /// Compute term negation, reusing cached terms where possible.
@@ -254,8 +330,6 @@ impl<'a> SatProofManager<'a> {
         let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
         let mut final_empty: Option<ProofId> = None;
         let mut weak_empty: Option<ProofId> = None;
-        let mut original_clause_idx: usize = 0;
-
         for (idx, step) in proof.steps.iter().enumerate() {
             let Some(clause) = Self::clause_from_step(step) else {
                 continue;
@@ -292,28 +366,38 @@ impl<'a> SatProofManager<'a> {
                 return None;
             }
             let Some(mut entry_clause_terms) = self.clause_to_terms(&entry.clause) else {
+                // Introspection: this trace entry is DROPPED from the replay maps
+                // entirely — its literals have no term mapping — so no later
+                // resolution can use it. Counted because a small `clause_terms`
+                // map is the difference between a reconstructable proof and a
+                // `trust` fallback.
+                self.untranslatable_entries += 1;
                 continue;
             };
             let mut entry_sat_clause = entry.clause.clone();
 
             let clause_proof = if entry.is_original {
-                // Look up clausification annotation by original clause index (#6031 Phase 3).
-                let annotation = self
-                    .clausification_proofs
-                    .and_then(|proofs| proofs.get(original_clause_idx))
-                    .and_then(|opt| opt.as_ref());
-                let indexed_theory_annotation = self
-                    .original_clause_theory_proofs
-                    .and_then(|proofs| proofs.get(original_clause_idx))
-                    .and_then(|opt| opt.as_ref());
+                // Bind annotations by the stable original-clause ID. The SAT
+                // layer reserves an ID when it omits a tautological input, so
+                // counting only surviving trace entries shifts every later
+                // annotation and can mislabel an `or_pos` clause as `ite_neg1`.
+                let annotation =
+                    Self::original_annotation_by_id(self.clausification_proofs, entry.id);
+                let indexed_theory_annotation =
+                    Self::original_annotation_by_id(self.original_clause_theory_proofs, entry.id);
                 // Look up theory lemma annotation by normalized clause content (#6031 Phase 4).
                 let normalized_key = Self::normalize_clause(&entry_clause_terms);
-                let theory_annotation = indexed_theory_annotation.or_else(|| {
-                    self.theory_lemma_proofs
-                        .and_then(|proofs| proofs.get(&normalized_key))
-                });
-                original_clause_idx += 1;
-
+                let theory_annotation = indexed_theory_annotation
+                    .and_then(|candidate| {
+                        Self::rebind_theory_annotation(candidate, &entry_clause_terms)
+                    })
+                    .or_else(|| {
+                        self.theory_lemma_proofs
+                            .and_then(|proofs| proofs.get(&normalized_key))
+                            .and_then(|candidate| {
+                                Self::rebind_theory_annotation(candidate, &entry_clause_terms)
+                            })
+                    });
                 // Level-0-minimized theory lemma bridge (#rank-4 increment 2).
                 // The SAT layer strips literals that are false at level 0
                 // from theory conflict clauses before they reach the trace,
@@ -387,7 +471,7 @@ impl<'a> SatProofManager<'a> {
                         &entry_clause_terms,
                         &mut existing_clause_map,
                         annotation,
-                        theory_annotation,
+                        theory_annotation.as_ref(),
                     ),
                 }
             } else {
@@ -589,6 +673,20 @@ impl<'a> SatProofManager<'a> {
     ///
     /// A non-zero count means the proof contains unverified steps. The proof
     /// is structurally valid but the trust nodes bypass independent checking.
+    /// (min, max) index of SAT variables missing from `var_to_term`, and the
+    /// number of mapped variables, for coverage diagnosis.
+    pub(crate) fn unmapped_var_range(&self) -> (Option<u32>, Option<u32>, usize) {
+        (
+            self.unmapped_var_min,
+            self.unmapped_var_max,
+            self.var_to_term.len(),
+        )
+    }
+
+    pub(crate) fn untranslatable_entries(&self) -> u32 {
+        self.untranslatable_entries
+    }
+
     pub(crate) fn trust_fallback_count(&self) -> u32 {
         self.trust_fallback_count
     }

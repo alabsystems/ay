@@ -106,7 +106,29 @@ extract_to = "benchmarks/sat/satcomp2026-main/instances"
 # Each ordered row carries the organizer's GBD content ID, a unique local path,
 # and exact response size/SHA-256. Duplicate selected payloads remain separate
 # benchmark rows while the downloader fetches each unique content ID once.
+#
+# WARNING (measured 2026-07-28): this is NOT the set SAT-COMP 2026 scored. It
+# comes from the organizers' pre-final benchmark-compilation selection. Compared
+# against the official per-instance export
+# (https://satcompetition.github.io/2026/downloads/scores.csv) only 20 of these
+# 400 files are shared BY SHA-256 CONTENT HASH; 371 are absent from the scored
+# set (5.17 GB here vs 2.24 GB there), and this manifest has 9 duplicate hashes
+# (400 rows, 391 distinct). Scoring against it and comparing to published winner
+# scores compares AY on one set of formulas to the winners on another.
+# For any competition claim use the `satcomp-2026-main-official` corpus below.
+# See benchmarks/sat/satcomp2026-main/README.md for the full evidence table.
 manifest = "benchmarks/sat/satcomp2026-main/SC2026.pinned.csv"
+
+[[corpus]]
+name = "satcomp-2026-main-official"
+groups = ["competition-2025-2026"]
+source = "gbd"
+extract_to = "benchmarks/sat/satcomp2026-main/official"
+# The 400 instances SAT-COMP 2026 actually scored, taken from the `instanceid`
+# column of the organizers' official results export. Provisioned (and each file
+# bound to its official instanceid by recomputing GBD's identity hash) via
+# scripts/sat_bench/fetch_satcomp2026_official.py.
+manifest = "benchmarks/sat/satcomp2026-main/SC2026.official.csv"
 
 [[corpus]]
 name = "pb-comp-selected-pb25"

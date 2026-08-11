@@ -10,8 +10,9 @@ use crate::command::Sort as CmdSort;
 use crate::command::Term as ParsedTerm;
 use ay_core::{Sort, Symbol, TermId};
 use num_bigint::{BigInt, Sign};
+use num_rational::BigRational;
 
-use super::{Context, ElaborateError, Result, SymbolInfo};
+use super::{Context, ElaborateError, Result, SymbolInfo, MAX_FUN_EXPANSION_DEPTH};
 
 /// Indexed identifiers whose indices must all be u32 numerals. Used by the
 /// up-front index validation in [`Context::elaborate_indexed_app`]; symbol- and
@@ -32,6 +33,10 @@ const NUMERAL_INDEXED: &[&str] = &[
     "fp.to_sbv",
     "divisible",
 ];
+
+/// Z3 5.0.0 installs its pseudo-Boolean declaration plugin only in the null,
+/// QF_FD, ALL, and HORN signatures.
+const PB_INDEXED: &[&str] = &["at-most", "at-least", "pble", "pbge", "pbeq"];
 
 /// Comparison operator for a pseudo-boolean / cardinality constraint.
 #[derive(Clone, Copy)]
@@ -91,6 +96,15 @@ impl Context {
             }
             let tester_name = format!("is-{ctor_name}");
             return self.elaborate_app(&tester_name, args, env);
+        }
+
+        if PB_INDEXED.contains(&name)
+            && self
+                .logic
+                .as_deref()
+                .is_some_and(|logic| !matches!(logic, "QF_FD" | "ALL" | "HORN"))
+        {
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
         }
 
         let arg_ids: Vec<TermId> = args
@@ -205,6 +219,9 @@ impl Context {
                     ParsedIndex::Hexadecimal(hexadecimal) => hexadecimal
                         .strip_prefix("#x")
                         .and_then(|hex| BigInt::parse_bytes(hex.as_bytes(), 16)),
+                    ParsedIndex::Binary(binary) => binary
+                        .strip_prefix("#b")
+                        .and_then(|bits| BigInt::parse_bytes(bits.as_bytes(), 2)),
                     _ => None,
                 }
                 .ok_or_else(|| ElaborateError::InvalidConstant(format!("(_ {name} {raw})")))?;
@@ -342,17 +359,6 @@ impl Context {
                     )
                 })?;
 
-                // `define-fun` is represented as an elaboration-time macro.
-                // Encoding it here as an array-map function symbol would lose
-                // its body and turn a fixed interpretation into a free UF.
-                // Higher-order macro expansion is not represented, so fail
-                // closed instead of changing the formula's semantics.
-                if self.fun_defs.contains_key(func_name) {
-                    return Err(ElaborateError::Unsupported(format!(
-                        "array map over defined function '{func_name}' is unsupported"
-                    )));
-                }
-
                 if arg_ids.is_empty() {
                     return Err(ElaborateError::InvalidConstant(
                         "map requires at least 1 array argument".to_string(),
@@ -387,6 +393,27 @@ impl Context {
                     }
                 }
 
+                let idx_sort = index_sort.ok_or_else(|| {
+                    ElaborateError::InvalidConstant(
+                        "map requires at least one array argument".to_string(),
+                    )
+                })?;
+                if let Some((params, result_sort, body)) = self.fun_defs.get(func_name).cloned() {
+                    let index = self.terms.mk_fresh_var("array_map_index", idx_sort.clone());
+                    let point_args = arg_ids
+                        .iter()
+                        .map(|&array| self.terms.mk_select(array, index))
+                        .collect::<Vec<_>>();
+                    let body = self.elaborate_defined_array_function_body(
+                        func_name,
+                        &params,
+                        &result_sort,
+                        &body,
+                        point_args,
+                    )?;
+                    return Ok(self.terms.mk_lambda_array(index, body));
+                }
+
                 let func_info = self
                     .resolve_declared_symbol_for_domain(func_name, &element_sorts)?
                     .ok_or_else(|| {
@@ -400,7 +427,6 @@ impl Context {
                         ))
                     })?;
 
-                let idx_sort = index_sort.expect("at least one array arg validated above");
                 let result_sort = Sort::array(idx_sort, func_info.sort);
                 let internal_name = func_info.internal_name.as_deref().unwrap_or(func_name);
 
@@ -428,12 +454,24 @@ impl Context {
                     )
                 })?;
 
-                // See the corresponding array-map gate above: an as-array of a
-                // macro cannot be represented as a free function symbol.
-                if self.fun_defs.contains_key(func_name) {
-                    return Err(ElaborateError::Unsupported(format!(
-                        "as-array over defined function '{func_name}' is unsupported"
-                    )));
+                if let Some((params, result_sort, body)) = self.fun_defs.get(func_name).cloned() {
+                    if params.len() != 1 {
+                        return Err(ElaborateError::InvalidConstant(format!(
+                            "function '{func_name}' used in (_ as-array {func_name}) requires 1 argument, got {}",
+                            params.len()
+                        )));
+                    }
+                    let index = self
+                        .terms
+                        .mk_fresh_var("as_array_index", params[0].1.clone());
+                    let body = self.elaborate_defined_array_function_body(
+                        func_name,
+                        &params,
+                        &result_sort,
+                        &body,
+                        vec![index],
+                    )?;
+                    return Ok(self.terms.mk_lambda_array(index, body));
                 }
 
                 let func_info = self
@@ -596,6 +634,11 @@ impl Context {
                         "divisible expects exactly 1 argument".to_string(),
                     ));
                 }
+                // Z3 5.0.0 does not apply its general Bool-to-Int arithmetic
+                // coercion at the indexed `divisible` boundary. Validate the
+                // declared Int rank before desugaring; otherwise the `mod`
+                // coercion below would incorrectly accept a Bool operand.
+                self.expect_arg_sort(arg_ids[0], &Sort::Int)?;
                 use crate::command::{Constant as PConst, Term as PTerm};
                 let zero = PTerm::Const(PConst::Numeral("0".to_string()));
                 let desugared = if indices[0] == 0 {
@@ -617,12 +660,17 @@ impl Context {
             // the audited LIA path (equisatisfiable, purely definitional).
             // Z3 ref: pb_decl_plugin.cpp (OP_AT_MOST_K / OP_AT_LEAST_K).
             "at-most" | "at-least" => {
+                if arg_ids.is_empty() {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "{name} requires at least 1 argument"
+                    )));
+                }
                 if parsed_indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(format!(
                         "{name} requires exactly 1 index (the bound k)"
                     )));
                 }
-                let k = parse_pb_index(&parsed_indices[0], name)?;
+                let k = parse_cardinality_index(&parsed_indices[0], name)?;
                 let coeffs = vec![BigInt::from(1); arg_ids.len()];
                 let cmp = if name == "at-most" {
                     PbCmp::Le
@@ -639,6 +687,11 @@ impl Context {
             // per-literal coefficients (one per Bool argument). Z3 ref:
             // pb_decl_plugin.cpp (OP_PB_LE / OP_PB_GE / OP_PB_EQ).
             "pble" | "pbge" | "pbeq" => {
+                if arg_ids.is_empty() {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "{name} requires at least 1 argument"
+                    )));
+                }
                 // One threshold index + one coefficient per Bool argument.
                 if parsed_indices.len() != arg_ids.len() + 1 {
                     return Err(ElaborateError::InvalidConstant(format!(
@@ -648,12 +701,12 @@ impl Context {
                         parsed_indices.len()
                     )));
                 }
-                let parsed_integers = parsed_indices
+                let parsed_rationals = parsed_indices
                     .iter()
-                    .map(|index| parse_pb_index(index, name))
+                    .map(|index| parse_pb_rational_index(index, name))
                     .collect::<Result<Vec<_>>>()?;
-                let k = parsed_integers[0].clone();
-                let coeffs = parsed_integers[1..].to_vec();
+                let (coeffs, k) =
+                    integerize_pb_parameters(&parsed_rationals[1..], &parsed_rationals[0]);
                 let cmp = match name {
                     "pble" => PbCmp::Le,
                     "pbge" => PbCmp::Ge,
@@ -688,6 +741,56 @@ impl Context {
                 )))
             }
         }
+    }
+
+    /// Expand a `define-fun` body used by `(_ map f)` or `(_ as-array f)`.
+    ///
+    /// The environment contains only the definition's parameters, never the
+    /// indexed identifier's use-site binders. This is the same capture-avoiding
+    /// rule as ordinary macro application in `elaborate_app`. The shared depth
+    /// counter also makes recursive definitions fail closed at the established
+    /// expansion limit instead of recursing without bound.
+    fn elaborate_defined_array_function_body(
+        &mut self,
+        name: &str,
+        params: &[(String, Sort)],
+        result_sort: &Sort,
+        body: &ParsedTerm,
+        mut args: Vec<TermId>,
+    ) -> Result<TermId> {
+        if self.fun_expansion_depth >= MAX_FUN_EXPANSION_DEPTH {
+            return Err(ElaborateError::RecursionDepthExceeded(
+                MAX_FUN_EXPANSION_DEPTH,
+            ));
+        }
+        self.fun_expansion_depth += 1;
+        let result = (|| {
+            let expected_sorts = params
+                .iter()
+                .map(|(_, sort)| sort.clone())
+                .collect::<Vec<_>>();
+            self.validate_application_signature(name, &expected_sorts, &mut args)?;
+
+            let mut definition_env = HashMap::default();
+            for ((parameter, _), argument) in params.iter().zip(args) {
+                definition_env.insert(parameter.clone(), argument);
+            }
+            let body = self.elaborate_term(body, &definition_env)?;
+            let actual = self.terms.sort(body).clone();
+            if &actual == result_sort {
+                Ok(body)
+            } else if self.int_real_coercions() && actual == Sort::Int && result_sort == &Sort::Real
+            {
+                Ok(self.coerce_int_to_real(body))
+            } else {
+                Err(ElaborateError::SortMismatch {
+                    expected: result_sort.to_string(),
+                    actual: actual.to_string(),
+                })
+            }
+        })();
+        self.fun_expansion_depth -= 1;
+        result
     }
 
     /// Resolve a Z3 special-relation application `((_ kind id) a b)` to an
@@ -761,6 +864,11 @@ impl Context {
                 term: None,
                 sort: Sort::Bool,
                 arg_sorts: vec![sort.clone(), sort.clone()],
+                public_sort: super::PublicSort::Core(Sort::Bool),
+                public_arg_sorts: vec![
+                    super::PublicSort::from_engine(&sort),
+                    super::PublicSort::from_engine(&sort),
+                ],
                 internal_name: None,
             },
         );
@@ -814,31 +922,113 @@ impl Context {
     }
 }
 
-/// Parse a pseudo-boolean threshold/coefficient index as an integer.
-///
-/// Z3's PB extension mirrors its C API's signed `int` coefficients and bound,
-/// so a negative decimal is lexed as a symbol token. Positive values must be
-/// numeral tokens: a quoted symbol such as `|8|` is not a numeric index.
-fn parse_pb_index(index: &ParsedIndex, op: &str) -> Result<BigInt> {
-    let text = match index {
-        ParsedIndex::Numeral(text) => text.as_str(),
-        ParsedIndex::Symbol(text)
-            if text.strip_prefix('-').is_some_and(|magnitude| {
-                !magnitude.is_empty() && magnitude.bytes().all(|byte| byte.is_ascii_digit())
-            }) =>
-        {
-            text.as_str()
+/// Parse the sole `at-most` / `at-least` parameter exactly as Z3 5.0.0 does.
+/// Its declaration plugin requires a non-negative machine `int`; decimals,
+/// negative values, and values above `INT_MAX` are rejected.
+fn parse_cardinality_index(index: &ParsedIndex, op: &str) -> Result<BigInt> {
+    let value = parse_unsigned_index_value(index).ok_or_else(|| {
+        ElaborateError::InvalidConstant(format!(
+            "{op}: expected one non-negative integer parameter, got '{}'",
+            index.text()
+        ))
+    })?;
+    if value > BigInt::from(i32::MAX) {
+        return Err(ElaborateError::InvalidConstant(format!(
+            "{op}: parameter '{}' does not fit Z3's non-negative machine int",
+            index.text()
+        )));
+    }
+    Ok(value)
+}
+
+/// Parse one `pble` / `pbge` / `pbeq` parameter as the rational value produced
+/// by Z3 5.0.0's SMT2 indexed-identifier parser. Unsigned numeral/bitvector
+/// indices that fit `unsigned` are first stored in a signed `int` parameter,
+/// including the 2^31..2^32-1 wraparound of that exact release. Larger values,
+/// decimals, and negative numeric tokens remain exact rationals.
+fn parse_pb_rational_index(index: &ParsedIndex, op: &str) -> Result<BigRational> {
+    if let Some(value) = parse_unsigned_index_value(index) {
+        if value <= BigInt::from(u32::MAX) {
+            let unsigned = value.to_u32_digits().1.first().copied().unwrap_or(0);
+            return Ok(BigRational::from_integer(BigInt::from(unsigned as i32)));
         }
+        return Ok(BigRational::from_integer(value));
+    }
+
+    let text = match index {
+        ParsedIndex::Decimal(text) => text.as_str(),
+        ParsedIndex::Symbol(text) if is_negative_decimal_text(text) => text.as_str(),
         _ => {
             return Err(ElaborateError::InvalidConstant(format!(
-                "{op}: expected an integer index, got '{}'",
+                "{op}: expected a rational parameter, got '{}'",
                 index.text()
             )));
         }
     };
-    text.parse::<BigInt>().map_err(|_| {
-        ElaborateError::InvalidConstant(format!("{op}: invalid integer index '{text}'"))
+    parse_decimal_rational(text).ok_or_else(|| {
+        ElaborateError::InvalidConstant(format!("{op}: invalid rational parameter '{text}'"))
     })
+}
+
+fn parse_unsigned_index_value(index: &ParsedIndex) -> Option<BigInt> {
+    match index {
+        ParsedIndex::Numeral(text) => text.parse().ok(),
+        ParsedIndex::Hexadecimal(text) => {
+            BigInt::parse_bytes(text.strip_prefix("#x")?.as_bytes(), 16)
+        }
+        ParsedIndex::Binary(text) => BigInt::parse_bytes(text.strip_prefix("#b")?.as_bytes(), 2),
+        _ => None,
+    }
+}
+
+fn is_negative_decimal_text(text: &str) -> bool {
+    let Some(magnitude) = text.strip_prefix('-') else {
+        return false;
+    };
+    let mut parts = magnitude.split('.');
+    let Some(integer) = parts.next() else {
+        return false;
+    };
+    let fraction = parts.next();
+    parts.next().is_none()
+        && !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn parse_decimal_rational(text: &str) -> Option<BigRational> {
+    let (negative, magnitude) = text
+        .strip_prefix('-')
+        .map_or((false, text), |magnitude| (true, magnitude));
+    let (integer, fraction) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    let integer = integer.parse::<BigInt>().ok()?;
+    let denominator = BigInt::from(10).pow(u32::try_from(fraction.len()).ok()?);
+    let fraction = if fraction.is_empty() {
+        BigInt::from(0)
+    } else {
+        fraction.parse::<BigInt>().ok()?
+    };
+    let numerator = integer * &denominator + fraction;
+    Some(BigRational::new(
+        if negative { -numerator } else { numerator },
+        denominator,
+    ))
+}
+
+/// Multiply a PB inequality/equality by a positive common denominator so the
+/// existing exact integer-arithmetic lowering can decide rational parameters.
+fn integerize_pb_parameters(
+    coefficients: &[BigRational],
+    bound: &BigRational,
+) -> (Vec<BigInt>, BigInt) {
+    let scale = coefficients
+        .iter()
+        .chain(std::iter::once(bound))
+        .fold(BigInt::from(1), |product, value| product * value.denom());
+    let scaled = |value: &BigRational| value.numer() * (&scale / value.denom());
+    (coefficients.iter().map(scaled).collect(), scaled(bound))
 }
 
 /// Map an elaborated argument sort back to the surface sort that round-trips

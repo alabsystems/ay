@@ -12,7 +12,7 @@ use ay_frontend::command::{
     Constant as FrontendConstant, Index as FrontendIndex, MatchPattern as FrontendMatchPattern,
     QualifiedIdentifier as FrontendQualifiedIdentifier, Sort as FrontendSort, Term as FrontendTerm,
 };
-use ay_frontend::Context;
+use ay_frontend::{Context, SExpr};
 
 pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
     match term {
@@ -28,7 +28,7 @@ pub(super) fn collect_surface_term_overrides(
     overrides: &mut HashMap<TermId, String>,
 ) {
     let parsed = strip_frontend_annotations(parsed);
-    let echo = realify_real_context_numerals(ctx, parsed, false);
+    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
     overrides.insert(canonical, format_frontend_term(&echo));
 
     if let (FrontendTerm::App(op, args), TermData::Not(inner)) = (parsed, ctx.terms.get(canonical))
@@ -129,7 +129,7 @@ fn collect_bound_surface_overrides(
 ) {
     let parsed = strip_frontend_annotations(parsed);
     if let Some(canonical) = ctx.elaborate_surface_subterm_with_bindings(parsed, env) {
-        let echo = realify_real_context_numerals(ctx, parsed, false);
+        let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
         overrides
             .entry(canonical)
             .or_insert_with(|| format_frontend_term(&echo));
@@ -215,7 +215,7 @@ fn collect_subterm_surface_overrides(
             continue;
         };
         if !overrides.contains_key(&child) {
-            let echo = realify_real_context_numerals(ctx, arg, false);
+            let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
             overrides.insert(child, format_frontend_term(&echo));
         }
         collect_subterm_surface_overrides(ctx, arg, overrides);
@@ -251,7 +251,7 @@ pub(super) fn collect_deep_arith_surface_overrides(
         }
         if let Some(child) = ctx.elaborate_surface_subterm(arg) {
             if !overrides.contains_key(&child) {
-                let echo = realify_real_context_numerals(ctx, arg, false);
+                let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
                 overrides.insert(child, format_frontend_term(&echo));
             }
         }
@@ -289,16 +289,25 @@ fn subterm_is_real_sorted(ctx: &mut Context, term: &FrontendTerm) -> bool {
 /// - comparisons / (dis)equality: Real when any argument elaborates to Real;
 /// - `ite`: branch positions inherit / infer Real; the condition never does.
 ///
-/// Terms under binders are left unchanged (their subterms cannot be
+/// `let` is descended THROUGH: a `let`-bound name cannot be re-elaborated in
+/// the global environment, so `let_env` carries each binding's Real-ness
+/// (computed from its value in the enclosing scope) for the body to read.
+/// Without this, every meti-tarski / hycomp assertion — which the problem files
+/// write as one big `(let ((?v_0 ...)) ...)` — fell into the catch-all arm and
+/// was echoed verbatim, so its numerals were never realified and the whole
+/// certificate was rejected at the parser.
+///
+/// Terms under QUANTIFIERS are still left unchanged (their subterms cannot be
 /// re-elaborated in the global environment, so no Real context is inferred).
 fn realify_real_context_numerals(
     ctx: &mut Context,
     term: &FrontendTerm,
     real_ctx: bool,
+    let_env: &mut Vec<(String, bool)>,
 ) -> FrontendTerm {
     match term {
         FrontendTerm::Annotated(inner, annotations) => FrontendTerm::Annotated(
-            Box::new(realify_real_context_numerals(ctx, inner, real_ctx)),
+            Box::new(realify_real_context_numerals(ctx, inner, real_ctx, let_env)),
             annotations.clone(),
         ),
         FrontendTerm::Const(FrontendConstant::Numeral(n)) if real_ctx => {
@@ -308,15 +317,15 @@ fn realify_real_context_numerals(
             let arg_ctx: Vec<bool> = match op.as_str() {
                 "/" => vec![true; args.len()],
                 "+" | "-" | "*" => {
-                    let rc = real_ctx || args.iter().any(|a| subterm_is_real_sorted(ctx, a));
+                    let rc = real_ctx || args.iter().any(|a| surface_is_real(ctx, a, let_env));
                     vec![rc; args.len()]
                 }
                 "<" | "<=" | ">" | ">=" | "=" | "distinct" => {
-                    let rc = args.iter().any(|a| subterm_is_real_sorted(ctx, a));
+                    let rc = args.iter().any(|a| surface_is_real(ctx, a, let_env));
                     vec![rc; args.len()]
                 }
                 "ite" if args.len() == 3 => {
-                    let rc = real_ctx || args[1..].iter().any(|a| subterm_is_real_sorted(ctx, a));
+                    let rc = real_ctx || args[1..].iter().any(|a| surface_is_real(ctx, a, let_env));
                     vec![false, rc, rc]
                 }
                 _ => vec![false; args.len()],
@@ -325,37 +334,114 @@ fn realify_real_context_numerals(
                 op.clone(),
                 args.iter()
                     .zip(arg_ctx)
-                    .map(|(a, rc)| realify_real_context_numerals(ctx, a, rc))
+                    .map(|(a, rc)| realify_real_context_numerals(ctx, a, rc, let_env))
                     .collect(),
             )
+        }
+        FrontendTerm::Let(bindings, body) => {
+            // SMT-LIB `let` binds in PARALLEL: every value is elaborated in the
+            // enclosing scope, so Real-ness is decided (and the values are
+            // realified) before any name is in scope.
+            let mut rebound = Vec::with_capacity(bindings.len());
+            let mut entries = Vec::with_capacity(bindings.len());
+            for (name, value) in bindings {
+                entries.push((name.clone(), surface_is_real(ctx, value, let_env)));
+                rebound.push((
+                    name.clone(),
+                    realify_real_context_numerals(ctx, value, false, let_env),
+                ));
+            }
+            let depth = let_env.len();
+            let_env.extend(entries);
+            let new_body = realify_real_context_numerals(ctx, body, real_ctx, let_env);
+            let_env.truncate(depth);
+            FrontendTerm::Let(rebound, Box::new(new_body))
         }
         other => other.clone(),
     }
 }
 
-pub(super) fn format_frontend_term(term: &FrontendTerm) -> String {
+/// Whether a surface subterm denotes a Real, consulting the `let` environment.
+///
+/// [`subterm_is_real_sorted`] answers by RE-ELABORATING the term, which fails
+/// outright for anything mentioning a `let`-bound name. This wrapper decides
+/// the shapes it can decide structurally — a bound name, and the arithmetic
+/// operators whose result sort is the join of their operands — and only falls
+/// back to re-elaboration for the rest. It is also the more reliable answer for
+/// `+`/`*`: `TermStore::mk_add`/`mk_mul` take the result sort from `args[0]`,
+/// so an elaborated `(+ 2 realVar)` reports `Int`.
+fn surface_is_real(ctx: &mut Context, term: &FrontendTerm, let_env: &[(String, bool)]) -> bool {
     match strip_frontend_annotations(term) {
+        FrontendTerm::Symbol(name) => {
+            if let Some((_, is_real)) = let_env.iter().rev().find(|(n, _)| n == name) {
+                return *is_real;
+            }
+            subterm_is_real_sorted(ctx, term)
+        }
+        FrontendTerm::App(op, args) => match op.as_str() {
+            "/" => true,
+            "+" | "-" | "*" | "abs" => args.iter().any(|a| surface_is_real(ctx, a, let_env)),
+            "ite" if args.len() == 3 => args[1..].iter().any(|a| surface_is_real(ctx, a, let_env)),
+            _ => subterm_is_real_sorted(ctx, term),
+        },
+        other => subterm_is_real_sorted(ctx, other),
+    }
+}
+
+pub(super) fn format_frontend_term(term: &FrontendTerm) -> String {
+    format_frontend_term_impl(term, false)
+}
+
+/// Render an authored term without discarding SMT-LIB annotations.
+pub(super) fn format_authored_frontend_term(term: &FrontendTerm) -> String {
+    format_frontend_term_impl(term, true)
+}
+
+fn format_frontend_term_impl(term: &FrontendTerm, preserve_annotations: bool) -> String {
+    let term = if preserve_annotations {
+        term
+    } else {
+        strip_frontend_annotations(term)
+    };
+    match term {
         FrontendTerm::Const(c) => format_frontend_constant(c),
         FrontendTerm::Symbol(name) => format_frontend_symbol(name),
-        FrontendTerm::App(name, args) => format_frontend_application(name, args),
-        FrontendTerm::IndexedApp(name, indices, args) => {
-            format_frontend_head_application(&format_indexed_head(name, indices), args)
+        FrontendTerm::App(name, args) => {
+            format_frontend_application(name, args, preserve_annotations)
         }
-        FrontendTerm::QualifiedApp(name, sort, args) => {
-            format_frontend_head_application(&format_qualified_head(name, sort), args)
+        FrontendTerm::IndexedApp(name, indices, args) => format_frontend_head_application(
+            &format_indexed_head(name, indices),
+            args,
+            preserve_annotations,
+        ),
+        FrontendTerm::QualifiedApp(name, sort, args) => format_frontend_head_application(
+            &format_qualified_head(name, sort),
+            args,
+            preserve_annotations,
+        ),
+        FrontendTerm::Let(bindings, body) => {
+            format_frontend_let(bindings, body, preserve_annotations)
         }
-        FrontendTerm::Let(bindings, body) => format_frontend_let(bindings, body),
         FrontendTerm::Forall(bindings, body) => {
-            format_frontend_quantifier("forall", bindings, body)
+            format_frontend_quantifier("forall", bindings, body, preserve_annotations)
         }
         FrontendTerm::Exists(bindings, body) => {
-            format_frontend_quantifier("exists", bindings, body)
+            format_frontend_quantifier("exists", bindings, body, preserve_annotations)
         }
         FrontendTerm::Lambda(bindings, body) => {
-            format_frontend_quantifier("lambda", bindings, body)
+            format_frontend_quantifier("lambda", bindings, body, preserve_annotations)
         }
-        FrontendTerm::Match(scrutinee, cases) => format_frontend_match(scrutinee, cases),
-        FrontendTerm::Annotated(_, _) => unreachable!("annotations stripped above"),
+        FrontendTerm::Match(scrutinee, cases) => {
+            format_frontend_match(scrutinee, cases, preserve_annotations)
+        }
+        FrontendTerm::Annotated(inner, attributes) => {
+            let mut rendered = vec![format_frontend_term_impl(inner, true)];
+            for (keyword, value) in attributes {
+                rendered.push(keyword.clone());
+                rendered.push(format_annotation_value(keyword, value));
+            }
+            format!("(! {})", rendered.join(" "))
+        }
         other => unreachable!("unsupported frontend term in proof export override: {other:?}"),
     }
 }
@@ -363,6 +449,7 @@ pub(super) fn format_frontend_term(term: &FrontendTerm) -> String {
 fn format_frontend_match(
     scrutinee: &FrontendTerm,
     cases: &[(FrontendMatchPattern, FrontendTerm)],
+    preserve_annotations: bool,
 ) -> String {
     let rendered_cases: Vec<String> = cases
         .iter()
@@ -370,13 +457,13 @@ fn format_frontend_match(
             format!(
                 "({} {})",
                 format_frontend_match_pattern(pattern),
-                format_frontend_term(body)
+                format_frontend_term_impl(body, preserve_annotations)
             )
         })
         .collect();
     format!(
         "(match {} ({}))",
-        format_frontend_term(scrutinee),
+        format_frontend_term_impl(scrutinee, preserve_annotations),
         rendered_cases.join(" ")
     )
 }
@@ -401,15 +488,26 @@ fn format_frontend_match_pattern(pattern: &FrontendMatchPattern) -> String {
     }
 }
 
-fn format_frontend_application(name: &str, args: &[FrontendTerm]) -> String {
-    format_frontend_head_application(&format_frontend_symbol(name), args)
+fn format_frontend_application(
+    name: &str,
+    args: &[FrontendTerm],
+    preserve_annotations: bool,
+) -> String {
+    format_frontend_head_application(&format_frontend_symbol(name), args, preserve_annotations)
 }
 
-fn format_frontend_head_application(head: &str, args: &[FrontendTerm]) -> String {
+fn format_frontend_head_application(
+    head: &str,
+    args: &[FrontendTerm],
+    preserve_annotations: bool,
+) -> String {
     if args.is_empty() {
         head.to_string()
     } else {
-        let rendered_args: Vec<String> = args.iter().map(format_frontend_term).collect();
+        let rendered_args: Vec<String> = args
+            .iter()
+            .map(|term| format_frontend_term_impl(term, preserve_annotations))
+            .collect();
         format!("({head} {})", rendered_args.join(" "))
     }
 }
@@ -436,15 +534,25 @@ fn format_qualified_head(identifier: &FrontendQualifiedIdentifier, sort: &Fronte
     )
 }
 
-fn format_frontend_let(bindings: &[(String, FrontendTerm)], body: &FrontendTerm) -> String {
+fn format_frontend_let(
+    bindings: &[(String, FrontendTerm)],
+    body: &FrontendTerm,
+    preserve_annotations: bool,
+) -> String {
     let rendered_bindings: Vec<String> = bindings
         .iter()
-        .map(|(name, value)| format!("({} {})", quote_symbol(name), format_frontend_term(value)))
+        .map(|(name, value)| {
+            format!(
+                "({} {})",
+                quote_symbol(name),
+                format_frontend_term_impl(value, preserve_annotations)
+            )
+        })
         .collect();
     format!(
         "(let ({}) {})",
         rendered_bindings.join(" "),
-        format_frontend_term(body)
+        format_frontend_term_impl(body, preserve_annotations)
     )
 }
 
@@ -452,6 +560,7 @@ fn format_frontend_quantifier(
     keyword: &str,
     bindings: &[(String, FrontendSort)],
     body: &FrontendTerm,
+    preserve_annotations: bool,
 ) -> String {
     let rendered_bindings: Vec<String> = bindings
         .iter()
@@ -460,8 +569,29 @@ fn format_frontend_quantifier(
     format!(
         "({keyword} ({}) {})",
         rendered_bindings.join(" "),
-        format_frontend_term(body)
+        format_frontend_term_impl(body, preserve_annotations)
     )
+}
+
+fn format_annotation_value(keyword: &str, value: &SExpr) -> String {
+    if keyword == ":pattern" {
+        if let SExpr::List(terms) = value {
+            let rendered = terms
+                .iter()
+                .map(|term| {
+                    FrontendTerm::from_sexp(term)
+                        .map(|term| format_frontend_term_impl(&term, true))
+                        .unwrap_or_else(|_| term.to_string())
+                })
+                .collect::<Vec<_>>();
+            return format!("({})", rendered.join(" "));
+        }
+    } else if keyword == ":no-pattern" {
+        if let Ok(term) = FrontendTerm::from_sexp(value) {
+            return format_frontend_term_impl(&term, true);
+        }
+    }
+    value.to_string()
 }
 
 fn format_frontend_symbol(name: &str) -> String {
@@ -471,6 +601,7 @@ fn format_frontend_symbol(name: &str) -> String {
 fn format_frontend_index(index: &FrontendIndex) -> String {
     match index {
         FrontendIndex::Numeral(value)
+        | FrontendIndex::Decimal(value)
         | FrontendIndex::Hexadecimal(value)
         | FrontendIndex::Binary(value) => value.clone(),
         FrontendIndex::Symbol(value) => quote_symbol(value),
@@ -534,6 +665,7 @@ mod tests {
     fn indexed_token_kinds_remain_distinct_when_formatted() {
         for (index, expected) in [
             (FrontendIndex::Numeral("8".to_string()), "8"),
+            (FrontendIndex::Decimal("0.5".to_string()), "0.5"),
             (FrontendIndex::Symbol("8".to_string()), "|8|"),
             (FrontendIndex::Hexadecimal("#x41".to_string()), "#x41"),
             (FrontendIndex::Symbol("#x41".to_string()), "|#x41|"),
@@ -541,5 +673,19 @@ mod tests {
             let term = FrontendTerm::IndexedApp("f".to_string(), vec![index], Vec::new());
             assert_eq!(format_frontend_term(&term), format!("(_ f {expected})"));
         }
+    }
+
+    #[test]
+    fn authored_formatter_preserves_pattern_annotations() {
+        let commands =
+            ay_frontend::parse("(assert (forall ((x X)) (! (= x x) :pattern ((as c X)) :qid q)))")
+                .expect("fixture parses");
+        let ay_frontend::Command::Assert(term) = &commands[0] else {
+            panic!("fixture must be an assertion")
+        };
+        assert_eq!(
+            format_authored_frontend_term(term),
+            "(forall ((x X)) (! (= x x) :pattern ((as c X)) :qid q))"
+        );
     }
 }

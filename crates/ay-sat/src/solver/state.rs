@@ -100,6 +100,15 @@ pub struct Solver {
     pub(super) has_empty_clause: bool,
     /// Statistics: number of propagations
     pub(super) num_propagations: u64,
+    /// Statistics: propagations attributable to the CDCL search loop only.
+    ///
+    /// `num_propagations` is cumulative across *every* BCP caller — probing,
+    /// vivification, sweeping, lookahead — so it is not comparable to Kissat's
+    /// `search_propagations`. Comparing AY's total against Kissat's search-only
+    /// figure inflates AY's propagations-per-conflict; this counter exists so
+    /// the two can be normalised the same way. Incremented only under
+    /// `bcp_mode::SEARCH`.
+    pub(super) num_search_propagations: u64,
     pub(super) no_conflict_until: usize,
     /// Search ticks per mode [0=focused, 1=stable]. Counts cache-line work in BCP.
     /// CaDiCaL restart.cpp:27, propagate.cpp:473.

@@ -23,6 +23,7 @@ fn test_logic_from_str_all_canonical() {
         Logic::QfAuflra,
         Logic::QfAuflira,
         Logic::QfNia,
+        Logic::QfEia,
         Logic::QfNra,
         Logic::QfNira,
         Logic::QfBv,

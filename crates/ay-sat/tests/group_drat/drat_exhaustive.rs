@@ -29,7 +29,7 @@ use ay_drat_check::drat_parser::parse_drat;
 use ay_sat::{parse_dimacs, ProofOutput, SatResult, Solver};
 use ntest::timeout;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ===========================================================================
 // Shared helpers
@@ -593,11 +593,28 @@ fn drat_exhaustive_dynamic_sweep_all_unsat() {
     );
 }
 
+/// Solve budget one braun instance may draw inside the sweep.
+const BRAUN_SWEEP_INSTANCE_SECS: u64 = 60;
+
+/// Wall budget the braun sweep may SPEND STARTING work: the 7 committed
+/// instances x [`BRAUN_SWEEP_INSTANCE_SECS`]. It sits 180s below the sweep's
+/// 600s `#[timeout]` net so the last instance's in-flight proof check (braun
+/// 12/13 emit proofs in the hundreds of MB) still lands inside the net.
+const BRAUN_SWEEP_BUDGET: Duration = Duration::from_secs(7 * BRAUN_SWEEP_INSTANCE_SECS);
+
 /// Dynamic sweep over `benchmarks/sat/eq_atree_braun/` UNSAT circuit files.
-/// These are larger and each gets a 60s solve timeout.
+/// These are larger and each gets up to a 60s solve timeout.
+///
+/// The `#[timeout]` is a SAFETY NET for a hang, so it must exceed the work the
+/// sweep is allowed to schedule; it is not the sweep's schedule. It previously
+/// did not: 7 committed braun instances at 60s each is 420s of solve budget
+/// alone (before in-process DRAT checking of proofs that run to hundreds of
+/// MB), under a 300s net — the net was guaranteed to fire mid-sweep and the
+/// test could never reach its own assertion. The sweep now carries its own
+/// wall budget ([`BRAUN_SWEEP_BUDGET`]) strictly below the net, and the net
+/// matches the one the per-instance `drat_exhaustive_braun_*` tests use.
 #[test]
-#[cfg_attr(debug_assertions, timeout(600_000))]
-#[cfg_attr(not(debug_assertions), timeout(300_000))]
+#[timeout(600_000)]
 fn drat_exhaustive_dynamic_sweep_braun() {
     if cfg!(debug_assertions) {
         eprintln!("SKIP: braun sweep is release-mode only due to debug overhead");
@@ -632,20 +649,39 @@ fn drat_exhaustive_dynamic_sweep_braun() {
 
     let mut verified = 0u32;
     let mut timed_out = 0u32;
+    let mut unbudgeted = 0u32;
     let mut failures: Vec<String> = Vec::new();
 
-    for cnf_path in &entries {
+    // Wall budget for the WHOLE sweep, strictly below the `#[timeout]` net so
+    // the sweep always reaches its assertion below. Each instance draws an
+    // equal share of what is left, capped at the intended 60s: with today's 7
+    // committed instances that is the full 60s each, so this changes nothing
+    // about what is checked — it only keeps the sweep inside its net when
+    // proof checking runs long or the directory grows.
+    let sweep_deadline = Instant::now() + BRAUN_SWEEP_BUDGET;
+
+    for (index, cnf_path) in entries.iter().enumerate() {
         let file_name = cnf_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let label = format!("braun_sweep_{file_name}");
 
+        let remaining = sweep_deadline.saturating_duration_since(Instant::now());
+        let remaining_files = (entries.len() - index) as u64;
+        let per_instance_secs =
+            (remaining.as_secs() / remaining_files).min(BRAUN_SWEEP_INSTANCE_SECS);
+        if per_instance_secs == 0 {
+            eprintln!("braun sweep: {file_name} unbudgeted (sweep wall budget exhausted)");
+            unbudgeted += 1;
+            continue;
+        }
+
         let cnf_text = std::fs::read_to_string(cnf_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", cnf_path.display()));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve_and_verify_native_with_timeout(&cnf_text, &label, 60)
+            solve_and_verify_native_with_timeout(&cnf_text, &label, per_instance_secs)
         }));
 
         match result {
@@ -665,9 +701,10 @@ fn drat_exhaustive_dynamic_sweep_braun() {
     }
 
     eprintln!(
-        "DRAT-exhaustive braun sweep: {} verified, {} timed out, {} failed (of {} total)",
+        "DRAT-exhaustive braun sweep: {} verified, {} timed out, {} unbudgeted, {} failed (of {} total)",
         verified,
         timed_out,
+        unbudgeted,
         failures.len(),
         entries.len()
     );

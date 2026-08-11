@@ -640,7 +640,11 @@ impl ClauseArena {
 
     /// Accumulated dead words from deleted clauses. Used to gate compaction:
     /// compact when `dead_words() > len() / 4`.
-    #[cfg(test)]
+    ///
+    /// Exposed to `--stats` because the compaction trigger reads this and
+    /// nothing else: a run can sit at 45 k live clauses in a 73 M-word arena
+    /// with zero compactions, and without this counter beside `arena_words`
+    /// there is no way to see that the trigger has gone blind.
     #[inline]
     pub(crate) fn dead_words(&self) -> usize {
         self.dead_words

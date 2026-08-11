@@ -98,6 +98,16 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(600);
 /// Total wall budget for the whole pass (analysis + SMT checks).
 const PASS_BUDGET: Duration = Duration::from_secs(8);
 
+/// Wall budget for the `#[cfg(test)]` fixpoint helpers.
+///
+/// Matches [`PASS_BUDGET`] rather than being a tighter figure of its own: these
+/// helpers run inside a ~4000-test parallel suite, so a budget sized for an idle
+/// machine makes the tests that use them fail under load rather than report a
+/// real regression. The deterministic [`PASS_WORK_BUDGET`] fuel cap is what
+/// actually bounds them.
+#[cfg(test)]
+const TEST_HELPER_BUDGET: Duration = PASS_BUDGET;
+
 /// Deterministic work cap in addition to the wall-clock deadline.
 ///
 /// Deadline checks happen at every abstract-expression, atom, argument, and
@@ -339,7 +349,7 @@ fn const_bigint_budgeted(expr: &ChcExpr, budget: &mut PassBudget) -> Option<Opti
 
 #[cfg(test)]
 fn const_bigint(expr: &ChcExpr) -> Option<BigInt> {
-    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    let mut budget = PassBudget::new(Instant::now() + TEST_HELPER_BUDGET, PASS_WORK_BUDGET);
     const_bigint_budgeted(expr, &mut budget).flatten()
 }
 
@@ -1029,7 +1039,7 @@ fn retain_informative(state: &mut PredState, budget: &mut PassBudget) -> Option<
 
 #[cfg(test)]
 fn forward_fixpoint(problem: &ChcProblem) -> PredState {
-    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    let mut budget = PassBudget::new(Instant::now() + TEST_HELPER_BUDGET, PASS_WORK_BUDGET);
     forward_fixpoint_budgeted(problem, &mut budget).unwrap_or_default()
 }
 
@@ -1037,7 +1047,7 @@ fn forward_fixpoint(problem: &ChcProblem) -> PredState {
 /// [`IntervalPropagator::transform`] runs it before the informative filter.
 #[cfg(test)]
 fn narrowed_fixpoint(problem: &ChcProblem) -> PredState {
-    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    let mut budget = PassBudget::new(Instant::now() + TEST_HELPER_BUDGET, PASS_WORK_BUDGET);
     let mut state = forward_fixpoint_budgeted(problem, &mut budget).unwrap_or_default();
     narrow_fixpoint(problem, &mut state, &mut budget).expect("narrowing fits the test budget");
     state

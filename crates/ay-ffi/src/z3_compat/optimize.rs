@@ -66,10 +66,11 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 use super::{
-    apply_supported_params, cache_ast_vector, cache_string, cache_symbol, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
-    flatten_statistics, record_ast_sort, require_term_ast_or_return, term_to_ast,
+    apply_finite_set_decision_gate, apply_supported_params, assert_reachable_finite_set_axioms,
+    cache_ast_vector, cache_string, cache_symbol, ffi_guard_ast, ffi_guard_const_ptr,
+    ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ffi_read_bounded_parser_file,
+    ffi_read_bounded_parser_text, ffi_read_bounded_text, finite_set_decision_gate,
+    flatten_statistics, public_ast_sort, record_ast_sort, require_term_ast_or_return, term_to_ast,
     DecisionOwnerFamily, ModelHandle, OptimizeCheckOutcome, OptimizeHandle, OptimizeScopeMarker,
     ParamDescr, ParamDescrsHandle, SoftRecord, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector,
     Z3_context, Z3_model, Z3_optimize, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
@@ -110,6 +111,8 @@ pub unsafe extern "C" fn Z3_mk_optimize(c: Z3_context) -> Z3_optimize {
                 _ctx: c,
                 hard: Vec::new(),
                 softs: Vec::new(),
+                parsed_soft_public_terms: Vec::new(),
+                public_objectives: Vec::new(),
                 last_model: None,
                 last_check_outcome: None,
                 tracked: Vec::new(),
@@ -385,6 +388,32 @@ pub unsafe extern "C" fn Z3_optimize_check(
                 return Z3_L_UNDEF;
             }
 
+            let mut finite_set_roots = opt.hard.clone();
+            finite_set_roots.extend(opt.softs.iter().map(|soft| soft.term));
+            finite_set_roots.extend(opt.parsed_soft_public_terms.iter().copied());
+            for &(tracking, assertion) in &opt.tracked {
+                finite_set_roots.push(tracking);
+                finite_set_roots.push(assertion);
+            }
+            finite_set_roots.extend(opt.public_objectives.iter().copied());
+            let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
+            if finite_set_gate.quantifier_reason.is_some() {
+                let _ = apply_finite_set_decision_gate(
+                    ctx,
+                    Z3_L_UNDEF,
+                    &finite_set_gate,
+                    "Z3_optimize_check",
+                );
+                let reason = ctx.error_msg.clone().unwrap_or_else(|| {
+                    "finite-set optimization result is not certified".to_string()
+                });
+                ctx.last_error = Z3_OK;
+                ctx.error_msg = Some(reason.clone());
+                opt.last_reason_unknown = Some(reason);
+                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
+                return Z3_L_UNDEF;
+            }
+
             // Honest handling of assumptions: not threaded through optimization.
             if num_assumptions > 0 {
                 let reason =
@@ -410,6 +439,13 @@ pub unsafe extern "C" fn Z3_optimize_check(
             // the sound definitional UNSAT power), and a SAT/optimum outcome
             // over any rec-f mention is demoted below.
             if let Err(e) = super::assert_background_axioms(ctx, true) {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(e.clone());
+                opt.last_reason_unknown = Some(e);
+                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
+                return Z3_L_UNDEF;
+            }
+            if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg = Some(e.clone());
                 opt.last_reason_unknown = Some(e);
@@ -485,6 +521,23 @@ pub unsafe extern "C" fn Z3_optimize_check(
             };
 
             capture_check_diagnostics(ctx, opt, verdict);
+            if verdict == Z3_L_TRUE {
+                let gated = apply_finite_set_decision_gate(
+                    ctx,
+                    verdict,
+                    &finite_set_gate,
+                    "Z3_optimize_check",
+                );
+                if gated != verdict {
+                    let reason = ctx
+                        .error_msg
+                        .clone()
+                        .unwrap_or_else(|| "finite-set optimum is not certified".to_string());
+                    opt.last_reason_unknown = Some(reason);
+                    opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
+                    return Z3_L_UNDEF;
+                }
+            }
             // Transitive-closure SAT gate: the background axioms for a
             // `Z3_mk_transitive_closure` predicate are only PARTIAL (see
             // `verify_transitive_closure_model` in solver.rs), so a SAT here
@@ -520,11 +573,7 @@ pub unsafe extern "C" fn Z3_optimize_check(
                     scan.push(p);
                     scan.push(a);
                 }
-                for idx in 0..ctx.solver.num_objectives() {
-                    if let Some(t) = ctx.solver.objective_term(idx) {
-                        scan.push(t);
-                    }
-                }
+                scan.extend(opt.public_objectives.iter().copied());
                 let parsed_softs_present = ctx.solver.num_parsed_soft_constraints() > 0;
                 if parsed_softs_present
                     || ctx.solver.contains_rec_fun_apps(&scan, &ctx.rec_fun_defs)
@@ -784,6 +833,7 @@ unsafe fn optimize_register_objective(
                 ObjectiveSense::Maximize => ctx.solver.maximize(term),
                 ObjectiveSense::Minimize => ctx.solver.minimize(term),
             };
+            opt.public_objectives.push(term);
             opt.clear_check_artifacts();
             ctx.last_error = Z3_OK;
             idx as c_uint
@@ -966,6 +1016,8 @@ pub unsafe extern "C" fn Z3_optimize_push(c: Z3_context, o: Z3_optimize) {
                 hard_len: opt.hard.len(),
                 soft_len: opt.softs.len(),
                 tracked_len: opt.tracked.len(),
+                public_objective_len: opt.public_objectives.len(),
+                parsed_soft_public_len: opt.parsed_soft_public_terms.len(),
             };
             if let Err(e) = ctx.solver.try_push() {
                 ctx.last_error = Z3_EXCEPTION;
@@ -1022,6 +1074,9 @@ pub unsafe extern "C" fn Z3_optimize_pop(c: Z3_context, o: Z3_optimize) {
             opt.softs.truncate(marker.soft_len);
             ctx.solver.truncate_soft_constraints(marker.soft_len);
             opt.tracked.truncate(marker.tracked_len);
+            opt.public_objectives.truncate(marker.public_objective_len);
+            opt.parsed_soft_public_terms
+                .truncate(marker.parsed_soft_public_len);
             // The popped scope's model / core no longer apply.
             opt.clear_check_artifacts();
             ctx.last_error = Z3_OK;
@@ -1159,26 +1214,26 @@ pub unsafe extern "C" fn Z3_optimize_get_objectives(
     // null-checked via `as_ref`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            if o.as_ref().is_none() {
+            let Some(opt) = o.as_ref() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("null Z3_optimize handle in get_objectives".to_string());
                 return cache_ast_vector(ctx, Vec::new());
-            }
+            };
             let n = ctx.solver.num_objectives();
-            // Collect (term, sort) with immutable borrows before mutating ctx.
-            let items: Vec<(Term, Option<Sort>)> = (0..n)
-                .filter_map(|i| {
-                    ctx.solver
-                        .objective_term(i)
-                        .map(|t| (t, ctx.solver.objective_sort(i)))
-                })
-                .collect();
+            if opt.public_objectives.len() != n {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(
+                    "Z3_optimize_get_objectives: public objective metadata is not aligned"
+                        .to_string(),
+                );
+                return cache_ast_vector(ctx, Vec::new());
+            }
+            let items = opt.public_objectives.clone();
             let mut asts = Vec::with_capacity(items.len());
-            for (term, sort) in items {
+            for term in items {
                 let ast = term_to_ast(ctx, term);
-                if let Some(s) = sort {
-                    record_ast_sort(ctx, ast, s);
-                }
+                let sort = public_ast_sort(ctx, ast, term);
+                record_ast_sort(ctx, ast, sort);
                 asts.push(ast);
             }
             ctx.last_error = Z3_OK;
@@ -1468,15 +1523,26 @@ fn parse_optimize_transaction(
         "{operation}: parse transaction was interrupted before completion"
     ));
 
-    match ctx.solver.parse_smtlib2(input) {
-        Ok(new_asserts) => {
-            opt.hard.extend(new_asserts);
+    let parsed = ctx
+        .solver
+        .parse_smtlib2_z3_5(input)
+        .map_err(|error| error.to_string())
+        .and_then(|batch| {
+            super::retain_parsed_finite_set_batch(ctx, batch)
+                .map_err(|error| format!("public FiniteSet metadata retention failed: {error}"))
+        });
+    match parsed {
+        Ok(retained) => {
+            opt.hard.extend(retained.assertions);
+            opt.parsed_soft_public_terms
+                .extend(retained.soft_constraints);
+            opt.public_objectives.extend(retained.objectives);
             opt.terminal_error = None;
             ctx.last_error = Z3_OK;
             ctx.error_msg = None;
         }
-        Err(e) => {
-            let mut reason = format!("{operation}: parse execution failed: {e}");
+        Err(error) => {
+            let mut reason = format!("{operation}: parse execution failed: {error}");
             if let Err(rollback) = ctx.solver.try_pop() {
                 reason.push_str(&format!("; semantic rollback also failed: {rollback}"));
             }

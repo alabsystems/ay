@@ -880,6 +880,27 @@ fn test_lrat_binary_panics_on_from_index_bypass() {
     let _ = writer.add(&[lit], &[1]);
 }
 
+#[test]
+fn bounded_lrat_pending_deletion_failure_interrupts_promptly() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut buf = Vec::new();
+    let mut writer = LratWriter::new_binary_bounded(&mut buf, 2, 1, Arc::clone(&interrupt));
+    writer.delete(1).expect("first pending deletion");
+    assert!(writer.delete(2).is_err());
+    assert_eq!(
+        writer.bounded_resource_failure(),
+        Some(LratBoundedResourceFailure::PendingDeletionLimit {
+            limit: 1,
+            attempted: 2,
+        })
+    );
+    assert!(interrupt.load(Ordering::Acquire));
+    assert!(writer.pending_deletions_capacity_for_tests() <= 1);
+}
+
 // -- Text encoding overflow via from_index() bypass (#4474) --
 
 #[test]

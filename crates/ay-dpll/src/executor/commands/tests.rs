@@ -154,6 +154,21 @@ fn test_get_assertions_empty_and_nonempty() {
 }
 
 #[test]
+fn test_labels_follow_z3_result_availability() {
+    let mut exec = Executor::new();
+    assert_eq!(exec.labels(), "(error \"labels are not available\")");
+
+    exec.last_result = Some(SolveResult::Sat);
+    assert_eq!(exec.labels(), "(labels)");
+
+    exec.last_result = Some(SolveResult::Unknown);
+    assert_eq!(exec.labels(), "(labels)");
+
+    exec.last_result = Some(SolveResult::unsat());
+    assert_eq!(exec.labels(), "(error \"labels are not available\")");
+}
+
+#[test]
 fn test_format_term_handles_core_term_forms() {
     let mut exec = Executor::new();
 

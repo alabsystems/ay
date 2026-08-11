@@ -56,7 +56,7 @@ struct ColoredGraph {
 }
 
 /// Build the colored literal+clause graph for `clauses`.
-fn build_graph(clauses: &[Vec<Literal>]) -> ColoredGraph {
+fn build_graph(clauses: &[Vec<Literal>], sign_split: bool) -> ColoredGraph {
     // Dense variable mapping (sorted for determinism).
     let mut var_set: BTreeSet<Variable> = BTreeSet::new();
     for c in clauses {
@@ -100,14 +100,28 @@ fn build_graph(clauses: &[Vec<Literal>]) -> ColoredGraph {
         adj[q as usize].push(p);
     }
 
-    // Initial colors: positive literals 0, negative literals 1, clauses by length.
+    // Initial colors: clauses by length, plus either a polarity split (positive
+    // literals 0, negative literals 1 — sign-PRESERVING search) or a single
+    // literal color (SIGNED search, which also finds automorphisms that flip
+    // polarities).
+    //
+    // The split is not free: it is exactly what makes AY blind on shuffled
+    // competition benchmarks. On `homer11.shuffled` (SAT-COMP 2026 Main),
+    // 1-WL from the split colors discretizes to 440 singleton literal classes —
+    // no candidate pair survives — while 1-WL from a single literal color stops
+    // at 2 classes of 220 literals. The instance's symmetry is entirely in
+    // sign-flipping permutations.
     let mut init_color = vec![0u32; n];
-    for di in 0..nv {
-        init_color[2 * di] = 0;
-        init_color[2 * di + 1] = 1;
-    }
+    let mut next_class = if sign_split {
+        for di in 0..nv {
+            init_color[2 * di] = 0;
+            init_color[2 * di + 1] = 1;
+        }
+        2u32
+    } else {
+        1u32
+    };
     let mut len_class: BTreeMap<usize, u32> = BTreeMap::new();
-    let mut next_class = 2u32;
     for (ci, c) in clauses.iter().enumerate() {
         let id = *len_class.entry(c.len()).or_insert_with(|| {
             let v = next_class;
@@ -129,9 +143,11 @@ fn build_graph(clauses: &[Vec<Literal>]) -> ColoredGraph {
 /// colors until the partition is stable. Renormalizes colors to a dense
 /// `0..k` range, ordered by `(old_color, sorted neighbor-color multiset)` so the
 /// refinement is deterministic and order-preserving.
-fn refine(adj: &[Vec<u32>], color: &mut Vec<u32>) {
+fn refine(adj: &[Vec<u32>], color: &mut Vec<u32>) -> u64 {
     let n = color.len();
+    let mut rounds = 0u64;
     loop {
+        rounds += 1;
         let mut sigs: Vec<(u32, Vec<u32>)> = Vec::with_capacity(n);
         for u in 0..n {
             let mut nb: Vec<u32> = adj[u].iter().map(|&v| color[v as usize]).collect();
@@ -155,6 +171,7 @@ fn refine(adj: &[Vec<u32>], color: &mut Vec<u32>) {
             break;
         }
     }
+    rounds
 }
 
 /// Individualize node `v`: give it a singleton color ordered first within its
@@ -227,6 +244,12 @@ struct Search<'a> {
     node_budget: u64,
     max_generators: usize,
     nodes: u64,
+    /// Edges in the model graph — the unit of the deterministic work budget.
+    edge_count: u64,
+    /// Literals in the clause multiset — the cost of one gate verification.
+    verify_cost: u64,
+    work: u64,
+    work_budget: u64,
     /// First (leftmost) discrete leaf: rank (color id) -> node.
     first_leaf: Option<Vec<usize>>,
     /// Cell-size invariant along the leftmost path, indexed by depth.
@@ -235,6 +258,11 @@ struct Search<'a> {
     uf: Vec<usize>,
     generators: Vec<BTreeMap<Variable, Variable>>,
     seen: BTreeSet<BTreeMap<Variable, Variable>>,
+    /// When set, leaves are projected to LITERAL permutations (sign flips
+    /// allowed) and collected in `signed_generators` instead.
+    signed: bool,
+    signed_generators: Vec<BTreeMap<Literal, Literal>>,
+    signed_seen: BTreeSet<Vec<(u32, u32)>>,
 }
 
 impl Search<'_> {
@@ -282,12 +310,84 @@ impl Search<'_> {
         Some(perm)
     }
 
+    /// Project a node-level automorphism to a LITERAL permutation, allowing
+    /// sign flips. Returns `None` when a literal node maps onto a clause node
+    /// or the complement pairing is broken.
+    fn project_signed(&self, g: &[usize]) -> Option<BTreeMap<Literal, Literal>> {
+        let mut perm = BTreeMap::new();
+        for i in 0..self.nv {
+            for sign in 0..2 {
+                let src = 2 * i + sign;
+                let img = g[src];
+                if img >= 2 * self.nv {
+                    return None; // literal mapped onto a clause node
+                }
+                // The complement pairing must be respected: ¬l tracks l.
+                if g[src ^ 1] != (img ^ 1) {
+                    return None;
+                }
+                if img != src {
+                    perm.insert(self.dense_literal(src), self.dense_literal(img));
+                }
+            }
+        }
+        Some(perm)
+    }
+
+    /// Literal for a dense literal-node id (`2*i` positive, `2*i+1` negative).
+    fn dense_literal(&self, node: usize) -> Literal {
+        let var = self.dense_to_var[node / 2];
+        if node.is_multiple_of(2) {
+            Literal::positive(var)
+        } else {
+            Literal::negative(var)
+        }
+    }
+
+    fn handle_signed_leaf(&mut self, leaf: &[usize], first: &[usize]) {
+        let n = leaf.len();
+        let mut g = vec![0usize; n];
+        for r in 0..n {
+            g[first[r]] = leaf[r];
+        }
+        let Some(perm) = self.project_signed(&g) else {
+            return;
+        };
+        self.work = self.work.saturating_add(self.verify_cost);
+        if perm.is_empty()
+            || !crate::symmetry::literal_permutation_preserves_formula(self.formula_counts, &perm)
+        {
+            return;
+        }
+        // Orbit union-find over literal nodes (sound: verified automorphism).
+        let pairs: Vec<(usize, usize)> = (0..2 * self.nv)
+            .filter_map(|src| (g[src] != src && g[src] < 2 * self.nv).then_some((src, g[src])))
+            .collect();
+        for (a, b) in pairs {
+            self.union(a, b);
+        }
+        let key: Vec<(u32, u32)> = perm.iter().map(|(a, b)| (a.raw(), b.raw())).collect();
+        if self.signed_seen.insert(key) {
+            self.signed_generators.push(perm);
+        }
+    }
+
     fn handle_leaf(&mut self, color: &[u32]) {
         let n = color.len();
         // rank (color id) -> node.
         let mut leaf = vec![0usize; n];
         for (node, &c) in color.iter().enumerate() {
             leaf[c as usize] = node;
+        }
+        if self.signed {
+            match self.first_leaf.take() {
+                None => self.first_leaf = Some(leaf),
+                Some(first) => {
+                    self.handle_signed_leaf(&leaf, &first);
+                    self.first_leaf = Some(first);
+                }
+            }
+            return;
         }
         match &self.first_leaf {
             None => self.first_leaf = Some(leaf),
@@ -318,12 +418,30 @@ impl Search<'_> {
         }
     }
 
+    /// Generators found so far, whichever projection this search is collecting.
+    fn generator_count(&self) -> usize {
+        if self.signed {
+            self.signed_generators.len()
+        } else {
+            self.generators.len()
+        }
+    }
+
     fn dfs(&mut self, mut color: Vec<u32>, depth: usize, leftmost: bool) {
-        if self.nodes > self.node_budget || self.generators.len() >= self.max_generators {
+        if self.nodes > self.node_budget
+            || self.work > self.work_budget
+            || self.generator_count() >= self.max_generators
+        {
             return;
         }
         self.nodes += 1;
-        refine(self.adj, &mut color);
+        let rounds = refine(self.adj, &mut color);
+        // Deterministic cost accounting: one refinement round touches every
+        // edge. Without it the SIGNED search is unaffordable — dropping the
+        // polarity split coarsens the initial partition, so the IR tree is far
+        // wider, and a node budget alone let a 2320-variable instance spend
+        // 3.6 s searching where the whole solve takes 0.02 s.
+        self.work = self.work.saturating_add(rounds * self.edge_count);
 
         let inv = cell_size_signature(&color);
         if leftmost {
@@ -345,7 +463,7 @@ impl Search<'_> {
         let mut branched: Vec<usize> = Vec::new();
         let mut first_child = true;
         for &v in &members {
-            if self.nodes > self.node_budget || self.generators.len() >= self.max_generators {
+            if self.nodes > self.node_budget || self.generator_count() >= self.max_generators {
                 break;
             }
             // Orbit pruning: skip v if a previously-branched node is in its orbit.
@@ -378,20 +496,65 @@ pub(crate) fn find_automorphisms(
     node_budget: u64,
     max_generators: usize,
 ) -> Vec<BTreeMap<Variable, Variable>> {
+    run_search(clauses, formula_counts, node_budget, max_generators, false).0
+}
+
+/// Find gate-verified SIGNED automorphisms: literal permutations that may flip
+/// polarities. Each generator is verified by
+/// [`crate::symmetry::literal_permutation_preserves_formula`], so a search bug
+/// can only cost generators, never soundness.
+///
+/// This is the projection that matters on competition benchmarks, whose
+/// polarity shuffling turns variable symmetry into signed symmetry.
+pub(crate) fn find_signed_automorphisms(
+    clauses: &[Vec<Literal>],
+    formula_counts: &BTreeMap<Vec<u32>, u32>,
+    node_budget: u64,
+    max_generators: usize,
+) -> Vec<BTreeMap<Literal, Literal>> {
+    run_search(clauses, formula_counts, node_budget, max_generators, true).1
+}
+
+type SearchResult = (
+    Vec<BTreeMap<Variable, Variable>>,
+    Vec<BTreeMap<Literal, Literal>>,
+);
+
+fn run_search(
+    clauses: &[Vec<Literal>],
+    formula_counts: &BTreeMap<Vec<u32>, u32>,
+    node_budget: u64,
+    max_generators: usize,
+    signed: bool,
+) -> SearchResult {
     if clauses.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let graph = build_graph(clauses);
+    let graph = build_graph(clauses, !signed);
     let n = graph.adj.len();
     // Guard against pathological graph sizes (caller also caps vars/clauses).
     if n == 0 || graph.nv == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let mut var_to_dense: BTreeMap<Variable, usize> = BTreeMap::new();
     for (i, v) in graph.dense_to_var.iter().enumerate() {
         var_to_dense.insert(*v, i);
     }
+
+    let edge_count: u64 = graph.adj.iter().map(|a| a.len() as u64).sum::<u64>().max(1);
+    let verify_cost: u64 = formula_counts
+        .iter()
+        .map(|(k, _)| k.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    // Deterministic work ceiling for the whole search, in edge-visits. Sized so
+    // detection stays in the tens of milliseconds on the instances it fires on
+    // while never dominating an easy solve. Overridable for experiments.
+    let work_budget: u64 = std::env::var("AY_SAT_IR_WORK_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000_000);
 
     let mut search = Search {
         adj: &graph.adj,
@@ -402,15 +565,22 @@ pub(crate) fn find_automorphisms(
         node_budget,
         max_generators,
         nodes: 0,
+        edge_count,
+        verify_cost,
+        work: 0,
+        work_budget,
         first_leaf: None,
         first_path_inv: Vec::new(),
         uf: (0..n).collect(),
         generators: Vec::new(),
         seen: BTreeSet::new(),
+        signed,
+        signed_generators: Vec::new(),
+        signed_seen: BTreeSet::new(),
     };
 
     search.dfs(graph.init_color.clone(), 0, true);
-    search.generators
+    (search.generators, search.signed_generators)
 }
 
 #[cfg(test)]
@@ -559,6 +729,55 @@ mod tests {
         for g in &gens {
             // Whatever it returns must be sound.
             assert!(permutation_preserves_formula(&counts, g));
+        }
+    }
+
+    /// `(a ∨ b) ∧ (¬a ∨ ¬b)` is invariant under flipping BOTH variables, a
+    /// symmetry no sign-preserving search can represent.
+    #[test]
+    fn signed_search_finds_a_polarity_flip() {
+        let clauses = vec![
+            vec![lit(0, true), lit(1, true)],
+            vec![lit(0, false), lit(1, false)],
+        ];
+        let counts = build_formula_counts(&clauses);
+        let signed = find_signed_automorphisms(&clauses, &counts, 10_000, 64);
+        assert!(!signed.is_empty(), "signed search must find generators");
+        for g in &signed {
+            assert!(crate::symmetry::literal_permutation_preserves_formula(
+                &counts, g
+            ));
+            // Complement-closed: ¬l tracks l.
+            for (from, to) in g {
+                assert_eq!(
+                    g.get(&from.negated()).copied(),
+                    Some(to.negated()),
+                    "signed permutation must be complement-closed"
+                );
+            }
+        }
+        assert!(
+            signed.iter().any(|g| g
+                .iter()
+                .any(|(from, to)| from.is_positive() != to.is_positive())),
+            "at least one generator must flip a polarity"
+        );
+    }
+
+    /// A formula with no symmetry at all must yield nothing from the signed
+    /// search either — and never an unverified permutation.
+    #[test]
+    fn signed_search_is_sound_on_an_asymmetric_formula() {
+        let clauses = vec![
+            vec![lit(0, true)],
+            vec![lit(0, true), lit(1, true)],
+            vec![lit(1, false), lit(2, true)],
+        ];
+        let counts = build_formula_counts(&clauses);
+        for g in &find_signed_automorphisms(&clauses, &counts, 10_000, 64) {
+            assert!(crate::symmetry::literal_permutation_preserves_formula(
+                &counts, g
+            ));
         }
     }
 }

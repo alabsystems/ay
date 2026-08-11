@@ -303,6 +303,7 @@ impl LogicCategory {
 
             // QF nonlinear -> QF UF + nonlinear
             Self::QfNia => Self::QfUfnia,
+            Self::QfEia => Self::QfUfnia,
             Self::QfNra => Self::QfUfnra,
             Self::QfNira => Self::QfUfnira,
 
@@ -340,6 +341,7 @@ impl LogicCategory {
         match self {
             // Already nonlinear — no upgrade needed
             Self::QfNia
+            | Self::QfEia
             | Self::QfNra
             | Self::QfNira
             | Self::QfUfnia

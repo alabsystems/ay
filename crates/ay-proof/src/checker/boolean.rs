@@ -66,25 +66,92 @@ pub(crate) fn find_app<'a>(
         .find_map(|lit| decode_app(terms, lit, name).map(|args| (lit, args)))
 }
 
-pub(crate) fn find_negated_ite(
-    terms: &TermStore,
-    clause: &[TermId],
-) -> Option<(TermId, (TermId, TermId, TermId))> {
-    clause.iter().copied().find_map(|lit| {
+// ---- Candidate enumeration ----
+//
+// The `find_*` helpers above return only the FIRST literal of a given shape and
+// never backtrack. That is only safe when the rule's target literal is the sole
+// candidate, and it is not: whenever an operand is itself a term of the same
+// shape, the clause holds two. `equiv_pos1` over `(= a (= p q))` emits
+// `(cl (not (= a (= p q))) a (not (= p q)))` — two `(not (= ...))` literals.
+// Nothing pins their order (`clause_matches_expected` is deliberately unordered,
+// precisely because emitters disagree), so when the decoy comes first the rule
+// decoded the wrong term and rejected a correct proof, publishing its `unsat`
+// as `unknown`.
+//
+// The plural forms below enumerate every candidate; `check_any_candidate` drives
+// the rule's own shape predicate over all of them. This is NOT a relaxation —
+// each candidate still has to satisfy the complete predicate. The only thing
+// that changes is that a failure on one candidate no longer suppresses the rest.
+// See `checker/candidate_backtracking_tests.rs`.
+
+pub(crate) fn negated_apps<'a>(
+    terms: &'a TermStore,
+    clause: &'a [TermId],
+    name: &'a str,
+) -> impl Iterator<Item = (TermId, &'a [TermId])> + 'a {
+    clause.iter().copied().filter_map(move |lit| {
+        let inner = strip_not(terms, lit)?;
+        let args = decode_app(terms, inner, name)?;
+        Some((lit, args))
+    })
+}
+
+pub(crate) fn apps<'a>(
+    terms: &'a TermStore,
+    clause: &'a [TermId],
+    name: &'a str,
+) -> impl Iterator<Item = (TermId, &'a [TermId])> + 'a {
+    clause
+        .iter()
+        .copied()
+        .filter_map(move |lit| decode_app(terms, lit, name).map(|args| (lit, args)))
+}
+
+pub(crate) fn ites<'a>(
+    terms: &'a TermStore,
+    clause: &'a [TermId],
+) -> impl Iterator<Item = (TermId, (TermId, TermId, TermId))> + 'a {
+    clause
+        .iter()
+        .copied()
+        .filter_map(move |lit| decode_ite(terms, lit).map(|ite| (lit, ite)))
+}
+
+pub(crate) fn negated_ites<'a>(
+    terms: &'a TermStore,
+    clause: &'a [TermId],
+) -> impl Iterator<Item = (TermId, (TermId, TermId, TermId))> + 'a {
+    clause.iter().copied().filter_map(move |lit| {
         let inner = strip_not(terms, lit)?;
         let ite = decode_ite(terms, inner)?;
         Some((lit, ite))
     })
 }
 
-pub(crate) fn find_ite(
-    terms: &TermStore,
-    clause: &[TermId],
-) -> Option<(TermId, (TermId, TermId, TermId))> {
-    clause
-        .iter()
-        .copied()
-        .find_map(|lit| decode_ite(terms, lit).map(|ite| (lit, ite)))
+/// Accept if ANY candidate satisfies `shape_ok`.
+///
+/// `shape_ok` returns the rule's own rejection reason for a candidate it turns
+/// down. If no candidate is accepted, the FIRST such reason is reported, so a
+/// clause with a single candidate produces exactly the message it produced
+/// before this driver existed. `missing` is used only when there is no
+/// candidate at all.
+pub(crate) fn check_any_candidate<T>(
+    step: ProofId,
+    rule: &str,
+    missing: &str,
+    candidates: impl Iterator<Item = T>,
+    mut shape_ok: impl FnMut(T) -> Result<(), &'static str>,
+) -> Result<(), ProofCheckError> {
+    let mut first_reason: Option<&'static str> = None;
+    for candidate in candidates {
+        match shape_ok(candidate) {
+            Ok(()) => return Ok(()),
+            Err(reason) => {
+                first_reason.get_or_insert(reason);
+            }
+        }
+    }
+    err(step, rule, first_reason.unwrap_or(missing))
 }
 
 fn decode_and_source<'a>(
@@ -151,6 +218,19 @@ pub(crate) fn matches_negation_of_term(terms: &TermStore, lit: TermId, term: Ter
         return true;
     }
 
+    // NNF represents `not (ite c t e)` as `ite c (not t) (not e)`.
+    // Proof rewriting uses that normalized form inside De Morgan complements
+    // (for example the gate literal of `and_pos`), so recognize the exact
+    // condition and the negation of both branches. This remains structural:
+    // changing the condition or either branch polarity is rejected.
+    if let Some((condition, then_term, else_term)) = decode_ite(terms, term) {
+        return decode_ite(terms, lit).is_some_and(|(lit_condition, lit_then, lit_else)| {
+            lit_condition == condition
+                && matches_negation_of_term(terms, lit_then, then_term)
+                && matches_negation_of_term(terms, lit_else, else_term)
+        });
+    }
+
     match terms.get(term) {
         TermData::Not(inner) => matches_positive_literal_of_term(terms, lit, *inner),
         TermData::App(Symbol::Named(name), args) if name == "and" => {
@@ -201,7 +281,27 @@ pub(crate) fn clause_matches_expected(
             }
             match expected_lit {
                 ExpectedLit::Lit(term) => lit == *term,
-                ExpectedLit::Not(term) => strip_not(terms, lit) == Some(*term),
+                // `matches_negation_of_term`, NOT a raw `strip_not` comparison.
+                //
+                // `strip_not(lit) == Some(term)` is purely syntactic, so when
+                // `term` is itself `(not X)` it demands the literal `(not (not X))`
+                // — a term `TermStore` CANNOT construct. `mk_not`, `negate_term`
+                // and the canonicalizer's `neg()` all collapse double negation to
+                // `X`, so no emitter could ever satisfy it, and every
+                // `equiv_pos1`/`equiv_neg1` over a negated operand was rejected as
+                // "clause shape does not match equality" — publishing a correct
+                // `unsat` as `unknown`.
+                //
+                // This is ADDITIVE, not a relaxation: `matches_negation_of_term`
+                // opens with exactly the `strip_not(lit) == Some(term)` test being
+                // replaced, so every clause accepted before is still accepted. Nor
+                // is it a new grant of trust — it is the same predicate
+                // `resolution.rs` uses for PIVOT matching (210/217/219), the most
+                // soundness-critical comparison in the checker. The rule's real
+                // content (exact multiset + length + operand POLARITY) is untouched
+                // and still enforced; see `equiv_negation_shape_tests.rs`, which
+                // pins the rejecting direction alongside the accepting one.
+                ExpectedLit::Not(term) => matches_negation_of_term(terms, lit, *term),
             }
         }) else {
             return false;

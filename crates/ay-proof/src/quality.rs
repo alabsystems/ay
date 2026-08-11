@@ -362,6 +362,8 @@ pub fn check_proof_strict_with_context(
         return Err(ProofCheckError::EmptyProof);
     }
 
+    crate::checker::validate_proof_producing_bv_budget(proof, terms)?;
+
     if let Some(assertions) = problem_assertions {
         validate_problem_assumptions(proof, terms, assertions)?;
     }
@@ -370,6 +372,10 @@ pub fn check_proof_strict_with_context(
     // whole-proof conditions (bound once, fresh against the problem, not
     // self-referential) are enforced, so a bad introduction fails the check
     // even when no lemma ever cites it.
+    // Same provenance discipline as `ext_diff`: built once from the PROBLEM so
+    // `SetCardEmptyByAssertion` can be decided; `None` keeps it fail-closed.
+    let empty_sets = problem_assertions
+        .map(|assertions| crate::checker::EmptySetRegistry::collect(terms, assertions));
     let ext_diff = match problem_assertions {
         Some(assertions) => Some(ExtDiffRegistry::collect(proof, terms, assertions)?),
         None => None,
@@ -389,6 +395,7 @@ pub fn check_proof_strict_with_context(
             dt_decls,
             ctor_selectors,
             ext_diff.as_ref(),
+            empty_sets.as_ref(),
             None,
         )?;
     }

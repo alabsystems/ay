@@ -424,6 +424,36 @@ mod tests {
         assert_eq!(capture.finish().as_bytes(), input);
     }
 
+    /// Run a trial, tolerating a transient `ETXTBSY` from the freshly written
+    /// fake-solver script.
+    ///
+    /// The unix tests below write a small shell script and immediately `execve`
+    /// it. `std::fs::write` closes its own descriptor, but any *other* test
+    /// thread in this same binary that forks in that window (there are several
+    /// process-spawning tests here) hands the forked child an inherited copy of
+    /// the still-open write descriptor. Until that child reaches its own
+    /// `execve` the kernel sees a writable descriptor on the script and refuses
+    /// our exec with `ETXTBSY` — reported as
+    /// `SpawnFailed { ExecutableFileBusy }`. The race is inherent to
+    /// fork/exec (rust-lang/rust#97590, golang/go#22315); the standard remedy
+    /// is to retry the exec, which observes exactly the same run and therefore
+    /// weakens no assertion below.
+    #[cfg(unix)]
+    fn run_trial_tolerating_text_busy(runner: &CliRunner, flags: &[&str]) -> SolveResult {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match runner.run(flags) {
+                Err(BisectError::SpawnFailed { source, .. })
+                    if source.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                other => return other.expect("fake solver trial must run"),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn cli_runner_bounds_noisy_output_and_keeps_trailing_verdict() {
@@ -442,7 +472,10 @@ mod tests {
         let input = dir.path().join("case.smt2");
         std::fs::write(&input, "(check-sat)\n").expect("write input");
         let runner = CliRunner::new(solver, input, Duration::from_secs(10), false);
-        assert_eq!(runner.run(&[]).unwrap(), SolveResult::Sat);
+        assert_eq!(
+            run_trial_tolerating_text_busy(&runner, &[]),
+            SolveResult::Sat
+        );
     }
 
     #[cfg(unix)]
@@ -479,7 +512,10 @@ mod tests {
         let runner = CliRunner::new(solver, input.clone(), Duration::from_secs(5), false)
             .with_resource_plan(&plan);
 
-        assert_eq!(runner.run(&["--no-bve"]).unwrap(), SolveResult::Sat);
+        assert_eq!(
+            run_trial_tolerating_text_busy(&runner, &["--no-bve"]),
+            SolveResult::Sat
+        );
         let argv = std::fs::read_to_string(argv_file).expect("read argv");
         assert!(argv.contains("--memory\n321\n"), "{argv:?}");
         assert!(argv.contains("--no-bve\n"), "{argv:?}");

@@ -659,6 +659,12 @@ fn native_definitional_forall_adopts_exact_macro_and_prints_model() {
     assert!(model.contains("native_definition_x"), "{model}");
 }
 
+/// A PREDICATE definition keeps REFUSING on an earlier constrained use.
+///
+/// Ground pre-definition applications are otherwise PINNED to their own
+/// definitional instance rather than refused, but a Bool-ranged pin is an
+/// equality strict UNSAT certification cannot currently reconstruct, so for
+/// predicates the original refusal stands and the `forall` is left asserted.
 #[test]
 fn native_definitional_forall_refuses_an_earlier_constrained_use() {
     let mut solver = Solver::try_new(Logic::Uflia).unwrap();
@@ -697,6 +703,96 @@ fn native_definitional_forall_refuses_a_discarded_raw_application() {
     solver.try_assert_term(axiom).unwrap();
 
     assert!(!solver.defined_funs.contains_key("native_prebuilt"));
+    assert_eq!(solver.assertions(), vec![axiom]);
+}
+
+/// A NON-predicate definition PINS instead: the retained raw application —
+/// asserted after adoption, bypassing `try_apply` expansion entirely, which is
+/// the exact hazard the whole-arena refusal was protecting against — is fixed
+/// at the value the definition gives it, so a contradicting claim still
+/// refutes. A stranded uninterpreted `native_pinned` would have been
+/// satisfiable.
+#[test]
+fn native_definitional_forall_pins_a_retained_ground_application() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let function = solver
+        .try_declare_fun("native_pinned", &[Sort::Int], Sort::Int)
+        .unwrap();
+    let zero = solver.int_const(0);
+    let retained_raw_application = solver.try_apply(&function, &[zero]).unwrap();
+
+    let one = solver.int_const(1);
+    let parameter = solver.fresh_var("native_pinned_x", Sort::Int);
+    let application = solver.try_apply(&function, &[parameter]).unwrap();
+    let body = solver.try_add(parameter, one).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+
+    assert!(solver.defined_funs.contains_key("native_pinned"));
+    assert_ne!(
+        solver.assertions(),
+        vec![axiom],
+        "the quantifier is discharged, not left standing"
+    );
+
+    // `native_pinned(0)` is 1 under the definition; claim 2 through the
+    // RETAINED handle and the pin must refute it.
+    let two = solver.int_const(2);
+    let wrong = solver.try_eq(retained_raw_application, two).unwrap();
+    solver.try_assert_term(wrong).unwrap();
+    let result = solver.check_sat();
+    assert!(result.is_unsat(), "pin must still constrain: {result:?}");
+}
+
+/// TWIN: the same retained handle with the TRUE value stays satisfiable, so the
+/// pin refutes because of the value, not because it is contradictory.
+#[test]
+fn native_definitional_forall_pin_admits_the_true_value() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let function = solver
+        .try_declare_fun("native_pinned_ok", &[Sort::Int], Sort::Int)
+        .unwrap();
+    let zero = solver.int_const(0);
+    let retained_raw_application = solver.try_apply(&function, &[zero]).unwrap();
+
+    let one = solver.int_const(1);
+    let parameter = solver.fresh_var("native_pinned_ok_x", Sort::Int);
+    let application = solver.try_apply(&function, &[parameter]).unwrap();
+    let body = solver.try_add(parameter, one).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+
+    let right = solver.try_eq(retained_raw_application, one).unwrap();
+    solver.try_assert_term(right).unwrap();
+    let result = solver.check_sat();
+    assert!(result.is_sat(), "the true value must remain: {result:?}");
+}
+
+/// NARROWNESS PIN: a pre-definition application over a VARIABLE argument cannot
+/// be pinned (the enclosing quantifier's other instances are applications at
+/// points no ground pin covers), so adoption keeps REFUSING there.
+#[test]
+fn native_definitional_forall_still_refuses_a_variable_argument_use() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let predicate = solver
+        .try_declare_fun("native_varuse", &[Sort::Int], Sort::Bool)
+        .unwrap();
+    let subject = solver
+        .try_declare_const("native_varuse_c", Sort::Int)
+        .unwrap();
+    let _retained_raw_application = solver.try_apply(&predicate, &[subject]).unwrap();
+
+    let zero = solver.int_const(0);
+    let parameter = solver.fresh_var("native_varuse_x", Sort::Int);
+    let application = solver.try_apply(&predicate, &[parameter]).unwrap();
+    let body = solver.try_gt(parameter, zero).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+
+    assert!(!solver.defined_funs.contains_key("native_varuse"));
     assert_eq!(solver.assertions(), vec![axiom]);
 }
 

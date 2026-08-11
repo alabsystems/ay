@@ -18,6 +18,33 @@ fn test_bool_constants() {
     assert_eq!(f1, store.false_term());
 }
 
+/// Store-free callers (the proof-shape recognizers, which receive only a
+/// `Proof`) name the `false` constant through `PREALLOCATED_FALSE`. Pin the
+/// invariant that makes that legal: the constant is the interning position
+/// `new()` gives `false`, and it survives cloning and rollback.
+#[test]
+fn preallocated_false_matches_every_store() {
+    let mut store = TermStore::new();
+    assert_eq!(store.false_term(), TermStore::PREALLOCATED_FALSE);
+    assert_eq!(
+        store.get(TermStore::PREALLOCATED_FALSE),
+        &TermData::Const(Constant::Bool(false))
+    );
+
+    let checkpoint = store.rollback_checkpoint();
+    let _scratch = store.mk_var("scratch", Sort::Bool);
+    let clone = store.clone();
+    assert_eq!(clone.false_term(), TermStore::PREALLOCATED_FALSE);
+    store.rollback_to(checkpoint);
+    assert_eq!(store.false_term(), TermStore::PREALLOCATED_FALSE);
+
+    assert_eq!(
+        TermStore::new().false_term(),
+        TermStore::PREALLOCATED_FALSE,
+        "a second store must agree with the first"
+    );
+}
+
 #[test]
 fn test_negation_simplification() {
     let mut store = TermStore::new();

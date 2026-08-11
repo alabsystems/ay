@@ -1,0 +1,7 @@
+(set-logic AUFLIA)
+(define-fun a ((x Int)) Bool (= x 0))
+(define-fun k2 () Int 0)
+(define-fun A () (Array Int Int) ((as const (Array Int Int)) 1))
+(assert (forall ((x Int)) (=> (a x) (forall ((y Int)) (not (= (select A y) x))))))
+(assert (a k2))
+(check-sat)

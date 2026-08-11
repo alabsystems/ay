@@ -154,6 +154,38 @@ fn test_const_array_read_simplification() {
 }
 
 #[test]
+fn test_array_default_preserves_stores_over_bool_carrier() {
+    let mut store = TermStore::new();
+    let false_term = store.mk_bool(false);
+    let true_term = store.mk_bool(true);
+    let base = store.mk_const_array(Sort::Bool, false_term);
+    let at_false = store.mk_store(base, false_term, true_term);
+    let all_true = store.mk_store(at_false, true_term, true_term);
+
+    let default = store.mk_array_default(all_true);
+
+    assert_eq!(store.get_array_default(default), Some(all_true));
+    assert_ne!(default, false_term);
+}
+
+#[test]
+fn test_array_default_preserves_stores_over_finite_bitvec_carrier() {
+    let mut store = TermStore::new();
+    let false_term = store.mk_bool(false);
+    let true_term = store.mk_bool(true);
+    let zero = store.mk_bitvec(BigInt::from(0), 1);
+    let one = store.mk_bitvec(BigInt::from(1), 1);
+    let base = store.mk_const_array(Sort::bitvec(1), false_term);
+    let at_zero = store.mk_store(base, zero, true_term);
+    let all_true = store.mk_store(at_zero, one, true_term);
+
+    let default = store.mk_array_default(all_true);
+
+    assert_eq!(store.get_array_default(default), Some(all_true));
+    assert_ne!(default, false_term);
+}
+
+#[test]
 fn test_const_array_with_store() {
     let mut store = TermStore::new();
 

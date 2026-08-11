@@ -20,17 +20,19 @@ default = []
 # Tests enabled by this feature require VeriPB through VERIPB_BIN or PATH and
 # fail closed when the checker is absent or rejects a generated proof.
 # Keep this opt-in so ordinary library consumers need no external checker.
-certified-proof-artifacts = ["dep:nix"]
+certified-proof-artifacts = ["ay-pb-core/certified-proof-artifacts", "dep:nix"]
 # Explicit, non-default developer campaigns and fixture generators. Keeping
 # these behind a feature lets the tools call crate-internal solver lanes without
 # widening the production library API.
-dev-tools = ["dep:nix"]
+dev-tools = ["ay-pb-core/dev-tools", "dep:nix"]
 
 [dependencies]
+ay-pb-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+ay-core.workspace = true
 ay-sat.workspace = true
 ay-sys.workspace = true
 signal-hook.workspace = true
@@ -39,10 +41,9 @@ ay-jit = { workspace = true, optional = true }
 num-rational.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
-# The native MILP engine lane (OPT-LIN post-solve optimality upgrade).
-# `optimize::milp_lane` imports it unconditionally, so it must be a plain
-# (all-platform) dependency — it briefly sat in the cfg(unix) table below,
-# which broke every Windows build with E0432 on `use ay_milp`.
+# Leaf-owned native MILP lane (OPT-LIN post-solve optimality upgrade). The
+# solver implementation is in ay-pb-core, so ay-milp can depend on that core
+# without closing a package cycle through this facade.
 ay-milp.workspace = true
 
 # Process-CPU accounting (getrusage) for the competition CPU-time budget

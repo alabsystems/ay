@@ -480,7 +480,7 @@ fn test_resolve_conflict_for_unsat_core_walks_resolved_away_assumption() {
     assumption_lit[a.index()] = Some(Literal::positive(a));
     assumption_lit[b.index()] = Some(Literal::positive(b));
 
-    let core =
+    let (core, _incomplete) =
         solver.resolve_conflict_for_unsat_core(conflict_ref, &is_assumption, &assumption_lit);
 
     assert!(

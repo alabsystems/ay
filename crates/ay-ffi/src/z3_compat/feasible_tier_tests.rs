@@ -639,15 +639,669 @@ fn quantifier_id_and_skolem_id_roundtrip() {
             .expect("quantifier Skolem ID must be valid UTF-8");
         assert_eq!(sname, "myskid");
 
-        // A STRUCTURALLY-DISTINCT quantifier with NO explicit qid → honest null
-        // (never fabricated). (It must differ structurally from `q`; a quantifier
-        // identical except for its qid hash-conses to the same term — the
-        // documented benign metadata caveat.)
+        // A structurally distinct quantifier with no explicit qid returns an
+        // honest null rather than a fabricated identifier.
         let body2 = Z3_mk_gt(c, x, Z3_mk_int(c, 5, int));
         let q2 = Z3_mk_forall_const(c, 0, 1, bound.as_ptr(), 0, ptr::null(), body2);
         assert!(Z3_get_quantifier_id(c, q2).is_null());
 
         Z3_del_context(c);
+    }
+}
+
+#[test]
+fn quantifier_symbol_ids_preserve_kind_and_reject_kind_aliases() {
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let x = Z3_mk_const(c, sym(c, c"quantifier-symbol-x"), int);
+        let body = Z3_mk_ge(c, x, Z3_mk_int(c, 0, int));
+        let bound = [x];
+        let integer_id = Z3_mk_int_symbol(c, 7);
+        let q = Z3_mk_quantifier_const_ex(
+            c,
+            true,
+            1,
+            integer_id,
+            integer_id,
+            1,
+            bound.as_ptr(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            body,
+        );
+        assert_ne!(q, 0);
+
+        let got_qid = Z3_get_quantifier_id(c, q);
+        let got_skid = Z3_get_quantifier_skolem_id(c, q);
+        assert_eq!(Z3_get_symbol_kind(c, got_qid), 0);
+        assert_eq!(Z3_get_symbol_kind(c, got_skid), 0);
+        assert_eq!(Z3_get_symbol_int(c, got_qid), 7);
+        assert_eq!(Z3_get_symbol_int(c, got_skid), 7);
+
+        let string_id = sym(c, c"7");
+        let conflicting = Z3_mk_quantifier_const_ex(
+            c,
+            true,
+            1,
+            string_id,
+            string_id,
+            1,
+            bound.as_ptr(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            body,
+        );
+        assert_eq!(conflicting, 0, "integer and string IDs must not alias");
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        assert_eq!(Z3_get_symbol_kind(c, Z3_get_quantifier_id(c, q)), 0);
+        assert_eq!(Z3_get_symbol_int(c, Z3_get_quantifier_id(c, q)), 7);
+
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn quantifier_weight_roundtrips() {
+    // Exact Z3 5.0.0 returns the caller-supplied weight from both quantifier
+    // construction families. In particular, a requested weight of 3 returns 3.
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let db = Z3_mk_bound(c, 0, int);
+        let db_body = Z3_mk_eq(c, db, db);
+        let sorts = [int];
+        let names = [sym(c, c"x")];
+        let db_q = Z3_mk_forall(
+            c,
+            3,
+            0,
+            ptr::null(),
+            1,
+            sorts.as_ptr(),
+            names.as_ptr(),
+            db_body,
+        );
+        assert_ne!(db_q, 0);
+        assert_eq!(Z3_get_quantifier_weight(c, db_q), 3);
+
+        let no_patterns = [db_body];
+        let extended_q = Z3_mk_quantifier_ex(
+            c,
+            false,
+            5,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            1,
+            no_patterns.as_ptr(),
+            1,
+            sorts.as_ptr(),
+            names.as_ptr(),
+            db_body,
+        );
+        assert_ne!(extended_q, 0);
+        assert_eq!(Z3_get_quantifier_num_no_patterns(c, extended_q), 1);
+        assert_ne!(Z3_get_quantifier_no_pattern_ast(c, extended_q, 0), 0);
+
+        let x = Z3_mk_const(c, sym(c, c"x-const"), int);
+        let const_body = Z3_mk_eq(c, x, x);
+        let bounds = [x];
+        let const_q = Z3_mk_exists_const(c, 7, 1, bounds.as_ptr(), 0, ptr::null(), const_body);
+        assert_ne!(const_q, 0);
+        assert_eq!(Z3_get_quantifier_weight(c, const_q), 7);
+
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn hash_cons_quantifier_metadata_conflicts_fail_closed() {
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let x = Z3_mk_const(c, sym(c, c"metadata-x"), int);
+        let bounds = [x];
+        let body = Z3_mk_eq(c, x, x);
+
+        let first = Z3_mk_forall_const(c, 2, 1, bounds.as_ptr(), 0, ptr::null(), body);
+        assert_ne!(first, 0);
+        let conflicting = Z3_mk_forall_const(c, 3, 1, bounds.as_ptr(), 0, ptr::null(), body);
+        assert_eq!(conflicting, 0, "different weight must not alias first AST");
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        assert_eq!(Z3_get_quantifier_weight(c, first), 2);
+
+        let body2 = Z3_mk_ge(c, x, Z3_mk_int(c, 0, int));
+        let first_no_patterns = [body2];
+        let with_no_pattern = Z3_mk_quantifier_const_ex(
+            c,
+            true,
+            4,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            bounds.as_ptr(),
+            0,
+            ptr::null(),
+            1,
+            first_no_patterns.as_ptr(),
+            body2,
+        );
+        assert_ne!(with_no_pattern, 0);
+        assert!(Z3_is_eq_ast(
+            c,
+            Z3_get_quantifier_no_pattern_ast(c, with_no_pattern, 0),
+            body2
+        ));
+
+        let conflicting_no_patterns = [x];
+        let conflicting = Z3_mk_quantifier_const_ex(
+            c,
+            true,
+            4,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            bounds.as_ptr(),
+            0,
+            ptr::null(),
+            1,
+            conflicting_no_patterns.as_ptr(),
+            body2,
+        );
+        assert_eq!(
+            conflicting, 0,
+            "different no-pattern must not alias first AST"
+        );
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        assert!(Z3_is_eq_ast(
+            c,
+            Z3_get_quantifier_no_pattern_ast(c, with_no_pattern, 0),
+            body2
+        ));
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn cross_context_quantifier_attributes_are_explicitly_rejected() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        let int = Z3_mk_int_sort(source);
+        let x = Z3_mk_const(source, sym(source, c"translated-q-x"), int);
+        let body = Z3_mk_eq(source, x, x);
+        let bounds = [x];
+        let quantifier = Z3_mk_forall_const(source, 2, 1, bounds.as_ptr(), 0, ptr::null(), body);
+        assert_ne!(quantifier, 0);
+
+        assert_eq!(Z3_translate(source, quantifier, target), 0);
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        assert!(
+            (*target).error_msg.as_deref().is_some_and(
+                |message| message.contains("quantifier weight/qid/skolemid/no-pattern")
+            ),
+            "translation rejection must name the unrepresentable attributes"
+        );
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn unrelated_translation_ignores_unreachable_quantifier_attributes() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        let int = Z3_mk_int_sort(source);
+        let x = Z3_mk_const(source, sym(source, c"unreachable-q-x"), int);
+        let body = Z3_mk_eq(source, x, x);
+        let bounds = [x];
+        let attributed = Z3_mk_forall_const(source, 2, 1, bounds.as_ptr(), 0, ptr::null(), body);
+        assert_ne!(attributed, 0);
+
+        let numeral = Z3_mk_int(source, 37, int);
+        let translated = Z3_translate(source, numeral, target);
+        assert_ne!(
+            translated, 0,
+            "metadata on an unreachable quantifier must not block translation"
+        );
+        let mut value = 0;
+        assert!(Z3_get_numeral_int(target, translated, &raw mut value));
+        assert_eq!(value, 37);
+
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn translated_default_quantifier_preserves_public_bound_name_and_sort() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+
+        let source_sort_symbol = Z3_mk_int_symbol(source, 901);
+        let source_sort = Z3_mk_uninterpreted_sort(source, source_sort_symbol);
+        let source_bound_symbol = Z3_mk_int_symbol(source, 731);
+        let source_bound = Z3_mk_const(source, source_bound_symbol, source_sort);
+        // Keep the binder unused so its public identity is reachable only
+        // through quantifier metadata, not through the logical term DAG.
+        let source_body = Z3_mk_true(source);
+        let source_bounds = [source_bound];
+        let source_quantifier = Z3_mk_forall_const(
+            source,
+            1,
+            1,
+            source_bounds.as_ptr(),
+            0,
+            ptr::null(),
+            source_body,
+        );
+        assert_ne!(source_quantifier, 0);
+
+        let translated = Z3_translate(source, source_quantifier, target);
+        assert_ne!(translated, 0);
+        let translated_name = Z3_get_quantifier_bound_name(target, translated, 0);
+        assert_eq!(Z3_get_symbol_kind(target, translated_name), 0);
+        assert_eq!(Z3_get_symbol_int(target, translated_name), 731);
+        let translated_sort = Z3_get_quantifier_bound_sort(target, translated, 0);
+        let translated_sort_name = Z3_get_sort_name(target, translated_sort);
+        assert_eq!(Z3_get_symbol_kind(target, translated_sort_name), 0);
+        assert_eq!(Z3_get_symbol_int(target, translated_sort_name), 901);
+
+        let translated_term = checked_ast_to_term(&*target, translated).expect("translated term");
+        let translated_bounds = (*target)
+            .quantifier_public_bound_terms
+            .get(&translated_term)
+            .expect("translated quantifier retains public bound terms");
+        assert_eq!(translated_bounds.len(), 1);
+        assert_eq!(
+            lookup_ast_sort(&*target, term_to_ast(&*target, translated_bounds[0])),
+            Some(&(*source_sort).sort),
+            "the translated bound retains its exact public sort side-table entry"
+        );
+
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn translation_rejects_cross_representation_quantifier_bound_metadata_collision() {
+    unsafe {
+        // The public sorts agree, but an integer C symbol is observably
+        // different from the parsed representation's string binder name.
+        let source = ctx();
+        let target = ctx();
+        let int = Z3_mk_int_sort(source);
+        let bound = Z3_mk_const(source, Z3_mk_int_symbol(source, 731), int);
+        let bounds = [bound];
+        let quantifier = Z3_mk_forall_const(
+            source,
+            1,
+            1,
+            bounds.as_ptr(),
+            0,
+            ptr::null(),
+            Z3_mk_true(source),
+        );
+        let source_term = checked_ast_to_term(&*source, quantifier).expect("source quantifier");
+        let target_term = (*target)
+            .solver
+            .translate_terms_from(&(*source).solver, &[source_term])[0];
+        (*target)
+            .parsed_quantifier_public_bound_sorts
+            .insert(target_term, vec![Sort::Int]);
+
+        assert_eq!(Z3_translate(source, quantifier, target), 0);
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        assert!((*target)
+            .error_msg
+            .as_deref()
+            .is_some_and(|message| { message.contains("parsed public-bound name/sort metadata") }));
+        Z3_del_context(target);
+        Z3_del_context(source);
+
+        // The binder name agrees, but the parsed public sort is different even
+        // though both representations can share an Int-lowered core binder.
+        let source = ctx();
+        let target = ctx();
+        let int = Z3_mk_int_sort(source);
+        let sorts = [int];
+        let names = [sym(source, c"x")];
+        let quantifier = Z3_mk_forall(
+            source,
+            1,
+            0,
+            ptr::null(),
+            1,
+            sorts.as_ptr(),
+            names.as_ptr(),
+            Z3_mk_true(source),
+        );
+        let source_term = checked_ast_to_term(&*source, quantifier).expect("source quantifier");
+        let target_term = (*target)
+            .solver
+            .translate_terms_from(&(*source).solver, &[source_term])[0];
+        (*target)
+            .parsed_quantifier_public_bound_sorts
+            .insert(target_term, vec![Sort::Char]);
+
+        assert_eq!(Z3_translate(source, quantifier, target), 0);
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        assert!((*target)
+            .error_msg
+            .as_deref()
+            .is_some_and(|message| { message.contains("parsed public-bound name/sort metadata") }));
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn cross_context_default_quantifier_rejects_target_metadata_collision() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+
+        let source_int = Z3_mk_int_sort(source);
+        let source_bound = Z3_mk_bound(source, 0, source_int);
+        let source_body = Z3_mk_eq(source, source_bound, source_bound);
+        let source_sorts = [source_int];
+        let source_names = [sym(source, c"x")];
+        let source_quantifier = Z3_mk_forall(
+            source,
+            1,
+            0,
+            ptr::null(),
+            1,
+            source_sorts.as_ptr(),
+            source_names.as_ptr(),
+            source_body,
+        );
+        assert_ne!(source_quantifier, 0);
+
+        let target_int = Z3_mk_int_sort(target);
+        let target_bound = Z3_mk_bound(target, 0, target_int);
+        let target_body = Z3_mk_eq(target, target_bound, target_bound);
+        let target_sorts = [target_int];
+        let target_names = [sym(target, c"x")];
+        let target_quantifier = Z3_mk_quantifier_ex(
+            target,
+            true,
+            2,
+            sym(target, c"target-qid"),
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            target_sorts.as_ptr(),
+            target_names.as_ptr(),
+            target_body,
+        );
+        assert_ne!(target_quantifier, 0);
+
+        assert_eq!(Z3_translate(source, source_quantifier, target), 0);
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        assert!((*target)
+            .error_msg
+            .as_deref()
+            .is_some_and(|message| message.contains("different target metadata")));
+
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn translated_default_quantifier_latches_metadata_against_later_mutation() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+
+        let source_int = Z3_mk_int_sort(source);
+        let source_bound = Z3_mk_bound(source, 0, source_int);
+        let source_body = Z3_mk_eq(source, source_bound, source_bound);
+        let source_sorts = [source_int];
+        let source_names = [sym(source, c"x")];
+        let source_quantifier = Z3_mk_forall(
+            source,
+            1,
+            0,
+            ptr::null(),
+            1,
+            source_sorts.as_ptr(),
+            source_names.as_ptr(),
+            source_body,
+        );
+        assert_ne!(source_quantifier, 0);
+
+        let translated = Z3_translate(source, source_quantifier, target);
+        assert_ne!(translated, 0);
+        let translated_term = checked_ast_to_term(&*target, translated).expect("translated term");
+        assert_eq!(
+            (*target).quantifier_ffi_metadata.get(&translated_term),
+            Some(&QuantifierFfiMetadata::default())
+        );
+
+        let target_int = Z3_mk_int_sort(target);
+        let target_bound = Z3_mk_bound(target, 0, target_int);
+        let target_body = Z3_mk_eq(target, target_bound, target_bound);
+        let target_sorts = [target_int];
+        let target_names = [sym(target, c"x")];
+        let conflicting = Z3_mk_quantifier_ex(
+            target,
+            true,
+            1,
+            sym(target, c"later-qid"),
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            target_sorts.as_ptr(),
+            target_names.as_ptr(),
+            target_body,
+        );
+        assert_eq!(conflicting, 0, "translated metadata must remain immutable");
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn cross_context_map_translation_rejects_private_function_name_collision() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+
+        // The first function declaration in each context receives the same
+        // private core name, while these public identities and signatures are
+        // deliberately different.
+        let source_int = Z3_mk_int_sort(source);
+        let mut source_domain = [source_int];
+        let source_function = Z3_mk_func_decl(
+            source,
+            sym(source, c"source-map-function"),
+            1,
+            source_domain.as_mut_ptr(),
+            source_int,
+        );
+        let target_bool = Z3_mk_bool_sort(target);
+        let mut target_domain = [target_bool];
+        let target_function = Z3_mk_func_decl(
+            target,
+            sym(target, c"target-map-function"),
+            1,
+            target_domain.as_mut_ptr(),
+            target_bool,
+        );
+        assert_eq!(
+            (*source_function).decl.name(),
+            (*target_function).decl.name(),
+            "test setup requires a cross-context private-name collision"
+        );
+
+        let source_array_sort = Z3_mk_array_sort(source, source_int, source_int);
+        let source_array = Z3_mk_const(source, sym(source, c"source-map-array"), source_array_sort);
+        let arguments = [source_array];
+        let mapped = Z3_mk_map(source, source_function, 1, arguments.as_ptr());
+        assert_ne!(mapped, 0);
+
+        assert_eq!(
+            Z3_translate(source, mapped, target),
+            0,
+            "translation must not bind map semantics to the target's colliding declaration"
+        );
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        // Two independent metadata checks catch this shape — the private
+        // identity carrying a different PUBLIC symbol, and the public key
+        // colliding on the private name — and either is a correct diagnosis, so
+        // pin the CLASS of diagnostic rather than whichever of the two happens
+        // to run first (it is the former today).
+        let message = (*target).error_msg.clone().expect("rejection diagnostic");
+        assert!(
+            message.contains("cross-context translation metadata conflict")
+                && message.contains("function"),
+            "the rejection must report a cross-context function-metadata \
+             conflict, got {message:?}"
+        );
+        // The substantive property: the target's own colliding declaration was
+        // NOT given the source's map semantics. A latched signature here is the
+        // exact aliasing this rejection exists to prevent.
+        let colliding_name = (*target_function).decl.name().to_string();
+        assert!(
+            !(*target).map_fn_sigs.contains_key(&colliding_name),
+            "a rejected translation must leave the target's map-signature latch \
+             untouched"
+        );
+
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn cross_context_datatype_translation_fails_closed_without_declaration_replay() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+
+        let source_constructor = Z3_mk_constructor(
+            source,
+            sym(source, c"translated-constructor"),
+            sym(source, c"source-recognizer"),
+            0,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        );
+        let mut source_constructors = [source_constructor];
+        let source_sort = Z3_mk_datatype(
+            source,
+            sym(source, c"TranslatedDatatype"),
+            1,
+            source_constructors.as_mut_ptr(),
+        );
+        assert!(!source_sort.is_null());
+
+        let value = Z3_mk_const(source, sym(source, c"translated-value"), source_sort);
+        assert_eq!(
+            Z3_translate(source, value, target),
+            0,
+            "translation must not publish a datatype term without replaying its declaration"
+        );
+        assert_eq!(Z3_get_error_code(target), Z3_INVALID_USAGE);
+        assert!(
+            (*target)
+                .error_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("datatype declarations cannot")),
+            "translation rejection must identify the missing declaration replay"
+        );
+
+        Z3_del_constructor(source, source_constructor);
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+unsafe fn mark_to_real_shadowed(c: Z3_context) {
+    // SAFETY: tests pass a live, exclusively owned context.
+    unsafe { (*c).solver.z3_compat_mark_to_real_shadowed() };
+}
+
+unsafe fn assert_to_real_shadowed(c: Z3_context) {
+    // SAFETY: tests pass a live context.
+    assert!(unsafe { (*c).solver.z3_compat_to_real_is_shadowed() });
+}
+
+#[test]
+fn ast_translation_propagates_to_real_shadow_latch() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        mark_to_real_shadowed(source);
+        assert_ne!(Z3_translate(source, Z3_mk_true(source), target), 0);
+        assert_to_real_shadowed(target);
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn goal_translation_propagates_to_real_shadow_latch() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        mark_to_real_shadowed(source);
+        let goal = Z3_mk_goal(source, false, false, false);
+        Z3_goal_assert(source, goal, Z3_mk_true(source));
+        assert!(!Z3_goal_translate(source, goal, target).is_null());
+        assert_to_real_shadowed(target);
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn solver_translation_propagates_to_real_shadow_latch() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        mark_to_real_shadowed(source);
+        let solver = Z3_mk_solver(source);
+        Z3_solver_assert(source, solver, Z3_mk_true(source));
+        assert!(!Z3_solver_translate(source, solver, target).is_null());
+        assert_to_real_shadowed(target);
+        Z3_del_context(target);
+        Z3_del_context(source);
+    }
+}
+
+#[test]
+fn optimize_translation_propagates_to_real_shadow_latch() {
+    unsafe {
+        let source = ctx();
+        let target = ctx();
+        mark_to_real_shadowed(source);
+        let optimize = Z3_mk_optimize(source);
+        Z3_optimize_assert(source, optimize, Z3_mk_true(source));
+        assert!(!Z3_optimize_translate(source, optimize, target).is_null());
+        assert_to_real_shadowed(target);
+        Z3_del_context(target);
+        Z3_del_context(source);
     }
 }
 

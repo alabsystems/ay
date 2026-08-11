@@ -93,6 +93,7 @@ impl Solver {
         clone.conflicts_since_restart = 0;
         clone.num_decisions = 0;
         clone.num_propagations = 0;
+        clone.num_search_propagations = 0;
         clone.search_ticks = [0; 2];
 
         // Ensure IC3 mode is active on the clone.
@@ -181,6 +182,7 @@ impl Solver {
             user_num_vars: self.user_num_vars,
             has_empty_clause: self.has_empty_clause,
             num_propagations: self.num_propagations,
+            num_search_propagations: self.num_search_propagations,
             no_conflict_until: self.no_conflict_until,
             search_ticks: self.search_ticks,
             stable_mode: self.stable_mode,
@@ -371,6 +373,9 @@ impl cold::ColdState {
             flush_inc: self.flush_inc,
             num_flushes: self.num_flushes,
             num_arena_compactions: self.num_arena_compactions,
+            num_arena_compaction_skips: self.num_arena_compaction_skips,
+            factor_skip_counts: self.factor_skip_counts,
+            arena_compaction_pending: self.arena_compaction_pending,
             scoped_clauses_reclaimed: self.scoped_clauses_reclaimed,
             eager_subsumed: self.eager_subsumed,
             max_learned_clauses: self.max_learned_clauses,
@@ -460,6 +465,7 @@ impl cold::ColdState {
 
             // LRAT/proof state (copied for clause ID consistency)
             clause_ids: self.clause_ids.clone(),
+            clause_ids_disabled: self.clause_ids_disabled,
             bcp_learned_clause_birth_conflicts: self.bcp_learned_clause_birth_conflicts.clone(),
             clause_birth_solve: self.clause_birth_solve.clone(),
             level0_proof_id: self.level0_proof_id.clone(),
@@ -470,6 +476,10 @@ impl cold::ColdState {
             next_original_clause_id: self.next_original_clause_id,
             lrat_enabled: false, // No LRAT in cloned solver
             unsat_certificate_enabled: self.unsat_certificate_enabled,
+            ambient_artifacts_enabled: self.ambient_artifacts_enabled,
+            retain_unsat_certificate: self.retain_unsat_certificate,
+            backward_proof_limits: self.backward_proof_limits.clone(),
+            backward_proof_failure: None,
             dense_factor_bve_lrat_route_enabled: false,
             circuit_bve_lrat_route_enabled: false,
             bve_lrat_scout_route_enabled: false,
@@ -488,6 +498,7 @@ impl cold::ColdState {
             #[cfg(debug_assertions)]
             scope_selector_axiom_ids: self.scope_selector_axiom_ids.clone(),
             has_been_incremental: self.has_been_incremental,
+            symmetry_oneshot: self.symmetry_oneshot,
             tainted_vars: self.tainted_vars.clone(),
             has_ever_scoped: self.has_ever_scoped,
             has_solved_once: self.has_solved_once,

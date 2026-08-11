@@ -46,6 +46,44 @@ fn round_rational_to_integer(r: &BigRational, rm: RoundingMode) -> BigInt {
     }
 }
 
+/// Significand of an f64 value that underflows into the target format's
+/// subnormal range. `None` when the result is not representable in `u64`.
+///
+/// Split out of the conversion because this shift arithmetic is what PANICKED:
+/// `right_shift = 1 - target_exp_biased` is UNBOUNDED — `target_exp_biased` is
+/// arbitrarily negative when an f64 normal is converted to a narrow target — so
+/// the total shift routinely exceeds 63, and Rust's `>>` is not defined past the
+/// operand width. With overflow checks on that is `attempt to shift right with
+/// overflow` (observed as `exit_code: 1` on
+/// `inc/FPArith/.../float20_true-unreach-call.i.smt2`, on a scoreboard that
+/// nonetheless reported `errors: 0`). With them off it is worse: the shift
+/// amount is masked to 6 bits and a NONZERO significand is fabricated for a
+/// value that underflowed to zero — a wrong model value rather than a crash.
+///
+/// Treating the shift arithmetically removes both: a 53-bit significand shifted
+/// right by 64 or more is exactly `0`, which is the signed zero the caller
+/// already returns for a zero significand.
+fn underflow_significand(full_sig: u64, right_shift: u64, shift_to_target: i64) -> Option<u64> {
+    if right_shift >= 64 {
+        return Some(0);
+    }
+    let base = full_sig >> right_shift;
+    if shift_to_target < 0 {
+        // Shifting further right; saturating past the width is exact zero.
+        return match right_shift.checked_add(shift_to_target.unsigned_abs()) {
+            Some(total) if total < 64 => Some(full_sig >> total),
+            _ => Some(0),
+        };
+    }
+    // Target format wider than f64: the left shift can drop high bits. Fail
+    // closed rather than publish a silently truncated significand.
+    let left = u32::try_from(shift_to_target).ok()?;
+    if left >= 64 || base.leading_zeros() < left {
+        return None;
+    }
+    Some(base << left)
+}
+
 impl Executor {
     /// Resolve a rounding-mode operand to a concrete mode: a literal
     /// (`RNE`…`roundTowardZero`) directly, otherwise THROUGH THE MODEL
@@ -217,10 +255,9 @@ impl Executor {
                 } else {
                     -i64::from(52 - stored_bits)
                 };
-                let sig = if shift_to_target >= 0 {
-                    (full_sig >> right_shift) << shift_to_target as u64
-                } else {
-                    full_sig >> (right_shift + (-shift_to_target) as u64)
+                let Some(sig) = underflow_significand(full_sig, right_shift, shift_to_target)
+                else {
+                    return EvalValue::Unknown;
                 };
                 if sig == 0 {
                     return if sign {
@@ -1087,7 +1124,19 @@ impl Executor {
                         // as f64, e.g. Float128 subnormals).
                         match v.to_rational() {
                             Some(r) => EvalValue::Rational(r),
-                            None => EvalValue::Unknown,
+                            // NaN and the infinities: SMT-LIB leaves the result
+                            // unspecified but TOTAL, so there is nothing to
+                            // recompute — the solve CHOSE a value, and
+                            // `pin_undefined_fp_to_real` recorded it against
+                            // this application. Reading it back is what makes
+                            // the choice observable to the validator and the
+                            // independent gate; without it the model silently
+                            // omits an interpretation it actually committed to.
+                            None => model
+                                .lra_model
+                                .as_ref()
+                                .and_then(|lra| lra.values.get(&term_id))
+                                .map_or(EvalValue::Unknown, |r| EvalValue::Rational(r.clone())),
                         }
                     }
                     _ => EvalValue::Unknown,
@@ -1131,5 +1180,55 @@ impl Executor {
         } else {
             eval
         }
+    }
+}
+
+#[cfg(test)]
+mod underflow_significand_tests {
+    use super::underflow_significand;
+
+    /// The exact shape that panicked: an f64 normal rebased into a narrow
+    /// target underflows so far that the right shift exceeds the operand width.
+    /// Before the fix this was `attempt to shift right with overflow`.
+    #[test]
+    fn shift_past_operand_width_is_zero_not_a_panic() {
+        let full_sig = (1u64 << 52) | 0x000f_ffff_ffff_ffff;
+        for right_shift in [64u64, 65, 86, 128, 1_000, u64::MAX] {
+            assert_eq!(
+                underflow_significand(full_sig, right_shift, -3),
+                Some(0),
+                "right_shift={right_shift} must underflow to exact zero"
+            );
+            assert_eq!(underflow_significand(full_sig, right_shift, 3), Some(0));
+        }
+    }
+
+    /// The additive path must not overflow `u64` while summing the two shifts.
+    #[test]
+    fn combined_shift_saturates_instead_of_wrapping() {
+        assert_eq!(underflow_significand(u64::MAX, 63, i64::MIN), Some(0));
+        assert_eq!(underflow_significand(u64::MAX, 1, -63), Some(0));
+        // 1 + 62 = 63 is still in range and must be a real shift, not zero.
+        assert_eq!(underflow_significand(1u64 << 63, 1, -62), Some(1));
+    }
+
+    /// In-range shifts keep their exact pre-fix behaviour.
+    #[test]
+    fn in_range_shifts_are_unchanged() {
+        let sig = 1u64 << 52;
+        assert_eq!(underflow_significand(sig, 4, 0), Some(sig >> 4));
+        assert_eq!(underflow_significand(sig, 4, -2), Some(sig >> 6));
+        assert_eq!(underflow_significand(1, 0, 8), Some(256));
+    }
+
+    /// A left shift that would drop high bits fails CLOSED rather than
+    /// publishing a truncated significand as if it were exact.
+    #[test]
+    fn overflowing_left_shift_fails_closed() {
+        assert_eq!(underflow_significand(1u64 << 63, 0, 1), None);
+        assert_eq!(underflow_significand(u64::MAX, 0, 1), None);
+        assert_eq!(underflow_significand(1, 0, 64), None);
+        // Exactly fits: 1 << 63 is representable.
+        assert_eq!(underflow_significand(1, 0, 63), Some(1u64 << 63));
     }
 }

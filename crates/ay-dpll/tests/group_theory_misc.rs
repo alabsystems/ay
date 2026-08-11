@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated theory_misc integration tests for ay-dpll.
-//! Groups 9 test modules into a single binary to reduce link time.
+//! Groups 10 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -11,6 +11,8 @@ mod common;
 
 #[path = "group_theory_misc/cross_check_4542.rs"]
 mod cross_check_4542;
+#[path = "group_theory_misc/ho_seq_refutation.rs"]
+mod ho_seq_refutation;
 #[path = "group_theory_misc/logic_auto_detection.rs"]
 mod logic_auto_detection;
 #[path = "group_theory_misc/model_equality_nonconvex_4906.rs"]

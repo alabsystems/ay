@@ -350,7 +350,7 @@ fn render_alethe_contains_rule_and_rhs() {
     let (constraints, cert) = linear_farkas_setup();
     assert_eq!(cert.verify(&constraints), Ok(()));
     let s = cert.render_alethe("t42", |t| format!("x{}", t.0));
-    assert!(s.contains(":rule nia_positivstellensatz"));
+    assert!(s.contains(":rule hole"));
     assert!(s.contains(":rhs -1"));
     assert!(s.contains("(cl)"));
     // A rational multiplier renders as (/ n d).

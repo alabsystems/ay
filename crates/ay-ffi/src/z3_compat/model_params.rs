@@ -1018,11 +1018,12 @@ pub unsafe extern "C" fn Z3_model_to_string(c: Z3_context, m: Z3_model) -> *cons
             }
             for (name, (val, width)) in model.iter_bvs() {
                 let display_name = model_entry_display_name(ctx, name);
-                let hex_str = format!("{val:x}");
-                let hex_width = (*width as usize).div_ceil(4);
-                let padded = format!("{hex_str:0>hex_width$}");
+                // Canonical BV printer: `#x` only at multiple-of-4 widths, else
+                // `#b`. Open-coding hex here emitted `(_ BitVec 5) #x11`, whose
+                // numeral reparses as 8 bits and contradicts its own ascription.
+                let numeral = ay_dpll::format_bitvec(val, *width);
                 parts.push(format!(
-                    "(define-fun {display_name} () (_ BitVec {width}) #x{padded})"
+                    "(define-fun {display_name} () (_ BitVec {width}) {numeral})"
                 ));
             }
             for (name, val) in model.iter_strings() {

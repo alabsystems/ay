@@ -38,10 +38,28 @@ fn check(m: &Model, opts: &SolveOpts) -> Outcome {
     BabSession::new(m.clone(), opts).unwrap().check().unwrap()
 }
 
+/// Options that pin the solve on NATIVE branch-and-bound.
+///
+/// Branch-and-bound is the only lane that builds a whole-tree
+/// `MilpInfeasibilityCertificate` — the subject of this entire file. The exact
+/// structure-recognition routes answer these tiny models before the LP
+/// relaxation exists, with a PB decision DAG instead of a case-split tree. That
+/// is a different, independently replayable artifact (and `tests/cert_io.rs`
+/// section (b2) tampers every one of those formats), but a test whose subject
+/// is the tree lane must ask for the tree lane, or it stops testing the thing
+/// its own name promises.
+///
+/// `routed_infeasibility_still_carries_replayable_evidence` below keeps the
+/// DEFAULT posture covered on the very same model, so this is not a way to
+/// avoid what ships.
+fn native_opts() -> SolveOpts {
+    SolveOpts::new().with_structure_routing(false)
+}
+
 /// Solve the case-split-only model and demand the whole-tree certificate.
 fn emitted_cert() -> (Model, MilpInfeasibilityCertificate) {
     let m = case_split_only_model();
-    match check(&m, &SolveOpts::new()) {
+    match check(&m, &native_opts()) {
         Outcome::Infeasible { cert, tree_cert } => {
             assert!(
                 cert.is_none(),
@@ -143,7 +161,9 @@ fn root_probe_shortlist_breaks_a_zero_objective_root_tie() {
     m.add_row(1.5, 1.5, &[(x0, 1.0), (x1, 1.0), (x2, 1.0)]);
     m.add_row(1.5, 1.5, &[(y0, 1.0), (y1, 1.0), (y2, 1.0)]);
 
-    let mut session = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    // SUBJECT: the native root strong-branching tie-break, which only exists
+    // inside branch-and-bound. See `native_opts`.
+    let mut session = BabSession::new(m.clone(), &native_opts()).unwrap();
     session.shortlist_root_strong_branch_candidates(&[x1]);
     match session.check().unwrap() {
         Outcome::Infeasible {
@@ -492,13 +512,84 @@ fn root_lp_infeasible_still_yields_classic_farkas() {
     let mut m = Model::new();
     let x = m.add_binary_col();
     m.add_row(2.0, f64::INFINITY, &[(x, 1.0)]); // x >= 2 vs x <= 1
-    match check(&m, &SolveOpts::new()) {
+    match check(&m, &native_opts()) {
         Outcome::Infeasible { cert, .. } => {
             cert.expect("root-LP infeasibility is Farkas-certified")
                 .verify(&m)
                 .unwrap();
         }
         other => panic!("expected Infeasible, got {other:?}"),
+    }
+}
+
+/// The companion to every `native_opts()` above: under the SHIPPED default a
+/// routed lane may own these verdicts, and when it does the verdict must still
+/// arrive with evidence that replays against the caller's own model.
+///
+/// This is the guarantee the routing work broke and this file's failures were
+/// reporting. It is asserted on the artifact, not on a claim string: a
+/// `ReplayClaim` is a solver's self-report, is not model-bound, and can never
+/// stand in for a certificate.
+#[test]
+fn routed_infeasibility_still_carries_replayable_evidence() {
+    // (a) the case-split-only model, (b) the root-LP conflict, (c) the
+    // two-block zero-objective model — one per test that opts out above.
+    let mut root_lp = Model::new();
+    let x = root_lp.add_binary_col();
+    root_lp.add_row(2.0, f64::INFINITY, &[(x, 1.0)]);
+
+    let mut two_block = Model::new();
+    let x0 = two_block.add_binary_col();
+    let x1 = two_block.add_binary_col();
+    let x2 = two_block.add_binary_col();
+    let y0 = two_block.add_binary_col();
+    let y1 = two_block.add_binary_col();
+    let y2 = two_block.add_binary_col();
+    two_block.add_row(1.5, 1.5, &[(x0, 1.0), (x1, 1.0), (x2, 1.0)]);
+    two_block.add_row(1.5, 1.5, &[(y0, 1.0), (y1, 1.0), (y2, 1.0)]);
+
+    for m in [case_split_only_model(), root_lp, two_block] {
+        let mut session = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+        let outcome = session.check().unwrap();
+        assert!(
+            matches!(outcome, Outcome::Infeasible { .. }),
+            "expected Infeasible, got {outcome:?}"
+        );
+
+        // Either the native lane's own artifacts, or a typed exact-reduction
+        // artifact published on the session. One of them must be there.
+        let native = match &outcome {
+            Outcome::Infeasible { cert, tree_cert } => {
+                if let Some(cert) = cert {
+                    cert.verify(&m).expect("root Farkas must replay");
+                }
+                if let Some(tree_cert) = tree_cert {
+                    tree_cert.verify(&m).expect("tree certificate must replay");
+                }
+                cert.is_some() || tree_cert.is_some()
+            }
+            _ => unreachable!(),
+        };
+        let routed = session.single_row_dp_infeasibility_certificate().is_some()
+            || session.multi_row_bdd_infeasibility_certificate().is_some()
+            || session.parity_infeasibility_certificate().is_some()
+            || session
+                .open_domain_single_row_dp_infeasibility_certificate()
+                .is_some()
+            || session
+                .open_domain_multi_row_bdd_infeasibility_certificate()
+                .is_some()
+            || session.hybrid_pb_lp_infeasibility_certificate().is_some()
+            || session
+                .hybrid_integer_lift_infeasibility_certificate()
+                .is_some();
+        assert!(
+            native || routed,
+            "an INFEASIBLE from the shipped default posture carried NO \
+             independently checkable evidence. `validate_witnesses` is a no-op \
+             on `Infeasible {{ cert: None, tree_cert: None }}`, so such a \
+             verdict is checked by nothing at the session boundary."
+        );
     }
 }
 

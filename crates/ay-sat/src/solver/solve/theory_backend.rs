@@ -352,6 +352,10 @@ impl Solver {
                 continue;
             }
 
+            // BCP drained without a conflict: the one point in the loop where a
+            // compaction deferred by `reduce_db` can actually run.
+            self.run_deferred_arena_compaction();
+
             let restarted = self.maybe_run_restart_pure();
             if restarted {
             } else if self.should_rephase() {
@@ -548,7 +552,11 @@ impl Solver {
                 continue;
             }
 
-            // No conflict from BCP — scheduling path.
+            // No conflict from BCP — scheduling path. This is the first moment
+            // after a reduction where BCP has drained, so it is where a
+            // compaction deferred by `reduce_db` can actually run.
+            self.run_deferred_arena_compaction();
+
             if self.cold.tla_trace.is_some() && self.trail.len() > trail_len_before_prop {
                 self.tla_trace_step(
                     CdclTraceState::Propagating,

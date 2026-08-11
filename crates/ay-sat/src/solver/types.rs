@@ -219,6 +219,11 @@ pub enum SatUnknownReason {
     AssumptionUnknown,
     /// SAT model reconstruction/verification produced an invalid model.
     InvalidSatModel,
+    /// Soundness guard (`#core-subset-audit`): an assumption-path UNSAT core
+    /// contained a literal that is not an assumption of this query, so the
+    /// returned core is not a certified unsatisfiable subset. The UNSAT-side
+    /// counterpart of [`Self::InvalidSatModel`].
+    InvalidUnsatCore,
     /// UNSAT proof finalization failed after the solver derived UNSAT.
     ProofFinalizationFailure,
     /// Deterministic conflict budget (`:rlimit`) was exhausted before a
@@ -248,6 +253,7 @@ impl SatUnknownReason {
             Self::ExtensionUnknown => "extension_unknown",
             Self::AssumptionUnknown => "assumption_unknown",
             Self::InvalidSatModel => "invalid_sat_model",
+            Self::InvalidUnsatCore => "invalid_unsat_core",
             Self::ProofFinalizationFailure => "proof_finalization_failure",
             Self::ResourceBudget => "resource_budget",
             Self::ClauseTooLarge => "clause_too_large",

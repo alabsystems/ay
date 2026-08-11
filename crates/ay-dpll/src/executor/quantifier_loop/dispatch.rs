@@ -57,7 +57,7 @@ impl Executor {
             LogicCategory::QfAx => self.solve_array_euf(),
             LogicCategory::QfLra | LogicCategory::Lra => self.solve_lra(),
             LogicCategory::QfLia | LogicCategory::Lia => self.solve_lia(),
-            LogicCategory::QfNia | LogicCategory::Nia => self.solve_nia(),
+            LogicCategory::QfNia | LogicCategory::QfEia | LogicCategory::Nia => self.solve_nia(),
             LogicCategory::QfNra | LogicCategory::Nra => self.solve_nra(),
             LogicCategory::QfLira | LogicCategory::Lira => self.solve_lira(),
             LogicCategory::QfNira | LogicCategory::Nira => {

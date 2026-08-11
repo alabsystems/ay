@@ -123,6 +123,253 @@ pub(crate) fn validate_datatype_distinct(
     }
 }
 
+/// Recognize a datatype tester evaluation theorem under the supplied
+/// datatype declarations. See [`validate_datatype_tester_eval`].
+#[must_use]
+pub fn recognize_datatype_tester_eval(
+    terms: &TermStore,
+    clause: &[TermId],
+    dt_decls: &[(String, Vec<String>)],
+) -> bool {
+    validate_datatype_tester_eval(terms, ProofId(0), clause, dt_decls, None).is_ok()
+}
+
+/// Declaration-complete recognizer used by the executor for tester axioms that
+/// also depend on constructor arity (the nullary-sibling exhaustiveness form).
+#[must_use]
+pub fn recognize_datatype_tester_eval_with_selectors(
+    terms: &TermStore,
+    clause: &[TermId],
+    dt_decls: &[(String, Vec<String>)],
+    ctor_selectors: &[(String, Vec<String>)],
+) -> bool {
+    validate_datatype_tester_eval(terms, ProofId(0), clause, dt_decls, Some(ctor_selectors)).is_ok()
+}
+
+/// Validate an exact datatype tester axiom.
+///
+/// A matching tester is true on its constructor application,
+/// `(is-C (C ...))`; a tester for another constructor of the same datatype is
+/// false, `(not (is-C (D ...)))`.  The same declaration-backed lane also
+/// accepts the two symbolic tester schemas needed to discharge authored roots
+/// without pretending the tested value is a constructor application:
+///
+/// * exclusion: `¬is-C(t) ∨ ¬is-D(t)` for distinct constructors of one datatype;
+/// * exhaustiveness: every declared tester on the same `t`, or the equivalent
+///   two-constructor form `is-C(t) ∨ t = D` when `D` is nullary.
+///
+/// Constructor and tester identities are authenticated by the declaration
+/// registry, so an arbitrary unary Boolean function whose name merely resembles
+/// a tester cannot enter this lane.
+pub(crate) fn validate_datatype_tester_eval(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+    let literals = flatten_clause_literals(terms, clause);
+    if literals.is_empty()
+        || literals
+            .iter()
+            .any(|&literal| terms.sort(literal) != &Sort::Bool)
+    {
+        return Err(invalid(
+            "datatype tester axiom must be a non-empty Bool clause".to_string(),
+        ));
+    }
+
+    // Concrete unit evaluation: `is-C(C(..))` / `¬is-C(D(..))`.
+    if let [literal] = literals.as_slice() {
+        let (tester, positive) = match terms.get(*literal) {
+            TermData::Not(inner) => (*inner, false),
+            _ => (*literal, true),
+        };
+        let (tested_ctor, tested_value) = tester_application(terms, tester).ok_or_else(|| {
+            invalid("datatype tester-evaluation literal is not a tester application".to_string())
+        })?;
+        let tested_datatype = constructor_datatype(dt_decls, tested_ctor).ok_or_else(|| {
+            invalid("datatype tester names an unregistered constructor".to_string())
+        })?;
+        let (actual_ctor, actual_datatype) = constructor_head(terms, dt_decls, tested_value)
+            .ok_or_else(|| {
+                invalid(
+                    "datatype tester argument is not an application of a registered constructor"
+                        .to_string(),
+                )
+            })?;
+        if tested_datatype != actual_datatype {
+            return Err(invalid(format!(
+                "datatype tester and constructor belong to different datatypes \
+                 ({tested_datatype} vs {actual_datatype})"
+            )));
+        }
+        let expected_positive = tested_ctor == actual_ctor;
+        if positive != expected_positive {
+            return Err(invalid(format!(
+                "datatype tester polarity is wrong for is-{tested_ctor}({actual_ctor}(...))"
+            )));
+        }
+        return Ok(());
+    }
+
+    // Symbolic mutual exclusion: `¬is-C(t) ∨ ¬is-D(t)`.
+    if let [left, right] = literals.as_slice() {
+        if let (TermData::Not(left_tester), TermData::Not(right_tester)) =
+            (terms.get(*left), terms.get(*right))
+        {
+            if let (Some((left_ctor, left_value)), Some((right_ctor, right_value))) = (
+                tester_application(terms, *left_tester),
+                tester_application(terms, *right_tester),
+            ) {
+                let left_dt = constructor_datatype(dt_decls, left_ctor);
+                let right_dt = constructor_datatype(dt_decls, right_ctor);
+                if left_value == right_value
+                    && left_ctor != right_ctor
+                    && left_dt.is_some()
+                    && left_dt == right_dt
+                    && left_dt.is_some_and(|datatype| {
+                        sort_matches_datatype(terms.sort(left_value), datatype)
+                    })
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Two-constructor exhaustiveness with a nullary sibling:
+        // `is-C(t) ∨ t = D` (literal order and equality orientation arbitrary).
+        for (tester_literal, equality_literal) in [(*left, *right), (*right, *left)] {
+            let Some((tested_ctor, tested_value)) = tester_application(terms, tester_literal)
+            else {
+                continue;
+            };
+            let Some((eq_lhs, eq_rhs)) = equality_sides(terms, equality_literal) else {
+                continue;
+            };
+            for (value_side, ctor_side) in [(eq_lhs, eq_rhs), (eq_rhs, eq_lhs)] {
+                if value_side != tested_value || terms.sort(value_side) != terms.sort(ctor_side) {
+                    continue;
+                }
+                let Some(selectors) = ctor_selectors else {
+                    continue;
+                };
+                let syntactically_nullary = matches!(terms.get(ctor_side), TermData::Var(..))
+                    || matches!(terms.get(ctor_side), TermData::App(_, args) if args.is_empty());
+                if !syntactically_nullary {
+                    continue;
+                }
+                let Some((sibling_ctor, sibling_dt)) = constructor_head(terms, dt_decls, ctor_side)
+                else {
+                    continue;
+                };
+                // The constructor registry by itself records names, not arity.
+                // Require the independently supplied constructor→selector map
+                // to contain the sibling with exactly zero fields; term shape
+                // alone (`Var` / zero-arg App) is forgeable.
+                if !selectors
+                    .iter()
+                    .any(|(constructor, fields)| constructor == &sibling_ctor && fields.is_empty())
+                {
+                    continue;
+                }
+                let Some(tested_dt) = constructor_datatype(dt_decls, tested_ctor) else {
+                    continue;
+                };
+                let Some((_, constructors)) = dt_decls.iter().find(|(dt, _)| dt == tested_dt)
+                else {
+                    continue;
+                };
+                if sibling_dt == tested_dt
+                    && sort_matches_datatype(terms.sort(tested_value), tested_dt)
+                    && sibling_ctor != tested_ctor
+                    && constructors.len() == 2
+                    && constructors.iter().any(|ctor| ctor == tested_ctor)
+                    && constructors.iter().any(|ctor| ctor == &sibling_ctor)
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // General tester exhaustiveness: exactly one positive tester for every
+    // constructor of a datatype, all applied to the identical subject.
+    let mut subject = None;
+    let mut datatype = None;
+    let mut tester_names: Vec<&str> = Vec::new();
+    for &literal in &literals {
+        if matches!(terms.get(literal), TermData::Not(_)) {
+            return Err(invalid(
+                "datatype tester exhaustiveness requires positive testers".to_string(),
+            ));
+        }
+        let (ctor, value) = tester_application(terms, literal).ok_or_else(|| {
+            invalid("datatype tester clause has a non-tester literal".to_string())
+        })?;
+        let dt = constructor_datatype(dt_decls, ctor).ok_or_else(|| {
+            invalid("datatype tester names an unregistered constructor".to_string())
+        })?;
+        if subject
+            .replace(value)
+            .is_some_and(|previous| previous != value)
+            || datatype.replace(dt).is_some_and(|previous| previous != dt)
+            || tester_names.contains(&ctor)
+        {
+            return Err(invalid(
+                "datatype tester exhaustiveness must use one common subject and distinct \
+                 constructors of one datatype"
+                    .to_string(),
+            ));
+        }
+        tester_names.push(ctor);
+    }
+    let Some(dt) = datatype else {
+        return Err(invalid(
+            "datatype tester clause has no datatype".to_string(),
+        ));
+    };
+    let Some(subject) = subject else {
+        return Err(invalid("datatype tester clause has no subject".to_string()));
+    };
+    if !sort_matches_datatype(terms.sort(subject), dt) {
+        return Err(invalid(
+            "datatype tester subject sort does not match its declared datatype".to_string(),
+        ));
+    }
+    let constructors = dt_decls
+        .iter()
+        .find_map(|(name, constructors)| (name == dt).then_some(constructors))
+        .ok_or_else(|| invalid("datatype declaration disappeared during validation".to_string()))?;
+    if tester_names.len() == constructors.len()
+        && constructors
+            .iter()
+            .all(|ctor| tester_names.contains(&ctor.as_str()))
+    {
+        Ok(())
+    } else {
+        Err(invalid(
+            "datatype tester exhaustiveness omits or adds a constructor".to_string(),
+        ))
+    }
+}
+
+/// Decode a named unary Boolean tester `is-<constructor>(value)`.
+fn tester_application(terms: &TermStore, term: TermId) -> Option<(&str, TermId)> {
+    let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
+        return None;
+    };
+    let constructor = name.strip_prefix("is-")?;
+    let [value] = args.as_slice() else {
+        return None;
+    };
+    (terms.sort(term) == &Sort::Bool).then_some((constructor, *value))
+}
+
 /// Given two disequalities `(not (= a1 b1))` and `(not (= a2 b2))`, find the
 /// shared operand `t` and return the two non-shared operands `(c1, c2)`.
 fn shared_term_constructors(

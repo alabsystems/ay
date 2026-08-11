@@ -1,0 +1,114 @@
+# Historical AY-vs-Gurobi known-gap closure corpus.
+#
+# Source: the corrected 2026-07-28 60-second, one-thread-per-solver comparison.
+# This freezes case membership only, not those historically contended timings.
+# The first block contains the 66 cases Gurobi solved and AY did not.  The second
+# contains the 35 cases both solved but Gurobi solved faster.  The two
+# numerically disputed controls `control30-3-2-3` and `neos-3421095-cinca`
+# are deliberately excluded.  Keep this file ordered and append-only unless
+# a benchmark-audit report explains a correction.
+
+# Gurobi-only (66)
+ej
+p2m2p1m1p0n100
+graphdraw-gemcutter
+bppc8-02
+gsvm2rl3
+prod1
+mik-250-20-75-1
+mik-250-20-75-2
+mik-250-20-75-3
+mik-250-20-75-4
+mik-250-20-75-5
+neos-3046615-murg
+neos-3046601-motu
+neos-1430701
+ran13x13
+pigeon-08
+neos16
+nsa
+beavma
+neos-3611689-kaihu
+bppc8-09
+rlp1
+neos-3611447-jijia
+nexp-50-20-1-1
+pigeon-10
+ran12x21
+bienst1
+fhnw-binpack4-18
+fhnw-binpack4-4
+neos-2624317-amur
+neos-2626858-aoos
+neos-2656603-coxs
+neos17
+rout
+neos-3072252-nete
+sp150x300d
+ic97_tension
+r50x360
+pigeon-13
+opt1217
+neos-3610051-istra
+qiu
+aflow30a
+neos-3610173-itata
+neos-911970
+ponderthis0517-inf
+exp-1-500-5-5
+cod105
+neos-807639
+neos-631517
+neos-3118745-obra
+neos-1396125
+nh97_potential
+gmu-35-40
+nexp-50-20-4-2
+app2-2
+neos-860300
+neos-4650160-yukon
+g200x740
+nh97_tension
+f2gap201600
+f2gap401600
+f2gap801600
+haprp
+dsbmip
+mtest4ma
+
+# Both solved; Gurobi faster (35)
+stein9inf
+stein15inf
+flugpl
+flugplinf
+enlight4
+stein45inf
+g503inf
+gr4x6
+pk1
+b-ball
+neos-1425699
+enlight8
+mas76
+neos859080
+enlight9
+neos-5192052-neckar
+gt2
+enlight_hard
+p0201
+enlight11
+misc07
+supportcase14
+mod008inf
+supportcase16
+blend2
+23588
+f2gap40400
+22433
+neos-3610040-iskar
+dcmulti
+gen
+fiber
+khb05250
+qnet1
+qnet1_o

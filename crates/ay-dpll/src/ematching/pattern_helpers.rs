@@ -260,6 +260,7 @@ pub(super) fn collect_patterns_from_term(
     term: TermId,
     var_indices: &HashMap<String, usize>,
     actual_var_names: &[String],
+    no_patterns: &[TermId],
     out: &mut Vec<(EMatchPattern, Vec<String>)>,
 ) {
     let let_scopes = Vec::new();
@@ -269,6 +270,7 @@ pub(super) fn collect_patterns_from_term(
         var_indices,
         actual_var_names,
         &let_scopes,
+        no_patterns,
         out,
     );
 }
@@ -279,6 +281,7 @@ fn collect_patterns_from_term_with_let_scopes(
     var_indices: &HashMap<String, usize>,
     actual_var_names: &[String],
     let_scopes: &[LetScopeFrame],
+    no_patterns: &[TermId],
     out: &mut Vec<(EMatchPattern, Vec<String>)>,
 ) {
     stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
@@ -288,7 +291,10 @@ fn collect_patterns_from_term_with_let_scopes(
                     term_has_bound_var_in_let_scope(terms, arg, var_indices, let_scopes)
                 });
 
-                if contains_bound_var && !is_builtin_symbol(sym) {
+                // Z3's pattern inference rejects an exact `:no-pattern` node as
+                // a candidate but still visits its children, so only suppress
+                // this one push; do not prune the traversal.
+                if contains_bound_var && !is_builtin_symbol(sym) && !no_patterns.contains(&term) {
                     let pattern_args: Vec<EMatchArg> = args
                         .iter()
                         .map(|&arg| {
@@ -312,6 +318,7 @@ fn collect_patterns_from_term_with_let_scopes(
                         var_indices,
                         actual_var_names,
                         let_scopes,
+                        no_patterns,
                         out,
                     );
                 }
@@ -323,6 +330,7 @@ fn collect_patterns_from_term_with_let_scopes(
                     var_indices,
                     actual_var_names,
                     let_scopes,
+                    no_patterns,
                     out,
                 );
             }
@@ -333,6 +341,7 @@ fn collect_patterns_from_term_with_let_scopes(
                     var_indices,
                     actual_var_names,
                     let_scopes,
+                    no_patterns,
                     out,
                 );
                 collect_patterns_from_term_with_let_scopes(
@@ -341,6 +350,7 @@ fn collect_patterns_from_term_with_let_scopes(
                     var_indices,
                     actual_var_names,
                     let_scopes,
+                    no_patterns,
                     out,
                 );
                 collect_patterns_from_term_with_let_scopes(
@@ -349,6 +359,7 @@ fn collect_patterns_from_term_with_let_scopes(
                     var_indices,
                     actual_var_names,
                     let_scopes,
+                    no_patterns,
                     out,
                 );
             }
@@ -360,6 +371,7 @@ fn collect_patterns_from_term_with_let_scopes(
                     var_indices,
                     actual_var_names,
                     &inner_scopes,
+                    no_patterns,
                     out,
                 );
             }

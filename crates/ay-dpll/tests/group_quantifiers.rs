@@ -54,6 +54,8 @@ mod left_inverse_attack_corpus;
 mod mbqi_5971;
 #[path = "group_quantifiers/nested_skolem_functions_7150.rs"]
 mod nested_skolem_functions_7150;
+#[path = "group_quantifiers/pattern_annotation_verdict_invariance.rs"]
+mod pattern_annotation_verdict_invariance;
 #[path = "group_quantifiers/qe_selfcheck_window_cap.rs"]
 mod qe_selfcheck_window_cap;
 #[path = "group_quantifiers/quantifier_alternation_soundness.rs"]
@@ -70,11 +72,17 @@ mod quantifier_model_3441;
 mod quantprod_model_production;
 #[path = "group_quantifiers/skolemization_5840.rs"]
 mod skolemization_5840;
+#[path = "group_quantifiers/ufbv_deferred_default_mode_wrong_sat.rs"]
+mod ufbv_deferred_default_mode_wrong_sat;
 #[path = "group_quantifiers/ufbv_deferred_selfcheck_failclosed.rs"]
 mod ufbv_deferred_selfcheck_failclosed;
 #[path = "group_quantifiers/ufbv_fixpoint_premise_forced_unsat.rs"]
 mod ufbv_fixpoint_premise_forced_unsat;
 #[path = "group_quantifiers/ufbv_fixpoint_probe_admission.rs"]
 mod ufbv_fixpoint_probe_admission;
+#[path = "group_quantifiers/ufbv_strict_uf_completion_coverage.rs"]
+mod ufbv_strict_uf_completion_coverage;
+#[path = "group_quantifiers/ufnira_uf_completion_soundness.rs"]
+mod ufnira_uf_completion_soundness;
 #[path = "group_quantifiers/vacuous_trigger_completeness.rs"]
 mod vacuous_trigger_completeness;

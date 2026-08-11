@@ -360,6 +360,7 @@ fn probe(args: Vec<String>) -> Result<(), String> {
         "bnn" => ProbeEngine::Bnn,
         "bnb" => ProbeEngine::BranchAndBound,
         "sls" => ProbeEngine::Sls,
+        "card" => ProbeEngine::CardDescent,
         "lp" => ProbeEngine::Lp,
         "safe-lp" => ProbeEngine::SafeLp,
         "milp" => ProbeEngine::Milp,
@@ -843,6 +844,11 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    // FIRST statement of main: arm() re-execs this process under a kernel-held
+    // memory bound, so anything above it is discarded work, and it sets an env
+    // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+
     apply_memory_limit();
     if let Err(error) = run() {
         eprintln!("ay-pb-dev: {error}");

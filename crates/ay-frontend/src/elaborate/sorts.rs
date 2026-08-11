@@ -265,8 +265,9 @@ impl Context {
         sort: &command::Sort,
         subst: &HashMap<String, Sort>,
     ) -> Result<Sort> {
-        // Stack-safety guard for deeply nested sorts (Array/Seq/Set/Multiset/Map),
-        // which would otherwise overflow the stack on adversarial nesting.
+        // Stack-safety guard for deeply nested sorts
+        // (Array/Seq/Set/FiniteSet/Multiset/Map), which would otherwise overflow
+        // the stack on adversarial nesting.
         stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
             self.elaborate_sort_dispatch(sort, subst)
         })
@@ -285,6 +286,15 @@ impl Context {
                 }
                 match name.as_str() {
                     "Bool" => Ok(Sort::Bool),
+                    // Z3 5.0.0 exposes this user-friendly alias only before a
+                    // logic is selected.  Under `(set-logic ...)`, lowercase
+                    // `bool` is free for an explicit user sort declaration.
+                    "bool" if self.logic.is_none() => Ok(Sort::Bool),
+                    // The proof carrier is likewise part of only the no-logic
+                    // basic signature. AY does not manufacture proof-object
+                    // terms here, but user declarations over the carrier have
+                    // the ordinary sound equality/UF semantics.
+                    "Proof" if self.logic.is_none() => Ok(Sort::Uninterpreted("Proof".to_string())),
                     "Int" => Ok(Sort::Int),
                     "Real" => Ok(Sort::Real),
                     "String" => Ok(Sort::String),
@@ -414,6 +424,21 @@ impl Context {
                     let element = self.elaborate_sort_inner(&params[1], subst)?;
                     Ok(Sort::array(index, element))
                 }
+                "->" if self
+                    .logic
+                    .as_deref()
+                    .is_none_or(|logic| matches!(logic, "HORN" | "ALL")) =>
+                {
+                    if params.len() != 2 {
+                        return Err(ElaborateError::InvalidConstant(
+                            "-> requires 2 type parameters in AY's supported Z3 array fragment"
+                                .to_string(),
+                        ));
+                    }
+                    let index = self.elaborate_sort_inner(&params[0], subst)?;
+                    let element = self.elaborate_sort_inner(&params[1], subst)?;
+                    Ok(Sort::array(index, element))
+                }
                 "Seq" => {
                     if params.len() != 1 {
                         return Err(ElaborateError::InvalidConstant(
@@ -433,6 +458,24 @@ impl Context {
                             "Set requires 1 type parameter".to_string(),
                         ));
                     }
+                    let element = self.elaborate_sort_inner(&params[0], subst)?;
+                    Ok(Sort::array(element, Sort::Bool))
+                }
+                // Z3 5.0.0 exposes a distinct `(FiniteSet T)` theory sort. AY's
+                // textual frontend lowers it to the same characteristic-array
+                // carrier used by the native set theory, while retaining the
+                // exact Z3 5 operator vocabulary in `app/set.rs`. Marking set
+                // usage here is load-bearing: a script that mentions the sort
+                // but reaches it only through equality still has to route
+                // through the set-aware decision path instead of looking like
+                // an ordinary Bool-valued array problem.
+                "FiniteSet" => {
+                    if params.len() != 1 {
+                        return Err(ElaborateError::InvalidConstant(
+                            "FiniteSet requires 1 type parameter".to_string(),
+                        ));
+                    }
+                    self.mark_uses_set();
                     let element = self.elaborate_sort_inner(&params[0], subst)?;
                     Ok(Sort::array(element, Sort::Bool))
                 }

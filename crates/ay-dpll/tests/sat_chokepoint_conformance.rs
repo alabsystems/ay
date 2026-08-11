@@ -6,8 +6,9 @@
 //! `crates/ay-dpll/src/executor/model/sat_emit.rs::emit_sat_verdict` is the ONLY
 //! place a proposed `Sat` becomes an emitted `Sat`, and every public verdict
 //! path (plain check-sat, check-sat-assuming, optimize) must route through it so
-//! the strict, independent, and authoritative-failclosed gates ALL run, followed
-//! by the release-mode validation-evidence postcondition. This test pins that
+//! the strict, quantified-certificate, independent, and
+//! authoritative-failclosed gates ALL run, followed by the release-mode
+//! validation-evidence postcondition. This test pins that
 //! structure: if a verdict path stops funnelling through `emit_sat_verdict`, or
 //! the funnel drops a gate, the build fails.
 
@@ -18,7 +19,7 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
-/// (a) The funnel runs the exact strict -> independent -> authoritative ->
+/// (a) The funnel runs the exact strict -> quantified -> independent -> authoritative ->
 /// formula-neutral output completion -> validation-postcondition sequence and
 /// only then mints the witness token.
 #[test]
@@ -40,6 +41,9 @@ fn emit_sat_verdict_has_strict_independent_authoritative_postcondition_sequence(
     let strict_alt = funnel
         .find("apply_strict_model_gate(")
         .expect("emit_sat_verdict must run apply_strict_model_gate for already-validated models");
+    let quantified = funnel
+        .find("apply_quantified_model_failclosed_gate(")
+        .expect("emit_sat_verdict must run the quantified-model certificate gate");
     let independent = funnel
         .find("apply_independent_model_gate(")
         .expect("emit_sat_verdict must run the INDEPENDENT model-check gate");
@@ -56,17 +60,20 @@ fn emit_sat_verdict_has_strict_independent_authoritative_postcondition_sequence(
         .rfind("SatCertificate(())")
         .expect("emit_sat_verdict must mint the non-trivial witness token");
 
-    // Ordering: strict (both forms) precede independent, which precedes
-    // authoritative.
+    // Ordering: strict (both forms) precede the quantified certificate, which
+    // precedes the compositional independent evaluator and its defenses.
     assert!(
-        strict < independent && strict_alt < independent,
-        "the strict gate must run BEFORE the independent gate in emit_sat_verdict"
+        strict < quantified && strict_alt < quantified,
+        "the strict gate must run BEFORE the quantified certificate in emit_sat_verdict"
+    );
+    assert!(
+        quantified < independent,
+        "the quantified certificate must run BEFORE the independent evaluator so only certified quantified leaves can be composed out"
     );
     assert!(
         independent < authoritative,
         "the independent gate must run BEFORE the authoritative-failclosed gate in \
-         emit_sat_verdict (the authoritative gate closes the independent gate's \
-         CannotConfirm fail-open)"
+         emit_sat_verdict (the latter is retained as defense in depth)"
     );
     assert!(
         authoritative < output_completion && output_completion < postcondition,
@@ -859,13 +866,16 @@ fn verified_result_exposes_no_public_sat_fabrication_capability() {
         "the fabrication helper must be both cfg(test) and crate-private"
     );
     assert!(
-        results.contains("pub(crate) fn from_validated("),
-        "normal construction must stay crate-private and require the SAT capability"
+        results.contains("pub(crate) fn certified_sat(_certificate: SatCertificate)")
+            && results.contains("pub(crate) fn certified_unsat(")
+            && results.contains("pub(crate) fn unknown()")
+            && !results.contains("pub(crate) fn from_validated("),
+        "definite construction must stay crate-private and require an exact capability"
     );
     assert!(
         !results.contains(
             "result: SolveResult,\n        model_validated: bool,\n        sat_certificate: Option<SatCertificate>"
-        ) && results.contains("model_validated: admitted_sat"),
+        ) && results.contains("model_validated: true"),
         "SAT validation provenance must be derived from the consumed certificate, not a caller-supplied bool"
     );
     assert!(

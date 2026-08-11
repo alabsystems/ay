@@ -6,11 +6,33 @@
 //!
 //! Tests the select-map axiom:
 //!   select(map[f](a1,...,an), i) = f(select(a1,i),...,select(an,i))
+//! and the Z3 5.0.0 default-map axiom:
+//!   default(map[f](a1,...,an)) = f(default(a1),...,default(an))
 //!
 //! The eager rewrite in mk_select handles the syntactic case.
 //! The theory solver check_select_map handles equality-graph-induced cases.
 
 use crate::common::{sat_result, solve};
+
+/// `default` distributes through `map` using the mapped declaration.  This is
+/// a separate Z3 array-theory axiom from the pointwise select rule.
+#[test]
+fn test_array_map_declared_function_default_unsat() {
+    let output = solve(
+        r#"
+        (set-logic ALL)
+        (declare-fun f (Int) Int)
+        (declare-const a (Array Bool Int))
+        (assert (distinct (default ((_ map f) a)) (f (default a))))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        sat_result(&output),
+        Some("unsat"),
+        "default(map[f](a)) must equal f(default(a))"
+    );
+}
 
 /// Basic map[f] with unary function: the eager rewrite at term construction
 /// should rewrite `select(map[inc](a), 0)` to `inc(select(a, 0))`.
