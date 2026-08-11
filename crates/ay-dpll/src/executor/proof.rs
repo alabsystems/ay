@@ -9,15 +9,22 @@
 //! Surface-syntax rewriting lives in `proof_rewrite`.
 
 mod authored_array_row1;
+mod authored_array_row_value;
 mod authored_congruence;
 mod authored_datatype;
 mod authored_divisibility;
+mod authored_equality_closure;
 mod authored_forall;
+mod authored_forall_inst_conflict;
+mod authored_forall_inst_equality;
 mod authored_guarded_linear;
+mod authored_helpers;
 mod authored_linear;
 mod authored_store_permutation;
 mod authored_string_length;
+mod authored_string_word_identity;
 mod check;
+mod collection_axiom_promotion;
 mod contextual_array_row2;
 mod double_negation;
 mod exact_array_row2;
@@ -28,6 +35,10 @@ mod finite_enum_tests;
 mod lifecycle;
 mod terminal_trust;
 
+use authored_helpers::{
+    collect_select_terms_local, pair_other_side_local, DerivedUnit, GroundBinding,
+    StringLengthFactProvenance, StringRelevantSubterms,
+};
 use ay_core::term::{Constant, TermData};
 use ay_core::{
     AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TheoryLemmaKind,
@@ -622,10 +633,16 @@ impl Executor {
         self.replace_with_exact_authored_affine_euf_refutation(&mut proof);
         self.replace_with_exact_authored_bv_refutation(&mut proof);
         self.replace_with_exact_authored_store_permutation_refutation(&mut proof);
+        self.replace_with_exact_authored_array_row_value_refutation(&mut proof);
         self.replace_with_exact_authored_congruence_refutation(&mut proof);
         self.replace_with_exact_authored_string_length_arith_refutation(&mut proof);
+        self.replace_with_exact_authored_ground_substitution_refutation(&mut proof);
+        self.replace_with_exact_authored_word_identity_refutation(&mut proof);
         self.replace_with_exact_authored_forall_inst_refutation(&mut proof);
+        self.replace_with_exact_authored_forall_inst_equality_refutation(&mut proof);
+        self.replace_with_exact_authored_forall_inst_conflict_refutation(&mut proof);
         self.replace_with_exact_authored_congruence_value_refutation(&mut proof);
+        self.replace_with_exact_authored_equality_closure_refutation(&mut proof);
         self.collapse_double_negated_trust_lemma_literals(&mut proof);
 
         // Proof validation (#4393): validates all non-Hole steps via partial
@@ -696,52 +713,7 @@ impl Executor {
             "BUG: build_unsat_proof did not run internal proof checker"
         );
 
-        // Reclassify the set-cardinality bridge axiom before publication.
-        //
-        // Every route that builds a refutation lands here, which is why the
-        // reclassification lives at this choke point rather than in the
-        // individual re-scoping passes: the axiom reaches publication as a
-        // `Step{Trust}` (the printer renders Trust as `hole`), and the
-        // re-scoping passes that rewrite non-authored ASSUMES never see it.
-        //
-        // This is a hint, not an authority: the strict checker independently
-        // re-validates the exact schema and rejects the lemma if the clause is
-        // anything other than `(<= 0 (set.card s))`.
-        for step in &mut proof.steps {
-            let ProofStep::Step {
-                rule: AletheRule::Trust,
-                clause,
-                ..
-            } = step
-            else {
-                continue;
-            };
-            let [literal] = clause.as_slice() else {
-                continue;
-            };
-            let kind = if Self::is_set_card_non_negative_axiom(&self.ctx.terms, *literal) {
-                Some(TheoryLemmaKind::SetCardNonNegative)
-            } else if Self::is_set_card_member_lower_bound_axiom(&self.ctx.terms, *literal) {
-                Some(TheoryLemmaKind::SetCardMemberLowerBound)
-            } else if Self::is_set_card_empty_axiom(&self.ctx.terms, *literal) {
-                Some(TheoryLemmaKind::SetCardEmpty)
-            } else if Self::is_set_card_member_count_axiom(&self.ctx.terms, *literal) {
-                Some(TheoryLemmaKind::SetCardMemberCount)
-            } else if Self::is_set_card_zero_axiom(&self.ctx.terms, *literal) {
-                Some(TheoryLemmaKind::SetCardEmptyByAssertion)
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
-                *step = ProofStep::TheoryLemma {
-                    theory: "sets".to_string(),
-                    clause: vec![*literal],
-                    farkas: None,
-                    kind,
-                    lia: None,
-                };
-            }
-        }
+        self.promote_final_collection_axioms(&mut proof);
 
         self.last_proof = Some(proof);
     }
@@ -3158,6 +3130,24 @@ impl Executor {
             );
         }
 
+        // (3b) Regex length lower bounds, from every AUTHORED `str.in_re`. The
+        //      bound is the CHECKER's own compositional minimum for the ground
+        //      regex, so a membership joins the linear pool the same way a
+        //      containment does.
+        for &root in &authored {
+            let Some(fact) = self.build_regex_length_lower_bound(root) else {
+                continue;
+            };
+            push_fact(
+                &mut facts,
+                fact,
+                StringLengthFactProvenance::FromRootClause {
+                    root,
+                    kind: TheoryLemmaKind::RegexLengthLowerBound,
+                },
+            );
+        }
+
         // (4) Concat-length sums, for every `str.++` subterm (nested chains
         //     included, so a nested concat's length is connected to its leaves).
         for &concat in &subterms.concats {
@@ -3452,7 +3442,45 @@ impl Executor {
                 let assume = candidate.add_assume(root, None);
                 Some(candidate.add_resolution(vec![fact], root, clausified, assume))
             }
+            StringLengthFactProvenance::FromRootClause { root, kind } => {
+                let negated_root = self.ctx.terms.mk_not_raw(root);
+                let lemma =
+                    candidate.add_theory_lemma_with_kind("STRINGS", vec![negated_root, fact], kind);
+                let assume = candidate.add_assume(root, None);
+                Some(candidate.add_resolution(vec![fact], root, lemma, assume))
+            }
         }
+    }
+
+    /// The `str.len` lower bound implied by an authored `(str.in_re x R)`, or
+    /// `None` when the CHECKER'S OWN minimum-length computation declines.
+    ///
+    /// The bound is `ay_proof::regex_min_length`'s value, not one this producer
+    /// derives: the checker owns the regex semantics, and the emitted clause is
+    /// kept only when `ay_proof::recognize_regex_length_lower_bound` — the exact
+    /// precondition of the strict validator — already accepts it. A bound of
+    /// zero is dropped because `str.len` non-negativity already supplies it.
+    fn build_regex_length_lower_bound(&mut self, root: TermId) -> Option<TermId> {
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(root) else {
+            return None;
+        };
+        if (name != "str.in_re" && name != "str.in.re") || args.len() != 2 {
+            return None;
+        }
+        let (subject, regex) = (args[0], args[1]);
+        let minimum = ay_proof::regex_min_length(&self.ctx.terms, regex)?;
+        if minimum <= BigInt::from(0) {
+            return None;
+        }
+        let bound = self.ctx.terms.mk_int(minimum);
+        let length = self.string_length_of(subject);
+        let fact = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("<="), [bound, length], Sort::Bool);
+        let negated_root = self.ctx.terms.mk_not_raw(root);
+        ay_proof::recognize_regex_length_lower_bound(&self.ctx.terms, &[negated_root, fact])
+            .then_some(fact)
     }
 
     /// `(= (str.len (str.++ a…)) (+ (str.len a)…))` for a `str.++` term, or
@@ -5947,38 +5975,6 @@ fn strip_not_local(terms: &TermStore, mut t: TermId) -> (TermId, bool) {
 /// Whether `t` is an integer constant term (`(Const (Int n))`).
 fn is_int_const_local(terms: &TermStore, t: TermId) -> bool {
     matches!(terms.get(t), TermData::Const(Constant::Int(_)))
-}
-
-/// How one length fact in
-/// [`Executor::replace_with_exact_authored_string_length_arith_refutation`]
-/// becomes a unit clause.
-#[derive(Clone, Copy)]
-enum StringLengthFactProvenance {
-    /// An exact authored root; emitted as an `assume`.
-    Authored,
-    /// A universally-valid `str.len` theorem; emitted as a unit
-    /// `StringLengthLemma`.
-    Tautology,
-    /// A consequence of an authored `root`, licensed by the length theorem
-    /// `or_term` = `(or (not root) fact)`; emitted as that lemma, clausified by
-    /// `AletheRule::Or`, then resolved against `root`.
-    FromRoot { root: TermId, or_term: TermId },
-}
-
-/// String-theory subterms of the authored scope that the length-arithmetic
-/// reconstruction can build certified facts from.
-#[derive(Default)]
-struct StringRelevantSubterms {
-    /// `str.++` applications of arity >= 2.
-    concats: Vec<TermId>,
-    /// String-constant subterms.
-    string_constants: Vec<TermId>,
-    /// Every string-sorted subterm (candidate `str.len` subject).
-    length_subjects: Vec<TermId>,
-    /// `(predicate, contained, container)` for containment predicates.
-    containments: Vec<(TermId, TermId, TermId)>,
-    /// `(equality, left, right)` for String-sorted equalities.
-    string_equalities: Vec<(TermId, TermId, TermId)>,
 }
 
 fn decode_eq_local(terms: &TermStore, t: TermId) -> Option<(TermId, TermId)> {

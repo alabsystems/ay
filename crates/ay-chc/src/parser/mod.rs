@@ -65,6 +65,14 @@ pub struct ChcParser {
     functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
     /// Overloaded declared functions keyed by surface name.
     overloaded_functions: FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
+    /// Polarity of the expression position currently being parsed:
+    /// `+1` positive, `-1` negative (under an odd number of negations /
+    /// on the antecedent side of `=>`), `0` mixed/unknown.
+    ///
+    /// Quantifier stripping is only equivalence-preserving for `forall` at
+    /// positive polarity and `exists` at negative polarity, so
+    /// `parse_quantifier_expr` needs to know where it is.
+    polarity: i8,
     /// Current position in input
     pos: usize,
     /// Input string
@@ -83,6 +91,7 @@ impl ChcParser {
             declared_datatype_sorts: FxHashMap::default(),
             functions: FxHashMap::default(),
             overloaded_functions: FxHashMap::default(),
+            polarity: 1,
             pos: 0,
             input: String::new(),
         }

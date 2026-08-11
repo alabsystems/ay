@@ -65,6 +65,10 @@ impl Solver {
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY across solve() calls.
 
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+
         // Record wall-clock start time for progress/observer reporting (#8155).
         if self.cold.progress_enabled || self.has_observer() {
             self.cold.solve_start_time = Some(ay_core::time::Instant::now());
@@ -72,6 +76,9 @@ impl Solver {
         }
 
         if let Some(result) = callback.init_loop(self) {
+            if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                return self.declare_unknown_with_reason(reason);
+            }
             return result;
         }
 
@@ -299,13 +306,13 @@ impl Solver {
         // 1024 iterations, to keep wall-clock query deadlines fail-closed.
         let mut loop_iters: u64 = 0;
         loop {
-            if self.is_interrupted() {
-                return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+            if let Some(reason) = self.active_interrupt_reason() {
+                return self.declare_unknown_with_reason(reason);
             }
             loop_iters = loop_iters.wrapping_add(1);
             if loop_iters & 1023 == 0 {
-                if should_stop() {
-                    return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                    return self.declare_unknown_with_reason(reason);
                 }
                 // Conflict-independent memory poll (see cdcl_loop_impl): the
                 // reduction-time poll requires conflicts, so a low-conflict
@@ -341,8 +348,8 @@ impl Solver {
                     return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                 }
                 if self.num_conflicts.is_multiple_of(100) {
-                    if should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                     self.maybe_emit_progress();
                 }
@@ -388,8 +395,8 @@ impl Solver {
                     if self.decision_budget_exhausted() {
                         return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                     }
-                    if self.is_interrupted() || should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                 }
             } else if let Some(var) = self.pick_next_decision_variable_main() {
@@ -399,8 +406,8 @@ impl Solver {
                     if self.decision_budget_exhausted() {
                         return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                     }
-                    if self.is_interrupted() || should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                 }
             } else {
@@ -423,13 +430,13 @@ impl Solver {
         // the wall-clock query deadline.
         let mut loop_iters: u64 = 0;
         loop {
-            if self.is_interrupted() {
-                return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+            if let Some(reason) = self.active_interrupt_reason() {
+                return self.declare_unknown_with_reason(reason);
             }
             loop_iters = loop_iters.wrapping_add(1);
             if loop_iters & 1023 == 0 {
-                if should_stop() {
-                    return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                    return self.declare_unknown_with_reason(reason);
                 }
                 // A zero-conflict theory-propagation spin (non-converging LIA
                 // bound refinements) makes no conflicts and no decisions, so
@@ -525,8 +532,8 @@ impl Solver {
                 // Interrupt check on conflict path (#6296): matches
                 // solve_no_assumptions' every-100-conflicts check.
                 if self.num_conflicts.is_multiple_of(100) {
-                    if should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                     // Periodic progress reporting (wall-clock gated, ~5s interval).
                     self.maybe_emit_progress();
@@ -621,10 +628,10 @@ impl Solver {
                 self.cold.theory_continue_polls = self.cold.theory_continue_polls.wrapping_add(1);
                 let continue_poll = matches!(theory_result, TheoryPropResult::Continue)
                     && self.cold.theory_continue_polls.is_multiple_of(32);
-                if (!matches!(theory_result, TheoryPropResult::Continue) || continue_poll)
-                    && should_stop()
-                {
-                    return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                if !matches!(theory_result, TheoryPropResult::Continue) || continue_poll {
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
+                    }
                 }
                 match theory_result {
                     TheoryPropResult::Continue => {
@@ -720,10 +727,8 @@ impl Solver {
                                 // #8452: BCP conflict inside fixpoint loop — not theory.
                                 self.update_theory_conflict_ratio(false);
                                 if self.num_conflicts.is_multiple_of(100) {
-                                    if should_stop() {
-                                        return self.declare_unknown_with_reason(
-                                            SatUnknownReason::Interrupted,
-                                        );
+                                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                                        return self.declare_unknown_with_reason(reason);
                                     }
                                     self.maybe_emit_progress();
                                 }
@@ -755,9 +760,8 @@ impl Solver {
                             // Each theory propagation call can run expensive simplex.
                             // Without this check, the fixpoint loop can consume the
                             // entire wall-clock budget without ever polling should_stop.
-                            if should_stop() {
-                                return self
-                                    .declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                            if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                                return self.declare_unknown_with_reason(reason);
                             }
                             match inner_theory {
                                 TheoryPropResult::Continue => {
@@ -927,8 +931,8 @@ impl Solver {
                     if self.check_wander_abort() {
                         return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                     }
-                    if self.is_interrupted() || should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                 }
                 if self.cold.tla_trace.is_some() {
@@ -942,8 +946,8 @@ impl Solver {
                     if self.decision_budget_exhausted() {
                         return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                     }
-                    if self.is_interrupted() || should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                 }
                 if self.cold.tla_trace.is_some() {
@@ -980,8 +984,8 @@ impl Solver {
                     if self.check_wander_abort() {
                         return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
                     }
-                    if self.is_interrupted() || should_stop() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
                     }
                 }
                 // JIT incremental compilation (#8203): periodically compile

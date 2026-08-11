@@ -43,7 +43,7 @@ impl Solver {
             if preprocess_probes_tried >= MAX_PREPROCESS_PROBES {
                 break;
             }
-            if self.is_interrupted() {
+            if self.is_interrupted() || self.preprocess_timed_out() {
                 break;
             }
             if self.num_propagations >= probe_props_limit {

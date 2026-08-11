@@ -1295,3 +1295,55 @@ fn arr_lia561_dup_store_flat_not_false_unsat() {
         "arr_lia561 dup-store-flat core is SAT (Z3 confirms); AY must not return false UNSAT"
     );
 }
+
+// --- Regression: a declared BV logic must not swallow a non-BV array theory ---
+
+/// A `(set-logic QF_ABV)` script whose arrays range over UNINTERPRETED sorts
+/// must not be dispatched to the eager bit-blasting lane.
+///
+/// That lane's array axiom generator (`executor::theories::bv_axioms_array`)
+/// models `select`/`store` only when the index AND element sorts are bit-vectors
+/// — every ROW/extensionality site there bails out on
+/// `let Sort::BitVec(..) = .. else`. With uninterpreted `Index`/`Element` the
+/// formula reached the SAT solver with ZERO array axioms
+/// (`array-axioms.after-row=0`), read-over-write was never enforced, and the
+/// search returned a MODEL THAT FALSIFIES an authored assertion — the
+/// `[AY SOUNDNESS GATE]` "caught an INVALID model" banner. Fail-closed, so no
+/// wrong `sat` shipped, but the model itself was genuinely wrong.
+///
+/// The declared logic is an upper bound, not a licence to drop a theory: with no
+/// bit-vector term anywhere in the assertions the router now re-derives the
+/// category from content and the array+EUF lane decides this exactly.
+///
+/// This is the same store/cross-swap shape as
+/// `qf_ax_storeinv_cross_swap_nf_2idx`, reduced to the two `select` reads that
+/// were falsified, and it is UNSAT: `i2 = d` forces `select(v0, d)` and
+/// `select(v0, i2)` to agree by congruence, so assertions 2 and 3 conflict.
+#[test]
+#[timeout(10_000)]
+fn qf_abv_uninterpreted_sort_array_is_not_bit_blasted() {
+    let (_, outputs) = solve(
+        r#"
+        (set-logic QF_ABV)
+        (declare-sort Element 0)
+        (declare-sort Index 0)
+        (declare-const i1 Index)
+        (declare-const i2 Index)
+        (declare-const a2 (Array Index Element))
+        (declare-const a1 (Array Index Element))
+        (declare-const d Index)
+        (assert (= i2 d))
+        (assert (= (select a1 d) (select (store a1 i1 (select a2 i1)) d)))
+        (assert (= (select (store a2 i1 (select a1 i1)) i2)
+                   (select (store a1 i1 (select a2 i1)) i2)))
+        (assert (not (= (select a1 d) (select (store a2 i1 (select a1 i1)) d))))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        outputs[0], "unsat",
+        "arrays over uninterpreted sorts must reach the array+EUF lane even under \
+         a declared BV logic; the bit-blasting lane emits no ROW axioms for them \
+         and returns an invalid model"
+    );
+}

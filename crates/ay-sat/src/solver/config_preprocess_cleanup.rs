@@ -5,6 +5,13 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreprocessOutcome {
+    Complete,
+    Unsat,
+    Stopped(SatUnknownReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PreprocessStageControl {
     Continue,
     ReturnFalse,
@@ -41,19 +48,23 @@ impl PreprocessCleanupOutcome {
 }
 
 impl Solver {
-    pub(super) fn run_preprocess_cleanup_stage(
+    pub(super) fn run_preprocess_cleanup_stage<F>(
         &mut self,
         preprocessing_quick_mode: bool,
         skip_expensive_preprocessing_passes: bool,
         skip_dense_formula: bool,
-    ) -> PreprocessCleanupOutcome {
+        should_stop: &F,
+    ) -> PreprocessCleanupOutcome
+    where
+        F: Fn() -> bool + ?Sized,
+    {
         let mut invalidated_watches = false;
 
         // 5. Conditioning (GBCE): globally blocked clause elimination.
         //    CaDiCaL runs conditioning only in full preprocessing rounds
         //    (internal.cpp:695-739), not in the quick path. Deferred from
         //    preprocessing quick mode.
-        if self.is_interrupted() || self.preprocess_timed_out() {
+        if self.preprocessing_should_stop(should_stop) {
             return PreprocessCleanupOutcome::return_false();
         }
         if self.inproc_ctrl.condition.enabled
@@ -76,7 +87,7 @@ impl Solver {
         //    Deferred from preprocessing quick mode.
         //    Bug fix: previously only subsumed clauses were deleted but
         //    strengthening results (literal removal) were silently discarded.
-        if self.is_interrupted() || self.preprocess_timed_out() {
+        if self.preprocessing_should_stop(should_stop) {
             return PreprocessCleanupOutcome::return_false();
         }
         if self.inproc_ctrl.subsume.enabled
@@ -158,7 +169,7 @@ impl Solver {
         //    Skip on large dense formulas: analyze_components allocates
         //    Vec<Vec<Literal>> for all clauses, which is O(total_lits) memory
         //    and time. On shuffling-2 (4.7M clauses), this alone costs ~100ms.
-        if self.is_interrupted() || self.preprocess_timed_out() {
+        if self.preprocessing_should_stop(should_stop) {
             return PreprocessCleanupOutcome::return_false();
         }
         if !skip_dense_formula && self.inproc_ctrl.decompose.enabled {

@@ -4605,7 +4605,36 @@ impl Executor {
         // overwrites solver-assigned values — and the full validation below
         // still decides acceptance, so it cannot introduce a wrong SAT. See
         // model/completion.rs.
-        self.complete_model_for_validation(&[]);
+        //
+        // ROOTS MUST MATCH THE GATE (#dt-assumption-completion-roots). The
+        // verdict this finalizer publishes is "sat under the CURRENT
+        // assumptions", and `independent_gate_query_roots` checks exactly
+        // `ctx.assertions ∪ last_assumptions`. Completing over the assertions
+        // ALONE left the model total on a strictly SMALLER set than the one it
+        // is then judged against, and an assumption-only atom is invisible to
+        // every completion phase — including the datatype construction, whose
+        // union-find is what turns a committed `=` into ONE class value.
+        //
+        // Measured shape (the deductive-checks `eval_objective_exact` control): the
+        // body binding `(= result (eval_terms_saturating t a))` is carried as
+        // an ASSUMPTION while the disequality between the two Result-valued UF
+        // applications is a top-level assertion. Rooted on the assertions only,
+        // `result` and `(eval_terms_saturating t a)` never merged, so
+        // construction gave them two DIFFERENT well-founded values — and the
+        // independent gate, which DOES read the assumption, then caught the
+        // published model falsifying it and fired the soundness banner. The
+        // model was genuinely wrong, not merely unconfirmable; the missing
+        // equality was the cause.
+        //
+        // Sound: an assumption is enforced true for this `check_sat_assuming`
+        // exactly as a top-level assertion is (completion.rs already documents
+        // and relies on that for its `extra_roots`), `last_assumptions` is
+        // cleared per solve by `prepare_check_sat_internal_state` so it can
+        // never be stale, and completion stays candidate-only — every gate
+        // re-checks the result, so a wrong completion still degrades to
+        // `unknown` rather than shipping a wrong `sat`.
+        let assumption_roots = self.last_assumptions.clone().unwrap_or_default();
+        self.complete_model_for_validation(&assumption_roots);
         self.materialize_symbolic_array_defaults();
         self.repair_asserted_bool_leaf_polarities();
 

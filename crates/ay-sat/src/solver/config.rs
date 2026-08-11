@@ -46,14 +46,14 @@ impl Solver {
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
-    /// Returns true if the preprocessing wall-clock deadline has been reached (#8078).
-    /// Checked alongside `is_interrupted()` in every preprocessing technique to
-    /// prevent aggregate preprocessing from exceeding the time budget.
+    /// True when preprocessing's local budget or the whole-solve deadline has
+    /// expired. Existing preprocessing internals poll this helper directly.
     #[inline]
     pub(super) fn preprocess_timed_out(&self) -> bool {
         self.cold
             .preprocess_deadline
             .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+            || self.solve_deadline_expired()
     }
 
     /// Install (or clear) the whole-solve wall-clock deadline

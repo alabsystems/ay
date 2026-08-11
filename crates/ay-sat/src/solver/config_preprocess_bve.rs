@@ -762,7 +762,7 @@ impl Solver {
                 (elim_after_quick - elim_before_quick) as u64;
             self.inproc.bve.stats_mut().fast_elim_clauses +=
                 cls_before_quick.saturating_sub(cls_after_quick) as u64;
-            if bve_unsat || self.is_interrupted() {
+            if bve_unsat || self.is_interrupted() || self.preprocess_timed_out() {
                 self.clear_stale_reasons();
                 // Flush learned clauses containing eliminated variables (#8482)
                 // before reconnecting watches, even on early exit.
@@ -894,7 +894,11 @@ impl Solver {
                 // Only run subsumption when the preceding BVE pass was productive,
                 // to avoid overhead on formulas where gate-BVE has little effect.
                 let elim_after_bve = self.var_lifecycle.count_removed();
-                if elim_after_bve > elim_before && !bve_unsat && !self.is_interrupted() {
+                if elim_after_bve > elim_before
+                    && !bve_unsat
+                    && !self.is_interrupted()
+                    && !self.preprocess_timed_out()
+                {
                     self.subsume();
                 }
                 // Post-pass clause growth check (#8482): if this pass caused

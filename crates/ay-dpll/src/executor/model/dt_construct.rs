@@ -77,11 +77,24 @@
 //! constraint, because the constraint itself is re-evaluated under the
 //! constructed assignment by the full pipeline.
 //!
-//! SCOPE. Construction BAILS OUT entirely (leaving the model exactly as
-//! today) when any datatype-sorted term is not a variable, constructor
-//! application, or selector application — UF applications, array `select`s,
-//! `ite`s over datatypes need EUF/array congruence this phase does not model.
-//! Fail-closed: bailing preserves today's behaviour verbatim.
+//! SCOPE. A datatype-sorted `ite` (whose value is decided by a branch this
+//! phase does not evaluate) still BAILS OUT entirely, leaving the model exactly
+//! as before. Fail-closed: bailing preserves today's behaviour verbatim.
+//!
+//! OPAQUE APPLICATIONS (#dt-opaque-app-model). A datatype-sorted UF application
+//! `(f a ..)` or array read `(select A i)` is collected as
+//! [`DtTermKind::Opaque`]: the phase does not interpret the head, but the term
+//! still joins the union-find, so committed equalities/disequalities over it
+//! steer construction. Congruence is modelled conservatively — two opaque terms
+//! with the same head merge ONLY when the model proves every corresponding
+//! argument equal (rule `(d)`).
+//!
+//! This is not a nicety. Bailing left these terms to the legacy per-leaf
+//! fallback [`Executor::resolve_dt_value`], whose last resort is the SORT's
+//! canonical default — a value that ignores the model's own disequalities. Two
+//! datatype-valued UF applications the solver had committed DISTINCT both
+//! received that one default, so the published model falsified the asserted
+//! disequality and the soundness gate had to reject a genuinely-SAT query.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
@@ -114,6 +127,21 @@ enum DtTermKind {
     CtorApp { ctor: String, args: Vec<TermId> },
     /// Selector application `(sel t)` whose RESULT is datatype-sorted.
     SelApp { sel: String, arg: TermId },
+    /// OPAQUE datatype-sorted application — an uninterpreted-function
+    /// application `(f a ..)` or an array read `(select A i)`. This phase does
+    /// not interpret the head; it treats the application as an opaque term
+    /// whose only structure is EUF congruence (see the `(d)` rule in
+    /// `dt_collect`: two opaque terms with the same head merge only when every
+    /// corresponding argument is PROVABLY equal under the model).
+    ///
+    /// Admitting these instead of bailing is what lets a class carrying a
+    /// committed DISEQUALITY between two datatype-valued UF applications get
+    /// two DISTINCT constructed values (#dt-opaque-app-model). Before this, the
+    /// whole phase bailed and the legacy per-leaf fallback
+    /// (`Executor::resolve_dt_value`) handed BOTH applications the same
+    /// sort-canonical default, producing a model that falsified the very
+    /// disequality the solver had committed true.
+    Opaque { head: String, args: Vec<TermId> },
 }
 
 /// Render a constructed [`ModelValue`] as a canonical string: injective per
@@ -439,9 +467,17 @@ impl Executor {
                                 arg: args[0],
                             }
                         } else {
-                            // UF application / array select / other: this phase
-                            // cannot model its congruence — bail entirely.
-                            return None;
+                            // UF application / array select / other: opaque to
+                            // this phase. Collected (not bailed on) so its class
+                            // participates in the union-find and in disequality
+                            // steering; congruence is modelled conservatively by
+                            // rule (d) below, which merges two opaque terms only
+                            // when the model PROVES their arguments equal
+                            // (#dt-opaque-app-model).
+                            DtTermKind::Opaque {
+                                head: name.clone(),
+                                args: args.clone(),
+                            }
                         };
                         dt_terms.push(t);
                         kinds_by_term.insert(t, kind);
@@ -581,6 +617,50 @@ impl Executor {
         //     ctor merge corresponding datatype args;
         // (c) selector-vs-argument: `(sel_i t)` merges with the i-th argument
         //     of a co-class constructor application owning `sel_i`.
+        // (d) opaque-application congruence: `(f a..)` ~ `(f b..)` when every
+        //     corresponding argument pair is PROVABLY equal under the model.
+        //
+        // Each admitted application is reduced ONCE to a congruence key: the
+        // head plus, per argument, either the argument's datatype CLASS (which
+        // moves as the fixpoint merges) or the model's evaluated value for it
+        // (fixed, so it is computed here and not re-evaluated every round). An
+        // application with an argument the model leaves unevaluable is dropped
+        // entirely — it can never be PROVED congruent to another, and merging
+        // on a guess is what would collapse two classes a committed
+        // disequality separates. Keys are then grouped in one pass per round,
+        // so this rule is linear in the number of opaque applications rather
+        // than pairwise.
+        enum OpaqueArgKey {
+            /// Datatype-sorted argument: keyed by its (moving) class root.
+            Class(usize),
+            /// Any other argument: keyed by its fixed evaluated model value.
+            Value(String),
+        }
+        let opaque_apps: Vec<(usize, String, Vec<OpaqueArgKey>)> = dt_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, _)| {
+                let DtTermKind::Opaque { head, args } = &kinds[i] else {
+                    return None;
+                };
+                if args.is_empty() {
+                    return None;
+                }
+                let keys: Option<Vec<OpaqueArgKey>> = args
+                    .iter()
+                    .map(|a| {
+                        if let Some(&ai) = index.get(a) {
+                            return Some(OpaqueArgKey::Class(ai));
+                        }
+                        match self.evaluate_term(model, *a) {
+                            EvalValue::Unknown => None,
+                            v => Some(OpaqueArgKey::Value(format!("{v:?}"))),
+                        }
+                    })
+                    .collect();
+                keys.map(|keys| (i, head.clone(), keys))
+            })
+            .collect();
         let dt_sel_apps: Vec<(usize, String, usize)> = dt_terms
             .iter()
             .enumerate()
@@ -651,6 +731,39 @@ impl Executor {
                         if uf_union(&mut parent, si, arg_idx) {
                             changed = true;
                         }
+                    }
+                }
+            }
+            // (d) opaque-application congruence. MERGE ONLY ON PROOF, exactly
+            // like (a)/(b)/(c): two applications merge when they share a head
+            // and every argument is either in the same datatype class or
+            // carries the same evaluated model value. Applications whose
+            // arguments the model cannot pin were already dropped from
+            // `opaque_apps`, so nothing here merges on a guess. The cost of NOT
+            // merging a pair that is in fact congruent is a fail-closed
+            // `unknown` from the downstream value-keyed gates, never a wrong
+            // `sat`.
+            let mut by_key: HashMap<String, usize> = HashMap::default();
+            for (i, head, keys) in &opaque_apps {
+                let mut key = head.clone();
+                for k in keys {
+                    key.push('\u{1}');
+                    match k {
+                        OpaqueArgKey::Class(ai) => {
+                            key.push('#');
+                            key.push_str(&uf_find(&mut parent, *ai).to_string());
+                        }
+                        OpaqueArgKey::Value(v) => key.push_str(v),
+                    }
+                }
+                match by_key.get(&key) {
+                    Some(&j) => {
+                        if uf_union(&mut parent, *i, j) {
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        by_key.insert(key, *i);
                     }
                 }
             }

@@ -3602,6 +3602,26 @@ mod tests {
         executor
     }
 
+    fn wide_signed_keep_max_executor() -> Executor {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_BV)\n\
+             (declare-const auth_wide_lo (_ BitVec 128))\n\
+             (declare-const auth_wide_hi (_ BitVec 128))\n\
+             (assert (not (bvslt (_ bv0 128)\n\
+                                (bvsub auth_wide_hi auth_wide_lo))))\n\
+             (assert (bvslt auth_wide_lo auth_wide_hi))\n\
+             (assert (bvsle (_ bv1 128) auth_wide_lo))",
+        )
+        .expect("wide Bool/BV fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("wide Bool/BV fixture must elaborate");
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        executor
+    }
+
     fn mixed_bv_lia_bridge_executor(lower_bound: u32) -> Executor {
         let smt = format!(
             "(set-logic ALL)\n\
@@ -3768,6 +3788,41 @@ mod tests {
             .ctx
             .terms
             .mk_var("auth_bv_late_append", ay_core::Sort::Bool);
+        assert!(executor.take_unsat_certificate().is_none());
+    }
+
+    #[test]
+    fn wide_source_bool_bv_refutation_mints_checked_authority() {
+        let mut executor = wide_signed_keep_max_executor();
+        let proposed = executor
+            .check_sat()
+            .expect("the production wide Bool/BV solve must finish");
+        assert!(proposed.is_unsat());
+
+        // Force the source-bound lane: neither a translated presentation nor
+        // the production SAT sidecar may account for publication.
+        executor.last_checked_sat_refutation = None;
+        executor.last_proof = None;
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+        assert!(published.is_unsat());
+        let certificate = executor
+            .last_unsat_certificate
+            .as_ref()
+            .expect("the source-bound refutation must mint an authority token");
+        assert!(matches!(
+            &certificate.0,
+            UnsatCertificateKind::CheckedBoolBv(_)
+        ));
+        assert!(certificate.independently_verified());
+        assert_eq!(
+            certificate.command_admission(),
+            CommandUnsatAdmission::CheckedBoolBv
+        );
+
+        let _late = executor
+            .ctx
+            .terms
+            .mk_var("auth_wide_late_append", ay_core::Sort::Bool);
         assert!(executor.take_unsat_certificate().is_none());
     }
 

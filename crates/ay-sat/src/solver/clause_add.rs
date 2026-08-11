@@ -287,11 +287,7 @@ impl Solver {
             manager.register_original_clause(&[]);
         }
 
-        let clause_id = self.cold.next_original_clause_id;
-        self.cold.next_original_clause_id += 1;
-        if self.cold.next_clause_id <= clause_id {
-            self.cold.next_clause_id = clause_id + 1;
-        }
+        let clause_id = self.allocate_original_clause_id();
 
         if self.cold.lrat_enabled {
             if let Some(ref mut manager) = self.proof_manager {
@@ -336,11 +332,7 @@ impl Solver {
             return;
         }
 
-        let clause_id = self.cold.next_original_clause_id;
-        self.cold.next_original_clause_id += 1;
-        if self.cold.next_clause_id <= clause_id {
-            self.cold.next_clause_id = clause_id + 1;
-        }
+        let clause_id = self.allocate_original_clause_id();
 
         if let Some(ref mut manager) = self.proof_manager {
             manager.register_original_clause(literals);

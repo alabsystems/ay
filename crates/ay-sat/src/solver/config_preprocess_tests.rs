@@ -108,3 +108,17 @@ fn preprocess_once_unsat_exit_is_self_disabling() {
         "deferring the UNSAT result to the normal solve path must remain valid"
     );
 }
+
+#[test]
+fn local_preprocess_deadline_is_normal_completion_not_solve_stop() {
+    use super::*;
+
+    let mut solver = Solver::new(1);
+    solver.cold.preprocess_deadline = Some(ay_core::time::Instant::now());
+
+    assert!(solver.preprocess_timed_out());
+    assert_eq!(
+        solver.classify_preprocess_outcome(false, &|| false),
+        PreprocessOutcome::Complete
+    );
+}

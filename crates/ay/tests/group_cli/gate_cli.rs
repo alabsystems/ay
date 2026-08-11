@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
@@ -129,7 +129,7 @@ fn solver_gate_can_list_native_steps_without_running_heavy_gate() {
         "[solver-gate] Root:",
         "solver_gate_wiring\t<native>",
         "critical_solver_policy\tbash scripts/check_critical_solver_policy.sh",
-        "debug_ay_smtlib_conformance_summary\tcargo test -p ay --test group_smt",
+        "debug_ay_smtlib_conformance_summary\tcargo test --locked -p ay --features cli --test group_smt",
         "release_ay_dpll_qf_bv_differential_strict\tZ3_DIFFERENTIAL_REQUIRED=1 cargo test",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
@@ -163,19 +163,18 @@ fn publish_gate_can_list_native_steps_without_running_heavy_gate() {
     }
 }
 
-#[test]
-fn critical_solver_policy_accepts_native_solver_gate_evidence() {
+fn run_critical_solver_policy(command: &str) -> Output {
     let tmp = TempDir::new().expect("tempdir");
     let paths = tmp.path().join("paths.txt");
     let message = tmp.path().join("message.txt");
     fs::write(&paths, "crates/ay/src/cmd_gate.rs\n").expect("write paths");
     fs::write(
         &message,
-        "native gate test\n\n## Verified\n- solver-gate: cargo run --locked -p ay -- gate solver\n  [solver-gate] PASS\n",
+        format!("native gate test\n\n## Verified\n- solver-gate: {command}\n"),
     )
     .expect("write message");
 
-    let output = Command::new("bash")
+    Command::new("bash")
         .args([
             "scripts/check_critical_solver_policy.sh",
             "--paths-file",
@@ -185,12 +184,157 @@ fn critical_solver_policy_accepts_native_solver_gate_evidence() {
         ])
         .current_dir(repo_root())
         .output()
-        .expect("spawn critical solver policy");
+        .expect("spawn critical solver policy")
+}
 
+#[test]
+fn critical_solver_policy_requires_canonical_cargo_evidence() {
+    let canonical = "cargo run --locked -p ay --features cli -- gate solver";
+    let output = run_critical_solver_policy(canonical);
     assert!(
         output.status.success(),
-        "policy should accept native solver gate evidence:\nstdout:\n{}\nstderr:\n{}",
+        "policy rejected canonical command: {canonical}\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let rejected = [
+        (
+            "old command without cli",
+            "cargo run --locked -p ay -- gate solver",
+        ),
+        (
+            "missing locked",
+            "cargo run -p ay --features cli -- gate solver",
+        ),
+        (
+            "missing package",
+            "cargo run --locked --features cli -- gate solver",
+        ),
+        (
+            "wrong package",
+            "cargo run --locked -p ay-client --features cli -- gate solver",
+        ),
+        (
+            "long package spelling",
+            "cargo run --locked --package ay --features cli -- gate solver",
+        ),
+        (
+            "package equals spelling",
+            "cargo run --locked --package=ay --features cli -- gate solver",
+        ),
+        (
+            "feature equals spelling",
+            "cargo run --locked -p ay --features=cli -- gate solver",
+        ),
+        (
+            "short feature spelling",
+            "cargo run --locked -p ay -F cli -- gate solver",
+        ),
+        (
+            "quoted feature",
+            "cargo run --locked -p ay --features 'cli' -- gate solver",
+        ),
+        (
+            "all features spelling",
+            "cargo run --locked -p ay --all-features -- gate solver",
+        ),
+        (
+            "extra solver feature",
+            "cargo run --locked -p ay --features cli,solver -- gate solver",
+        ),
+        (
+            "solver feature only",
+            "cargo run --locked -p ay --features solver -- gate solver",
+        ),
+        (
+            "environment wrapper",
+            "env cargo run --locked -p ay --features cli -- gate solver",
+        ),
+        (
+            "environment assignment",
+            "CARGO_TERM_COLOR=never cargo run --locked -p ay --features cli -- gate solver",
+        ),
+        ("direct binary", "target/release/ay gate solver"),
+        ("path binary", "./target/debug/ay gate solver"),
+        (
+            "client feature substring",
+            "cargo run --locked -p ay --features client -- gate solver",
+        ),
+        (
+            "cli-disabled feature substring",
+            "cargo run --locked -p ay --features cli-disabled -- gate solver",
+        ),
+        (
+            "feature after separator",
+            "cargo run --locked -p ay -- gate solver --features cli",
+        ),
+        (
+            "feature in comment",
+            "cargo run --locked -p ay -- gate solver # --features cli",
+        ),
+        (
+            "comment after canonical command",
+            "cargo run --locked -p ay --features cli -- gate solver # local gate",
+        ),
+        (
+            "all-features false",
+            "cargo run --locked -p ay --all-features=false -- gate solver",
+        ),
+        (
+            "all-features false beside cli",
+            "cargo run --locked -p ay --features cli --all-features=false -- gate solver",
+        ),
+        (
+            "package after separator",
+            "cargo run --locked --features cli -- gate solver -p ay",
+        ),
+        (
+            "extra gate argument",
+            "cargo run --locked -p ay --features cli -- gate solver --list-steps",
+        ),
+        (
+            "manifest path",
+            "cargo run --locked -p ay --features cli --manifest-path Cargo.toml -- gate solver",
+        ),
+        (
+            "example target",
+            "cargo run --locked -p ay --features cli --example demo -- gate solver",
+        ),
+        (
+            "binary target",
+            "cargo run --locked -p ay --features cli --bin ay -- gate solver",
+        ),
+        (
+            "positional Cargo argument",
+            "cargo run --locked -p ay --features cli unexpected -- gate solver",
+        ),
+        (
+            "unknown Cargo flag",
+            "cargo run --locked -p ay --features cli --unknown -- gate solver",
+        ),
+        (
+            "reordered canonical flags",
+            "cargo run -p ay --locked --features cli -- gate solver",
+        ),
+        (
+            "duplicate interior whitespace",
+            "cargo run  --locked -p ay --features cli -- gate solver",
+        ),
+        (
+            "solver suffix",
+            "cargo run --locked -p ay --features cli -- gate solver-extra",
+        ),
+        (
+            "shell control operator",
+            "cargo run --locked -p ay --features cli && echo -- gate solver",
+        ),
+    ];
+    for (case, command) in rejected {
+        let output = run_critical_solver_policy(command);
+        assert!(
+            !output.status.success(),
+            "policy accepted {case}: {command}"
+        );
+    }
 }

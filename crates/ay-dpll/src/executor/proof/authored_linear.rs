@@ -167,7 +167,7 @@ impl Executor {
     ///
     /// A cheap necessary condition used to narrow candidate work before a
     /// checker recognizer runs — never a substitute for one.
-    fn is_bitvec_constant(terms: &TermStore, term: TermId) -> bool {
+    pub(super) fn is_bitvec_constant(terms: &TermStore, term: TermId) -> bool {
         matches!(terms.get(term), TermData::Const(Constant::BitVec { .. }))
     }
 

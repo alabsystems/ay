@@ -262,13 +262,42 @@ impl ChcParser {
     pub(super) fn parse_application(&mut self, func: &str) -> ChcResult<ChcExpr> {
         let mut args = Vec::new();
 
+        // Track POLARITY while descending so `parse_quantifier_expr` can tell a
+        // legitimate implicit-universal wrapper from a body-position `forall`
+        // (which weakens its guard when stripped) or a head-position `exists`
+        // (which strengthens, and could fabricate a proof).
+        //
+        //   not        -> flips its argument
+        //   =>         -> flips the antecedent, preserves the consequent
+        //   and / or   -> preserve
+        //   everything else (ite conditions, Bool `=`/`distinct`/`xor`, ...)
+        //                -> MIXED (0); a quantifier there is not safely strippable
+        let outer_polarity = self.polarity;
+        let mut arg_index = 0usize;
         loop {
             self.skip_whitespace_and_comments();
             if self.peek_char() == Some(')') {
                 break;
             }
-            args.push(self.parse_expr()?);
+            self.polarity = match func {
+                "not" => -outer_polarity,
+                "=>" | "implies" => {
+                    // `=>` is checked to be binary below; antecedent is arg 0.
+                    if arg_index == 0 {
+                        -outer_polarity
+                    } else {
+                        outer_polarity
+                    }
+                }
+                "and" | "or" => outer_polarity,
+                _ => 0,
+            };
+            let parsed = self.parse_expr();
+            self.polarity = outer_polarity;
+            args.push(parsed?);
+            arg_index += 1;
         }
+        self.polarity = outer_polarity;
         self.expect_char(')')?;
 
         // Map function names to operations

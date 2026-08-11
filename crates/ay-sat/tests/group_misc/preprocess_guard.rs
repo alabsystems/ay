@@ -4,15 +4,15 @@
 
 #![allow(clippy::panic)]
 
-fn preprocess_body(source: &str) -> &str {
-    let signature = "pub(super) fn preprocess(&mut self) -> bool {";
+fn preprocess_pipeline_body(source: &str) -> &str {
+    let signature = "pub(super) fn preprocess_inner<F>";
     let start = source
         .find(signature)
-        .expect("preprocess definition must exist");
+        .expect("preprocess pipeline definition must exist");
     let open_brace = source[start..]
         .find('{')
         .map(|offset| start + offset)
-        .expect("preprocess opening brace must exist");
+        .expect("preprocess pipeline opening brace must exist");
 
     let mut depth = 0usize;
     for (offset, ch) in source[open_brace..].char_indices() {
@@ -29,17 +29,17 @@ fn preprocess_body(source: &str) -> &str {
         }
     }
 
-    panic!("preprocess closing brace must exist");
+    panic!("preprocess pipeline closing brace must exist");
 }
 
 #[test]
 fn test_preprocess_propagate_checks_always_guard_empty_clause() {
-    // The preprocess function uses `propagate_check_unsat()` which is defined as:
+    // The preprocess pipeline uses `propagate_check_unsat()` which is defined as:
     //   self.has_empty_clause || self.search_propagate().is_some()
-    // Verify that preprocess calls propagate_check_unsat (not raw search_propagate),
+    // Verify that the pipeline calls propagate_check_unsat (not raw search_propagate),
     // and that propagate_check_unsat itself includes the has_empty_clause guard.
     let config_source = include_str!("../../src/solver/config_preprocess.rs");
-    let preprocess = preprocess_body(config_source);
+    let preprocess = preprocess_pipeline_body(config_source);
 
     const CALL: &str = "self.propagate_check_unsat()";
     let calls = preprocess.match_indices(CALL).count();

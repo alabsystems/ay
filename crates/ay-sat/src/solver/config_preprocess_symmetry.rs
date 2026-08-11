@@ -67,8 +67,22 @@ impl Solver {
     /// emit lex-leader SBP clauses for each orbit.
     ///
     /// Returns `(unsat, changed)`.
+    #[cfg(test)]
     pub(super) fn preprocess_symmetry(&mut self) -> (bool, bool) {
+        self.preprocess_symmetry_interruptible(&|| false)
+    }
+
+    /// Callback-aware symmetry preprocessing used by the initial-preprocess
+    /// transaction. Cancellation is sampled at read-only phase boundaries and
+    /// during candidate-swap verification; no partial set of SBPs is installed.
+    pub(super) fn preprocess_symmetry_interruptible<F>(&mut self, should_stop: &F) -> (bool, bool)
+    where
+        F: Fn() -> bool + ?Sized,
+    {
         self.cold.symmetry_stats.begin_run();
+        if self.preprocessing_should_stop(should_stop) {
+            return (false, false);
+        }
         if std::env::var_os("AY_SAT_SYMMETRY_TRACE").is_some() {
             safe_eprintln!(
                 "c symmetry-trace: entered: enabled={} oneshot={} incremental={} proof_manager={} lrat={} clause_trace={} vars={} clauses={}",
@@ -465,6 +479,9 @@ impl Solver {
         }
 
         let clauses = self.snapshot_root_irredundant_clauses_for_symmetry();
+        if self.preprocessing_should_stop(should_stop) {
+            return (false, false);
+        }
         if clauses.len() < 2 {
             self.cold
                 .symmetry_stats
@@ -667,7 +684,16 @@ impl Solver {
             }
             cls
         } else {
-            let (sbp, det_stats) = detector.detect_and_encode(&clauses);
+            let Some((sbp, det_stats)) = detector.detect_and_encode_interruptible(&clauses, || {
+                self.preprocessing_should_stop(should_stop)
+            }) else {
+                // Detection is read-only until it returns clauses. Discarding
+                // partial detector state therefore leaves the formula intact.
+                // A local preprocessing deadline is a normal phase truncation;
+                // a whole-solve stop is classified by the outer transaction.
+                self.user_num_vars = user_num_vars_before;
+                return (false, false);
+            };
             // Propagate detector stats into symmetry stats.
             self.cold.symmetry_stats.candidate_pairs = self
                 .cold
@@ -701,6 +727,14 @@ impl Solver {
             self.cold
                 .symmetry_stats
                 .skip(crate::symmetry::SymmetrySkipReason::NoPairs);
+            return (false, false);
+        }
+
+        // Do not begin the mutating SBP installation phase after a stop. Once
+        // installation starts it runs atomically so cancellation cannot expose
+        // a partial set of symmetry breakers.
+        if self.preprocessing_should_stop(should_stop) {
+            self.user_num_vars = user_num_vars_before;
             return (false, false);
         }
 
@@ -938,6 +972,10 @@ impl Solver {
         // `competition/prepare_sat26_submission.sh` always passes `--proof`.
         let mut changed = false;
         if self.symmetry_proof_surface_active() {
+            for (a, b) in &matrix.synth_amo {
+                self.freeze(*a);
+                self.freeze(*b);
+            }
             for (clause, witness) in matrix.sr_steps() {
                 // Emit the DSR a-line first (records the addition), then add the
                 // unit on the trusted route — the same order as the aux-free SR
@@ -962,6 +1000,16 @@ impl Solver {
             // entry, and for the graph-colouring shape the formula does not
             // supply that. `sr_steps` emits the same clauses ahead of the units
             // on the proof route.
+            // Freeze every variable the synthesized AMO clauses mention, so BVE
+            // cannot eliminate it. Task #18: with these clauses added, some
+            // deletion downstream removes a clause the final refutation needs —
+            // established by bisect (every addition verifies; the empty clause
+            // does not) and by stripping all `d` lines (proof then verifies).
+            // The XOR extension guards the same hazard the same way.
+            for (a, b) in &matrix.synth_amo {
+                self.freeze(*a);
+                self.freeze(*b);
+            }
             for mut clause in matrix.synth_amo_clauses() {
                 match self.add_clause_watched(&mut clause) {
                     AddResult::Added(_) | AddResult::Unit(_) => {

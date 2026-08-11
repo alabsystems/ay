@@ -186,7 +186,12 @@ impl ExtPropagateResult {
 /// 3. freeze theory-tracked variables before SAT preprocessing continues.
 ///
 /// The consumed clause positions refer to the exact clause snapshot passed to
-/// the builder callback.
+/// the builder callback. The extension must enforce the exact conjunction of
+/// those clauses over their shared variables, not merely an equisatisfiable
+/// projection: SAT preprocessing may derive other constraints from the source
+/// clauses before ownership is committed. Every variable occurring in a
+/// consumed clause must therefore also appear in `frozen_variables`; the
+/// solver rejects preparation when that interface is incomplete.
 pub struct PreparedExtension<E> {
     /// The extension to activate once SAT preprocessing finishes.
     pub extension: E,

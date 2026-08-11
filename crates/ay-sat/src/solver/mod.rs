@@ -167,6 +167,7 @@ mod config_preprocess_finalize;
 mod config_preprocess_policy;
 mod config_preprocess_probe;
 mod config_preprocess_symmetry;
+mod config_preprocess_transaction;
 mod conflict_analysis;
 mod conflict_analysis_bumping;
 mod conflict_analysis_dip;

@@ -204,7 +204,15 @@ fn test_no_promote_under_concat() {
     );
 }
 
-/// `k` under `extract`: must NOT promote.
+/// `k` under `extract`: like the `bvadd` case above, the slice link
+/// (`#bv2nat-extract-link`) relates `bv2nat(k[3:0])` to `bv2nat(k)`, so `k`
+/// materializes and the SAT witness (k = #x00, L = 0) validates.
+///
+/// This row asserted `unknown` while the slice floated free of its source. That
+/// was never the true answer — the query is trivially satisfiable — it was the
+/// promotion guard declining a model it could not realize. The guard's real job
+/// is refusing a FALSE `sat`, and that is unchanged: the published `sat` here is
+/// a witness the independent model gate confirmed against the original roots.
 #[test]
 #[timeout(60_000)]
 fn test_no_promote_under_extract() {
@@ -217,8 +225,8 @@ fn test_no_promote_under_extract() {
     "#;
     assert_eq!(
         verdict(smt),
-        "unknown",
-        "extract under bv2nat: must NOT promote"
+        "sat",
+        "extract under bv2nat: materialized witness validates (SAT)"
     );
 }
 

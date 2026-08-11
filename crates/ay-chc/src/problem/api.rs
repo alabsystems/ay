@@ -13,6 +13,7 @@ impl ChcProblem {
             clauses: Vec::new(),
             pruned_false_queries: 0,
             fixedpoint_format: false,
+            stripped_body_forall: false,
             datatype_defs: FxHashMap::default(),
             action_names: Vec::new(),
         }
@@ -247,6 +248,17 @@ impl ChcProblem {
     /// Mark this problem as using Z3 fixedpoint format.
     pub fn set_fixedpoint_format(&mut self) {
         self.fixedpoint_format = true;
+    }
+
+    /// True when a `forall` was stripped from a rule BODY, weakening the
+    /// antecedent. Proofs remain valid; counterexamples do not.
+    pub fn has_stripped_body_forall(&self) -> bool {
+        self.stripped_body_forall
+    }
+
+    /// Record that a body-position `forall` was stripped (over-approximation).
+    pub fn mark_stripped_body_forall(&mut self) {
+        self.stripped_body_forall = true;
     }
 
     /// Datatype definitions from declare-datatype commands (#7016).

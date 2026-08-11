@@ -207,6 +207,8 @@ impl SatResult {
 pub enum SatUnknownReason {
     /// Solve was interrupted by callback or interrupt flag.
     Interrupted,
+    /// The caller-supplied whole-solve wall-clock deadline expired.
+    DeadlineExceeded,
     /// Theory callback requested stop (`TheoryPropResult::Stop`).
     TheoryStop,
     /// Unsupported API/configuration combination.
@@ -247,6 +249,7 @@ impl SatUnknownReason {
     pub const fn diagnostic_label(self) -> &'static str {
         match self {
             Self::Interrupted => "interrupted",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::TheoryStop => "theory_stop",
             Self::UnsupportedConfig => "unsupported_config",
             Self::EmptyTheoryConflict => "empty_theory_conflict",

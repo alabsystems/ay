@@ -75,20 +75,51 @@ impl SymmetryDetector {
     /// Returns `(breaking_clauses, stats)` where each breaking clause
     /// is a `Vec<Literal>`. The caller is responsible for adding these to the
     /// solver's clause database.
+    #[cfg(test)]
     pub(crate) fn detect_and_encode(
         &self,
         clauses: &[Vec<Literal>],
     ) -> (Vec<Vec<Literal>>, DetectorStats) {
+        self.detect_and_encode_interruptible(clauses, || false)
+            .expect("a never-stop symmetry detector cannot be interrupted")
+    }
+
+    /// Run the full detection pipeline with cooperative cancellation.
+    ///
+    /// `should_stop` is polled at phase boundaries and while verifying a
+    /// candidate swap against the formula. `None` means detection was
+    /// interrupted; no partially derived symmetry-breaking clauses are
+    /// returned or installed.
+    pub(crate) fn detect_and_encode_interruptible<F>(
+        &self,
+        clauses: &[Vec<Literal>],
+        should_stop: F,
+    ) -> Option<(Vec<Vec<Literal>>, DetectorStats)>
+    where
+        F: Fn() -> bool,
+    {
         let mut stats = DetectorStats::default();
+
+        if should_stop() {
+            return None;
+        }
 
         // Phase 1: Iterative color refinement.
         let refined = refinement::iterative_color_refinement(clauses);
         stats.refinement_rounds = refined.rounds as u64;
 
+        if should_stop() {
+            return None;
+        }
+
         // Phase 2: Within each refined color class, verify swaps.
         let formula_counts = build_formula_counts(clauses);
         let groups = refined.candidate_groups();
         let mut verified_swaps: Vec<BinarySwap> = Vec::new();
+
+        if should_stop() {
+            return None;
+        }
 
         for variables in groups.into_values() {
             if variables.len() >= 2 {
@@ -108,9 +139,14 @@ impl SymmetryDetector {
                     }
                     stats.candidate_pairs += 1;
                     let pair = BinarySwap::ordered(variables[i], variables[j]);
-                    if swap_preserves_formula(&formula_counts, pair) {
-                        stats.pairs_detected += 1;
-                        verified_swaps.push(pair);
+                    match swap_preserves_formula_interruptible(&formula_counts, pair, &should_stop)
+                    {
+                        Some(true) => {
+                            stats.pairs_detected += 1;
+                            verified_swaps.push(pair);
+                        }
+                        Some(false) => {}
+                        None => return None,
                     }
                 }
                 if verified_swaps.len() >= self.max_pairs {
@@ -120,7 +156,11 @@ impl SymmetryDetector {
         }
 
         if verified_swaps.is_empty() {
-            return (Vec::new(), stats);
+            return Some((Vec::new(), stats));
+        }
+
+        if should_stop() {
+            return None;
         }
 
         // Phase 3: Extract orbits from verified swaps using union-find.
@@ -134,7 +174,7 @@ impl SymmetryDetector {
             all_clauses.extend(sbp_clauses);
         }
 
-        (all_clauses, stats)
+        Some((all_clauses, stats))
     }
 
     /// Composite-symmetry pipeline (#17): color refinement → gate-verified
@@ -1139,12 +1179,26 @@ fn encode_perm_lex_leader_with_witness(
 
 /// Check whether swapping `pair.lhs <-> pair.rhs` in every clause preserves
 /// the formula as a multiset of canonical clause keys.
-fn swap_preserves_formula(formula_counts: &BTreeMap<Vec<u32>, u32>, pair: BinarySwap) -> bool {
-    formula_counts.iter().all(|(clause, count)| {
-        formula_counts
-            .get(&swap_clause_key(clause, pair))
-            .is_some_and(|swapped_count| swapped_count == count)
-    })
+fn swap_preserves_formula_interruptible(
+    formula_counts: &BTreeMap<Vec<u32>, u32>,
+    pair: BinarySwap,
+    should_stop: &impl Fn() -> bool,
+) -> Option<bool> {
+    // FmlaEquivChain spends minutes here in debug builds: each candidate pair
+    // scans the full clause multiset and performs a BTreeMap lookup per clause.
+    // Poll often enough to bound cancellation latency without putting an atomic
+    // load / clock read on every lookup.
+    const INTERRUPT_POLL_INTERVAL: usize = 64;
+
+    for (clause_index, (clause, count)) in formula_counts.iter().enumerate() {
+        if clause_index.is_multiple_of(INTERRUPT_POLL_INTERVAL) && should_stop() {
+            return None;
+        }
+        if formula_counts.get(&swap_clause_key(clause, pair)) != Some(count) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Apply a variable swap to a canonical clause key and re-sort.
@@ -1172,7 +1226,8 @@ fn swap_clause_key(clause: &[u32], pair: BinarySwap) -> Vec<u32> {
 
 /// SOUND verification gate for composite-permutation symmetry detection (#17).
 ///
-/// Generalizes [`swap_preserves_formula`] from a single transposition to an
+/// Generalizes the single-transposition check in
+/// [`swap_preserves_formula_interruptible`] to an
 /// arbitrary variable permutation `perm` (each variable maps to its image;
 /// variables absent from `perm` are fixed). Returns true iff applying `perm` to
 /// every clause leaves the formula invariant as a multiset of canonical clause
@@ -1600,6 +1655,10 @@ pub(crate) fn deduplicate_sbp_clauses(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "detector_interrupt_tests.rs"]
+mod interrupt_tests;
 
 #[cfg(test)]
 mod tests {

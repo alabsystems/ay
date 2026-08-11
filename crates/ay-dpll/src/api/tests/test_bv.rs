@@ -992,6 +992,47 @@ fn test_bv_const_bigint_large_value() {
 }
 
 #[test]
+fn test_wide_signed_keep_max_refutation_is_source_certified() {
+    const WIDTH: u32 = 128;
+    let mut solver = Solver::new(Logic::QfBv);
+    solver.set_produce_unsat_cores(true);
+
+    let lo = solver.declare_const("wide_keep_max_lo", Sort::bitvec(WIDTH));
+    let hi = solver.declare_const("wide_keep_max_hi", Sort::bitvec(WIDTH));
+    let zero = solver.bv_const(0, WIDTH);
+    let one = solver.bv_const(1, WIDTH);
+    let difference = solver.bvsub(hi, lo);
+    let difference_positive = solver.bvslt(zero, difference);
+    let difference_not_positive = solver.not(difference_positive);
+    let lo_below_hi = solver.bvslt(lo, hi);
+    let one_below_lo = solver.bvsle(one, lo);
+
+    solver.push();
+    solver
+        .try_assert_named(difference_not_positive, "wide_keep_max_nonpositive")
+        .expect("name the negated keep-max obligation");
+    solver
+        .try_assert_named(lo_below_hi, "wide_keep_max_order")
+        .expect("name the strict order premise");
+    solver
+        .try_assert_named(one_below_lo, "wide_keep_max_positive_lower")
+        .expect("name the positive lower-bound premise");
+
+    let result = solver.check_sat();
+    assert!(
+        result.is_unsat(),
+        "the exact wide signed keep-max contradiction must publish certified UNSAT, got {result:?}"
+    );
+
+    solver.pop();
+    assert_eq!(
+        solver.check_sat(),
+        SolveResult::Sat,
+        "the scoped wide refutation capability must not survive pop"
+    );
+}
+
+#[test]
 fn test_bv_const_bigint_vs_bv_const() {
     // Ensure bv_const_bigint produces the same result as bv_const for i64 values
     let mut solver = Solver::new(Logic::QfBv);
@@ -3032,85 +3073,4 @@ fn test_bv_lia_congruence_wide_width_sat_fix7() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Native dense-BV solve-boundary resource envelope.
-// ---------------------------------------------------------------------------
-
-const FIRST_UNSUPPORTED_NATIVE_BV_WIDTH: u32 = (1 << 20) + 1;
-
-#[test]
-fn native_bv_boundary_rejects_unused_nested_declaration_sort() {
-    // `declare_const` accepts native Sort values directly. The nested BV never
-    // appears below an assertion, but SAT model completion still enumerates
-    // declarations, so the symbol-signature scan must catch it.
-    let mut solver = Solver::new(Logic::All);
-    let nested = Sort::array(
-        Sort::Int,
-        Sort::seq(Sort::bitvec(FIRST_UNSUPPORTED_NATIVE_BV_WIDTH)),
-    );
-    let _array = solver.declare_const("oversized_nested_array", nested);
-
-    let result = solver.check_sat();
-    assert!(result.is_unknown());
-    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
-}
-
-#[test]
-fn native_bv_boundary_scans_derived_assumption_dag() {
-    // Extension can amplify individually-supported one-bit variables past the
-    // dense-BV envelope. Only the temporary assumption reaches these terms.
-    let mut solver = Solver::new(Logic::All);
-    let x = solver.bv_var("small_x", 1);
-    let y = solver.bv_var("small_y", 1);
-    let wide_x = solver.bvzeroext(x, 1 << 20);
-    let wide_y = solver.bvzeroext(y, 1 << 20);
-    let assumption = solver.eq(wide_x, wide_y);
-
-    let result = solver.check_sat_assuming(&[assumption]);
-    assert!(result.is_unknown());
-    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
-}
-
-#[test]
-fn native_bv_boundary_scans_unused_quantifier_binder_sort() {
-    // The bound variable is deliberately absent from the body. Its width lives
-    // only in `TermData::Forall` metadata, not in the Bool term/body sorts.
-    let mut solver = Solver::new(Logic::All);
-    let bound = solver.fresh_var(
-        "oversized_bound",
-        Sort::bitvec(FIRST_UNSUPPORTED_NATIVE_BV_WIDTH),
-    );
-    let truth = solver.bool_const(true);
-    let quantified = solver.forall(&[bound], truth);
-    solver.assert_term(quantified);
-
-    assert!(solver.check_sat().is_unknown());
-}
-
-#[test]
-fn native_bv_boundary_scans_optimization_objective_dag() {
-    // Objective solving bypasses `check_sat_guarded`; preflight its DAG before
-    // finite-domain binary search computes 2^width.
-    let mut solver = Solver::new(Logic::All);
-    let x = solver.int_var("objective_source");
-    let oversized = solver.int2bv(x, FIRST_UNSUPPORTED_NATIVE_BV_WIDTH);
-    solver.maximize(oversized);
-
-    assert!(solver.optimize_check().is_unknown());
-}
-
-#[test]
-fn native_bv_boundary_scans_maxsmt_soft_dag_before_scaffolding() {
-    // Preflight native soft terms before relaxation/cardinality scaffolding,
-    // rather than rediscovering the unsupported width during feasibility.
-    let mut solver = Solver::new(Logic::All);
-    let x = solver.int_var("soft_source_x");
-    let y = solver.int_var("soft_source_y");
-    let oversized_x = solver.int2bv(x, FIRST_UNSUPPORTED_NATIVE_BV_WIDTH);
-    let oversized_y = solver.int2bv(y, FIRST_UNSUPPORTED_NATIVE_BV_WIDTH);
-    let soft = solver.eq(oversized_x, oversized_y);
-    solver.assert_soft(soft, 1, None).unwrap();
-
-    let result = solver.check_sat_max().unwrap();
-    assert_eq!(result.status, MaxSmtStatus::Unknown);
-}
+mod native_boundary;

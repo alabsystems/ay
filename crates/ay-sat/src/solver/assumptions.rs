@@ -4,6 +4,7 @@
 
 //! Assumption-based solving with unsat core extraction.
 
+use super::config_preprocess_cleanup::PreprocessOutcome;
 use super::*;
 
 impl Solver {
@@ -31,6 +32,9 @@ impl Solver {
     fn solve_with_assumptions_raw(&mut self, assumptions: &[Literal]) -> AssumeResult {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
+        if let Some(result) = self.finish_stopped_assumption_entry(None::<&fn() -> bool>) {
+            return result;
+        }
         let combined = self.compose_scope_assumptions(assumptions);
         self.emit_diagnostic_assumption_batch(&combined, !self.cold.scope_selectors.is_empty());
 
@@ -108,6 +112,9 @@ impl Solver {
     {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
+        if let Some(result) = self.finish_stopped_assumption_entry(Some(&should_stop)) {
+            return result;
+        }
         let combined = self.compose_scope_assumptions(assumptions);
         self.emit_diagnostic_assumption_batch(&combined, !self.cold.scope_selectors.is_empty());
 
@@ -186,6 +193,10 @@ impl Solver {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
 
+        if let Some(reason) = self.optional_solve_stop_reason(should_stop) {
+            return self.declare_assume_unknown_with_reason(reason);
+        }
+
         // On second+ solve, disable destructive inprocessing (#5031).
         if self.cold.has_solved_once {
             self.disable_destructive_inprocessing();
@@ -240,14 +251,10 @@ impl Solver {
             }
             self.reset_search_state();
         }
-        // #unguarded-tvalid-lemmas STAGE 0: record the assumption-prefix
-        // depth (scope selectors + user assumptions) for this solve so
-        // conflict analysis can classify assumption-level conflicts. Set
-        // AFTER the reset above (the reset zeroes it); no-assumption solve
-        // entries leave it at the reset value 0.
+        // Record the assumption-prefix depth after reset so conflict analysis
+        // can classify assumption-level conflicts.
         self.cold.active_assumption_count = assumptions.len().min(u32::MAX as usize) as u32;
-        // MiniSat assumption-based solving invariant: search must start at
-        // level 0. Assumptions are assigned at levels 1..=n.
+        // MiniSat invariant: assumptions are assigned above a level-0 start.
         debug_assert_eq!(
             self.decision_level, 0,
             "BUG: assumption solve starts at decision_level {} (expected 0)",
@@ -255,15 +262,11 @@ impl Solver {
         );
         // Handle empty formula
         if self.arena.is_empty() {
-            // Even when there are no clauses, assumptions still constrain the model.
-            // Satisfiable unless assumptions contain an immediate contradiction.
+            // Assumptions still constrain an otherwise empty formula.
             let mut model = self.get_model();
             let mut first_lit_for_var: Vec<Option<Literal>> = vec![None; self.num_vars];
-            // Variables whose vals[] slots we poke below (without a trail entry).
-            // The pokes let finalize_sat_model read assumption values from vals[],
-            // but they leave vals[] inconsistent with the (empty) level-0 trail.
-            // We undo them once the model is finalized so a Sat-returning solve
-            // guarantees vals[]/trail consistency (backtrack.rs post-invariant).
+            // Track off-trail vals[] pokes so they can be undone after model
+            // finalization and preserve the vals[]/trail invariant.
             let mut poked_vars: Vec<usize> = Vec::new();
 
             for &lit in assumptions {
@@ -435,7 +438,10 @@ impl Solver {
                 }
             }
 
-            let preprocess_unsat = self.preprocess();
+            let preprocess_outcome = match should_stop {
+                Some(stop) => self.preprocess_interruptible(stop),
+                None => self.preprocess_interruptible(&|| false),
+            };
 
             // Melt assumption variables — the freeze was only needed during
             // preprocessing to prevent elimination. Melting restores the solver's
@@ -450,32 +456,37 @@ impl Solver {
                 }
             }
 
-            if preprocess_unsat {
-                return self.declare_unsat_assume(vec![]);
+            let cleanup_unsat = self.finish_initial_preprocessing();
+            let stop_reason = match preprocess_outcome {
+                PreprocessOutcome::Stopped(latched) => {
+                    self.solve_stop_reason(&|| false).or(Some(latched))
+                }
+                PreprocessOutcome::Complete | PreprocessOutcome::Unsat => {
+                    self.optional_solve_stop_reason(should_stop)
+                }
+            };
+            match preprocess_outcome {
+                // Cleanup is mandatory after a partial pass, but a conflict it
+                // discovers cannot replace a stop that was already latched.
+                PreprocessOutcome::Stopped(latched_reason) => {
+                    let reason = stop_reason.unwrap_or(latched_reason);
+                    return self.declare_assume_unknown_with_reason(reason);
+                }
+                PreprocessOutcome::Unsat => {
+                    if let Some(reason) = stop_reason {
+                        return self.declare_assume_unknown_with_reason(reason);
+                    }
+                    return self.declare_unsat_assume(vec![]);
+                }
+                PreprocessOutcome::Complete => {
+                    if let Some(reason) = stop_reason {
+                        return self.declare_assume_unknown_with_reason(reason);
+                    }
+                    if cleanup_unsat {
+                        return self.declare_unsat_assume(vec![]);
+                    }
+                }
             }
-
-            // Reinitialize watches after preprocessing (clauses may have been modified)
-            self.watches.clear();
-            self.initialize_watches();
-            self.qhead = 0;
-
-            if let Some(conflict_ref) = self.search_propagate() {
-                self.record_level0_conflict_chain(conflict_ref);
-                return self.declare_unsat_assume(vec![]);
-            }
-
-            // Match solve_no_assumptions: scheduling should use the live
-            // irredundant clause count after preprocessing shrink, not the
-            // monotonic arena slot count captured before BVE/subsumption.
-            self.num_original_clauses = self.arena.active_clause_count();
-
-            // JIT-compile static clauses for assumption-based solving.
-            // Mirrors solve_no_assumptions in solve/mod.rs.
-            // Uses adaptive compilation (#8203) for size-dependent strategy.
-
-            // Disable preprocessing for subsequent solve calls — DPLL(T) re-solves
-            // with new theory lemmas; preprocessing should only run once.
-            self.cold.preprocess_enabled = false;
         }
 
         // Track which variables are assumptions and which assumptions are "failed"
@@ -542,8 +553,8 @@ impl Solver {
         loop {
             // Parity with solve_no_assumptions in solve/mod.rs:322 —
             // honor external interrupt handle and process memory limit (#6552).
-            if self.is_interrupted() {
-                return self.declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+            if let Some(reason) = self.active_interrupt_reason() {
+                return self.declare_assume_unknown_with_reason(reason);
             }
             // Branch-independent time-based interrupt: no CDCL branch (conflict,
             // decision, or restart) can starve this, so a query handed a wall-clock
@@ -553,19 +564,9 @@ impl Solver {
             // ping-pong — that increment neither num_conflicts nor num_decisions.)
             loop_iters = loop_iters.wrapping_add(1);
             if loop_iters & 1023 == 0 {
-                if let Some(stop) = should_stop {
-                    if stop() {
-                        return self
-                            .declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
-                    }
-                }
-                // #array-deadline-forward: the whole-solve deadline covers
-                // callers of the NON-interruptible `solve_with_assumptions`
-                // entry (should_stop = None) — e.g. the DPLL(T) assume
-                // split-loop pipeline, whose per-iteration budgets bound the
-                // search but not wall time. Same amortization as above.
-                if self.solve_deadline_expired() {
-                    return self.declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+                let stop_reason = self.optional_solve_stop_reason(should_stop);
+                if let Some(reason) = stop_reason {
+                    return self.declare_assume_unknown_with_reason(reason);
                 }
             }
 
@@ -615,10 +616,10 @@ impl Solver {
                         .declare_assume_unknown_with_reason(SatUnknownReason::ResourceBudget);
                 }
                 // Check for interrupt every 100 conflicts
-                if let Some(stop) = should_stop {
-                    if self.num_conflicts.is_multiple_of(100) && stop() {
-                        return self
-                            .declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+                if self.num_conflicts.is_multiple_of(100) {
+                    let stop_reason = self.optional_solve_stop_reason(should_stop);
+                    if let Some(reason) = stop_reason {
+                        return self.declare_assume_unknown_with_reason(reason);
                     }
                 }
 
@@ -1003,9 +1004,8 @@ impl Solver {
                     // SAT-leaning runs can make many decisions with no conflicts.
                     // Parity with solve/mod.rs:363 — check is_interrupted() in
                     // decision branch for memory limit and external handle (#6552).
-                    if self.is_interrupted() {
-                        return self
-                            .declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.active_interrupt_reason() {
+                        return self.declare_assume_unknown_with_reason(reason);
                     }
                     // Deterministic decision-budget checkpoint FIRST
                     // (#ground-determinism), then the external stop.
@@ -1023,12 +1023,9 @@ impl Solver {
                                 SatUnknownReason::ResourceBudget,
                             );
                         }
-                        if let Some(stop) = should_stop {
-                            if stop() {
-                                return self.declare_assume_unknown_with_reason(
-                                    SatUnknownReason::Interrupted,
-                                );
-                            }
+                        let stop_reason = self.optional_solve_stop_reason(should_stop);
+                        if let Some(reason) = stop_reason {
+                            return self.declare_assume_unknown_with_reason(reason);
                         }
                     }
                 } else {

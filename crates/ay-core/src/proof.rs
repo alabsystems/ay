@@ -23,243 +23,13 @@
 //! ```
 
 use crate::term::TermId;
-use num_rational::Rational64;
 use serde::{Deserialize, Serialize};
 
+mod annotations;
 mod fp;
 
+pub use annotations::{BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation};
 pub use fp::FpOp;
-
-/// Farkas annotation for arithmetic theory lemmas
-///
-/// When an arithmetic theory (LRA/LIA) produces an UNSAT conflict, the
-/// Farkas lemma provides coefficients λ₁, λ₂, ..., λₙ ≥ 0 such that
-/// combining the constraints Σλᵢcᵢ produces a contradiction (0 ≤ negative).
-///
-/// These coefficients are essential for Craig interpolation: the interpolant
-/// is computed by combining only the A-partition constraints weighted by
-/// their Farkas coefficients.
-///
-/// # Example
-///
-/// For constraints:
-/// ```text
-/// x ≤ 5    (from A)
-/// x ≥ 10   (from B)
-/// ```
-///
-/// Farkas coefficients λ₁ = λ₂ = 1 give:
-/// ```text
-/// 1·(x ≤ 5) + 1·(-x ≤ -10) → (0 ≤ -5)  contradiction
-/// ```
-///
-/// The interpolant (from A only): `x ≤ 5`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FarkasAnnotation {
-    /// Farkas coefficients for each constraint in the conflict
-    /// Indexed by position in the clause (same order as `clause` field)
-    pub coefficients: Vec<Rational64>,
-}
-
-impl FarkasAnnotation {
-    /// Create a new Farkas annotation with the given coefficients
-    #[must_use]
-    pub fn new(coefficients: Vec<Rational64>) -> Self {
-        Self { coefficients }
-    }
-
-    /// Create from integer coefficients (convenience method)
-    #[must_use]
-    pub fn from_ints(coefficients: &[i64]) -> Self {
-        Self {
-            coefficients: coefficients.iter().map(|&c| Rational64::from(c)).collect(),
-        }
-    }
-
-    /// Check if all coefficients are non-negative (valid Farkas certificate)
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        self.coefficients.iter().all(|c| *c >= Rational64::from(0))
-    }
-
-    /// Rebind position-indexed coefficients from `source_clause` to
-    /// `target_clause` by literal identity.
-    ///
-    /// SAT watched-literal movement and clause normalization may permute or
-    /// deduplicate a clause without changing it. Coefficients for duplicate
-    /// source literals are summed; the sum is placed on the first target
-    /// occurrence and later duplicates receive zero. A source literal may be
-    /// dropped only when its merged coefficient is zero. Target-only literals
-    /// are sound weakening rows and receive zero. Any other mismatch declines.
-    #[must_use]
-    pub fn rebind_by_literal(
-        &self,
-        source_clause: &[TermId],
-        target_clause: &[TermId],
-    ) -> Option<Self> {
-        use std::collections::{BTreeMap, BTreeSet};
-
-        if self.coefficients.len() != source_clause.len() {
-            return None;
-        }
-        if source_clause == target_clause {
-            return Some(self.clone());
-        }
-
-        let zero = Rational64::from(0);
-        let mut by_literal: BTreeMap<TermId, Rational64> = BTreeMap::new();
-        for (&literal, coefficient) in source_clause.iter().zip(self.coefficients.iter()) {
-            *by_literal.entry(literal).or_insert(zero) += *coefficient;
-        }
-
-        let mut seen = BTreeSet::new();
-        let mut rebound = Vec::with_capacity(target_clause.len());
-        for &literal in target_clause {
-            if seen.insert(literal) {
-                rebound.push(by_literal.remove(&literal).unwrap_or(zero));
-            } else {
-                rebound.push(zero);
-            }
-        }
-        if by_literal.values().any(|coefficient| *coefficient != zero) {
-            return None;
-        }
-        Some(Self::new(rebound))
-    }
-}
-
-/// LIA-specific proof annotation for integer arithmetic theory lemmas.
-///
-/// LIA conflicts can arise from three distinct proof shapes:
-/// - **BoundsGap**: effective lower bound > upper bound (e.g., x >= 6 AND x <= 5)
-/// - **Divisibility**: GCD test fails (e.g., 2|x AND x = 3)
-/// - **CuttingPlane**: Farkas combination followed by integer rounding (Gomory cut)
-///
-/// When present on a `TheoryLemma` or `TheoryLemmaProof`, this annotation tells
-/// the strict-mode proof checker which LIA-specific validation to apply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum LiaAnnotation {
-    /// Bounds gap: the effective integer bounds are contradictory.
-    ///
-    /// A Farkas-style combination of the conflict literals produces
-    /// `lower > upper` when rounded to integers.
-    BoundsGap,
-
-    /// Divisibility conflict: GCD of constraint coefficients does not divide
-    /// the constant, proving no integer solution exists.
-    Divisibility,
-
-    /// Cutting plane: a Farkas combination followed by integer rounding
-    /// (division + ceiling) produces a contradiction.
-    CuttingPlane(CuttingPlaneAnnotation),
-
-    /// Linear identity: a POSITIVE equality `(= L R)` whose difference `L - R`
-    /// reduces to the identically-zero integer linear form (every variable
-    /// coefficient 0 and the constant 0), so `L = R` holds for ALL integer
-    /// assignments. Validates the tautology direction (e.g. `(* x 0) = 0`,
-    /// `(* x 1) = x`), as opposed to the infeasibility annotations above.
-    LinearIdentity,
-}
-
-/// Annotation for a cutting-plane (Gomory cut) proof step.
-///
-/// The cutting plane derivation:
-/// 1. Combine conflict literals using Farkas coefficients (same as LRA)
-/// 2. Divide all coefficients by `divisor`
-/// 3. Round up (ceiling) to obtain tighter integer bounds
-/// 4. The tightened bound contradicts existing constraints
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CuttingPlaneAnnotation {
-    /// Farkas coefficients for the linear combination step
-    pub farkas: FarkasAnnotation,
-    /// Divisor for the cutting-plane rounding step (must be > 0)
-    pub divisor: i64,
-}
-
-/// Type of BV gate for bit-blast proof annotation.
-///
-/// Each variant corresponds to an SMT-LIB bitvector operation that the
-/// bit-blaster encodes into propositional clauses. Carrying the gate type
-/// in the proof allows the checker and printer to emit `bv_bitblast`
-/// instead of the unverified `trust` fallback.
-///
-/// Reference: CVC5 `src/theory/bv/bitblast/proof_bitblaster.cpp`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum BvGateType {
-    /// Bitwise AND (`bvand`)
-    And,
-    /// Bitwise OR (`bvor`)
-    Or,
-    /// Bitwise XOR (`bvxor`)
-    Xor,
-    /// Bitwise NOT (`bvnot`)
-    Not,
-    /// Addition (`bvadd`)
-    Add,
-    /// Multiplication (`bvmul`)
-    Mul,
-    /// Negation (`bvneg`)
-    Neg,
-    /// Shift left (`bvshl`)
-    Shl,
-    /// Logical shift right (`bvlshr`)
-    Lshr,
-    /// Arithmetic shift right (`bvashr`)
-    Ashr,
-    /// Equality (`=` on bitvectors)
-    Eq,
-    /// Unsigned less-than (`bvult`)
-    Ult,
-    /// Concatenation (`concat`)
-    Concat,
-    /// Extraction (`extract`)
-    Extract,
-    /// Zero extension (`zero_extend`)
-    ZeroExtend,
-    /// Sign extension (`sign_extend`)
-    SignExtend,
-    /// Unsigned division (`bvudiv`)
-    Udiv,
-    /// Unsigned remainder (`bvurem`)
-    Urem,
-    /// Constant bit-vector literal
-    Const,
-    /// Variable (bit-blast a BV variable into Boolean bits)
-    Variable,
-    /// MUX / if-then-else on bitvectors
-    Ite,
-}
-
-impl std::fmt::Display for BvGateType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::And => "bvand",
-            Self::Or => "bvor",
-            Self::Xor => "bvxor",
-            Self::Not => "bvnot",
-            Self::Add => "bvadd",
-            Self::Mul => "bvmul",
-            Self::Neg => "bvneg",
-            Self::Shl => "bvshl",
-            Self::Lshr => "bvlshr",
-            Self::Ashr => "bvashr",
-            Self::Eq => "=",
-            Self::Ult => "bvult",
-            Self::Concat => "concat",
-            Self::Extract => "extract",
-            Self::ZeroExtend => "zero_extend",
-            Self::SignExtend => "sign_extend",
-            Self::Udiv => "bvudiv",
-            Self::Urem => "bvurem",
-            Self::Const => "const",
-            Self::Variable => "variable",
-            Self::Ite => "ite",
-        };
-        f.write_str(s)
-    }
-}
 
 /// Kind of theory lemma for proof export
 ///
@@ -465,6 +235,99 @@ pub enum TheoryLemmaKind {
     /// means no evidence, and the lemma fails closed.
     SetCardEmptyByAssertion,
 
+    /// The definitional set-cardinality recurrence over a store chain rooted
+    /// at the SYNTACTIC empty set -- the elaborated form of
+    /// `set.singleton` / `set.insert` / `set.remove`.
+    ///
+    /// ```text
+    /// (= (set.card R) 0)                                   R syntactically empty
+    /// (= (set.card (store B e true))  (+ (set.card B) 1))  e not in B
+    /// (= (set.card (store B e true))  (set.card B))        e in B
+    /// (= (set.card (store B e false)) (set.card B))        e not in B
+    /// (= (set.card (store B e false)) (- (set.card B) 1))  e in B
+    /// ```
+    ///
+    /// THE EMPTY ROOT IS LOAD-BEARING, not incidental. A finite chain of writes
+    /// over the empty carrier denotes a FINITE set, and the recurrence is a
+    /// theorem of finite set theory. Over an unrestricted base it is not safe
+    /// to hand out: under the interpretation `card(X) = |X|` for finite `X` and
+    /// `card(X) = N` for infinite `X` (`N` above every literal-membership count
+    /// in the problem) -- which satisfies [`Self::SetCardNonNegative`],
+    /// [`Self::SetCardMemberLowerBound`], [`Self::SetCardEmpty`] and the
+    /// finite-chain recurrence alike -- an increment over the universal set
+    /// reads `N = N + 1`. Requiring the empty root keeps every instance inside
+    /// the fragment where the equations are simply true. AY's own producer
+    /// imposes the identical restriction (`is_covered_store_chain`).
+    ///
+    /// AY's strict checker establishes the empty root with a walk of its OWN,
+    /// separate from the one that decides the membership side condition: the
+    /// membership walk stops at the first write on the probed index and can
+    /// answer without ever reaching the root, so it cannot be what confines the
+    /// schema to the finite fragment.
+    ///
+    /// The membership side condition is likewise re-derived rather than taken
+    /// on the producer's word. That walk steps past a write only when the two
+    /// indices are syntactically identical or DISTINCT LITERAL constants. Two
+    /// symbolic indices may denote the same element, so an undecidable chain is
+    /// rejected fail-closed rather than guessed -- the difference between
+    /// refusing to certify `|{x, y}| = 2` and asserting it (false when
+    /// `x = y`).
+    ///
+    /// Either orientation of the equality is accepted; `=` is symmetric, so
+    /// the two spellings are the same claim.
+    ///
+    /// Checkable only by AY's native strict checker; the pinned external
+    /// Alethe checker has no rule for the non-standard `set.card` operator.
+    SetCardChainRecurrence,
+
+    /// Reflexivity of a collection subset predicate: `(cl (X.subset a a))` for
+    /// `X` one of `set`, `map`, `multiset`.
+    ///
+    /// `a subset a` holds in every model of all three theories with NO side
+    /// condition, which is what makes it checkable with no problem context --
+    /// the same status as [`Self::SetCardNonNegative`]. All three native
+    /// solvers document the same fact (`ay-set`, `ay-map`, `ay-multiset`:
+    /// "reflexivity is valid ... `subset(m, m)` is a tautology"). The two
+    /// operands must be the SAME term: a subset claim between different
+    /// collections is not a tautology and is rejected fail-closed.
+    ///
+    /// These three predicates are *declaration-activated* in `ay-frontend`
+    /// (user-declarable, but only at the native
+    /// `(Array ..) (Array ..) -> Bool` signature, which is documented to
+    /// request the native semantics). AY's strict checker does not rely on
+    /// that gate: `validate_subset_reflexive` re-derives the native signature
+    /// from the clause itself.
+    ///
+    /// Checkable only by AY's native strict checker; the pinned external
+    /// Alethe checker has no rule for these AY-extension predicates, so this
+    /// internal certificate renders as an honest `hole` on that wire.
+    SubsetReflexive,
+
+    /// The subset DEFINITION instantiated at one element term -- the ground
+    /// witness obligation the native set/multiset solvers refute against.
+    ///
+    /// ```text
+    /// (cl (not (set.subset A B)) (not (select A E)) (select B E))
+    /// (cl (not (multiset.subset A B)) (<= (select A E) (select B E)))
+    /// ```
+    ///
+    /// The first is `A subset B -> (E in A -> E in B)` over the
+    /// `Array(I -> Bool)` membership carrier; the second is
+    /// `A subset B -> count(A,E) <= count(B,E)` over the `Array(I -> Int)`
+    /// multiplicity carrier. Both are entailed by the subset atom alone, so
+    /// each clause is valid under every interpretation.
+    ///
+    /// `A`, `B` and `E` must be identical throughout -- that identity is the
+    /// whole content of the axiom, and dropping it would licence
+    /// `A subset B => e in C` for an unrelated `C`. The multiset `<=`
+    /// orientation is likewise fixed: the mirror image is the converse claim
+    /// and is false.
+    ///
+    /// `map.subset` is NOT covered: its element-wise definition is a
+    /// conjunction over the `map.dom` projection, not this single implication,
+    /// so a `map.subset` clause fails closed here.
+    SubsetElementInstance,
+
     /// Array extensionality axiom.
     ///
     /// `(=> (forall ((i Index)) (= (select a i) (select b i))) (= a b))`
@@ -550,6 +413,115 @@ pub enum TheoryLemmaKind {
     /// on any non-ground leaf, unimplemented operator, incomplete alphabet
     /// partition, reachable accepting state, or budget exhaustion.
     RegexIntersectEmpty,
+
+    /// Universally-valid containment/order identity over a SYMBOLIC subject:
+    /// the clause carries one of
+    ///
+    /// ```text
+    /// (str.contains t t)   (str.prefixof t t)   (str.suffixof t t)
+    /// (str.<= t t)         (not (str.< t t))
+    /// (str.contains t "")  (str.prefixof "" t)  (str.suffixof "" t)
+    /// ```
+    ///
+    /// A word contains, prefixes, suffixes and `str.<=`-precedes ITSELF, is
+    /// never strictly less than itself, and contains/starts with/ends with the
+    /// empty word. Each holds under EVERY interpretation, so the clause is a
+    /// tautology.
+    ///
+    /// The two argument positions must hold the SAME `TermId` (or the exact
+    /// empty-string constant in the operator's own contained-word position) —
+    /// that identity IS the theorem. Two syntactically different terms may
+    /// denote different words, and `str.contains` takes the CONTAINER first
+    /// while `str.prefixof`/`str.suffixof` take the CONTAINED word first, so
+    /// the positions are not interchangeable.
+    ///
+    /// This is the SYMBOLIC counterpart of [`Self::StringGroundEval`], which
+    /// only decides facts whose subject is a constant. Uses AY's
+    /// `string_containment_identity` rule; validated by `ay-proof` with a
+    /// purely structural re-derivation that fails closed on any near-miss (two
+    /// different subjects, the wrong empty-word position, a flipped polarity,
+    /// non-String arguments). The pinned external Alethe checker has no rule
+    /// for it, so it renders as an honest `hole` on that wire.
+    StringContainmentIdentity,
+
+    /// Free-monoid cancellation for `str.++`:
+    ///
+    /// ```text
+    /// (cl (not (= (str.++ P… W…) (str.++ Q… W…))) (= P… Q…))   ; right
+    /// (cl (not (= (str.++ W… P…) (str.++ W… Q…))) (= P… Q…))   ; left
+    /// ```
+    ///
+    /// `str.++` denotes concatenation in the FREE monoid over the SMT-LIB
+    /// alphabet, in which every element cancels on both sides: `u·w = v·w`
+    /// forces `u = v`, and `w·u = w·v` forces `u = v`. Both hold under every
+    /// interpretation, so the two-literal clause is a tautology.
+    ///
+    /// The cancelled block `W…` must be a NON-EMPTY, syntactically identical
+    /// operand run at the SAME end of both sides, and each residual run must
+    /// denote exactly its side of the conclusion (an empty residual is the
+    /// `""` constant, a one-operand residual is that operand, a longer one is
+    /// the `str.++` of exactly that run). Anything else is rejected rather
+    /// than re-associated, so a producer cannot smuggle a conclusion past the
+    /// residual it is supposed to name.
+    ///
+    /// Uses AY's `string_concat_cancellation` rule; validated by `ay-proof`
+    /// with a structural re-derivation, fail-closed. The pinned external
+    /// Alethe checker has no rule for it, so it renders as an honest `hole`.
+    StringConcatCancellation,
+
+    /// A containment predicate refuted by the GROUND blocks it names, over an
+    /// otherwise symbolic word:
+    ///
+    /// ```text
+    /// (cl (not (str.contains  C  (str.++ … k …))))   ; k not a factor of C
+    /// (cl (not (str.prefixof  K  (str.++ m …))))     ; |K| <= |m|, K not a prefix of m
+    /// (cl (not (str.suffixof  K  (str.++ … m))))     ; |K| <= |m|, K not a suffix of m
+    /// ```
+    ///
+    /// `str.contains C T` says T's value is a CONTIGUOUS factor of C's, and a
+    /// factor of a factor is a factor — so every concat block of T is a factor
+    /// of C. A ground block absent from a ground container therefore refutes
+    /// the containment for EVERY value of the symbolic blocks. The
+    /// prefix/suffix forms pin the ground pattern against the container's
+    /// ground boundary block: when the pattern is no LONGER than that block it
+    /// must be its prefix/suffix, so a disagreement refutes the predicate
+    /// outright. A pattern that reaches past the ground block decides nothing
+    /// and is rejected.
+    ///
+    /// Every argument is about the ground data the clause itself carries; the
+    /// symbolic blocks are never reasoned about. Uses AY's
+    /// `string_ground_factor_conflict` rule; validated by `ay-proof` with an
+    /// independent factor scan, fail-closed on a symbolic container, a
+    /// symbolic boundary block, an empty or present factor, an over-long
+    /// pattern, or a positive-polarity literal. The pinned external Alethe
+    /// checker has no rule for it, so it renders as an honest `hole`.
+    StringGroundFactorConflict,
+
+    /// A regex membership bounding `str.len` BELOW:
+    ///
+    /// ```text
+    /// (cl (not (str.in_re x R)) (<= k (str.len x)))
+    /// ```
+    ///
+    /// where `R` is GROUND and `k` is at most the minimum word length of
+    /// `L(R)`. Either `x` is outside the language and the first literal holds,
+    /// or it is inside and the second does, so the clause is a tautology.
+    ///
+    /// This is what lets a length-arithmetic refutation use a regex the way
+    /// the solver does: `x·x = "aaaa"` pins `2·len(x) = 4`, and
+    /// `x ∈ ((_ re.loop 3 5) (str.to_re "a"))` pins `len(x) >= 3`, which is a
+    /// plain linear contradiction once the bound is stated as a checkable
+    /// clause.
+    ///
+    /// Validated by `ay-proof` with its OWN compositional minimum-length
+    /// computation over the regex tree (`re.++` sums, `re.union` takes the
+    /// smallest branch, `re.inter` the largest, `re.*`/`re.opt` give `0`,
+    /// `(_ re.loop lo hi)` gives `lo` times the body). `re.comp` and every
+    /// unmodelled operator REJECT rather than guess, and a non-ground leaf, a
+    /// mismatched membership subject, a negative or over-strong bound, and a
+    /// wrong clause shape all fail closed. Alethe has no rule for it, so it
+    /// renders as an honest `hole` on that wire.
+    RegexLengthLowerBound,
 
     /// Datatype constructor distinctness: `(cl (not (= t C1)) (not (= t C2)))`
     /// where `C1` and `C2` are applications of DISTINCT constructors of the same
@@ -784,6 +756,9 @@ impl TheoryLemmaKind {
             Self::SetCardEmpty => "set_card_empty",
             Self::SetCardMemberCount => "set_card_member_count",
             Self::SetCardEmptyByAssertion => "set_card_empty_by_assertion",
+            Self::SetCardChainRecurrence => "set_card_chain_recurrence",
+            Self::SubsetReflexive => "subset_reflexive",
+            Self::SubsetElementInstance => "subset_element_instance",
             Self::ArrayExtensionality => "extensionality",
             Self::FpToBv { .. } => "fp_to_bv",
             Self::StringLengthAxiom => "string_length",
@@ -792,6 +767,10 @@ impl TheoryLemmaKind {
             Self::StringNormalForm => "string_code_inj",
             Self::StringGroundEval => "string_ground_eval",
             Self::RegexIntersectEmpty => "regex_intersect_empty",
+            Self::StringContainmentIdentity => "string_containment_identity",
+            Self::StringConcatCancellation => "string_concat_cancellation",
+            Self::StringGroundFactorConflict => "string_ground_factor_conflict",
+            Self::RegexLengthLowerBound => "regex_length_lower_bound",
             Self::DatatypeDistinct => "dt_distinct",
             Self::DatatypeEnumPigeonhole => "dt_enum_pigeonhole",
             Self::DatatypeSelectorProject => "dt_project",

@@ -42,7 +42,9 @@ use super::{debug_ite_conditions_enabled, debug_preprocessed_enabled};
 // Re-export so existing `use super::bv::BvSolveConfig` paths continue to work.
 pub(in crate::executor) use super::bv_config::BvSolveConfig;
 
-struct BvSatDeadlineGuard(Option<(Arc<(Mutex<bool>, Condvar)>, std::thread::JoinHandle<()>)>);
+pub(super) struct BvSatDeadlineGuard(
+    Option<(Arc<(Mutex<bool>, Condvar)>, std::thread::JoinHandle<()>)>,
+);
 
 impl Drop for BvSatDeadlineGuard {
     fn drop(&mut self) {
@@ -57,11 +59,14 @@ impl Drop for BvSatDeadlineGuard {
     }
 }
 
-fn install_bv_sat_interrupt(
+pub(super) fn install_bv_sat_interrupt(
     solver: &mut SatSolver,
     external_interrupt: Option<Arc<AtomicBool>>,
     solve_deadline: Option<Instant>,
 ) -> BvSatDeadlineGuard {
+    // Preserve timeout provenance at the SAT result boundary. The timer flag
+    // remains installed below for legacy deep loops that only poll interrupts.
+    solver.set_solve_deadline(solve_deadline);
     let sat_deadline_interrupt_flag = solve_deadline.map(|_| {
         Arc::new(AtomicBool::new(
             external_interrupt
@@ -72,9 +77,10 @@ fn install_bv_sat_interrupt(
     let sat_interrupt_flag = sat_deadline_interrupt_flag
         .clone()
         .or_else(|| external_interrupt.clone());
-    if let Some(ref flag) = sat_interrupt_flag {
-        solver.set_interrupt(flag.clone());
-    }
+    // Persistent BV solvers outlive one public query. Rebind even when this
+    // query has no controls so a prior timeout's local flag cannot poison a
+    // retry.
+    solver.set_interrupt_handle(sat_interrupt_flag);
 
     // Spawn a cancellable deadline timer thread if needed (#8554). The timer
     // writes only to the SAT-local deadline flag, never to the caller's API
@@ -215,89 +221,7 @@ fn configure_ephemeral_bv_sat_solver(
 }
 
 #[cfg(test)]
-mod deadline_interrupt_tests {
-    use super::*;
-    use ay_sat::BranchSelectorMode;
-
-    #[test]
-    fn bv_sat_deadline_does_not_poison_external_interrupt_8961() {
-        let external_interrupt = Arc::new(AtomicBool::new(false));
-        let mut solver = SatSolver::new(1);
-
-        let _guard = install_bv_sat_interrupt(
-            &mut solver,
-            Some(external_interrupt.clone()),
-            Some(Instant::now()),
-        );
-
-        assert!(
-            !external_interrupt.load(Ordering::Relaxed),
-            "BV SAT deadline timer must not set the reusable API interrupt flag"
-        );
-    }
-
-    #[test]
-    fn ephemeral_bv_sat_solver_disables_restart_inprocessing_11936() {
-        let mut solver = SatSolver::new(100_000);
-        configure_ephemeral_bv_sat_solver(&mut solver, 100_000, 100_000, false);
-        let profile = solver.inprocessing_feature_profile();
-
-        assert!(!profile.preprocess);
-        assert!(!profile.shrink);
-        assert!(!profile.probe);
-        assert!(!profile.vivify);
-        assert!(!profile.subsume);
-        assert!(!profile.condition);
-        assert!(!profile.congruence);
-        assert!(!profile.reorder);
-        assert_eq!(solver.active_branch_heuristic(), BranchHeuristic::Vmtf);
-        assert_eq!(
-            solver.branch_selector_mode(),
-            BranchSelectorMode::Fixed(BranchHeuristic::Vmtf)
-        );
-    }
-
-    #[test]
-    fn large_abv_stable_restart_phase_requires_large_array_bitblast_8140() {
-        assert!(should_extend_large_abv_stable_restart_phase(
-            ABV_LARGE_STABLE_RESTART_MIN_VARS,
-            ABV_LARGE_STABLE_RESTART_MIN_CLAUSES,
-            true,
-        ));
-        assert!(!should_extend_large_abv_stable_restart_phase(
-            ABV_LARGE_STABLE_RESTART_MIN_VARS - 1,
-            ABV_LARGE_STABLE_RESTART_MIN_CLAUSES,
-            true,
-        ));
-        assert!(!should_extend_large_abv_stable_restart_phase(
-            ABV_LARGE_STABLE_RESTART_MIN_VARS,
-            ABV_LARGE_STABLE_RESTART_MIN_CLAUSES - 1,
-            true,
-        ));
-        assert!(!should_extend_large_abv_stable_restart_phase(
-            ABV_LARGE_STABLE_RESTART_MIN_VARS,
-            ABV_LARGE_STABLE_RESTART_MIN_CLAUSES,
-            false,
-        ));
-    }
-
-    #[test]
-    fn large_abv_ephemeral_solver_keeps_stable_focused_branch_coupling_8140() {
-        let mut solver = SatSolver::new(ABV_LARGE_STABLE_RESTART_MIN_VARS);
-
-        configure_ephemeral_bv_sat_solver(
-            &mut solver,
-            ABV_LARGE_STABLE_RESTART_MIN_VARS,
-            ABV_LARGE_STABLE_RESTART_MIN_CLAUSES,
-            true,
-        );
-
-        assert_eq!(
-            solver.branch_selector_mode(),
-            BranchSelectorMode::LegacyCoupled
-        );
-    }
-}
+mod deadline_interrupt_tests;
 
 #[cfg(test)]
 mod restored_coverage_tests {
@@ -1587,7 +1511,7 @@ impl Executor {
         // executor/API interrupt flag: API callers reuse a solver across many
         // checks, and a timed-out BV subsolve must not poison later queries as
         // externally interrupted (#8961).
-        let _deadline_guard = install_bv_sat_interrupt(
+        let mut _deadline_guard = install_bv_sat_interrupt(
             &mut solver,
             self.solve_interrupt.clone(),
             self.solve_deadline.get(),
@@ -1882,9 +1806,11 @@ impl Executor {
                             all_clauses.len() + accumulated_delayed_clauses.len(),
                             config.array_axioms,
                         );
-                        if let Some(ref flag) = self.solve_interrupt {
-                            fresh_solver.set_interrupt(flag.clone());
-                        }
+                        _deadline_guard = install_bv_sat_interrupt(
+                            &mut fresh_solver,
+                            self.solve_interrupt.clone(),
+                            self.solve_deadline.get(),
+                        );
 
                         // Re-add all original clauses.
                         for clause in &all_clauses {
@@ -2048,9 +1974,11 @@ impl Executor {
                     all_clauses.len() + accumulated_delayed_clauses.len(),
                     config.array_axioms,
                 );
-                if let Some(ref flag) = self.solve_interrupt {
-                    fresh.set_interrupt(flag.clone());
-                }
+                _deadline_guard = install_bv_sat_interrupt(
+                    &mut fresh,
+                    self.solve_interrupt.clone(),
+                    self.solve_deadline.get(),
+                );
 
                 // Re-add all original clauses.
                 for clause in &all_clauses {
@@ -2602,14 +2530,14 @@ impl Executor {
     /// reason. Shared by non-incremental and incremental BV paths (#6691).
     pub(super) fn propagate_bv_unknown_reason(&mut self, is_unknown: bool) {
         if is_unknown && self.pending_sat_unknown_reason.is_none() {
-            if self
+            if self.solve_deadline.expired() {
+                self.last_unknown_reason = Some(UnknownReason::Timeout);
+            } else if self
                 .solve_interrupt
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
                 self.last_unknown_reason = Some(UnknownReason::Interrupted);
-            } else if self.solve_deadline.expired() {
-                self.last_unknown_reason = Some(UnknownReason::Timeout);
             }
         }
     }

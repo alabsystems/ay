@@ -2258,14 +2258,14 @@ fn test_bv2nat_out_of_range_opaque_value_rejected() {
 }
 
 // SOUNDNESS GATE: the opaque-Int fallback fires ONLY when there is no bv_model.
-// With a bv_model present (even if `k` is absent and defaults to 0), the
-// computed path is authoritative and the LIA opaque value is NOT consulted.
+// With a bv_model present, a missing `k` stays Unknown and the LIA opaque value
+// is NOT consulted.
 #[test]
 fn test_bv2nat_lia_fallback_gated_on_absent_bv_model() {
     let mut ex = Executor::new();
     let k = ex.ctx.terms.mk_var("k", Sort::bitvec(8));
     let b2n = ex.ctx.terms.mk_bv2nat(k);
-    // bv_model present but missing `k` -> evaluate_var(k) defaults to BitVec(0).
+    // bv_model present but missing `k` -> evaluate_var(k) is Unknown.
     let mut model = empty_model();
     model.bv_model = Some(BvModel {
         values: HashMap::default(),
@@ -2278,7 +2278,7 @@ fn test_bv2nat_lia_fallback_gated_on_absent_bv_model() {
     model.lia_model = Some(LiaModel { values: lia });
     assert_eq!(
         ex.evaluate_term(&model, b2n),
-        EvalValue::Rational(BigRational::from(BigInt::zero())),
-        "with a bv_model present, bv2nat uses the computed BV value (0 default), not the LIA opaque value"
+        EvalValue::Unknown,
+        "with a bv_model present, bv2nat must neither invent zero nor use the LIA opaque value"
     );
 }

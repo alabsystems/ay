@@ -262,6 +262,56 @@ fn test_signed_msb_bv2nat_link_refutes() {
     );
 }
 
+/// The msb-link at its root (#bv2nat-extract-link): `bv2nat(x) = 10` and
+/// `bv2nat(x[31:31]) = 1` disagree — 10 has a zero top bit — so the pair is
+/// UNSAT.
+///
+/// REGRESSION, and this one is a SOUNDNESS regression, not a completeness one.
+/// The range fact `0 <= bv2nat(t) <= 2^w - 1` was the ONLY constraint the bridge
+/// put on a `bv2nat` of an extracted slice, so the arithmetic side was free to
+/// pick `bv2nat(x) = 10` together with `msb = 1` while the BV side picked
+/// `x = 0x0000000a`. That composite model FALSIFIES its own assertion, and AY's
+/// independent model gate caught it — printing the `[AY SOUNDNESS GATE] caught
+/// an INVALID model` banner and fail-closing to `unknown`. The banner is the
+/// symptom; a slice floating free of its source is the cause.
+#[test]
+#[timeout(60_000)]
+fn test_bv2nat_slice_disagrees_with_source_refutes() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-const x (_ BitVec 32))
+        (assert (= (bv2nat x) 10))
+        (assert (= (bv2nat ((_ extract 31 31) x)) 1))
+        (check-sat)
+    "#;
+    assert_eq!(
+        verdict(smt),
+        "unsat",
+        "bv2nat(x)=10 forces the top bit to 0, so bv2nat(x[31:31])=1 is impossible"
+    );
+}
+
+/// SOUNDNESS control for the link: the SAME shape with a magnitude that really
+/// does set the top bit. `bv2nat(x) = 2^31 + 10` has `x[31:31] = 1`, so the pair
+/// is CONSISTENT (`x = 0x8000000a`) and must NOT be refuted — the link must pin
+/// the slice, never delete the negative half of the range.
+#[test]
+#[timeout(60_000)]
+fn test_bv2nat_slice_agrees_with_source_not_unsat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-const x (_ BitVec 32))
+        (assert (= (bv2nat x) 2147483658))
+        (assert (= (bv2nat ((_ extract 31 31) x)) 1))
+        (check-sat)
+    "#;
+    assert_ne!(
+        verdict(smt),
+        "unsat",
+        "x = 0x8000000a satisfies both: bv2nat = 2^31+10 and top bit 1"
+    );
+}
+
 /// SOUNDNESS: a large `bv2nat` DOES set the sign negative — `bv2nat(x)=2^31`
 /// means msb=1, so `bvslt x 0` is TRUE and `(not (bvslt x 0))` is UNSAT, but the
 /// plain `bvslt x 0` here is SAT and must not be refuted.

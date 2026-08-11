@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Native CI/release gates.
+//! Native local/release gates.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -21,7 +21,7 @@ pub(crate) enum GateCommand {
     Health(HealthGateArgs),
     /// Run repo-local staged-tree pre-commit guards.
     Precommit(PrecommitGateArgs),
-    /// Run the checked-in solver gate used by CI.
+    /// Run the checked-in local solver gate.
     Solver(SolverGateArgs),
     /// Run the checked-in publish gate used by CI.
     Publish(PublishGateArgs),
@@ -327,11 +327,7 @@ fn run_solver_gate(args: &SolverGateArgs) -> Result<i32> {
     steps.push(ExternalStep::new(
         "critical_solver_policy",
         "bash",
-        &[
-            "scripts/check_critical_solver_policy.sh",
-            "--rev-range",
-            &critical_range,
-        ],
+        &[CRITICAL_SOLVER_POLICY_PATH, "--rev-range", &critical_range],
     ));
     steps.push(ExternalStep::new("z3_version", "z3", &["--version"]));
     steps.extend(solver_gate_cargo_steps());
@@ -342,7 +338,7 @@ fn run_solver_gate(args: &SolverGateArgs) -> Result<i32> {
     }
 
     run_native_step("solver-gate", "solver_gate_wiring", || {
-        check_solver_gate_wiring(&repo_root)
+        check_local_solver_gate_entrypoint(&repo_root)
     })?;
     for step in &steps {
         run_external_step("solver-gate", &repo_root, step)?;
@@ -358,8 +354,11 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay",
+                "--features",
+                "cli",
                 "--test",
                 "group_misc",
                 "build_version_stamp_8870",
@@ -372,8 +371,11 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay",
+                "--features",
+                "cli",
                 "--test",
                 "group_cli",
                 "external_codegen_consumer_canaries_8870",
@@ -386,8 +388,11 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay",
+                "--features",
+                "cli",
                 "--test",
                 "group_smt",
                 "smt_lib_conformance::test_conformance_cross_logic_summary",
@@ -401,6 +406,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -415,6 +421,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -429,6 +436,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-sat",
                 "--test",
@@ -443,6 +451,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -457,6 +466,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -471,6 +481,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -485,6 +496,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -499,6 +511,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--test",
@@ -513,6 +526,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-sat",
                 "--release",
@@ -528,6 +542,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--release",
@@ -543,6 +558,7 @@ fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
             "cargo",
             &[
                 "test",
+                "--locked",
                 "-p",
                 "ay-dpll",
                 "--release",
@@ -1679,36 +1695,81 @@ fn print_steps(prefix: &str, external: &[ExternalStep], native: &[&str]) {
     }
 }
 
-fn check_solver_gate_wiring(repo_root: &Path) -> Result<()> {
-    let workflow = repo_root.join(".github/workflows/solver-gate.yml");
-    let text = fs::read_to_string(&workflow)
-        .with_context(|| format!("read solver workflow {}", workflow.display()))?;
+const CRITICAL_SOLVER_POLICY_NAME: &str = "critical-solver-policy-gate";
+const CRITICAL_SOLVER_POLICY_PATH: &str = "scripts/check_critical_solver_policy.sh";
+
+fn check_local_solver_gate_entrypoint(repo_root: &Path) -> Result<()> {
+    let policy_script = repo_root.join(CRITICAL_SOLVER_POLICY_PATH);
+    let script_text = fs::read_to_string(&policy_script)
+        .with_context(|| format!("read local solver policy {}", policy_script.display()))?;
     require_contains(
-        &text,
-        "run: cargo run --locked -p ay -- gate solver",
-        "CI solver gate must invoke ay gate solver",
+        &script_text,
+        &format!("# ay-script: {CRITICAL_SOLVER_POLICY_NAME}"),
+        "local solver policy must declare its indexed script identity",
     )?;
-    require_contains(
-        &text,
-        "fetch-depth: 0",
-        "CI solver gate must fetch full history for landing-range checks",
-    )?;
-    require_contains(
-        &text,
-        "SOLVER_GATE_CRITICAL_SOLVER_RANGE",
-        "CI solver gate must pass SOLVER_GATE_CRITICAL_SOLVER_RANGE",
-    )
+
+    let index_path = repo_root.join("scripts/index.toml");
+    let index_text = fs::read_to_string(&index_path)
+        .with_context(|| format!("read script index {}", index_path.display()))?;
+    let index: toml::Value = toml::from_str(&index_text)
+        .with_context(|| format!("parse script index {}", index_path.display()))?;
+    let entries = index
+        .get("script")
+        .and_then(toml::Value::as_array)
+        .with_context(|| {
+            format!(
+                "script index {} has no script entries",
+                index_path.display()
+            )
+        })?;
+    let entry = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| name == CRITICAL_SOLVER_POLICY_NAME)
+        })
+        .with_context(|| {
+            format!(
+                "script index {} does not register {CRITICAL_SOLVER_POLICY_NAME}",
+                index_path.display()
+            )
+        })?;
+
+    let indexed_path = entry
+        .get("path")
+        .and_then(toml::Value::as_str)
+        .context("critical solver policy index entry has no path")?;
+    if indexed_path != CRITICAL_SOLVER_POLICY_PATH {
+        bail!(
+            "critical solver policy index path must be {CRITICAL_SOLVER_POLICY_PATH}, found {indexed_path}"
+        );
+    }
+    let indexed_cli = entry
+        .get("cli")
+        .and_then(toml::Value::as_str)
+        .context("critical solver policy index entry has no fronting CLI")?;
+    if indexed_cli != "ay gate" {
+        bail!("critical solver policy must be fronted by `ay gate`, found {indexed_cli}");
+    }
+    Ok(())
 }
 
 fn check_publish_gate_wiring(repo_root: &Path) -> Result<()> {
     let workflow = repo_root.join(".github/workflows/publish-gate.yml");
     let text = fs::read_to_string(&workflow)
         .with_context(|| format!("read publish workflow {}", workflow.display()))?;
-    require_contains(
-        &text,
-        "run: cargo run --locked -p ay -- gate publish",
-        "CI publish gate must invoke ay gate publish",
-    )
+    let expected = "run: cargo run --locked -p ay --features cli -- gate publish";
+    if text
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.starts_with('#') && line == expected)
+    {
+        Ok(())
+    } else {
+        bail!("CI publish gate must invoke ay gate publish")
+    }
 }
 
 fn require_contains(text: &str, needle: &str, message: &str) -> Result<()> {
@@ -1731,7 +1792,7 @@ fn check_release_gate_assets_present(repo_root: &Path) -> Result<()> {
 
 const RELEASE_GATE_REQUIRED_ASSETS: &[&str] = &[
     ".github/workflows/publish-gate.yml",
-    "scripts/check_critical_solver_policy.sh",
+    CRITICAL_SOLVER_POLICY_PATH,
     "scripts/check_api_docs.sh",
     "scripts/check_doc_reality.sh",
     "README.md",
@@ -1972,5 +2033,179 @@ fn shell_quote(arg: &str) -> String {
         arg.to_string()
     } else {
         format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_local_solver_gate_fixture(index_entry: &str) -> TempDir {
+        let repo = TempDir::new().expect("temporary repository");
+        let scripts = repo.path().join("scripts");
+        fs::create_dir(&scripts).expect("create scripts directory");
+        fs::write(
+            scripts.join("check_critical_solver_policy.sh"),
+            "#!/usr/bin/env bash\n# ay-script: critical-solver-policy-gate\n",
+        )
+        .expect("write local solver policy");
+        fs::write(
+            scripts.join("index.toml"),
+            format!("schema_version = 1\n\n{index_entry}\n"),
+        )
+        .expect("write script index");
+        repo
+    }
+
+    fn write_publish_gate_fixture(workflow_line: &str) -> TempDir {
+        let repo = TempDir::new().expect("temporary repository");
+        let workflows = repo.path().join(".github/workflows");
+        fs::create_dir_all(&workflows).expect("create workflows directory");
+        fs::write(
+            workflows.join("publish-gate.yml"),
+            format!("steps:\n  - name: publish\n    {workflow_line}\n"),
+        )
+        .expect("write publish workflow");
+        repo
+    }
+
+    fn cargo_args_before_separator(step: &ExternalStep) -> &[String] {
+        assert_eq!(step.program, "cargo", "unexpected step: {}", step.name);
+        let separator = step
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or_else(|| panic!("Cargo step has no argument separator: {}", step.rendered()));
+        &step.args[..separator]
+    }
+
+    fn cargo_option_value<'a>(args: &'a [String], short: &str, long: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|pair| pair[0] == short || pair[0] == long)
+            .map(|pair| pair[1].as_str())
+    }
+
+    #[test]
+    fn local_solver_gate_entrypoint_accepts_indexed_policy_without_workflow() {
+        let repo = write_local_solver_gate_fixture(
+            r#"[[script]]
+name = "critical-solver-policy-gate"
+path = "scripts/check_critical_solver_policy.sh"
+cli = "ay gate""#,
+        );
+
+        assert!(
+            !repo.path().join(".github").exists(),
+            "fixture must not acquire a hosted workflow"
+        );
+        check_local_solver_gate_entrypoint(repo.path())
+            .expect("indexed local policy should satisfy solver gate wiring");
+    }
+
+    #[test]
+    fn local_solver_gate_entrypoint_rejects_misindexed_policy_path() {
+        let repo = write_local_solver_gate_fixture(
+            r#"[[script]]
+name = "critical-solver-policy-gate"
+path = "scripts/ci/not-the-policy.sh"
+cli = "ay gate""#,
+        );
+
+        let error = check_local_solver_gate_entrypoint(repo.path())
+            .expect_err("misindexed local policy must fail closed");
+        assert!(
+            format!("{error:#}").contains(
+                "critical solver policy index path must be scripts/check_critical_solver_policy.sh"
+            ),
+            "unexpected wiring error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn publish_gate_wiring_remains_a_separate_workflow_contract() {
+        let repo = write_local_solver_gate_fixture(
+            r#"[[script]]
+name = "critical-solver-policy-gate"
+path = "scripts/check_critical_solver_policy.sh"
+cli = "ay gate""#,
+        );
+        check_local_solver_gate_entrypoint(repo.path())
+            .expect("local solver gate fixture should be valid");
+
+        let error = check_publish_gate_wiring(repo.path())
+            .expect_err("local solver wiring must not satisfy publish wiring");
+        assert!(
+            format!("{error:#}").contains(".github/workflows/publish-gate.yml"),
+            "unexpected publish wiring error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn publish_gate_wiring_accepts_exact_cli_command() {
+        let repo = write_publish_gate_fixture(
+            "run: cargo run --locked -p ay --features cli -- gate publish",
+        );
+
+        check_publish_gate_wiring(repo.path())
+            .expect("publish workflow should enable the ay CLI feature");
+    }
+
+    #[test]
+    fn publish_gate_wiring_rejects_noncanonical_lines() {
+        for (case, workflow_line) in [
+            (
+                "old command without CLI feature",
+                "run: cargo run --locked -p ay -- gate publish",
+            ),
+            (
+                "commented command",
+                "# run: cargo run --locked -p ay --features cli -- gate publish",
+            ),
+            (
+                "command with suffix",
+                "run: cargo run --locked -p ay --features cli -- gate publish --list-steps",
+            ),
+        ] {
+            let repo = write_publish_gate_fixture(workflow_line);
+            let error = match check_publish_gate_wiring(repo.path()) {
+                Ok(()) => panic!("publish wiring accepted {case}"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains("CI publish gate must invoke ay gate publish"),
+                "unexpected publish wiring error for {case}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn solver_gate_cargo_steps_are_locked_and_cli_enabled() {
+        let steps = solver_gate_cargo_steps();
+        assert!(!steps.is_empty());
+        for step in &steps {
+            let cargo_args = cargo_args_before_separator(step);
+            assert_eq!(
+                cargo_args.first().map(String::as_str),
+                Some("test"),
+                "solver gate Cargo subcommand must be positional: {}",
+                step.rendered()
+            );
+            assert!(
+                cargo_args.iter().any(|arg| arg == "--locked"),
+                "solver gate Cargo step is not locked: {}",
+                step.rendered()
+            );
+            let package = cargo_option_value(cargo_args, "-p", "--package")
+                .unwrap_or_else(|| panic!("Cargo package is missing: {}", step.rendered()));
+            if package == "ay" {
+                assert_eq!(
+                    cargo_option_value(cargo_args, "-F", "--features"),
+                    Some("cli"),
+                    "ay test step does not enable its required CLI feature: {}",
+                    step.rendered()
+                );
+            }
+        }
     }
 }

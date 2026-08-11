@@ -25,6 +25,12 @@
 
 use crate::adaptive_decision_log::DecisionEntry;
 use crate::adaptive_decision_log::DecisionLog;
+use crate::adaptive_prestage_budget::algebraic_prestage_budget;
+#[cfg(test)]
+use crate::adaptive_prestage_budget::{
+    ALGEBRAIC_LARGE_ACYCLIC_BUDGET, ALGEBRAIC_POLYNOMIAL_PRESTAGE_BUDGET_CAP,
+    ALGEBRAIC_PRESTAGE_BUDGET,
+};
 use crate::chc_statistics::ChcStatistics;
 use crate::classifier::{ProblemClass, ProblemClassifier, ProblemFeatures};
 use crate::engine_result::ValidationEvidence;
@@ -72,19 +78,6 @@ pub(crate) const ADAPTIVE_SOLVER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Fix B3: minimum fraction of the global budget that must remain for the
 /// escalation retry round to fire after a first-round Unknown.
 const ESCALATION_RETRY_MIN_REMAINING_FRACTION: f64 = 0.25;
-
-/// Wall-clock cap for the algebraic invariant pre-strategy (#8753).
-///
-/// Algebraic synthesis is advertised as `<100ms`, but the SMT validation
-/// phase could previously burn the full CHC wall clock on NIA/LRA dual
-/// simplex loops (`half_true_modif_m`, `s_mutants_16`, `dillig02_m`).
-/// 3 s is the advertised Kind pre-pass budget in `adaptive_multi_pred.rs`
-/// and keeps the pre-strategy consistent with other portfolio stages.
-const ALGEBRAIC_PRESTAGE_BUDGET: Duration = Duration::from_secs(3);
-const ALGEBRAIC_POLYNOMIAL_PRESTAGE_BUDGET_CAP: Duration = Duration::from_secs(10);
-const ALGEBRAIC_LARGE_ACYCLIC_BUDGET: Duration = Duration::from_secs(30);
-const ALGEBRAIC_LARGE_ACYCLIC_MIN_PREDS: usize = 80;
-const ALGEBRAIC_LARGE_ACYCLIC_MIN_DEPTH: usize = 80;
 
 /// Wall-clock cap for the SAFE-only Solidity array-DT projection route (#9395).
 ///
@@ -165,59 +158,6 @@ const ARRAY_GHOST_PAIR_FINALIZE_RECHECK_BUDGET: Duration = Duration::from_secs(2
 const DUAL_CAS_LRA_ARG_COUNT: usize = 9;
 const LIA_FARKAS_ROUTE_BUDGET: Duration = Duration::from_secs(3);
 const LIA_FARKAS_ROUTE_VALIDATION_RESERVE: Duration = Duration::from_millis(750);
-
-fn algebraic_prestage_budget(features: &ProblemFeatures, solve_budget: Duration) -> Duration {
-    let mut budget = ALGEBRAIC_PRESTAGE_BUDGET;
-
-    // Polynomial closed-form synthesis is the intended route for accumulator
-    // and s_multipl-style LIA benchmarks. Give pure arithmetic cases more than
-    // the default 3s, but cap the extension so arbitrary Int multiplication
-    // does not monopolize CHC-COMP wall time before the rest of the portfolio.
-    if !solve_budget.is_zero()
-        && features.has_multiplication
-        && !features.has_mod_div
-        && !features.uses_arrays
-        && !features.uses_real
-    {
-        let polynomial_budget = solve_budget
-            .div_f64(2.0)
-            .min(ALGEBRAIC_POLYNOMIAL_PRESTAGE_BUDGET_CAP);
-        budget = budget.max(polynomial_budget);
-    }
-
-    // Large acyclic compiler block graphs can require many exact fact
-    // transfers before the algebraic proof reaches the query edge (#9004,
-    // model-checker-consumer vec-iterator canaries).
-    // Keep the strict 3s default for hard nonlinear/modular cases, but allow
-    // this bounded linear DAG shape enough time to finish its constructive proof.
-    if matches!(features.class, ProblemClass::MultiPredLinear)
-        && features.is_linear
-        && !features.has_cycles
-        && features.has_multiplication
-        && !features.has_mod_div
-        && !features.uses_arrays
-        && !features.uses_real
-        && features.num_predicates >= ALGEBRAIC_LARGE_ACYCLIC_MIN_PREDS
-        && features.dag_depth >= ALGEBRAIC_LARGE_ACYCLIC_MIN_DEPTH
-    {
-        budget = ALGEBRAIC_LARGE_ACYCLIC_BUDGET;
-    }
-
-    if !solve_budget.is_zero() {
-        let half_budget = solve_budget.div_f64(2.0);
-        if half_budget < budget {
-            // Honour the half-budget cap. Re-raising to ALGEBRAIC_PRESTAGE_BUDGET
-            // here defeated the very cap being applied: at a 5s wall the 3s floor
-            // handed this pre-stage 63% of the budget before any engine ran. The
-            // floor only ever bound for solve budgets under 6s, so competition
-            // budgets are unaffected.
-            budget = half_budget;
-        }
-        budget = budget.min(solve_budget);
-    }
-
-    budget
-}
 
 fn should_prioritize_acyclic_bv_proof_prepass(
     features: &ProblemFeatures,
@@ -1939,6 +1879,25 @@ impl AdaptivePortfolio {
     /// ENSURES: `VerifiedChcResult::Unknown` is returned if:
     ///          - No strategy could determine satisfiability within the budget
     pub fn solve(&self) -> crate::VerifiedChcResult {
+        // Single choke point for the body-`forall` over-approximation. The
+        // parser strips a body-position `forall`, which WEAKENS the antecedent:
+        // proofs survive a fortiori, but a counterexample may be fabricated by
+        // the weakened guard. So `Unsafe` must become `Unknown` here.
+        //
+        // The ONLY transition this can cause is `Unsafe -> Unknown`. `Safe` and
+        // `Unknown` pass through untouched, so no proof can be gained or lost.
+        let result = self.solve_inner_for_polarity_guard();
+        if self.problem.has_stripped_body_forall()
+            && matches!(result, crate::VerifiedChcResult::Unsafe(_))
+        {
+            return crate::VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::new(),
+            );
+        }
+        result
+    }
+
+    fn solve_inner_for_polarity_guard(&self) -> crate::VerifiedChcResult {
         // Run on a dedicated thread with a large stack to prevent stack
         // overflow from deep Arc<ChcExpr> recursive Drop (#6847).
         // The adaptive solver runs probe PDR, Kind, and retry engines

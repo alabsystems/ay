@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::mutate::ReasonPolicy;
+use super::mutate::{DeleteResult, ReasonPolicy};
 use super::*;
 
 impl Solver {
@@ -86,20 +86,79 @@ impl Solver {
                 .iter()
                 .any(|lit| self.var_lifecycle.is_removed(lit.variable().index()));
             if has_removed {
-                deleted_any = true;
                 if is_pending_garbage {
                     // Pending-garbage: force-delete by zeroing lit_len.
                     // The clause is already logically dead; we just need to
                     // ensure BCP cannot traverse it via stale watch entries.
                     self.stats.clear_bcp_learned_1963_blocker_cert(idx);
                     self.arena.delete(idx);
+                    deleted_any = true;
                 } else {
-                    self.delete_clause_checked(idx, ReasonPolicy::ClearLevel0);
+                    // This is mandatory correctness cleanup, not an optional
+                    // inprocessing mutation. Start in stop-immune mode so LRAT
+                    // unit materialization cannot partially advance and then
+                    // leave an active clause containing a removed variable.
+                    let result =
+                        self.delete_clause_checked_required_cleanup(idx, ReasonPolicy::ClearLevel0);
+                    assert_eq!(
+                        result,
+                        DeleteResult::Deleted,
+                        "BUG: mandatory preprocessing cleanup retained active clause {idx} containing a removed variable",
+                    );
+                    assert!(
+                        !self.arena.is_active(idx),
+                        "BUG: mandatory preprocessing cleanup reported deletion but clause {idx} remains active",
+                    );
+                    deleted_any = true;
                 }
             }
         }
         self.defer_stale_reason_cleanup = false;
         self.clear_stale_reasons();
         deleted_any
+    }
+
+    /// Restore a search-safe clause/watch state after initial preprocessing.
+    ///
+    /// This is deliberately unconditional with respect to the preprocessing
+    /// outcome. A cooperative stop can arrive after a destructive pass, so an
+    /// `Unknown` caller must perform the same dead-clause purge, watch rebuild,
+    /// root re-propagation, and one-shot disarm as a completed phase. Returns
+    /// whether cleanup propagation discovered a level-0 conflict.
+    pub(super) fn finish_initial_preprocessing(&mut self) -> bool {
+        if self.finalize_preprocess_clause_cleanup() {
+            self.cold.preprocess_watches_valid = false;
+        }
+        if !self.cold.preprocess_watches_valid {
+            self.watches.clear();
+            self.initialize_watches();
+        }
+
+        // Every current root assignment must be reconsidered against the
+        // rebuilt clause database, including units added by a partial pass.
+        self.qhead = 0;
+        let trail_before = self.trail.len();
+        let conflict = if self.has_empty_clause {
+            // Preprocessing may already have recorded the terminal conflict.
+            // BCP requires `has_empty_clause == false`; there is nothing left
+            // to propagate once the empty clause is known.
+            self.qhead = self.trail.len();
+            true
+        } else if let Some(conflict_ref) = self.search_propagate() {
+            self.record_level0_conflict_chain(conflict_ref);
+            true
+        } else {
+            if self.cold.tla_trace.is_some() && self.trail.len() > trail_before {
+                self.tla_trace_step(
+                    CdclTraceState::Propagating,
+                    Some(CdclTraceAction::Propagate),
+                );
+            }
+            false
+        };
+
+        self.cold.preprocess_enabled = false;
+        self.num_original_clauses = self.arena.active_clause_count();
+        conflict
     }
 }

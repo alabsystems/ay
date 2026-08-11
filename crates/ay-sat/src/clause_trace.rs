@@ -258,9 +258,19 @@ impl ClauseTrace {
         self.add_clause_with_hints(id, clause, is_original, Vec::new());
     }
 
+    /// Whether any entry already carries this stable id.
+    ///
+    /// The trace's id space must be injective — `clause_trace_resolution`
+    /// rejects the WHOLE trace on a duplicate, which discards an otherwise
+    /// valid refutation. Callers that mint an id from a different space (the
+    /// LRAT proof manager, say) must check before pushing.
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
     /// Record a clause addition with explicit resolution hints.
     ///
-    /// Empty clauses are always recorded (they signal UNSAT). Non-empty
+    /// Empty clauses are always recorded because they signal UNSAT. Non-empty
     /// clauses are silently dropped when the memory budget is exceeded.
     pub fn add_clause_with_hints(
         &mut self,
@@ -289,6 +299,20 @@ impl ClauseTrace {
             return;
         }
 
+        if std::env::var_os("AY_PROBE_TRACE_DUP").is_some() && self.contains_id(id) {
+            let prev = self
+                .entries
+                .iter()
+                .position(|e| e.id == id)
+                .unwrap_or(usize::MAX);
+            eprintln!(
+                "AY_PROBE_TRACE_DUP: id={id} pushed at entry {} already at entry {prev};                  new_is_original={is_original} new_len={} prev_is_original={} prev_len={}",
+                self.entries.len(),
+                clause.len(),
+                self.entries.get(prev).map(|e| e.is_original).unwrap_or(false),
+                self.entries.get(prev).map(|e| e.clause.len()).unwrap_or(0),
+            );
+        }
         self.used_bytes += entry_bytes;
         self.entries.push(ClauseTraceEntry {
             id,

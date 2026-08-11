@@ -129,6 +129,10 @@ impl Solver {
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY across solve() calls.
 
+        if let Some(reason) = self.solve_stop_reason(&|| false) {
+            return self.declare_assume_unknown_with_reason(reason);
+        }
+
         // IC3 fast path (#8569 Gap 1): avoid per-query Vec allocation when no
         // scopes are active and no constraint activation variable is set. This
         // is the common case for IC3/PDR where push/pop is not used and
@@ -320,8 +324,8 @@ impl Solver {
             // Parity with the general assumption driver: honor the external
             // interrupt handle and the process-memory gate on every
             // iteration, including conflict-free SAT descents.
-            if self.is_interrupted() {
-                return self.declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+            if let Some(reason) = self.active_interrupt_reason() {
+                return self.declare_assume_unknown_with_reason(reason);
             }
             // Learned level-0 units and incrementally added clauses can
             // uncover a root contradiction between propagation calls; it is
@@ -562,9 +566,8 @@ impl Solver {
                     // SAT-leaning runs can make many decisions between
                     // conflicts; keep the external interrupt honored on
                     // this branch too.
-                    if self.is_interrupted() {
-                        return self
-                            .declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+                    if let Some(reason) = self.active_interrupt_reason() {
+                        return self.declare_assume_unknown_with_reason(reason);
                     }
                 } else {
                     // No unassigned decision variable remains (within the

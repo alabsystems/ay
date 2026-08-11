@@ -11,6 +11,13 @@ fn sat_unknown_reason_mapping_is_specific() {
     Executor::record_sat_unknown_reason(&mut reason, Some(SatUnknownReason::Interrupted));
     assert_eq!(reason, Some(UnknownReason::Interrupted));
 
+    assert_eq!(
+        Executor::map_sat_unknown_origin(SatUnknownReason::DeadlineExceeded),
+        UnknownOrigin::SolveDeadline
+    );
+    Executor::record_sat_unknown_reason(&mut reason, Some(SatUnknownReason::DeadlineExceeded));
+    assert_eq!(reason, Some(UnknownReason::Timeout));
+
     Executor::record_sat_unknown_reason(&mut reason, Some(SatUnknownReason::UnsupportedConfig));
     assert_eq!(reason, Some(UnknownReason::Unsupported));
 

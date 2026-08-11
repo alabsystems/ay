@@ -47,16 +47,24 @@ mod order_ite;
 pub use order_ite::recognize_order_ite_tautology;
 mod regex_empty;
 pub use regex_empty::recognize_regex_intersect_empty;
+mod regex_length;
+pub use regex_length::{recognize_regex_length_lower_bound, regex_min_length};
 mod rounding_mode;
 #[path = "set_axiom.rs"]
 mod set_axiom;
+#[path = "set_card_chain.rs"]
+mod set_card_chain;
+#[path = "subset_axiom.rs"]
+mod subset_axiom;
 pub use rounding_mode::recognize_rounding_mode_domain;
 pub(crate) use set_axiom::EmptySetRegistry;
+pub use set_card_chain::recognize_set_card_chain_recurrence;
 pub use string_ground::recognize_string_ground_eval;
 pub(crate) use string_ground::{
     STRING_CHAR_ALLOCATION_LIMIT, STRING_EVAL_WORK_LIMIT, STRING_NUMERIC_BIT_ALLOCATION_LIMIT,
     STRING_NUMERIC_WORK_LIMIT,
 };
+pub use subset_axiom::recognize_subset_theory_lemma;
 mod fp_bounded;
 pub use fp_bounded::{
     recognize_fp_classification, recognize_fp_classification_op, recognize_fp_rounding_mode_domain,
@@ -77,6 +85,11 @@ mod string_axiom;
 mod string_ground;
 mod string_length_identity;
 pub use string_length_identity::recognize_string_length_lemma;
+mod string_word_identity;
+pub use string_word_identity::{
+    recognize_string_concat_cancellation, recognize_string_containment_identity,
+    recognize_string_ground_factor_conflict,
+};
 
 use ay_core::{
     AletheRule, FarkasAnnotation, LiaAnnotation, Proof, ProofId, ProofStep, TermId, TermStore,
@@ -767,6 +780,23 @@ fn validate_theory_lemma(
                     terms, step_id, clause, empty_sets,
                 )?;
             }
+            // Definitional set-cardinality recurrence over an EMPTY-ROOTED
+            // store chain. The empty root confines the schema to the finite
+            // fragment and is established by a walk of its own -- the
+            // membership walk short-circuits at the probed index and can
+            // answer without ever seeing the root. See set_card_chain.rs.
+            TheoryLemmaKind::SetCardChainRecurrence => {
+                set_card_chain::validate_set_card_chain_recurrence(terms, step_id, clause)?;
+            }
+            // Collection subset schemas: universally valid, re-derived from
+            // the clause alone (exact operand identity, native array
+            // signature, carrier element sort). See subset_axiom.rs.
+            TheoryLemmaKind::SubsetReflexive => {
+                subset_axiom::validate_subset_reflexive(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::SubsetElementInstance => {
+                subset_axiom::validate_subset_element_instance(terms, step_id, clause)?;
+            }
             // Skolemized extensionality: NOT a tautology, so shape alone can
             // never license it. Accepted only against the whole-proof
             // `array_ext_diff_intro` provenance registry; `None` (the caller
@@ -825,6 +855,44 @@ fn validate_theory_lemma(
             // establish outright.
             TheoryLemmaKind::RegexIntersectEmpty => {
                 regex_empty::validate_regex_intersect_empty(terms, step_id, clause)?;
+            }
+            // Universally-valid containment/order identity over a SYMBOLIC
+            // subject: self-containment/prefix/suffix, `str.<=` reflexivity,
+            // `str.<` irreflexivity, or an empty-word containment. The
+            // INDEPENDENT structural checker re-derives the exact theorem —
+            // the two positions must hold the SAME term, or the empty-string
+            // constant in the operator's own contained-word position — and
+            // fails closed on every near-miss.
+            TheoryLemmaKind::StringContainmentIdentity => {
+                string_word_identity::validate_string_containment_identity(terms, step_id, clause)?;
+            }
+            // Free-monoid cancellation for `str.++`: `u·w = v·w` forces
+            // `u = v` and `w·u = w·v` forces `u = v`. The INDEPENDENT
+            // structural checker re-derives the shared block and both
+            // residuals from the clause alone; a block that is not
+            // syntactically identical, sits at the wrong end, or does not
+            // leave exactly the conclusion's two sides is rejected.
+            TheoryLemmaKind::StringConcatCancellation => {
+                string_word_identity::validate_string_concat_cancellation(terms, step_id, clause)?;
+            }
+            // A containment refuted by the GROUND blocks it names. The
+            // INDEPENDENT factor scan re-derives the impossibility from the
+            // clause's own constants — a ground block missing from a ground
+            // container, or a ground pattern disagreeing with the container's
+            // ground boundary block — and never reasons about the symbolic
+            // parts.
+            TheoryLemmaKind::StringGroundFactorConflict => {
+                string_word_identity::validate_string_ground_factor_conflict(
+                    terms, step_id, clause,
+                )?;
+            }
+            // A regex membership bounding `str.len` below. The INDEPENDENT
+            // compositional minimum-length computation re-derives the bound
+            // from the ground regex tree and rejects `re.comp`, every
+            // unmodelled operator, a non-ground leaf, a mismatched subject, and
+            // any bound stronger than it can support.
+            TheoryLemmaKind::RegexLengthLowerBound => {
+                regex_length::validate_regex_length_lower_bound(terms, step_id, clause)?;
             }
             // Datatype constructor distinctness (#8419 / trust_count→0).
             //

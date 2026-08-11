@@ -32,12 +32,14 @@ mod inprocessing_elimination;
 mod inprocessing_incremental;
 mod inprocessing_maintenance;
 mod inprocessing_schedule;
+mod preprocessing_extension_transaction;
 #[cfg(test)]
 mod tests;
 mod theory_backend;
 mod theory_callback;
 mod theory_entry;
 
+use super::config_preprocess_cleanup::PreprocessOutcome;
 use super::*;
 impl Solver {
     /// Run one inprocessing pass with scoped diagnostic tracing and timing.
@@ -254,6 +256,10 @@ impl Solver {
         // learned clauses derived afterwards are suspect, so any later UNSAT
         // must be downgraded to Unknown. Do NOT reset here.
 
+        if let Some(result) = self.finish_stopped_sat_entry(&|| false) {
+            return result;
+        }
+
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
@@ -328,6 +334,10 @@ impl Solver {
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY — see solve_raw() comment.
 
+        if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+            return result;
+        }
+
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
@@ -384,6 +394,10 @@ impl Solver {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY — see solve_raw() comment.
+
+        if let Some(result) = self.finish_stopped_sat_entry(&|| false) {
+            return result;
+        }
 
         if self.has_empty_clause {
             let result = self.declare_unsat();
@@ -535,7 +549,15 @@ impl Solver {
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY — see solve_raw() comment.
 
-        if let Some(result) = self.init_solve() {
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+
+        let init_result = self.init_solve();
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+        if let Some(result) = init_result {
             return result;
         }
 
@@ -545,6 +567,10 @@ impl Solver {
         // the route's consumed bit keeps this exactly-once.
         let mut startup_passes_run = Vec::new();
         self.run_fmla_decompose_lrat_preflight_route(&mut startup_passes_run);
+
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
 
         // Early lucky phase at preprocessing entry (kissat lucky.c): try the
         // trivial-assignment probes (all-true/all-false constants, then
@@ -556,23 +582,26 @@ impl Solver {
         // bounded by a size-proportional wall budget and every lucky SAT is
         // re-verified by the model gate. Kill switch: AY_AB_LUCKY=0.
         if let Some(result) = self.try_lucky_phases_at_preprocess_entry() {
+            if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                return self.declare_unknown_with_reason(reason);
+            }
             return result;
         }
-        if self.is_interrupted() {
-            return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
         }
 
         // Run initial preprocessing (BVE, probing, subsumption)
         // This can eliminate variables and simplify clauses before CDCL
-        if self.cold.preprocess_enabled {
+        let preprocess_outcome = if self.cold.preprocess_enabled {
             let t0 = ay_core::time::Instant::now();
-            let unsat = self.preprocess();
+            let outcome = self.preprocess_interruptible(&should_stop);
             self.stats.preprocess_time_ns =
                 t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            if unsat {
-                return self.declare_unsat();
-            }
-        }
+            Some(outcome)
+        } else {
+            None
+        };
 
         // Reinitialize watches after preprocessing (clauses may have been modified)
         // Must clear watches first to avoid duplicates from pre-preprocessing state.
@@ -581,60 +610,32 @@ impl Solver {
         // subsequent pass modified clause literals in-place (e.g., quick-mode on
         // large instances), skip the redundant O(clauses) watch rebuild. On
         // shuffling-2 (4.7M clauses), this saves ~6 seconds of double watch init.
-        if self.cold.preprocess_enabled {
-            // #8496: Ensure all clauses containing eliminated/substituted
-            // variables are cleaned up, regardless of how preprocess() exited
-            // (normal completion, timeout, or interrupt). Preprocessing may
-            // return early via timeout checks after passes that eliminate
-            // variables (decompose, sweep, BVE), leaving stale clauses in
-            // the arena. This must run before initialize_watches() to prevent
-            // watching dead clauses that reference eliminated variables.
-            let finalize_deleted = self.finalize_preprocess_clause_cleanup();
-            // #8496: When finalize deleted any clauses, force a full watch
-            // rebuild. arena.delete() on pending-garbage clauses zeroes
-            // lit_len and sets GARBAGE_BIT, but does NOT remove their stale
-            // watch entries. The binary-clause BCP path does not check
-            // garbage bits (it relies on eager watch unlinking at deletion
-            // time). A full watches.clear() + initialize_watches() is the
-            // only safe way to purge all stale entries.
-            if finalize_deleted {
-                self.cold.preprocess_watches_valid = false;
-            }
-            if !self.cold.preprocess_watches_valid {
-                self.watches.clear();
-                self.initialize_watches();
-            }
-            // Reset qhead so all level-0 assignments re-propagate through
-            // current watches (#1818). Needed even when watches are valid
-            // because backbone/BVE may have enqueued new units.
-            self.qhead = 0;
-
-            // Re-propagate after watch reinitialization (#1464)
-            // BVE may have added resolvents that are unit/conflict under current assignment.
-            // Without this propagation, the solver may miss conflicts or unit implications.
-            {
-                let trail_before = self.trail.len();
-                // Post-preprocess: no probing/vivify — search variant.
-                if let Some(conflict_ref) = self.search_propagate() {
-                    self.record_level0_conflict_chain(conflict_ref);
+        if let Some(preprocess_outcome) = preprocess_outcome {
+            let cleanup_unsat = self.finish_initial_preprocessing();
+            let cleanup_stop =
+                self.stop_reason_after_preprocess_cleanup(preprocess_outcome, &should_stop);
+            // A previously latched stop, or one observed while cleanup was in
+            // progress, wins over any conflict cleanup discovered.
+            match preprocess_outcome {
+                PreprocessOutcome::Stopped(latched_reason) => {
+                    let reason = cleanup_stop.unwrap_or(latched_reason);
+                    return self.declare_unknown_with_reason(reason);
+                }
+                PreprocessOutcome::Unsat => {
+                    if let Some(reason) = cleanup_stop {
+                        return self.declare_unknown_with_reason(reason);
+                    }
                     return self.declare_unsat();
                 }
-                if self.cold.tla_trace.is_some() && self.trail.len() > trail_before {
-                    self.tla_trace_step(
-                        CdclTraceState::Propagating,
-                        Some(CdclTraceAction::Propagate),
-                    );
+                PreprocessOutcome::Complete => {
+                    if let Some(reason) = cleanup_stop {
+                        return self.declare_unknown_with_reason(reason);
+                    }
+                    if cleanup_unsat {
+                        return self.declare_unsat();
+                    }
                 }
             }
-
-            // Disable for subsequent calls — prevents double preprocessing if a
-            // later call goes through solve_with_assumptions_impl().
-            self.cold.preprocess_enabled = false;
-
-            // Use the post-preprocessing irredundant count for scheduling.
-            // arena.num_clauses() counts deleted slots left behind by BVE and
-            // subsumption, which overstates the live problem size.
-            self.num_original_clauses = self.arena.active_clause_count();
 
             // Density-aware restart tuning (#8466): on small dense formulas
             // (clique_n2_k10: 180 vars, 3160 clauses, density 17.5), the
@@ -1077,6 +1078,10 @@ impl Solver {
             self.cold.next_inprobe_conflict = self.total_conflicts().saturating_add(limit);
         }
 
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+
         // Try lucky phases (CaDiCaL-style pre-solving)
         // This can quickly solve formulas with simple satisfying assignments.
         //
@@ -1103,6 +1108,9 @@ impl Solver {
                     .lucky_time_ns
                     .saturating_add(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
                 if let Some(sat) = lucky_result {
+                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                        return self.declare_unknown_with_reason(reason);
+                    }
                     if sat {
                         // Lucky phase found satisfying assignment
                         self.tla_trace_step(CdclTraceState::Sat, Some(CdclTraceAction::DeclareSat));
@@ -1113,8 +1121,8 @@ impl Solver {
                 }
             }
         }
-        if self.is_interrupted() {
-            return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
         }
 
         // Run warmup to initialize target phases before walk

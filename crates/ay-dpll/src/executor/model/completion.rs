@@ -16,7 +16,7 @@
 //! This pass completes the model in two phases at finalize time:
 //!
 //! 1. Default truly-free variables that have no value in any model and are
-//!    not substitution keys: Bool -> false, Int/Real -> 0.
+//!    not substitution keys: Bool -> false, Int/Real/BitVec -> 0.
 //! 2. Replay the recorded variable substitutions to a fixpoint, evaluating
 //!    each eliminated variable's replacement RHS under the (now richer)
 //!    model via the full term evaluator (`evaluate_term`), which resolves
@@ -148,7 +148,8 @@ enum ExistingArrayDefaultPolicy {
 
 impl Executor {
     /// Complete the last SAT model so it is total over the original free
-    /// variables (Bool/Int/Real sorts), then leave acceptance to validation.
+    /// variables (Bool/Int/Real/BitVec sorts), then leave acceptance to
+    /// validation.
     ///
     /// Runs at the top of `finalize_sat_model_validation` (and the
     /// assumption variant) so every solve path benefits. Idempotent and
@@ -808,7 +809,7 @@ impl Executor {
         // model over all assertions/assumptions
         // ([`Self::completed_gap_model_accepted`], the same snapshot-and-
         // RETRACT discipline as `complete_constrained_gaps`,
-        // #array-completion-order). Any refutation retracts to the pre-pass
+        // #array-completion-order). Any non-confirmation retracts to the pre-pass
         // snapshot — exactly today's fail-closed partial model. SOUND BY
         // CONSTRUCTION: a manufactured cell value that actually matters
         // falsifies re-validation and is retracted, so no invalid witness can
@@ -2704,8 +2705,8 @@ impl Executor {
     ///
     /// The completion slot exists so a completed value NEVER requires creating
     /// an absent theory sub-model: materializing e.g. an empty `bv_model` would
-    /// flip `evaluate_var`'s missing-entry semantics for every OTHER variable
-    /// of that theory (#no-fabricated-model-values).
+    /// change theory-routing decisions for every OTHER term guarded by
+    /// `bv_model.is_some()` (#no-fabricated-model-values).
     fn insert_completed_value(
         terms: &ay_core::TermStore,
         model: &mut Model,
@@ -3345,8 +3346,8 @@ impl Executor {
     /// GATE-VERIFIED CANDIDATE by [`Self::complete_constrained_gaps`]: derive
     /// from asserted equalities / bounds where possible, default otherwise,
     /// then re-check the completed model with the strict oracles and the
-    /// independent gate — if either refutes it, the candidates are RETRACTED
-    /// (the model returns to its pre-candidate state) so a bad guess can
+    /// independent gate — unless both positively accept it, the candidates are
+    /// RETRACTED (the model returns to its pre-candidate state) so a bad guess can
     /// neither print nor influence the verdict. The former print-time
     /// fabricator "completed" these same variables silently, unvalidated, at
     /// print time (#no-fabricated-model-values).
@@ -3909,10 +3910,11 @@ impl Executor {
     /// assertion bounds), defaulted otherwise, in up to two dependency rounds
     /// (deriving `v` from `(= (select a i) v)` needs `i` pinned first). The
     /// completed model is then re-checked by `verify_model_strict` and the
-    /// independent gate: any refutation RETRACTS every candidate, restoring
-    /// the pre-candidate model, so a wrong guess can never ship — the sat
-    /// verdict and the printed values behave exactly as if no candidate had
-    /// been tried. Returns the number of committed candidate values.
+    /// independent gate: anything short of positive confirmation RETRACTS every
+    /// candidate, restoring the pre-candidate model, so a wrong guess can never
+    /// ship — the sat verdict and the printed values behave exactly as if no
+    /// candidate had been tried. Returns the number of committed candidate
+    /// values.
     fn complete_constrained_gaps(&mut self, model: &mut Model, gap_vars: &[TermId]) -> usize {
         if gap_vars.is_empty() {
             return 0;
@@ -3950,11 +3952,11 @@ impl Executor {
             tracing::debug!(
                 candidates = filled,
                 strategy = ?strategy,
-                "model completion: constrained-gap candidates refuted — trying next strategy"
+                "model completion: constrained-gap candidates not confirmed — trying next strategy"
             );
         }
 
-        // W3: both all-or-nothing strategies were refuted. Retry per variable,
+        // W3: neither all-or-nothing strategy was confirmed. Retry per variable,
         // retracting only the variables the gates actually reject.
         //
         // COMPLETENESS REQUIREMENT (#w3-partial-completion): the result is
@@ -4092,7 +4094,7 @@ impl Executor {
     }
 
     /// W3 (default ON, `AY_STR_WITNESS=0` kill switch): PER-VARIABLE retracting
-    /// completion, run only after BOTH all-or-nothing strategies were refuted.
+    /// completion, run only after NEITHER all-or-nothing strategy was confirmed.
     ///
     /// The pre-existing pass fills every gap variable, gate-checks ONCE, and on
     /// any refutation throws the WHOLE completion away — so a single bad
@@ -4145,7 +4147,7 @@ impl Executor {
                         progress = true;
                         break;
                     }
-                    // Refuted: retract JUST this variable and try the next
+                    // Not confirmed: retract JUST this variable and try the next
                     // strategy for it (the accepted prefix is preserved).
                     *model = before.clone();
                     super::eval_memo_clear();
@@ -4194,7 +4196,7 @@ impl Executor {
     /// EVERY produced value is a CANDIDATE only:
     /// [`Self::complete_constrained_gaps`] re-checks the completed model with the
     /// strict oracles + independent gate and RETRACTS all candidates on any
-    /// refutation, so a wrong filler can never ship — it degrades to Unknown.
+    /// non-confirmation, so a wrong filler can never ship — it degrades to Unknown.
     fn reconstruct_string_from_len_or_equalities(
         &self,
         model: &Model,
@@ -4223,7 +4225,7 @@ impl Executor {
         //      always refuted there; the derivative witness search emits exactly
         //      the characters the regex classes demand. Same candidate status as
         //      every other branch — `complete_constrained_gaps` re-checks and
-        //      RETRACTS on refutation, so this can only convert to a
+        //      RETRACTS on non-confirmation, so this can only convert to a
         //      gate-validated SAT, never mis-answer.
         if string_witness::str_witness_w1() {
             if let Some(s) = self.derive_string_from_sat_regex_memberships(model, var) {
@@ -4305,7 +4307,7 @@ impl Executor {
     ///
     /// GATE STATUS: candidate only. `complete_constrained_gaps` re-runs the
     /// strict oracles + the independent gate over the completed model and
-    /// retracts every candidate on any refutation.
+    /// retracts every candidate on any non-confirmation.
     fn derive_string_from_sat_regex_memberships(
         &self,
         model: &Model,
@@ -4365,13 +4367,13 @@ impl Executor {
         let prev_result = self.last_result.clone();
         self.last_result = Some(SolveResult::Sat);
         let strict_reject = self.verify_model_strict().is_some();
-        let gate_reject = matches!(
+        let gate_confirmed = matches!(
             self.confirm_sat_with_independent_gate(),
-            GateVerdict::ModelViolates { .. }
+            GateVerdict::ConfirmedSat
         );
         self.last_result = prev_result;
         *model = self.last_model.take().expect("installed above");
-        !(strict_reject || gate_reject)
+        !strict_reject && gate_confirmed
     }
 
     /// The canonical completion default for an UNCONSTRAINED variable of a
@@ -4669,7 +4671,8 @@ impl Executor {
     }
 
     /// Collect the free variables of the current (original) assertions for
-    /// the sorts completion can default (Bool/Int/Real).
+    /// the sorts completion can default in this early pass
+    /// (Bool/Int/Real/BitVec).
     ///
     /// Quantifier bodies are intentionally NOT traversed: bound variables in
     /// them are `TermData::Var` nodes indistinguishable from free variables
@@ -4687,7 +4690,10 @@ impl Executor {
             }
             match terms.get(tid) {
                 TermData::Var(_, _) => {
-                    if matches!(terms.sort(tid), Sort::Bool | Sort::Int | Sort::Real) {
+                    if matches!(
+                        terms.sort(tid),
+                        Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_)
+                    ) {
                         vars.push(tid);
                     }
                 }
@@ -4716,6 +4722,136 @@ impl Executor {
         for (&from, &to) in var_subst.substitutions() {
             self.recorded_var_substitutions.insert(from, to);
         }
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_candidate_completion_tests {
+    use super::{Executor, Model};
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use ay_model_check::GateVerdict;
+
+    /// A completion candidate is authoritative only when every gate confirms
+    /// it. An internal helper root makes the strict oracle abstain and the
+    /// independent gate return `CannotConfirm`; the filled value must therefore
+    /// be rejected and the pre-candidate model restored exactly.
+    #[test]
+    fn constrained_gap_completion_rejects_cannot_confirm() {
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("completion-gap-x", Sort::Int);
+        let internal_gap = exec.ctx.terms.mk_app(
+            Symbol::named("__ay_completion_gate_gap"),
+            vec![x],
+            Sort::Bool,
+        );
+        exec.ctx.assertions.push(internal_gap);
+        assert!(exec.contains_internal_symbol(internal_gap));
+
+        // Establish the exact decision split exercised by the regression: the
+        // strict oracle does not refute, while the independent gate abstains.
+        exec.last_model = Some(Model::empty());
+        exec.last_result = Some(crate::executor_types::SolveResult::Sat);
+        assert!(exec.verify_model_strict().is_none());
+        assert!(matches!(
+            exec.confirm_sat_with_independent_gate(),
+            GateVerdict::CannotConfirm { .. }
+        ));
+        let mut model = exec.last_model.take().expect("probe model remains");
+        exec.last_result = None;
+
+        let filled = exec.complete_constrained_gaps(&mut model, &[x]);
+
+        assert_eq!(filled, 0, "CannotConfirm must reject the completion");
+        assert!(
+            !model.completed_values.contains_key(&x),
+            "rejected candidate must restore the exact pre-completion model"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bv_missing_entry_completion_tests {
+    use super::{EvalValue, Executor, Model, SolveResult};
+    use ay_bv::BvModel;
+    use ay_core::kani_compat::DetHashMap as HashMap;
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use num_bigint::BigInt;
+    use num_traits::Zero;
+
+    #[test]
+    fn missing_bv_entries_are_defaulted_only_after_substitution_recovery() {
+        let mut executor = Executor::new();
+        let bv8 = Sort::bitvec(8);
+        let recovered = executor.ctx.terms.mk_var("recovered", bv8.clone());
+        let source = executor.ctx.terms.mk_var("source", bv8.clone());
+        let free = executor.ctx.terms.mk_var("free", bv8);
+
+        // Keep both variables visible to the original-assertion completion
+        // walk. `recovered = source` mirrors a preprocessing substitution;
+        // `free = free` is deliberately built without simplification and
+        // leaves `free` genuinely unconstrained.
+        let definition =
+            executor
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), vec![recovered, source], Sort::Bool);
+        let free_tautology =
+            executor
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), vec![free, free], Sort::Bool);
+        executor.ctx.assertions = vec![definition, free_tautology];
+        executor
+            .recorded_var_substitutions
+            .insert(recovered, source);
+
+        let source_value = BigInt::from(0x5au8);
+        let mut values = HashMap::default();
+        values.insert(source, source_value.clone());
+        let mut model = Model::empty();
+        model.bv_model = Some(BvModel {
+            values,
+            term_to_bits: HashMap::default(),
+            bool_overrides: HashMap::default(),
+        });
+        executor.last_result = Some(SolveResult::Sat);
+        executor.last_model = Some(model);
+
+        executor.complete_model_for_validation(&[]);
+
+        let model = executor.last_model.as_ref().expect("completed model");
+        let values = &model.bv_model.as_ref().expect("BV model").values;
+        assert_eq!(
+            values.get(&recovered),
+            Some(&source_value),
+            "a missing substitution key must inherit its defining RHS"
+        );
+        assert_eq!(
+            values.get(&free),
+            Some(&BigInt::zero()),
+            "a genuinely free BV variable may receive an explicit canonical default"
+        );
+        assert_eq!(
+            executor.evaluate_term(model, recovered),
+            EvalValue::BitVec {
+                value: source_value,
+                width: 8,
+            }
+        );
+        assert_eq!(
+            executor
+                .last_statistics
+                .get_int("model_completion.recovered"),
+            Some(1)
+        );
+        assert_eq!(
+            executor
+                .last_statistics
+                .get_int("model_completion.defaulted"),
+            Some(1)
+        );
     }
 }
 

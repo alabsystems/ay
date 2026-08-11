@@ -94,7 +94,8 @@ impl Executor {
     /// Returns true when the child is a BV-sorted variable and the BV model
     /// exists but does NOT contain an entry for it. This indicates the variable
     /// was eliminated by preprocessing and not recovered during model extraction.
-    /// Its evaluate_term result will be a default 0, which is unreliable.
+    /// Its `evaluate_term` result is deliberately `Unknown`; callers may use an
+    /// application-level BV cache entry, but must not invent a child value.
     ///
     /// Also returns true if the child is a BV application term whose recursive
     /// sub-terms include a missing variable (transitive check via bv_model cache:

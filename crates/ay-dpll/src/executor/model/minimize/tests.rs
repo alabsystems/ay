@@ -402,3 +402,114 @@ fn minimize_bails_on_expired_deadline_and_keeps_model() {
         "control run must shrink the inflated value, got {after_run}"
     );
 }
+
+/// A tolerant per-candidate evaluation may skip an internal helper assertion,
+/// but that does not authorize replacing the solver-produced model. The
+/// independent gate's `CannotConfirm` verdict must restore the snapshot.
+#[test]
+fn minimization_restores_snapshot_when_gate_cannot_confirm() {
+    let commands = ay_frontend::parse(
+        "(set-option :produce-models true)(declare-const x Int)(assert (> x 90))(check-sat)",
+    )
+    .expect("valid SMT-LIB");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute succeeds");
+    assert_eq!(outputs[0], "sat");
+
+    let x = exec
+        .ctx
+        .symbol_info("x")
+        .and_then(|info| info.term)
+        .expect("declared x term");
+    let inflated = BigInt::from(1_000_000);
+    exec.last_model
+        .as_mut()
+        .and_then(|model| model.lia_model.as_mut())
+        .expect("lia model present")
+        .values
+        .insert(x, inflated.clone());
+
+    let internal_gap =
+        exec.ctx
+            .terms
+            .mk_app(Symbol::named("__ay_minimize_gate_gap"), vec![x], Sort::Bool);
+    exec.ctx.assertions.push(internal_gap);
+    assert!(exec.contains_internal_symbol(internal_gap));
+    assert!(matches!(
+        exec.confirm_sat_with_independent_gate(),
+        ay_model_check::GateVerdict::CannotConfirm { .. }
+    ));
+
+    exec.minimize_model_sat_preserving();
+
+    let after = exec
+        .last_model
+        .as_ref()
+        .and_then(|model| model.lia_model.as_ref())
+        .and_then(|lia| lia.values.get(&x))
+        .expect("x remains in the restored model");
+    assert_eq!(
+        after, &inflated,
+        "CannotConfirm must restore the exact pre-minimization scalar value"
+    );
+}
+
+/// A stop observed after one candidate was kept must roll the whole cosmetic
+/// pass back. The poll counter makes the post-mutation stop deterministic.
+#[test]
+fn minimization_stop_after_kept_candidate_restores_snapshot() {
+    let commands = ay_frontend::parse(
+        "(set-option :produce-models true)\
+         (declare-const x Int)(assert (> x 90))(check-sat)",
+    )
+    .expect("valid SMT-LIB");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute succeeds");
+    assert_eq!(outputs[0], "sat");
+
+    let x = exec
+        .ctx
+        .symbol_info("x")
+        .and_then(|info| info.term)
+        .expect("declared x term");
+    let inflated = BigInt::from(1_000_000);
+    let lia = exec
+        .last_model
+        .as_mut()
+        .and_then(|model| model.lia_model.as_mut())
+        .expect("lia model present");
+    lia.values.retain(|term, _| *term == x);
+    lia.values.insert(x, inflated.clone());
+
+    let mut polls = 0usize;
+    exec.minimize_model_sat_preserving_with_stop(|_| {
+        polls += 1;
+        // One successful pass (start + attempt), then one converged pass
+        // (start + attempt), then the post-loop safety poll.
+        polls >= 5
+    });
+    assert_eq!(polls, 5, "stop must occur in the post-mutation poll");
+    let restored = exec
+        .last_model
+        .as_ref()
+        .and_then(|model| model.lia_model.as_ref())
+        .expect("restored lia model");
+    assert_eq!(restored.values.get(&x), Some(&inflated));
+
+    // Control: without the injected stop, the same model is genuinely
+    // shrinkable. This proves the stopped run reached a kept candidate rather
+    // than passing vacuously because neither attempt could change.
+    exec.minimize_model_sat_preserving_with_stop(|_| false);
+    let minimized = exec
+        .last_model
+        .as_ref()
+        .and_then(|model| model.lia_model.as_ref())
+        .expect("minimized lia model");
+    assert!(
+        minimized
+            .values
+            .get(&x)
+            .is_some_and(|value| value < &inflated),
+        "control run must shrink the variable"
+    );
+}

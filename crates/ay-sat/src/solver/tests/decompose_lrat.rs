@@ -25,6 +25,25 @@ use crate::preprocess_transaction::{
 use crate::solver::inprocessing::FMLA_MAIN_LRAT_PREFLIGHT_MAX_PROOF_ROWS;
 use crate::ProofOutput;
 
+fn stop_after_startup_route() -> impl Fn() -> bool {
+    let polls = std::cell::Cell::new(0usize);
+    move || {
+        let next = polls.get() + 1;
+        polls.set(next);
+        // The first two polls bracket `init_solve`; the third follows the
+        // startup LRAT route and stops before optional lucky/search work.
+        next >= 3
+    }
+}
+
+fn run_startup_route_then_stop(solver: &mut Solver) {
+    let result = solver.solve_no_assumptions(stop_after_startup_route());
+    assert!(
+        matches!(result, SatResult::Unknown),
+        "fixture should stop immediately after the startup LRAT route"
+    );
+}
+
 fn active_clause_lits(solver: &Solver) -> Vec<Vec<Literal>> {
     solver
         .arena
@@ -1036,7 +1055,7 @@ fn test_fmla_decompose_lrat_preflight_route_runs_at_solve_startup() {
     solver.set_sat_comp_main_conflict_pruning(true);
     solver.set_fmla_decompose_lrat_preflight_route_enabled(true);
 
-    let _ = solver.solve_no_assumptions(|| true);
+    run_startup_route_then_stop(&mut solver);
 
     assert!(
         solver.cold.fmla_decompose_lrat_preflight_route_consumed,
@@ -1069,7 +1088,7 @@ fn test_fmla_startup_route_materializes_support_cover_rows_before_preprocessing(
     let proof_added_before = solver.proof_manager.as_ref().unwrap().added_count();
     let proof_deleted_before = solver.proof_manager.as_ref().unwrap().deleted_count();
 
-    let _ = solver.solve_no_assumptions(|| true);
+    run_startup_route_then_stop(&mut solver);
 
     assert!(
         solver.cold.fmla_decompose_lrat_preflight_route_consumed,
@@ -1301,7 +1320,7 @@ fn test_fmla_startup_route_rejects_hidden_support_cover_source_ids() {
     let proof_added_before = solver.proof_manager.as_ref().unwrap().added_count();
     let proof_deleted_before = solver.proof_manager.as_ref().unwrap().deleted_count();
 
-    let _ = solver.solve_no_assumptions(|| true);
+    run_startup_route_then_stop(&mut solver);
 
     assert!(solver.cold.fmla_decompose_lrat_preflight_route_consumed);
     assert!(
@@ -1368,7 +1387,7 @@ fn test_fmla_startup_route_rejects_hidden_guarded_ternary_source_ids() {
     let proof_added_before = solver.proof_manager.as_ref().unwrap().added_count();
     let proof_deleted_before = solver.proof_manager.as_ref().unwrap().deleted_count();
 
-    let _ = solver.solve_no_assumptions(|| true);
+    run_startup_route_then_stop(&mut solver);
 
     assert!(solver.cold.fmla_decompose_lrat_preflight_route_consumed);
     assert!(

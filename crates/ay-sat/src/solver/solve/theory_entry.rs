@@ -38,6 +38,10 @@ impl Solver {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
 
+        if let Some(result) = self.finish_stopped_sat_entry(&|| false) {
+            return result;
+        }
+
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);

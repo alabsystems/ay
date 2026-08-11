@@ -10,7 +10,6 @@
 
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId};
-use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::Zero;
 
@@ -44,7 +43,7 @@ impl Executor {
     /// - Bool: SAT model → BV bool_overrides → Unknown
     /// - Int: LIA → LRA → EUF term_values/int_values → default 0
     /// - Real: LRA → EUF term_values → default 0
-    /// - BitVec: BV model → default 0 (or Unknown if no BV model)
+    /// - BitVec: BV model → Unknown
     /// - FP: FP model → Unknown
     /// - String: String model → Unknown
     /// - Seq: Seq model → Unknown
@@ -153,18 +152,14 @@ impl Executor {
                         width: bv.width,
                     };
                 }
-                // BV model exists but variable is missing: default to 0
-                // (model completion for unassigned variables).
-                return EvalValue::BitVec {
-                    value: BigInt::zero(),
-                    width: bv.width,
-                };
             }
-            // No BV model (solved via AUFLIA as uninterpreted): return
-            // Unknown. The AUFLIA solver treats BV terms as uninterpreted
-            // and does not produce BV-semantic values, so defaulting to 0
-            // would give wrong evaluation results for BV operations like
-            // extract, concat, etc. (#5356)
+            // A missing entry is not evidence that the variable is free: it
+            // may have been eliminated by preprocessing and be defined by a
+            // recorded substitution. Keep it Unknown so model completion can
+            // either replay that definition or explicitly install the
+            // canonical value for a genuinely free variable. This also covers
+            // the no-BV-model AUFLIA route, whose uninterpreted treatment does
+            // not provide BV-semantic values (#5356).
             EvalValue::Unknown
         } else if matches!(sort, Sort::FloatingPoint(..)) {
             // FloatingPoint variable: check FP model

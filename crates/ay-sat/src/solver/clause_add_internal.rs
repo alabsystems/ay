@@ -12,6 +12,36 @@
 use super::*;
 
 impl Solver {
+    /// Allocate an ID for an original/axiomatic clause without colliding with
+    /// derived clauses.
+    ///
+    /// An LRAT writer may reserve `1..=N` for input clauses up front. Those
+    /// canonical IDs must be honored even when inprocessing emits a derived
+    /// step before the last input arrives. Once that reservation is exhausted
+    /// (or when clause tracing has no writer/reservation), originals and
+    /// derived clauses share `next_clause_id` so a late theory axiom cannot
+    /// reuse a live derived ID.
+    pub(super) fn allocate_original_clause_id(&mut self) -> u64 {
+        let candidate = self.cold.next_original_clause_id;
+        let reserved_end = self
+            .proof_manager
+            .as_ref()
+            .map_or(0, ProofManager::reserved_original_clause_ids);
+
+        if candidate <= reserved_end {
+            self.cold.next_original_clause_id += 1;
+            if self.cold.next_clause_id <= candidate {
+                self.cold.next_clause_id = candidate + 1;
+            }
+            candidate
+        } else {
+            let id = self.cold.next_clause_id.max(candidate);
+            self.cold.next_clause_id = id + 1;
+            self.cold.next_original_clause_id = id + 1;
+            id
+        }
+    }
+
     #[inline]
     pub(super) fn add_clause_db(&mut self, literals: &[Literal], learned: bool) -> usize {
         self.add_clause_db_checked(literals, learned, learned, &[])
@@ -204,15 +234,7 @@ impl Solver {
         // Derived clauses use next_clause_id which tracks the proof writer's
         // monotonic ID space (including deletions).
         let clause_id = if !forward_check_derived {
-            // Original clause: use its pre-registered LRAT position.
-            let id = self.cold.next_original_clause_id;
-            self.cold.next_original_clause_id += 1;
-            // Keep next_clause_id at least past original IDs so derived
-            // clauses don't collide with original IDs.
-            if self.cold.next_clause_id <= id {
-                self.cold.next_clause_id = id + 1;
-            }
-            id
+            self.allocate_original_clause_id()
         } else {
             let id = self.cold.next_clause_id;
             self.cold.next_clause_id += 1;

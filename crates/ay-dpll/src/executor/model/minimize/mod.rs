@@ -66,6 +66,19 @@ impl Executor {
     /// Call this after `self.last_model` is populated and before
     /// `finalize_sat_model_validation`.
     pub(in crate::executor) fn minimize_model_sat_preserving(&mut self) {
+        self.minimize_model_sat_preserving_with_stop(|executor| executor.solve_deadline.expired());
+    }
+
+    /// Implementation of [`Self::minimize_model_sat_preserving`] with an
+    /// explicit cooperative-stop predicate.
+    ///
+    /// Keeping the poll as a parameter makes the post-mutation stop path
+    /// deterministic under test. Production always supplies the live solve
+    /// deadline above.
+    fn minimize_model_sat_preserving_with_stop(
+        &mut self,
+        mut should_stop: impl FnMut(&Self) -> bool,
+    ) {
         // Gate-consistency snapshot (#minimize-gate-consistent, 2026-07-11):
         // the per-candidate accept check evaluates through the TOLERANT
         // model evaluator, which resolves a UF application's self-row via
@@ -76,22 +89,24 @@ impl Executor {
         // downgrading a genuine sat to unknown (multiarg_6146; the pre-gate
         // "pass" shipped that invalid witness as sat). Snapshot the
         // extracted model and, if minimization changed anything, re-check
-        // through the SAME gate that will judge the final model; on
-        // ModelViolates restore the snapshot — reverting to the model the
-        // solver itself produced can never be worse.
+        // through the SAME gate that will judge the final model. Only a
+        // ConfirmedSat verdict authorizes the cosmetic replacement; every
+        // non-confirming verdict restores the solver-produced snapshot.
         //
         // Deadline discipline (model-checker-consumer #39/#42): minimization is best-effort
         // COSMETICS for witness quality — the stored model is already valid.
         // Each candidate re-solve re-evaluates every assertion (and, with
         // datatypes present, walks term DAGs), which historically burned tens
-        // of seconds past the solve deadline. Bailing at ANY point is sound:
-        // we simply keep the current (unminimized-but-valid) model and the
-        // sat verdict is untouched.
+        // of seconds past the solve deadline. A stop before any mutation returns
+        // immediately. A stop after a kept candidate restores the original
+        // model before returning, so the deadline cannot bypass the final gate.
         let mut pre_minimization: Option<Model> = None;
         let mut scalar_changed = false;
-        for _pass in 0..MAX_MINIMIZATION_PASSES {
-            if self.solve_deadline.expired() {
-                return;
+        let mut stopped = false;
+        'passes: for _pass in 0..MAX_MINIMIZATION_PASSES {
+            if should_stop(self) {
+                stopped = true;
+                break;
             }
             // Phase 1: Collect all variables and their candidate lists.
             let mut attempts = match self.last_model.as_ref() {
@@ -115,8 +130,9 @@ impl Executor {
             for attempt in attempts {
                 // Live poll between variables — a single variable's candidate
                 // sweep is bounded by the same check inside try_*_candidates.
-                if self.solve_deadline.expired() {
-                    return;
+                if should_stop(self) {
+                    stopped = true;
+                    break 'passes;
                 }
                 let changed = match attempt {
                     MinAttempt::Lia(term_id, candidates) => {
@@ -130,21 +146,34 @@ impl Executor {
                     }
                 };
                 any_changed |= changed;
+                scalar_changed |= changed;
             }
 
             // If nothing changed this pass, no point in another pass.
-            scalar_changed |= any_changed;
             if !any_changed {
                 break;
             }
         }
+        // A candidate check can itself consume the remaining budget. Poll once
+        // more after the last mutation so even the final attempt of the final
+        // pass cannot retain an un-gated cosmetic replacement past the stop.
+        if scalar_changed && !stopped && should_stop(self) {
+            stopped = true;
+        }
         if scalar_changed {
-            if let ay_model_check::GateVerdict::ModelViolates { .. } =
-                self.confirm_sat_with_independent_gate()
-            {
+            let confirmed = !stopped
+                && matches!(
+                    self.confirm_sat_with_independent_gate(),
+                    ay_model_check::GateVerdict::ConfirmedSat
+                );
+            if !confirmed {
                 self.last_model = pre_minimization;
                 super::eval_memo_clear();
             }
+        }
+
+        if stopped {
+            return;
         }
 
         // Phase 3: Exact structural array minimization (#4522).

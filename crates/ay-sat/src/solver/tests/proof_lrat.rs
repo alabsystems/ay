@@ -2384,6 +2384,45 @@ fn test_register_clause_id_advances_writer_counter() {
     );
 }
 
+/// A dynamically added theory axiom is original for proof checking, but it is
+/// not part of a construction-time LRAT original-ID reservation. It must draw
+/// from the same monotonic namespace as derived clauses rather than reusing the
+/// derived clause's live ID in `ClauseTrace`.
+#[test]
+fn clause_trace_late_theory_axiom_does_not_reuse_derived_id() {
+    let mut solver = Solver::new(3);
+    solver.enable_clause_trace();
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+
+    solver.add_clause(vec![a, b, c]);
+    solver.add_clause(vec![c.negated()]);
+    let learned = solver.add_learned_clause(vec![a, b], 1, &[1, 2]);
+    let learned_id = solver.clause_id(learned);
+
+    let theory = solver
+        .add_theory_lemma(vec![a.negated(), b.negated()])
+        .expect("non-unit theory axiom");
+    let theory_id = solver.clause_id(theory);
+    assert!(
+        theory_id > learned_id,
+        "late theory axiom ID {theory_id} must be fresh after derived ID {learned_id}"
+    );
+
+    let trace = solver.take_clause_trace().expect("clause trace enabled");
+    let mut ids: Vec<u64> = trace.entries().iter().map(|entry| entry.id).collect();
+    let entry_count = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        entry_count,
+        "every original and derived trace entry must have a unique ID"
+    );
+}
+
 #[test]
 fn test_add_clause_reusing_buffer() {
     use crate::proof::ProofOutput;

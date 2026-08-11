@@ -300,3 +300,155 @@ fn flat_surface_and_pos_over_64_is_linear_and_repeated_budget_is_typed() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Non-vacuity of the ROW1 / eq_congruent SURFACE validators.
+//
+// A certified step is printed through a table that may re-spell any `TermId`.
+// These pin that the validators reject a printed step whose operand spelling
+// denotes something OTHER than the term the strict checker certified, so no
+// later change can quietly turn the guard into a rubber stamp. They are
+// independent of how a producer arranges for such a divergence not to arise.
+// ---------------------------------------------------------------------------
+
+fn bv8(terms: &mut TermStore, value: u32) -> TermId {
+    terms.mk_bitvec(num_bigint::BigInt::from(value), 8)
+}
+
+/// The certified unit ROW1 lemma `(= (select (store mem p V) p) V)`, returning
+/// its `store` subterm (the override handle these tests re-spell) too.
+fn row1_fixture(terms: &mut TermStore, value: u32) -> (TermId, ProofStep) {
+    let index_sort = Sort::bitvec(8);
+    let element_sort = Sort::bitvec(8);
+    let array_sort = Sort::array(index_sort.clone(), element_sort.clone());
+    let mem = terms.mk_var("row1_mem", array_sort.clone());
+    let p = terms.mk_var("row1_p", index_sort);
+    let stored = bv8(terms, value);
+    // RAW applications: `mk_store`/`mk_select` apply the ROW1 identity
+    // themselves, which is precisely the step being certified here.
+    let store = terms.mk_app(Symbol::named("store"), vec![mem, p, stored], array_sort);
+    let select = terms.mk_app(Symbol::named("select"), vec![store, p], element_sort);
+    let row = terms.mk_app(Symbol::named("="), vec![select, stored], Sort::Bool);
+    let step = ProofStep::TheoryLemma {
+        theory: "array".to_string(),
+        clause: vec![row],
+        farkas: None,
+        kind: ay_core::TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        lia: None,
+    };
+    (store, step)
+}
+
+#[test]
+fn row1_without_surface_spellings_prints_the_certified_terms() {
+    let mut terms = TermStore::new();
+    let (_, step) = row1_fixture(&mut terms, 0x10);
+    let printer = AlethePrinter::new(&terms);
+
+    assert_eq!(
+        printer
+            .format_step(&step, ProofId(1))
+            .expect("the identity rendering of a certified ROW1 is checkable"),
+        "(step t1 (cl (= (select (store row1_mem row1_p #b00010000) row1_p) #b00010000)) \
+         :rule arrays_idx)"
+    );
+}
+
+#[test]
+fn row1_rejects_a_store_value_surface_denoting_a_different_constant() {
+    let mut terms = TermStore::new();
+    let (store, step) = row1_fixture(&mut terms, 0x10);
+    let mut overrides = DetHashMap::default();
+    // Same shape, same array, same index — a DIFFERENT written value.
+    overrides.insert(store, "(store row1_mem row1_p #b11111111)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let error = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a store value that is not the certified one must be refused");
+    assert!(
+        matches!(error, AlethePrintError::InvalidArrayStep { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn row1_rejects_a_store_index_surface_denoting_a_different_term() {
+    let mut terms = TermStore::new();
+    let (store, step) = row1_fixture(&mut terms, 0x10);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(store, "(store row1_mem row1_other #b00010000)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let error = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a write address that is not the certified one must be refused");
+    assert!(
+        matches!(error, AlethePrintError::InvalidArrayStep { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn row1_rejects_a_base_array_surface_denoting_a_different_array() {
+    let mut terms = TermStore::new();
+    let (store, step) = row1_fixture(&mut terms, 0x10);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(
+        store,
+        "(store row1_other_mem row1_p #b00010000)".to_string(),
+    );
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let error = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a base array that is not the certified one must be refused");
+    assert!(
+        matches!(error, AlethePrintError::InvalidArrayStep { .. }),
+        "{error}"
+    );
+}
+
+/// `(cl (not (= a b)) (= (f a) (f b)))` re-spelled so the congruent
+/// application is printed at a THIRD term no hypothesis mentions.
+#[test]
+fn eq_congruent_rejects_a_surface_argument_denoting_a_different_term() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("cong_a", Sort::bitvec(8));
+    let b = terms.mk_var("cong_b", Sort::bitvec(8));
+    let fa = terms.mk_app(Symbol::named("cong_f"), vec![a], Sort::bitvec(8));
+    let fb = terms.mk_app(Symbol::named("cong_f"), vec![b], Sort::bitvec(8));
+    let equality = terms.mk_app(Symbol::named("="), vec![a, b], Sort::Bool);
+    let negated = terms.mk_not_raw(equality);
+    let conclusion = terms.mk_app(Symbol::named("="), vec![fa, fb], Sort::Bool);
+    let step = ProofStep::Step {
+        rule: AletheRule::EqCongruent,
+        clause: vec![negated, conclusion],
+        premises: Vec::new(),
+        args: Vec::new(),
+    };
+
+    let plain = AlethePrinter::new(&terms);
+    assert_eq!(
+        plain
+            .format_step(&step, ProofId(2))
+            .expect("the identity rendering of a certified congruence is checkable"),
+        "(step t2 (cl (not (= cong_a cong_b)) (= (cong_f cong_a) (cong_f cong_b))) \
+         :rule eq_congruent)"
+    );
+
+    // The hypothesis still names `cong_a`, but the left application is now
+    // printed at a term the clause never equates. The AC bridge is the only
+    // repair the printer has, and it must not fire on an argument pair it
+    // cannot prove equal.
+    let mut overrides = DetHashMap::default();
+    overrides.insert(fa, "(cong_f cong_elsewhere)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+    let error = printer
+        .format_step(&step, ProofId(2))
+        .expect_err("a congruence argument that is not the certified one must be refused");
+    assert!(
+        matches!(error, AlethePrintError::InvalidCongruenceStep { .. }),
+        "{error}"
+    );
+}

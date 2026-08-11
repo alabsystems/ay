@@ -111,6 +111,14 @@ pub struct ChcProblem {
     /// - HORN: sat = satisfiable (safe), unsat = unsatisfiable (unsafe)
     /// - Fixedpoint: sat = query reachable (unsafe), unsat = query unreachable (safe)
     fixedpoint_format: bool,
+    /// Set when the parser stripped a `forall` from a NEGATIVE-polarity
+    /// position (a rule body). Hoisting the bound variable into the flat
+    /// clause scope turns `forall i. (B(i) -> H)` into `(exists i. B(i)) -> H`,
+    /// i.e. it WEAKENS the antecedent. That is a sound over-approximation for
+    /// proofs -- an `unsat`/Safe answer stays valid a fortiori -- but it can
+    /// FABRICATE a counterexample, so a Sat/Unsafe answer must be downgraded to
+    /// Unknown. See `parser/expr.rs::parse_quantifier_expr`.
+    stripped_body_forall: bool,
     /// Datatype definitions from declare-datatype commands (#7016).
     /// Maps datatype name → Vec<(constructor_name, Vec<(selector_name, selector_sort)>)>.
     /// Preserves structural metadata that the function signature map discards.

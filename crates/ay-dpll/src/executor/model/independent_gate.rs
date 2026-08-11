@@ -1941,6 +1941,30 @@ impl IndependentModelView<'_> {
                 return Some(v);
             }
         }
+        // #dt-element-canon, at the array-cell boundary. A DATATYPE-sorted array
+        // cell reaches the gate as the printer's SMT-LIB text — a constructor
+        // APPLICATION such as `(PbTerm_PbTerm #x00..00)`. The scalar layer below
+        // hands any such text back as an opaque `Element`, which
+        // `model_value_for` can only normalize when it names a NULLARY
+        // constructor; a constructor with fields therefore arrives as
+        // `ModelValue::Uninterpreted("(PbTerm_PbTerm #x00..00)")` while the SAME
+        // value reaching the gate as a datatype LEAF is the structured
+        // `Datatype { ctor, args }`. `value_eq` then reports "equality between
+        // incomparable model values (Datatype vs Uninterpreted)" and a ground
+        // seed `(= seed (select arr #x0..0))` — the shape deductive-checks emits for
+        // every array-argument function — cannot be confirmed even when the
+        // model is right.
+        //
+        // Fixed where the two encodings are produced, never in `value_eq`: parse
+        // the text with the SAME reader the datatype leaf/application paths use,
+        // so one value has one encoding. FAIL-SOFT: text this reader declines
+        // falls through to exactly today's opaque behaviour, and the gate still
+        // re-checks every assertion against whatever it parsed.
+        if self.exec.datatype_sort_name(sort).is_some() {
+            if let Some(v) = self.exec.parse_rendered_dt_value(s, sort) {
+                return Some(v);
+            }
+        }
         let ev = self.exec.parse_model_value_string(s, &Some(sort.clone()));
         // Array interpretations store values as strings.  A nullary datatype
         // constructor therefore parses through the scalar layer as an

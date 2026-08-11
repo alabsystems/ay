@@ -1142,11 +1142,96 @@ fn push_bv2nat_range(terms: &mut TermStore, out: &mut Vec<TermId>, bv: TermId, n
     let Some(width) = bv_width(terms, bv) else {
         return;
     };
+    push_bv2nat_width_bounds(terms, out, width, nat);
+    push_bv2nat_congruence(terms, out, bv, nat, width);
+    push_bv2nat_extract_link(terms, out, bv, nat);
+}
+
+/// `0 <= nat <= 2^width - 1` — the unsigned range of a width-`width` vector.
+fn push_bv2nat_width_bounds(terms: &mut TermStore, out: &mut Vec<TermId>, width: u32, nat: TermId) {
     let zero = terms.mk_int(BigInt::zero());
     let max = terms.mk_int((BigInt::one() << width) - BigInt::one());
     out.push(terms.mk_ge(nat, zero));
     out.push(terms.mk_le(nat, max));
-    push_bv2nat_congruence(terms, out, bv, nat, width);
+}
+
+/// Link `bv2nat((_ extract h l) t)` to `bv2nat(t)` (#bv2nat-extract-link).
+///
+/// The range fact alone leaves an extracted slice's unsigned value FLOATING
+/// with respect to its source: `bv2nat(x)` and `bv2nat((_ extract 31 31) x)`
+/// were two independent Int variables constrained only by `[0, 2^32)` and
+/// `[0, 2)`, so the arithmetic solver could pick `bv2nat(x) = 10` together with
+/// `msb = 1` while the BV solver picked `x = 0x0000000a`. That combination
+/// satisfies neither theory's view of the other, and the composite model
+/// falsifies the very assertion that produced it — the case AY's independent
+/// model gate catches as an INVALID model.
+///
+/// The fix is definitional. Splitting `t` at the slice boundaries,
+///
+/// ```text
+///   bv2nat(t) = 2^(h+1) * bv2nat(t[W-1:h+1])   (omitted when h+1 = W)
+///             + 2^l     * bv2nat(t[h:l])
+///             +           bv2nat(t[l-1:0])     (omitted when l = 0)
+/// ```
+///
+/// is the unique base-2 place-value decomposition of the unsigned value of `t`,
+/// so it is entailed by `t`'s value under every assignment.
+///
+/// SOUNDNESS: an EXACT identity of `bv2nat`, not an approximation — it removes
+/// no model (every true assignment satisfies it, with the high/low pieces taking
+/// their actual slice values), so it can only turn a spurious SAT into the
+/// correct verdict and can never manufacture an UNSAT. The two companion slices
+/// are ordinary `bv2nat` terms and carry their own width bounds; they are NOT
+/// re-linked recursively here, so the emitted set stays finite (a split only ever
+/// introduces slices whose endpoints already bound the original one).
+fn push_bv2nat_extract_link(terms: &mut TermStore, out: &mut Vec<TermId>, bv: TermId, nat: TermId) {
+    let TermData::App(Symbol::Indexed(name, indices), args) = terms.get(bv).clone() else {
+        return;
+    };
+    if name != "extract" || indices.len() != 2 || args.len() != 1 {
+        return;
+    }
+    let (high, low) = (indices[0], indices[1]);
+    if high < low {
+        return;
+    }
+    let source = args[0];
+    let Some(src_width) = bv_width(terms, source) else {
+        return;
+    };
+    // A malformed slice carries no decomposition; a full-width slice is `source`
+    // itself (already simplified away by `mk_bvextract`), so nothing to link.
+    if high >= src_width || (low == 0 && high + 1 == src_width) {
+        return;
+    }
+    let nat_src = terms.mk_bv2nat(source);
+    push_bv2nat_width_bounds(terms, out, src_width, nat_src);
+
+    let mut parts: Vec<TermId> = Vec::new();
+    if high + 1 < src_width {
+        let hi_slice = terms.mk_bvextract(src_width - 1, high + 1, source);
+        let nat_hi = terms.mk_bv2nat(hi_slice);
+        push_bv2nat_width_bounds(terms, out, src_width - high - 1, nat_hi);
+        let scale = terms.mk_int(BigInt::one() << (high + 1));
+        parts.push(terms.mk_mul(vec![scale, nat_hi]));
+    }
+    if low > 0 {
+        let scale = terms.mk_int(BigInt::one() << low);
+        parts.push(terms.mk_mul(vec![scale, nat]));
+        let lo_slice = terms.mk_bvextract(low - 1, 0, source);
+        let nat_lo = terms.mk_bv2nat(lo_slice);
+        push_bv2nat_width_bounds(terms, out, low, nat_lo);
+        parts.push(nat_lo);
+    } else {
+        parts.push(nat);
+    }
+    let sum = if parts.len() == 1 {
+        parts[0]
+    } else {
+        terms.mk_add(parts)
+    };
+    let link = terms.mk_eq(nat_src, sum);
+    out.push(link);
 }
 
 /// Assert the EXACT modular congruence relating `bv2nat(int2bv(s, w))` to its

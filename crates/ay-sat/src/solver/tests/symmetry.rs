@@ -61,6 +61,38 @@ fn test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair() {
 }
 
 #[test]
+fn interruptible_symmetry_discards_mid_scan_output_before_installation() {
+    let x0 = Variable(0);
+    let x1 = Variable(1);
+    let mut solver = Solver::new(67);
+    solver.cold.symmetry_enabled = true;
+
+    for index in 0..65 {
+        let z = Variable(index + 2);
+        assert!(solver.add_clause(vec![Literal::positive(x0), Literal::positive(z)]));
+        assert!(solver.add_clause(vec![Literal::positive(x1), Literal::positive(z)]));
+    }
+
+    let clauses_before = solver.arena.active_clause_count();
+    let user_vars_before = solver.user_num_vars;
+    let polls = std::cell::Cell::new(0usize);
+    let (unsat, changed) = solver.preprocess_symmetry_interruptible(&|| {
+        let next = polls.get() + 1;
+        polls.set(next);
+        // Two solver phase boundaries, three detector boundaries, then the
+        // candidate scan polls at clause indices 0 and 64.
+        next >= 7
+    });
+
+    assert!(!unsat);
+    assert!(!changed);
+    assert_eq!(polls.get(), 7);
+    assert_eq!(solver.arena.active_clause_count(), clauses_before);
+    assert_eq!(solver.user_num_vars, user_vars_before);
+    assert_eq!(solver.cold.symmetry_stats.sb_clauses_added, 0);
+}
+
+#[test]
 fn signed_symmetry_runs_only_for_an_explicit_one_shot_solver() {
     let mut solver = Solver::new(3);
     solver.set_symmetry_oneshot(true);

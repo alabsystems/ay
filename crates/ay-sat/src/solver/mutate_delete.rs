@@ -11,7 +11,24 @@
 use super::mutate::{DeleteResult, ReasonPolicy};
 use super::*;
 
+#[derive(Clone, Copy)]
+enum DeleteStopPolicy {
+    Interruptible,
+    RequiredCleanup,
+}
+
 impl Solver {
+    #[inline]
+    fn materialize_delete_unit_proofs(&mut self, stop_policy: DeleteStopPolicy) -> bool {
+        match stop_policy {
+            DeleteStopPolicy::Interruptible => self.materialize_level0_unit_proofs_interruptible(),
+            DeleteStopPolicy::RequiredCleanup => {
+                self.materialize_level0_unit_proofs();
+                true
+            }
+        }
+    }
+
     #[inline]
     fn emit_lrat_delete_unit_derivation(
         &mut self,
@@ -116,6 +133,18 @@ impl Solver {
         &mut self,
         clause_idx: usize,
     ) -> bool {
+        self.lrat_clause_unit_rederivations_ready_for_delete_with_policy(
+            clause_idx,
+            DeleteStopPolicy::Interruptible,
+        )
+    }
+
+    #[inline]
+    fn lrat_clause_unit_rederivations_ready_for_delete_with_policy(
+        &mut self,
+        clause_idx: usize,
+        stop_policy: DeleteStopPolicy,
+    ) -> bool {
         if !self.cold.lrat_enabled {
             return true;
         }
@@ -123,7 +152,7 @@ impl Solver {
         if clause_id == 0 {
             return true;
         }
-        if !self.materialize_level0_unit_proofs_interruptible() {
+        if !self.materialize_delete_unit_proofs(stop_policy) {
             return false;
         }
         let clause_len = self.arena.len_of(clause_idx);
@@ -166,10 +195,23 @@ impl Solver {
         clause_idx: usize,
         clause_id: u64,
     ) -> bool {
+        self.lrat_rederive_units_referencing_clause_with_policy(
+            clause_idx,
+            clause_id,
+            DeleteStopPolicy::Interruptible,
+        )
+    }
+
+    fn lrat_rederive_units_referencing_clause_with_policy(
+        &mut self,
+        clause_idx: usize,
+        clause_id: u64,
+        stop_policy: DeleteStopPolicy,
+    ) -> bool {
         if !self.cold.lrat_enabled || clause_id == 0 {
             return true;
         }
-        if !self.materialize_level0_unit_proofs_interruptible() {
+        if !self.materialize_delete_unit_proofs(stop_policy) {
             return false;
         }
         let clause_len = self.arena.len_of(clause_idx);
@@ -201,10 +243,27 @@ impl Solver {
         clause_idx: usize,
         reason_policy: ReasonPolicy,
     ) -> bool {
+        self.delete_clause_observed_with_policy(
+            clause_idx,
+            reason_policy,
+            DeleteStopPolicy::Interruptible,
+        )
+    }
+
+    fn delete_clause_observed_with_policy(
+        &mut self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+        stop_policy: DeleteStopPolicy,
+    ) -> bool {
         let clause_id = self.clause_id(ClauseRef(clause_idx as u32));
         // Fix #6270: re-derive unit proofs that reference this clause's ID
         // before the delete is emitted (see helper doc).
-        if !self.lrat_rederive_units_referencing_clause(clause_idx, clause_id) {
+        if !self.lrat_rederive_units_referencing_clause_with_policy(
+            clause_idx,
+            clause_id,
+            stop_policy,
+        ) {
             return false;
         }
         self.drain_pending_garbage_mark(clause_idx);
@@ -296,6 +355,34 @@ impl Solver {
         clause_idx: usize,
         reason_policy: ReasonPolicy,
     ) -> DeleteResult {
+        self.delete_clause_checked_with_policy(
+            clause_idx,
+            reason_policy,
+            DeleteStopPolicy::Interruptible,
+        )
+    }
+
+    pub(super) fn delete_clause_checked_required_cleanup(
+        &mut self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+    ) -> DeleteResult {
+        // A stopped preprocessing transaction must still finish destructive
+        // cleanup. Select the stop policy before any proof/reason mutation;
+        // retrying the interruptible path after a partial mutation is unsafe.
+        self.delete_clause_checked_with_policy(
+            clause_idx,
+            reason_policy,
+            DeleteStopPolicy::RequiredCleanup,
+        )
+    }
+
+    fn delete_clause_checked_with_policy(
+        &mut self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+        stop_policy: DeleteStopPolicy,
+    ) -> DeleteResult {
         // CaDiCaL clause.cpp: deletion only during inprocessing at level 0.
         // Soundness-critical: deleting at higher levels corrupts solver state (#4560).
         assert_eq!(
@@ -307,7 +394,9 @@ impl Solver {
         if !self.can_delete_clause(clause_idx, reason_policy) {
             return DeleteResult::Skipped;
         }
-        if !self.lrat_clause_unit_rederivations_ready_for_delete(clause_idx) {
+        if !self
+            .lrat_clause_unit_rederivations_ready_for_delete_with_policy(clause_idx, stop_policy)
+        {
             return DeleteResult::Skipped;
         }
 
@@ -340,7 +429,7 @@ impl Solver {
 
                 if self.is_reason_clause_marked(clause_idx) {
                     if self.cold.lrat_enabled {
-                        if !self.materialize_level0_unit_proofs_interruptible() {
+                        if !self.materialize_delete_unit_proofs(stop_policy) {
                             return DeleteResult::Skipped;
                         }
                         let cid = self.clause_id(cref);
@@ -451,7 +540,7 @@ impl Solver {
             }
         }
 
-        if self.delete_clause_observed(clause_idx, reason_policy) {
+        if self.delete_clause_observed_with_policy(clause_idx, reason_policy, stop_policy) {
             DeleteResult::Deleted
         } else {
             DeleteResult::Skipped

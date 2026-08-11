@@ -239,7 +239,7 @@ impl ChcParser {
     }
 
     /// Parse quantifier expression (forall/exists)
-    fn parse_quantifier_expr(&mut self, _quantifier: &str) -> ChcResult<ChcExpr> {
+    fn parse_quantifier_expr(&mut self, quantifier: &str) -> ChcResult<ChcExpr> {
         self.skip_whitespace_and_comments();
         self.expect_char('(')?;
 
@@ -267,8 +267,37 @@ impl ChcParser {
         self.skip_whitespace_and_comments();
         self.expect_char(')')?;
 
-        // For CHC, we treat forall as implicit and return the body
-        // The variables are already registered
+        // Stripping the binder hoists its variable into the FLAT clause scope,
+        // where it becomes universally quantified over the whole clause. That
+        // is equivalence-preserving in only two of the four cases:
+        //
+        //   forall @ positive  -- the implicit-universal wrapper. Sound.
+        //   exists @ negative  -- `(exists x. B(x)) -> H` == `forall x. B(x) -> H`. Sound.
+        //   forall @ negative  -- `forall i. (B(i) -> H)` becomes `(exists i. B(i)) -> H`:
+        //                         the antecedent is WEAKENED. Sound for proofs
+        //                         (an unsat stays valid a fortiori) but it can
+        //                         FABRICATE a counterexample, so flag it and let
+        //                         the caller downgrade Sat/Unsafe to Unknown.
+        //   exists @ positive  -- `B -> exists x. H(x)` becomes `forall x. B -> H(x)`:
+        //                         STRICTLY STRONGER, so facts the input never
+        //                         entailed become derivable. That is a false-proof
+        //                         route, and no downgrade can repair it -> reject.
+        //
+        // Mixed polarity (0: `ite` conditions, Bool `=`/`distinct`/`xor`) is not
+        // safely strippable either way; `forall` there is treated as the
+        // over-approximating case, `exists` is rejected.
+        match (quantifier, self.polarity) {
+            ("forall", p) if p > 0 => {}
+            ("exists", p) if p < 0 => {}
+            ("forall", _) => self.problem.mark_stripped_body_forall(),
+            _ => {
+                return Err(ChcError::Parse(format!(
+                    "unsupported CHC input: `{quantifier}` in a non-negative                      (head/mixed) position would be STRENGTHENED to `forall` by                      implicit-universal stripping, which can derive facts the                      input does not entail; hoist it out or Skolemise it before                      HORN solving"
+                )));
+            }
+        }
+
+        // The variables are already registered.
         Ok(body)
     }
 

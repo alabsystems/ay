@@ -2233,3 +2233,1060 @@ fn uflia_congruence_value_conflict_without_argument_equality_is_sat() {
         solver.unknown_reason(),
     );
 }
+/// Regression (#trust-count→0): a ROW2 read-over-write whose index
+/// DISEQUALITY is not authored but derived from two authored constants must
+/// export a strictly verified, trust-free proof.
+///
+/// `i = #x05`, `j = #x06`, `(select a j) = #xAA` and
+/// `(select (store a i v) j) = #xBB` is UNSAT (z3 5.0.0 agrees: `unsat`), and
+/// AY computes that verdict. `replace_with_exact_authored_array_row2_refutation`
+/// declines because the problem authors no `(not (= i j))` premise, so the
+/// reconstruction fell through to the whole-problem `trust` closer and the
+/// mandatory publication gate degraded the verdict to `unknown`.
+#[test]
+fn qfabv_row2_derived_index_disequality_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfAbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const i (_ BitVec 8))
+            (declare-const j (_ BitVec 8))
+            (declare-const v (_ BitVec 8))
+            (assert (= i #x05))
+            (assert (= j #x06))
+            (assert (= (select a j) #xAA))
+            (assert (= (select (store a i v) j) #xBB))
+            "#,
+        )
+        .expect("ROW2 derived-disequality fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "a write at #x05 cannot change the cell at #x06 (z3 5.0.0 agrees), \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        "ROW2 derived-index-disequality",
+    );
+}
+
+/// Regression (#trust-count→0): a ROW1 read-over-write reached through an
+/// authored ARRAY equality must export a strictly verified, trust-free proof.
+///
+/// `mem2 = store(mem, p+0, #x10)` with `(select mem2 (bvadd p #x00)) = #x20` is
+/// UNSAT (z3 5.0.0 agrees: `unsat`). The read names `mem2`, not the store term,
+/// so the refutation needs a congruence lift onto the store before ROW1 applies.
+#[test]
+fn qfabv_row1_through_authored_array_equality_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfAbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const p (_ BitVec 8))
+            (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))
+            (assert (= mem2 (store mem (bvadd p #x00) #x10)))
+            (assert (= (select mem2 (bvadd p #x00)) #x20))
+            "#,
+        )
+        .expect("ROW1 array-equality fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "the cell just written with #x10 cannot read back #x20 (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        "ROW1 through an authored array equality",
+    );
+}
+
+/// Regression (#trust-count→0): a ROW1 read-over-write whose index EQUALITY is
+/// derived from two authored constants must export a strictly verified,
+/// trust-free proof.
+///
+/// `p0 = #x10`, `p1 = #x10`, `mem2 = store(mem, p0, #xAA)` and
+/// `(select mem2 p1) = #xBB` is UNSAT (z3 5.0.0 agrees: `unsat`). The problem
+/// authors no `(= p0 p1)` premise; it is reached by transitivity through the
+/// shared constant.
+#[test]
+fn qfabv_row1_derived_index_equality_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfAbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const p0 (_ BitVec 8))
+            (declare-const p1 (_ BitVec 8))
+            (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))
+            (assert (= p0 #x10))
+            (assert (= p1 #x10))
+            (assert (= mem2 (store mem p0 #xAA)))
+            (assert (= (select mem2 p1) #xBB))
+            "#,
+        )
+        .expect("ROW1 derived-index-equality fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "p0 and p1 are both #x10, so the write of #xAA is what p1 reads \
+         (z3 5.0.0 agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        "ROW1 derived-index-equality",
+    );
+}
+
+/// Regression (#trust-count→0): a congruence conflict closed by an AUTHORED
+/// disequality — rather than by a ground value mismatch — must export a
+/// strictly verified, trust-free proof.
+///
+/// `x = #x05`, `f(x) = #xAA` and `f(#x05) != #xAA` is UNSAT (z3 5.0.0 agrees:
+/// `unsat`). Neither existing arm of
+/// `replace_with_exact_authored_congruence_refutation` fires: ARM A needs the
+/// refuting disequality to be BETWEEN the two congruent applications, and ARM B
+/// needs BOTH of them pinned to values by authored equalities.
+#[test]
+fn qfufbv_congruence_against_authored_disequality_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfUfbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+            (declare-const x (_ BitVec 8))
+            (assert (= x #x05))
+            (assert (= (f x) #xAA))
+            (assert (not (= (f #x05) #xAA)))
+            "#,
+        )
+        .expect("congruence-against-authored-disequality fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "f(x) and f(#x05) are the same application when x is #x05 (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::EufCongruent,
+        "congruence against an authored disequality",
+    );
+}
+
+/// Regression (#trust-count→0): a read-over-write CHAIN spanning three SSA
+/// array equalities must export a strictly verified, trust-free proof.
+///
+/// `mem1 = store(mem0, #x00, #x01)`, `mem2 = store(mem1, #x01, #x02)`,
+/// `mem3 = store(mem2, #x02, #x03)` and `(select mem3 #x01) = #xFF` is UNSAT
+/// (z3 5.0.0 agrees: `unsat`). Closing it needs a WALK: ROW2 past the `#x02`
+/// write, then ROW1 at the `#x01` write, with a congruence lift onto each SSA
+/// array name in between — one ROW step is not enough.
+#[test]
+fn qfabv_row_chain_walk_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfAbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const mem0 (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const mem1 (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const mem3 (Array (_ BitVec 8) (_ BitVec 8)))
+            (assert (= mem1 (store mem0 #x00 #x01)))
+            (assert (= mem2 (store mem1 #x01 #x02)))
+            (assert (= mem3 (store mem2 #x02 #x03)))
+            (assert (= (select mem3 #x01) #xFF))
+            "#,
+        )
+        .expect("SSA store-chain fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "cell #x01 holds #x02 after the chain, not #xFF (z3 5.0.0 agrees), \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        "read-over-write chain walk",
+    );
+}
+
+/// Regression (#trust-count→0): a value conflict between two NESTED congruent
+/// applications must export a strictly verified, trust-free proof.
+///
+/// `x = y`, `f(select(a, x)) = #xAA` and `f(select(a, y)) = #xBB` is UNSAT
+/// (z3 5.0.0 agrees: `unsat`). No argument position of the two `f`
+/// applications carries an authored equality — `(select a x)` and
+/// `(select a y)` are themselves only congruent — so the refutation needs one
+/// `eq_congruent` per level.
+#[test]
+fn qfaufbv_nested_congruence_value_conflict_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfAufbv);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+            (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+            (declare-const x (_ BitVec 8))
+            (declare-const y (_ BitVec 8))
+            (assert (= x y))
+            (assert (= (f (select a x)) #xAA))
+            (assert (= (f (select a y)) #xBB))
+            "#,
+        )
+        .expect("nested-congruence fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "f of the same cell cannot be both #xAA and #xBB (z3 5.0.0 agrees), \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_refutation_is_plainly_checked(
+        &solver,
+        TheoryLemmaKind::EufCongruent,
+        "nested congruence value conflict",
+    );
+}
+
+/// Assert the shared post-conditions of a refutation whose equality chain
+/// needed a ground INSTANCE of an authored `forall`
+/// (`replace_with_exact_authored_forall_inst_equality_refutation`).
+///
+/// The PLAIN-checker call is the load-bearing one. `artifact.strict_verdict`
+/// is NOT enough on its own: `strict_verdict_with_deferred_trust`
+/// (`api/proofs.rs`) also reports `Verified` when the deferred-trust RESCUE
+/// re-discharges an unverified leaf, so it cannot distinguish "the step was
+/// checked" from "the step was tolerated". `check_proof_strict_with_datatypes`
+/// is the same call `mint_unsat_certificate` makes BEFORE any rescue, and it
+/// runs `validate_forall_inst`'s full re-derivation of the substitution plus
+/// `validate_euf_transitive`'s BFS for a genuine path between the conclusion
+/// equality's two endpoints.
+fn assert_forall_inst_equality_refutation_is_plainly_checked(solver: &Solver) {
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a certified UNSAT must publish a proof artifact");
+    let proof = solver
+        .last_proof()
+        .expect("a certified UNSAT publishes its proof");
+
+    solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the PLAIN strict checker must accept the instantiated-equality \
+                 refutation, got {error}\n{}",
+                artifact.alethe,
+            )
+        });
+
+    // ...and the steps it accepted are the universal instantiation and the
+    // transitivity chain, not something else. Read the proof IR, not the
+    // printed text.
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::ForallInst,
+                ..
+            }
+        )),
+        "refutation must instantiate the authored forall with `forall_inst`:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::EqTransitive,
+                ..
+            }
+        )),
+        "refutation must close through a checked transitivity chain:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        artifact.quality.is_complete(),
+        "proof must have zero trust/hole steps: {}\n{}",
+        artifact.quality,
+        artifact.alethe,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+}
+
+/// Regression (#trust-count→0, the deductive-checks left-inverse family), ARM 1 —
+/// SHARED ENDPOINT. The authored `forall` instance `(= (Unbox (Box c)) c)`
+/// and the authored pin `(= (Unbox (Box c)) d)` share an endpoint, so
+/// `eq_transitive` yields `(= c d)`, which the authored `distinct` refutes.
+///
+/// Before this pass AY computed `unsat` and published `unknown`:
+/// `strict UNSAT proof validation failed: step t4 uses unverified trust rule`.
+/// `replace_with_exact_authored_forall_inst_refutation` cannot reach it — that
+/// lane needs an authored `(not I)` root that is the EXACT complement of the
+/// instantiated body, and here the instance is an equality that has to be
+/// COMPOSED with the other roots before anything contradicts.
+///
+/// THE BITVECTOR ELEMENT SORT IS PART OF THE FIXTURE, NOT DECORATION. The
+/// same shape over an uninterpreted element sort never reaches this pass: the
+/// ordinary reconstruction already derives the instance through the proof
+/// tracker's `add_forall_instantiated_assertion` and closes it with a checked
+/// `eq_transitive`, so the strict checker accepts and the pass early-returns
+/// on its first line. On the BV32 signature — the shape deductive-checks actually
+/// emits — the reconstruction closes on the whole-problem `trust` step
+/// instead, which is where this pass fires.
+///
+/// z3 5.0.0: unsat.
+#[test]
+fn forall_instance_shared_endpoint_refutation_is_strict_verified() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-sort Poly 0)
+            (declare-const c (_ BitVec 32))
+            (declare-const d (_ BitVec 32))
+            (declare-fun Box_i32 ((_ BitVec 32)) Poly)
+            (declare-fun Unbox_i32 (Poly) (_ BitVec 32))
+            (assert (forall ((x (_ BitVec 32))) (= (Unbox_i32 (Box_i32 x)) x)))
+            (assert (distinct c d))
+            (assert (= (Unbox_i32 (Box_i32 c)) d))
+            "#,
+        )
+        .expect("left-inverse image-disagreement fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "z3 5.0.0 decides this unsat; got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_forall_inst_equality_refutation_is_plainly_checked(&solver);
+}
+
+/// NEAR-MISS twin of ARM 1, one token different: the authored pin AGREES with
+/// the axiom (`(= (Unbox (Box c)) c)`), so the chain the arm can build ends at
+/// `(= c c)` and the authored `distinct c d` refutes nothing.
+///
+/// This is what stops the arm from being a rubber stamp. A producer that
+/// fabricated the endpoint equality instead of deriving it would turn this
+/// SATISFIABLE problem into `unsat`. Stated over an uninterpreted element sort
+/// because the pinned oracle does not decide the BV32 twin's SAT direction
+/// inside a 280 s budget; the pass is sort-agnostic, so the schema contrast is
+/// the same one.
+///
+/// z3 5.0.0: sat.
+#[test]
+fn forall_instance_shared_endpoint_agreeing_pin_is_not_unsat() {
+    let mut solver = Solver::new(Logic::Uf);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-sort E 0)
+            (declare-sort Poly 0)
+            (declare-const c E)
+            (declare-const d E)
+            (declare-fun Box (E) Poly)
+            (declare-fun Unbox (Poly) E)
+            (assert (forall ((x E)) (= (Unbox (Box x)) x)))
+            (assert (distinct c d))
+            (assert (= (Unbox (Box c)) c))
+            "#,
+        )
+        .expect("near-miss fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        !verdict.is_unsat(),
+        "an agreeing pin is satisfiable (z3 5.0.0: sat); refuting it would mean \
+         the endpoint equality was fabricated rather than derived, got {verdict:?}",
+    );
+}
+
+/// Regression (#trust-count→0, the deductive-checks left-inverse family), ARM 2 —
+/// CONGRUENCE BRIDGE. Two instances of the authored `forall`,
+/// `(= (Unbox (Box a)) a)` and `(= (Unbox (Box b)) b)`, are joined by a
+/// congruence unit built from the authored `(= (Box a) (Box b))` — the same
+/// `derive_authored_congruence_unit` the ground lane uses — and the three-edge
+/// chain yields `(= a b)`, refuted by the authored `distinct`.
+///
+/// z3 5.0.0: unsat.
+#[test]
+fn forall_instance_congruence_bridge_refutation_is_strict_verified() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-sort Poly 0)
+            (declare-const a (_ BitVec 32))
+            (declare-const b (_ BitVec 32))
+            (declare-fun Box_i32 ((_ BitVec 32)) Poly)
+            (declare-fun Unbox_i32 (Poly) (_ BitVec 32))
+            (assert (forall ((x (_ BitVec 32))) (= (Unbox_i32 (Box_i32 x)) x)))
+            (assert (distinct a b))
+            (assert (= (Box_i32 a) (Box_i32 b)))
+            "#,
+        )
+        .expect("left-inverse non-injectivity fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "z3 5.0.0 decides this unsat; got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_forall_inst_equality_refutation_is_plainly_checked(&solver);
+}
+
+/// NEAR-MISS twin of ARM 2, one token different: the authored equality pins
+/// `(= (Box a) (Wrap b))`, whose two sides are applications of DIFFERENT
+/// heads, so no congruence bridges the two instances and the chain never
+/// reaches `(= a b)`.
+///
+/// Sort rationale as in the ARM 1 near-miss above.
+///
+/// z3 5.0.0: sat.
+#[test]
+fn forall_instance_congruence_bridge_distinct_heads_is_not_unsat() {
+    let mut solver = Solver::new(Logic::Uf);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-sort E 0)
+            (declare-sort Poly 0)
+            (declare-const a E)
+            (declare-const b E)
+            (declare-fun Box (E) Poly)
+            (declare-fun Wrap (E) Poly)
+            (declare-fun Unbox (Poly) E)
+            (assert (forall ((x E)) (= (Unbox (Box x)) x)))
+            (assert (distinct a b))
+            (assert (= (Box a) (Wrap b)))
+            "#,
+        )
+        .expect("near-miss fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        !verdict.is_unsat(),
+        "two different heads cannot be bridged by congruence, so this is \
+         satisfiable (z3 5.0.0: sat), got {verdict:?}",
+    );
+}
+
+/// Assert the shared post-conditions of a UNIVERSAL-INSTANTIATION refutation
+/// whose instance is refuted by the REST of the authored problem rather than
+/// by being the literal complement of one authored root.
+///
+/// The PLAIN-checker call is the load-bearing one, for the same reason it is
+/// in [`assert_forall_inst_refutation_is_plainly_checked`]:
+/// `artifact.strict_verdict` alone cannot distinguish "the step was checked"
+/// from "the step was tolerated", because `strict_verdict_with_deferred_trust`
+/// (`api/proofs.rs`) also returns `Verified` from its RESCUE arms.
+/// `check_proof_strict_with_datatypes` is the same call
+/// `mint_unsat_certificate` makes BEFORE any rescue, and it runs
+/// `validate_forall_inst`'s full re-derivation (binder/argument arity and
+/// sorts, argument groundness, and the EXACT simultaneous capture-safe
+/// substitution) plus the Boolean and arithmetic validators for every other
+/// step of the rebuilt refutation.
+fn assert_forall_inst_conflict_refutation_is_plainly_checked(solver: &Solver) {
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a certified UNSAT must publish a proof artifact");
+    let proof = solver
+        .last_proof()
+        .expect("a certified UNSAT publishes its proof");
+
+    solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the PLAIN strict checker must accept the forall_inst \
+                 conflict refutation, got {error}\n{}",
+                artifact.alethe,
+            )
+        });
+
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::ForallInst,
+                ..
+            }
+        )),
+        "refutation must contain a checker-validated forall_inst step:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        artifact.quality.is_complete(),
+        "proof must have zero trust/hole steps: {}\n{}",
+        artifact.quality,
+        artifact.alethe,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+}
+
+/// Regression (#trust-count→0): a `forall` instance that complements NO
+/// authored root, and conflicts with the ground assertions only through a
+/// Farkas combination, must export a strictly verified, trust-free proof.
+///
+/// This is the fixture of the pre-existing
+/// `api::tests::test_core::test_uflia_ground_unsat_with_referenced_forall_axiom_2829`,
+/// which asserts only the VERDICT. Instantiating the axiom at `x := i` gives
+/// `(= (double i) (+ i i))`, which complements no authored root; it conflicts
+/// with `(>= i 0)`, `(= i_prime (double i))` and `(not (>= i_prime 0))`
+/// TOGETHER, and only arithmetically, over the opaque atom `(double i)`. The
+/// conflict is admitted only after `try_lra_farkas_reconstruction` (the same
+/// LRA solver the checker's `la_generic` validator replays) returns an actual
+/// certificate for the exact clause. z3 5.0.0 answers `unsat`.
+///
+/// NON-VACUOUS, measured: with the pass's call site removed this test fails at
+/// its first assertion with `step t5 uses unverified trust rule`.
+#[test]
+fn arithmetic_forall_instantiation_bound_conflict_is_strict_verified() {
+    let mut solver = Solver::new(Logic::Uflia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun double (Int) Int)
+            (declare-const i Int)
+            (declare-const i_prime Int)
+            (assert (>= i 0))
+            (assert (< i 10))
+            (assert (= i_prime (double i)))
+            (assert (not (>= i_prime 0)))
+            (assert (forall ((x Int))
+                (! (= (double x) (+ x x)) :pattern ((double x)))))
+            "#,
+        )
+        .expect("arithmetic instantiation fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "i >= 0 and double(i) = i + i force i_prime >= 0 (z3 5.0.0 agrees), \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_forall_inst_conflict_refutation_is_plainly_checked(&solver);
+}
+
+/// The falsifiable near-miss, pinned so the pass cannot be widened into a
+/// schema that accepts more than it derives. WITHOUT `(>= i 0)` the very same
+/// axiom and chain are SATISFIABLE — a negative `i` gives a negative
+/// `i_prime = i + i` — and z3 5.0.0 returns `sat`. The Farkas search finds no
+/// certificate for any premise subset, so no candidate is ever built and no
+/// refutation is ever published.
+///
+/// The assertion is `!is_unsat()` rather than `is_sat()` DELIBERATELY, and the
+/// difference is measured, not assumed: on this head AY answers `unknown` here
+/// with `QuantifierEmatchingExistsIncomplete`. That incompleteness is
+/// pre-existing, lives in the quantifier lane, and is untouched by this commit
+/// — a proof-step derivation cannot reach it, because no verdict is ever
+/// computed to certify. What this test pins is the property this pass could
+/// actually violate: a satisfiable problem must never come back `unsat`.
+#[test]
+fn arithmetic_forall_instantiation_consistent_bound_is_sat() {
+    let mut solver = Solver::new(Logic::Uflia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun double (Int) Int)
+            (declare-const i Int)
+            (declare-const i_prime Int)
+            (assert (< i 10))
+            (assert (= i_prime (double i)))
+            (assert (not (>= i_prime 0)))
+            (assert (forall ((x Int))
+                (! (= (double x) (+ x x)) :pattern ((double x)))))
+            "#,
+        )
+        .expect("consistent-bound near-miss fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        !verdict.is_unsat(),
+        "a negative i makes i_prime = i + i negative, so this is SATISFIABLE \
+         (z3 5.0.0 agrees) and no refutation may ever be built for it, \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+}
+
+/// Regression (#trust-count→0, the datatype equality-closure family): a
+/// refutation whose whole content is EQUALITY REASONING over the authored roots
+/// must export a strictly verified proof, not degrade to `unknown`.
+///
+/// `(and (= red c1) (= c1 c2))` together with `(= blue c2)` chains `red` to
+/// `blue` through two variables. The congruence closure / datatype solver closes
+/// this internally and publishes the conflict as ONE `Generic` (trust) clause —
+/// typically the bare negation of the authored conjunction — which carries no
+/// argument, so strict mode must reject it, discharging it is re-proving the
+/// problem, and the mandatory publication gate turned a correct `unsat` into
+/// `unknown`.
+///
+/// `replace_with_exact_authored_equality_closure_refutation` rebuilds the
+/// derivation instead: `and_pos` projections for the conjuncts, `eq_transitive`
+/// for the chain, and a registry-backed `DatatypeDistinct` lemma to refute
+/// `(= red blue)`. Every one of those has an independent strict validator in
+/// `ay-proof`, so the certificate is CHECKED rather than tolerated.
+#[test]
+fn datatype_equality_chain_distinct_constructors_is_strict_verified() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-datatypes ((Colour 0)) (((red) (blue) (green))))
+            (declare-const c1 Colour)
+            (declare-const c2 Colour)
+            (assert (and (= red c1) (= c1 c2)))
+            (assert (= blue c2))
+            "#,
+        )
+        .expect("datatype equality-chain fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "red = c1 = c2 = blue is UNSAT for distinct constructors (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a certified UNSAT must publish a proof artifact");
+    let proof = solver
+        .last_proof()
+        .expect("a certified UNSAT publishes its proof");
+
+    // The assertion that matters: the PLAIN strict checker accepts it. The
+    // artifact's own verdict would not distinguish "checked" from "tolerated",
+    // because `strict_verdict_with_deferred_trust` also reports `Verified` from
+    // its two RESCUE arms.
+    solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the PLAIN strict checker must accept the equality-closure \
+                 refutation, got {error}\n{}",
+                artifact.alethe,
+            )
+        });
+
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::DatatypeDistinct,
+                ..
+            }
+        )),
+        "the refutation must close on a registry-validated dt_distinct lemma:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::EqTransitive,
+                ..
+            }
+        )),
+        "the chain red = c1 = c2 = blue must be stated as eq_transitive:\n{}",
+        artifact.alethe,
+    );
+}
+
+/// The CONGRUENCE arm of the same pass, and the arm that closes on an authored
+/// DISEQUALITY rather than on constructor distinctness.
+///
+/// `result = Accept(claimed)` and `actual = claimed` force
+/// `result = Accept(actual)`, contradicting the second assertion. The rebuilt
+/// derivation therefore needs `eq_congruent` (to lift `actual = claimed` through
+/// the constructor) as well as `eq_transitive`, both independently re-validated
+/// by `ay-proof`: `validate_euf_congruent` re-checks that the two conclusion
+/// sides apply the SAME symbol at the SAME arity and that premise `i` links
+/// argument position `i`, so a mis-built congruence is rejected there and the
+/// pass leaves the proof — and the `unknown` — exactly as it found them.
+#[test]
+fn datatype_constructor_congruence_closure_is_strict_verified() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-datatypes ((Verdict 0)) (((Reject) (Accept (objv (_ BitVec 8))))))
+            (declare-const result Verdict)
+            (declare-const actual (_ BitVec 8))
+            (declare-const claimed (_ BitVec 8))
+            (assert (= result (Accept claimed)))
+            (assert (not (= result (Accept actual))))
+            (assert (= actual claimed))
+            "#,
+        )
+        .expect("constructor-congruence fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "actual = claimed forces Accept(actual) = Accept(claimed) = result, so \
+         the fixture is UNSAT (z3 5.0.0 agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a certified UNSAT must publish a proof artifact");
+    let proof = solver
+        .last_proof()
+        .expect("a certified UNSAT publishes its proof");
+
+    solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the PLAIN strict checker must accept the congruence-closure \
+                 refutation, got {error}\n{}",
+                artifact.alethe,
+            )
+        });
+
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::EqCongruent,
+                ..
+            }
+        )),
+        "lifting actual = claimed through the constructor must be stated as \
+         eq_congruent:\n{}",
+        artifact.alethe,
+    );
+}
+
+/// Assert the shared post-conditions of a refutation this round's string
+/// passes rebuild, and that the step the checker accepted carries `kind`.
+///
+/// The PLAIN-checker call is the load-bearing one. `artifact.strict_verdict`
+/// is NOT enough on its own: `strict_verdict_with_deferred_trust`
+/// (`api/proofs.rs`) also reports `Verified` when the deferred-trust RESCUE
+/// re-discharges an unverified leaf, so it cannot distinguish "the step was
+/// checked" from "the step was tolerated". `check_proof_strict_with_datatypes`
+/// is the same call `mint_unsat_certificate` makes BEFORE any rescue, and it
+/// runs each new validator's full independent re-derivation.
+fn assert_string_refutation_carries_kind(solver: &Solver, kind: TheoryLemmaKind) {
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a certified UNSAT must publish a proof artifact");
+    let proof = solver
+        .last_proof()
+        .expect("a certified UNSAT publishes its proof");
+
+    solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the PLAIN strict checker must accept the refutation, got \
+                 {error}\n{}",
+                artifact.alethe,
+            )
+        });
+
+    // ...and the step it accepted is the expected rule, not something else.
+    // Read the proof IR, not the printed text: Carcara has no rule for these
+    // internal certificates, so the WIRE name is an honest `hole` while AY's
+    // own checker validates the kind.
+    assert!(
+        proof
+            .steps
+            .iter()
+            .any(|step| matches!(step, ProofStep::TheoryLemma { kind: k, .. } if *k == kind)),
+        "refutation must contain a checker-validated {kind:?} lemma:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        artifact.quality.is_complete(),
+        "proof must have zero trust/hole steps: {}\n{}",
+        artifact.quality,
+        artifact.alethe,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+}
+
+/// Regression (#trust-count→0, the extended-function reduction shape):
+/// `(= x "hello")` propagated into `(= (str.substr x 1 3) "abc")` leaves a
+/// GROUND claim — `str.substr("hello", 1, 3)` is `"ell"`, not `"abc"` — so the
+/// problem is UNSAT and z3 5.0.0 agrees. AY computed that every time and
+/// published `unknown`, because the reduction happens outside the SAT trace and
+/// the reconstruction closed on the whole-problem `trust` fallback.
+///
+/// The rebuilt refutation transports the authored literal across the ground
+/// binding with `eq_congruent` / `eq_congruent_pred` (whose validators re-derive
+/// the per-argument matching themselves) and closes on `StringGroundEval`, whose
+/// INDEPENDENT evaluator re-decides `str.substr("hello", 1, 3)`.
+#[test]
+fn qfslia_substr_ground_substitution_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfSlia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (= x "hello"))
+            (assert (= (str.substr x 1 3) "abc"))
+            "#,
+        )
+        .expect("substr reduction fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "str.substr(\"hello\", 1, 3) is \"ell\", not \"abc\"; UNSAT (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
+}
+
+/// The same pass over `str.indexof`: `str.indexof("abcab", "b", 0)` is the
+/// LEFTMOST occurrence, `1`, not `4`. z3 5.0.0 answers `unsat`.
+#[test]
+fn qfslia_indexof_ground_substitution_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfSlia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (= x "abcab"))
+            (assert (= (str.indexof x "b" 0) 4))
+            "#,
+        )
+        .expect("indexof reduction fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "the leftmost \"b\" in \"abcab\" is at index 1, not 4; UNSAT (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
+}
+
+/// The same pass over `str.replace`, which rewrites only the FIRST occurrence:
+/// `str.replace("abcab", "b", "z")` is `"azcab"`, not `"abcaz"`. z3 5.0.0
+/// answers `unsat`.
+#[test]
+fn qfslia_replace_ground_substitution_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfSlia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (= x "abcab"))
+            (assert (= (str.replace x "b" "z") "abcaz"))
+            "#,
+        )
+        .expect("replace reduction fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "str.replace rewrites only the first occurrence; UNSAT (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
+}
+
+/// Regression (#trust-count→0, the self-containment shape): every word contains
+/// itself, so `(not (str.contains x x))` is UNSAT for any `x`. z3 5.0.0 agrees.
+/// The refutation states that theorem as `StringContainmentIdentity`, whose
+/// validator re-checks that the two argument positions hold the SAME term.
+#[test]
+fn qfs_self_containment_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfS);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (not (str.contains x x)))
+            "#,
+        )
+        .expect("self-containment fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "a word contains itself; UNSAT (z3 5.0.0 agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringContainmentIdentity);
+}
+
+/// Regression (#trust-count→0, the ground-factor shape): `"c"` does not occur
+/// in `"ab"`, so no value of `x` makes `x ++ "c"` a factor of `"ab"` and
+/// `(str.contains "ab" (str.++ x "c"))` is UNSAT. z3 5.0.0 agrees.
+#[test]
+fn qfs_ground_factor_conflict_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfS);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (str.contains "ab" (str.++ x "c")))
+            "#,
+        )
+        .expect("ground-factor fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "\"c\" is not a factor of \"ab\"; UNSAT (z3 5.0.0 agrees), got \
+         {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundFactorConflict);
+}
+
+/// The boundary-block arm of the same kind: the last character of `x ++ "b"` is
+/// `"b"`, so `(str.suffixof "c" (str.++ x "b"))` is UNSAT. z3 5.0.0 agrees.
+/// This exercises the prefix/suffix schema (pattern no longer than the ground
+/// boundary block) rather than the factor scan.
+#[test]
+fn qfs_ground_suffix_conflict_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfS);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (str.suffixof "c" (str.++ x "b")))
+            "#,
+        )
+        .expect("ground-suffix fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "the last character of x ++ \"b\" is \"b\"; UNSAT (z3 5.0.0 agrees), \
+         got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundFactorConflict);
+}
+
+/// Regression (#trust-count→0, the cancellation shape): `str.++` cancels on the
+/// right in the free monoid, so `x ++ "c" = y ++ "c"` forces `x = y` and the
+/// added `(not (= x y))` is UNSAT. z3 5.0.0 agrees. The refutation states the
+/// cancellation as `StringConcatCancellation`, whose validator re-derives the
+/// shared operand run and both residuals from the clause alone.
+#[test]
+fn qfslia_concat_cancellation_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfSlia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (declare-fun y () String)
+            (assert (= (str.len x) (str.len y)))
+            (assert (= (str.++ x "c") (str.++ y "c")))
+            (assert (not (= x y)))
+            "#,
+        )
+        .expect("concat cancellation fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "str.++ cancels on the right; UNSAT (z3 5.0.0 agrees), got \
+         {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringConcatCancellation);
+}
+
+/// Regression (#trust-count→0, the regex length-bound shape): `x ++ x = "aaaa"`
+/// pins `2*len(x) = 4`, i.e. `len(x) = 2`, while
+/// `x` in `((_ re.loop 3 5) (str.to_re "a"))` pins `len(x) >= 3`. z3 5.0.0
+/// answers `unsat`.
+///
+/// The bound joins the existing length-arithmetic pool as a
+/// `RegexLengthLowerBound` clause, whose validator recomputes the regex's
+/// minimum word length compositionally, and the pool closes on a rational
+/// `LraFarkas` certificate.
+#[test]
+fn qfs_regex_length_lower_bound_unsat_proof_is_strict_verified() {
+    let mut solver = Solver::new(Logic::QfS);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-fun x () String)
+            (assert (= (str.++ x x) "aaaa"))
+            (assert (str.in_re x ((_ re.loop 3 5) (str.to_re "a"))))
+            "#,
+        )
+        .expect("regex length-bound fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "len(x) = 2 contradicts the regex's minimum length 3; UNSAT (z3 5.0.0 \
+         agrees), got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::RegexLengthLowerBound);
+}

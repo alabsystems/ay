@@ -1137,6 +1137,10 @@ pub enum BvExprExportError {
 pub(crate) struct BvExprProofLimits {
     pub(crate) max_expr_nodes: usize,
     pub(crate) max_expr_depth: usize,
+    /// Maximum width of any internal expression node. This may exceed the
+    /// serialized proof's top-level equality width when a source-bound Bool
+    /// query contains wide bit-vector terms.
+    pub(crate) max_internal_width: u32,
     pub(crate) max_estimated_gate_work: usize,
     pub(crate) max_resolution_steps: usize,
     pub(crate) resolution: ResolutionProofLimits,
@@ -1740,10 +1744,10 @@ fn preflight_bv_expr(
         }
     };
 
-    if width == 0 || width > SOLVED_MAX_WIDTH {
+    if width == 0 || width > limits.max_internal_width {
         return Err(BvExprExportError::UnsupportedWidth {
             got: width,
-            max: SOLVED_MAX_WIDTH,
+            max: limits.max_internal_width,
         });
     }
     charge_bv_expr_resource(

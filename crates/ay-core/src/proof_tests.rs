@@ -3,6 +3,7 @@
 // Author: Andrew Yates
 
 use super::*;
+use num_rational::Rational64;
 
 #[test]
 fn farkas_annotation_from_ints_preserves_values() {

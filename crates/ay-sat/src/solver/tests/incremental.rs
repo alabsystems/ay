@@ -458,8 +458,9 @@ fn test_solve_interruptible_honors_should_stop_with_scope_selectors() {
 
     let callback_calls = std::cell::Cell::new(0usize);
     let result = solver.solve_interruptible(|| {
-        callback_calls.set(callback_calls.get() + 1);
-        true
+        let calls = callback_calls.get() + 1;
+        callback_calls.set(calls);
+        calls >= 3
     });
 
     assert_eq!(
@@ -468,8 +469,8 @@ fn test_solve_interruptible_honors_should_stop_with_scope_selectors() {
         "interrupt callback must be respected on scoped-selector path"
     );
     assert!(
-        callback_calls.get() > 0,
-        "interrupt callback should be invoked on scoped-selector path"
+        callback_calls.get() == 3,
+        "interrupt callback should stop at the scoped decision checkpoint"
     );
 }
 
@@ -490,8 +491,9 @@ fn test_solve_interruptible_honors_should_stop_on_scoped_decision_path() {
 
     let callback_calls = std::cell::Cell::new(0usize);
     let result = solver.solve_interruptible(|| {
-        callback_calls.set(callback_calls.get() + 1);
-        true
+        let calls = callback_calls.get() + 1;
+        callback_calls.set(calls);
+        calls >= 3
     });
 
     assert_eq!(
@@ -505,8 +507,8 @@ fn test_solve_interruptible_honors_should_stop_on_scoped_decision_path() {
         solver.num_decisions()
     );
     assert!(
-        callback_calls.get() > 0,
-        "interrupt callback should be invoked on scoped decision-heavy path"
+        callback_calls.get() == 3,
+        "interrupt callback should stop at the scoped decision checkpoint"
     );
 
     let events = read_diagnostic_trace(&diag_path);
@@ -533,8 +535,9 @@ fn test_solve_with_assumptions_interruptible_honors_stop_on_scoped_decision_path
     let callback_calls = std::cell::Cell::new(0usize);
     let result = solver
         .solve_with_assumptions_interruptible(&[], || {
-            callback_calls.set(callback_calls.get() + 1);
-            true
+            let calls = callback_calls.get() + 1;
+            callback_calls.set(calls);
+            calls >= 3
         })
         .into_inner();
 
@@ -548,21 +551,17 @@ fn test_solve_with_assumptions_interruptible_honors_stop_on_scoped_decision_path
         solver.num_decisions()
     );
     assert!(
-        callback_calls.get() > 0,
-        "interrupt callback should be invoked in scoped assumption API"
+        callback_calls.get() == 3,
+        "interrupt callback should stop at the scoped assumption decision checkpoint"
     );
 
     let events = read_diagnostic_trace(&diag_path);
     assert_single_unknown_result_summary_with_reason(&events, "interrupted");
 }
 
-/// The callback-based interrupt (`solve_interruptible`) is checked in the CDCL
-/// loop, not during preprocessing.  A trivial 2-variable formula is solved
-/// (via lucky phases or walk) before reaching the CDCL conflict loop, so the
-/// callback never fires and the result is Sat.
-///
-/// Note: the `set_interrupt` / `Arc<AtomicBool>` path *does* check during
-/// preprocessing — see `test_set_interrupt_honored_during_preprocess`.
+/// Three entry polls and two early-lucky boundary polls remain false. The sixth
+/// poll stops inside the initial preprocessing transaction, after which the
+/// transaction must restore a reusable clause/watch state.
 #[test]
 fn test_solve_interruptible_honors_should_stop_during_preprocess() {
     let mut solver = Solver::new(2);
@@ -571,18 +570,36 @@ fn test_solve_interruptible_honors_should_stop_during_preprocess() {
         Literal::positive(Variable(1)),
     ]);
 
+    let callback_calls = std::cell::Cell::new(0usize);
     let result = solver
         .solve_interruptible(|| {
-            // Interrupt immediately — but preprocessing does not check the callback.
-            true
+            let calls = callback_calls.get() + 1;
+            callback_calls.set(calls);
+            calls == 6
         })
         .into_inner();
 
-    // Trivial SAT formula is solved before the callback is ever consulted.
     assert!(
-        matches!(result, SatResult::Sat(_)),
-        "trivial formula should be solved before interrupt callback fires"
+        matches!(result, SatResult::Unknown),
+        "preprocessing must honor the solve callback"
     );
+    assert_eq!(callback_calls.get(), 6);
+    assert_eq!(
+        solver.last_unknown_reason(),
+        Some(SatUnknownReason::Interrupted)
+    );
+    assert!(
+        solver.cold.preprocess_deadline.is_none(),
+        "preprocessing transaction must clear its local deadline"
+    );
+    assert!(
+        !solver.is_preprocess_enabled(),
+        "stopped preprocessing must be disarmed"
+    );
+    assert_eq!(solver.qhead, solver.trail.len());
+
+    let retry = solver.solve().into_inner();
+    assert!(matches!(retry, SatResult::Sat(_)));
 }
 
 /// Verify that `set_interrupt()` + `is_interrupted()` wiring works (#3638).

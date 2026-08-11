@@ -87,12 +87,20 @@ impl Solver {
             let result = self.declare_unknown_with_reason(SatUnknownReason::ClauseTooLarge);
             self.trace_sat_result(&result);
             self.finish_tla_trace();
+            self.reset_constraint();
+            return result;
+        }
+        if let Some(result) = self.finish_stopped_sat_entry(&|| false) {
+            // This API owns a one-shot constraint just like the ordinary
+            // assumption entry. A stop must not leak it into the retry.
+            self.reset_constraint();
             return result;
         }
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
             self.finish_tla_trace();
+            self.reset_constraint();
             return result;
         }
         let combined = self.compose_scope_assumptions(assumptions);
@@ -210,6 +218,10 @@ impl Solver {
             return result;
         }
 
+        if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+            return result;
+        }
+
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
@@ -259,6 +271,10 @@ impl Solver {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY across solve() calls.
+
+        if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+            return result;
+        }
 
         if self.has_empty_clause {
             let result = self.declare_unsat();
@@ -487,6 +503,10 @@ impl Solver {
             return result;
         }
 
+        if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+            return result;
+        }
+
         if self.has_empty_clause {
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
@@ -547,6 +567,9 @@ impl Solver {
         }
 
         if self.has_empty_clause {
+            if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+                return result;
+            }
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
             self.finish_tla_trace();
@@ -554,6 +577,9 @@ impl Solver {
         }
 
         if self.cold.scope_selectors.is_empty() {
+            if let Some(result) = self.finish_stopped_sat_entry(&should_stop) {
+                return result;
+            }
             let result = self
                 .solve_no_assumptions_with_preprocessing_extension(build_extension, should_stop);
             self.trace_sat_result(&result);
@@ -586,6 +612,10 @@ impl Solver {
             let result = self.declare_unknown_with_reason(SatUnknownReason::ClauseTooLarge);
             self.trace_sat_result(&result);
             self.finish_tla_trace();
+            return result;
+        }
+
+        if let Some(result) = self.finish_stopped_sat_entry(&|| false) {
             return result;
         }
 
@@ -674,47 +704,43 @@ impl Solver {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
 
-        if let Some(result) = self.init_solve() {
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+
+        let init_result = self.init_solve();
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+        if let Some(result) = init_result {
             return result;
         }
 
-        let extension = if self.cold.has_been_incremental {
+        let mut extension = if self.cold.has_been_incremental {
             None
         } else {
             self.prepare_preprocessing_extension(&mut build_extension)
         };
 
-        if self.cold.preprocess_enabled && self.preprocess() {
-            return self.declare_unsat();
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            if let Some(pending) = extension.as_ref() {
+                self.cancel_preprocessing_extension(pending);
+            }
+            return self.declare_unknown_with_reason(reason);
         }
 
-        if self.cold.preprocess_enabled {
-            // #8496: Ensure all clauses containing eliminated/substituted
-            // variables are cleaned up, regardless of how preprocess() exited.
-            let finalize_deleted = self.finalize_preprocess_clause_cleanup();
-            if finalize_deleted {
-                self.cold.preprocess_watches_valid = false;
-            }
-            if !self.cold.preprocess_watches_valid {
-                self.watches.clear();
-                self.initialize_watches();
-            }
-            self.qhead = 0;
+        let preprocess_outcome = if self.cold.preprocess_enabled {
+            Some(self.preprocess_interruptible(&should_stop))
+        } else {
+            None
+        };
 
-            let trail_before = self.trail.len();
-            if let Some(conflict_ref) = self.search_propagate() {
-                self.record_level0_conflict_chain(conflict_ref);
-                return self.declare_unsat();
-            }
-            if self.cold.tla_trace.is_some() && self.trail.len() > trail_before {
-                self.tla_trace_step(
-                    CdclTraceState::Propagating,
-                    Some(CdclTraceAction::Propagate),
-                );
-            }
-
-            self.cold.preprocess_enabled = false;
-            self.num_original_clauses = self.arena.active_clause_count();
+        if let Err(result) = self.finish_preprocessing_extension_transaction(
+            &mut extension,
+            preprocess_outcome,
+            &should_stop,
+        ) {
+            return result;
         }
 
         // JIT-compile static clauses into native propagation functions.
@@ -722,9 +748,9 @@ impl Solver {
         // Mirrors solve/mod.rs to ensure extension/theory paths get JIT benefit.
         // Uses adaptive compilation (#8203) for size-dependent strategy.
 
-        if extension.is_none() {
+        let Some(mut extension) = extension else {
             return self.solve_remaining_no_assumptions(should_stop);
-        }
+        };
 
         self.disable_extension_inprocessing();
 
@@ -736,87 +762,12 @@ impl Solver {
             self.cold.next_inprobe_conflict = self.total_conflicts().saturating_add(limit);
         }
 
-        let mut extension = extension.expect("checked Some(extension) above");
+        let extension = &mut extension.prepared;
         extension.extension.init();
         let mut callback = ExtensionCallback {
             ext: &mut extension.extension,
         };
         self.cdcl_loop(&mut callback, should_stop)
-    }
-
-    fn prepare_preprocessing_extension<E, B>(
-        &mut self,
-        build_extension: &mut B,
-    ) -> Option<PreparedExtension<E>>
-    where
-        E: Extension,
-        B: FnMut(&[Vec<Literal>]) -> Option<PreparedExtension<E>>,
-    {
-        let (clauses, clause_offsets) = self.snapshot_irredundant_clauses();
-        let prepared = build_extension(&clauses)?;
-
-        for var in &prepared.frozen_variables {
-            if var.index() < self.num_vars {
-                self.freeze(*var);
-            }
-        }
-
-        // Suppress DRAT/LRAT proof deletion lines for consumed clauses (#4533).
-        //
-        // The extension (e.g., XOR Gauss-Jordan) will produce theory lemmas that
-        // are logically implied by the consumed original clauses. For these
-        // lemmas to be RUP-derivable by an external DRAT checker, the consumed
-        // clauses must remain in the checker's clause database at the time the
-        // lemmas are added. If we emit deletion lines here (before the CDCL
-        // loop starts), the checker removes the consumed clauses, making theory
-        // lemmas non-RUP-derivable and causing proof verification failure.
-        //
-        // Strategy: use defer_proof_deletions to buffer the deletion lines,
-        // then discard them. The internal solver state correctly deletes the
-        // clauses (watches removed, arena slots freed), but the proof stream
-        // retains them as available axioms for theory lemma derivation.
-        let was_deferring = self.defer_proof_deletions;
-        self.defer_proof_deletions = true;
-
-        for &position in &prepared.consumed_clause_positions {
-            let Some(&clause_idx) = clause_offsets.get(position) else {
-                debug_assert!(
-                    false,
-                    "prepared extension consumed out-of-range clause position {position}"
-                );
-                continue;
-            };
-            if self.arena.is_dead(clause_idx) {
-                continue;
-            }
-            self.delete_clause_checked(clause_idx, mutate::ReasonPolicy::ClearLevel0);
-        }
-
-        // Discard deferred deletions — consumed clause deletions are intentionally
-        // suppressed from the proof stream (#4533).
-        self.defer_proof_deletions = was_deferring;
-        self.deferred_proof_deletions.clear();
-
-        // Mark that theory lemmas from this extension are trusted transforms
-        // (derived from consumed original clauses) and should not block LRAT (#7913).
-        self.cold.extension_trusted_lemmas = true;
-
-        Some(prepared)
-    }
-
-    fn snapshot_irredundant_clauses(&self) -> (Vec<Vec<Literal>>, Vec<usize>) {
-        let mut clauses = Vec::new();
-        let mut clause_offsets = Vec::new();
-
-        for clause_idx in self.arena.active_indices() {
-            if self.arena.is_dead(clause_idx) || self.arena.is_learned(clause_idx) {
-                continue;
-            }
-            clauses.push(self.arena.literals(clause_idx).to_vec());
-            clause_offsets.push(clause_idx);
-        }
-
-        (clauses, clause_offsets)
     }
 
     fn solve_remaining_no_assumptions<F>(&mut self, should_stop: F) -> SatResult
@@ -831,15 +782,22 @@ impl Solver {
             self.cold.next_inprobe_conflict = self.total_conflicts().saturating_add(limit);
         }
 
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+
         if let Some(sat) = self.try_lucky_phases() {
+            if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                return self.declare_unknown_with_reason(reason);
+            }
             if sat {
                 self.tla_trace_step(CdclTraceState::Sat, Some(CdclTraceAction::DeclareSat));
                 return self.declare_sat_from_current_assignment();
             }
             return self.declare_unsat();
         }
-        if self.is_interrupted() {
-            return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
         }
 
         self.try_warmup();

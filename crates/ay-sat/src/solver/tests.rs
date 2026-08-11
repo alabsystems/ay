@@ -37,6 +37,7 @@ mod oversized_clause_split;
 mod phase_hints;
 mod preprocess_transaction_ledger;
 mod preprocessing_bve;
+mod preprocessing_interrupt;
 mod proof_checking;
 mod proof_lrat;
 mod propagation;

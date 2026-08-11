@@ -20,7 +20,7 @@ use crate::executor_types::{Result, SolveResult};
 use crate::incremental_state::IncrementalBvState;
 
 use super::super::Executor;
-use super::bv::BvSolveConfig;
+use super::bv::{install_bv_sat_interrupt, BvSolveConfig};
 use super::bv_encoding;
 
 impl Executor {
@@ -49,7 +49,9 @@ impl Executor {
         // `impl Fn() -> bool` keeps an immutable borrow on `self` alive, which
         // conflicts with the mutable borrow of `self.incr_bv_state` below.
         // Instead, clone the Arc and copy the deadline directly.
-        let interrupt_flag = self.solve_interrupt.clone();
+        let sat_interrupt = self.solve_interrupt.clone();
+        let sat_deadline = self.solve_deadline.get();
+        let interrupt_flag = sat_interrupt.clone();
         let deadline = self.solve_deadline.clone();
         let should_stop = move || {
             if let Some(ref flag) = interrupt_flag {
@@ -572,6 +574,7 @@ impl Executor {
             .persistent_sat
             .as_mut()
             .expect("incremental BV must store persistent SAT solver before solve");
+        let _deadline_guard = install_bv_sat_interrupt(solver, sat_interrupt, sat_deadline);
 
         // With delayed internalization (#7015), this becomes an iterative loop:
         // 1. Solve SAT

@@ -44,6 +44,7 @@ impl Executor {
     pub(in crate::executor) fn map_sat_unknown_origin(reason: SatUnknownReason) -> UnknownOrigin {
         match reason {
             SatUnknownReason::Interrupted => UnknownOrigin::InterruptFlag,
+            SatUnknownReason::DeadlineExceeded => UnknownOrigin::SolveDeadline,
             SatUnknownReason::ResourceBudget => UnknownOrigin::DeterministicResourceBudget,
             SatUnknownReason::TheoryStop | SatUnknownReason::ExtensionUnknown => {
                 UnknownOrigin::IncompleteSolverLane

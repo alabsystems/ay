@@ -460,20 +460,14 @@ fn test_evaluate_term_var_bitvec_from_bv_model() {
 }
 
 #[test]
-fn test_evaluate_term_var_bitvec_defaults_to_zero() {
+fn test_evaluate_term_var_bitvec_missing_from_model_returns_unknown() {
     let mut executor = Executor::new();
     let x = executor.ctx.terms.mk_var("x", Sort::bitvec(16));
 
-    // Use a BV model with no values — model completion should default to 0.
-    // Note: empty_model() has bv_model: None which returns Unknown (AUFLIA case, #5356).
+    // An existing BV model does not prove an absent variable is free. It may
+    // be a substitution key that completion still needs to recover.
     let model = bv_model(&[]);
-    assert_eq!(
-        executor.evaluate_term(&model, x),
-        EvalValue::BitVec {
-            value: BigInt::zero(),
-            width: 16
-        }
-    );
+    assert_eq!(executor.evaluate_term(&model, x), EvalValue::Unknown);
 }
 
 #[test]

@@ -796,8 +796,11 @@ impl BoolBvUnsatAuthenticationError {
 /// This is deliberately independent of the production solver's bit-blast CNF:
 /// it lowers the exact source roots again, constructs provenance-bearing gate
 /// clauses, obtains a pure-RUP refutation, and replays every gate and resolution
-/// step before returning an opaque capability.  `caller_deadline`, when
-/// present, is clamped with this checker's fixed three-second ceiling.
+/// step before returning an opaque capability. Internal bit-vector terms may
+/// be up to 128 bits subject to the finite proof-production envelope; the
+/// serialized/top-level `BvBlastProof` width contract remains unchanged.
+/// `caller_deadline`, when present, is clamped with this checker's fixed
+/// three-second ceiling.
 pub fn authenticate_bool_bv_unsat_query(
     terms: &TermStore,
     roots: &[TermId],
@@ -852,6 +855,11 @@ const PROOF_PRODUCING_AGGREGATE_WORK_PER_LEMMA: u64 = 50_000_000;
 /// lemma that can enter the private proof-producing BV fallback. This matches
 /// the replay validator's maximum allocation budget.
 const PROOF_PRODUCING_AGGREGATE_BYTES_PER_LEMMA: usize = 128 * 1024 * 1024;
+
+/// The source-bound checker may lower 128-bit terms inside an outer one-bit
+/// Boolean refutation. Public/serialized top-level BV proofs remain capped by
+/// `bv_blast_export::MAX_WIDTH`.
+const MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH: u32 = 128;
 
 #[derive(Clone)]
 enum ProofProducingExpr {
@@ -991,6 +999,7 @@ fn proof_producing_limits(caller_deadline: Option<Instant>) -> BvExprProofLimits
     BvExprProofLimits {
         max_expr_nodes: MAX_PROOF_PRODUCING_EXPR_NODES,
         max_expr_depth: MAX_PROOF_PRODUCING_EXPR_DEPTH,
+        max_internal_width: MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH,
         max_estimated_gate_work: MAX_PROOF_PRODUCING_GATE_WORK,
         max_resolution_steps: MAX_PROOF_PRODUCING_RESOLUTION_STEPS,
         resolution,
@@ -1056,12 +1065,14 @@ impl<'a> ProofProducingLowerer<'a> {
         let data = self.terms.get(term).clone();
         let result = match sort {
             Sort::Bool => self.lower_bool_node(term, data),
-            Sort::BitVec(width) if width.width > 0 && width.width <= 64 => {
+            Sort::BitVec(width)
+                if width.width > 0 && width.width <= MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH =>
+            {
                 self.lower_bv_node(term, width.width, data)
             }
             Sort::BitVec(width) => Err(format!(
-                "BitVec width {} is outside proof-producing range 1..=64",
-                width.width
+                "BitVec width {} is outside proof-producing range 1..={}",
+                width.width, MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH
             )),
             other => Err(format!("unsupported sort {other:?} in Bool/BV clause")),
         };
@@ -1179,7 +1190,7 @@ impl<'a> ProofProducingLowerer<'a> {
         let (expr, width) = match data {
             TermData::Const(Constant::BitVec { value, width }) => {
                 let value = value.to_u128().ok_or_else(|| {
-                    "BitVec constant does not fit the 64-bit proof range".to_string()
+                    format!("BitVec constant does not fit the {MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH}-bit proof range")
                 })?;
                 (BvExpr::const_val(value, width), width)
             }
@@ -1329,7 +1340,10 @@ mod authenticated_query_tests {
     use ay_core::{Sort, Symbol, TermStore};
     use num_bigint::BigInt;
 
-    use super::{authenticate_bool_bv_unsat_query, BoolBvUnsatAuthenticationError};
+    use super::{
+        authenticate_bool_bv_unsat_query, BoolBvUnsatAuthenticationError,
+        MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH,
+    };
 
     fn signed_add_safety_query(
         terms: &mut TermStore,
@@ -1352,6 +1366,30 @@ mod authenticated_query_tests {
         let sum_positive = terms.mk_app(Symbol::named("bvsgt"), [sum, zero], Sort::Bool);
         let no_positive_overflow = terms.mk_implies(both_positive, sum_positive);
         vec![lhs_eq, rhs_eq, no_positive_overflow]
+    }
+
+    fn wide_signed_keep_max_query(
+        terms: &mut TermStore,
+        negate_difference_positive: bool,
+    ) -> Vec<ay_core::TermId> {
+        const WIDTH: u32 = 128;
+        let lo = terms.mk_var("auth_wide_lo", Sort::bitvec(WIDTH));
+        let hi = terms.mk_var("auth_wide_hi", Sort::bitvec(WIDTH));
+        let zero = terms.mk_bitvec(BigInt::from(0_u8), WIDTH);
+        let one = terms.mk_bitvec(BigInt::from(1_u8), WIDTH);
+        let difference = terms.mk_app(Symbol::named("bvsub"), [hi, lo], Sort::bitvec(WIDTH));
+        let difference_positive =
+            terms.mk_app(Symbol::named("bvslt"), [zero, difference], Sort::Bool);
+        let first = if negate_difference_positive {
+            terms.mk_not_raw(difference_positive)
+        } else {
+            difference_positive
+        };
+        vec![
+            first,
+            terms.mk_app(Symbol::named("bvslt"), [lo, hi], Sort::Bool),
+            terms.mk_app(Symbol::named("bvsle"), [one, lo], Sort::Bool),
+        ]
     }
 
     #[test]
@@ -1379,6 +1417,37 @@ mod authenticated_query_tests {
         let error = authenticate_bool_bv_unsat_query(&terms, &roots, None)
             .expect_err("a safe concrete addition is satisfiable");
         assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
+    }
+
+    #[test]
+    fn source_bound_query_authenticates_wide_signed_keep_max_refutation() {
+        let mut terms = TermStore::new();
+        let roots = wide_signed_keep_max_query(&mut terms, true);
+
+        let evidence = authenticate_bool_bv_unsat_query(&terms, &roots, None)
+            .expect("the wide signed keep-max contradiction must have a checked refutation");
+        assert!(evidence.is_current_for(&terms, &roots));
+    }
+
+    #[test]
+    fn source_bound_query_refuses_satisfiable_wide_signed_keep_max_twin() {
+        let mut terms = TermStore::new();
+        let roots = wide_signed_keep_max_query(&mut terms, false);
+        let error = authenticate_bool_bv_unsat_query(&terms, &roots, None)
+            .expect_err("the positive-difference twin has satisfying assignments");
+        assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
+    }
+
+    #[test]
+    fn source_bound_query_declines_width_above_internal_ceiling() {
+        const WIDTH: u32 = MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH + 1;
+        let mut terms = TermStore::new();
+        let value = terms.mk_var("auth_too_wide", Sort::bitvec(WIDTH));
+        let reflexive = terms.mk_app(Symbol::named("="), [value, value], Sort::Bool);
+        let contradiction = terms.mk_not_raw(reflexive);
+        let error = authenticate_bool_bv_unsat_query(&terms, &[contradiction], None)
+            .expect_err("widths above the internal source-checker ceiling must decline");
+        assert!(error.is_unsupported_fragment());
     }
 
     #[test]

@@ -85,35 +85,12 @@ extract_verified_section() {
     sed -n '/^## Verified/,$p' "$message_file" | sed -n '1p; 2,${ /^## /q; p; }'
 }
 
-trim_leading_whitespace() {
-    local value="$1"
-    printf '%s' "${value#"${value%%[![:space:]]*}"}"
-}
-
 is_checked_in_solver_gate_command() {
     local command="$1"
 
-    command="$(trim_leading_whitespace "$command")"
-
-    while true; do
-        if [[ "$command" == env[[:space:]]* ]]; then
-            command="$(trim_leading_whitespace "${command#env}")"
-            continue
-        fi
-
-        if [[ "$command" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+ ]]; then
-            command="${command:${#BASH_REMATCH[0]}}"
-            command="$(trim_leading_whitespace "$command")"
-            continue
-        fi
-
-        break
-    done
-
-    [[ "$command" =~ ^(\./)?target/[^[:space:]]*/ay[[:space:]]+gate[[:space:]]+solver([[:space:]]|$) ]] && return 0
-    [[ "$command" =~ ^(\./)?target/release/ay[[:space:]]+gate[[:space:]]+solver([[:space:]]|$) ]] && return 0
-    [[ "$command" =~ ^ay[[:space:]]+gate[[:space:]]+solver([[:space:]]|$) ]] && return 0
-    [[ "$command" =~ ^cargo[[:space:]]+run([[:space:]][^[:space:]]+)*[[:space:]]+--[[:space:]]+gate[[:space:]]+solver([[:space:]]|$) ]]
+    command="${command#"${command%%[![:space:]]*}"}"
+    command="${command%"${command##*[![:space:]]}"}"
+    [[ "$command" == "cargo run --locked -p ay --features cli -- gate solver" ]]
 }
 
 verified_has_solver_gate_evidence() {
@@ -209,7 +186,7 @@ check_message_and_paths() {
         echo "   Critical solver files:" >&2
         print_critical_paths "$paths_file"
         echo "   Add a line in ## Verified that runs the checked-in native solver gate, for example:" >&2
-        echo "     - solver-gate: cargo run --locked -p ay -- gate solver" >&2
+        echo "     - solver-gate: cargo run --locked -p ay --features cli -- gate solver" >&2
         echo "       [solver-gate output]" >&2
         echo "   Ad hoc cargo test or other gate lines do not satisfy this policy." >&2
         echo "" >&2
@@ -323,7 +300,7 @@ check_range() {
         echo "   Critical solver files touched somewhere in the range:" >&2
         print_critical_paths "$aggregate_paths"
         echo "   Add a line in the tip commit's ## Verified section that runs the checked-in native solver gate, for example:" >&2
-        echo "     - solver-gate: cargo run --locked -p ay -- gate solver" >&2
+        echo "     - solver-gate: cargo run --locked -p ay --features cli -- gate solver" >&2
         echo "       [solver-gate output]" >&2
         echo "" >&2
         status=1

@@ -101,16 +101,21 @@ CLAIMS = [
 # identical to a claim that passed.
 RETRACTED = [
     {"track": "sq", "division": "QF_Datatypes", "was": 394,
-     "why": "the banked run is real, but HEAD CANNOT REPRODUCE IT. Re-measured "
-            "2026-08-06 over all 395 banked-non-unknown instances: HEAD solves "
-            "198 of 394 (107 sat->unknown, 89 unsat->unknown, 0 soundness "
-            "flips), and is 27.8x slower on what it keeps. cvc5 same-metal is "
-            "385, so +9 became -187. Attribution airtight: a binary at "
-            "e22fb87f0 reproduces the banked answer on 191/199 = 96%, and the "
-            "live mechanism is still at executor/theories/euf/dt.rs:1011 -- "
-            "66538b006f made proof_tracker.enable() unconditional, so "
-            "produce_proofs_enabled() is true under --z3-mode and the DT-lazy "
-            "rollback never fires"},
+     "why": "the banked run is real, but HEAD CANNOT REPRODUCE IT. RE-MEASURED "
+            "2026-08-11 at the clean envelope (--jobs 1, memlimit 8576, above "
+            "the banked 6954), stopped at 118 of 552 once decisive: LOST 5, "
+            "GAINED 0 = 4.2%, projecting ~371 against a same-metal cvc5 385. "
+            "That is a large improvement on the 2026-08-06 reading (198 of 394, "
+            "27.8x slower) because the finite-enum pigeonhole blocker was fixed "
+            "that day -- the Bouvier vlsat3 family answers again "
+            "(TheoryLemmaKind::DatatypeEnumPigeonhole). It is still a LOSS, and "
+            "the division stays retracted. Three blockers remain, all from "
+            "66538b006 making certification mandatory: duplicate clause-trace "
+            "ids (mechanism confirmed; do NOT fix by renumbering originals, it "
+            "invalidates LRAT hints -- tried and reverted), certification "
+            "overhead pushing 550-790s solves past the 1197s cap, and array "
+            "axioms lacking a per-clause TheoryLemmaProof. Full record: "
+            "the development design notes"},
     {"track": "uc", "division": "QF_LinearIntArith", "was": 4267796,
      "why": "same-metal race LOST 1.8x: AY 1,306,544 validated vs Yices2 "
             "2,375,255. The 4,267,796 compared an unvalidated local AY figure "

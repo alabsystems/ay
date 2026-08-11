@@ -4,7 +4,7 @@
 
 //! Initial preprocessing pipeline split from `config.rs` for file-size compliance (#5142).
 
-use super::config_preprocess_cleanup::PreprocessStageControl;
+use super::config_preprocess_cleanup::{PreprocessOutcome, PreprocessStageControl};
 use super::config_preprocess_policy::{factor_dense_enabled, PreprocessPolicy};
 use super::*;
 
@@ -19,6 +19,16 @@ impl Solver {
     ///
     /// Returns true if UNSAT was detected during preprocessing.
     pub(super) fn preprocess(&mut self) -> bool {
+        matches!(
+            self.preprocess_interruptible(&|| false),
+            PreprocessOutcome::Unsat
+        )
+    }
+
+    pub(super) fn preprocess_inner<F>(&mut self, should_stop: &F) -> bool
+    where
+        F: Fn() -> bool + ?Sized,
+    {
         // #8477: Runtime disable flags for bisecting preprocessing soundness bugs.
         // These permanently disable techniques for BOTH preprocessing and inprocessing.
         // Must be processed BEFORE the no_preprocess early return so that
@@ -58,6 +68,10 @@ impl Solver {
         if sat_flags.no_preprocess {
             return false;
         }
+        // Early exits do not reach the normal tail that computes watch
+        // validity. Fail safe by requiring callers to rebuild unless the inner
+        // pipeline completes and overwrites this field.
+        self.cold.preprocess_watches_valid = false;
         let _preprocess_start = ay_core::time::Instant::now();
         let preprocess_budget_secs =
             PreprocessPolicy::budget_secs_for_counts(self.num_vars, self.arena.num_clauses());
@@ -186,7 +200,7 @@ impl Solver {
             // shape as the large-workload / compiler_consumer 300 GB incident that motivated
             // `poll_process_memory_limit_now` for the zero-conflict spin.
             self.poll_process_memory_limit_now();
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
 
@@ -247,7 +261,8 @@ impl Solver {
             }
             let _t_bcp_done = _t_bcp0.elapsed();
 
-            let (symmetry_unsat, symmetry_changed) = self.preprocess_symmetry();
+            let (symmetry_unsat, symmetry_changed) =
+                self.preprocess_symmetry_interruptible(should_stop);
             if symmetry_unsat {
                 return true;
             }
@@ -262,7 +277,7 @@ impl Solver {
             // 1. Congruence closure must run before decompose so Tarjan SCC can
             //    consume new equivalence binaries; skipping decompose here can
             //    break reconstruction when BVE later eliminates those variables (#5752).
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             // Route-aware collapse probe (#15, AY_AB_SUBST_AUTO — default ON
@@ -331,7 +346,7 @@ impl Solver {
             _t1_cong = _t0.elapsed().as_millis();
 
             // 1b. Backbone literal computation.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             // CaDiCaL runs backbone during preprocessing (internal.cpp:769)
@@ -360,7 +375,7 @@ impl Solver {
             //     equivalent variables via SCC analysis and discovering units.
             //     On crn_11_99_u, sweep finds 45 units — the single largest
             //     contributor to CaDiCaL's fixed-var count.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             // AY's sweep uses kitten-based COI probing (CaDiCaL sweep.cpp
@@ -404,7 +419,7 @@ impl Solver {
             //    and any new units discovered by backbone/sweep.
             //    Decompose stays disabled in proof modes until proof emission
             //    and final model reconstruction are both safe.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             // Decompose is gated by density (#8448): the SCC substitution
@@ -444,7 +459,7 @@ impl Solver {
                 && !skip_dense_formula
             {
                 for _round in 0..10 {
-                    if self.is_interrupted() {
+                    if self.preprocessing_should_stop(should_stop) {
                         return false;
                     }
                     let round_start = ay_core::time::Instant::now();
@@ -614,7 +629,7 @@ impl Solver {
             //       decompose(); if (ternary()) decompose();
             //     HTR resolves ternary clause pairs to derive binary resolvents
             //     that create new implication graph edges for decompose.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if self.inproc_ctrl.htr.enabled
@@ -649,7 +664,7 @@ impl Solver {
             //    before backtracking, so probing works in both DRAT and LRAT modes.
             //    Deferred from preprocessing quick path — fires in first inprocessing
             //    round at ~2K conflicts (CaDiCaL internal.cpp:695-739).
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if self.inproc_ctrl.probe.enabled
@@ -688,7 +703,7 @@ impl Solver {
             //    dominates. Threshold of 1000 vars is conservative; density >10
             //    catches clique/Ramsey-type formulas while allowing structured
             //    formulas (e.g. FmlaEquivChain at density ~3) through.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             // #8466: Removed the small-dense factorization skip (av < 1000
@@ -825,7 +840,7 @@ impl Solver {
             //     formulas. On clique formulas, factorization introduces extension
             //     variables that compress binary clause patterns -- subsumption
             //     removes the resulting redundancy (#7178 Gap A).
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if !dense_factor_bve_lrat_route
@@ -847,7 +862,7 @@ impl Solver {
             //   enables more effective variable elimination. Kissat achieves 88%
             //   vivification success on clique formulas; running vivification
             //   during preprocessing ensures AY gets the same benefit.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             {
@@ -878,7 +893,7 @@ impl Solver {
             // eliminations on LP-extracted encodings; only fires when a
             // caller arms inproc_ctrl.bce.enabled (MaxSAT one-shot), so
             // default SAT/SMT paths are bit-identical.
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if !dense_factor_bve_lrat_route
@@ -897,7 +912,7 @@ impl Solver {
             // 4d. BVE / fastelim (witness-based reconstruction, CaDiCaL approach).
             //     Preprocessing uses fastelimbound=8 and bypasses conflict-interval
             //     scheduling because num_conflicts=0 would otherwise suppress BVE (#4209).
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if self.circuit_bve_lrat_preprocess_route_active() {
@@ -928,7 +943,7 @@ impl Solver {
             //     this skips the post-BVE probing step that CaDiCaL includes.
             //     On stric-bmc-ibm-10, this is the difference between SAT (0.35s)
             //     and Unknown (timeout) when factor+sweep are both enabled (#3366).
-            if self.is_interrupted() || self.preprocess_timed_out() {
+            if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
             if self.inproc_ctrl.probe.enabled
@@ -945,6 +960,7 @@ impl Solver {
                 preprocessing_quick_mode,
                 skip_expensive_preprocessing_passes,
                 skip_dense_formula,
+                should_stop,
             );
             if cleanup.invalidated_watches {
                 watches_valid = false;
@@ -1019,10 +1035,6 @@ impl Solver {
         let base_valid = watches_valid || bve_rebuilt_watches;
         self.cold.preprocess_watches_valid = base_valid && !finalize_deleted;
 
-        // Clear the preprocessing deadline so it does not interfere with
-        // inprocessing or subsequent preprocessing calls.
-        self.cold.preprocess_deadline = None;
-
         let _t_final = _preprocess_start.elapsed();
         tracing::debug!(
             "[preprocess-final] total={:.1}ms cong={_t1_cong}ms bb={_t2_bb}ms decomp={_t3_decomp}ms factor={_t4_factor}ms bve={_t5_bve}ms probe={_t6_probe}ms gc={:.1}ms",
@@ -1063,44 +1075,9 @@ impl Solver {
         {
             return false;
         }
-        if self.preprocess() {
-            // `preprocess_once` is a one-shot lifecycle boundary even when
-            // preprocessing proves UNSAT. Its callers may intentionally defer
-            // consuming the result until their normal solve path (MaxSAT does
-            // this), so do not leave the preprocessing pipeline armed on the
-            // already-mutated clause database.
-            self.cold.preprocess_enabled = false;
-            self.cold.preprocess_deadline = None;
-            self.num_original_clauses = self.arena.active_clause_count();
-            return true; // UNSAT detected during preprocessing
-        }
-        // #8496: purge clauses referencing eliminated/substituted variables
-        // before touching watches, regardless of how preprocess() exited.
-        let finalize_deleted = self.finalize_preprocess_clause_cleanup();
-        if finalize_deleted {
-            self.cold.preprocess_watches_valid = false;
-        }
-        if !self.cold.preprocess_watches_valid {
-            self.watches.clear();
-            self.initialize_watches();
-        }
-        self.qhead = 0;
-        // BVE may have enqueued new units / added resolvents that are unit or
-        // conflict under the current (empty) assignment — propagate them.
-        if let Some(conflict_ref) = self.search_propagate() {
-            self.record_level0_conflict_chain(conflict_ref);
-            // Match the normal completion path below: UNSAT is still a
-            // completed one-shot run, not permission to preprocess again.
-            self.cold.preprocess_enabled = false;
-            self.cold.preprocess_deadline = None;
-            self.num_original_clauses = self.arena.active_clause_count();
-            return true;
-        }
-        // Disable so subsequent solve_with_assumptions calls do NOT re-run
-        // preprocessing (this is the whole point vs. option-b's rehash storm).
-        self.cold.preprocess_enabled = false;
-        self.num_original_clauses = self.arena.active_clause_count();
-        false
+        let preprocess_unsat = self.preprocess();
+        let cleanup_unsat = self.finish_initial_preprocessing();
+        preprocess_unsat || cleanup_unsat
     }
 
     /// Helper: count the number of fixed (assigned at level 0) variables.

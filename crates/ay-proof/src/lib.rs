@@ -94,9 +94,14 @@ pub use checker::recognize_nra_interval_unsat;
 pub use checker::recognize_nra_univariate_unsat;
 pub use checker::recognize_order_ite_tautology;
 pub use checker::recognize_regex_intersect_empty;
+pub use checker::recognize_regex_length_lower_bound;
 pub use checker::recognize_rounding_mode_domain;
+pub use checker::recognize_string_concat_cancellation;
+pub use checker::recognize_string_containment_identity;
 pub use checker::recognize_string_ground_eval;
+pub use checker::recognize_string_ground_factor_conflict;
 pub use checker::recognize_string_length_lemma;
+pub use checker::regex_min_length;
 pub use checker::{
     authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
     recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
@@ -123,6 +128,7 @@ pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use checker::{
     recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_rounding_mode_domain,
 };
+pub use checker::{recognize_set_card_chain_recurrence, recognize_subset_theory_lemma};
 pub use la_generic_signs::*;
 pub use partial::{check_proof_partial, PartialProofCheck};
 pub use quality::{
