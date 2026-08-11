@@ -74,6 +74,32 @@ fn test_detect_disjunctive_3_tasks_1_machine() {
     assert_eq!(skipped, 9, "should skip 6 reifs plus 3 order clauses");
 }
 
+#[test]
+fn test_detect_disjunctive_rejects_inconsistent_task_durations() {
+    let fzn = "\
+        var 0..30: s0;\n\
+        var 0..30: s1;\n\
+        var 0..30: s2;\n\
+        var bool: b01; var bool: b10;\n\
+        var bool: b02; var bool: b20;\n\
+        var bool: b12; var bool: b21;\n\
+        constraint int_lin_le_reif([1, -1], [s0, s1], -3, b01);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s0], -4, b10);\n\
+        constraint int_lin_le_reif([1, -1], [s0, s2], -5, b02);\n\
+        constraint int_lin_le_reif([1, -1], [s2, s0], -2, b20);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s2], -4, b12);\n\
+        constraint int_lin_le_reif([1, -1], [s2, s1], -2, b21);\n\
+        constraint bool_or(b01, b10, true);\n\
+        constraint bool_or(b02, b20, true);\n\
+        constraint bool_or(b12, b21, true);\n\
+        solve satisfy;\n";
+    let (_, skipped) = detect_and_count_skipped(fzn);
+    assert_eq!(
+        skipped, 0,
+        "inconsistent duration for s0 must retain every exact generated constraint"
+    );
+}
+
 /// No disjunctive pattern: int_lin_le_reif with wrong coefficients.
 /// Detection should find nothing.
 #[test]
@@ -104,6 +130,27 @@ fn test_detect_disjunctive_no_match_positive_rhs() {
         skipped, 0,
         "positive rhs should not match (not a precedence)"
     );
+}
+
+#[test]
+fn test_detect_disjunctive_rejects_negative_and_unrepresentable_durations() {
+    let negative = "\
+        var 0..10: s0; var 0..10: s1;\n\
+        var bool: b01; var bool: b10;\n\
+        constraint int_lin_le_reif([1, -1], [s0, s1], 2, b01);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s0], 2, b10);\n\
+        constraint bool_or(b01, b10, true);\n\
+        solve satisfy;\n";
+    assert_eq!(detect_and_count_skipped(negative).1, 0);
+
+    let unrepresentable = "\
+        var 0..10: s0; var 0..10: s1;\n\
+        var bool: b01; var bool: b10;\n\
+        constraint int_lin_le_reif([1, -1], [s0, s1], -9223372036854775808, b01);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s0], -1, b10);\n\
+        constraint bool_or(b01, b10, true);\n\
+        solve satisfy;\n";
+    assert_eq!(detect_and_count_skipped(unrepresentable).1, 0);
 }
 
 /// Unpaired half: only one direction. Should not create a disjunctive.

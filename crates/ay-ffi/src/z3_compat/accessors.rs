@@ -392,6 +392,17 @@ pub unsafe extern "C" fn Z3_get_app_decl(c: Z3_context, a: Z3_ast) -> Z3_func_de
                 } else {
                     (domain, lookup_public_term_sort(ctx, a, term))
                 };
+            if let Some(authenticated) = ctx
+                .ffi_func_decls
+                .values()
+                .find(|decl| {
+                    decl.declaration_identity_name() == name && decl.arity() == domain.len()
+                })
+                .cloned()
+            {
+                let instantiated = authenticated.with_instantiated_signature(domain, range);
+                return cache_func_decl_with_params(ctx, instantiated, params);
+            }
             cache_func_decl_with_params(
                 ctx,
                 ay_dpll::api::FuncDecl::new(base_name, domain, range),
@@ -486,6 +497,8 @@ pub unsafe extern "C" fn Z3_get_domain(c: Z3_context, d: Z3_func_decl, i: c_uint
     // `.decl` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
     let decl = unsafe { &(*d).decl };
+    // SAFETY: `c` is valid or null under this function's contract; `as_ref`
+    // handles null and only takes a shared borrow for the signature lookup.
     let public_signature = unsafe {
         c.as_ref()
             .and_then(|ctx| ctx.finite_set_decl_signatures.get(decl.name()))
@@ -519,6 +532,8 @@ pub unsafe extern "C" fn Z3_get_range(c: Z3_context, d: Z3_func_decl) -> Z3_sort
     // `.decl` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
     let decl = unsafe { &(*d).decl };
+    // SAFETY: `c` is valid or null under this function's contract; `as_ref`
+    // handles null and the signature map is only read.
     let sort = unsafe {
         c.as_ref()
             .and_then(|ctx| ctx.finite_set_decl_signatures.get(decl.name()))

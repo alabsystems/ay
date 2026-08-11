@@ -481,12 +481,17 @@ impl Solver {
         let verification = VerificationSummary {
             sat_model_validated: verified.was_model_validated(),
             unsat_proof_available: raw.is_unsat() && self.last_proof().is_some(),
+            unsat_proof_strictly_verified: verified.was_unsat_strictly_verified(),
+            unsat_independently_verified: verified.was_unsat_independently_verified(),
+            unsat_exact_semantically_verified: verified.was_unsat_exact_semantically_verified(),
             unsat_proof_checker_failures: statistics.get_int("proof_checker_failures").unwrap_or(0),
             sat_independent_checks: independent,
             sat_delegated_checks: delegated,
             sat_incomplete_checks: incomplete,
         };
-        let verification_level = VerificationLevel::from_state(self.is_producing_proofs());
+        let proof_checking_requested =
+            self.is_producing_proofs() || self.executor.verification_level().has_proof_checking();
+        let verification_level = VerificationLevel::from_state(proof_checking_requested);
         let limit_hit = self.last_unknown_reason.and_then(|r| match r {
             UnknownReason::Timeout => Some(LimitKind::Timeout),
             UnknownReason::MemoryLimit => Some(LimitKind::MemoryLimit),
@@ -594,6 +599,7 @@ fn default_unknown_cost_center(
             UnknownReason::MemoryLimit | UnknownReason::ResourceLimit => "memory",
             UnknownReason::InternalError => "internal-error",
             UnknownReason::SelfCheckRejected => "self-check-rejected",
+            UnknownReason::ProofTrusted => "proof-trusted",
             UnknownReason::Incomplete | UnknownReason::Unknown => "unknown",
         },
     }
@@ -622,6 +628,7 @@ fn default_unknown_detail(reason: UnknownReason) -> &'static str {
         }
         UnknownReason::InternalError => "executor returned an internal error",
         UnknownReason::SelfCheckRejected => "AY COMPUTED A VERDICT AND ITS OWN FAIL-CLOSED CHECKER REFUTED IT -- this is a caught wrong answer, not a missing capability",
+        UnknownReason::ProofTrusted => "AY COMPUTED AN UNSAT AND WITHHELD IT -- the terminal derivation chain is not trust-free, so no checker can confirm the refutation; this is a soundness gate firing, not a missing capability",
         UnknownReason::Incomplete | UnknownReason::Unknown => "solver returned Unknown",
     }
 }

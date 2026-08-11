@@ -29,7 +29,7 @@ fn check_sat_with_assertion(solver: &mut Solver, assertion: Term) -> Result<bool
     solver.try_push()?;
     let result = (|| -> Result<bool, SolverError> {
         solver.try_assert_term(assertion)?;
-        Ok(solver.check_sat() == SolveResult::Sat)
+        Ok(solver.check_sat_internal_api() == SolveResult::Sat)
     })();
     let pop_result = solver.try_pop();
 
@@ -152,7 +152,7 @@ impl Solver {
         // Collect BV variables: (name, term_id, width).
         let bv_vars: Vec<(String, Term, u32)> = self
             .declared_variables()
-            .filter_map(|(name, term)| match self.var_sorts.get(&term.0) {
+            .filter_map(|(name, term)| match self.var_sorts.get(&term.id()) {
                 Some(Sort::BitVec(bv)) if bv.width > 0 => Some((name.to_string(), term, bv.width)),
                 _ => None,
             })
@@ -161,7 +161,7 @@ impl Solver {
         // Collect Int variables: (name, term_id).
         let int_vars: Vec<(String, Term)> = self
             .declared_variables()
-            .filter_map(|(name, term)| match self.var_sorts.get(&term.0) {
+            .filter_map(|(name, term)| match self.var_sorts.get(&term.id()) {
                 Some(Sort::Int) => Some((name.to_string(), term)),
                 _ => None,
             })
@@ -205,7 +205,7 @@ impl Solver {
         int_vars: &[(String, Term)],
     ) -> Result<(), SolverError> {
         // Re-check to refresh the model inside the new scope.
-        if self.check_sat() != SolveResult::Sat {
+        if self.check_sat_internal_api() != SolveResult::Sat {
             return Err(SolverError::ModelGenerationFailed(
                 "failed to refresh SAT model before minimization".to_string(),
             ));
@@ -252,7 +252,7 @@ impl Solver {
             pin_bv_value(self, *term, &chosen, *width)?;
 
             // Re-check to refresh the model for subsequent variables.
-            if self.check_sat() != SolveResult::Sat {
+            if self.check_sat_internal_api() != SolveResult::Sat {
                 return Err(SolverError::ModelGenerationFailed(format!(
                     "model minimization produced a non-sat state while pinning `{name}`"
                 )));
@@ -290,7 +290,7 @@ impl Solver {
             pin_int_value(self, *term, &chosen)?;
 
             // Re-check to refresh the model for subsequent variables.
-            if self.check_sat() != SolveResult::Sat {
+            if self.check_sat_internal_api() != SolveResult::Sat {
                 return Err(SolverError::ModelGenerationFailed(format!(
                     "model minimization produced a non-sat state while pinning `{name}`"
                 )));

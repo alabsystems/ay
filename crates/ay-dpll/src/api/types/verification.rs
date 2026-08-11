@@ -140,7 +140,8 @@ impl From<&VerifiedSolveResult> for SolveDecision {
 /// result without inspecting scattered env vars.
 ///
 /// The levels encode two independent axes: debug assertions (compile-time)
-/// and proof production (runtime). `FullyVerified` means both are active.
+/// and fail-closed proof checking (runtime). `FullyVerified` means both are
+/// active. Proof artifact output is a separate presentation choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VerificationLevel {
@@ -151,8 +152,10 @@ pub enum VerificationLevel {
     /// verification, EUF re-checking, propagation validation).
     /// Active when `cfg(debug_assertions)` is true.
     DebugChecked,
-    /// Proof production was enabled: the solver generated a DRAT/LRAT proof
-    /// for UNSAT results or validated the model for SAT results.
+    /// Proof checking was requested: UNSAT publication requires a strict
+    /// checker-accepted refutation, while SAT publication requires a validated
+    /// model. Retaining or exporting the proof artifact is configured
+    /// separately.
     ProofChecked,
     /// Both debug-assertion checks and proof production were active.
     /// Maximum internal verification.
@@ -163,7 +166,7 @@ impl VerificationLevel {
     /// Compute the verification level from the current runtime state.
     ///
     /// Examines `cfg(debug_assertions)` (compile-time) and whether proof
-    /// production is enabled (runtime) to determine the level.
+    /// checking was requested (runtime) to determine the level.
     #[must_use]
     pub fn from_state(proofs_enabled: bool) -> Self {
         let debug = cfg!(debug_assertions);
@@ -231,11 +234,28 @@ impl std::fmt::Display for VerificationLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct VerificationSummary {
-    /// True when `validate_model()` actually ran and passed on this solve call.
-    /// False when validation was skipped (deferred, or result was UNSAT/Unknown).
+    /// True when SAT crossed a complete sealed witness-evidence lane. Usually
+    /// this means `validate_model()` ran and passed; a narrow exact semantic
+    /// theorem or total-projection certificate may instead prove the authored
+    /// formula and install its corresponding complete model. False for
+    /// UNSAT/Unknown and for any SAT candidate lacking complete evidence.
     pub sat_model_validated: bool,
     /// True when an UNSAT result has a proof artifact available.
     pub unsat_proof_available: bool,
+    /// True only when the exact-query UNSAT result consumed a strict
+    /// checker-accepted publication certificate. Proof availability or zero
+    /// recorded failures alone does not establish this claim.
+    pub unsat_proof_strictly_verified: bool,
+    /// True when strict proof checking declined a trust-family step, but a
+    /// sealed independent SAT-refutation or complete trust-discharge lane
+    /// established the exact authored query. This never means that the original
+    /// proof itself passed strict checking.
+    pub unsat_independently_verified: bool,
+    /// True only when the exact-query UNSAT result consumed the narrow,
+    /// independently checked integer-existential semantic certificate. This is
+    /// deliberately disjoint from `unsat_proof_strictly_verified` and does not
+    /// claim that an external proof artifact exists.
+    pub unsat_exact_semantically_verified: bool,
     /// Number of internal proof-checker failures recorded for the solve call.
     pub unsat_proof_checker_failures: u64,
     /// Number of assertions independently verified by the model evaluator.

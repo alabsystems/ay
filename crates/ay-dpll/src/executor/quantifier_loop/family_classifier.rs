@@ -19,7 +19,7 @@
 //!   with trigger `f(x)`). This is the first minter — the round-chaining that mints
 //!   the depth-4/5 free-var chains before search. Recognized by MIRRORING the
 //!   defining-equation head extraction of [`super::super::mbqi`]'s
-//!   `pointwise_definition_eq_head` / `quantifier_is_uf_definition` recognizers
+//!   the UF-definition head recognizer
 //!   (same completable-UF-head-over-bound-vars discipline, reusing
 //!   `is_mbqi_completable_uf_symbol` + `symbol_is_datatype_selector_or_constructor`)
 //!   and EXTENDING with the recursive-descent check those recognizers deliberately
@@ -48,10 +48,10 @@
 //!   such as a recursive definition plus its own nonneg lemma, both keyed on the
 //!   same head, is NOT a bridge and stays `Other`).
 //!
-//! - [`FamilyClass::Other`] — everything else. Every certificate-path shape lands
-//!   here: the quantifier_consumer seq-prelude model-completion axioms, the uf-completion
-//!   pointwise/constant definitions, and plain bounded finite-table foralls. This
-//!   is the fall-through, and it is deliberately the majority class.
+//! - [`FamilyClass::Other`] — everything else, including quantifier_consumer seq-prelude
+//!   axioms, UF-completion candidates, and plain bounded finite-table foralls.
+//!   Classification alone grants no SAT authority. This is the fall-through,
+//!   and it is deliberately the majority class.
 //!
 //! PRECEDENCE: `SelfChainingDefinitional` wins over `BridgeCycle` for a single
 //! forall's tag (a recursive definition that also happens to sit in a cross-vocab
@@ -219,7 +219,7 @@ impl Executor {
     /// `forall x⃗:DT. f(x⃗) = ... f(<selector-chain over a bound var>) ...`,
     /// where `head` is the defined symbol `f`.
     ///
-    /// Head recognition MIRRORS `pointwise_definition_eq_head` (mbqi.rs): `f` is a
+    /// Head recognition mirrors the MBQI UF-definition discipline: `f` is a
     /// completable free UF (not a datatype selector/constructor) applied to exactly
     /// the distinct bound variables. It DIVERGES on the value side: those
     /// recognizers require the value to be `f`-free (a pointwise definition), whereas
@@ -299,7 +299,7 @@ impl Executor {
         let TermData::App(f, hargs) = self.ctx.terms.get(head) else {
             return None;
         };
-        // Same head discipline as `pointwise_definition_eq_head`: a completable
+        // Same head discipline as the MBQI UF-definition recognizer: a completable
         // free UF, not a datatype selector/constructor.
         if hargs.is_empty()
             || !is_mbqi_completable_uf_symbol(f.name())

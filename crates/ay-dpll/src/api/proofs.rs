@@ -4,28 +4,33 @@
 
 //! Consumer-facing proof export API for UNSAT results.
 //!
-//! Provides [`UnsatProofArtifact`] as a portable proof certificate that
-//! downstream consumers (downstream proof consumers) can use without
-//! linking against executor internals, plus a strict proof verdict and
-//! consumer acceptance helpers.
+//! Provides [`UnsatProofArtifact`] as a consumer-facing proof artifact that
+//! downstream consumers (downstream proof consumers) can use without linking
+//! against executor internals, plus a native strict proof verdict and consumer
+//! acceptance helpers. Use [`SerializableProofBundle`] for a self-contained,
+//! offline-recheckable certificate; rendered Alethe may be an honest diagnostic
+//! skeleton containing `hole`.
 
 use ay_core::{AletheRule, ProofStep};
 use ay_proof::{
     check_proof_collecting_trust_with_context, check_proof_partial, check_proof_with_quality,
-    export_alethe_with_problem_scope, PartialProofCheck, ProofCheckError, ProofQuality,
+    PartialProofCheck, ProofCheckError, ProofQuality,
 };
 use num_rational::BigRational;
 
 use crate::array_proof_check::{check_array_clause, ArrayStepVerdict};
-use crate::bv_proof_check::{
-    check_bv_assertions_unsat, check_bv_clause, problem_mixes_int_and_bv, BvStepVerdict,
-};
+use crate::bv_proof_check::{check_bv_assertions_unsat, check_bv_clause, BvStepVerdict};
 
 /// Exported strict-verification verdict for an UNSAT proof artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StrictProofVerdict {
-    /// Strict proof validation succeeded with the returned quality metrics.
+    /// AY's native proof-IR validation succeeded with the returned metrics.
+    ///
+    /// This verdict does not claim that an external checker accepted the
+    /// rendered [`UnsatProofArtifact::alethe`] text. An internally supported
+    /// inference can render there as an honest `hole` when the pinned Alethe
+    /// calculus has no corresponding rule.
     Verified(ProofQuality),
     /// Strict proof validation rejected the artifact with a stable explanation.
     Rejected(String),
@@ -35,7 +40,7 @@ pub enum StrictProofVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProofAcceptanceMode {
-    /// Require strict proof validation to have succeeded.
+    /// Require AY's native strict proof validation to have succeeded.
     Strict,
     /// Require strict validation plus the restricted-rule-subset strict subset.
     RestrictedRuleSubset,
@@ -71,26 +76,34 @@ pub struct FarkasCertificate {
     pub coefficients: Vec<BigRational>,
 }
 
-/// A portable UNSAT proof certificate for downstream consumers.
+/// A consumer-facing UNSAT proof artifact for downstream consumers.
 ///
-/// Contains rendered Alethe proof text, diagnostic quality metrics, a strict
-/// proof verdict, and a restricted-rule-subset flag for consumers that need a stricter
-/// acceptance boundary than the raw solver result.
+/// Contains rendered Alethe proof text, diagnostic quality metrics, a native
+/// strict proof verdict, and a restricted-rule-subset flag for consumers that need a
+/// stricter acceptance boundary than the raw solver result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use]
 pub struct UnsatProofArtifact {
-    /// Diagnostic (non-strict) quality metrics: trust/hole/resolution/theory counts.
+    /// Diagnostic native-IR quality metrics: trust/hole/resolution/theory counts.
     ///
     /// This is a diagnostic summary. It does **not** imply full semantic
     /// verification — theory lemmas and generic rules are accepted as axioms.
-    /// Use [`strict_verdict`](Self::strict_verdict) for the exported strict verdict.
+    /// Use [`strict_verdict`](Self::strict_verdict) for the native strict verdict.
+    /// These counts describe the native IR, so `hole_count` can be zero even
+    /// when the rendered Alethe text contains a disclosed compatibility hole.
     pub quality: ProofQuality,
     /// Rendered Alethe proof text (SMT-LIB compatible).
+    ///
+    /// This may be an honestly holey diagnostic skeleton when AY's native
+    /// strict checker supports an inference that the pinned external Alethe
+    /// calculus does not. [`Self::strict_verdict`] reports validation of the
+    /// native proof IR; it is not a claim that Carcara returned `valid` for
+    /// this text. [`Self::restricted_rule_subset`] stays false for such artifacts.
     pub alethe: String,
     /// Partial check result from the internal checker.
     pub partial_check: Option<PartialProofCheck>,
-    /// Consumer-visible strict proof verdict.
+    /// Consumer-visible verdict from AY's native strict proof checker.
     pub strict_verdict: StrictProofVerdict,
     /// Whether every proof step uses only rules in the restricted-rule-subset subset
     /// **and** the proof passes strict semantic validation.
@@ -256,15 +269,11 @@ fn strict_verdict_with_deferred_trust(
     // a forged UNSAT for a satisfiable problem re-solves to SAT → Rejected, so it
     // can never produce a false-PROVE.
     //
-    // PRIMARY re-solve: a FRESH `Executor` over a CLONE of the original `TermStore`,
-    // asserting the ORIGINAL TermIds — the COMPLETE solve path (logic detection +
-    // ite-lifting + the full theory loop) on the parser-built term structure. This
-    // decides deep nested-ite LIA obligations (e.g. a 4-op chained-wrapping
-    // invariant) that the thin `Solver`+`Translator` re-build in
-    // `check_bv_assertions_unsat` re-constructs into a shape `solve_lia` leaves
-    // Unknown. `check_bv_assertions_unsat` stays as a SECONDARY for the rare cases
-    // the executor path declines. Both are independent fresh solves — a forged UNSAT
-    // re-solves to SAT and is Rejected.
+    // PRIMARY re-solve: a FRESH `Executor` over a CLONE of the original
+    // `TermStore`, asserting the ORIGINAL TermIds. Repeating the search verdict
+    // is not evidence by itself: the fresh result is accepted only when its own
+    // proof passes the plain strict checker, with no deferred-trust rescue. This
+    // prevents the same unsound engine path from corroborating itself.
     if executor_reconfirms_unsat(resolve_ctx) {
         return StrictProofVerdict::Verified(diagnostic_quality.clone());
     }
@@ -288,9 +297,10 @@ fn strict_verdict_with_deferred_trust(
 /// terms decide. This instead builds a FRESH `Executor`, sets its `TermStore` to a
 /// CLONE of the original `terms`, asserts the ORIGINAL `assertions` TermIds, and runs
 /// the full `check_sat` (logic detection → `solve_lia` with arithmetic-ite lifting).
-/// Returns `true` ONLY on an independently-reproduced UNSAT — a forged UNSAT of a
-/// satisfiable problem re-solves to SAT (or Unknown), so this can never yield a
-/// false-PROVE. Fresh executor state means it does not trust the original proof.
+/// Returns `true` only when the fresh solve both reports UNSAT and supplies a
+/// proof accepted by the plain strict checker. Fresh search state alone is not
+/// independence: without the second condition, the same wrong-UNSAT path could
+/// simply repeat and certify itself.
 fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
     if resolve_ctx.assertions.is_empty() {
         return false;
@@ -301,32 +311,25 @@ fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
     // state is fresh; `check_sat` re-encodes the assertions from scratch.
     let mut exec = crate::Executor::new();
     exec.ctx = resolve_ctx.clone();
+    executor_reports_plain_strict_unsat(&mut exec)
+}
+
+/// Re-solve one fresh executor obligation and accept UNSAT only with a plain
+/// strict proof over its exact authored roots.
+///
+/// This deliberately does not call the deferred-trust rescue: a trust-bearing
+/// proof may be the object currently being discharged, so allowing another
+/// same-engine re-solve to use the same rescue would be circular.
+fn executor_reports_plain_strict_unsat(exec: &mut crate::Executor) -> bool {
+    exec.begin_public_solve(false);
+    exec.bind_unsat_query_assumptions(&[]);
     if !matches!(exec.check_sat(), Ok(result) if result.is_unsat()) {
         return false;
     }
-
-    // MIXED Int+BV FORGED-UNSAT GUARD (fail-closed, narrow). On the BV<->LIA bridge
-    // fragment the `Executor` can close the search with a fallback step on a bridge
-    // clause it cannot actually refute — the `#nia-oom` allocation VC
-    // (`count = bv2nat(bvshl(int2bv 1, int2bv 28))` against an integer ceiling and
-    // `u64::MAX` bounds) is SATISFIABLE yet re-solves to a forged `unsat`. A
-    // re-solve is only an INDEPENDENT certificate when its own refutation is
-    // STRICTLY VERIFIED end-to-end: `check_proof_strict` rejects not only `Trust`/
-    // `Hole` placeholders (the shape #nia-oom emits) but also any unsound/
-    // unverifiable theory lemma (a bogus Farkas / bit-blast `TheoryLemma`) — the
-    // same forge re-encoded as a different step kind. A re-solve whose proof is not
-    // strictly checkable is the same forge, not a certificate, so it does not
-    // confirm. Pure-BV / pure-LIA re-solves (e.g. the deep nested-ite LIA
-    // obligations this path exists to decide) are UNAFFECTED — the strict-proof
-    // gate is applied on the mixed fragment ONLY; they keep the unconditional
-    // confirmation below.
-    if problem_mixes_int_and_bv(&resolve_ctx.terms, &resolve_ctx.assertions) {
-        let Some(proof) = exec.last_proof() else {
-            return false;
-        };
-        return exec.check_proof_strict_with_datatypes(proof).is_ok();
-    }
-    true
+    let Some(proof) = exec.last_proof() else {
+        return false;
+    };
+    exec.check_proof_strict_with_datatypes(proof).is_ok()
 }
 
 /// Fresh-re-solve forged-UNSAT guard: the DUAL of [`executor_reconfirms_unsat`].
@@ -447,9 +450,9 @@ pub(crate) fn discharge_trust_clause(
         let mut exec = crate::Executor::new();
         exec.ctx = entail;
         exec.set_deadline(Some(
-            ay_core::time::Instant::now() + std::time::Duration::from_millis(1000),
+            ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
         ));
-        if matches!(exec.check_sat(), Ok(result) if result.is_unsat()) {
+        if executor_reports_plain_strict_unsat(&mut exec) {
             return Some(());
         }
     }
@@ -471,23 +474,19 @@ pub(crate) fn discharge_trust_clause(
     // and extends it to every theory the solver can decide, without assuming
     // anything about which one the clause belongs to.
     //
-    // SOUND and fail-closed. `Unsat` is the only accepting outcome: a `Sat`
-    // means `C` is refutable and must not be accepted, and an `Unknown`/timeout
-    // means we did not establish it, so it is not accepted either. The nested
-    // solve re-enters the publication funnel, which is why the caller holds a
-    // re-entrancy guard; nested certification falls back to plain strict.
+    // SOUND and fail-closed. A repeated raw `Unsat` is not accepting evidence;
+    // the nested solve must also produce a plain-strict proof of `not C`'s
+    // inconsistency. `Sat`, `Unknown`, timeout, missing proof, or any trust/hole
+    // in that proof all decline.
     let mut probe = ay_frontend::Context::new();
     probe.terms = discharge_terms;
     probe.assertions = negated.clone();
     let mut exec = crate::Executor::new();
     exec.ctx = probe;
     exec.set_deadline(Some(
-        ay_core::time::Instant::now() + std::time::Duration::from_millis(1000),
+        ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
     ));
-    match exec.check_sat() {
-        Ok(result) if result.is_unsat() => Some(()),
-        _ => None,
-    }
+    executor_reports_plain_strict_unsat(&mut exec).then_some(())
 }
 
 /// Evaluate the proof through all three validation levels in a single pass.
@@ -667,10 +666,12 @@ impl UnsatProofArtifact {
 }
 
 impl super::Solver {
-    /// Export the last UNSAT proof as a rendered Alethe certificate with
-    /// diagnostic quality metrics, a strict verdict, and a restricted-rule-subset compatibility flag.
+    /// Export the last UNSAT proof as rendered Alethe diagnostic text with
+    /// native quality metrics, a native strict verdict, and a clean
+    /// compatibility flag.
     ///
-    /// `strict_verdict` preserves the result of `check_proof_strict`.
+    /// `strict_verdict` preserves AY's native `check_proof_strict` result; it
+    /// is not an external-checker verdict for the rendered Alethe text.
     /// `restricted_rule_subset` is `true` only when the strict verdict is verified
     /// **and** every rule is in the restricted rule whitelist. The `quality` field
     /// remains the non-strict diagnostic summary.
@@ -679,16 +680,17 @@ impl super::Solver {
     /// - The last result was not UNSAT
     /// - Proof production was not enabled
     /// - No proof was generated
+    /// - A query-sealed proof has no current authenticated Alethe surface
+    /// - Bounded Alethe rendering fails or exhausts its work budget
     #[must_use]
     pub fn export_last_unsat_artifact(&self) -> Option<UnsatProofArtifact> {
         let proof = self.executor.last_proof()?;
         let terms = self.executor.terms();
-        let problem_assertions = self.executor.problem_assertions_for_strict_proof();
-        let mut resolve_ctx = self.executor.context().clone();
-        resolve_ctx.assertions = problem_assertions;
-        let assertions = resolve_ctx.assertions.as_slice();
-
-        let alethe = export_alethe_with_problem_scope(proof, terms, assertions);
+        let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
+        let alethe = self
+            .executor
+            .try_export_last_proof_alethe_for_problem_scope()?
+            .ok()?;
         let strict_quality = self.executor.check_proof_strict_with_datatypes(proof);
         let evaluation = evaluate_proof_artifact_boundary(proof, terms, strict_quality)?;
 
@@ -699,7 +701,16 @@ impl super::Solver {
         // reasoning is accepted IFF every such clause is independently
         // re-discharged as a theory tautology (¬clause UNSAT). All other strict
         // failures stay Rejected. Stays at the strict-checked (SmtBacked) tier.
-        let strict_verdict = {
+        let strict_verdict = if finite_enum {
+            match &evaluation.strict_quality {
+                Ok(quality) => StrictProofVerdict::Verified(quality.clone()),
+                Err(error) => StrictProofVerdict::Rejected(error.to_string()),
+            }
+        } else {
+            let problem_assertions = self.executor.problem_assertions_for_strict_proof();
+            let mut resolve_ctx = self.executor.context().clone();
+            resolve_ctx.assertions = problem_assertions;
+            let assertions = resolve_ctx.assertions.as_slice();
             // Deferred-trust validation can run fresh solvers. Those are
             // semantic checks of this already-produced proof, not new caller
             // decisions, so they must preserve the sealed CNF byte-for-byte.
@@ -732,26 +743,47 @@ impl super::Solver {
     /// be re-checked OFFLINE by [`ay_proof::re_check_bundle_strict`] — with no
     /// solver run and without trusting this solver. The bundle carries the proof
     /// steps, a checker-only term snapshot (so every embedded `TermId` resolves),
-    /// and the problem's asserted obligation term ids (so the strict checker can
-    /// constrain the proof's `assume` axioms to the claimed obligation).
+    /// and its proof-authorized obligation term ids (so the strict checker can
+    /// constrain the proof's `assume` axioms to the claimed obligation). Those
+    /// ids may form an authenticated UNSAT-core subset of the full query.
     ///
     /// Offline re-checking establishes the bundle's internal soundness; it does
     /// not authenticate that the producer supplied the intended external
-    /// problem. A consumer must independently compare the assertions together
-    /// with the datatype, selector, and complete free-symbol declaration
-    /// context described by [`SerializableProofBundle`].
+    /// problem. A consumer must independently verify that every obligation
+    /// assertion is a member of the intended query and compare the datatype,
+    /// selector, and complete free-symbol declaration context described by
+    /// [`SerializableProofBundle`].
     ///
-    /// Returns `None` under the same conditions as
-    /// [`export_last_unsat_artifact`](Self::export_last_unsat_artifact): the last
-    /// result was not UNSAT, proof production was not enabled, or no proof was
-    /// generated.
+    /// Unlike [`export_last_unsat_artifact`](Self::export_last_unsat_artifact),
+    /// this native bundle does not require an authenticated Alethe surface. A
+    /// surface-less sealed finite-enum proof can therefore export a bundle even
+    /// when textual Alethe export declines. It still returns `None` when the
+    /// last result was not UNSAT, no proof was generated, or the bounded bundle
+    /// snapshot/current-query checks fail.
     #[must_use]
     pub fn export_last_unsat_bundle(&self) -> Option<ay_proof::SerializableProofBundle> {
         let proof = self.executor.last_proof()?;
         let terms = self.executor.terms();
+        let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
+        if finite_enum && !self.executor.last_proof_is_checked_finite_enum() {
+            return None;
+        }
+        let (datatype_declarations, constructor_selectors) = if finite_enum {
+            if !self
+                .executor
+                .checked_finite_enum_bundle_export_is_bounded(proof)
+            {
+                return None;
+            }
+            self.executor
+                .checked_finite_enum_export_declarations(proof)?
+        } else {
+            (
+                self.executor.datatype_decls_for_strict_proof(),
+                self.executor.ctor_selector_decls_for_strict_proof(),
+            )
+        };
         let assertions = self.executor.problem_assertions_for_strict_proof();
-        let datatype_declarations = self.executor.datatype_decls_for_strict_proof();
-        let constructor_selectors = self.executor.ctor_selector_decls_for_strict_proof();
         Some(ay_proof::SerializableProofBundle::from_proof_with_context(
             proof,
             terms,
@@ -773,18 +805,19 @@ impl super::Solver {
     /// datatype, selector, and free-symbol signature context.
     #[must_use]
     pub fn render_term_canonical(&self, term: super::Term) -> String {
-        ay_proof::render_term_canonical(self.executor.terms(), term.id())
+        let term = self.require_term("render_term_canonical", term);
+        ay_proof::render_term_canonical(self.executor.terms(), term)
     }
 
     /// Export the last UNSAT proof as rendered Alethe text.
     ///
-    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    /// Returns `None` if the last result was not UNSAT, proofs were not enabled,
+    /// no current authenticated surface is available, or rendering fails.
     #[must_use]
     pub fn export_last_proof_alethe(&self) -> Option<String> {
-        let proof = self.executor.last_proof()?;
-        let terms = self.executor.terms();
-        let assertions = self.executor.problem_assertions_for_strict_proof();
-        Some(export_alethe_with_problem_scope(proof, terms, &assertions))
+        self.executor
+            .try_export_last_proof_alethe_for_problem_scope()?
+            .ok()
     }
 
     /// Get diagnostic (non-strict) quality metrics for the last UNSAT proof.

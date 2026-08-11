@@ -224,13 +224,12 @@ pub fn compute_diff(
                     (&b.benchmark_content_hash, &h.benchmark_content_hash),
                     (Some(base), Some(head)) if base == head
                 );
-                if !resources_match || !content_matches {
-                    let reason = match (resources_match, content_matches) {
-                        (false, false) => "resource envelope and benchmark content differ",
-                        (false, true) => "resource envelope differs",
-                        (true, false) => "benchmark content differs",
-                        (true, true) => unreachable!(),
-                    };
+                if let Some(reason) = match (resources_match, content_matches) {
+                    (false, false) => Some("resource envelope and benchmark content differ"),
+                    (false, true) => Some("resource envelope differs"),
+                    (true, false) => Some("benchmark content differs"),
+                    (true, true) => None,
+                } {
                     non_comparable.push(NonComparableEntry {
                         eval_name: eval,
                         benchmark_path: bench,

@@ -34,15 +34,20 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ay_core::kani_compat::DetHashMap;
-use ay_core::term::TermData;
+use ay_core::term::{Symbol, TermData, TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::time::Instant;
 use ay_core::{Sort, TermId, TermStore};
 use ay_fp::FpModelValue;
-use ay_model_check::{ArrayValue, EvalOutcome, Evaluator, GateVerdict, ModelValue, ModelView};
+use ay_frontend::{DeclarationKind, SourceContextStamp};
+use ay_model_check::{
+    ArrayValue, EvalOutcome, Evaluator, GateVerdict, ModelValue, ModelView, ProjectionLookupError,
+    ProvenUnconstrainedKind,
+};
 
-use super::{EvalValue, Model};
+use super::{EvalValue, Model, QuantifiedConfirmationModelEpoch};
 use crate::ematching::contains_quantifier;
-use crate::executor::Executor;
+use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
+use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
@@ -52,19 +57,29 @@ use crate::logic_detection::LogicCategory;
 /// axioms in a mutated context must not replace captured source roots, and
 /// assumptions are semantically part of the query rather than optional model
 /// hints.
-fn independent_gate_query_roots(exec: &Executor) -> Vec<TermId> {
-    let mut roots = exec
-        .self_check_authored_assertions
-        .as_ref()
-        .map_or_else(|| exec.ctx.assertions.clone(), Clone::clone);
-    if let Some(assumptions) = exec.last_assumptions.as_ref() {
-        for &assumption in assumptions {
-            if !roots.contains(&assumption) {
-                roots.push(assumption);
+impl Executor {
+    /// Return the canonical ordered roots of the public query currently being
+    /// certified. Quantified theorem producers and every public model gate must
+    /// use this same constructor so temporary assumptions cannot fall outside a
+    /// certificate's authenticated root window.
+    pub(in crate::executor) fn independent_gate_query_roots(&self) -> Vec<TermId> {
+        let mut roots = self
+            .independent_gate_authored_assertions
+            .as_ref()
+            .map_or_else(|| self.ctx.assertions.clone(), Clone::clone);
+        if let Some(assumptions) = self.last_assumptions.as_ref() {
+            for &assumption in assumptions {
+                if !roots.contains(&assumption) {
+                    roots.push(assumption);
+                }
             }
         }
+        roots
     }
-    roots
+}
+
+fn independent_gate_query_roots(exec: &Executor) -> Vec<TermId> {
+    exec.independent_gate_query_roots()
 }
 
 /// Which sort kind a leaf-defining equality must produce.
@@ -330,6 +345,25 @@ impl ModelView for IndependentModelView<'_> {
         }
     }
 
+    /// Return only the exact checked projection index. The independent
+    /// evaluator owns beta reduction so its graph, memo, depth, and bindings
+    /// survive across the projection boundary.
+    fn projection_argument(&self, t: TermId) -> Result<Option<usize>, ProjectionLookupError> {
+        let result_sort = self.exec.ctx.terms.sort(t);
+        let TermData::App(symbol, arguments) = self.exec.ctx.terms.get(t) else {
+            return Ok(None);
+        };
+        self.model
+            .projection_ufs
+            .projected_argument_for_application(
+                symbol,
+                &self.exec.ctx.terms,
+                arguments,
+                result_sort,
+            )
+            .map_err(|error| ProjectionLookupError::inconsistent_model(error.to_string()))
+    }
+
     /// Datatype registry for datatypes abstracted to `Sort::Uninterpreted(name)`
     /// (the eager DtAufbv path lowers a declared datatype to an uninterpreted
     /// sort, so `(fld_rhs x)` / `(is-C x)` / `(C ..)` carry `Uninterpreted`, not
@@ -429,6 +463,69 @@ impl ModelView for IndependentModelView<'_> {
                     return Some(v);
                 }
             }
+            // A selector-bearing datatype application can still be represented
+            // by an abstract EUF class token even though the model printer has
+            // already committed that class to one concrete constructor tree.
+            // Read the printer's existing reconstruction here, just as
+            // `leaf_value` does for datatype constants, so the same published
+            // value cannot enter the congruence graph once as `Datatype` and
+            // once as `Uninterpreted`. This is deliberately restricted to the
+            // exact datatype sort and to a successfully parsed renderer result:
+            // an unresolved class remains unpinned and therefore fails closed.
+            if self.exec.selector_bearing_datatype(&sort) {
+                if let Sort::Uninterpreted(sort_name) = &sort {
+                    if let Some(rendered) = self.exec.resolve_dt_value(sort_name, t, self.model) {
+                        if let Some(value) = self.exec.parse_rendered_dt_value(&rendered, &sort) {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+            // For an all-nullary datatype, the exact EUF class may be the only
+            // model evidence tying this application to a constructor. Read the
+            // unique constructor from that class without falling back to a
+            // fabricated datatype default.
+            //
+            // #dt-app-euf-class — the SAME producer gap one level deeper, and
+            // the one that costs the FINITE-ENUM sats.
+            //
+            // For an all-nullary (enum) datatype the model commits `(f a)`'s
+            // value ONLY as an equivalence-class membership: the executor's
+            // `add_finite_enum_domain_coverage` asserts `(or (= t c0) … )`, the
+            // SAT layer picks a disjunct, and EUF merges `(f a)` into that
+            // constructor's class. But the class is NAMED by a minted
+            // `@Enum!n` representative (`ay-euf` model_extraction mints
+            // `@{sort}!{n}` for every `Sort::Uninterpreted` class, and an enum
+            // datatype is lowered to exactly that), so the branch above sees a
+            // token that is not a constructor NAME and declines, and the value
+            // reaches the gate as `Uninterpreted("@Enum!0")` — while the same
+            // value reached as a LEAF is `Datatype { ctor: "c0" }` via
+            // `nullary_constructor_leaf`. `value_eq` then reports
+            // "equality between incomparable model values (Datatype vs
+            // Uninterpreted)" and the gate CannotConfirm a correct witness:
+            //
+            //   (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+            //   (declare-fun f (Enum) Enum) (declare-const a Enum)
+            //   (assert (not (= a (f a))))     ; z3: sat — AY published unknown
+            //
+            // ONE VALUE IN TWO ENCODINGS, fixed at the PRODUCER exactly as
+            // `#dt-element-canon` prescribes: `value_eq` is untouched, and the
+            // class match is the SAME one `(get-value ((f a)))` already prints
+            // (`resolve_dt_value` strategy 2 — verified: it prints `c1`, not
+            // the canonical default `c0`, when the class holds `c1`).
+            //
+            // NOT `resolve_dt_value` itself: that function ends in
+            // `datatype_canonical_value`, a FABRICATED default for a value
+            // nothing determines. Adopting it here would be the gate inventing
+            // a value — the one thing it must never do. `dt_euf_class_constructor`
+            // is the model-reading half alone, and declines (leaving the
+            // application exactly as unpinned as today) when no unique nullary
+            // constructor shares the class.
+            if let Some(ctor) = self.exec.dt_euf_class_constructor(self.model, t) {
+                if let Some(v) = self.exec.parse_rendered_dt_value(&ctor, &sort) {
+                    return Some(v);
+                }
+            }
         }
         // An ARRAY-sorted UF application is the mirror of the datatype case
         // just above, and needs the same treatment (#seq-array-uf-def):
@@ -479,12 +576,59 @@ impl ModelView for IndependentModelView<'_> {
                     .flatten()
             })
             // LAST RESORT (#gate-scalar-uf-def): nothing in the model pins this
-            // application, but an asserted equality may DEFINE it — `(= v (f
-            // i))`, or the `(= (fp.to_real x) 5.0)` that is the sole constraint
-            // on a result SMT-LIB deliberately leaves unspecified. Placed after
-            // every model read above, so a committed value always wins and this
-            // only ever fills a hole where the gate would otherwise fail closed.
+            // genuine declared-UF application, but an asserted equality may
+            // DEFINE it — `(= v (f i))`. Theory applications are excluded by
+            // the exact declaration-kind guard; evaluator-proven unconstrained
+            // theory inputs use the separately typed method above. Placed after
+            // every model read, so a committed value always wins.
             .or_else(|| self.uf_app_definition_value(t))
+    }
+
+    /// Resolve only an evaluator-PROVEN unconstrained theory application from
+    /// an asserted definition.
+    ///
+    /// This is deliberately separate from [`Self::uf_app_value`]. A missing
+    /// committed value for an ordinary theory application is never permission
+    /// to believe the assertion that mentions it: only `ay-model-check` can mint
+    /// the typed reason after independently evaluating the arguments and proving
+    /// that SMT-LIB leaves this exact input unconstrained. We then defensively
+    /// recheck the exact canonical head and signature before consulting the same
+    /// unconditional definition index used for genuine UFs.
+    fn proven_unconstrained_app_value(
+        &self,
+        t: TermId,
+        kind: ProvenUnconstrainedKind,
+    ) -> Option<ModelValue> {
+        // Legal declarations colliding with a builtin receive a private core
+        // identity. Seeing a live declaration own one of the canonical
+        // identities means that invariant was bypassed; neither the theory head
+        // nor the definition-index control operators are then trustworthy.
+        if !self.canonical_theory_bindings_are_coherent() {
+            return None;
+        }
+
+        let TermData::App(Symbol::Named(name), args) = self.exec.ctx.terms.get(t) else {
+            return None;
+        };
+        let result_sort = self.exec.ctx.terms.sort(t);
+        let exact_shape = match (kind, name.as_str(), args.as_slice(), result_sort) {
+            (ProvenUnconstrainedKind::FpToRealNonFinite, "fp.to_real", [arg], Sort::Real) => {
+                matches!(self.exec.ctx.terms.sort(*arg), Sort::FloatingPoint(_, _))
+            }
+            (ProvenUnconstrainedKind::RealDivByZero, "/", [left, right], Sort::Real) => {
+                self.exec.ctx.terms.sort(*left) == &Sort::Real
+                    && self.exec.ctx.terms.sort(*right) == &Sort::Real
+            }
+            (ProvenUnconstrainedKind::IntDivByZero, "div", [left, right], Sort::Int)
+            | (ProvenUnconstrainedKind::IntModByZero, "mod", [left, right], Sort::Int) => {
+                self.exec.ctx.terms.sort(*left) == &Sort::Int
+                    && self.exec.ctx.terms.sort(*right) == &Sort::Int
+            }
+            _ => false,
+        };
+        exact_shape
+            .then(|| self.asserted_app_definition_value(t))
+            .flatten()
     }
 
     /// The model's committed value for an array-`select` read `t` = `(select A
@@ -550,6 +694,29 @@ impl<'a> IndependentModelView<'a> {
 }
 
 impl IndependentModelView<'_> {
+    /// Whether every live declaration at a canonical theory-operator identity
+    /// is positively owned by the theory layer.
+    ///
+    /// Source declarations that collide with builtin spellings receive private
+    /// core identities and therefore remain ordinary UFs. Declaration-activated
+    /// operators retain their canonical identities with an effective
+    /// [`DeclarationKind::Theory`]. Any other live owner at a canonical identity
+    /// means low-level registration bypassed those invariants. In that state the
+    /// definition index cannot safely interpret even its control heads (`and`,
+    /// `or`, `ite`, ...), so every assertion-derived application value must fail
+    /// closed rather than borrow authority from a forged operator.
+    fn canonical_theory_bindings_are_coherent(&self) -> bool {
+        !self.exec.ctx.symbol_iter().any(|(surface, info)| {
+            let identity = self.exec.ctx.symbol_identity_name(surface, info);
+            ay_frontend::is_canonical_theory_operator_identity(identity)
+                && self
+                    .exec
+                    .ctx
+                    .effective_declaration_kind(info.declaration_id())
+                    != Some(DeclarationKind::Theory)
+        })
+    }
+
     /// Resolve an array-variable leaf.
     ///
     /// An array variable is rarely a true free leaf: it is usually *defined* by
@@ -1116,6 +1283,13 @@ impl IndependentModelView<'_> {
     /// asserted array/datatype `(= l r)` are indexed, so this returns `t`'s
     /// entailed-equal partners — leaf aliases and `store`/`const-array` exprs.)
     fn definitions_for(&self, t: TermId, kind: DefKind) -> Vec<TermId> {
+        // This is the shared consumer boundary for array and datatype
+        // definitions. A prebuilt/shared index must not remain authoritative if
+        // a malformed live declaration owns an identity that `index_walk`
+        // interprets as a theory control head.
+        if !self.canonical_theory_bindings_are_coherent() {
+            return Vec::new();
+        }
         self.ensure_def_index();
         let idx = self.def_index.borrow();
         let Some(map) = idx.as_ref() else {
@@ -1151,6 +1325,19 @@ impl IndependentModelView<'_> {
     /// (including each `or`/`ite`), so a mis-selected branch can only surface as a
     /// `ModelViolates` (→ Unknown), never confirm a wrong witness. (#g3-or-entailed-def)
     fn ensure_def_index(&self) {
+        // `index_walk` assigns semantics to `=`, `and`, `or`, `ite`, and `if`
+        // from their canonical identities. If low-level registration let an
+        // ordinary declaration forge any canonical theory identity, none of
+        // those interpretations is authoritative. Memoize an empty index so
+        // every array/datatype/application definition fails closed, including
+        // callers that eagerly build the index before asking for a definition.
+        if !self.canonical_theory_bindings_are_coherent() {
+            self.building_index.set(false);
+            *self.def_index.borrow_mut() = Some(HashMap::new());
+            self.resolved.borrow_mut().clear();
+            self.resolved_none.borrow_mut().clear();
+            return;
+        }
         if self.def_index.borrow().is_some() || self.building_index.get() {
             return;
         }
@@ -1377,43 +1564,68 @@ impl IndependentModelView<'_> {
         // theory heads stay fail-closed here; widening `fp.to_real` at its
         // unspecified points belongs in the FP evaluator, which can tell the
         // two cases apart.
-        let TermData::App(sym, _) = self.exec.ctx.terms.get(t) else {
+        let TermData::App(sym, args) = self.exec.ctx.terms.get(t) else {
             return None;
         };
-        let name = sym.name().to_string();
-        // SECOND GATE, by NAME, over the operators SMT-LIB leaves
-        // unspecified-but-total. The declared-symbol test below already keeps
-        // every theory head out, because a theory operator is not in the
-        // front-end's symbol table — this list is what still holds if that ever
-        // stops being true (a front-end that registers a signature for a
-        // built-in, a logic in which one of these names is BOTH declarable and
-        // interpreted). Inventing a value here would confirm the witness under
-        // an interpretation the model does not hold and the printer would not
-        // emit: `(= (fp.to_real +oo) 0)` is satisfiable in the abstract, but it
-        // is not evidence about THIS model. The only cost of the redundancy is
-        // a refusal on a user function that took one of these names verbatim,
-        // and a refusal is the direction this gate is allowed to be wrong in.
-        if matches!(
-            name.as_str(),
-            "fp.to_real"
-                | "fp.min"
-                | "fp.max"
-                | "fp.to_ieee_bv"
-                | "fp.to_ubv"
-                | "fp.to_sbv"
-                | "div"
-                | "mod"
-                | "/"
-        ) {
+        // A canonical theory identity is never an ordinary UF, even when a
+        // low-level native alias incorrectly installs an Uninterpreted
+        // declaration at that exact identity. Builtin-colliding source
+        // declarations receive private core identities and remain eligible.
+        // Indexed applications are theory syntax or malformed at this generic
+        // boundary; source-declared UFs always carry a non-indexed identity.
+        if matches!(sym, Symbol::Indexed(..))
+            || ay_frontend::is_canonical_theory_operator_identity(sym.name())
+        {
             return None;
         }
+        // Positive authority only: the exact core head must resolve to a live,
+        // non-nullary declaration whose full signature matches this application
+        // and whose CURRENT semantic kind is an ordinary uninterpreted function.
+        // Never fall back from a missing core identity to a surface-name lookup:
+        // builtin-colliding declarations deliberately carry a private core
+        // identity, and accepting the builtin spelling via their surface binding
+        // would conflate two different functions. The effective-kind lookup is
+        // also load-bearing for declared functions
+        // adopted as definitional macros; their original declaration remains
+        // `Uninterpreted`, but the live interpretation is no longer free.
         let declared = self
             .exec
             .ctx
-            .symbol_info_by_identity(&name)
-            .or_else(|| self.exec.ctx.symbol_info(&name))
-            .is_some_and(|info| !info.arg_sorts.is_empty());
+            .symbol_info_by_identity(sym.name())
+            .is_some_and(|info| {
+                !info.arg_sorts.is_empty()
+                    && info.arg_sorts.len() == args.len()
+                    && info
+                        .arg_sorts
+                        .iter()
+                        .zip(args)
+                        .all(|(expected, &arg)| expected == self.exec.ctx.terms.sort(arg))
+                    && &info.sort == self.exec.ctx.terms.sort(t)
+                    && self
+                        .exec
+                        .ctx
+                        .effective_declaration_kind(info.declaration_id())
+                        == Some(DeclarationKind::Uninterpreted)
+            });
         if !declared {
+            return None;
+        }
+        self.asserted_app_definition_value(t)
+    }
+
+    /// Read one application through an unconditionally asserted equality.
+    ///
+    /// Eligibility is intentionally owned by the caller: ordinary UF lookup
+    /// first proves an exact live `DeclarationKind::Uninterpreted` binding;
+    /// typed theory lookup proves an exact allowlisted unconstrained input. This
+    /// shared core only performs the entailed-definition resolution, including
+    /// exact result-sort filtering and cycle-safe independent evaluation.
+    fn asserted_app_definition_value(&self, t: TermId) -> Option<ModelValue> {
+        // `ensure_def_index` recognizes interpreted control heads by their exact
+        // canonical identities. If an ordinary declaration has forged any such
+        // identity, even a different, legitimate UF target could otherwise
+        // inherit a conditionally asserted equality as though it were entailed.
+        if !self.canonical_theory_bindings_are_coherent() {
             return None;
         }
         let sort = self.exec.ctx.terms.sort(t).clone();
@@ -2304,8 +2516,32 @@ impl Executor {
             self.dt_registry_lookup(name)
         })
     }
+
+    /// Revoke the one-shot direct quantified-model handoff on both the
+    /// executor and the installed model it named.
+    pub(in crate::executor) fn revoke_quantified_model_confirmation_authority(&mut self) {
+        self.quantified_model_confirmation = None;
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_quantified_confirmation();
+        }
+    }
+
     /// Run the independent gate over the current `Sat` model and assertions.
     pub(in crate::executor) fn confirm_sat_with_independent_gate(&self) -> GateVerdict {
+        // Ordinary internal confirmations have no authority to skip quantified
+        // leaves. The one-shot direct handoff is available only through the
+        // designated SAT-funnel consumer below.
+        self.confirm_sat_with_independent_gate_confirmation(None)
+    }
+
+    fn confirm_sat_with_independent_gate_confirmation(
+        &self,
+        confirmation: Option<&QuantifiedModelConfirmation>,
+    ) -> GateVerdict {
+        // Select the public obligation window exactly once. Detection,
+        // certificate scope checks, quantified-leaf filtering, and the final
+        // evaluator must all refer to this same ordered root snapshot.
+        let query_roots = independent_gate_query_roots(self);
         let Some(model) = self.last_model.as_ref() else {
             return GateVerdict::CannotConfirm {
                 reason: "no model was produced".to_string(),
@@ -2324,23 +2560,51 @@ impl Executor {
         // still checks every ground sibling. This is an evidence composition,
         // not a skip: the quantified gate runs first and sets one of these
         // markers only after its own fail-closed validation succeeds.
-        let quantified_certified = self.dt_cert_grant_active
-            || self.finite_table_cert_grant_active
-            || self.bv_quantifier_full_domain_proof
-            // Read as a RAW BOOL, like its two siblings. The stat string
-            // `deferred-certified-const-interp` written at the fail-closed
-            // handoff below is NOT in the `matches!` list, so adding only the
-            // string there would never reach this consumer.
-            || self.const_interp_cert_grant_active
-            || self.mbqi_sat_cert_grant_active
-            || matches!(
-                self.last_statistics
-                    .get_string("model_check_gate.quantified"),
-                Some("confirmed" | "deferred-certified-dt")
-            );
+        let finite_table_certified = self.finite_table_cert_grant_active
+            && self
+                .finite_table_cert_witness_state
+                .as_ref()
+                .is_some_and(|state| state.is_installed_current_for(self, &query_roots, model));
+        let dt_certified = self.dt_cert_grant_active
+            && self
+                .dt_cert_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots));
+        let bv_full_domain_certified = self.bv_quantifier_full_domain_proof
+            && self
+                .bv_quantifier_full_domain_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots));
+        let const_interp_certified = self.const_interp_cert_grant_active
+            && self
+                .const_interp_cert_witness_state
+                .as_ref()
+                .is_some_and(|state| state.is_installed_current_for(self, &query_roots, model));
+        let mbqi_certified = self.mbqi_sat_cert_grant_active
+            && self
+                .mbqi_sat_cert_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots));
+        let direct_confirmation = confirmation
+            .and_then(|confirmation| confirmation.bind_current(self, &query_roots, model));
+        let directly_confirmed = direct_confirmation.is_some();
+        let quantified_certified = dt_certified
+            || finite_table_certified
+            || bv_full_domain_certified
+            || const_interp_certified
+            || mbqi_certified
+            || self
+                .cegqi_uf_recompletion_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots))
+            // The immediately preceding quantified gate checked this exact
+            // root snapshot against this exact installed model. Statistics are
+            // diagnostic only: even the string `confirmed` cannot discharge a
+            // quantified leaf without this typed, current capability.
+            || directly_confirmed;
         let mut independently_checkable = Vec::new();
         if quantified_certified {
-            for &assertion in &self.ctx.assertions {
+            for &assertion in &query_roots {
                 let mut conjuncts = Vec::new();
                 crate::executor::quantifier_loop::collect_and_conjuncts(
                     &self.ctx.terms,
@@ -2360,9 +2624,14 @@ impl Executor {
         let assertions = if quantified_certified {
             independently_checkable.as_slice()
         } else {
-            self.ctx.assertions.as_slice()
+            query_roots.as_slice()
         };
-        ay_model_check::confirm_model(&self.ctx.terms, &view, assertions)
+        let verdict = ay_model_check::confirm_model(&self.ctx.terms, &view, assertions);
+        // Keep the borrow-bound model authority alive through the complete
+        // compositional evaluation. No model mutation can interleave with this
+        // pure consumer.
+        let _confirmation_still_borrowed = direct_confirmation.as_ref();
+        verdict
     }
 
     /// Authority-grade independent confirmation for a strict-gate coverage
@@ -2452,7 +2721,7 @@ impl Executor {
         let has_dt_or_array = self.ctx.symbol_iter().any(|(name, info)| {
             info.arg_sorts.is_empty()
                 && info.term.is_some()
-                && !self.is_dt_internal_symbol(name)
+                && !self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
                 && (self.datatype_sort_name(&info.sort).is_some()
                     || matches!(info.sort, Sort::Array(_)))
         });
@@ -2465,7 +2734,7 @@ impl Executor {
             if !info.arg_sorts.is_empty() {
                 continue;
             }
-            if self.is_dt_internal_symbol(name) {
+            if self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info)) {
                 continue;
             }
             let Some(term_id) = info.term else {
@@ -2584,16 +2853,16 @@ impl Executor {
         result: SolveResult,
     ) -> SolveResult {
         if result != SolveResult::Sat {
+            self.revoke_quantified_model_confirmation_authority();
             return result;
         }
-        // Nothing to independently re-check without a model (trivially-SAT /
-        // empty-assertion paths are already validated upstream): leave the
-        // verdict untouched rather than manufacture an Unknown.
-        if self.last_model.is_none() {
-            return result;
-        }
-
-        match self.confirm_sat_with_independent_gate() {
+        let confirmation = self.quantified_model_confirmation.take();
+        let verdict = self.confirm_sat_with_independent_gate_confirmation(confirmation.as_ref());
+        // The direct quantified confirmation is a one-gate handoff, not
+        // durable SAT authority. Consume it regardless of the independent
+        // verdict so no later internal check can reuse it.
+        self.revoke_quantified_model_confirmation_authority();
+        match verdict {
             GateVerdict::ConfirmedSat => {
                 self.last_statistics
                     .set_string("model_check_gate.result", "confirmed-sat");
@@ -2741,7 +3010,7 @@ impl Executor {
     }
 
     /// Common bookkeeping for downgrading a gate-rejected `Sat` to `Unknown`.
-    fn downgrade_sat_after_gate(&mut self, detail: &str) {
+    pub(in crate::executor) fn downgrade_sat_after_gate(&mut self, detail: &str) {
         self.last_model = None;
         self.last_unknown_reason = Some(UnknownReason::Incomplete);
         self.last_statistics
@@ -2859,7 +3128,7 @@ impl Executor {
 
     /// AUTHORITATIVE-GROUND FAIL-CLOSED gate (defense in depth, #sat-chokepoint).
     ///
-    /// The independent gate now rejects every [`GateVerdict::CannotConfirm`]
+    /// The independent gate rejects every [`GateVerdict::CannotConfirm`]
     /// before this pass can observe a public `Sat`. This narrower historical
     /// classifier remains in the funnel and in direct regression tests as a
     /// second fail-closed boundary: if ordering changes, an authoritatively
@@ -3644,99 +3913,13 @@ impl Executor {
         )
     }
 
-    /// DEEP-QE RESTORE CERTIFICATE (#qe-prepass-restore-cert).
-    ///
-    /// Evidence that the emitted model satisfies every QUANTIFIED assertion of
-    /// the restored (authored) window, for the one class the deep-QE pre-pass
-    /// decides: assertions it can eliminate ENTIRELY into a quantifier-free
-    /// equivalent.
-    ///
-    /// WHY IT IS NEEDED. `qe_prepass::deep_qe` runs before the quantifier loop
-    /// and replaces such an assertion, in the SOLVED window, by its
-    /// quantifier-free equivalent — so the ground lane decides the problem
-    /// exactly. `restore_assertions` then puts the AUTHORED quantified form
-    /// back for model validation, which skips quantified assertions
-    /// (`skipped_quantifier`), and the skipped-quantifier evidence gate finds
-    /// no certificate covering them. MBQI cannot supply one (the binders range
-    /// over an infinite Int domain), so a correctly-decided `sat` was published
-    /// as `unknown` whenever a GROUND sibling was present:
-    /// `(> a 5) ∧ ∀x∃y.(y > x ∧ y > a)` measured `unknown` against z3's `sat`.
-    ///
-    /// WHY IT IS SOUND. Two independent obligations, both fail-closed:
-    ///
-    /// 1. **Equivalence.** The quantifier-free `A'` is re-derived HERE by the
-    ///    canonical pass (`deep_qe`), whose every per-variable elimination is
-    ///    gated by Cooper's / Loos-Weispfenning's own equivalence self-check
-    ///    and whose adoption is all-or-nothing — capability is not evidence, so
-    ///    a residual quantifier (or a refused/unchanged assertion) declines.
-    /// 2. **Model evidence.** `A'` must evaluate to a DEFINITE `Bool(true)`
-    ///    under the emitted model with the INDEPENDENT evaluator
-    ///    (`ay_model_check`) — the same evaluator every ground gate anchors on.
-    ///    Unevaluable, non-Boolean, or `false` all decline.
-    ///
-    /// `A ≡ A'` and `M ⊨ A'` give `M ⊨ A`. Nothing here is vacuous: an empty
-    /// quantified set declines (this certificate has no business firing when
-    /// there is nothing to certify), and clause 2 genuinely reads the model —
-    /// `∀x.(0 ≤ x ≤ 3 ⇒ x < a)` eliminates to `a > 3`, which this REJECTS at
-    /// `a = 0` and accepts at `a = 10`
-    /// (`qe_prepass_restore_cert_rejects_falsifying_model`).
-    ///
-    /// The `Sat` this admits is not published on this certificate alone: it
-    /// still passes the emission funnel's quantified gate and independent gate
-    /// over the same restored window.
-    pub(crate) fn qe_prepass_certifies_restored_quantifiers(&mut self) -> bool {
-        if self.last_model.is_none() {
-            return false;
-        }
-        // The restored (authored) assertions that still carry a quantifier.
-        let quantified: Vec<TermId> = self
-            .ctx
-            .assertions
-            .iter()
-            .copied()
-            .filter(|&a| contains_quantifier(&self.ctx.terms, a))
-            .collect();
-        // NON-VACUITY: with nothing quantified to certify this certificate
-        // must not vote. The caller's other arms own that case.
-        if quantified.is_empty() {
-            return false;
-        }
-        // (1) Re-derive the quantifier-free equivalent with the canonical pass.
-        let mut rewritten = quantified.clone();
-        crate::executor::qe_prepass::deep_qe(
-            &mut self.ctx.terms,
-            &mut rewritten,
-            self.solve_interrupt.as_deref(),
-        );
-        for (original, qf) in quantified.iter().zip(rewritten.iter()) {
-            if qf == original || contains_quantifier(&self.ctx.terms, *qf) {
-                return false;
-            }
-        }
-        // (2) Every equivalent must be DEFINITELY true under the emitted model.
-        let Some(model) = self.last_model.as_ref() else {
-            return false;
-        };
-        let view = IndependentModelView::new(self, model);
-        view.ensure_def_index();
-        for &qf in &rewritten {
-            if !matches!(
-                ay_model_check::evaluate_term(&self.ctx.terms, &view, qf),
-                EvalOutcome::Value(ModelValue::Bool(true))
-            ) {
-                return false;
-            }
-        }
-        true
-    }
-
     /// QUANTIFIED-ASSERTION fail-closed model gate (#quantified-model-gate).
     ///
     /// The independent evaluator cannot evaluate a quantifier
-    /// (`ay_model_check` reports `CannotConfirm` on `Forall`/`Exists`) and now
-    /// fails closed universally. This additional quantified-model checker can
-    /// retain SAT completeness when it independently proves the emitted model's
-    /// quantified obligations. Historically no gate checked a
+    /// (`ay_model_check` reports `CannotConfirm` on `Forall`/`Exists`). This
+    /// earlier quantified-model checker fails closed on those obligations while
+    /// retaining SAT completeness when it independently proves the emitted
+    /// model's quantified assertions. Historically no gate checked a
     /// universally quantified assertion against the concrete emitted model,
     /// and a `sat` whose model FALSIFIES its own `forall` could ship
     /// (AUFLIA `(forall i. (= (select a i) (f i)))` emitted `f := λ.1` against
@@ -3768,6 +3951,10 @@ impl Executor {
         &mut self,
         result: SolveResult,
     ) -> SolveResult {
+        // A confirmation is valid for exactly one direct handoff. Revoke any
+        // predecessor before inspecting this result, including on non-SAT and
+        // recursive paths.
+        self.revoke_quantified_model_confirmation_authority();
         if result != SolveResult::Sat {
             return result;
         }
@@ -3778,10 +3965,17 @@ impl Executor {
         if self.in_quantified_model_gate {
             return result;
         }
-        // Without an emitted model there is no witness to validate here; the
-        // other funnel gates and the validation-evidence postcondition own
-        // that case (mirrors the independent gate's no-model posture).
-        if self.last_model.is_none() {
+        // Capture one exact public obligation window and use it for every
+        // decision below, including all typed grant currentness checks and the
+        // quantified leaves sent to nested confirmation.
+        let query_roots = independent_gate_query_roots(self);
+        let query_epoch = self.query_authority_epoch.clone();
+        let source_context_stamp = self.ctx.source_context_stamp();
+        let has_quantified_assertion = query_roots
+            .iter()
+            .copied()
+            .any(|assertion| contains_quantifier(&self.ctx.terms, assertion));
+        if !has_quantified_assertion {
             return result;
         }
         // The all-or-nothing DT certificate already checked every snapshot
@@ -3790,7 +3984,12 @@ impl Executor {
         // preceding strict and independent gates still checked.  Record the
         // certificate handoff explicitly and do not let the independent gate's
         // ground-core `ConfirmedSat` marker short-circuit this provenance.
-        if self.dt_cert_grant_active {
+        if self.dt_cert_grant_active
+            && self
+                .dt_cert_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots))
+        {
             self.last_statistics
                 .set_string("model_check_gate.quantified", "deferred-certified-dt");
             return result;
@@ -3803,7 +4002,16 @@ impl Executor {
         // independent gate still checks. Without this handoff a `forall` over an
         // infinite domain is unevaluable against the ground-core model, this gate
         // fails closed, and a certified `Sat` is published as `unknown`.
-        if self.finite_table_cert_grant_active {
+        if self.finite_table_cert_grant_active
+            && self
+                .finite_table_cert_witness_state
+                .as_ref()
+                .is_some_and(|state| {
+                    self.last_model.as_ref().is_some_and(|model| {
+                        state.is_installed_current_for(self, &query_roots, model)
+                    })
+                })
+        {
             self.last_statistics.set_string(
                 "model_check_gate.quantified",
                 "deferred-certified-finite-table",
@@ -3815,7 +4023,12 @@ impl Executor {
         // exhaustive BV-MBQI enumeration, or a symbolic entailment refutation.
         // The independent evaluator still checks every ground sibling; only
         // the already-proved quantified leaves are discharged here.
-        if self.bv_quantifier_full_domain_proof {
+        if self.bv_quantifier_full_domain_proof
+            && self
+                .bv_quantifier_full_domain_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots))
+        {
             self.last_statistics.set_string(
                 "model_check_gate.quantified",
                 "deferred-certified-bv-full-domain",
@@ -3833,7 +4046,16 @@ impl Executor {
         // marker records the older certificate's provenance and this one's
         // string is dropped. That ordering is deliberate and matches the
         // existing dt-before-finite-table precedence.
-        if self.const_interp_cert_grant_active {
+        if self.const_interp_cert_grant_active
+            && self
+                .const_interp_cert_witness_state
+                .as_ref()
+                .is_some_and(|state| {
+                    self.last_model.as_ref().is_some_and(|model| {
+                        state.is_installed_current_for(self, &query_roots, model)
+                    })
+                })
+        {
             self.last_statistics.set_string(
                 "model_check_gate.quantified",
                 "deferred-certified-const-interp",
@@ -3844,23 +4066,50 @@ impl Executor {
         // through a complete finite-domain check or an explicitly constructed
         // total interpretation. Preserve that authority through the public
         // funnel while leaving every ground sibling to the independent gate.
-        if self.mbqi_sat_cert_grant_active {
+        if self.mbqi_sat_cert_grant_active
+            && self
+                .mbqi_sat_cert_query_grant
+                .as_ref()
+                .is_some_and(|grant| grant.is_current_for(self, &query_roots))
+        {
             self.last_statistics
                 .set_string("model_check_gate.quantified", "deferred-certified-mbqi-sat");
             return result;
         }
-        // `ConfirmedSat` means the independent evaluator pinned EVERY
-        // assertion (quantified included, e.g. via a true ground disjunct) to
-        // `true` — nothing left to check.
-        if self.last_statistics.get_string("model_check_gate.result") == Some("confirmed-sat") {
+        // The sealed CEGQI theorem carries the exact completed UF model used
+        // to refute every counterexample group. Its grant additionally binds
+        // that model to this query epoch, restored root vector, live source
+        // declarations, and frontend scope. Only quantified leaves are
+        // discharged; the independent gate still checks every ground sibling.
+        if self
+            .cegqi_uf_recompletion_grant
+            .as_ref()
+            .is_some_and(|grant| grant.is_current_for(self, &query_roots))
+        {
+            self.last_statistics.set_string(
+                "model_check_gate.quantified",
+                "deferred-certified-cegqi-uf-recompletion",
+            );
             return result;
         }
-
+        // A quantified `Sat` without an emitted model has no witness that any
+        // model gate can validate. In particular, CEGQI may classify an empty
+        // ground remainder as `Sat` after stripping a quantifier nested under
+        // a Boolean connective. That classification is not a certificate for
+        // the original formula, so fail closed unless one of the authenticated
+        // whole-snapshot certificate handoffs above is active.
+        if self.last_model.is_none() {
+            self.last_statistics
+                .set_string("model_check_gate.quantified", "missing-model-failclosed");
+            self.downgrade_sat_after_gate(
+                "a quantified satisfiable result had no emitted model to validate",
+            );
+            return SolveResult::Unknown;
+        }
         // Collect the quantified LEAF conjuncts of the scoped assertion set
         // (each `(and …)` assertion is true iff all its leaf conjuncts are).
-        let assertions = self.ctx.assertions.clone();
         let mut candidates: Vec<TermId> = Vec::new();
-        for &assertion in &assertions {
+        for &assertion in &query_roots {
             if !contains_quantifier(&self.ctx.terms, assertion) {
                 continue;
             }
@@ -3890,6 +4139,24 @@ impl Executor {
             return result;
         }
 
+        // Seal the exact candidate model BEFORE any nested confirmation solve.
+        // Those solves save and restore this model, but a foreign replacement,
+        // clone, query rotation, source mutation, or root-window mutation must
+        // make the eventual handoff impossible.
+        let Some(check_scope) = QuantifiedModelCheckScope::capture(
+            self,
+            query_epoch,
+            source_context_stamp,
+            &query_roots,
+        ) else {
+            self.last_statistics
+                .set_string("model_check_gate.quantified", "stale-scope-failclosed");
+            self.downgrade_sat_after_gate(
+                "the quantified-model check scope was stale before validation",
+            );
+            return SolveResult::Unknown;
+        };
+
         // One shared wall budget PER CHECK-SAT for every nested confirm (an
         // axiom-heavy problem must not multiply the budget per assertion),
         // never extending an already-tighter outer deadline. Nested solves
@@ -3908,13 +4175,6 @@ impl Executor {
         let mut deferred_any = false;
         for &conjunct in &candidates {
             if self.solve_deadline.expired() {
-                if self.quantified_conjunct_defer_eligible(conjunct) {
-                    // Out of budget, but the witness prints no interpretation
-                    // for any of this conjunct's functions — the same
-                    // deferral the full check would reach on indeterminate.
-                    deferred_any = true;
-                    continue;
-                }
                 failure = Some((
                     conjunct,
                     QuantifiedModelCheck::Indeterminate("gate budget exhausted"),
@@ -3953,6 +4213,15 @@ impl Executor {
                     );
                     SolveResult::Unknown
                 } else {
+                    let Some(confirmation) = check_scope.finish(self) else {
+                        self.last_statistics
+                            .set_string("model_check_gate.quantified", "stale-scope-failclosed");
+                        self.downgrade_sat_after_gate(
+                            "the quantified-model confirmation became stale during validation",
+                        );
+                        return SolveResult::Unknown;
+                    };
+                    self.quantified_model_confirmation = Some(confirmation);
                     self.last_statistics
                         .set_string("model_check_gate.quantified", "confirmed");
                     result
@@ -4117,14 +4386,17 @@ impl Executor {
     ///      `pins ∧ distinct ∧ matrix[sk⃗]`: UNSAT refutes (no structure at
     ///      all has a witness, so neither does the model); SAT confirms only
     ///      when CLEAN;
-    ///    * anything else (alternations, quantifiers under connectives) —
-    ///      `pins ∧ distinct ∧ conjunct` through the QE prepass; if
-    ///      quantifier-free afterwards, SAT/UNSAT map as in the existential
-    ///      route.
+    ///    * anything else (alternations, quantifiers under connectives) — the
+    ///      QE prepass may produce a quantifier-free candidate, but its bounded
+    ///      differential checks are not a proof of universal equivalence. The
+    ///      candidate therefore never confirms or refutes the source; the gate
+    ///      fails closed and leaves confirmation to the constructive witness
+    ///      route or the exact global-validity fallback.
     fn check_quantified_conjunct_against_model(
         &mut self,
         conjunct: TermId,
     ) -> QuantifiedModelCheck {
+        let source_conjunct = conjunct;
         // (1) Independent-evaluator confirm (quantifier itself is unevaluable,
         // but a surrounding connective can already pin the conjunct true).
         {
@@ -4140,6 +4412,20 @@ impl Executor {
                 return QuantifiedModelCheck::Confirmed;
             }
         }
+
+        // Exact vacuity normalization at the model-check boundary. The main
+        // quantifier pipeline may certify a solve-time snapshot after dropping
+        // an unused binder, but public SAT emission deliberately restores the
+        // authored assertion before reaching this independent gate. Re-derive
+        // only that unconditional equivalence here instead of trusting a
+        // solve-time marker:
+        //
+        //   Q x. P  ==  P, when x is not free in P
+        //
+        // for either quantifier over SMT's non-empty sorts. This is intentionally
+        // narrower than the preprocessing pass: no arithmetic feasibility,
+        // hoisting, QE, or model-dependent fold is part of the rewrite.
+        let conjunct = self.quantified_gate_drop_unused_binders(conjunct);
 
         // Shared uninterpreted-sort element context (one fresh constant per
         // model universe element, asserted pairwise-distinct exactly as the
@@ -4446,47 +4732,87 @@ impl Executor {
                 if is_universal {
                     let target = self.ctx.terms.mk_not(instance);
                     nested.push(target);
-                    let r = self.quantified_gate_isolated_solve(nested);
+                    let r = self.quantified_gate_checked_ground_solve(nested);
                     if std::env::var("AY_DEBUG_QMG").is_ok() {
                         safe_eprintln!("QMG universal nested result: {r:?}");
                     }
                     match r {
-                        SolveResult::Unsat(_) => QuantifiedModelCheck::Confirmed,
-                        SolveResult::Sat if clean => QuantifiedModelCheck::Refuted { clean: true },
-                        SolveResult::Sat => QuantifiedModelCheck::Indeterminate(
-                            "universal negation satisfiable under partial pins",
-                        ),
-                        SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
-                        SolveResult::Unknown => {
-                            QuantifiedModelCheck::Indeterminate("nested solve undecided")
+                        Some(QuantifiedGateCheckedGroundDecision {
+                            decision: CheckedGroundDecision::Unsat(proof),
+                            roots,
+                        }) => {
+                            if proof.consume(self, &roots) {
+                                QuantifiedModelCheck::Confirmed
+                            } else {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "checked universal refutation became stale",
+                                )
+                            }
                         }
+                        Some(QuantifiedGateCheckedGroundDecision {
+                            decision: CheckedGroundDecision::Sat(model),
+                            roots,
+                        }) => {
+                            if !model.consume(self, &roots) {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "checked universal witness became stale",
+                                )
+                            } else if clean {
+                                QuantifiedModelCheck::Refuted { clean: true }
+                            } else {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "universal negation satisfiable under partial pins",
+                                )
+                            }
+                        }
+                        None if closed => QuantifiedModelCheck::Deferred,
+                        None => QuantifiedModelCheck::Indeterminate("nested solve undecided"),
                     }
                 } else {
                     nested.push(instance);
-                    match self.quantified_gate_isolated_solve(nested) {
+                    match self.quantified_gate_checked_ground_solve(nested) {
                         // UNSAT over every structure: the model has no witness
                         // either — a sound refutation even under partial pins.
-                        SolveResult::Unsat(_) => QuantifiedModelCheck::Refuted { clean },
-                        SolveResult::Sat if clean => QuantifiedModelCheck::Confirmed,
-                        SolveResult::Sat => QuantifiedModelCheck::Indeterminate(
-                            "existential witness under partial pins",
-                        ),
-                        SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
-                        SolveResult::Unknown => {
-                            QuantifiedModelCheck::Indeterminate("nested solve undecided")
+                        Some(QuantifiedGateCheckedGroundDecision {
+                            decision: CheckedGroundDecision::Unsat(proof),
+                            roots,
+                        }) => {
+                            if proof.consume(self, &roots) {
+                                QuantifiedModelCheck::Refuted { clean }
+                            } else {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "checked existential refutation became stale",
+                                )
+                            }
                         }
+                        Some(QuantifiedGateCheckedGroundDecision {
+                            decision: CheckedGroundDecision::Sat(model),
+                            roots,
+                        }) => {
+                            if !model.consume(self, &roots) {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "checked existential witness became stale",
+                                )
+                            } else if clean {
+                                QuantifiedModelCheck::Confirmed
+                            } else {
+                                QuantifiedModelCheck::Indeterminate(
+                                    "existential witness under partial pins",
+                                )
+                            }
+                        }
+                        None if closed => QuantifiedModelCheck::Deferred,
+                        None => QuantifiedModelCheck::Indeterminate("nested solve undecided"),
                     }
                 }
             }
             // FORALL-EXISTS alternation: a universal prefix over a matrix
-            // that is itself existential. The general route runs FIRST and
-            // unchanged — when its `deep_qe` eliminates the alternation
-            // (Presburger/LRA) it decides the conjunct outright and this arm
-            // is byte-identical to HEAD. Only when it comes back NON-DECISIVE
-            // (a residual quantifier — the NIA alternations) does the witness
-            // route spend gate budget trying to synthesise the existential
-            // witness term. Confirm-only, so a failed synthesis leaves the
-            // general route's own fail-closed outcome exactly as it was.
+            // that is itself existential. The general route may run `deep_qe`
+            // as a candidate screen, but never treats that sampled rewrite as
+            // theorem authority. Its fail-closed result enables the
+            // constructive witness route to try an exact witness obligation.
+            // Confirm-only, so a failed synthesis leaves the general route's
+            // own fail-closed outcome exactly as it was.
             Some(true) => {
                 let general = self.quantified_gate_general_check(
                     conjunct,
@@ -4515,6 +4841,24 @@ impl Executor {
                 model_independent,
             ),
         };
+        // Prefer the model-specific check, including the constructive
+        // FORALL-EXISTS witness route above. In particular, a concrete
+        // refutation of the emitted witness must never be overridden by a
+        // stronger global-validity query. The latter is only a completeness
+        // fallback after every model-specific route could not decide the
+        // conjunct. `Deferred` is likewise undecided: it means a
+        // model-independent closed residue survived QE, not that theorem
+        // authority has already confirmed the source.
+        let outcome = match outcome {
+            undecided @ (QuantifiedModelCheck::Indeterminate(_)
+            | QuantifiedModelCheck::Deferred) => {
+                match self.certify_globally_valid_quantified_conjunct(source_conjunct) {
+                    Some(checked) => checked.confirm(self, source_conjunct),
+                    None => undecided,
+                }
+            }
+            decided => decided,
+        };
         if let QuantifiedModelCheck::Indeterminate(_) = outcome {
             // The witness prints NO interpretation for any of this
             // conjunct's uninterpreted functions, so it asserts nothing
@@ -4527,6 +4871,300 @@ impl Executor {
             }
         }
         outcome
+    }
+
+    /// Drop only semantically unused quantifier binders for the quantified
+    /// model gate.
+    ///
+    /// Binder occurrence is checked with lexical shadowing: a same-named inner
+    /// quantifier/`let` binding does not keep an outer binder alive, while a
+    /// `let` value is still inspected because simultaneous SMT-LIB bindings do
+    /// not scope over their own right-hand sides. Trigger groups mentioning a
+    /// removed binder are discarded; triggers guide matching but do not change
+    /// quantifier semantics.
+    fn quantified_gate_drop_unused_binders(&mut self, root: TermId) -> TermId {
+        let mut memo: DetHashMap<TermId, TermId> = DetHashMap::default();
+        self.quantified_gate_drop_unused_binders_rec(root, &mut memo)
+    }
+
+    fn quantified_gate_drop_unused_binders_rec(
+        &mut self,
+        term: TermId,
+        memo: &mut DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&normalized) = memo.get(&term) {
+            return normalized;
+        }
+        let normalized = match self.ctx.terms.get(term).clone() {
+            TermData::Const(_) | TermData::Var(..) => term,
+            TermData::App(symbol, arguments) => {
+                let normalized_arguments: Vec<TermId> = arguments
+                    .iter()
+                    .map(|&argument| self.quantified_gate_drop_unused_binders_rec(argument, memo))
+                    .collect();
+                if normalized_arguments == arguments {
+                    term
+                } else {
+                    let sort = self.ctx.terms.sort(term).clone();
+                    self.ctx.terms.mk_app(symbol, normalized_arguments, sort)
+                }
+            }
+            TermData::Not(inner) => {
+                let normalized_inner = self.quantified_gate_drop_unused_binders_rec(inner, memo);
+                if normalized_inner == inner {
+                    term
+                } else {
+                    self.ctx.terms.mk_not(normalized_inner)
+                }
+            }
+            TermData::Ite(condition, then_term, else_term) => {
+                let normalized_condition =
+                    self.quantified_gate_drop_unused_binders_rec(condition, memo);
+                let normalized_then = self.quantified_gate_drop_unused_binders_rec(then_term, memo);
+                let normalized_else = self.quantified_gate_drop_unused_binders_rec(else_term, memo);
+                if normalized_condition == condition
+                    && normalized_then == then_term
+                    && normalized_else == else_term
+                {
+                    term
+                } else {
+                    self.ctx
+                        .terms
+                        .mk_ite(normalized_condition, normalized_then, normalized_else)
+                }
+            }
+            TermData::Let(bindings, body) => {
+                let normalized_bindings: Vec<(String, TermId)> = bindings
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            self.quantified_gate_drop_unused_binders_rec(*value, memo),
+                        )
+                    })
+                    .collect();
+                let normalized_body = self.quantified_gate_drop_unused_binders_rec(body, memo);
+                if normalized_bindings == bindings && normalized_body == body {
+                    term
+                } else {
+                    self.ctx.terms.mk_let(normalized_bindings, normalized_body)
+                }
+            }
+            TermData::Forall(vars, body, triggers) => {
+                let normalized_body = self.quantified_gate_drop_unused_binders_rec(body, memo);
+                let kept: Vec<(String, Sort)> = vars
+                    .iter()
+                    .filter(|(name, _)| {
+                        self.quantified_gate_name_occurs_free(normalized_body, name)
+                    })
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    normalized_body
+                } else if kept.len() == vars.len() && normalized_body == body {
+                    term
+                } else {
+                    let triggers = self.quantified_gate_retain_triggers(&triggers, &vars, &kept);
+                    self.ctx
+                        .terms
+                        .mk_forall_with_triggers(kept, normalized_body, triggers)
+                }
+            }
+            TermData::Exists(vars, body, triggers) => {
+                let normalized_body = self.quantified_gate_drop_unused_binders_rec(body, memo);
+                let kept: Vec<(String, Sort)> = vars
+                    .iter()
+                    .filter(|(name, _)| {
+                        self.quantified_gate_name_occurs_free(normalized_body, name)
+                    })
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    normalized_body
+                } else if kept.len() == vars.len() && normalized_body == body {
+                    term
+                } else {
+                    let triggers = self.quantified_gate_retain_triggers(&triggers, &vars, &kept);
+                    self.ctx
+                        .terms
+                        .mk_exists_with_triggers(kept, normalized_body, triggers)
+                }
+            }
+            // `TermData` is non-exhaustive. A future term form is retained
+            // byte-for-byte until its binding semantics are audited here.
+            _ => term,
+        };
+        memo.insert(term, normalized);
+        normalized
+    }
+
+    /// Whether `target` occurs free with respect to a quantifier that binds it
+    /// outside `term`.
+    fn quantified_gate_name_occurs_free(&self, term: TermId, target: &str) -> bool {
+        match self.ctx.terms.get(term) {
+            TermData::Var(name, _) => name == target,
+            TermData::App(_, arguments) => arguments
+                .iter()
+                .any(|&argument| self.quantified_gate_name_occurs_free(argument, target)),
+            TermData::Not(inner) => self.quantified_gate_name_occurs_free(*inner, target),
+            TermData::Ite(condition, then_term, else_term) => {
+                self.quantified_gate_name_occurs_free(*condition, target)
+                    || self.quantified_gate_name_occurs_free(*then_term, target)
+                    || self.quantified_gate_name_occurs_free(*else_term, target)
+            }
+            TermData::Let(bindings, body) => {
+                bindings
+                    .iter()
+                    .any(|(_, value)| self.quantified_gate_name_occurs_free(*value, target))
+                    || (!bindings.iter().any(|(name, _)| name == target)
+                        && self.quantified_gate_name_occurs_free(*body, target))
+            }
+            TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
+                !vars.iter().any(|(name, _)| name == target)
+                    && self.quantified_gate_name_occurs_free(*body, target)
+            }
+            TermData::Const(_) => false,
+            _ => false,
+        }
+    }
+
+    fn quantified_gate_retain_triggers(
+        &self,
+        triggers: &[Vec<TermId>],
+        all_vars: &[(String, Sort)],
+        kept: &[(String, Sort)],
+    ) -> Vec<Vec<TermId>> {
+        let dropped: Vec<&str> = all_vars
+            .iter()
+            .filter(|(name, _)| !kept.iter().any(|(kept_name, _)| kept_name == name))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        triggers
+            .iter()
+            .filter(|group| {
+                group.iter().all(|&trigger| {
+                    dropped
+                        .iter()
+                        .all(|name| !self.quantified_gate_name_occurs_free(trigger, name))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Prove a quantified conjunct independently of the retained model.
+    ///
+    /// Negative-polarity deep Skolemization produces an equisatisfiable NNF
+    /// representation of `not source`. Only a quantifier-free residue may enter
+    /// the isolated solver. A definitive UNSAT therefore proves `source` valid
+    /// in every interpretation; any alternation residue, stop, source-context
+    /// change, or non-UNSAT result declines without minting authority.
+    fn certify_globally_valid_quantified_conjunct(
+        &mut self,
+        source: TermId,
+    ) -> Option<GloballyValidQuantifiedConjunct> {
+        if self.should_abort_theory_loop() {
+            return None;
+        }
+
+        // The source-to-ground implication is intentionally tiny and exact:
+        // only a trigger-free top-level, single-binder forall with a
+        // quantifier-free body. Triggers are semantically annotations, but
+        // excluding them keeps this proof kernel's source reconstruction
+        // byte-exact instead of silently discarding authored metadata.
+        // Deep/nested and multi-binder Skolemization remain useful candidate
+        // transforms elsewhere, but their richer dependency/capture rules are
+        // not theorem authority for this fallback.
+        let (binder_name, binder_sort, body) = match self.ctx.terms.get(source).clone() {
+            TermData::Forall(binders, body, triggers)
+                if binders.len() == 1 && triggers.is_empty() =>
+            {
+                let (name, sort) = binders.into_iter().next()?;
+                if contains_quantifier(&self.ctx.terms, body) {
+                    return None;
+                }
+                (name, sort, body)
+            }
+            _ => return None,
+        };
+
+        let source_context_stamp = self.ctx.source_context_stamp();
+        let term_count_before = self.ctx.terms.len();
+        let (negated, provenance) =
+            crate::skolemize::skolemize_deep_with_provenance(&mut self.ctx.terms, source, false);
+        let negated = negated?;
+        let [provenance] = provenance.as_slice() else {
+            return None;
+        };
+        if provenance.quantified != source
+            || contains_quantifier(&self.ctx.terms, negated)
+            || self.should_abort_theory_loop()
+        {
+            return None;
+        }
+
+        // Authenticate the actual witness minted by Skolemization. Registry
+        // membership is creation-site provenance rather than a name-prefix
+        // heuristic; the term-index bounds additionally prove this live Var
+        // was appended by this exact transformation, not borrowed from the
+        // pre-existing source universe.
+        let TermData::Var(witness_name, _) = self.ctx.terms.get(provenance.witness) else {
+            return None;
+        };
+        if (provenance.witness.0 as usize) < term_count_before
+            || (provenance.witness.0 as usize) >= self.ctx.terms.len()
+            || self.ctx.terms.sort(provenance.witness) != &binder_sort
+            || !self.ctx.terms.is_skolem_symbol(witness_name)
+        {
+            return None;
+        }
+
+        // Recompute the exact source-body substitution independently of the
+        // provenance record, then require the returned root to be the literal
+        // negation of that same instance. Any folding or different rewrite
+        // shape declines; it can cost completeness but cannot launder a nearby
+        // formula's ground proof into authority for `source`.
+        let mut substitution: DetHashMap<String, TermId> = DetHashMap::default();
+        substitution.insert(binder_name, provenance.witness);
+        let recomputed =
+            crate::ematching::subst_vars_exact_qf(&mut self.ctx.terms, body, &substitution)?;
+        if recomputed != provenance.instance
+            || !matches!(
+                self.ctx.terms.get(negated),
+                TermData::Not(instance) if *instance == recomputed
+            )
+        {
+            return None;
+        }
+
+        // Do not run this theorem query on the outer Executor. In particular,
+        // `active_support_axioms` contains ground instances that are valid only
+        // under the OUTER asserted foralls. Letting one of those instances into
+        // a refutation of `not source` would be circular: a consequence of
+        // `source` is not an admissible premise for proving `source` globally
+        // valid. The disposable helper clones only the frontend Context into a
+        // fresh Executor, so support axioms, semantic-verification memos, proof
+        // state, models, and every other solve-derived artifact all start empty
+        // and die with the probe.
+        let roots = vec![negated];
+        let checked = self.checked_ground_solve(roots.clone(), LogicCategory::Other, 500)?;
+        let verified_unsat = match checked {
+            CheckedGroundDecision::Unsat(proof) => proof.consume(self, &roots),
+            CheckedGroundDecision::Sat(_) => false,
+        };
+        if !verified_unsat
+            || self.should_abort_theory_loop()
+            || source_context_stamp != self.ctx.source_context_stamp()
+        {
+            return None;
+        }
+        Some(GloballyValidQuantifiedConjunct {
+            source,
+            query_epoch: self.query_authority_epoch.clone(),
+            source_context_stamp,
+            roots: independent_gate_query_roots(self).into(),
+            term_snapshot: self.ctx.terms.snapshot_stamp(),
+        })
     }
 
     /// FORALL-EXISTS route (#quantified-model-gate alternation): confirm
@@ -4546,7 +5184,7 @@ impl Executor {
     /// `deep_qe`, which is a Presburger/LRA elimination: it leaves an
     /// NIA alternation exactly as it found it, and
     /// [`Self::quantified_gate_general_check`] then refuses the residual
-    /// quantifier. `quantified_gate_isolated_solve` likewise refuses any
+    /// quantifier. `quantified_gate_checked_ground_solve` likewise refuses any
     /// quantified assertion outright. So a ∀∃ conjunct has NO ground instance
     /// for the gate to evaluate and every lane ends in `Deferred` /
     /// `Indeterminate`, i.e. a published `unknown`.
@@ -4711,15 +5349,21 @@ impl Executor {
             nested.extend(elems.distinct_assertions(&mut self.ctx.terms));
             let target = self.ctx.terms.mk_not(instance);
             nested.push(target);
-            let result = self.quantified_gate_isolated_solve(nested);
+            let result = self.quantified_gate_checked_ground_solve(nested);
             if debug {
                 safe_eprintln!(
                     "QMG forall-exists witness obligation: not {} -> {result:?}",
                     self.format_term(instance)
                 );
             }
-            if matches!(result, SolveResult::Unsat(_)) {
-                return Some(QuantifiedModelCheck::Confirmed);
+            if let Some(QuantifiedGateCheckedGroundDecision {
+                decision: CheckedGroundDecision::Unsat(proof),
+                roots,
+            }) = result
+            {
+                if proof.consume(self, &roots) {
+                    return Some(QuantifiedModelCheck::Confirmed);
+                }
             }
         }
         None
@@ -4816,11 +5460,15 @@ impl Executor {
         out
     }
 
-    /// General/alternation route: decide `pins ∧ distinct ∧ conjunct` after
-    /// the QE prepass, with function interpretations substituted first. Only a
-    /// QUANTIFIER-FREE residue is solved (`deep_qe` is an equivalence
-    /// transform — the same pass the main pipeline applies to the assertion
-    /// set); any residual quantifier fails closed.
+    /// General/alternation candidate screen.
+    ///
+    /// `deep_qe` is guarded by bounded differential testing, which is useful
+    /// for finding candidate residues but is not a universal equivalence proof.
+    /// Consequently neither a SAT nor an UNSAT solve of its quantifier-free
+    /// residue is authority about the authored quantified conjunct. This route
+    /// always fails closed; exact confirmation remains available through the
+    /// constructive forall-exists witness route and the isolated
+    /// global-validity proof fallback.
     fn quantified_gate_general_check(
         &mut self,
         conjunct: TermId,
@@ -4852,29 +5500,33 @@ impl Executor {
         // alternations, quantifiers under `=>`/`or`/`ite`/`not not`).
         let closed =
             model_independent && clean && pins.equalities.is_empty() && elems.by_token.is_empty();
-        if nested
+        let has_residual_quantifier = nested
             .iter()
-            .any(|&t| contains_quantifier(&self.ctx.terms, t))
-        {
+            .any(|&t| contains_quantifier(&self.ctx.terms, t));
+        if std::env::var("AY_DEBUG_QMG").is_ok() {
+            safe_eprintln!(
+                "QMG general clean={clean} closed={closed} total={} ufs_complete={ufs_complete} residual_quantifier={has_residual_quantifier}",
+                pins.total
+            );
+            for &term in &nested {
+                safe_eprintln!("QMG general assertion: {}", self.format_term(term));
+            }
+        }
+        if has_residual_quantifier {
             if closed {
                 return QuantifiedModelCheck::Deferred;
             }
             return QuantifiedModelCheck::Indeterminate("residual quantifier after QE");
         }
-        match self.quantified_gate_isolated_solve(nested) {
-            // `pins ∧ conjunct` UNSAT over every structure refutes the model
-            // (the model satisfies the pins by construction).
-            SolveResult::Unsat(_) => QuantifiedModelCheck::Refuted { clean },
-            // With a CLEAN check the conjunct's truth depends only on symbol
-            // values every pin forces to the model's, so SAT is truth in the
-            // emitted model.
-            SolveResult::Sat if clean => QuantifiedModelCheck::Confirmed,
-            SolveResult::Sat => {
-                QuantifiedModelCheck::Indeterminate("QE residue satisfiable under partial pins")
-            }
-            SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
-            SolveResult::Unknown => QuantifiedModelCheck::Indeterminate("nested solve undecided"),
-        }
+        // Do not solve the candidate and map its result back to the source.
+        // Without a proof that `deep_qe` preserved this exact formula in both
+        // directions, either mapping would be circular authority: SAT could
+        // confirm a false source, and UNSAT could spuriously refute a valid
+        // emitted model. The exact routes following this function own both
+        // decisions.
+        QuantifiedModelCheck::Indeterminate(
+            "quantifier-free QE candidate lacks exact equivalence authority",
+        )
     }
 
     /// EXACT ground-value folding (#quantified-model-gate): replace every
@@ -5081,40 +5733,6 @@ impl Executor {
     /// function from the map, leaving its applications FREE in the nested
     /// solve (which can only weaken a confirm into a fail-close, never
     /// fabricate a refutation: refutes require the CLEAN flag).
-    /// Cheap defer-eligibility check (#quantified-model-gate): whether
-    /// `conjunct` has at least one declared arity>0 function head and NONE of
-    /// its heads has a printed interpretation (no EUF function table) — the
-    /// same condition the full check derives, computable without any solving
-    /// when the gate budget is already exhausted.
-    fn quantified_conjunct_defer_eligible(&self, conjunct: TermId) -> bool {
-        let declared: HashSet<String> = self
-            .ctx
-            .symbol_iter()
-            .filter(|(_, info)| !info.arg_sorts.is_empty())
-            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
-            .collect();
-        let mut has_head = false;
-        let mut stack = vec![conjunct];
-        let mut seen: HashSet<TermId> = HashSet::default();
-        let euf = self.last_model.as_ref().and_then(|m| m.euf_model.as_ref());
-        while let Some(t) = stack.pop() {
-            if !seen.insert(t) {
-                continue;
-            }
-            if let TermData::App(sym, args) = self.ctx.terms.get(t) {
-                if !args.is_empty() && declared.contains(sym.name()) {
-                    has_head = true;
-                    if euf.is_some_and(|e| e.function_tables.contains_key(sym.name())) {
-                        // A printed interpretation exists: not defer-eligible.
-                        return false;
-                    }
-                }
-            }
-            stack.extend(self.ctx.terms.children(t));
-        }
-        has_head
-    }
-
     /// Returns the interpretation map plus `defer_ok`: whether the conjunct
     /// HAS at least one uninterpreted-function head and NONE of its heads has
     /// a printed interpretation (no EUF function table).
@@ -5220,6 +5838,56 @@ impl Executor {
                 Some(QmgRowVal::Literal(raw.to_string()))
             };
             'next_fn: for name in &heads {
+                // Certificate-built total tables have an exact typed source.
+                // Consume it directly instead of reparsing the separately
+                // rendered EUF table (`-1`/`(- 1)`, Real decimal spellings,
+                // and placeholder resolution must not change the model the
+                // SAT certificate proved).
+                if let Some(total) = model.certified_total_ufs.by_symbol.get(name) {
+                    let (arg_sorts, result_sort) = declared[name].clone();
+                    if total.arg_sorts != arg_sorts
+                        || total.result_sort != result_sort
+                        || total.rows.len() >= QUANTIFIED_GATE_MAX_UF_ROWS
+                    {
+                        if qmg_debug {
+                            safe_eprintln!(
+                                "QMG interp {name}: dropped (typed total-table signature/size mismatch)"
+                            );
+                        }
+                        deferable_heads += 1;
+                        continue;
+                    }
+                    let mut rows: Vec<(Vec<QmgRowVal>, QmgRowVal)> = total
+                        .rows
+                        .iter()
+                        .map(|(args, value)| {
+                            (
+                                args.iter().cloned().map(QmgRowVal::Eval).collect(),
+                                QmgRowVal::Eval(value.clone()),
+                            )
+                        })
+                        .collect();
+                    // Phase B treats the final row's result as the else branch;
+                    // its argument tuple is converted but never used.
+                    let carrier = arg_sorts
+                        .iter()
+                        .map(|_| {
+                            QmgRowVal::Eval(EvalValue::Rational(
+                                num_rational::BigRational::from_integer(num_bigint::BigInt::from(
+                                    0,
+                                )),
+                            ))
+                        })
+                        .collect();
+                    rows.push((carrier, QmgRowVal::Eval(total.default.clone())));
+                    collected.push(RowValues {
+                        name: name.clone(),
+                        arg_sorts,
+                        result_sort,
+                        rows,
+                    });
+                    continue;
+                }
                 if euf.function_table_conflicts.contains(name) {
                     if qmg_debug {
                         safe_eprintln!("QMG interp {name}: dropped (table conflict)");
@@ -5812,114 +6480,28 @@ impl Executor {
         rewritten
     }
 
-    /// Isolated nested solve of a QUANTIFIER-FREE assertion list, with the
-    /// FULL nested-solve state discipline: every piece of verdict/model/
-    /// validation state the solve can perturb is saved and restored
-    /// (`ctx.assertions`, `incr_theory_state`, `incr_bv_state`, `last_model`,
-    /// `last_model_validated`, `last_validation_stats`, `last_unknown_reason`,
-    /// `defer_model_validation`, `last_result`, `skip_model_eval`;
-    /// `last_statistics` is snapshotted by the gate driver). The outer `Sat`
-    /// therefore keeps its own witness on the CONFIRM leg — the nested solve
-    /// can never ship a nulled/foreign model. Runs `solve_for_category`
-    /// directly (below the emit funnel), so no gate/certificate/proof machinery
-    /// re-enters; anything unclassifiable or undecided returns `Unknown`.
-    fn quantified_gate_isolated_solve(&mut self, mut assertions: Vec<TermId>) -> SolveResult {
+    /// Check one quantifier-free gate obligation through the public verdict
+    /// funnels on a disposable executor, then consume the resulting affine
+    /// decision only while its exact ordered roots and every outer authority
+    /// binding remain current. Raw `solve_for_category` results never cross
+    /// this boundary: SAT requires an independently validated model and UNSAT
+    /// requires a strictly verified proof.
+    fn quantified_gate_checked_ground_solve(
+        &mut self,
+        assertions: Vec<TermId>,
+    ) -> Option<QuantifiedGateCheckedGroundDecision> {
         if assertions
             .iter()
             .any(|&t| contains_quantifier(&self.ctx.terms, t))
         {
-            return SolveResult::Unknown;
+            return None;
         }
-        // Slice the gate budget per nested solve: one undecidable nested
-        // problem must not starve the remaining conjuncts' checks.
-        let saved_deadline = self.solve_deadline.get();
-        let slice = Instant::now() + Duration::from_millis(500);
-        self.set_deadline(match saved_deadline {
-            Some(d) if d < slice => Some(d),
-            _ => Some(slice),
-        });
-        // The model-table expansion used by the quantified gate naturally
-        // produces obligations of the form
-        //
-        //   not (= p (and p q_1 ... q_n)).
-        //
-        // Sending that spelling directly through Tseitin + LIA makes the
-        // solver enumerate hundreds of mutually exclusive disequalities.  In
-        // the mid-range Bool-UF certificate this occasionally consumed the
-        // entire 500 ms fail-closed slice under host load even though the
-        // obligation has the exact Boolean normal form `p /\ !(and q_i)`.
-        // Normalize only this top-level, equivalence-preserving absorption
-        // identity before theory dispatch.  It exposes `p` as a unit; the
-        // ordinary LIA VariableSubstitution pass then folds the residue to
-        // false deterministically.  The slice itself stays unchanged, and
-        // every unrecognized shape still follows the existing Unknown path.
-        // DT certificate search consumes similarly shaped Int-returning
-        // tables, but relies on their original Boolean skeleton to complete a
-        // model.  Keep this UFLIA completeness aid out of every context with
-        // datatype declarations; the target Bool-UF/Int lane has none.
-        let has_datatype_declarations = self.ctx.datatype_iter().next().is_some();
-        if !has_datatype_declarations {
-            for assertion in &mut assertions {
-                *assertion = quantified_gate_simplify_negated_absorbed_bool_eq(
-                    &mut self.ctx.terms,
-                    *assertion,
-                );
-            }
-        }
-        // Same Nelson-Oppen purification the top-level pipeline applies —
-        // skolem UF applications inside arithmetic stay related to it.
-        crate::executor::purify_int_uf_arith::purify_int_uf_arith(
-            &mut self.ctx.terms,
-            &mut assertions,
-        );
-        let (category, _) = self.detect_logic_category(&assertions);
-        if matches!(category, LogicCategory::Other) {
-            // The slice is nested-solve-local.  Even an unsupported category
-            // must not leak the shortened deadline into the outer solve.
-            self.set_deadline(saved_deadline);
-            return SolveResult::Unknown;
-        }
-
-        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, assertions);
-        let saved_theory_state = self.incr_theory_state.take();
-        let saved_bv_state = self.incr_bv_state.take();
-        let saved_model = self.last_model.take();
-        let saved_model_validated = self.last_model_validated;
-        let saved_validation_stats = self.last_validation_stats.take();
-        let saved_unknown_reason = self.last_unknown_reason;
-        let saved_defer = self.defer_model_validation;
-        let saved_last_result = self.last_result.take();
-        let saved_skip_model_eval = self.skip_model_eval;
-        // A nested UNSAT builds a proof of the NESTED formula; without this
-        // save/restore the outer (kept-`Sat`) solve would carry a foreign
-        // `last_proof` that a later Alethe export could surface.
-        let saved_proof = self.last_proof.take();
-        let saved_proof_overrides = self.last_proof_term_overrides.take();
-        let saved_proof_quality = self.last_proof_quality.take();
-        let saved_qfax_refinement = self.qfax_refinement_clause.take();
-        let saved_rejected_array = self.last_rejected_array_assertion.take();
-        self.defer_model_validation = false;
-
-        let result = self.solve_for_category(category);
-
-        self.ctx.assertions = saved_assertions;
-        self.incr_theory_state = saved_theory_state;
-        self.incr_bv_state = saved_bv_state;
-        self.last_model = saved_model;
-        self.last_model_validated = saved_model_validated;
-        self.last_validation_stats = saved_validation_stats;
-        self.last_unknown_reason = saved_unknown_reason;
-        self.defer_model_validation = saved_defer;
-        self.last_result = saved_last_result;
-        self.skip_model_eval = saved_skip_model_eval;
-        self.last_proof = saved_proof;
-        self.last_proof_term_overrides = saved_proof_overrides;
-        self.last_proof_quality = saved_proof_quality;
-        self.qfax_refinement_clause = saved_qfax_refinement;
-        self.last_rejected_array_assertion = saved_rejected_array;
-        self.set_deadline(saved_deadline);
-
-        result.unwrap_or(SolveResult::Unknown)
+        let roots = assertions;
+        let decision = self.checked_ground_solve(roots.clone(), LogicCategory::Other, 500)?;
+        Some(QuantifiedGateCheckedGroundDecision {
+            decision,
+            roots: roots.into(),
+        })
     }
 
     /// Build the MODEL PINS for `conjunct`: one `(= leaf <value-term>)` per
@@ -6146,92 +6728,127 @@ impl Executor {
     }
 }
 
-/// Return the integer variable selected by a point equality such as `x = 7`.
-fn quantified_gate_int_point_variable(terms: &TermStore, term: TermId) -> Option<TermId> {
-    let TermData::App(equality, args) = terms.get(term) else {
-        return None;
-    };
-    if equality.name() != "=" || args.len() != 2 {
-        return None;
-    }
-    for (variable, point) in [(args[0], args[1]), (args[1], args[0])] {
-        if matches!(terms.get(variable), TermData::Var(..))
-            && terms.sort(variable) == &Sort::Int
-            && matches!(terms.get(point), TermData::Const(ay_core::Constant::Int(_)))
-        {
-            return Some(variable);
-        }
-    }
-    None
+/// Sealed handoff proving that the direct quantified-model gate confirmed
+/// every quantified leaf of one exact public obligation window against one
+/// exact installed model.
+///
+/// The constructor and fields stay in this module.  A diagnostic statistic, a
+/// solver routing Boolean, or another certificate therefore cannot mint this
+/// authority.  The compositional independent gate accepts it only while every
+/// query/source/root/model binding remains current, then the SAT funnel
+/// consumes it.
+#[must_use = "quantified model confirmation must reach the independent gate"]
+#[derive(Debug)]
+pub(in crate::executor) struct QuantifiedModelConfirmation {
+    query_epoch: QueryAuthorityEpoch,
+    source_context_stamp: SourceContextStamp,
+    roots: Box<[TermId]>,
+    root_entries: Box<[TermEntryStamp]>,
+    model_epoch: QuantifiedConfirmationModelEpoch,
 }
 
-/// Normalize the specific large integer-point Boolean-table residue emitted by
-/// a printer-table quantified-model check:
-///
-/// ```text
-/// !((x = k) = ((x = k) /\ (x != k_1) /\ ...))
-///     <=> (x = k) /\ !((x != k_1) /\ ...)
-/// ```
-///
-/// Outer and point equality are symmetric.  This is deliberately a top-level
-/// gate-obligation rewrite rather than a general distributive simplifier: it
-/// is linear in the already-materialized table, cannot expand the term DAG,
-/// and leaves every other shape byte-for-byte unchanged.  Requiring the exact
-/// integer point-table grammar prevents an equivalent rewrite from perturbing
-/// unrelated certificate search lanes.
-fn quantified_gate_simplify_negated_absorbed_bool_eq(
-    terms: &mut TermStore,
-    assertion: TermId,
-) -> TermId {
-    // Small absorption residues are cheap for the existing gate solver and,
-    // more importantly, retain useful search structure for the DT model
-    // certificate fallback.  The timeout this rewrite addresses is specific
-    // to printer tables with hundreds of leaves, so keep the intervention
-    // explicitly in that high-fanout lane.
-    const MIN_TABLE_FANOUT: usize = 256;
+impl QuantifiedModelConfirmation {
+    fn bind_current<'a>(
+        &self,
+        executor: &'a Executor,
+        roots: &[TermId],
+        model: &'a Model,
+    ) -> Option<CurrentQuantifiedModelConfirmation<'a>> {
+        let installed = executor.last_model.as_ref()?;
+        if !std::ptr::eq(installed, model)
+            || !self
+                .query_epoch
+                .is_same_epoch(&executor.query_authority_epoch)
+            || self.source_context_stamp != executor.ctx.source_context_stamp()
+            || self.roots.as_ref() != roots
+            || !self.root_entries.iter().copied().map(Some).eq(self
+                .roots
+                .iter()
+                .map(|&root| executor.ctx.terms.entry_stamp(root)))
+            || !model.carries_quantified_confirmation(&self.model_epoch)
+        {
+            return None;
+        }
+        Some(CurrentQuantifiedModelConfirmation { _model: model })
+    }
+}
 
-    let TermData::Not(inner) = terms.get(assertion).clone() else {
-        return assertion;
-    };
-    let TermData::App(eq, eq_args) = terms.get(inner).clone() else {
-        return assertion;
-    };
-    if eq.name() != "=" || eq_args.len() != 2 || terms.sort(eq_args[0]) != &Sort::Bool {
-        return assertion;
+/// Borrow-bound view of a current direct confirmation.
+///
+/// Holding this value keeps the exact installed model immutably borrowed for
+/// the entire independent evaluation that consumes the quantified authority.
+struct CurrentQuantifiedModelConfirmation<'a> {
+    _model: &'a Model,
+}
+
+/// Pre-check identity of the exact query and model whose quantified leaves are
+/// about to be validated.
+///
+/// Nested isolated solves necessarily mutate executor result state. Capturing
+/// only after they return would authenticate whatever model happened to be
+/// installed at the end rather than the model actually inspected. This scope
+/// seals the incoming model first and can finish only if every binding is still
+/// exact after all checks.
+struct QuantifiedModelCheckScope {
+    query_epoch: QueryAuthorityEpoch,
+    source_context_stamp: SourceContextStamp,
+    roots: Box<[TermId]>,
+    root_entries: Box<[TermEntryStamp]>,
+    model_epoch: QuantifiedConfirmationModelEpoch,
+}
+
+impl QuantifiedModelCheckScope {
+    fn capture(
+        executor: &mut Executor,
+        query_epoch: QueryAuthorityEpoch,
+        source_context_stamp: SourceContextStamp,
+        roots: &[TermId],
+    ) -> Option<Self> {
+        if !query_epoch.is_same_epoch(&executor.query_authority_epoch)
+            || source_context_stamp != executor.ctx.source_context_stamp()
+            || independent_gate_query_roots(executor) != roots
+        {
+            return None;
+        }
+        let root_entries = roots
+            .iter()
+            .map(|&root| executor.ctx.terms.entry_stamp(root))
+            .collect::<Option<Vec<_>>>()?;
+        let model_epoch = executor.last_model.as_mut()?.seal_quantified_confirmation();
+        Some(Self {
+            query_epoch,
+            source_context_stamp,
+            roots: roots.into(),
+            root_entries: root_entries.into_boxed_slice(),
+            model_epoch,
+        })
     }
 
-    for (pivot, compound) in [(eq_args[0], eq_args[1]), (eq_args[1], eq_args[0])] {
-        let TermData::App(connective, args) = terms.get(compound).clone() else {
-            continue;
-        };
-        if connective.name() != "and" {
-            continue;
+    fn finish(self, executor: &Executor) -> Option<QuantifiedModelConfirmation> {
+        if !self
+            .query_epoch
+            .is_same_epoch(&executor.query_authority_epoch)
+            || self.source_context_stamp != executor.ctx.source_context_stamp()
+            || independent_gate_query_roots(executor).as_slice() != self.roots.as_ref()
+            || !self.root_entries.iter().copied().map(Some).eq(self
+                .roots
+                .iter()
+                .map(|&root| executor.ctx.terms.entry_stamp(root)))
+            || !executor
+                .last_model
+                .as_ref()
+                .is_some_and(|model| model.carries_quantified_confirmation(&self.model_epoch))
+        {
+            return None;
         }
-        if args.len() < MIN_TABLE_FANOUT {
-            continue;
-        }
-        let Some(pivot_index) = args.iter().position(|&arg| arg == pivot) else {
-            continue;
-        };
-        let Some(table_variable) = quantified_gate_int_point_variable(terms, pivot) else {
-            continue;
-        };
-        let mut rest = args;
-        let _ = rest.remove(pivot_index);
-        if !rest.iter().all(|&entry| {
-            let TermData::Not(point) = terms.get(entry) else {
-                return false;
-            };
-            quantified_gate_int_point_variable(terms, *point) == Some(table_variable)
-        }) {
-            continue;
-        }
-        let residue = terms.mk_and(rest);
-        let not_residue = terms.mk_not(residue);
-        return terms.mk_and(vec![pivot, not_residue]);
+        Some(QuantifiedModelConfirmation {
+            query_epoch: self.query_epoch,
+            source_context_stamp: self.source_context_stamp,
+            roots: self.roots,
+            root_entries: self.root_entries,
+            model_epoch: self.model_epoch,
+        })
     }
-
-    assertion
 }
 
 /// Outcome of validating one quantified assertion conjunct against the
@@ -6253,6 +6870,47 @@ enum QuantifiedModelCheck {
     /// (exactly HEAD's trust level; refutation outcomes are never converted
     /// to this).
     Deferred,
+}
+
+/// One checked disposable-ground result kept together with the exact ordered
+/// roots its private SAT/UNSAT payload must consume against. Neither the
+/// decision nor its evidence is cloneable, and callers destructure this value
+/// only at the semantic acceptance site.
+#[derive(Debug)]
+struct QuantifiedGateCheckedGroundDecision {
+    decision: CheckedGroundDecision,
+    roots: Box<[TermId]>,
+}
+
+/// Sealed, non-cloneable theorem authority for one exact quantified conjunct.
+///
+/// Construction is private to the independent gate and requires a definitive
+/// isolated refutation of the conjunct's quantifier-free negation.
+#[must_use = "global quantified validity authority must be consumed"]
+struct GloballyValidQuantifiedConjunct {
+    source: TermId,
+    query_epoch: QueryAuthorityEpoch,
+    source_context_stamp: SourceContextStamp,
+    roots: Box<[TermId]>,
+    term_snapshot: TermStoreSnapshotStamp,
+}
+
+impl GloballyValidQuantifiedConjunct {
+    fn confirm(self, executor: &mut Executor, source: TermId) -> QuantifiedModelCheck {
+        if self.source == source
+            && self
+                .query_epoch
+                .is_same_epoch(&executor.query_authority_epoch)
+            && self.source_context_stamp == executor.ctx.source_context_stamp()
+            && self.roots.as_ref() == independent_gate_query_roots(executor).as_slice()
+            && self.term_snapshot == executor.ctx.terms.snapshot_stamp()
+            && !executor.should_abort_theory_loop()
+        {
+            QuantifiedModelCheck::Confirmed
+        } else {
+            QuantifiedModelCheck::Indeterminate("globally-valid quantified authority became stale")
+        }
+    }
 }
 
 /// The model pins for one quantified conjunct: equality terms forcing each
@@ -6408,6 +7066,10 @@ fn qmg_row_val_to_term(
                     .ok()
                     .map(|i| terms.mk_int(i))
             }
+            Sort::Real => match Executor::parse_real_string(raw) {
+                EvalValue::Rational(r) => Some(terms.mk_rational(r)),
+                _ => None,
+            },
             Sort::BitVec(w) => {
                 if let Some(bits) = raw.strip_prefix("#b") {
                     num_bigint::BigInt::parse_bytes(bits.as_bytes(), 2)
@@ -6880,6 +7542,359 @@ mod tests {
         (exec, outputs)
     }
 
+    fn loaded(input: &str) -> Executor {
+        let commands = parse(input).expect("valid SMT-LIB input");
+        let mut exec = Executor::new();
+        for command in &commands {
+            assert!(
+                exec.execute(command).expect("execute succeeds").is_none(),
+                "fixture must not contain a query command"
+            );
+        }
+        exec
+    }
+
+    /// Forge the impossible state the defensive coherence gate is meant to
+    /// reject without weakening the production native-alias registrar.
+    ///
+    /// Any live non-theory declaration at a canonical theory identity poisons
+    /// interpretation of that identity, independently of its signature.  The
+    /// ordinary low-level symbol registrar is sufficient to construct that
+    /// corrupt internal state for a unit test; production native aliases must
+    /// continue rejecting an absent canonical target.
+    fn forge_non_theory_canonical_owner(exec: &mut Executor, identity: &str, sort: Sort) {
+        assert!(ay_frontend::is_canonical_theory_operator_identity(identity));
+        let term = exec.ctx.terms.mk_fresh_named_var(identity, sort.clone());
+        exec.ctx.register_symbol(identity.to_string(), term, sort);
+        let declaration = exec
+            .ctx
+            .symbol_info_by_identity(identity)
+            .expect("forged canonical owner must be live");
+        assert_eq!(
+            exec.ctx
+                .effective_declaration_kind(declaration.declaration_id()),
+            Some(DeclarationKind::Uninterpreted),
+            "fixture must install a non-theory owner at `{identity}`"
+        );
+    }
+
+    fn only_quantified_assertion(exec: &Executor) -> TermId {
+        exec.ctx
+            .assertions
+            .iter()
+            .copied()
+            .find(|&term| contains_quantifier(&exec.ctx.terms, term))
+            .expect("fixture has a quantified assertion")
+    }
+
+    fn quantified_gate_checked_unsat(exec: &mut Executor, roots: Vec<TermId>) -> bool {
+        let Some(QuantifiedGateCheckedGroundDecision { decision, roots }) =
+            exec.quantified_gate_checked_ground_solve(roots)
+        else {
+            return false;
+        };
+        match decision {
+            CheckedGroundDecision::Unsat(proof) => proof.consume(exec, &roots),
+            CheckedGroundDecision::Sat(_) => false,
+        }
+    }
+
+    #[test]
+    fn default_quantified_gate_reads_exact_dedicated_authored_roots() {
+        let mut exec = loaded(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun f (Int) Int)
+                (declare-const a Int)
+                (assert (forall ((x Int)) (>= (f x) 0)))
+                (assert (> a 0))
+            "#,
+        );
+        let authored = exec.ctx.assertions.clone();
+        assert!(authored
+            .iter()
+            .any(|&root| contains_quantifier(&exec.ctx.terms, root)));
+        assert!(!exec.self_check(), "the regression exercises default mode");
+        assert!(exec.self_check_authored_assertions.is_none());
+
+        // Model a preprocessing pass that replaced the working assertion
+        // window. The independent gate must still select the ordered authored
+        // roots, without borrowing the self-check/model-completion slot.
+        let rewritten = exec.ctx.terms.true_term();
+        exec.ctx.assertions = vec![rewritten];
+        exec.independent_gate_authored_assertions = Some(authored.clone());
+
+        assert_eq!(independent_gate_query_roots(&exec), authored);
+        assert!(exec.self_check_authored_assertions.is_none());
+    }
+
+    #[test]
+    fn checked_quantified_gate_probe_preserves_outer_proof_suppression() {
+        let mut exec = Executor::new();
+        exec.last_unsat_proof_reconstruction_suppressed = true;
+        let contradiction = exec.ctx.terms.false_term();
+
+        assert!(
+            quantified_gate_checked_unsat(&mut exec, vec![contradiction]),
+            "the disposable fixture must carry a strictly checked refutation"
+        );
+        assert!(
+            exec.last_unsat_proof_reconstruction_suppressed,
+            "a disposable checked solve must not alter the outer proof-authority marker"
+        );
+    }
+
+    #[test]
+    fn quantified_gate_checked_evidence_rejects_every_stale_binding() {
+        fn checked_false() -> (Executor, QuantifiedGateCheckedGroundDecision) {
+            let mut exec = Executor::new();
+            let contradiction = exec.ctx.terms.false_term();
+            let checked = exec
+                .quantified_gate_checked_ground_solve(vec![contradiction])
+                .expect("false must produce checked UNSAT evidence");
+            (exec, checked)
+        }
+
+        let (mut wrong_roots, checked) = checked_false();
+        let QuantifiedGateCheckedGroundDecision { decision, .. } = checked;
+        let CheckedGroundDecision::Unsat(proof) = decision else {
+            panic!("false must be UNSAT");
+        };
+        let different_roots = [wrong_roots.ctx.terms.true_term()];
+        assert!(
+            !proof.consume(&mut wrong_roots, &different_roots),
+            "a checked proof cannot be retargeted to nearby roots"
+        );
+
+        let (mut epoch_stale, checked) = checked_false();
+        epoch_stale.advance_query_authority_epoch();
+        let QuantifiedGateCheckedGroundDecision { decision, roots } = checked;
+        let CheckedGroundDecision::Unsat(proof) = decision else {
+            panic!("false must be UNSAT");
+        };
+        assert!(
+            !proof.consume(&mut epoch_stale, &roots),
+            "a later public query cannot reuse checked ground evidence"
+        );
+
+        let (mut terms_stale, checked) = checked_false();
+        let _ = terms_stale
+            .ctx
+            .terms
+            .mk_fresh_var("post-ground-check", Sort::Bool);
+        let QuantifiedGateCheckedGroundDecision { decision, roots } = checked;
+        let CheckedGroundDecision::Unsat(proof) = decision else {
+            panic!("false must be UNSAT");
+        };
+        assert!(
+            !proof.consume(&mut terms_stale, &roots),
+            "a changed term universe cannot reuse checked ground evidence"
+        );
+    }
+
+    #[test]
+    fn exact_single_forall_mints_typed_global_validity() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int)) (< x (+ x 1))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        let checked = exec
+            .certify_globally_valid_quantified_conjunct(source)
+            .expect("the exact Skolem instance has a strictly checked UNSAT proof");
+
+        assert!(matches!(
+            checked.confirm(&mut exec, source),
+            QuantifiedModelCheck::Confirmed
+        ));
+    }
+
+    #[test]
+    fn false_single_forall_cannot_mint_global_validity() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int)) (= x 0)))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "a checked SAT negation cannot mint global-validity authority"
+        );
+    }
+
+    #[test]
+    fn multi_binder_forall_cannot_enter_single_binder_proof_kernel() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int) (y Int)) (< x (+ x 1))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "multi-binder provenance is outside the exact fallback contract"
+        );
+    }
+
+    #[test]
+    fn patterned_forall_cannot_enter_trigger_free_proof_kernel() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int))
+                    (! (< x (+ x 1)) :pattern ((+ x 1)))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "trigger-bearing source provenance is outside the exact fallback contract"
+        );
+    }
+
+    #[test]
+    fn nested_forall_cannot_enter_quantifier_free_body_proof_kernel() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int))
+                    (forall ((y Int)) (< y (+ y 1)))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "nested Skolem provenance is outside the exact fallback contract"
+        );
+    }
+
+    #[test]
+    fn folded_negated_instance_cannot_mint_global_validity() {
+        let mut exec = loaded(
+            r#"
+                (set-logic UF)
+                (declare-sort U 0)
+                (declare-fun f (U) U)
+                (assert (forall ((x U)) (= (f x) (f x))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "even a valid formula must decline when Skolemization folds away the exact negated root"
+        );
+    }
+
+    #[test]
+    fn outer_forall_support_cannot_circularly_mint_global_validity() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int)) (= x 0)))
+                (assert false)
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        // Model the state of a wrong-SAT outer quantifier solve that derived a
+        // contradictory ground instance from the very forall this gate is now
+        // checking. The explicit `false` assertion keeps the support writer's
+        // production invariant (the support root is in the outer assertion
+        // set). Such an instance is sound support for the OUTER asserted
+        // problem, but using it while refuting `not source` would beg the
+        // question and "prove" the false source from one of its consequences.
+        let contradictory_instance = exec.ctx.terms.false_term();
+        exec.active_support_axioms
+            .push(ay_core::TheoryLit::new(contradictory_instance, true));
+        let support_before = exec.active_support_axioms.clone();
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "a satisfiable negation must stay SAT even when the outer solve carries circular support"
+        );
+        assert_eq!(
+            exec.active_support_axioms, support_before,
+            "the disposable theorem probe must neither consume nor rewrite outer support"
+        );
+    }
+
+    #[test]
+    fn forall_exists_residue_cannot_mint_global_validity() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int)) (exists ((y Int)) (> y x))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+
+        assert!(
+            exec.certify_globally_valid_quantified_conjunct(source)
+                .is_none(),
+            "a residual universal in the negation must fail closed"
+        );
+    }
+
+    #[test]
+    fn global_validity_authority_stales_on_query_roots_and_term_universe() {
+        fn fixture() -> (Executor, TermId, GloballyValidQuantifiedConjunct) {
+            let mut exec = loaded(
+                r#"
+                    (set-logic LIA)
+                    (declare-const c Int)
+                    (assert (forall ((x Int)) (< x (+ x 1))))
+                    (assert (>= c 0))
+                "#,
+            );
+            let source = only_quantified_assertion(&exec);
+            let authority = exec
+                .certify_globally_valid_quantified_conjunct(source)
+                .expect("fixture must mint exact checked authority");
+            (exec, source, authority)
+        }
+
+        let (mut epoch_stale, source, authority) = fixture();
+        epoch_stale.advance_query_authority_epoch();
+        assert!(matches!(
+            authority.confirm(&mut epoch_stale, source),
+            QuantifiedModelCheck::Indeterminate(_)
+        ));
+
+        let (mut roots_stale, source, authority) = fixture();
+        roots_stale.ctx.assertions.reverse();
+        assert!(matches!(
+            authority.confirm(&mut roots_stale, source),
+            QuantifiedModelCheck::Indeterminate(_)
+        ));
+
+        let (mut terms_stale, source, authority) = fixture();
+        let _ = terms_stale
+            .ctx
+            .terms
+            .mk_fresh_var("post-cert-mutation", Sort::Bool);
+        assert!(matches!(
+            authority.confirm(&mut terms_stale, source),
+            QuantifiedModelCheck::Indeterminate(_)
+        ));
+    }
+
     /// A model over ONLY the given LIA assignments (every other sub-model
     /// empty), used to synthetically replace the solver's real witness.
     fn synthetic_lia_model(values: &[(TermId, i64)]) -> Model {
@@ -6888,6 +7903,8 @@ mod tests {
             lia.insert(t, BigInt::from(v));
         }
         Model {
+            quantified_confirmation_seal: Default::default(),
+            quantified_grant_model_seal: Default::default(),
             sat_model: vec![],
             term_to_var: DetHashMap::default(),
             bool_overrides: DetHashMap::default(),
@@ -6899,10 +7916,53 @@ mod tests {
             fp_model: None,
             string_model: None,
             seq_model: None,
+            projection_ufs: Default::default(),
+            certified_total_ufs: Default::default(),
+            certified_const_interps: Default::default(),
+            formula_neutral_function_defaults: Default::default(),
             completed_values: DetHashMap::default(),
             dt_ground: DetHashMap::default(),
             dt_pins: DetHashMap::default(),
         }
+    }
+
+    /// `deep_qe` can reduce this true Presburger alternation to a ground
+    /// candidate, but its finite differential guard is not an equivalence
+    /// proof. The general route must therefore decline rather than mint the
+    /// `Confirmed` authority that lets a public SAT verdict survive.
+    #[test]
+    fn quantifier_free_deep_qe_candidate_cannot_confirm_source() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LIA)
+                (assert (forall ((x Int)) (exists ((y Int)) (> y x))))
+            "#,
+        );
+        let source = only_quantified_assertion(&exec);
+        exec.last_model = Some(synthetic_lia_model(&[]));
+
+        // Lock the fixture to the authority boundary under test: this must be
+        // a case where the candidate pass actually removes every quantifier.
+        let mut candidate = vec![source];
+        crate::executor::qe_prepass::deep_qe(
+            &mut exec.ctx.terms,
+            &mut candidate,
+            exec.solve_interrupt.as_deref(),
+        );
+        assert!(
+            !contains_quantifier(&exec.ctx.terms, candidate[0]),
+            "fixture must reach a quantifier-free deep-QE candidate"
+        );
+
+        let mut elems = QuantifiedGateElements::default();
+        let outcome =
+            exec.quantified_gate_general_check(source, &DetHashMap::default(), &mut elems, true);
+        assert!(matches!(
+            outcome,
+            QuantifiedModelCheck::Indeterminate(
+                "quantifier-free QE candidate lacks exact equivalence authority"
+            )
+        ));
     }
 
     /// A model carrying only exact EUF equivalence-class identities.
@@ -6928,6 +7988,200 @@ mod tests {
     }
 
     #[test]
+    fn scalar_uf_definition_requires_exact_private_declaration_identity() {
+        let mut exec = loaded(
+            r#"
+                (declare-fun rem (Int Int) Int)
+                (assert (= (rem 1 2) 7))
+            "#,
+        );
+        let assertion = exec.ctx.assertions[0];
+        let TermData::App(_, equality_args) = exec.ctx.terms.get(assertion).clone() else {
+            panic!("fixture assertion must be an equality application");
+        };
+        let declared_app = equality_args
+            .iter()
+            .copied()
+            .find(|&term| matches!(exec.ctx.terms.get(term), TermData::App(_, _)))
+            .expect("fixture equality must contain the declared application");
+        let TermData::App(declared_symbol, _) = exec.ctx.terms.get(declared_app) else {
+            unreachable!("application selected above");
+        };
+        let declared_symbol = declared_symbol.clone();
+        assert_ne!(
+            declared_symbol.name(),
+            "rem",
+            "a builtin-colliding declaration must retain its private core identity"
+        );
+
+        let model = synthetic_lia_model(&[]);
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            matches!(
+                view.uf_app_definition_value(declared_app),
+                Some(ModelValue::Int(value)) if value == BigInt::from(7)
+            ),
+            "the exact private identity of a live ordinary UF remains eligible"
+        );
+        drop(view);
+
+        // Owning the exact symbol identity is not enough if a malformed core
+        // application borrows it at a different signature.
+        let true_term = exec.ctx.terms.true_term();
+        let two = exec.ctx.terms.mk_int(BigInt::from(2));
+        let forged_signature =
+            exec.ctx
+                .terms
+                .mk_app(declared_symbol, vec![true_term, two], Sort::Int);
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let forged_definition = exec.ctx.terms.mk_eq(forged_signature, zero);
+        exec.independent_gate_authored_assertions = Some(vec![forged_definition]);
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            view.uf_app_definition_value(forged_signature).is_none(),
+            "an exact declaration identity at a forged signature must fail closed"
+        );
+        drop(view);
+
+        // A raw builtin `rem` head is NOT the declaration above.  A fallback
+        // from exact identity to the surface-name table used to borrow the
+        // private declaration's authority and resolve this forged application.
+        let one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let two = exec.ctx.terms.mk_int(BigInt::from(2));
+        let forged_builtin = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("rem"), vec![one, two], Sort::Int);
+        let forged_definition = exec.ctx.terms.mk_eq(forged_builtin, zero);
+        exec.independent_gate_authored_assertions = Some(vec![forged_definition]);
+
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            view.uf_app_definition_value(forged_builtin).is_none(),
+            "a surface spelling must not inherit a distinct private declaration identity"
+        );
+    }
+
+    #[test]
+    fn scalar_uf_definition_rejects_nonfree_declaration_kinds() {
+        // A problem-level definition has fixed semantics even if a raw core
+        // application of its registered name reaches this defensive fallback.
+        let mut defined = loaded("(define-fun f ((x Int)) Int (+ x 1))");
+        let info = defined.ctx.symbol_info("f").expect("defined symbol info");
+        assert_eq!(
+            defined
+                .ctx
+                .effective_declaration_kind(info.declaration_id()),
+            Some(DeclarationKind::Defined)
+        );
+        let arg = defined.ctx.terms.mk_int(BigInt::from(4));
+        let app = defined
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![arg], Sort::Int);
+        let value = defined.ctx.terms.mk_int(BigInt::from(5));
+        let equality = defined.ctx.terms.mk_eq(app, value);
+        defined.independent_gate_authored_assertions = Some(vec![equality]);
+        let model = synthetic_lia_model(&[]);
+        assert!(
+            IndependentModelView::new(&defined, &model)
+                .uf_app_definition_value(app)
+                .is_none(),
+            "defined functions must not be treated as free UF interpretations"
+        );
+
+        // Declaration-activated collection operators live in the symbol table,
+        // but their positive kind is Theory rather than Uninterpreted.
+        let mut theory =
+            loaded("(declare-fun set.subset ((Array Int Bool) (Array Int Bool)) Bool)");
+        let info = theory
+            .ctx
+            .symbol_info("set.subset")
+            .expect("theory symbol info");
+        assert_eq!(
+            theory.ctx.effective_declaration_kind(info.declaration_id()),
+            Some(DeclarationKind::Theory)
+        );
+        let false_term = theory.ctx.terms.false_term();
+        let array = theory.ctx.terms.mk_const_array(Sort::Int, false_term);
+        let app =
+            theory
+                .ctx
+                .terms
+                .mk_app(Symbol::named("set.subset"), vec![array, array], Sort::Bool);
+        let true_term = theory.ctx.terms.true_term();
+        let equality = theory.ctx.terms.mk_eq(app, true_term);
+        theory.independent_gate_authored_assertions = Some(vec![equality]);
+        assert!(
+            IndependentModelView::new(&theory, &model)
+                .uf_app_definition_value(app)
+                .is_none(),
+            "theory declarations must not be treated as free UF interpretations"
+        );
+
+        // Macro adoption overlays the stable declaration identity with an
+        // effective non-free kind while its defining forall remains live.
+        let mut adopted = loaded(
+            r#"
+                (declare-fun g (Int) Int)
+                (assert (forall ((x Int)) (= (g x) (+ x 1))))
+            "#,
+        );
+        let info = adopted.ctx.symbol_info("g").expect("adopted symbol info");
+        assert_eq!(
+            adopted
+                .ctx
+                .effective_declaration_kind(info.declaration_id()),
+            Some(DeclarationKind::AdoptedDefinition)
+        );
+        let arg = adopted.ctx.terms.mk_int(BigInt::from(8));
+        let app = adopted
+            .ctx
+            .terms
+            .mk_app(Symbol::named("g"), vec![arg], Sort::Int);
+        let value = adopted.ctx.terms.mk_int(BigInt::from(9));
+        let equality = adopted.ctx.terms.mk_eq(app, value);
+        adopted.independent_gate_authored_assertions = Some(vec![equality]);
+        assert!(
+            IndependentModelView::new(&adopted, &model)
+                .uf_app_definition_value(app)
+                .is_none(),
+            "adopted definitions must not reuse their original free-UF kind"
+        );
+    }
+
+    #[test]
+    fn scalar_uf_definition_rejects_native_alias_at_fp_min_identity() {
+        let mut exec = Executor::new();
+        let fp16 = Sort::FloatingPoint(5, 11);
+        forge_non_theory_canonical_owner(&mut exec, "fp.min", fp16.clone());
+
+        let positive_zero = exec.ctx.terms.mk_var("fp-min-positive-zero", fp16.clone());
+        let negative_zero = exec.ctx.terms.mk_var("fp-min-negative-zero", fp16.clone());
+        let minimum = exec.ctx.terms.mk_app(
+            Symbol::named("fp.min"),
+            vec![positive_zero, negative_zero],
+            fp16,
+        );
+        let definition = exec.ctx.terms.mk_eq(minimum, positive_zero);
+        exec.independent_gate_authored_assertions = Some(vec![definition]);
+
+        let mut model = synthetic_fp_model(positive_zero, FpModelValue::PosZero { eb: 5, sb: 11 });
+        model
+            .fp_model
+            .as_mut()
+            .expect("synthetic FP model")
+            .values
+            .insert(negative_zero, FpModelValue::NegZero { eb: 5, sb: 11 });
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(
+            view.uf_app_definition_value(minimum).is_none(),
+            "an evaluator-owned fp.min application must never borrow generic UF authority"
+        );
+    }
+
+    #[test]
     fn independent_gate_confirms_exact_finite_fp_to_real_witness() {
         let mut exec = Executor::new();
         let fp16 = Sort::FloatingPoint(5, 11);
@@ -6946,7 +8200,7 @@ mod tests {
             .ctx
             .terms
             .mk_app(Symbol::named(">"), vec![r, one], Sort::Bool);
-        exec.self_check_authored_assertions = Some(vec![definition, greater_than_one]);
+        exec.independent_gate_authored_assertions = Some(vec![definition, greater_than_one]);
         let mut model = synthetic_fp_model(
             x,
             FpModelValue::Fp {
@@ -6971,7 +8225,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_gate_rejects_unspecified_fp_to_real_witness() {
+    fn independent_gate_confirms_proven_unconstrained_fp_to_real_witness() {
         let mut exec = Executor::new();
         let fp16 = Sort::FloatingPoint(5, 11);
         let x = exec.ctx.terms.mk_var("fp-to-real-inf", fp16);
@@ -6984,7 +8238,7 @@ mod tests {
             .terms
             .mk_rational(BigRational::from_integer(BigInt::from(0)));
         let assertion = exec.ctx.terms.mk_eq(to_real, zero);
-        exec.self_check_authored_assertions = Some(vec![assertion]);
+        exec.independent_gate_authored_assertions = Some(vec![assertion]);
         exec.last_model = Some(synthetic_fp_model(
             x,
             FpModelValue::PosInf { eb: 5, sb: 11 },
@@ -6992,8 +8246,530 @@ mod tests {
 
         assert!(matches!(
             exec.confirm_sat_with_fully_evaluated_independent_gate(),
-            GateVerdict::CannotConfirm { .. }
+            GateVerdict::ConfirmedSat
         ));
+    }
+
+    #[test]
+    fn independent_gate_rejects_finite_fp_to_real_assertion_fallback() {
+        let mut exec = Executor::new();
+        let fp16 = Sort::FloatingPoint(5, 11);
+        let x = exec.ctx.terms.mk_var("fp-to-real-finite", fp16);
+        let to_real = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("fp.to_real"), vec![x], Sort::Real);
+        let five = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(5)));
+        let assertion = exec.ctx.terms.mk_eq(to_real, five);
+        exec.independent_gate_authored_assertions = Some(vec![assertion]);
+        exec.last_model = Some(synthetic_fp_model(
+            x,
+            // Float16 +1.0: exponent=bias=15, zero stored fraction.
+            FpModelValue::Fp {
+                sign: false,
+                exponent: 15,
+                significand: 0,
+                eb: 5,
+                sb: 11,
+            },
+        ));
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ModelViolates { assertion: rejected } if rejected == assertion
+        ));
+    }
+
+    #[test]
+    fn independent_gate_confirms_exact_zero_divisor_definition_fallbacks() {
+        let mut exec = Executor::new();
+        let int_one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let int_zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let int_five = exec.ctx.terms.mk_int(BigInt::from(5));
+        let int_six = exec.ctx.terms.mk_int(BigInt::from(6));
+        let int_div =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("div"), vec![int_one, int_zero], Sort::Int);
+        let int_mod =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("mod"), vec![int_one, int_zero], Sort::Int);
+        let div_definition = exec.ctx.terms.mk_eq(int_div, int_five);
+        let mod_definition = exec.ctx.terms.mk_eq(int_mod, int_six);
+
+        let real_one = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(1)));
+        let real_zero = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(0)));
+        let real_seven = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(7)));
+        let real_div =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("/"), vec![real_one, real_zero], Sort::Real);
+        let real_definition = exec.ctx.terms.mk_eq(real_div, real_seven);
+
+        exec.independent_gate_authored_assertions =
+            Some(vec![div_definition, mod_definition, real_definition]);
+        exec.last_model = Some(Model::empty());
+
+        assert!(matches!(
+            exec.confirm_sat_with_fully_evaluated_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ));
+    }
+
+    #[test]
+    fn typed_unconstrained_bridge_rejects_exact_identity_collisions() {
+        let fp16 = Sort::FloatingPoint(5, 11);
+        let collisions = [
+            ("fp.to_real", fp16),
+            ("/", Sort::Real),
+            ("div", Sort::Int),
+            ("mod", Sort::Int),
+            ("=", Sort::Bool),
+            ("and", Sort::Bool),
+            ("or", Sort::Bool),
+            ("not", Sort::Bool),
+            ("=>", Sort::Bool),
+            ("ite", Sort::Int),
+            ("if", Sort::Int),
+        ];
+
+        for (identity, range) in collisions {
+            let mut exec = Executor::new();
+            forge_non_theory_canonical_owner(&mut exec, identity, range);
+
+            let declaration = exec
+                .ctx
+                .symbol_info_by_identity(identity)
+                .expect("collision must own the exact core identity");
+            assert_eq!(
+                exec.ctx
+                    .effective_declaration_kind(declaration.declaration_id()),
+                Some(DeclarationKind::Uninterpreted),
+                "fixture must exercise a live ordinary declaration at `{identity}`"
+            );
+
+            let one = exec.ctx.terms.mk_int(BigInt::from(1));
+            let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+            let seven = exec.ctx.terms.mk_int(BigInt::from(7));
+            let div = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("div"), vec![one, zero], Sort::Int);
+            let definition = exec.ctx.terms.mk_eq(div, seven);
+            exec.independent_gate_authored_assertions = Some(vec![definition]);
+            let model = Model::empty();
+            let view = IndependentModelView::new(&exec, &model);
+
+            assert!(
+                view.uf_app_definition_value(div).is_none(),
+                "canonical theory head must not borrow generic UF authority under `{identity}` collision"
+            );
+            assert!(
+                view.uf_app_value(div).is_none(),
+                "generic model lookup must not bypass typed authority under `{identity}` collision"
+            );
+            assert!(
+                view.proven_unconstrained_app_value(div, ProvenUnconstrainedKind::IntDivByZero,)
+                    .is_none(),
+                "typed lookup must fail closed under `{identity}` collision"
+            );
+        }
+    }
+
+    #[test]
+    fn asserted_uf_definition_rejects_forged_control_identity_collisions() {
+        let collisions = [
+            ("or", Sort::Bool),
+            ("not", Sort::Bool),
+            ("=>", Sort::Bool),
+            ("ite", Sort::Int),
+        ];
+
+        for (identity, range) in collisions {
+            let mut exec = loaded("(declare-fun f (Int) Int)");
+            let one = exec.ctx.terms.mk_int(BigInt::from(1));
+            let seven = exec.ctx.terms.mk_int(BigInt::from(7));
+            let app = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+            let definition = exec.ctx.terms.mk_eq(app, seven);
+            exec.independent_gate_authored_assertions = Some(vec![definition]);
+            let model = synthetic_lia_model(&[]);
+
+            let coherent_view = IndependentModelView::new(&exec, &model);
+            assert!(
+                matches!(
+                    coherent_view.uf_app_definition_value(app),
+                    Some(ModelValue::Int(value)) if value == BigInt::from(7)
+                ),
+                "the ordinary f fixture must resolve before the adversarial registration"
+            );
+            drop(coherent_view);
+
+            forge_non_theory_canonical_owner(&mut exec, identity, range);
+            let declaration = exec
+                .ctx
+                .symbol_info_by_identity(identity)
+                .expect("collision must own the exact core identity");
+            assert_eq!(
+                exec.ctx
+                    .effective_declaration_kind(declaration.declaration_id()),
+                Some(DeclarationKind::Uninterpreted),
+                "fixture must install a non-theory owner at `{identity}`"
+            );
+
+            let view = IndependentModelView::new(&exec, &model);
+            assert!(
+                !view.canonical_theory_bindings_are_coherent(),
+                "the forged `{identity}` owner must poison assertion-derived authority"
+            );
+            assert!(
+                view.asserted_app_definition_value(app).is_none(),
+                "the shared definition boundary must reject ordinary f under forged `{identity}`"
+            );
+            assert!(
+                view.uf_app_definition_value(app).is_none(),
+                "ordinary f must not borrow asserted-definition authority under forged `{identity}`"
+            );
+        }
+    }
+
+    #[test]
+    fn array_and_datatype_definition_index_rejects_forged_control_identities() {
+        let collisions = ["=", "and", "or", "ite", "if"];
+
+        for identity in collisions {
+            let mut exec = loaded(
+                r#"
+                    (declare-datatype D ((mkD) (otherD)))
+                    (declare-const d D)
+                    (assert (= d mkD))
+                "#,
+            );
+            let datatype_definition = exec.ctx.assertions[0];
+            let datatype_leaf = exec
+                .ctx
+                .symbol_info("d")
+                .and_then(|info| info.term)
+                .expect("declared datatype leaf");
+            let TermData::App(datatype_eq, datatype_args) = exec.ctx.terms.get(datatype_definition)
+            else {
+                panic!(
+                    "datatype fixture must retain its asserted equality, got {:?}",
+                    exec.ctx.terms.get(datatype_definition)
+                );
+            };
+            assert_eq!(datatype_eq.name(), "=");
+            let datatype_partner = datatype_args
+                .iter()
+                .copied()
+                .find(|&term| term != datatype_leaf)
+                .expect("datatype equality partner");
+
+            let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+            let constant = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+            let array_leaf = exec
+                .ctx
+                .terms
+                .mk_var("indexed-array", Sort::array(Sort::Int, Sort::Int));
+            let array_definition = exec.ctx.terms.mk_eq(array_leaf, constant);
+            let both_definitions = exec.ctx.terms.mk_app(
+                Symbol::named("and"),
+                vec![array_definition, datatype_definition],
+                Sort::Bool,
+            );
+            let false_term = exec.ctx.terms.false_term();
+            let true_term = exec.ctx.terms.true_term();
+            let root = match identity {
+                "=" => None,
+                "and" => Some(both_definitions),
+                "or" => Some(exec.ctx.terms.mk_app(
+                    Symbol::named("or"),
+                    vec![false_term, both_definitions],
+                    Sort::Bool,
+                )),
+                "ite" | "if" => Some(exec.ctx.terms.mk_app(
+                    Symbol::named(identity),
+                    vec![true_term, both_definitions, false_term],
+                    Sort::Bool,
+                )),
+                _ => unreachable!("collision table contains only index controls"),
+            };
+            exec.independent_gate_authored_assertions = Some(root.map_or_else(
+                || vec![array_definition, datatype_definition],
+                |term| vec![term],
+            ));
+
+            let model = Model::empty();
+            let coherent = IndependentModelView::new(&exec, &model);
+            assert!(
+                coherent
+                    .definitions_for(array_leaf, DefKind::Array)
+                    .contains(&constant),
+                "baseline `{identity}` walk must index the array definition"
+            );
+            assert!(
+                coherent
+                    .definitions_for(datatype_leaf, DefKind::Datatype)
+                    .contains(&datatype_partner),
+                "baseline `{identity}` walk must index the datatype definition"
+            );
+            drop(coherent);
+
+            forge_non_theory_canonical_owner(&mut exec, identity, Sort::Bool);
+            let poisoned = IndependentModelView::new(&exec, &model);
+            assert!(!poisoned.canonical_theory_bindings_are_coherent());
+
+            poisoned.ensure_def_index();
+            assert!(
+                poisoned
+                    .def_index
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(HashMap::is_empty),
+                "eager index construction must memoize no authority under forged `{identity}`"
+            );
+            assert!(
+                poisoned
+                    .definitions_for(array_leaf, DefKind::Array)
+                    .is_empty(),
+                "array definitions must fail closed under forged `{identity}`"
+            );
+            assert!(
+                poisoned
+                    .definitions_for(datatype_leaf, DefKind::Datatype)
+                    .is_empty(),
+                "datatype definitions must fail closed under forged `{identity}`"
+            );
+        }
+    }
+
+    #[test]
+    fn asserted_uf_definition_allows_declaration_activated_theory_bindings() {
+        let mut exec = loaded(
+            r#"
+                (declare-fun set.subset ((Array Int Bool) (Array Int Bool)) Bool)
+                (declare-fun f (Int) Int)
+            "#,
+        );
+        let theory = exec
+            .ctx
+            .symbol_info("set.subset")
+            .expect("declaration-activated theory binding");
+        assert_eq!(
+            exec.ctx.effective_declaration_kind(theory.declaration_id()),
+            Some(DeclarationKind::Theory)
+        );
+
+        let one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let seven = exec.ctx.terms.mk_int(BigInt::from(7));
+        let app = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+        let definition = exec.ctx.terms.mk_eq(app, seven);
+        exec.independent_gate_authored_assertions = Some(vec![definition]);
+        let model = synthetic_lia_model(&[]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(view.canonical_theory_bindings_are_coherent());
+        assert!(matches!(
+            view.uf_app_definition_value(app),
+            Some(ModelValue::Int(value)) if value == BigInt::from(7)
+        ));
+    }
+
+    #[test]
+    fn map_target_definitions_do_not_poison_independent_definition_recovery() {
+        let cases = [
+            (
+                "define-fun",
+                r#"
+                    (define-fun div ((x Int) (y Int)) Int x)
+                    (declare-fun f (Int) Int)
+                "#,
+                vec!["div"],
+            ),
+            (
+                "define-fun-rec",
+                r#"
+                    (define-fun-rec mod ((x Int)) Int
+                        (ite (= x 0) 5 (mod 0)))
+                    (declare-fun f (Int) Int)
+                "#,
+                vec!["mod"],
+            ),
+            (
+                "define-funs-rec",
+                r#"
+                    (define-funs-rec
+                        ((abs ((x Int)) Int) (min ((x Int)) Int))
+                        ((ite (= x 0) 11 (min 0))
+                         (ite (= x 0) 11 (abs 0))))
+                    (declare-fun f (Int) Int)
+                "#,
+                vec!["abs", "min"],
+            ),
+        ];
+
+        for (label, script, defined_names) in cases {
+            let mut exec = loaded(script);
+            for name in defined_names {
+                let info = exec.ctx.symbol_info(name).expect("defined symbol metadata");
+                assert_eq!(
+                    exec.ctx.effective_declaration_kind(info.declaration_id()),
+                    Some(DeclarationKind::Defined),
+                    "{label}: definition kind"
+                );
+                assert!(
+                    info.internal_name.as_deref().is_some_and(|id| id != name),
+                    "{label}: `{name}` must not own its canonical theory identity"
+                );
+            }
+
+            let one = exec.ctx.terms.mk_int(BigInt::from(1));
+            let seven = exec.ctx.terms.mk_int(BigInt::from(7));
+            let app = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+            let definition = exec.ctx.terms.mk_eq(app, seven);
+            exec.independent_gate_authored_assertions = Some(vec![definition]);
+            let model = synthetic_lia_model(&[]);
+            let view = IndependentModelView::new(&exec, &model);
+
+            assert!(
+                view.canonical_theory_bindings_are_coherent(),
+                "{label}: legal map-target definitions must not poison canonical theory ownership"
+            );
+            assert!(matches!(
+                view.uf_app_definition_value(app),
+                Some(ModelValue::Int(value)) if value == BigInt::from(7)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_map_target_constant_does_not_poison_independent_definition_recovery() {
+        let mut exec = loaded("(declare-fun f (Int) Int)");
+        let native = exec.register_native_global_constant("div".to_string(), Sort::Int);
+        let core_name = match exec.ctx.terms.get(native) {
+            TermData::Var(name, _) => name.clone(),
+            other => panic!("native constant must be a Var, got {other:?}"),
+        };
+        let native_info = exec
+            .ctx
+            .symbol_info("div")
+            .expect("native constant metadata");
+        assert_ne!(core_name, "div");
+        assert_eq!(
+            native_info.internal_name.as_deref(),
+            Some(core_name.as_str())
+        );
+        assert_eq!(
+            exec.ctx
+                .effective_declaration_kind(native_info.declaration_id()),
+            Some(DeclarationKind::Uninterpreted)
+        );
+        assert!(exec.ctx.symbol_info_by_identity("div").is_none());
+
+        let one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let seven = exec.ctx.terms.mk_int(BigInt::from(7));
+        let app = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+        let definition = exec.ctx.terms.mk_eq(app, seven);
+        exec.independent_gate_authored_assertions = Some(vec![definition]);
+        let model = synthetic_lia_model(&[]);
+        let view = IndependentModelView::new(&exec, &model);
+
+        assert!(view.canonical_theory_bindings_are_coherent());
+        assert!(matches!(
+            view.uf_app_definition_value(app),
+            Some(ModelValue::Int(value)) if value == BigInt::from(7)
+        ));
+    }
+
+    #[test]
+    fn typed_unconstrained_bridge_rejects_mismatched_shapes() {
+        let mut exec = Executor::new();
+        let int_one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let int_zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let int_seven = exec.ctx.terms.mk_int(BigInt::from(7));
+        let real_one = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(1)));
+        let real_seven = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(7)));
+
+        let wrong_head =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("mod"), vec![int_one, int_zero], Sort::Int);
+        let indexed_head = exec.ctx.terms.mk_app(
+            Symbol::indexed("div", vec![0]),
+            vec![int_one, int_zero],
+            Sort::Int,
+        );
+        let wrong_arity = exec.ctx.terms.mk_app(
+            Symbol::named("div"),
+            vec![int_one, int_zero, int_one],
+            Sort::Int,
+        );
+        let wrong_argument_sort =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("div"), vec![real_one, int_zero], Sort::Int);
+        let wrong_result_sort =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("div"), vec![int_one, int_zero], Sort::Real);
+
+        exec.independent_gate_authored_assertions = Some(vec![
+            exec.ctx.terms.mk_eq(wrong_head, int_seven),
+            exec.ctx.terms.mk_eq(indexed_head, int_seven),
+            exec.ctx.terms.mk_eq(wrong_arity, int_seven),
+            exec.ctx.terms.mk_eq(wrong_argument_sort, int_seven),
+            exec.ctx.terms.mk_eq(wrong_result_sort, real_seven),
+        ]);
+        let model = Model::empty();
+        let view = IndependentModelView::new(&exec, &model);
+
+        for (label, term) in [
+            ("reason/head mismatch", wrong_head),
+            ("indexed head", indexed_head),
+            ("wrong arity", wrong_arity),
+            ("wrong argument sort", wrong_argument_sort),
+            ("wrong result sort", wrong_result_sort),
+        ] {
+            assert!(
+                view.proven_unconstrained_app_value(term, ProvenUnconstrainedKind::IntDivByZero,)
+                    .is_none(),
+                "typed fallback accepted {label}"
+            );
+            assert!(
+                view.uf_app_definition_value(term).is_none(),
+                "generic fallback accepted {label}"
+            );
+        }
     }
 
     #[test]
@@ -7004,7 +8780,7 @@ mod tests {
         let four = exec.ctx.terms.mk_int(BigInt::from(4));
         let base = exec.ctx.terms.mk_eq(x, five);
         let assumption = exec.ctx.terms.mk_eq(x, four);
-        exec.self_check_authored_assertions = Some(vec![base]);
+        exec.independent_gate_authored_assertions = Some(vec![base]);
         exec.last_assumptions = Some(vec![assumption]);
         exec.last_model = Some(synthetic_lia_model(&[(x, 5)]));
 
@@ -7020,7 +8796,7 @@ mod tests {
         let x = exec.ctx.terms.mk_var("assuming-positive-x", Sort::Int);
         let five = exec.ctx.terms.mk_int(BigInt::from(5));
         let base = exec.ctx.terms.mk_eq(x, five);
-        exec.self_check_authored_assertions = Some(vec![base]);
+        exec.independent_gate_authored_assertions = Some(vec![base]);
         exec.last_assumptions = Some(vec![base]);
         exec.last_model = Some(synthetic_lia_model(&[(x, 5)]));
 
@@ -7035,7 +8811,7 @@ mod tests {
         let mut exec = Executor::new();
         let true_term = exec.ctx.terms.true_term();
         let unpinned = exec.ctx.terms.mk_var("assuming-unpinned", Sort::Bool);
-        exec.self_check_authored_assertions = Some(vec![true_term]);
+        exec.independent_gate_authored_assertions = Some(vec![true_term]);
         exec.last_assumptions = Some(vec![unpinned]);
         exec.last_model = Some(synthetic_lia_model(&[]));
 
@@ -7058,7 +8834,7 @@ mod tests {
         let read = exec.ctx.terms.mk_select(target, zero);
         let read_is_zero = exec.ctx.terms.mk_eq(read, zero);
         let true_term = exec.ctx.terms.true_term();
-        exec.self_check_authored_assertions = Some(vec![true_term]);
+        exec.independent_gate_authored_assertions = Some(vec![true_term]);
         exec.last_assumptions = Some(vec![definition, read_is_zero]);
 
         let mut model = synthetic_lia_model(&[]);
@@ -7196,58 +8972,15 @@ mod tests {
             let mut exec = Executor::new();
             let obligation = midrange_bool_uf_gate_obligation(&mut exec);
             assert!(
-                matches!(
-                    exec.quantified_gate_isolated_solve(vec![obligation]),
-                    SolveResult::Unsat(_)
-                ),
+                quantified_gate_checked_unsat(&mut exec, vec![obligation]),
                 "iteration {iteration}: valid Bool-UF table equivalence was not proved"
             );
         }
     }
 
-    /// Small absorption-shaped obligations stay byte-for-byte on the legacy
-    /// path.  Rewriting those can perturb the DT-certificate fallback's search
-    /// order even though the replacement is propositionally equivalent.
-    #[test]
-    fn quantified_gate_small_absorption_is_not_rewritten() {
-        let mut exec = Executor::new();
-        let pivot = exec.ctx.terms.mk_var("qmg!small-p", Sort::Bool);
-        let residue = exec.ctx.terms.mk_var("qmg!small-q", Sort::Bool);
-        let compound = exec.ctx.terms.mk_and(vec![pivot, residue]);
-        let equality = exec.ctx.terms.mk_eq(pivot, compound);
-        let assertion = exec.ctx.terms.mk_not(equality);
-
-        assert_eq!(
-            quantified_gate_simplify_negated_absorbed_bool_eq(&mut exec.ctx.terms, assertion),
-            assertion
-        );
-    }
-
-    /// Fanout alone is insufficient: unrelated Boolean/DT table obligations
-    /// must retain their original search structure.
-    #[test]
-    fn quantified_gate_large_non_integer_table_is_not_rewritten() {
-        let mut exec = Executor::new();
-        let pivot = exec.ctx.terms.mk_var("qmg!large-p", Sort::Bool);
-        let mut table = Vec::with_capacity(256);
-        table.push(pivot);
-        for _ in 1..256 {
-            table.push(exec.ctx.terms.mk_fresh_var("qmg!large-q", Sort::Bool));
-        }
-        let compound = exec.ctx.terms.mk_and(table);
-        let equality = exec.ctx.terms.mk_eq(pivot, compound);
-        let assertion = exec.ctx.terms.mk_not(equality);
-
-        assert_eq!(
-            quantified_gate_simplify_negated_absorbed_bool_eq(&mut exec.ctx.terms, assertion),
-            assertion
-        );
-    }
-
-    /// The normalization is a completeness aid, not a verdict escape hatch.
     /// Mixed nonlinear Int/Real arithmetic is intentionally unsupported by
-    /// the nested dispatcher and must remain fail-closed Unknown.  The local
-    /// 500 ms slice must also restore the caller's longer deadline.
+    /// the checked probe and must remain fail-closed. The disposable 500 ms
+    /// budget must also leave the caller's longer deadline untouched.
     #[test]
     fn quantified_gate_out_of_fragment_stays_unknown_and_restores_deadline() {
         let mut exec = Executor::new();
@@ -7267,9 +9000,10 @@ mod tests {
 
         let outer_deadline = Instant::now() + Duration::from_secs(10);
         exec.set_deadline(Some(outer_deadline));
-        assert_eq!(
-            exec.quantified_gate_isolated_solve(assertions),
-            SolveResult::Unknown
+        assert!(
+            exec.quantified_gate_checked_ground_solve(assertions)
+                .is_none(),
+            "an unsupported checked probe must not return a decision token"
         );
         assert_eq!(exec.solve_deadline.get(), Some(outer_deadline));
     }
@@ -7499,6 +9233,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nontrivial_model_less_sat_fails_closed_even_with_validation_marker() {
+        let mut exec = Executor::new();
+        let assertion = exec.ctx.terms.true_term();
+        exec.ctx.assertions.push(assertion);
+        exec.last_result = Some(SolveResult::Sat);
+        exec.last_model_validated = true;
+        assert!(exec.last_model.is_none(), "the setup must have no witness");
+
+        let gated = exec.apply_independent_model_gate(SolveResult::Sat);
+
+        assert_eq!(gated, SolveResult::Unknown);
+        assert_eq!(
+            exec.last_statistics.get_string("model_check_gate.result"),
+            Some("cannot-confirm")
+        );
+        assert_eq!(
+            exec.last_statistics
+                .get_string("model_check_gate.cannot_confirm_reason"),
+            Some("no model was produced")
+        );
+    }
+
     /// The soundness-gate alarm's debug payload (printed to stderr by
     /// [`Executor::report_caught_invalid_model`]) must name the violated
     /// assertion's leaves and their falsifying model values. Pins the
@@ -7545,6 +9302,387 @@ mod tests {
             exec.last_statistics.get_string("model_check_gate.result"),
             Some("confirmed-sat"),
             "the gate must independently confirm the valid witness"
+        );
+    }
+
+    #[test]
+    fn quantified_sat_without_model_fails_closed() {
+        let commands = parse(
+            "(set-logic AUFLIA)\
+             (assert (forall ((x Int)) (= x x)))",
+        )
+        .expect("valid SMT-LIB input");
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).expect("execute succeeds");
+        assert!(outputs.is_empty(), "the setup must not solve the formula");
+        assert!(exec.last_model.is_none(), "the setup must have no witness");
+
+        let gated = exec.apply_quantified_model_failclosed_gate(SolveResult::Sat);
+        assert_eq!(
+            gated,
+            SolveResult::Unknown,
+            "a quantified SAT classification without a model is not a certificate"
+        );
+        assert_eq!(
+            exec.last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("missing-model-failclosed")
+        );
+    }
+
+    fn typed_quantified_confirmation_fixture() -> Executor {
+        let mut exec = loaded(
+            "(set-logic LIA)\
+             (assert (forall ((x Int)) (= x x)))",
+        );
+        exec.last_model = Some(Model::empty());
+        let roots = independent_gate_query_roots(&exec);
+        let query_epoch = exec.query_authority_epoch.clone();
+        let source_context_stamp = exec.ctx.source_context_stamp();
+        let scope = QuantifiedModelCheckScope::capture(
+            &mut exec,
+            query_epoch,
+            source_context_stamp,
+            &roots,
+        )
+        .expect("fixture captures the checked model");
+        let confirmation = scope.finish(&exec).expect("fixture remains current");
+        exec.quantified_model_confirmation = Some(confirmation);
+        exec
+    }
+
+    fn confirm_with_designated_quantified_handoff(exec: &Executor) -> GateVerdict {
+        exec.confirm_sat_with_independent_gate_confirmation(
+            exec.quantified_model_confirmation.as_ref(),
+        )
+    }
+
+    #[test]
+    fn forged_confirmed_telemetry_cannot_skip_quantified_leaves() {
+        let mut exec = loaded(
+            "(set-logic LIA)\
+             (assert (forall ((x Int)) (= x x)))",
+        );
+        exec.last_model = Some(Model::empty());
+        exec.last_statistics
+            .set_string("model_check_gate.quantified", "confirmed");
+
+        assert!(
+            matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::CannotConfirm { .. }
+            ),
+            "diagnostic text must never discharge a quantified leaf"
+        );
+    }
+
+    #[test]
+    fn quantified_check_scope_rejects_postcheck_model_replacement() {
+        let mut exec = loaded(
+            "(set-logic LIA)\
+             (assert (forall ((x Int)) (= x x)))",
+        );
+        exec.last_model = Some(Model::empty());
+        let roots = independent_gate_query_roots(&exec);
+        let query_epoch = exec.query_authority_epoch.clone();
+        let source_context_stamp = exec.ctx.source_context_stamp();
+        let scope = QuantifiedModelCheckScope::capture(
+            &mut exec,
+            query_epoch,
+            source_context_stamp,
+            &roots,
+        )
+        .expect("pre-check scope captures the incoming model");
+
+        let mut foreign = exec.last_model.as_ref().expect("fixture model").clone();
+        let true_term = exec.ctx.terms.true_term();
+        foreign
+            .completed_values
+            .insert(true_term, EvalValue::Bool(false));
+        exec.last_model = Some(foreign);
+
+        assert!(
+            scope.finish(&exec).is_none(),
+            "a clone installed after checking must not inherit the incoming model seal"
+        );
+    }
+
+    #[test]
+    fn quantified_check_scope_rejects_reused_root_slot() {
+        let mut exec = Executor::new();
+        exec.last_model = Some(Model::empty());
+        let checkpoint = exec.ctx.terms.rollback_checkpoint();
+        let body = exec.ctx.terms.true_term();
+        let root = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        let original_entry = exec
+            .ctx
+            .terms
+            .entry_stamp(root)
+            .expect("captured root is live");
+        exec.ctx.assertions.push(root);
+        let query_epoch = exec.query_authority_epoch.clone();
+        let source_context_stamp = exec.ctx.source_context_stamp();
+        let scope = QuantifiedModelCheckScope::capture(
+            &mut exec,
+            query_epoch,
+            source_context_stamp,
+            &[root],
+        )
+        .expect("scope captures the live quantified root");
+
+        exec.ctx.assertions.clear();
+        exec.ctx.terms.rollback_to(checkpoint);
+        let replacement_body = exec.ctx.terms.false_term();
+        let replacement = exec.ctx.terms.mk_forall(
+            vec![("replacement".to_string(), Sort::Int)],
+            replacement_body,
+        );
+        assert_eq!(replacement, root, "rollback should reuse the numeric slot");
+        assert_ne!(
+            exec.ctx.terms.entry_stamp(replacement),
+            Some(original_entry),
+            "the reused slot must have a different birth identity"
+        );
+        exec.ctx.assertions.push(replacement);
+
+        assert!(
+            scope.finish(&exec).is_none(),
+            "numeric root equality cannot authenticate a rolled-back term"
+        );
+    }
+
+    #[test]
+    fn quantified_confirmation_rejects_reused_root_slot() {
+        let mut exec = Executor::new();
+        exec.last_model = Some(Model::empty());
+        let checkpoint = exec.ctx.terms.rollback_checkpoint();
+        let body = exec.ctx.terms.true_term();
+        let root = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        exec.ctx.assertions.push(root);
+        let query_epoch = exec.query_authority_epoch.clone();
+        let source_context_stamp = exec.ctx.source_context_stamp();
+        let confirmation = QuantifiedModelCheckScope::capture(
+            &mut exec,
+            query_epoch,
+            source_context_stamp,
+            &[root],
+        )
+        .and_then(|scope| scope.finish(&exec))
+        .expect("confirmation captures the live quantified root");
+
+        exec.ctx.assertions.clear();
+        exec.ctx.terms.rollback_to(checkpoint);
+        let replacement_body = exec.ctx.terms.false_term();
+        let replacement = exec.ctx.terms.mk_forall(
+            vec![("replacement".to_string(), Sort::Int)],
+            replacement_body,
+        );
+        assert_eq!(replacement, root, "rollback should reuse the numeric slot");
+        exec.ctx.assertions.push(replacement);
+        let model = exec
+            .last_model
+            .as_ref()
+            .expect("sealed model remains installed");
+
+        assert!(
+            confirmation
+                .bind_current(&exec, &[replacement], model)
+                .is_none(),
+            "a confirmation cannot be retargeted onto a reused root slot"
+        );
+    }
+
+    #[test]
+    fn quantified_confirmation_accepts_append_only_term_growth() {
+        let mut exec = typed_quantified_confirmation_fixture();
+        let roots = independent_gate_query_roots(&exec);
+        let _suffix = exec
+            .ctx
+            .terms
+            .mk_fresh_var("post-confirmation-suffix", Sort::Bool);
+        let confirmation = exec
+            .quantified_model_confirmation
+            .as_ref()
+            .expect("fixture installs a confirmation");
+        let model = exec.last_model.as_ref().expect("fixture installs a model");
+
+        assert!(
+            confirmation.bind_current(&exec, &roots, model).is_some(),
+            "unreferenced append-only suffix terms preserve every root entry"
+        );
+    }
+
+    #[test]
+    fn typed_quantified_confirmation_is_exact_and_stales_on_every_binding() {
+        let mut exec = typed_quantified_confirmation_fixture();
+        assert!(
+            matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::CannotConfirm { .. }
+            ),
+            "ordinary internal checks must not borrow the designated handoff"
+        );
+        exec.last_statistics
+            .set_string("model_check_gate.quantified", "confirmed");
+        assert_eq!(
+            exec.apply_independent_model_gate(SolveResult::Sat),
+            SolveResult::Sat,
+            "the designated consumer may use the exact sealed handoff"
+        );
+        assert!(exec.quantified_model_confirmation.is_none());
+        assert_eq!(
+            exec.last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("confirmed"),
+            "consumption does not rewrite diagnostic telemetry"
+        );
+        assert!(
+            matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::CannotConfirm { .. }
+            ),
+            "stale confirmed telemetry cannot resurrect a consumed handoff"
+        );
+
+        let mut epoch_stale = typed_quantified_confirmation_fixture();
+        epoch_stale.advance_query_authority_epoch();
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&epoch_stale),
+            GateVerdict::CannotConfirm { .. }
+        ));
+
+        let mut source_stale = typed_quantified_confirmation_fixture();
+        let push = parse("(push 1)").expect("valid push");
+        source_stale
+            .ctx
+            .process_command(&push[0])
+            .expect("push changes the source/scope stamp");
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&source_stale),
+            GateVerdict::CannotConfirm { .. }
+        ));
+
+        let mut roots_stale = typed_quantified_confirmation_fixture();
+        let true_term = roots_stale.ctx.terms.true_term();
+        roots_stale.ctx.assertions.push(true_term);
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&roots_stale),
+            GateVerdict::CannotConfirm { .. }
+        ));
+
+        let mut model_stale = typed_quantified_confirmation_fixture();
+        model_stale.last_model = Some(Model::empty());
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&model_stale),
+            GateVerdict::CannotConfirm { .. }
+        ));
+
+        let mut cloned_model_stale = typed_quantified_confirmation_fixture();
+        let mut cloned = cloned_model_stale
+            .last_model
+            .as_ref()
+            .expect("fixture model")
+            .clone();
+        let true_term = cloned_model_stale.ctx.terms.true_term();
+        cloned
+            .completed_values
+            .insert(true_term, EvalValue::Bool(false));
+        cloned_model_stale.last_model = Some(cloned);
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&cloned_model_stale),
+            GateVerdict::CannotConfirm { .. }
+        ));
+
+        let mut revoked = typed_quantified_confirmation_fixture();
+        revoked
+            .last_model
+            .as_mut()
+            .expect("fixture model")
+            .revoke_quantified_confirmation();
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&revoked),
+            GateVerdict::CannotConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn canonical_quantified_authority_clear_consumes_direct_confirmation() {
+        let mut exec = typed_quantified_confirmation_fixture();
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&exec),
+            GateVerdict::ConfirmedSat
+        ));
+
+        exec.clear_quantified_sat_authority();
+
+        assert!(exec.quantified_model_confirmation.is_none());
+        assert!(matches!(
+            confirm_with_designated_quantified_handoff(&exec),
+            GateVerdict::CannotConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn quantified_gate_independently_confirms_vacuous_inner_forall() {
+        let mut exec = loaded(
+            r#"
+                (set-logic AUFLIA)
+                (define-fun a ((x Int)) Bool (= x 0))
+                (define-fun A () (Array Int Int) ((as const (Array Int Int)) 1))
+                (assert (forall ((x Int))
+                    (=> (a x)
+                        (forall ((y Int)) (not (= (select A y) x))))))
+            "#,
+        );
+        // Force the proofless global-validity fallback to decline. The model
+        // gate must independently confirm the exact vacuity equivalence and
+        // the remaining quantifier-free matrix instead.
+        exec.set_produce_proofs(true);
+        exec.last_model = Some(Model::empty());
+
+        assert_eq!(
+            exec.apply_quantified_model_failclosed_gate(SolveResult::Sat),
+            SolveResult::Sat
+        );
+        assert_eq!(
+            exec.last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("confirmed")
+        );
+    }
+
+    #[test]
+    fn quantified_gate_keeps_used_inner_binder_and_fails_closed() {
+        let mut exec = loaded(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun f (Int) Int)
+                (assert (forall ((x Int))
+                    (or (forall ((y Int)) (= (f x) y)) (= x 0))))
+            "#,
+        );
+        exec.set_produce_proofs(true);
+        exec.last_model = Some(Model::empty());
+
+        assert_eq!(
+            exec.apply_quantified_model_failclosed_gate(SolveResult::Sat),
+            SolveResult::Unknown,
+            "a genuinely used residual binder must not be erased or certified"
+        );
+        assert_eq!(
+            exec.last_unknown_reason,
+            Some(UnknownReason::Incomplete),
+            "the gate records the reason before the public funnel commits last_result"
+        );
+        assert!(
+            exec.last_model.is_none(),
+            "a fail-closed quantified witness must not remain observable"
         );
     }
 
@@ -7787,6 +9925,8 @@ mod tests {
         let mut euf = ay_euf::EufModel::default();
         euf.term_values.insert(i, "-2".to_string());
         exec.last_model = Some(Model {
+            quantified_confirmation_seal: Default::default(),
+            quantified_grant_model_seal: Default::default(),
             sat_model: vec![],
             term_to_var: DetHashMap::default(),
             bool_overrides: DetHashMap::default(),
@@ -7798,6 +9938,10 @@ mod tests {
             fp_model: None,
             string_model: None,
             seq_model: None,
+            projection_ufs: Default::default(),
+            certified_total_ufs: Default::default(),
+            certified_const_interps: Default::default(),
+            formula_neutral_function_defaults: Default::default(),
             completed_values: DetHashMap::default(),
             dt_ground: DetHashMap::default(),
             dt_pins: DetHashMap::default(),

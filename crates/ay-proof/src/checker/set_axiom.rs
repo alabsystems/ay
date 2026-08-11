@@ -19,10 +19,13 @@
 //! MENTIONING `set.card` would licence `(<= 5 (set.card s))`, which is false
 //! for the empty set and would let a refutation be built out of nothing.
 
+use std::collections::VecDeque;
+use std::mem::size_of;
+
 use ay_core::{Constant, ProofId, Sort, TermData, TermId, TermStore};
 use num_traits::Zero;
 
-use ay_core::kani_compat::DetHashSet;
+use ay_core::kani_compat::{DetHashMap, DetHashSet};
 
 use crate::ProofCheckError;
 
@@ -33,57 +36,116 @@ use crate::ProofCheckError;
 /// disjunction is NOT unconditional -- harvesting one would licence
 /// `|s| = 0` for a set the problem never claims is empty.
 #[derive(Debug, Default)]
-pub struct EmptySetRegistry {
+pub(crate) struct EmptySetRegistry {
     known_empty: DetHashSet<TermId>,
 }
 
 impl EmptySetRegistry {
     /// Close the syntactically-empty sets under the problem's asserted
     /// equalities. `(assert (= s empty))` makes `s` empty; `(assert (= t s))`
-    /// then makes `t` empty too, so this iterates to a fixpoint.
-    pub fn collect(terms: &TermStore, problem_assertions: &[TermId]) -> Self {
-        let equalities: Vec<(TermId, TermId)> = problem_assertions
-            .iter()
-            .filter_map(|&assertion| match terms.get(assertion) {
-                TermData::App(operator, args) if operator.name() == "=" && args.len() == 2 => {
-                    Some((args[0], args[1]))
-                }
-                _ => None,
-            })
-            .collect();
+    /// then makes `t` empty too, closing the whole equality component.
+    pub(crate) fn collect(terms: &TermStore, problem_assertions: &[TermId]) -> Self {
+        let mut unbounded = |_: usize, _: usize| true;
+        // The unbounded callback cannot reject. A checked-size overflow is
+        // therefore the only possible error, and an empty registry is the
+        // fail-closed result: it may reject a valid lemma but cannot admit an
+        // unsupported one.
+        Self::collect_with_progress(terms, problem_assertions, &mut unbounded).unwrap_or_default()
+    }
 
+    /// Metered, linear-time construction for strict authentication.
+    ///
+    /// The old repeated equality scan was quadratic on a reverse-ordered
+    /// chain. This builds an undirected equality graph once and propagates
+    /// emptiness with one breadth-first traversal. `progress` is called before
+    /// each allocation/work block, including every equality edge.
+    pub(crate) fn collect_with_progress(
+        terms: &TermStore,
+        problem_assertions: &[TermId],
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<Self, ProofCheckError> {
+        let mut adjacency: DetHashMap<TermId, Vec<TermId>> = DetHashMap::default();
         let mut known_empty = DetHashSet::default();
-        for &(lhs, rhs) in &equalities {
-            for side in [lhs, rhs] {
-                if is_syntactically_empty_set(terms, side) {
-                    known_empty.insert(side);
+        let mut queue = VecDeque::new();
+
+        for &assertion in problem_assertions {
+            registry_charge(progress, 1, 0)?;
+            let TermData::App(operator, args) = terms.get(assertion) else {
+                continue;
+            };
+            let [lhs, rhs] = args.as_slice() else {
+                continue;
+            };
+            if operator.name() != "=" {
+                continue;
+            }
+
+            // Conservatively charge a map entry and vector allocation in both
+            // directions even when an endpoint already has an adjacency list.
+            // Overcharging is safe and avoids allocator-specific accounting.
+            let directed_edge_bytes = checked_registry_add(
+                size_of::<TermId>(),
+                checked_registry_add(size_of::<Vec<TermId>>(), size_of::<TermId>())?,
+            )?;
+            registry_charge(progress, 2, checked_registry_mul(directed_edge_bytes, 2)?)?;
+            adjacency.entry(*lhs).or_default().push(*rhs);
+            adjacency.entry(*rhs).or_default().push(*lhs);
+
+            for side in [*lhs, *rhs] {
+                let seed_bytes = checked_registry_add(size_of::<TermId>() * 2, 32)?;
+                registry_charge(progress, 1, seed_bytes)?;
+                if is_syntactically_empty_set(terms, side) && known_empty.insert(side) {
+                    queue.push_back(side);
                 }
             }
         }
 
-        // Fixpoint. Bounded by the equality count: each pass adds at least one
-        // term or stops.
-        loop {
-            let mut grew = false;
-            for &(lhs, rhs) in &equalities {
-                if known_empty.contains(&lhs) && known_empty.insert(rhs) {
-                    grew = true;
+        while let Some(empty) = queue.pop_front() {
+            registry_charge(progress, 1, 0)?;
+            let Some(neighbors) = adjacency.get(&empty) else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                // Hash-set entry plus the possible queue element. Charging it
+                // for duplicates too is conservative while work remains one
+                // callback/predicate/insert attempt per directed edge.
+                let discovered_bytes = checked_registry_add(size_of::<TermId>() * 2, 32)?;
+                registry_charge(progress, 1, discovered_bytes)?;
+                if known_empty.insert(neighbor) {
+                    queue.push_back(neighbor);
                 }
-                if known_empty.contains(&rhs) && known_empty.insert(lhs) {
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
             }
         }
-        Self { known_empty }
+
+        Ok(Self { known_empty })
     }
 
     /// Whether the problem forces `term` to be the empty set.
-    pub fn is_known_empty(&self, terms: &TermStore, term: TermId) -> bool {
+    pub(crate) fn is_known_empty(&self, terms: &TermStore, term: TermId) -> bool {
         is_syntactically_empty_set(terms, term) || self.known_empty.contains(&term)
     }
+}
+
+fn registry_charge(
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+    work: usize,
+    bytes: usize,
+) -> Result<(), ProofCheckError> {
+    if progress(work, bytes) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::ResourceLimit)
+    }
+}
+
+fn checked_registry_add(left: usize, right: usize) -> Result<usize, ProofCheckError> {
+    left.checked_add(right)
+        .ok_or(ProofCheckError::ResourceLimit)
+}
+
+fn checked_registry_mul(left: usize, right: usize) -> Result<usize, ProofCheckError> {
+    left.checked_mul(right)
+        .ok_or(ProofCheckError::ResourceLimit)
 }
 
 /// Validate a `SetCardEmptyByAssertion` lemma: `(= (set.card s) 0)` where the
@@ -416,6 +478,22 @@ fn integer_index(terms: &TermStore, term: TermId) -> Option<&num_bigint::BigInt>
     }
 }
 
+const SET_MEMBER_COUNT_WORK_LIMIT: usize = 100_000_000;
+const SET_MEMBER_COUNT_DEPTH_LIMIT: usize = 512;
+
+fn charge_member_count(work: &mut usize, amount: usize) -> Result<(), String> {
+    let Some(next) = work.checked_add(amount) else {
+        return Err("set-card-member-count work accounting overflow".to_string());
+    };
+    if next > SET_MEMBER_COUNT_WORK_LIMIT {
+        return Err(format!(
+            "set-card-member-count exceeds {SET_MEMBER_COUNT_WORK_LIMIT} checked operations"
+        ));
+    }
+    *work = next;
+    Ok(())
+}
+
 /// Walk the membership tree, checking every leaf bounds `card` below by the
 /// number of memberships holding on the path to it.
 fn walk_member_count(
@@ -424,7 +502,20 @@ fn walk_member_count(
     set: TermId,
     card: TermId,
     path: &mut Vec<num_bigint::BigInt>,
+    work: &mut usize,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > SET_MEMBER_COUNT_DEPTH_LIMIT {
+        return Err(format!(
+            "set-card-member-count exceeds depth {SET_MEMBER_COUNT_DEPTH_LIMIT}"
+        ));
+    }
+    charge_member_count(
+        work,
+        path.len()
+            .checked_add(1)
+            .ok_or_else(|| "set-card-member-count path-length accounting overflow".to_string())?,
+    )?;
     let TermData::Ite(condition, then_branch, else_branch) = terms.get(node) else {
         // Leaf: `(<= |path| (set.card s))` over the SAME set.
         let Some(bounded) = card_lower_bounded_by_term(terms, node, path.len()) else {
@@ -469,10 +560,13 @@ fn walk_member_count(
     }
 
     path.push(value.clone());
-    let then_ok = walk_member_count(terms, *then_branch, set, card, path);
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "set-card-member-count depth overflow".to_string())?;
+    let then_ok = walk_member_count(terms, *then_branch, set, card, path, work, child_depth);
     path.pop();
     then_ok?;
-    walk_member_count(terms, *else_branch, set, card, path)
+    walk_member_count(terms, *else_branch, set, card, path, work, child_depth)
 }
 
 /// `(<= <count> (set.card s))` -- returns the bounded set, for a usize count.
@@ -517,28 +611,60 @@ pub(crate) fn validate_set_card_member_count(
     };
     // Anchor the cardinality term from the set itself, so a leaf bounding some
     // OTHER set's cardinality cannot define the anchor and then match itself.
-    let Some(card) = find_card_of(terms, *literal, set) else {
+    let mut work = 0_usize;
+    let Some(card) = find_card_of(terms, *literal, set, &mut work, 0).map_err(|reason| {
+        ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!("set-card-member-count: {reason}"),
+        }
+    })?
+    else {
         return reject(format!("no `({OP_CARD} s)` over the tested set was found"));
     };
 
     let mut path = Vec::new();
-    match walk_member_count(terms, *literal, set, card, &mut path) {
+    match walk_member_count(terms, *literal, set, card, &mut path, &mut work, 0) {
         Ok(()) => Ok(()),
         Err(reason) => reject(format!("set-card-member-count: {reason}")),
     }
 }
 
 /// Find `(set.card set)` anywhere in `node` (the tree's leaves all use it).
-fn find_card_of(terms: &TermStore, node: TermId, set: TermId) -> Option<TermId> {
+fn find_card_of(
+    terms: &TermStore,
+    node: TermId,
+    set: TermId,
+    work: &mut usize,
+    depth: usize,
+) -> Result<Option<TermId>, String> {
+    if depth > SET_MEMBER_COUNT_DEPTH_LIMIT {
+        return Err(format!(
+            "set-card-member-count search exceeds depth {SET_MEMBER_COUNT_DEPTH_LIMIT}"
+        ));
+    }
+    charge_member_count(work, 1)?;
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "set-card-member-count search depth overflow".to_string())?;
     match terms.get(node) {
-        TermData::Ite(_, then_branch, else_branch) => find_card_of(terms, *then_branch, set)
-            .or_else(|| find_card_of(terms, *else_branch, set)),
+        TermData::Ite(_, then_branch, else_branch) => {
+            if let Some(card) = find_card_of(terms, *then_branch, set, work, child_depth)? {
+                Ok(Some(card))
+            } else {
+                find_card_of(terms, *else_branch, set, work, child_depth)
+            }
+        }
         TermData::App(operator, args) => {
             if operator.name() == OP_CARD && args.len() == 1 && args[0] == set {
-                return Some(node);
+                return Ok(Some(node));
             }
-            args.iter().find_map(|&a| find_card_of(terms, a, set))
+            for &arg in args {
+                if let Some(card) = find_card_of(terms, arg, set, work, child_depth)? {
+                    return Ok(Some(card));
+                }
+            }
+            Ok(None)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }

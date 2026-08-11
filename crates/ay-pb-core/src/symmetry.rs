@@ -493,10 +493,10 @@ const MAX_VERIFIED_PARTITION_ASSEMBLY_WORK: usize = 1_000_000;
 /// declared variable.  A miss is `Ok(None)`; malformed input, resource
 /// exhaustion, and deadlines are distinguished and never return a partial
 /// partition.
-pub fn detect_verified_block_partition_with_deadline<'a>(
-    instance: &'a PbInstance,
+pub fn detect_verified_block_partition_with_deadline(
+    instance: &PbInstance,
     deadline: Option<std::time::Instant>,
-) -> Result<Option<VerifiedBlockPartition<'a>>, VerifiedBlockPartitionDecline> {
+) -> Result<Option<VerifiedBlockPartition<'_>>, VerifiedBlockPartitionDecline> {
     preflight_verified_block_partition(instance, deadline)?;
     if instance.num_vars < 2 {
         return Ok(None);
@@ -2095,9 +2095,7 @@ fn is_automorphism_with_limits(
     let mut domain = std::collections::BTreeSet::new();
     let mut image = std::collections::BTreeSet::new();
     for (&source, &target) in perm {
-        if charge_automorphism_work(work, 2, max_work, deadline).is_none() {
-            return None;
-        }
+        charge_automorphism_work(work, 2, max_work, deadline)?;
         domain.insert(source);
         image.insert(target);
     }
@@ -2159,9 +2157,7 @@ fn is_automorphism_with_limits(
     // coefficient and polarity. A variable absent from the objective has
     // implicit coefficient 0; its image must also be absent (or zero).
     for (&x, &sx) in perm {
-        if charge_automorphism_work(work, 1, max_work, deadline).is_none() {
-            return None;
-        }
+        charge_automorphism_work(work, 1, max_work, deadline)?;
         let ox = objective.get(&x).copied();
         let osx = objective.get(&sx).copied();
         if ox != osx {

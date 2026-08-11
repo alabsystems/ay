@@ -16,10 +16,10 @@ use ay_dpll::api::{Sort, Term};
 use super::{
     activate_finite_set_quantifier_gate, bounded_sort_hi, ffi_count_within_limit,
     ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, finite_set_engine_public_sort,
-    lookup_ast_sort, range_guard_term, record_ast_sort, require_term_ast_or_return,
-    require_term_asts_or_return, sort_mentions_finite_set, term_to_ast, QuantifierFfiMetadata,
-    SymbolKey, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS,
-    Z3_INVALID_ARG, Z3_INVALID_USAGE,
+    lookup_ast_sort, range_guard_term, record_ast_sort, record_bounded_array_ext_lemma,
+    require_term_ast_or_return, require_term_asts_or_return, sort_mentions_finite_set, term_to_ast,
+    QuantifierFfiMetadata, SymbolKey, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
+    MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG, Z3_INVALID_USAGE,
 };
 
 /// Metadata supplied alongside one quantifier construction. Keeping it in the
@@ -461,6 +461,14 @@ pub(crate) unsafe fn mk_quantifier_const(
                         .map(|hi| (v, hi))
                 })
                 .collect();
+            // The UNRELATIVIZED body, kept for the bounded-array extensionality
+            // lemma below: it must inspect what the caller wrote
+            // (`(= (select a i) (select b i))`), not the guarded implication.
+            let public_body_source = body_term;
+            let public_bound_sort = match vars.as_slice() {
+                [only] => lookup_ast_sort(ctx, term_to_ast(ctx, *only)).cloned(),
+                _ => None,
+            };
             let body_term = guard_bounded_quantifier_body(ctx, is_forall, &var_bounds, body_term);
             let result = if let Some(ref trigger_slices) = trigger_slices {
                 let trigger_refs: Vec<&[Term]> = trigger_slices.iter().map(Vec::as_slice).collect();
@@ -484,6 +492,19 @@ pub(crate) unsafe fn mk_quantifier_const(
                         return 0;
                     }
                     ctx.quantifier_public_bound_terms.insert(term, vars.clone());
+                    if is_forall {
+                        if let ([only], Some(bound_sort)) =
+                            (vars.as_slice(), public_bound_sort.as_ref())
+                        {
+                            record_bounded_array_ext_lemma(
+                                ctx,
+                                term,
+                                *only,
+                                bound_sort,
+                                public_body_source,
+                            );
+                        }
+                    }
                     if has_finite_set_binder {
                         activate_finite_set_quantifier_gate(ctx, term, "constant-style quantifier");
                     }

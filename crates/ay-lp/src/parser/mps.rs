@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::error::LpError;
 use crate::model::{Constraint, Problem, RowKind, Sense, VarKind, Variable};
+use crate::parser::checked_finite_add;
 
 /// Parses an MPS file into a [`Problem`].
 ///
@@ -119,8 +120,8 @@ struct ParserState {
     row_index: BTreeMap<String, usize>,
     /// Column names -> index into `problem.variables`.
     col_index: BTreeMap<String, usize>,
-    /// RANGES values keyed by row name, applied in `finalize`.
-    ranges: BTreeMap<String, f64>,
+    /// RANGES values and source lines keyed by row name, applied in `finalize`.
+    ranges: BTreeMap<String, (f64, usize)>,
 }
 
 impl ParserState {
@@ -137,7 +138,7 @@ impl ParserState {
         // become a pair (>=, <=).
         let mut new_constraints: Vec<Constraint> = Vec::new();
         let mut replacements: Vec<(usize, Constraint)> = Vec::new();
-        for (name, r) in &self.ranges {
+        for (name, &(r, line)) in &self.ranges {
             let idx = self
                 .row_index
                 .get(name)
@@ -153,7 +154,8 @@ impl ParserState {
             let base_coeffs = self.problem.constraints[idx].coeffs.clone();
             match base_kind {
                 RowKind::Le => {
-                    let lower = base_rhs - r.abs();
+                    let lower =
+                        checked_finite_add(base_rhs, -r.abs(), line, "ranged-row lower bound")?;
                     new_constraints.push(Constraint {
                         name: format!("{base_name}_rng"),
                         kind: RowKind::Ge,
@@ -162,7 +164,8 @@ impl ParserState {
                     });
                 }
                 RowKind::Ge => {
-                    let upper = base_rhs + r.abs();
+                    let upper =
+                        checked_finite_add(base_rhs, r.abs(), line, "ranged-row upper bound")?;
                     new_constraints.push(Constraint {
                         name: format!("{base_name}_rng"),
                         kind: RowKind::Le,
@@ -171,10 +174,11 @@ impl ParserState {
                     });
                 }
                 RowKind::Eq => {
-                    let (lo, hi) = if *r >= 0.0 {
-                        (base_rhs, base_rhs + r)
+                    let shifted = checked_finite_add(base_rhs, r, line, "ranged equality bound")?;
+                    let (lo, hi) = if r >= 0.0 {
+                        (base_rhs, shifted)
                     } else {
-                        (base_rhs + r, base_rhs)
+                        (shifted, base_rhs)
                     };
                     replacements.push((
                         idx,
@@ -297,7 +301,12 @@ fn parse_columns_line(
         let row = tokens[i];
         let value = parse_float(tokens[i + 1], line)?;
         if state.obj_row.as_deref() == Some(row) {
-            state.problem.variables[col_idx].obj_coeff = value;
+            // Free-form MPS permits a column to be continued across multiple
+            // records. Repeated entries denote additive matrix coefficients,
+            // including entries in the objective row.
+            let current = state.problem.variables[col_idx].obj_coeff;
+            state.problem.variables[col_idx].obj_coeff =
+                checked_finite_add(current, value, line, "objective coefficient sum")?;
         } else {
             let row_idx = *state
                 .row_index
@@ -306,9 +315,16 @@ fn parse_columns_line(
                     line,
                     name: row.to_string(),
                 })?;
-            state.problem.constraints[row_idx]
+            let constraint = &mut state.problem.constraints[row_idx];
+            if let Some((_, current)) = constraint
                 .coeffs
-                .push((col_idx, value));
+                .iter_mut()
+                .find(|(variable, _)| *variable == col_idx)
+            {
+                *current = checked_finite_add(*current, value, line, "constraint coefficient sum")?;
+            } else {
+                constraint.coeffs.push((col_idx, value));
+            }
         }
         i += 2;
     }
@@ -374,7 +390,7 @@ fn parse_ranges_line(tokens: &[&str], line: usize, state: &mut ParserState) -> R
                 name: row.to_string(),
             });
         }
-        state.ranges.insert(row.to_string(), value);
+        state.ranges.insert(row.to_string(), (value, line));
         i += 2;
     }
     Ok(())

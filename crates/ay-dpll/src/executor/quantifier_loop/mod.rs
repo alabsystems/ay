@@ -19,17 +19,20 @@ mod cegqi_refinement;
 mod dispatch;
 mod entailed_consts;
 pub(crate) mod family_classifier;
-mod model_completion;
 mod preprocess;
-mod result_mapping;
+// Untrusted projection proposal plus independent semantic/source checking.
+// This module cannot emit SAT: its opaque result must still be consumed with
+// an authored-query permit at the sealed SAT authority boundary.
+pub(in crate::executor) mod projection_candidate;
+pub(in crate::executor) mod result_mapping;
 
-use ay_core::{Constant, Sort, TermData, TermId, TermStore};
-use num_bigint::BigInt;
+use ay_core::{Sort, TermData, TermId, TermStore};
 
 pub(in crate::executor) use cegqi_refinement::unsupported_arith_mentions_ce_var;
 pub(in crate::executor) use family_classifier::write_family_class_statistics;
+pub(in crate::executor) use result_mapping::CegqiUfRecompletionGrant;
 
-use super::Executor;
+use super::{Executor, QuantExpansionRecord};
 use crate::cegqi::CegqiInstantiator;
 use crate::ematching::{collect_quantifiers, contains_quantifier};
 use crate::quantifier_manager::QuantifierManager;
@@ -71,11 +74,8 @@ fn is_mbqi_unsafe_binder_sort(sort: &Sort) -> bool {
 fn forall_has_unsafe_binder(terms: &TermStore, term: TermId) -> bool {
     match terms.get(term) {
         TermData::Forall(vars, body, _) => {
-            (vars.iter().any(|(_, s)| is_mbqi_unsafe_binder_sort(s))
-                || forall_indexes_array_at_binder(terms, vars, *body))
-                && !model_completion::is_quantifier_consumer_seq_model_completion_quantifier(
-                    terms, term,
-                )
+            vars.iter().any(|(_, s)| is_mbqi_unsafe_binder_sort(s))
+                || forall_indexes_array_at_binder(terms, vars, *body)
         }
         _ => false,
     }
@@ -239,6 +239,18 @@ fn assertions_have_direct_boolean_conflict(terms: &TermStore, assertions: &[Term
     false
 }
 
+/// Exact preprocessing snapshot retained when canonical finite-domain
+/// expansion removes every quantifier before E-matching starts.
+///
+/// The records are producer provenance, not SAT authority. Result mapping must
+/// still replay the canonical expander, prove complete coverage of the authored
+/// quantified roots, validate the retained model against `expanded_assertions`,
+/// and bind any grant to that exact model.
+pub(in crate::executor) struct ExactFiniteExpansionEvidence {
+    pub(super) expanded_assertions: Box<[TermId]>,
+    pub(super) records: Box<[QuantExpansionRecord]>,
+}
+
 /// Result of quantifier preprocessing: flags consumed by `map_quantifier_result`.
 pub(in crate::executor) struct QuantifierProcessingResult {
     /// Whether any quantifiers had no E-matching instantiations.
@@ -282,6 +294,10 @@ pub(in crate::executor) struct QuantifierProcessingResult {
     /// Original assertions snapshot (before E-matching modifications).
     /// `Some` when quantifiers were present; used to restore assertions after solving.
     pub original_assertions: Option<Vec<TermId>>,
+    /// Canonical finite-expansion provenance for the early fully-ground exit.
+    /// Kept separate from `original_assertions`: restoration state alone is
+    /// never evidence that an expansion was exact or exhaustive.
+    pub exact_finite_expansion: Option<ExactFiniteExpansionEvidence>,
     /// CEGQI state for refinement: (quantifier_id, instantiator) pairs.
     /// Used by `map_quantifier_result` to compute model-based instantiations
     /// when the CE lemma yields SAT (counterexample found).
@@ -292,37 +308,13 @@ pub(in crate::executor) struct QuantifierProcessingResult {
     /// because the ground solver only sees a finite set of E-matched
     /// instances of an infinite-domain quantifier (ay #8729, Z3 #6303).
     pub has_unsafe_partial_quantifiers: bool,
-    /// True for the narrow QuantifierConsumer opaque-Seq axiom bundle where skipped
-    /// quantifiers are a definitional library over otherwise-ground AUFLIA
-    /// constraints. This is a positive certificate used to bypass the broad
-    /// unsafe-partial and skipped-quantifier gates without weakening them for
-    /// arbitrary Seq-binder formulas.
-    pub quantifier_consumer_opaque_seq_sat_certificate: bool,
-    /// True when every remaining universal quantifier with an MBQI-unsafe
-    /// binder sort is a definition/axiom family that the UF-completion
-    /// soundness gate can discharge. This is narrower than the QuantifierConsumer opaque
-    /// Seq certificate because mixed QuantifierConsumer library bundles can include
-    /// both Seq definitions and non-Seq UF definitions.
-    pub unsafe_quantifiers_supported_by_uf_completion: bool,
-    /// True when every collected universal quantifier is a definition/axiom
-    /// family that UF completion can discharge. Used to recover SAT when
-    /// E-matching creates ground mixed-collection instances that the lower
-    /// theory route cannot solve, but the original quantified library facts
-    /// are syntactically completion-safe.
+    /// True when every collected universal quantifier is a syntactic
+    /// UF-completion candidate.
+    ///
+    /// This is only a refinement hint. It is not SAT authority: the classifier
+    /// does not construct one shared interpretation for all accepted atoms, and
+    /// E-matching having produced an instance is not domain coverage.
     pub quantifiers_supported_by_uf_completion: bool,
-    /// Like `quantifiers_supported_by_uf_completion` but with the ground
-    /// assertions checked under MODEL-BACKED (evaluability-only) semantics:
-    /// pure-arithmetic ground atoms are allowed because a genuine solver model
-    /// establishes their truth directly. ONLY sound to consult when the lower
-    /// result is a genuine `Sat` (or a validated model exists) — never for
-    /// promoting a lower `Unknown` (#quantifier_consumer-arith wrong-SAT).
-    pub quantifiers_supported_by_uf_completion_given_sat: bool,
-    /// A self-contained strict SAT certificate for an assertion set containing
-    /// only pairwise-distinct, pointwise-materializable UF definitions and no
-    /// ground assertions. Each head can be interpreted by its checked lambda
-    /// body, so this remains sound even when the nonlinear ground lane returns
-    /// `Unknown` and has no model to contribute.
-    pub strict_pointwise_uf_completion_without_ground: bool,
 }
 
 impl QuantifierProcessingResult {
@@ -344,14 +336,32 @@ impl QuantifierProcessingResult {
             ematching_rounds_completed: 0,
             ematching_instances_created: 0,
             original_assertions: None,
+            exact_finite_expansion: None,
             cegqi_state: Vec::new(),
             has_unsafe_partial_quantifiers: false,
-            quantifier_consumer_opaque_seq_sat_certificate: false,
-            unsafe_quantifiers_supported_by_uf_completion: false,
             quantifiers_supported_by_uf_completion: false,
-            quantifiers_supported_by_uf_completion_given_sat: false,
-            strict_pointwise_uf_completion_without_ground: false,
         }
+    }
+
+    /// Preserve the exact before/after expansion relation when preprocessing
+    /// has made the solve entirely ground. Returning `no_quantifiers()` here
+    /// used to discard both the authored roots and their authenticated
+    /// `QuantExpansionRecord`s, so restoration could only fail closed after a
+    /// valid ground SAT.
+    fn fully_expanded(
+        original_assertions: Vec<TermId>,
+        expanded_assertions: Vec<TermId>,
+        records: Vec<QuantExpansionRecord>,
+    ) -> Self {
+        let exact_finite_expansion = (!records.is_empty()).then(|| ExactFiniteExpansionEvidence {
+            expanded_assertions: expanded_assertions.clone().into_boxed_slice(),
+            records: records.into_boxed_slice(),
+        });
+        let mut result = Self::no_quantifiers();
+        result.refinement_assertions = Some(expanded_assertions);
+        result.original_assertions = Some(original_assertions);
+        result.exact_finite_expansion = exact_finite_expansion;
+        result
     }
 }
 
@@ -567,7 +577,19 @@ impl Executor {
             .any(|&a| contains_quantifier(&self.ctx.terms, a));
         if !still_has_quantifiers {
             // Finite-domain expansion / Skolemization already fully eliminated
-            // all quantifiers — the ground result is complete.
+            // all quantifiers. Preserve the exact before/after relation and its
+            // producer records: the mapper may consume them only after an
+            // independent canonical replay and an exact-model validation.
+            if let Some(original_assertions) = original_assertions {
+                return QuantifierProcessingResult::fully_expanded(
+                    original_assertions,
+                    self.ctx.assertions.clone(),
+                    self.quant_expansion_records.clone(),
+                );
+            }
+            // Defensive fail-closed fallback for an impossible state: without
+            // the authored snapshot the ground replacement must not be treated
+            // as public restoration or SAT evidence.
             return QuantifierProcessingResult::no_quantifiers();
         }
         // #read-congruence-quantified-scope (#7956 tseitin regression): the
@@ -609,6 +631,16 @@ impl Executor {
         //     conflict-verification support subset with the same rewrite so the
         //     support-axiom tags continue to reference terms actually asserted.
         self.reduce_dt_selectors_in_ematching(&mut ematching);
+
+        // Proof-producing solves must assert the same raw structural instance
+        // that the strict `forall_inst` checker reconstructs.  Keep the search
+        // result, support roots, and provenance records term-identical before
+        // registration or assertion filtering observes them.
+        self.materialize_exact_ematching_instances(
+            &mut ematching.instantiations,
+            &mut ematching.unconditional_forall_roots,
+            &mut ematching.unconditional_forall_instantiations,
+        );
 
         // 5. Add E-matching instances (duplicate + model-satisfied filtering).
         //    Records the sound support-axiom subset into `active_support_axioms`.
@@ -683,14 +715,13 @@ impl Executor {
                 //    verified by disabling it (the SAT case above then goes UNSAT).
                 let orig = original_assertions.clone().unwrap_or_default();
                 if !self.snapshot_has_nonconjunctive_forall_probe(&orig) {
-                    // The derived table is live for EXACTLY this one expansion call
-                    // and cleared immediately. It must never be visible to a nested
-                    // sub-solve: those run on a SUBSET of the assertions, which need
-                    // not entail these constants, so folding them in there would not
-                    // be equals-for-equals.
-                    crate::skolemize::set_derived_consts(consts);
+                    // The derived table is live for EXACTLY this one expansion call.
+                    // Its RAII owner restores the predecessor on return or unwind. It
+                    // must never be visible to a nested sub-solve: those run on a
+                    // SUBSET of the assertions, which need not entail these constants,
+                    // so folding them in there would not be equals-for-equals.
+                    let _derived_scope = crate::skolemize::scoped_derived_consts(consts);
                     self.expand_finite_domains();
-                    crate::skolemize::set_derived_consts(Default::default());
                 }
             }
         }
@@ -713,16 +744,6 @@ impl Executor {
         quantifiers.sort_unstable_by_key(|term| term.index());
         quantifiers.dedup();
 
-        let unsafe_quantifiers: Vec<TermId> = quantifiers
-            .iter()
-            .copied()
-            .filter(|&q| forall_has_unsafe_binder(&self.ctx.terms, q))
-            .collect();
-        let unsafe_quantifiers_supported_by_uf_completion = !unsafe_quantifiers.is_empty()
-            && unsafe_quantifiers
-                .iter()
-                .copied()
-                .all(|q| self.quantifier_supported_by_uf_completion(q));
         let forall_quantifiers: Vec<TermId> = quantifiers
             .iter()
             .copied()
@@ -751,118 +772,16 @@ impl Executor {
             && ground_assertions_supported_by_uf_completion
             && ground_assertions_consistent
             && forall_quantifiers_supported_by_uf_completion;
-        let mut strict_pointwise_heads = Vec::with_capacity(forall_quantifiers.len());
-        let strict_pointwise_uf_completion_without_ground = ground_assertions.is_empty()
-            && !forall_quantifiers.is_empty()
-            && forall_quantifiers.len() == quantifiers.len()
-            && forall_quantifiers.iter().copied().all(|quantifier| {
-                let Some(head) = self.pointwise_materializable_uf_definition_head(quantifier)
-                else {
-                    return false;
-                };
-                strict_pointwise_heads.push(head);
-                true
-            })
-            && {
-                strict_pointwise_heads.sort_unstable();
-                strict_pointwise_heads
-                    .windows(2)
-                    .all(|pair| pair[0] != pair[1])
-            };
         if std::env::var_os("AY_DEBUG_CERT").is_some() {
             eprintln!(
-                "CERT: nforall={} unsafe={} unsafe_ok={} ground_ok={} consistent={} forall_ok={} strict={}",
+                "CERT: nforall={} ground_ok={} consistent={} forall_ok={} candidate={}",
                 forall_quantifiers.len(),
-                unsafe_quantifiers.len(),
-                unsafe_quantifiers_supported_by_uf_completion,
                 ground_assertions_supported_by_uf_completion,
                 ground_assertions_consistent,
                 forall_quantifiers_supported_by_uf_completion,
                 quantifiers_supported_by_uf_completion,
             );
         }
-        // MODEL-BACKED variant (#quantifier_consumer-arith completeness): the same
-        // certificate with ground assertions checked for evaluability only.
-        // Consulted downstream ONLY when the lower result is a genuine `Sat`
-        // (or the model was validated), where pure-arithmetic ground atoms are
-        // already established by the model itself. In exchange for relaxing
-        // the ground-atom freedom gate, the FORALL side is much stricter than
-        // `quantifier_supported_by_uf_completion`: every forall must be a
-        // POINTWISE-MATERIALIZABLE UF definition (`forall v⃗. f(v⃗) = rhs`,
-        // non-recursive, interpreted-pure rhs, distinct-bound-var head), so
-        // that `f := λv⃗. eval(rhs)` extends the model without disturbing any
-        // other symbol. Full e-matching instantiation coverage is required
-        // separately at the construction site below: it guarantees the ground
-        // model already agrees with each definition at every ground
-        // application, so the materialization preserves the validated ground
-        // assertions (rejects the recursive popcount fixpoint shape, #8969).
-        let ground_assertions_supported_given_model = ground_assertions.iter().copied().all(|a| {
-            self.quantifier_consumer_ground_assertion_supported_by_completion_ext(a, true)
-        });
-        // FRAGMENT SCOPE (#8969 popcount wrong-SAT): the "genuine Sat" premise
-        // of the model-backed leg only holds where the ground solve is
-        // DECISION-COMPLETE and the model fully evaluable. In QF_UFBV (all
-        // subterms Bool/BitVec) a ground `Sat` carries a total bit-level model
-        // with no unevaluable atoms; the same holds for LINEAR Int + EUF, so
-        // the fragment is `term_in_bv_bool_euf_lia_fragment` (rank-9 step 3:
-        // Bool / BitVec / Int sorts, linear evaluable operators only — a
-        // strict superset of the previous BV/Bool gate). A UFLIA ground core
-        // with `div`/`mod`/`*` (popcount SWAR) can return a "Sat" whose model
-        // validation silently falls back on atoms it cannot evaluate —
-        // trusting the certificate there fabricates a counterexample to
-        // correct code — so those operators stay excluded.
-        //
-        // DEFINITION SHAPES (rank-9 step 3): each forall must be a pointwise-
-        // materializable UF definition, now including GUARDED definitions
-        // `forall v⃗. guard(v⃗) => f(v⃗) = rhs` with interpreted-pure, f-free
-        // guard and rhs (see `pointwise_materializable_uf_definition_head`).
-        // The materialization argument is per SYMBOL, so the defined heads
-        // must be PAIRWISE DISTINCT: two definitions of the same symbol can
-        // clash at a point no ground application covers (`v>=0 => f(v)=1` and
-        // `v<=0 => f(v)=2` clash at 0 while a ground core touching only f(5)
-        // stays satisfiable) — accepting both would mint a wrong SAT.
-        let mut given_sat_definition_heads: Vec<String> =
-            Vec::with_capacity(forall_quantifiers.len());
-        let given_sat_definitions_ok = !forall_quantifiers.is_empty()
-            && forall_quantifiers.iter().copied().all(|q| {
-                let Some(head) = self.pointwise_materializable_uf_definition_head(q) else {
-                    return false;
-                };
-                given_sat_definition_heads.push(head);
-                match self.ctx.terms.get(q) {
-                    TermData::Forall(_, body, _) => self.term_in_bv_bool_euf_lia_fragment(*body),
-                    _ => false,
-                }
-            })
-            && {
-                given_sat_definition_heads.sort_unstable();
-                given_sat_definition_heads
-                    .windows(2)
-                    .all(|pair| pair[0] != pair[1])
-            };
-        // NOTE (#2774 arm REMOVED — wrong-SAT): ae06cec3b5 OR-ed a
-        // left-inverse/identity certificate into this flag. Its "genuine
-        // ground Sat over a decision-complete core" premise was UNENFORCED:
-        // `ground_assertions_consistent` is a syntactic probe, and admitting
-        // uninterpreted-sorted equalities between distinct UF applications
-        // (`term_in_bv_bool_euf_lia_fragment_ext(_, true)`) let the ground
-        // solve treat them as FREE — missing the quantifier-derived
-        // congruence consequences. Counterexample (answered wrong `sat`;
-        // genuinely UNSAT by congruence through Unbox):
-        //   forall x. Unbox(Box x) = x  :pattern (Box x)
-        //   (distinct a b)  (= (Box a) (Box b))
-        // The sound replacement is the upstream #2774 left-inverse SAT
-        // certificate (`mbqi_sat_validated_left_inverse_axioms`): it EXHIBITS
-        // a total materialized model and RE-EVALUATES every original ground
-        // assertion under it, so a non-injectivity fact re-evaluates false
-        // and the certificate declines. Do not re-add a shape-only arm here.
-        let quantifiers_supported_by_uf_completion_given_sat = given_sat_definitions_ok
-            && ground_assertions_supported_given_model
-            && ground_assertions_consistent
-            && ground_assertions
-                .iter()
-                .copied()
-                .all(|a| self.term_in_bv_bool_euf_lia_fragment(a));
         // 9. CEGQI setup for unhandled quantifiers + FlattenAnd + strip quantifiers.
         self.set_active_solve_phase("quantifier-cegqi-setup", "cegqi");
         let cegqi = self.setup_cegqi_for_unhandled(
@@ -895,6 +814,7 @@ impl Executor {
                 self.run_post_cegqi_ematching(
                     &refinement_assertions,
                     &ematching.uninstantiated_quantifiers,
+                    &cegqi.cegqi_ce_lemma_ids,
                 )
             } else {
                 (false, None)
@@ -935,20 +855,6 @@ impl Executor {
                 .as_ref()
                 .map_or(0, |e| e.instances_created);
 
-        let quantifier_consumer_opaque_seq_sat_certificate =
-            original_assertions.as_ref().is_some_and(|orig| {
-                has_quantifier_consumer_opaque_seq_sat_certificate(
-                    &self.ctx.terms,
-                    orig,
-                    &self.ctx.assertions,
-                )
-            });
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
-            eprintln!(
-                "CERT2: quantifier_consumer_opaque={quantifier_consumer_opaque_seq_sat_certificate} uninst={has_uninstantiated} limit={reached_limit}"
-            );
-        }
-
         QuantifierProcessingResult {
             has_uninstantiated_quantifiers: has_uninstantiated,
             reached_instantiation_limit: reached_limit,
@@ -965,240 +871,16 @@ impl Executor {
             ematching_rounds_completed,
             ematching_instances_created,
             original_assertions,
+            exact_finite_expansion: None,
             cegqi_state: cegqi.cegqi_state,
             has_unsafe_partial_quantifiers,
-            quantifier_consumer_opaque_seq_sat_certificate,
-            unsafe_quantifiers_supported_by_uf_completion,
+            // Candidate only: result mapping may use this to schedule sound
+            // refutation probes, never to grant SAT or bypass model validation.
+            // The accepted atoms need not admit one shared interpretation (for
+            // example `f(x)=0 /\ x=f(x)`), and a first E-match is not coverage.
             quantifiers_supported_by_uf_completion,
-            // Coverage conditions for the model-backed leg (see the flag's
-            // computation above): every quantifier fully instantiated by
-            // E-matching within budget (the ground model therefore agrees
-            // with each pointwise-materializable definition at every ground
-            // application) and no existential (materialization supplies no
-            // witnesses).
-            quantifiers_supported_by_uf_completion_given_sat:
-                quantifiers_supported_by_uf_completion_given_sat
-                    && !has_uninstantiated
-                    && !reached_limit
-                    // A deferred (cost-capped, not-yet-asserted) instantiation
-                    // is a coverage gap even when its quantifier produced
-                    // other instances: the ground model was never forced to
-                    // agree with the definition at that point, so the
-                    // materialization premise fails. Conservative tightening
-                    // (rank-9 step 3).
-                    && !deferred_exists
-                    && !quantifiers
-                        .iter()
-                        .any(|&q| matches!(self.ctx.terms.get(q), TermData::Exists(..))),
-            strict_pointwise_uf_completion_without_ground,
         }
     }
-}
-
-fn has_quantifier_consumer_opaque_seq_sat_certificate(
-    terms: &TermStore,
-    original_assertions: &[TermId],
-    ground_assertions: &[TermId],
-) -> bool {
-    let mut saw_quantifier_consumer_axiom = false;
-    for &assertion in original_assertions {
-        if contains_quantifier(terms, assertion) {
-            if !is_quantifier_consumer_opaque_seq_axiom(terms, assertion) {
-                return false;
-            }
-            saw_quantifier_consumer_axiom = true;
-        } else if !is_quantifier_consumer_opaque_seq_ground_fragment(terms, assertion) {
-            return false;
-        }
-    }
-
-    saw_quantifier_consumer_axiom
-        && quantifier_consumer_seq_len_ground_terms_have_nonneg_instances(
-            terms,
-            original_assertions,
-            ground_assertions,
-        )
-}
-
-fn is_quantifier_consumer_opaque_seq_axiom(terms: &TermStore, assertion: TermId) -> bool {
-    let TermData::Forall(vars, body, _) = terms.get(assertion) else {
-        return false;
-    };
-
-    match vars.as_slice() {
-        [(s, sort)] if is_seq_int_sort(sort) => {
-            is_quantifier_consumer_seq_len_nonnegative_axiom(terms, *body, s)
-                || is_quantifier_consumer_seq_concat_left_identity_axiom(terms, *body, s)
-                || is_quantifier_consumer_seq_concat_right_identity_axiom(terms, *body, s)
-        }
-        [(v, Sort::Int)] => is_quantifier_consumer_seq_empty_contains_axiom(terms, *body, v),
-        [(s, sort_s), (i, Sort::Int)] if is_seq_int_sort(sort_s) => {
-            is_quantifier_consumer_seq_select_bridge_axiom(terms, *body, s, i)
-                || is_quantifier_consumer_seq_get_in_bounds_axiom(terms, *body, s, i)
-                || is_quantifier_consumer_seq_get_out_of_bounds_axiom(terms, *body, s, i)
-                || is_quantifier_consumer_seq_push_front_definition_axiom(terms, *body, s, i)
-                || is_quantifier_consumer_seq_push_back_definition_axiom(terms, *body, s, i)
-        }
-        [(lhs, lhs_sort), (rhs, rhs_sort)]
-            if is_seq_int_sort(lhs_sort) && is_seq_int_sort(rhs_sort) =>
-        {
-            is_quantifier_consumer_seq_concat_len_axiom(terms, *body, lhs, rhs)
-        }
-        [(s, s_sort), (v, Sort::Int), (x, Sort::Int)] if is_seq_int_sort(s_sort) => {
-            is_quantifier_consumer_seq_contains_push_back_axiom(terms, *body, s, v, x)
-        }
-        [(s1, s1_sort), (s2, s2_sort), (i, Sort::Int)]
-            if is_seq_int_sort(s1_sort) && is_seq_int_sort(s2_sort) =>
-        {
-            is_quantifier_consumer_seq_concat_left_index_axiom(terms, *body, s1, s2, i)
-                || is_quantifier_consumer_seq_concat_right_index_axiom(terms, *body, s1, s2, i)
-        }
-        [(s1, s1_sort), (s2, s2_sort), (s3, s3_sort)]
-            if is_seq_int_sort(s1_sort) && is_seq_int_sort(s2_sort) && is_seq_int_sort(s3_sort) =>
-        {
-            is_quantifier_consumer_seq_concat_assoc_axiom(terms, *body, s1, s2, s3)
-        }
-        _ => false,
-    }
-}
-
-fn is_quantifier_consumer_opaque_seq_ground_fragment(terms: &TermStore, assertion: TermId) -> bool {
-    let mut stack = vec![assertion];
-    while let Some(term) = stack.pop() {
-        match terms.get(term) {
-            TermData::Forall(..) | TermData::Exists(..) => return false,
-            TermData::Var(name, _) if is_blocked_quantifier_consumer_seq_ground_symbol(name) => {
-                return false;
-            }
-            TermData::App(sym, args) => {
-                if is_blocked_quantifier_consumer_seq_ground_symbol(sym.name()) {
-                    return false;
-                }
-                stack.extend(args.iter().copied());
-            }
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
-            }
-            TermData::Let(bindings, body) => {
-                for (_, value) in bindings {
-                    stack.push(*value);
-                }
-                stack.push(*body);
-            }
-            TermData::Const(_) => {}
-            _ => {}
-        }
-    }
-    true
-}
-
-fn is_blocked_quantifier_consumer_seq_ground_symbol(name: &str) -> bool {
-    name.starts_with("seq.")
-        || matches!(
-            name,
-            "logic_None"
-                | "logic_Some"
-                | "seq_concat"
-                | "seq_contains"
-                | "seq_get"
-                | "seq_index_logic"
-                | "seq_push_back"
-                | "seq_push_front"
-                | "seq_reverse"
-                | "seq_set"
-                | "seq_singleton"
-                | "seq_subsequence"
-                | "seq_sum"
-        )
-}
-
-fn quantifier_consumer_seq_len_ground_terms_have_nonneg_instances(
-    terms: &TermStore,
-    original_assertions: &[TermId],
-    ground_assertions: &[TermId],
-) -> bool {
-    let mut seq_len_terms = Vec::new();
-    for &assertion in original_assertions {
-        if !contains_quantifier(terms, assertion) {
-            collect_seq_len_terms(terms, assertion, &mut seq_len_terms);
-        }
-    }
-    seq_len_terms.sort_unstable_by_key(|t| t.0);
-    seq_len_terms.dedup();
-
-    seq_len_terms.into_iter().all(|len_term| {
-        ground_assertions
-            .iter()
-            .copied()
-            .any(|assertion| contains_le_zero_term(terms, assertion, len_term))
-    })
-}
-
-fn collect_seq_len_terms(terms: &TermStore, term: TermId, out: &mut Vec<TermId>) {
-    match terms.get(term) {
-        TermData::App(sym, args) => {
-            if sym.name() == "seq_len" && args.len() == 1 {
-                out.push(term);
-            }
-            for &arg in args {
-                collect_seq_len_terms(terms, arg, out);
-            }
-        }
-        TermData::Not(inner) => collect_seq_len_terms(terms, *inner, out),
-        TermData::Ite(c, t, e) => {
-            collect_seq_len_terms(terms, *c, out);
-            collect_seq_len_terms(terms, *t, out);
-            collect_seq_len_terms(terms, *e, out);
-        }
-        TermData::Let(bindings, body) => {
-            for (_, value) in bindings {
-                collect_seq_len_terms(terms, *value, out);
-            }
-            collect_seq_len_terms(terms, *body, out);
-        }
-        TermData::Forall(..) | TermData::Exists(..) | TermData::Const(_) | TermData::Var(_, _) => {}
-        _ => {}
-    }
-}
-
-fn contains_le_zero_term(terms: &TermStore, term: TermId, target: TermId) -> bool {
-    if is_le_zero_term(terms, term, target) {
-        return true;
-    }
-    match terms.get(term) {
-        TermData::App(sym, args) if sym.name() == "and" => args
-            .iter()
-            .copied()
-            .any(|arg| contains_le_zero_term(terms, arg, target)),
-        _ => false,
-    }
-}
-
-fn is_le_zero_term(terms: &TermStore, term: TermId, target: TermId) -> bool {
-    app_args(terms, term, "<=")
-        .is_some_and(|args| args.len() == 2 && is_int_const(terms, args[0], 0) && args[1] == target)
-        // An equality pinning the term to a nonnegative constant is a strictly
-        // stronger nonneg instance than `(<= 0 t)` — the verification-consumer preamble
-        // states `(= 0 (seq_len seq_empty))` rather than a bound.
-        || app_args(terms, term, "=").is_some_and(|args| {
-            args.len() == 2
-                && ((args[1] == target && is_nonneg_int_const(terms, args[0]))
-                    || (args[0] == target && is_nonneg_int_const(terms, args[1])))
-        })
-}
-
-fn is_nonneg_int_const(terms: &TermStore, term: TermId) -> bool {
-    matches!(
-        terms.get(term),
-        TermData::Const(Constant::Int(n)) if n.sign() != num_bigint::Sign::Minus
-    )
-}
-
-fn is_seq_int_sort(sort: &Sort) -> bool {
-    matches!(sort, Sort::Seq(elem) if elem.as_ref() == &Sort::Int)
 }
 
 fn app_args<'a>(terms: &'a TermStore, term: TermId, name: &str) -> Option<&'a [TermId]> {
@@ -1206,10 +888,6 @@ fn app_args<'a>(terms: &'a TermStore, term: TermId, name: &str) -> Option<&'a [T
         TermData::App(sym, args) if sym.name() == name => Some(args.as_slice()),
         _ => None,
     }
-}
-
-fn is_var_named(terms: &TermStore, term: TermId, name: &str) -> bool {
-    matches!(terms.get(term), TermData::Var(n, _) if n == name)
 }
 
 /// A sort whose interpretation is FIXED and fully determined by the theory
@@ -1255,6 +933,41 @@ fn closed_quantifier_free_forall_parts(
     terms: &TermStore,
     term: TermId,
 ) -> Option<(Vec<(String, Sort)>, TermId)> {
+    closed_quantifier_free_forall_parts_with_operators(terms, term, is_builtin_operator)
+}
+
+/// Return the closed scalar universals on which a concrete literal tuple may
+/// be checked without assigning any model-dependent symbol.
+///
+/// This is intentionally a different class from
+/// [`closed_quantifier_free_forall_parts`].  The latter asks whether a
+/// skolemized negation is model-independent and must therefore exclude
+/// under-specified division-by-zero operators.  Here a verdict is authorized
+/// only by one *fully evaluated* ground tuple (and zero-divisor evaluations
+/// remain `Unknown`), so `div`/`mod`/`rem`, the fixed Int/Real conversion
+/// operators, and fixed-width BV comparisons are safe to admit. Free
+/// declarations remain excluded.
+pub(in crate::executor) fn closed_quantifier_free_forall_literal_parts(
+    terms: &TermStore,
+    term: TermId,
+) -> Option<(Vec<(String, Sort)>, TermId)> {
+    let parts = closed_quantifier_free_forall_parts_with_operators(
+        terms,
+        term,
+        is_literal_witness_operator,
+    )?;
+    parts
+        .0
+        .iter()
+        .all(|(_, sort)| matches!(sort, Sort::Int | Sort::Real | Sort::BitVec(_)))
+        .then_some(parts)
+}
+
+fn closed_quantifier_free_forall_parts_with_operators(
+    terms: &TermStore,
+    term: TermId,
+    operator_allowed: impl Fn(&str) -> bool,
+) -> Option<(Vec<(String, Sort)>, TermId)> {
     let (vars, body) = match terms.get(term) {
         TermData::Forall(vars, body, _) => (vars.clone(), *body),
         _ => return None,
@@ -1270,7 +983,7 @@ fn closed_quantifier_free_forall_parts(
     let closed = {
         let bound: ay_core::kani_compat::DetHashSet<&str> =
             vars.iter().map(|(n, _)| n.as_str()).collect();
-        body_is_closed_and_uf_free(terms, body, &bound)
+        body_is_closed_and_uf_free(terms, body, &bound, operator_allowed)
     };
     if closed {
         Some((vars, body))
@@ -1288,6 +1001,7 @@ fn body_is_closed_and_uf_free(
     terms: &TermStore,
     body: TermId,
     bound: &ay_core::kani_compat::DetHashSet<&str>,
+    operator_allowed: impl Fn(&str) -> bool,
 ) -> bool {
     use ay_core::kani_compat::DetHashSet as HashSet;
     let mut visited: HashSet<TermId> = HashSet::default();
@@ -1310,7 +1024,7 @@ fn body_is_closed_and_uf_free(
                 // BV indexed op, etc.). Only built-ins keep the universal
                 // model-independent. `Indexed` symbols (e.g. BV extract) are
                 // never built-ins for this precheck and disqualify here.
-                if !is_builtin_operator(sym.name()) {
+                if !operator_allowed(sym.name()) {
                     return false;
                 }
                 stack.extend(args.iter().copied());
@@ -1371,553 +1085,28 @@ fn is_builtin_operator(name: &str) -> bool {
     )
 }
 
-fn is_seq_empty(terms: &TermStore, term: TermId) -> bool {
-    is_var_named(terms, term, "seq_empty")
-}
-
-fn is_int_const(terms: &TermStore, term: TermId, value: i64) -> bool {
-    matches!(
-        terms.get(term),
-        TermData::Const(Constant::Int(n)) if n == &BigInt::from(value)
-    )
-}
-
-fn is_not<P>(terms: &TermStore, term: TermId, pred: P) -> bool
-where
-    P: Fn(TermId) -> bool,
-{
-    matches!(terms.get(term), TermData::Not(inner) if pred(*inner))
-}
-
-fn is_eq_between<P, Q>(terms: &TermStore, term: TermId, left: P, right: Q) -> bool
-where
-    P: Fn(TermId) -> bool,
-    Q: Fn(TermId) -> bool,
-{
-    app_args(terms, term, "=").is_some_and(|args| {
-        args.len() == 2 && ((left(args[0]) && right(args[1])) || (left(args[1]) && right(args[0])))
-    })
-}
-
-fn is_or_with3<P, Q, R>(terms: &TermStore, term: TermId, p: P, q: Q, r: R) -> bool
-where
-    P: Fn(TermId) -> bool,
-    Q: Fn(TermId) -> bool,
-    R: Fn(TermId) -> bool,
-{
-    app_args(terms, term, "or").is_some_and(|args| {
-        args.len() == 3
-            && args.iter().copied().any(&p)
-            && args.iter().copied().any(&q)
-            && args.iter().copied().any(&r)
-    })
-}
-
-fn is_or_with2<P, Q>(terms: &TermStore, term: TermId, p: P, q: Q) -> bool
-where
-    P: Fn(TermId) -> bool,
-    Q: Fn(TermId) -> bool,
-{
-    app_args(terms, term, "or").is_some_and(|args| {
-        args.len() == 2 && args.iter().copied().any(&p) && args.iter().copied().any(&q)
-    })
-}
-
-fn is_and_with2<P, Q>(terms: &TermStore, term: TermId, p: P, q: Q) -> bool
-where
-    P: Fn(TermId) -> bool,
-    Q: Fn(TermId) -> bool,
-{
-    app_args(terms, term, "and").is_some_and(|args| {
-        args.len() == 2 && args.iter().copied().any(&p) && args.iter().copied().any(&q)
-    })
-}
-
-fn is_plus_of2<P, Q>(terms: &TermStore, term: TermId, p: P, q: Q) -> bool
-where
-    P: Fn(TermId) -> bool,
-    Q: Fn(TermId) -> bool,
-{
-    app_args(terms, term, "+").is_some_and(|args| {
-        args.len() == 2 && args.iter().copied().any(&p) && args.iter().copied().any(&q)
-    })
-}
-
-fn is_le_zero_var(terms: &TermStore, term: TermId, var: &str) -> bool {
-    app_args(terms, term, "<=").is_some_and(|args| {
-        args.len() == 2 && is_int_const(terms, args[0], 0) && is_var_named(terms, args[1], var)
-    })
-}
-
-fn is_le_seq_len_var(terms: &TermStore, term: TermId, seq: &str, var: &str) -> bool {
-    app_args(terms, term, "<=").is_some_and(|args| {
-        args.len() == 2
-            && is_seq_len_of_var(terms, args[0], seq)
-            && is_var_named(terms, args[1], var)
-    })
-}
-
-fn is_lt_var_zero(terms: &TermStore, term: TermId, var: &str) -> bool {
-    app_args(terms, term, "<").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], var) && is_int_const(terms, args[1], 0)
-    })
-}
-
-fn is_lt_var_seq_len(terms: &TermStore, term: TermId, var: &str, seq: &str) -> bool {
-    app_args(terms, term, "<").is_some_and(|args| {
-        args.len() == 2
-            && is_var_named(terms, args[0], var)
-            && is_seq_len_of_var(terms, args[1], seq)
-    })
-}
-
-fn is_seq_len_of_var(terms: &TermStore, term: TermId, seq: &str) -> bool {
-    app_args(terms, term, "seq_len")
-        .is_some_and(|args| args.len() == 1 && is_var_named(terms, args[0], seq))
-}
-
-fn is_seq_offset_of_var(terms: &TermStore, term: TermId, seq: &str) -> bool {
-    app_args(terms, term, "seq_offset")
-        .is_some_and(|args| args.len() == 1 && is_var_named(terms, args[0], seq))
-}
-
-fn is_seq_array_of_var(terms: &TermStore, term: TermId, seq: &str) -> bool {
-    app_args(terms, term, "seq_array")
-        .is_some_and(|args| args.len() == 1 && is_var_named(terms, args[0], seq))
-}
-
-fn is_seq_index_logic(terms: &TermStore, term: TermId, seq: &str, idx: &str) -> bool {
-    app_args(terms, term, "seq_index_logic").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_var_named(terms, args[1], idx)
-    })
-}
-
-fn is_seq_index_logic_concat(
-    terms: &TermStore,
-    term: TermId,
-    s1: &str,
-    s2: &str,
-    idx: &str,
-) -> bool {
-    app_args(terms, term, "seq_index_logic").is_some_and(|args| {
-        args.len() == 2
-            && is_seq_concat_vars(terms, args[0], s1, s2)
-            && is_var_named(terms, args[1], idx)
-    })
-}
-
-fn is_seq_index_logic_concat_offset(
-    terms: &TermStore,
-    term: TermId,
-    s1: &str,
-    s2: &str,
-    idx: &str,
-) -> bool {
-    app_args(terms, term, "seq_index_logic").is_some_and(|args| {
-        args.len() == 2
-            && is_seq_concat_vars(terms, args[0], s1, s2)
-            && is_plus_of2(
-                terms,
-                args[1],
-                |t| is_seq_len_of_var(terms, t, s1),
-                |t| is_var_named(terms, t, idx),
-            )
-    })
-}
-
-fn is_seq_get(terms: &TermStore, term: TermId, seq: &str, idx: &str) -> bool {
-    app_args(terms, term, "seq_get").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_var_named(terms, args[1], idx)
-    })
-}
-
-fn is_seq_contains_var(terms: &TermStore, term: TermId, seq: &str, value: &str) -> bool {
-    app_args(terms, term, "seq_contains").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_var_named(terms, args[1], value)
-    })
-}
-
-fn is_seq_contains_empty(terms: &TermStore, term: TermId, value: &str) -> bool {
-    app_args(terms, term, "seq_contains").is_some_and(|args| {
-        args.len() == 2 && is_seq_empty(terms, args[0]) && is_var_named(terms, args[1], value)
-    })
-}
-
-fn is_seq_contains_push_back(
-    terms: &TermStore,
-    term: TermId,
-    seq: &str,
-    pushed: &str,
-    value: &str,
-) -> bool {
-    app_args(terms, term, "seq_contains").is_some_and(|args| {
-        args.len() == 2
-            && is_seq_push_back(terms, args[0], seq, pushed)
-            && is_var_named(terms, args[1], value)
-    })
-}
-
-fn is_seq_push_back(terms: &TermStore, term: TermId, seq: &str, value: &str) -> bool {
-    app_args(terms, term, "seq_push_back").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_var_named(terms, args[1], value)
-    })
-}
-
-fn is_seq_push_front(terms: &TermStore, term: TermId, seq: &str, value: &str) -> bool {
-    app_args(terms, term, "seq_push_front").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_var_named(terms, args[1], value)
-    })
-}
-
-fn is_seq_singleton_var(terms: &TermStore, term: TermId, value: &str) -> bool {
-    app_args(terms, term, "seq_singleton")
-        .is_some_and(|args| args.len() == 1 && is_var_named(terms, args[0], value))
-}
-
-fn is_seq_concat_vars(terms: &TermStore, term: TermId, lhs: &str, rhs: &str) -> bool {
-    app_args(terms, term, "seq_concat").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], lhs) && is_var_named(terms, args[1], rhs)
-    })
-}
-
-fn is_seq_concat_empty_left(terms: &TermStore, term: TermId, seq: &str) -> bool {
-    app_args(terms, term, "seq_concat").is_some_and(|args| {
-        args.len() == 2 && is_seq_empty(terms, args[0]) && is_var_named(terms, args[1], seq)
-    })
-}
-
-fn is_seq_concat_empty_right(terms: &TermStore, term: TermId, seq: &str) -> bool {
-    app_args(terms, term, "seq_concat").is_some_and(|args| {
-        args.len() == 2 && is_var_named(terms, args[0], seq) && is_seq_empty(terms, args[1])
-    })
-}
-
-fn is_seq_concat_singleton_left(terms: &TermStore, term: TermId, value: &str, seq: &str) -> bool {
-    app_args(terms, term, "seq_concat").is_some_and(|args| {
-        args.len() == 2
-            && is_seq_singleton_var(terms, args[0], value)
-            && is_var_named(terms, args[1], seq)
-    })
-}
-
-fn is_seq_concat_singleton_right(terms: &TermStore, term: TermId, seq: &str, value: &str) -> bool {
-    app_args(terms, term, "seq_concat").is_some_and(|args| {
-        args.len() == 2
-            && is_var_named(terms, args[0], seq)
-            && is_seq_singleton_var(terms, args[1], value)
-    })
-}
-
-fn is_logic_some_index(terms: &TermStore, term: TermId, seq: &str, idx: &str) -> bool {
-    app_args(terms, term, "logic_Some")
-        .is_some_and(|args| args.len() == 1 && is_seq_index_logic(terms, args[0], seq, idx))
-}
-
-fn is_logic_none(terms: &TermStore, term: TermId) -> bool {
-    app_args(terms, term, "logic_None").is_some_and(<[TermId]>::is_empty)
-        || is_var_named(terms, term, "logic_None")
-}
-
-fn is_quantifier_consumer_seq_select_bridge_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    idx: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| {
-            app_args(terms, t, "select").is_some_and(|args| {
-                args.len() == 2
-                    && is_seq_array_of_var(terms, args[0], seq)
-                    && is_plus_of2(
-                        terms,
-                        args[1],
-                        |u| is_seq_offset_of_var(terms, u, seq),
-                        |u| is_var_named(terms, u, idx),
-                    )
-            })
-        },
-        |t| is_seq_index_logic(terms, t, seq, idx),
-    )
-}
-
-fn is_quantifier_consumer_seq_len_nonnegative_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-) -> bool {
-    app_args(terms, body, "<=").is_some_and(|args| {
-        args.len() == 2 && is_int_const(terms, args[0], 0) && is_seq_len_of_var(terms, args[1], seq)
-    })
-}
-
-fn is_quantifier_consumer_seq_get_in_bounds_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    idx: &str,
-) -> bool {
-    is_or_with3(
-        terms,
-        body,
-        |t| {
-            is_eq_between(
-                terms,
-                t,
-                |u| is_seq_get(terms, u, seq, idx),
-                |u| is_logic_some_index(terms, u, seq, idx),
-            )
-        },
-        // Accept BOTH syntactic forms of the same guard (#seq-inbounds-normalized):
-        // the raw `(not (<= 0 i))` / `(not (< i (seq_len s)))` and the
-        // NOT-eliminated normalized `(< i 0)` / `(<= (seq_len s) i)` the term
-        // store actually holds. The normalized recognizers already exist and the
-        // sibling out-of-bounds axiom uses them; matching only the raw form made
-        // this axiom unrecognizable, which alone falsified the whole opaque-Seq
-        // certificate (it requires EVERY quantified assertion to match). Purely
-        // syntactic completion — semantically identical, widens nothing.
-        |t| is_not(terms, t, |u| is_le_zero_var(terms, u, idx)) || is_lt_var_zero(terms, t, idx),
-        |t| {
-            is_not(terms, t, |u| is_lt_var_seq_len(terms, u, idx, seq))
-                || is_le_seq_len_var(terms, t, seq, idx)
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_get_out_of_bounds_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    idx: &str,
-) -> bool {
-    is_or_with2(
-        terms,
-        body,
-        |t| {
-            is_eq_between(
-                terms,
-                t,
-                |u| is_seq_get(terms, u, seq, idx),
-                |u| is_logic_none(terms, u),
-            )
-        },
-        |t| {
-            // Both syntactic forms, mirroring the in-bounds axiom
-            // (#seq-inbounds-normalized): the store's NOT-elimination turns
-            // `(not (< i 0))` into `(<= 0 i)` and `(not (<= (seq_len s) i))`
-            // into `(< i (seq_len s))`.
-            is_and_with2(
-                terms,
-                t,
-                |u| {
-                    is_not(terms, u, |v| is_lt_var_zero(terms, v, idx))
-                        || is_le_zero_var(terms, u, idx)
-                },
-                |u| {
-                    is_not(terms, u, |v| is_le_seq_len_var(terms, v, seq, idx))
-                        || is_lt_var_seq_len(terms, u, idx, seq)
-                },
-            )
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_empty_contains_axiom(
-    terms: &TermStore,
-    body: TermId,
-    value: &str,
-) -> bool {
-    is_not(terms, body, |t| is_seq_contains_empty(terms, t, value))
-}
-
-fn is_quantifier_consumer_seq_contains_push_back_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    pushed: &str,
-    value: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| is_seq_contains_push_back(terms, t, seq, pushed, value),
-        |t| {
-            is_or_with2(
-                terms,
-                t,
-                |u| {
-                    is_eq_between(
-                        terms,
-                        u,
-                        |v| is_var_named(terms, v, pushed),
-                        |v| is_var_named(terms, v, value),
-                    )
-                },
-                |u| is_seq_contains_var(terms, u, seq, value),
-            )
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_len_axiom(
-    terms: &TermStore,
-    body: TermId,
-    lhs: &str,
-    rhs: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| {
-            app_args(terms, t, "seq_len")
-                .is_some_and(|args| args.len() == 1 && is_seq_concat_vars(terms, args[0], lhs, rhs))
-        },
-        |t| {
-            is_plus_of2(
-                terms,
-                t,
-                |u| is_seq_len_of_var(terms, u, lhs),
-                |u| is_seq_len_of_var(terms, u, rhs),
-            )
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_left_index_axiom(
-    terms: &TermStore,
-    body: TermId,
-    lhs: &str,
-    rhs: &str,
-    idx: &str,
-) -> bool {
-    is_or_with3(
-        terms,
-        body,
-        |t| {
-            is_eq_between(
-                terms,
-                t,
-                |u| is_seq_index_logic_concat(terms, u, lhs, rhs, idx),
-                |u| is_seq_index_logic(terms, u, lhs, idx),
-            )
-        },
-        // Both syntactic forms (#seq-inbounds-normalized).
-        |t| is_not(terms, t, |u| is_le_zero_var(terms, u, idx)) || is_lt_var_zero(terms, t, idx),
-        |t| {
-            is_not(terms, t, |u| is_lt_var_seq_len(terms, u, idx, lhs))
-                || is_le_seq_len_var(terms, t, lhs, idx)
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_right_index_axiom(
-    terms: &TermStore,
-    body: TermId,
-    lhs: &str,
-    rhs: &str,
-    idx: &str,
-) -> bool {
-    is_or_with3(
-        terms,
-        body,
-        |t| {
-            is_eq_between(
-                terms,
-                t,
-                |u| is_seq_index_logic_concat_offset(terms, u, lhs, rhs, idx),
-                |u| is_seq_index_logic(terms, u, rhs, idx),
-            )
-        },
-        // Both syntactic forms (#seq-inbounds-normalized).
-        |t| is_not(terms, t, |u| is_le_zero_var(terms, u, idx)) || is_lt_var_zero(terms, t, idx),
-        |t| {
-            is_not(terms, t, |u| is_lt_var_seq_len(terms, u, idx, rhs))
-                || is_le_seq_len_var(terms, t, rhs, idx)
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_assoc_axiom(
-    terms: &TermStore,
-    body: TermId,
-    s1: &str,
-    s2: &str,
-    s3: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| {
-            app_args(terms, t, "seq_concat").is_some_and(|args| {
-                args.len() == 2
-                    && is_seq_concat_vars(terms, args[0], s1, s2)
-                    && is_var_named(terms, args[1], s3)
-            })
-        },
-        |t| {
-            app_args(terms, t, "seq_concat").is_some_and(|args| {
-                args.len() == 2
-                    && is_var_named(terms, args[0], s1)
-                    && is_seq_concat_vars(terms, args[1], s2, s3)
-            })
-        },
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_left_identity_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| is_var_named(terms, t, seq),
-        |t| is_seq_concat_empty_left(terms, t, seq),
-    )
-}
-
-fn is_quantifier_consumer_seq_concat_right_identity_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| is_var_named(terms, t, seq),
-        |t| is_seq_concat_empty_right(terms, t, seq),
-    )
-}
-
-fn is_quantifier_consumer_seq_push_front_definition_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    value: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| is_seq_push_front(terms, t, seq, value),
-        |t| is_seq_concat_singleton_left(terms, t, value, seq),
-    )
-}
-
-fn is_quantifier_consumer_seq_push_back_definition_axiom(
-    terms: &TermStore,
-    body: TermId,
-    seq: &str,
-    value: &str,
-) -> bool {
-    is_eq_between(
-        terms,
-        body,
-        |t| is_seq_push_back(terms, t, seq, value),
-        |t| is_seq_concat_singleton_right(terms, t, seq, value),
-    )
+/// Operators accepted by the exact-literal witness lane.  Every non-total
+/// operation below remains fail-closed at an undefined literal (notably a zero
+/// divisor); the lane never infers anything from `Unknown`.
+pub(in crate::executor) fn is_literal_witness_operator(name: &str) -> bool {
+    is_builtin_operator(name)
+        || matches!(
+            name,
+            "/" | "div"
+                | "mod"
+                | "rem"
+                | "to_real"
+                | "to_int"
+                | "is_int"
+                | "bvult"
+                | "bvule"
+                | "bvugt"
+                | "bvuge"
+                | "bvslt"
+                | "bvsle"
+                | "bvsgt"
+                | "bvsge"
+        )
 }
 
 /// Collect AND-conjuncts of a term transitively (#5991).

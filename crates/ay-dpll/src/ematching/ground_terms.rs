@@ -6,6 +6,8 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore};
+use num_bigint::BigInt;
+use num_rational::BigRational;
 
 use super::{instantiate_body, TermIndex};
 
@@ -43,7 +45,7 @@ pub(crate) fn enumerative_instantiation(
     assertions: &[TermId],
     quantifier: TermId,
     max_instantiations: usize,
-) -> Vec<TermId> {
+) -> Vec<(Vec<TermId>, TermId)> {
     // A no_mbqi ("E-matching only") quantifier — the Hilbert-`choose` combined
     // axiom — must never be enumeratively (synthesis) instantiated: enumeration
     // builds the cartesian product of ground terms, which reaches the always-true
@@ -66,11 +68,43 @@ pub(crate) fn enumerative_instantiation(
     // A ground term is any term that is not under a quantifier binding scope
     // and has no free bound variables.
     let ground_by_sort = collect_ground_terms_by_sort(terms, assertions);
+    let needs_interpreted_arithmetic_basis = contains_fixed_interpreted_arithmetic(terms, body);
 
     // For each bound variable, find ground terms of the matching sort.
     let mut candidates_per_var: Vec<Vec<TermId>> = Vec::with_capacity(vars.len());
     for (_name, sort) in &vars {
-        let candidates = ground_by_sort.get(sort).cloned().unwrap_or_default();
+        let mut candidates = ground_by_sort.get(sort).cloned().unwrap_or_default();
+        // Fixed arithmetic conversions and integer division operations have
+        // semantic discontinuities that a ground-term-only seed can miss. For
+        // example, `forall x:Real. to_int(x) = 0` contains no ground Real term,
+        // while `forall x:Int. rem(x, 2) = 0` exposes only the non-refuting
+        // points 0 and 2. Add a small, deterministic arithmetic basis exactly
+        // for formulas containing those interpreted heads. Every generated
+        // instance is still a direct consequence of the entailed universal;
+        // in proof mode the caller derives it with `forall_inst` and the strict
+        // checker independently evaluates the ground operation.
+        if needs_interpreted_arithmetic_basis {
+            let mut add = |candidate: TermId| {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            };
+            match sort {
+                Sort::Int => {
+                    add(terms.mk_int(BigInt::from(0)));
+                    add(terms.mk_int(BigInt::from(1)));
+                    add(terms.mk_int(BigInt::from(-1)));
+                }
+                Sort::Real => {
+                    add(terms.mk_rational(BigRational::from_integer(BigInt::from(0))));
+                    add(terms.mk_rational(BigRational::from_integer(BigInt::from(1))));
+                    add(terms.mk_rational(BigRational::from_integer(BigInt::from(-1))));
+                    add(terms.mk_rational(BigRational::new(BigInt::from(1), BigInt::from(2))));
+                    add(terms.mk_rational(BigRational::new(BigInt::from(-1), BigInt::from(2))));
+                }
+                _ => {}
+            }
+        }
         if candidates.is_empty() {
             // No ground terms of this sort — can't instantiate this quantifier.
             return vec![];
@@ -96,7 +130,7 @@ pub(crate) fn enumerative_instantiation(
             .collect();
 
         let inst = instantiate_body(terms, body, &var_names, &binding);
-        instantiations.push(inst);
+        instantiations.push((binding, inst));
 
         // Advance to next combination (rightmost index increments first)
         let mut carry = true;
@@ -116,6 +150,51 @@ pub(crate) fn enumerative_instantiation(
     }
 
     instantiations
+}
+
+/// Whether `root` contains a fixed-semantics arithmetic operation whose useful
+/// counterexample may lie outside the input's existing ground-term set.
+///
+/// User declarations that reuse `div`/`mod`/`rem` are assigned a private core
+/// identity by the frontend, so only the actual interpreted head reaches the
+/// exact-name cases below. The explicit shadow flags cover the two conversion
+/// names that legacy contexts can redefine without private remapping.
+pub(crate) fn contains_fixed_interpreted_arithmetic(terms: &TermStore, root: TermId) -> bool {
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::App(symbol, arguments) => {
+                let fixed = match symbol.name() {
+                    "to_real" => !terms.to_real_is_shadowed(),
+                    "is_int" => !terms.is_int_is_shadowed(),
+                    "to_int" | "div" | "mod" | "rem" => true,
+                    _ => false,
+                };
+                if fixed {
+                    return true;
+                }
+                stack.extend(arguments.iter().copied());
+            }
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(condition, then_term, else_term) => {
+                stack.push(*condition);
+                stack.push(*then_term);
+                stack.push(*else_term);
+            }
+            TermData::Let(bindings, body) => {
+                stack.extend(bindings.iter().map(|(_, value)| *value));
+                stack.push(*body);
+            }
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+            TermData::Const(_) | TermData::Var(..) => {}
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Collect ground terms from assertions grouped by their sort.

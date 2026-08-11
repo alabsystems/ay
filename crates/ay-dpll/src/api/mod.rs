@@ -116,12 +116,11 @@ pub use ay_core::{
 pub use terms::AstKind;
 
 use ay_core::kani_compat::DetHashMap as HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ay_core::TermStore;
-use ay_frontend::Command;
 
 use crate::{Executor, UnknownReason};
 
@@ -209,6 +208,25 @@ struct DefinedFun {
     /// equality rather than introduced by the explicit define-fun API.
     /// Assertion-derived definitions must be removed by reset-assertions.
     assertion_derived: bool,
+    /// Exact authority of the handle allowed to expand this body. Explicit
+    /// native definitions get a fresh opaque incarnation; an assertion-adopted
+    /// definition retains the frontend identity of the declared UF it refines.
+    identity: FuncDeclIdentity,
+}
+
+/// One authenticated native uninterpreted-function declaration.
+///
+/// The public name remains the map key. `core_name` is the frontend-assigned
+/// declaration identity used in the term DAG and can deliberately differ from
+/// that key when the public spelling collides with an interpreted builtin.
+#[derive(Debug, Clone)]
+struct NativeFunctionRegistration {
+    domain: Vec<Sort>,
+    range: Sort,
+    core_name: String,
+    /// Exact frontend declaration and context incarnation. A reused core name
+    /// and matching signature after reset must not authenticate an old handle.
+    identity: FrontendFuncDeclIdentity,
 }
 
 /// Native Rust API for AY SMT solver
@@ -216,6 +234,10 @@ struct DefinedFun {
 /// Provides a programmatic interface for building SMT constraints
 /// and checking satisfiability without parsing SMT-LIB text.
 pub struct Solver {
+    /// Opaque generation identity for consumers caching solver-local handles.
+    /// It remains stable while the term/declaration arena is preserved and is
+    /// rotated by a full reset.
+    cache_token: SolverCacheToken,
     /// Boxed: `Executor` is a ~56 KiB struct (the inline incremental BV/theory
     /// state alone holds three `SatSolver`s). Held inline it makes `Solver` —
     /// and every consumer struct embedding a `Solver` by value — a ~56 KiB
@@ -226,6 +248,9 @@ pub struct Solver {
     /// slot to 8 bytes; all access auto-derefs and only the construction
     /// site (stack-guarded below) allocates.
     executor: Box<Executor>,
+    /// Opaque incarnation of the native term-handle arena. Rotated only by a
+    /// successful full reset; push/pop and reset-assertions preserve it.
+    term_arena: TermArenaStamp,
     /// Variable names for model extraction
     var_names: HashMap<TermId, String>,
     /// Exact native declaration identity -> variable term.
@@ -271,6 +296,14 @@ pub struct Solver {
     /// soft after execution so the transaction authentication check is exercised.
     #[cfg(test)]
     corrupt_native_soft_transaction: bool,
+    /// Test-only publication-lifetime hook: fire the native interrupt after the
+    /// MaxSMT engine has returned but before objective accounting is admitted.
+    #[cfg(test)]
+    interrupt_native_maxsmt_after_execution: bool,
+    /// Test-only publication-lifetime hook: exhaust the per-instance term
+    /// budget after the MaxSMT engine returns, at the native accounting boundary.
+    #[cfg(test)]
+    exhaust_native_maxsmt_term_memory_after_execution: bool,
     /// Function definitions registered via `try_define_fun` (#8613).
     /// Maps function name to its definition (params, body, return sort).
     /// When `try_apply` encounters a defined function, it expands inline
@@ -280,9 +313,70 @@ pub struct Solver {
     /// Exact native uninterpreted-function signatures, preserving API-level
     /// sort kinds (notably `TypeVar`) that the frontend lowers in its core
     /// symbol table. This authenticates public `FuncDecl` handles in O(1).
-    native_fun_signatures: HashMap<String, (Vec<Sort>, Sort)>,
+    native_fun_signatures: HashMap<String, NativeFunctionRegistration>,
     /// Native API replay trace for downstream reducers/debuggers.
     native_replay_events: Vec<NativeReplayEvent>,
+}
+
+/// Opaque identity for one generation of a [`Solver`]'s handle arena.
+///
+/// Term handles are meaningful only in the solver that created them. Adapter
+/// crates that cache such handles can retain this token and invalidate their
+/// cache when a different solver is attached or the solver is fully reset. The
+/// marker allocation is kept alive by every clone, so identities cannot collide
+/// through allocator address reuse after a generation ends.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SolverCacheToken(Arc<SolverCacheMarker>);
+
+struct SolverCacheMarker {
+    current: AtomicBool,
+}
+
+impl SolverCacheToken {
+    fn new() -> Self {
+        Self(Arc::new(SolverCacheMarker {
+            current: AtomicBool::new(true),
+        }))
+    }
+
+    fn invalidate(&self) {
+        self.0.current.store(false, Ordering::Release);
+    }
+
+    /// Whether the solver still retains the handle arena represented by this
+    /// token.
+    ///
+    /// A successful full reset invalidates every clone of the previous token,
+    /// allowing adapter caches to reject stale handles even before they obtain
+    /// the solver's replacement token.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.0.current.load(Ordering::Acquire)
+    }
+}
+
+impl PartialEq for SolverCacheToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SolverCacheToken {}
+
+impl std::fmt::Debug for SolverCacheToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SolverCacheToken(..)")
+    }
+}
+
+impl Drop for Solver {
+    fn drop(&mut self) {
+        // Cached handles cannot outlive their arena. Notify every retained
+        // token clone before the executor and term store are destroyed.
+        self.cache_token.invalidate();
+    }
 }
 
 impl Solver {
@@ -400,7 +494,9 @@ impl Solver {
             0,
         )];
         Ok(Self {
+            cache_token: SolverCacheToken::new(),
             executor,
+            term_arena: TermArenaStamp::fresh(),
             var_names: HashMap::default(),
             var_terms_by_name: HashMap::default(),
             var_sorts: HashMap::default(),
@@ -419,6 +515,10 @@ impl Solver {
             soft_constraints: Vec::new(),
             #[cfg(test)]
             corrupt_native_soft_transaction: false,
+            #[cfg(test)]
+            interrupt_native_maxsmt_after_execution: false,
+            #[cfg(test)]
+            exhaust_native_maxsmt_term_memory_after_execution: false,
             defined_funs: HashMap::default(),
             native_fun_signatures: HashMap::default(),
             native_replay_events,
@@ -428,6 +528,112 @@ impl Solver {
     /// Access the internal term store
     fn terms(&self) -> &TermStore {
         &self.executor.context().terms
+    }
+
+    /// Authenticate a public term capability before any term-store indexing or
+    /// solver-state mutation.
+    fn resolve_term(&self, operation: &'static str, term: Term) -> Result<TermId, SolverError> {
+        let id = term.id();
+        let Some(entry) = self.terms().entry_stamp(id) else {
+            return Err(SolverError::InvalidTermHandle {
+                operation,
+                term: term.to_raw(),
+            });
+        };
+        if !term.authenticates(self.term_arena, entry) {
+            return Err(SolverError::InvalidTermHandle {
+                operation,
+                term: term.to_raw(),
+            });
+        }
+        Ok(id)
+    }
+
+    fn resolve_terms(
+        &self,
+        operation: &'static str,
+        terms: &[Term],
+    ) -> Result<Vec<TermId>, SolverError> {
+        terms
+            .iter()
+            .map(|term| self.resolve_term(operation, *term))
+            .collect()
+    }
+
+    #[allow(clippy::panic)]
+    fn require_term(&self, operation: &'static str, term: Term) -> TermId {
+        self.resolve_term(operation, term)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[allow(clippy::panic)]
+    fn require_terms(&self, operation: &'static str, terms: &[Term]) -> Vec<TermId> {
+        self.resolve_terms(operation, terms)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Mint the sole authenticated public wrapper for a live internal term.
+    #[allow(clippy::panic)]
+    fn wrap_term(&self, id: TermId) -> Term {
+        let entry = self
+            .terms()
+            .entry_stamp(id)
+            .unwrap_or_else(|| panic!("attempted to publish non-live internal term {id}"));
+        Term::authenticated(id, self.term_arena, entry)
+    }
+
+    /// Lower an API sort through this solver's live nominal-sort registry.
+    ///
+    /// `Sort::as_term_sort` is context-free and therefore cannot distinguish a
+    /// datatype (or other named sort) redeclared with the same surface spelling
+    /// after scope exit.  Every API boundary that creates or checks a term sort
+    /// must use this contextual lowering so the engine sees the exact live
+    /// carrier identity.  Undeclared uninterpreted sorts retain their ordinary
+    /// context-free identity for backwards-compatible native construction.
+    fn lower_live_sort(&self, sort: &Sort) -> Sort {
+        match sort {
+            Sort::Uninterpreted(name) => self
+                .executor
+                .context()
+                .sort_definition(name)
+                .cloned()
+                .unwrap_or_else(|| sort.as_term_sort()),
+            Sort::Datatype(datatype) => self
+                .executor
+                .context()
+                .sort_definition(&datatype.name)
+                .cloned()
+                .unwrap_or_else(|| sort.as_term_sort()),
+            Sort::Array(array) => Sort::array(
+                self.lower_live_sort(&array.index_sort),
+                self.lower_live_sort(&array.element_sort),
+            ),
+            Sort::Seq(element) => Sort::seq(self.lower_live_sort(element)),
+            _ => sort.as_term_sort(),
+        }
+    }
+
+    /// Return this solver's opaque handle-arena generation identity.
+    ///
+    /// Intended for adapter caches that hold solver-local [`Term`] or
+    /// [`FuncDecl`] handles. A successful full [`Self::try_reset`] changes the
+    /// token because all such handles become stale; reset-assertions does not.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cache_token(&self) -> SolverCacheToken {
+        self.cache_token.clone()
+    }
+
+    /// Whether `name` is already occupied by a declaration in this solver.
+    ///
+    /// This adapter-facing query lets fresh-name generators distinguish a
+    /// collision from other [`SolverError::InvalidArgument`] failures without
+    /// parsing error text.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_symbol_name_occupied(&self, name: &str) -> bool {
+        self.var_terms_by_name.contains_key(name)
+            || self.executor.context().has_symbol_binding(name)
     }
 
     /// Crate-internal accessor for the term store backing [`Self::last_proof`].
@@ -443,7 +649,7 @@ impl Solver {
 
     /// Access the internal term store mutably
     fn terms_mut(&mut self) -> &mut TermStore {
-        &mut self.executor.context_mut().terms
+        &mut self.executor.context_mut_internal().terms
     }
 
     /// Mark the native term arena as containing a user-shadowed `to_real`.
@@ -468,8 +674,13 @@ impl Solver {
         self.terms().to_real_is_shadowed()
     }
 
+    fn resolved_term_sort(&self, operation: &'static str, term: Term) -> Result<Sort, SolverError> {
+        let id = self.resolve_term(operation, term)?;
+        Ok(self.terms().sort(id).clone())
+    }
+
     fn expect_bitvec(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         match sort {
             Sort::BitVec(_) => Ok(()),
             other => Err(SolverError::SortMismatch {
@@ -481,7 +692,7 @@ impl Solver {
     }
 
     fn expect_int(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         match sort {
             Sort::Int => Ok(()),
             other => Err(SolverError::SortMismatch {
@@ -493,7 +704,7 @@ impl Solver {
     }
 
     fn expect_real(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         match sort {
             Sort::Real => Ok(()),
             other => Err(SolverError::SortMismatch {
@@ -505,7 +716,7 @@ impl Solver {
     }
 
     fn expect_bitvec_width(&self, operation: &'static str, t: Term) -> Result<u32, SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         match sort {
             Sort::BitVec(bv) => Ok(bv.width),
             other => Err(SolverError::SortMismatch {
@@ -522,8 +733,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<(u32, u32), SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         match (&a_sort, &b_sort) {
             (Sort::BitVec(a_bv), Sort::BitVec(b_bv)) => Ok((a_bv.width, b_bv.width)),
             _ => Err(SolverError::SortMismatch {
@@ -540,8 +751,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<u32, SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         match (&a_sort, &b_sort) {
             (Sort::BitVec(a_bv), Sort::BitVec(b_bv)) if a_bv.width == b_bv.width => Ok(a_bv.width),
             _ => Err(SolverError::SortMismatch {
@@ -554,7 +765,7 @@ impl Solver {
 
     /// Check that a term has an arithmetic sort (Int or Real).
     fn expect_arith(&self, operation: &'static str, a: Term) -> Result<Sort, SolverError> {
-        let sort = self.terms().sort(a.0).clone();
+        let sort = self.resolved_term_sort(operation, a)?;
         match &sort {
             Sort::Int | Sort::Real => Ok(sort),
             _ => Err(SolverError::SortMismatch {
@@ -572,8 +783,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<Sort, SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         match (&a_sort, &b_sort) {
             (Sort::Int, Sort::Int) => Ok(Sort::Int),
             (Sort::Real, Sort::Real) => Ok(Sort::Real),
@@ -592,8 +803,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<(), SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         match (&a_sort, &b_sort) {
             (Sort::Int, Sort::Int) => Ok(()),
             _ => Err(SolverError::SortMismatch {
@@ -611,8 +822,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<(), SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         match (&a_sort, &b_sort) {
             (Sort::Real, Sort::Real) => Ok(()),
             _ => Err(SolverError::SortMismatch {
@@ -625,7 +836,7 @@ impl Solver {
 
     /// Check that a term has Bool sort.
     fn expect_bool(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         match sort {
             Sort::Bool => Ok(()),
             other => Err(SolverError::SortMismatch {
@@ -643,8 +854,8 @@ impl Solver {
         a: Term,
         b: Term,
     ) -> Result<(), SolverError> {
-        let a_sort = self.terms().sort(a.0).clone();
-        let b_sort = self.terms().sort(b.0).clone();
+        let a_sort = self.resolved_term_sort(operation, a)?;
+        let b_sort = self.resolved_term_sort(operation, b)?;
         if a_sort == b_sort {
             Ok(())
         } else {
@@ -658,7 +869,7 @@ impl Solver {
 
     /// Check that a term has String sort.
     fn expect_string(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         if sort == Sort::String {
             Ok(())
         } else {
@@ -672,7 +883,7 @@ impl Solver {
 
     /// Check that a term has RegLan sort.
     fn expect_reglan(&self, operation: &'static str, t: Term) -> Result<(), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let sort = self.resolved_term_sort(operation, t)?;
         if sort == Sort::RegLan {
             Ok(())
         } else {

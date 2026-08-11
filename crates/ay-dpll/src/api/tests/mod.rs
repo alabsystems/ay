@@ -16,6 +16,7 @@ mod test_bv_quantifier;
 mod test_closure_capture_model;
 mod test_core;
 mod test_counterexample_minimization;
+mod test_declaration_identity;
 mod test_define_fun;
 mod test_explanation_report;
 mod test_fp;

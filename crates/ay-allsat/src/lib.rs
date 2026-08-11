@@ -28,7 +28,7 @@
 //! solver.add_clause(vec![1, 2]);
 //! solver.add_clause(vec![-1, -2]);
 //!
-//! let solutions: Vec<_> = solver.iter().collect();
+//! let solutions = solver.try_enumerate().expect("enumeration is exhaustive");
 //! assert_eq!(solutions.len(), 2);
 //! ```
 //!
@@ -48,7 +48,9 @@
 //!     projection: Some(vec![1]),
 //!     ..Default::default()
 //! };
-//! let solutions = solver.enumerate_with_config(config);
+//! let solutions = solver
+//!     .try_enumerate_with_config(config)
+//!     .expect("projected enumeration is exhaustive");
 //! // Only one projected solution: x1=T
 //! assert_eq!(solutions.len(), 1);
 //! ```
@@ -75,8 +77,12 @@
 //! - McMillan, "Applying SAT Methods in Unbounded Symbolic Model Checking"
 //! - Grumberg et al., "Memory Efficient All-Solutions SAT Solver"
 
+mod count;
+mod outcome;
 mod solver;
 
+pub use outcome::{AllSatIncomplete, AllSatInputError, AllSatOutcome, AllSatStats};
 pub use solver::{
-    AllSatConfig, AllSatIterator, AllSatOutcome, AllSatSolver, AllSatStats, Solution,
+    AllSatConfig, AllSatIterator, AllSatSolver, EnumerationReport, Solution, SolutionIndexing,
+    SolutionLiteralError,
 };

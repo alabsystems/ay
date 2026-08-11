@@ -68,242 +68,91 @@ pub fn prefetch_read_l2<T>(ptr: *const T) {
     }
 }
 
-/// Unchecked slice index for `i8` arrays (val lookup in BCP hot path).
+/// Slice index for `i8` arrays (val lookup in the BCP hot path).
 ///
-/// In debug builds, performs a normal bounds-checked access (panics on OOB).
-/// In release builds, uses `get_unchecked` to skip the bounds check.
-///
-/// This eliminates one `cmp + jae` (comparison + conditional branch to panic)
-/// per val lookup in the BCP inner loop. CaDiCaL uses `signed char *vals`
-/// (raw pointer, no bounds check). AY uses `Vec<i8>` which has bounds
-/// checking on every index. On benchmarks with millions of val lookups per
-/// second, the cumulative branch predictor pressure and decode-slot cost is
-/// measurable.
-///
-/// # Safety contract
-///
-/// The caller must ensure `index < slice.len()`. In debug builds this is
-/// enforced by a panic. In release builds, violating this is UB.
-///
-/// The function is safe to call because ay-sat's invariant guarantees that
-/// every `Literal::index()` is `< 2 * num_vars == vals.len()`. This is
-/// established at construction and maintained across all assignment operations.
+/// Panics when `index` is out of bounds. Keeping this public function checked
+/// is required for a sound safe API; callers that have proved a raw-pointer
+/// access valid can use the explicitly unsafe helpers below.
 #[inline(always)]
 pub fn val_at(vals: &[i8], index: usize) -> i8 {
-    debug_assert!(
-        index < vals.len(),
-        "val_at: index {index} out of bounds for vals of length {}",
-        vals.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        vals[index]
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < vals.len(). In ay-sat, every
-        // Literal::index() is < 2*num_vars == vals.len() by construction.
-        unsafe { *vals.get_unchecked(index) }
-    }
+    vals[index]
 }
 
-/// Unchecked slice index for `u32` arrays (arena word lookup in BCP hot path).
+/// Checked slice index for `u32` arrays (arena word lookup in BCP hot path).
 ///
-/// Same safety contract as [`val_at`] but for `u32` slices. Used for arena
+/// Like [`val_at`], this panics on an out-of-bounds index. Used for arena
 /// literal access during the BCP replacement scan where the clause offset +
 /// literal index is known to be within the arena's allocated words.
 #[inline(always)]
 pub fn word_at(words: &[u32], index: usize) -> u32 {
-    debug_assert!(
-        index < words.len(),
-        "word_at: index {index} out of bounds for words of length {}",
-        words.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        words[index]
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < words.len(). In ay-sat, arena offsets
-        // are validated at clause creation and never exceed words.len().
-        unsafe { *words.get_unchecked(index) }
-    }
+    words[index]
 }
 
-/// Unchecked slice read for `u32` arrays (SoA blocker/clause_ref in BCP hot path).
+/// Checked slice read for `u32` arrays (SoA blocker/clause_ref in BCP hot path).
 ///
-/// Same safety contract as [`val_at`] but for `u32` slices. Used in the SoA
-/// blocker fast path to read blocker values without bounds checks (#8243).
+/// Like [`val_at`], this panics on an out-of-bounds index. Used in the SoA
+/// blocker fast path to read blocker values (#8243).
 /// With SoA layout, 32 blockers fit per cache line (vs 16 packed u64 entries),
 /// doubling the blocker scan throughput.
 #[inline(always)]
 pub fn blocker_at(blockers: &[u32], index: usize) -> u32 {
-    debug_assert!(
-        index < blockers.len(),
-        "blocker_at: index {index} out of bounds for blockers of length {}",
-        blockers.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        blockers[index]
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < blockers.len(). In the BCP fast path,
-        // the loop condition `i < watch_len` guarantees in-bounds access.
-        unsafe { *blockers.get_unchecked(index) }
-    }
+    blockers[index]
 }
 
-/// Unchecked mutable slice write for `u32` arrays (SoA blocker store in BCP).
+/// Checked mutable slice write for `u32` arrays (SoA blocker store in BCP).
 ///
-/// Same safety contract as [`blocker_at`] but for writes. Used in the BCP
+/// Like [`blocker_at`], this panics on an out-of-bounds index. Used in the BCP
 /// compaction loop for the speculative copy `blockers[j] = blockers[i]` (#8243).
 #[inline(always)]
 pub fn blocker_set(blockers: &mut [u32], index: usize, value: u32) {
-    debug_assert!(
-        index < blockers.len(),
-        "blocker_set: index {index} out of bounds for blockers of length {}",
-        blockers.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        blockers[index] = value;
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < blockers.len().
-        unsafe {
-            *blockers.get_unchecked_mut(index) = value;
-        }
-    }
+    blockers[index] = value;
 }
 
-/// Unchecked slice read for `u64` arrays (SoA clause_ref in BCP slow path).
+/// Checked slice read for `u64` arrays (SoA clause_ref in BCP slow path).
 ///
-/// Same safety contract as [`blocker_at`] but for clause_ref arrays. Only
+/// Like [`blocker_at`], this panics on an out-of-bounds index. It is only
 /// accessed on blocker miss, avoiding cache pollution on the fast path (#8243).
 /// Each clause_ref word is a `u64` carrying the binary flag at bit 32 plus the
 /// full 32-bit clause word offset in the low bits (#9670).
 #[inline(always)]
 pub fn clause_ref_at(clause_refs: &[u64], index: usize) -> u64 {
-    debug_assert!(
-        index < clause_refs.len(),
-        "clause_ref_at: index {index} out of bounds for clause_refs of length {}",
-        clause_refs.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        clause_refs[index]
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < clause_refs.len().
-        unsafe { *clause_refs.get_unchecked(index) }
-    }
+    clause_refs[index]
 }
 
-/// Unchecked mutable slice write for `u64` arrays (SoA clause_ref store).
+/// Checked mutable slice write for `u64` arrays (SoA clause_ref store).
 ///
-/// Same safety contract as [`blocker_at`] but for clause_ref array writes.
+/// Like [`blocker_at`], this panics on an out-of-bounds index.
 #[inline(always)]
 pub fn clause_ref_set(clause_refs: &mut [u64], index: usize, value: u64) {
-    debug_assert!(
-        index < clause_refs.len(),
-        "clause_ref_set: index {index} out of bounds for clause_refs of length {}",
-        clause_refs.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        clause_refs[index] = value;
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < clause_refs.len().
-        unsafe {
-            *clause_refs.get_unchecked_mut(index) = value;
-        }
-    }
+    clause_refs[index] = value;
 }
 
-/// Unchecked slice read for `u64` arrays (watch entry load in BCP hot path).
+/// Checked slice read for `u64` arrays (watch entry load in BCP hot path).
 ///
-/// Same safety contract as [`val_at`] but for `u64` slices. Used in the BCP
-/// blocker fast path to read packed watch entries without bounds checks.
-/// Eliminates the `cmp + b.hs` bounds check branch that prevents the optimizer from
-/// hoisting the slice data pointer into a register (#3758).
+/// Like [`val_at`], this panics on an out-of-bounds index. Used in the BCP
+/// blocker fast path to read packed watch entries.
 #[inline(always)]
 pub fn entry_at(entries: &[u64], index: usize) -> u64 {
-    debug_assert!(
-        index < entries.len(),
-        "entry_at: index {index} out of bounds for entries of length {}",
-        entries.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        entries[index]
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < entries.len(). In the BCP fast path,
-        // the loop condition `i < watch_len` where `watch_len = entries.len()`
-        // guarantees in-bounds access for reads. The compaction invariant
-        // `j <= i` guarantees in-bounds access for writes.
-        unsafe { *entries.get_unchecked(index) }
-    }
+    entries[index]
 }
 
-/// Unchecked mutable slice write for `u64` arrays (watch entry store in BCP).
+/// Checked mutable slice write for `u64` arrays (watch entry store in BCP).
 ///
-/// Same safety contract as [`val_set`] but for `u64` slices. Used in the BCP
+/// Like [`entry_at`], this panics on an out-of-bounds index. Used in the BCP
 /// blocker fast path for the speculative copy `entries[j] = entries[i]`.
 /// The compaction invariant `j <= i < entries.len()` guarantees safety.
-/// Eliminates the `cmp + b.hs` bounds check branch that prevents the optimizer from
-/// hoisting the slice data pointer into a register (#3758).
 #[inline(always)]
 pub fn entry_set(entries: &mut [u64], index: usize, value: u64) {
-    debug_assert!(
-        index < entries.len(),
-        "entry_set: index {index} out of bounds for entries of length {}",
-        entries.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        entries[index] = value;
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < entries.len(). See entry_at for
-        // the invariant proof.
-        unsafe {
-            *entries.get_unchecked_mut(index) = value;
-        }
-    }
+    entries[index] = value;
 }
 
-/// Unchecked mutable slice write for `i8` arrays (val store in enqueue).
+/// Checked mutable slice write for `i8` arrays (val store in enqueue).
 ///
-/// Same safety contract as [`val_at`] but for writes. Used in `enqueue()`
-/// to set `vals[lit] = 1` and `vals[¬lit] = -1` without bounds checks.
+/// Like [`val_at`], this panics on an out-of-bounds index. Used in `enqueue()`
+/// to set `vals[lit] = 1` and `vals[¬lit] = -1`.
 #[inline(always)]
 pub fn val_set(vals: &mut [i8], index: usize, value: i8) {
-    debug_assert!(
-        index < vals.len(),
-        "val_set: index {index} out of bounds for vals of length {}",
-        vals.len()
-    );
-    #[cfg(debug_assertions)]
-    {
-        vals[index] = value;
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // SAFETY: caller ensures index < vals.len().
-        unsafe {
-            *vals.get_unchecked_mut(index) = value;
-        }
-    }
+    vals[index] = value;
 }
 
 /// Issue a non-blocking L2 cache prefetch hint for a specific offset

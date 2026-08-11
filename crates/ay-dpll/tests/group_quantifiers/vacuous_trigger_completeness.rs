@@ -4,32 +4,25 @@
 
 #![allow(clippy::panic)]
 
-//! End-to-end guards for the vacuous-trigger completeness rule
-//! (#verification-consumer lang/while_let).
+//! End-to-end guards for dead explicit triggers (#verification-consumer lang/while_let).
 //!
 //! A *triggered* `forall` whose trigger symbol has NO ground occurrence in the
-//! problem can never be instantiated by E-matching. Previously such a
-//! quantifier left a ground SAT escalated to `unknown (quantifier-unhandled)`.
-//! The fix keeps the genuine ground SAT as `sat`: the never-grounded,
-//! uninterpreted trigger symbol can be interpreted freely, so the ground model
-//! extends to the quantifier.
+//! problem cannot be instantiated by E-matching. That is an instantiation fact,
+//! not a semantic SAT certificate: the body can still be impossible at every
+//! binder value, and `no_mbqi` quantifiers have no independent fallback. The
+//! solver therefore fails closed unless another semantic certificate applies.
 //!
-//! The rule ONLY converts a ground `Sat` into a final `Sat`; it never produces
-//! `Unsat`. These tests pin both the capability (the previously-stuck SAT now
-//! resolves) and the cardinal soundness property: a genuinely UNSAT problem —
-//! including one whose contradiction needs the universal fact — must still
-//! decide `unsat`, and a satisfiable problem must never flip to `unsat`.
+//! These tests pin the conservative result and the cardinal soundness property:
+//! a genuinely UNSAT problem must still decide `unsat`, and a satisfiable
+//! problem must never flip to `unsat`.
 
 use ntest::timeout;
 
-/// CAPABILITY: a ground-SAT problem carrying a triggered `forall` whose trigger
-/// symbol `logic_Some` never appears in any ground term must resolve to `sat`,
-/// NOT `unknown`. This mirrors the `lang/while_let` `loop_entry_may_execute`
-/// probe, where the only ground option terms use the native `Some` constructor
-/// while the injected Option axioms range over `logic_Some`.
+/// A satisfiable dead-trigger problem currently has no independently
+/// constructed total model, so the honest result is `unknown`.
 #[test]
 #[timeout(60_000)]
-fn vacuous_trigger_ground_sat_resolves_sat() {
+fn dead_trigger_ground_sat_fails_closed() {
     let smt = r#"
         (set-logic UF)
         (declare-sort Option 0)
@@ -49,8 +42,8 @@ fn vacuous_trigger_ground_sat_resolves_sat() {
         .find(|l| matches!(l.trim(), "sat" | "unsat" | "unknown"));
     assert_eq!(
         res.map(String::as_str),
-        Some("sat"),
-        "ground-SAT with a dead-trigger forall must resolve sat, got {outputs:?}"
+        Some("unknown"),
+        "dead-trigger SAT needs a semantic certificate, got {outputs:?}"
     );
 }
 

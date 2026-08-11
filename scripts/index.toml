@@ -329,6 +329,16 @@ tools   = ["z3"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
+name    = "ufbv-fixpoint-audit"
+path    = "scripts/ufbv_fixpoint_audit.py"
+lang    = "python"
+group   = "audit.smt"
+summary = "Guarded two-lane production and self-check audit of the exact 121-file quantified UFBV fixpoint family."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
 name    = "chc-cert-check"
 path    = "scripts/chc_cert_check.py"
 lang    = "python"

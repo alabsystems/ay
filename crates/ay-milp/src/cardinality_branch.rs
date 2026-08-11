@@ -227,7 +227,7 @@ mod tests {
 
         assert_eq!(
             unit_amo_rows(&model),
-            vec![super::UnitAmoRow {
+            vec![UnitAmoRow {
                 row: good.index(),
                 support: vec![a.index(), b.index()],
             }]

@@ -10,7 +10,9 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{FarkasAnnotation, Sort, TermData, TermId, TermStore, TheoryLemmaKind};
+use ay_core::{
+    FarkasAnnotation, Sort, TermData, TermId, TermStore, TheoryConflict, TheoryLemmaKind, TheoryLit,
+};
 
 use super::decode_eq;
 
@@ -166,13 +168,117 @@ fn replay_bridge_clause_with_farkas(
         };
         ay_core::TheorySolver::assert_literal(&mut lra, atom, value);
     }
-    if let ay_core::TheoryResult::UnsatWithFarkas(conflict) = ay_core::TheorySolver::check(&mut lra)
+    let ay_core::TheoryResult::UnsatWithFarkas(conflict) = ay_core::TheorySolver::check(&mut lra)
+    else {
+        return None;
+    };
+    rebind_replayed_farkas(terms, clause, &conflict)
+}
+
+/// Rebind an LRA replay certificate from the solver's conflict order to the
+/// bridge clause's order, then validate it against that exact clause.
+///
+/// `LraSolver` may return a conflict subset in an order different from the
+/// assertion order. Farkas coefficients are positional, so a length check alone
+/// cannot establish that they still describe `target_clause`.
+fn rebind_replayed_farkas(
+    terms: &TermStore,
+    target_clause: &[TermId],
+    conflict: &TheoryConflict,
+) -> Option<FarkasAnnotation> {
+    let source_farkas = conflict.farkas.as_ref()?;
+    if source_farkas.coefficients.len() != conflict.literals.len() {
+        return None;
+    }
+
+    let zero = num_rational::Rational64::from(0);
+    let mut source_clause = Vec::with_capacity(conflict.literals.len());
+    let mut source_coefficients = Vec::with_capacity(conflict.literals.len());
+    for (&literal, coefficient) in conflict
+        .literals
+        .iter()
+        .zip(source_farkas.coefficients.iter())
     {
-        if let Some(ref f) = conflict.farkas {
-            if f.coefficients.len() == clause.len() {
-                return conflict.farkas;
+        let blocker = target_clause.iter().copied().find(|&candidate| {
+            if literal.value {
+                matches!(terms.get(candidate), TermData::Not(inner) if *inner == literal.term)
+            } else {
+                candidate == literal.term
             }
+        });
+        match blocker {
+            Some(blocker) => {
+                source_clause.push(blocker);
+                source_coefficients.push(*coefficient);
+            }
+            None if *coefficient == zero => {}
+            None => return None,
         }
     }
-    None
+
+    let source_farkas = FarkasAnnotation::new(source_coefficients);
+    let rebound = source_farkas.rebind_by_literal(&source_clause, target_clause)?;
+    let target_conflict: Vec<TheoryLit> = target_clause
+        .iter()
+        .map(|&literal| match terms.get(literal) {
+            TermData::Not(inner) => TheoryLit::new(*inner, true),
+            _ => TheoryLit::new(literal, false),
+        })
+        .collect();
+    ay_core::proof_validation::verify_farkas_conflict_lits_full(terms, &target_conflict, &rebound)
+        .ok()?;
+    Some(rebound)
+}
+
+#[cfg(test)]
+mod tests {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+
+    use super::*;
+
+    #[test]
+    fn replayed_farkas_is_rebound_from_permuted_nonuniform_conflict() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(BigRational::from_integer(BigInt::from(0)));
+        let one = terms.mk_rational(BigRational::from_integer(BigInt::from(1)));
+        let three = terms.mk_rational(BigRational::from_integer(BigInt::from(3)));
+        let three_x = terms.mk_mul(vec![three, x]);
+        let three_x_le_zero = terms.mk_le(three_x, zero);
+        let x_ge_one = terms.mk_ge(x, one);
+        let not_three_x_le_zero = terms.mk_not(three_x_le_zero);
+        let not_x_ge_one = terms.mk_not(x_ge_one);
+
+        let target_clause = vec![not_three_x_le_zero, not_x_ge_one];
+        let target_conflict = vec![
+            TheoryLit::new(three_x_le_zero, true),
+            TheoryLit::new(x_ge_one, true),
+        ];
+        let source_farkas = FarkasAnnotation::from_ints(&[3, 1]);
+        assert!(ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            &terms,
+            &target_conflict,
+            &source_farkas,
+        )
+        .is_err());
+
+        let solver_conflict = TheoryConflict::with_farkas(
+            vec![
+                TheoryLit::new(x_ge_one, true),
+                TheoryLit::new(three_x_le_zero, true),
+            ],
+            source_farkas,
+        );
+        let rebound = rebind_replayed_farkas(&terms, &target_clause, &solver_conflict)
+            .expect("permuted replay certificate should rebind by literal identity");
+
+        assert_eq!(rebound, FarkasAnnotation::from_ints(&[1, 3]));
+        ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            &terms,
+            &target_conflict,
+            &rebound,
+        )
+        .expect("rebound certificate must validate against the exact bridge clause");
+    }
 }

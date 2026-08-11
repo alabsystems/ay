@@ -130,8 +130,7 @@ fn potentials_are_always_a_model_of_the_asserted_edges() {
             for &(f, t, ww) in &live {
                 assert!(
                     model[t] - model[f] <= ww,
-                    "potential violates {f}->{t}:{ww} (model {:?})",
-                    model
+                    "potential violates {f}->{t}:{ww} (model {model:?})"
                 );
             }
         }

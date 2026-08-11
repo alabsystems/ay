@@ -22,6 +22,18 @@ use crate::executor_types::{
 };
 use crate::logic_detection::{LogicCategory, TheoryKind};
 
+/// Which public boundary owns SAT emission for an assumption solve.
+///
+/// Direct `check-sat-assuming` calls emit locally. Plain `check-sat`'s named
+/// core redirect is already inside the outer solve pipeline, so it must return
+/// a bare proposal and let that pipeline consume any affine certificate model
+/// exactly once after the original assertion stack is restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum AssumptionSatPublication {
+    EmitHere,
+    DeferToPlainCheckSat,
+}
+
 impl Executor {
     /// Run check-sat with assumptions.
     ///
@@ -31,6 +43,29 @@ impl Executor {
     /// `pub(crate)`: External consumers MUST use `api::Solver::check_sat_assuming()`
     /// which returns `VerifiedSolveResult`. Part of #5787 (Phase 6).
     pub(crate) fn check_sat_assuming(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
+        self.check_sat_assuming_with_publication(assumptions, AssumptionSatPublication::EmitHere)
+    }
+
+    /// Named-core redirect used from inside plain `check-sat`.
+    ///
+    /// The caller owns the ordinary SAT funnel after this returns, so a SAT
+    /// result here must retain Pending certificate transport and carry no
+    /// already-minted public SAT token.
+    pub(in crate::executor) fn check_sat_assuming_deferred_to_plain_check_sat(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<SolveResult> {
+        self.check_sat_assuming_with_publication(
+            assumptions,
+            AssumptionSatPublication::DeferToPlainCheckSat,
+        )
+    }
+
+    fn check_sat_assuming_with_publication(
+        &mut self,
+        assumptions: &[TermId],
+        publication: AssumptionSatPublication,
+    ) -> Result<SolveResult> {
         self.last_sat_certificate = None;
         let mut symbolic_power_roots = self.ctx.assertions.clone();
         symbolic_power_roots.extend_from_slice(assumptions);
@@ -60,7 +95,20 @@ impl Executor {
         self.validate_bv_cnf_export_roots(&dump_roots)?;
         let solve_started_at = Instant::now();
         let previous_deadline = self.install_timeout_deadline_for_call();
-        let result = self.check_sat_assuming_with_controls(assumptions);
+        // A direct assumption query captures its exact pre-solve base just as
+        // plain `check-sat` does. A nested named-core redirect retains the
+        // already-installed outer authored snapshot; replacing it with the
+        // stripped unnamed base would bind Pending theorem transport to the
+        // redirect's reordered working set instead of the public query.
+        // `last_assumptions`, installed by the inner call, is appended (with
+        // exact-TermId deduplication) by `independent_gate_query_roots`.
+        let saved_independent_gate_authored = self.independent_gate_authored_assertions.take();
+        let active_authored_roots = saved_independent_gate_authored
+            .clone()
+            .unwrap_or_else(|| self.ctx.assertions.clone());
+        self.independent_gate_authored_assertions = Some(active_authored_roots);
+        let result = self.check_sat_assuming_with_controls(assumptions, publication);
+        self.independent_gate_authored_assertions = saved_independent_gate_authored;
         self.restore_timeout_deadline_after_call(previous_deadline);
         self.record_z3_resource_statistics(solve_started_at);
         let result = result.and_then(|result| {
@@ -88,9 +136,9 @@ impl Executor {
     /// SATISFIABLE together with the unnamed assertions (unsound output;
     /// the verdicts themselves were correct).
     ///
-    /// INTERNAL solver probes (optimization bound probes, the MaxSMT
-    /// disjoint-core lower bound, get-consequences/get-abduct entailment
-    /// checks) deliberately call `check_sat_assuming` directly instead:
+    /// INTERNAL solver probes (optimization bound probes and the MaxSMT
+    /// disjoint-core lower bound) deliberately call `check_sat_assuming`
+    /// directly instead:
     /// they authenticate harvested cores against exactly the assumption set
     /// they passed, and injecting named assertions there would disable
     /// those sound-progress checks (and with them e.g. the MaxSMT
@@ -154,7 +202,10 @@ impl Executor {
                     let (result, rescue_elapsed) = match result {
                         Ok(SolveResult::Unknown) => {
                             let rescue_started = Instant::now();
-                            let rescued = self.rescue_named_core_redirect_unknown(&combined);
+                            let rescued = self.rescue_named_core_redirect_unknown(
+                                &combined,
+                                AssumptionSatPublication::EmitHere,
+                            );
                             (rescued, Some(rescue_started.elapsed()))
                         }
                         other => (other, None),
@@ -277,35 +328,25 @@ impl Executor {
             // certificate.
             return result;
         }
-        // The re-solves below run on THIS executor and reach the same public
-        // publication funnel. Its unknown path (`finalize_unknown_publication`
-        // -> `publish_unknown_from_origin` -> `invalidate_last_check_result`)
-        // CLEARS `proof_problem_assertion_provenance`, which is the authored
-        // authority `begin_public_solve` installed for the outer query. A
-        // preprocessing lane inside the re-solve then rebuilds provenance with
-        // `preserving_authority_from(None)` and so promotes its own transformed
-        // working set to "authored"; because the arithmetic lanes deliberately
-        // keep their window installed on UNSAT, that forged authority survives
-        // back out to `mint_unsat_certificate`, which rejects the (correct)
-        // refutation with `AssertionEpochMismatch`.
-        //
-        // Re-rooting cannot widen authority: `preserving_authority_from` copies
-        // the outer roots and keeps an inner premise/source path only when it
-        // is already expressed in those roots.
-        let authored_authority = self.proof_problem_assertion_provenance.clone();
-        let recheck = self.check_sat_assuming(&core);
-        self.reroot_proof_authority(authored_authority.as_ref());
-        if matches!(recheck, Ok(SolveResult::Unsat(_))) {
+        // A bare same-engine UNSAT is not a certificate for a reduced public
+        // core. Reconstruct the exact base + harvested assumptions in a
+        // disposable public-query transaction and require a strict proof token
+        // bound to this outer epoch/source/root/term snapshot. The cloned probe
+        // cannot clobber the outer proof or model state, so no restorative
+        // re-solve or provenance rerooting is needed.
+        let mut obligation = self.ctx.assertions.clone();
+        obligation.extend(core.iter().copied());
+        let rechecked = self
+            .checked_exact_unsat_solve(obligation.clone(), 2_000)
+            .is_some_and(|checked| checked.consume(self, &obligation));
+        if rechecked {
             self.last_assumption_core = Some(core);
-            return recheck;
+            return result;
         }
-        // Uncertified harvest -- the exact defect class this gate exists
-        // for. Restore the original solve state (deterministic re-solve),
-        // then discard the harvest so the padded superset prints.
-        let restored = self.check_sat_assuming(combined);
-        self.reroot_proof_authority(authored_authority.as_ref());
+        // Uncertified harvest—the exact defect class this gate exists for.
+        // Discard it so downstream prints the conservative padded superset.
         self.last_assumption_core = None;
-        restored
+        result
     }
 
     /// Rebase whatever provenance a nested same-executor re-solve left behind
@@ -318,6 +359,7 @@ impl Executor {
     /// solve cleared provenance outright, the outer authority is reinstated
     /// verbatim. Either way no solver-generated term becomes an authored
     /// `assume`.
+    #[cfg(test)]
     fn reroot_proof_authority(
         &mut self,
         outer: Option<&super::theories::solve_harness::ProofProblemAssertionProvenance>,
@@ -366,6 +408,7 @@ impl Executor {
     pub(in crate::executor) fn rescue_named_core_redirect_unknown(
         &mut self,
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
         if std::env::var_os("AY_PHASE_TRACE").is_some() {
             eprintln!("c phase-trace named-core-redirect direct=unknown rescue=scoped");
@@ -387,14 +430,38 @@ impl Executor {
             // `emit_sat_verdict` to run the model gates and mint the
             // SatCertificate — an unminted Sat is fail-closed to Unknown at
             // the API boundary.
-            Ok(SolveResult::Sat) => self.emit_sat_verdict(SolveResult::Sat, assumptions),
+            Ok(SolveResult::Sat) => self.publish_or_defer_assumption_sat(assumptions, publication),
             other => other,
         };
         self.restore_timeout_deadline_after_call(previous_deadline);
         result
     }
 
-    fn check_sat_assuming_with_controls(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
+    fn publish_or_defer_assumption_sat(
+        &mut self,
+        assumptions: &[TermId],
+        publication: AssumptionSatPublication,
+    ) -> Result<SolveResult> {
+        match publication {
+            AssumptionSatPublication::EmitHere => {
+                self.emit_sat_verdict(SolveResult::Sat, assumptions)
+            }
+            AssumptionSatPublication::DeferToPlainCheckSat => {
+                self.last_sat_certificate = None;
+                if self.ctx.assertions.is_empty() && assumptions.is_empty() {
+                    self.last_model = Some(crate::executor::model::Model::empty());
+                    self.last_model_validated = true;
+                }
+                Ok(SolveResult::Sat)
+            }
+        }
+    }
+
+    fn check_sat_assuming_with_controls(
+        &mut self,
+        assumptions: &[TermId],
+        publication: AssumptionSatPublication,
+    ) -> Result<SolveResult> {
         // Scope-transience for the RM domain axioms the inner gate may push
         // (#P0.2 Pass B): the assumption routes have no
         // `scope_tracked_assertions` restore of their own, so truncate back to
@@ -402,7 +469,7 @@ impl Executor {
         // assertion vector restore it themselves (e.g. the BV arm), so the
         // entry length is exactly the pre-axiom length.
         let base_len = self.ctx.assertions.len();
-        let result = self.check_sat_assuming_with_controls_inner(assumptions);
+        let result = self.check_sat_assuming_with_controls_inner(assumptions, publication);
         self.ctx.assertions.truncate(base_len);
         result
     }
@@ -423,10 +490,13 @@ impl Executor {
         // Clear any previous model/proof
         self.last_model = None;
         self.last_proof = None;
+        self.clear_finite_enum_proof_state();
+        self.last_unsat_proof_reconstruction_suppressed = false;
         self.last_lrat_certificate = None;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
@@ -456,9 +526,10 @@ impl Executor {
         self.slia_accepted_unknown = false;
         // Result-authorization markers are scoped to one public solve. The
         // assumption path and core-minimization subset re-solves share this
-        // reset and must earn both authorizations independently.
+        // reset and must earn every authorization independently.
         self.sat_validated_by_mod_div_or_branch = false;
         self.nested_array_row_reduction_unsat = false;
+        self.clear_quantified_sat_authority();
         self.ho_seq_unfold_array_free_unsat = false;
         self.array_axiom_scope = None;
         self.row_seeded_terms.clear();
@@ -468,6 +539,7 @@ impl Executor {
     fn check_sat_assuming_with_controls_inner(
         &mut self,
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
         self.reset_solve_session_state();
 
@@ -600,7 +672,7 @@ impl Executor {
             // all-empty SAT is minted through `emit_sat_verdict` so it carries a
             // SatCertificate; with no assertions/assumptions the funnel takes its
             // nothing-to-validate fast path.
-            return self.emit_sat_verdict(SolveResult::Sat, assumptions);
+            return self.publish_or_defer_assumption_sat(assumptions, publication);
         }
 
         let mut all_assertions = base_assertions.clone();
@@ -610,7 +682,11 @@ impl Executor {
         if pre_quantifier_features.has_bv_int_conversion {
             let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
             if bridge_result.is_unsat() {
-                return Ok(self.finish_check_sat_assuming_result(assumptions, bridge_result));
+                return Ok(self.finish_check_sat_assuming_result(
+                    assumptions,
+                    bridge_result,
+                    publication,
+                ));
             }
         }
 
@@ -619,8 +695,9 @@ impl Executor {
             .copied()
             .any(|assertion| contains_quantifier(&self.ctx.terms, assertion))
         {
-            let result = self.solve_quantified_assumptions(&base_assertions, assumptions)?;
-            return Ok(self.finish_check_sat_assuming_result(assumptions, result));
+            let result =
+                self.solve_quantified_assumptions(&base_assertions, assumptions, publication)?;
+            return Ok(self.finish_check_sat_assuming_result(assumptions, result, publication));
         }
 
         let (category, features) = self.detect_logic_category(&all_assertions);
@@ -689,9 +766,11 @@ impl Executor {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
                     if bridge_result.is_unsat() {
-                        return Ok(
-                            self.finish_check_sat_assuming_result(assumptions, bridge_result)
-                        );
+                        return Ok(self.finish_check_sat_assuming_result(
+                            assumptions,
+                            bridge_result,
+                            publication,
+                        ));
                     }
                 }
                 self.solve_lia_with_assumptions(&base_assertions, assumptions)
@@ -802,9 +881,11 @@ impl Executor {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
                     if bridge_result.is_unsat() {
-                        return Ok(
-                            self.finish_check_sat_assuming_result(assumptions, bridge_result)
-                        );
+                        return Ok(self.finish_check_sat_assuming_result(
+                            assumptions,
+                            bridge_result,
+                            publication,
+                        ));
                     }
                 }
                 self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
@@ -848,9 +929,11 @@ impl Executor {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
                     if bridge_result.is_unsat() {
-                        return Ok(
-                            self.finish_check_sat_assuming_result(assumptions, bridge_result)
-                        );
+                        return Ok(self.finish_check_sat_assuming_result(
+                            assumptions,
+                            bridge_result,
+                            publication,
+                        ));
                     }
                 }
                 self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
@@ -903,9 +986,11 @@ impl Executor {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
                     if bridge_result.is_unsat() {
-                        return Ok(
-                            self.finish_check_sat_assuming_result(assumptions, bridge_result)
-                        );
+                        return Ok(self.finish_check_sat_assuming_result(
+                            assumptions,
+                            bridge_result,
+                            publication,
+                        ));
                     }
                 }
                 self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
@@ -932,9 +1017,11 @@ impl Executor {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
                     if bridge_result.is_unsat() {
-                        return Ok(
-                            self.finish_check_sat_assuming_result(assumptions, bridge_result)
-                        );
+                        return Ok(self.finish_check_sat_assuming_result(
+                            assumptions,
+                            bridge_result,
+                            publication,
+                        ));
                     }
                 }
                 self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
@@ -1127,22 +1214,21 @@ impl Executor {
         }?;
 
         let result = if result == SolveResult::Sat {
-            // SINGLE SAT-EMISSION CHOKEPOINT (#sat-chokepoint): the assumption
-            // path funnels through the SAME combined validation boundary as
-            // plain check-sat. emit_sat_verdict temporarily installs
-            // `base_assertions + assumptions`, completes the final model, runs
-            // every gate, mints the certificate, then restores the base stack.
-            // There is deliberately NO assumption completion/validation after
-            // emission: that used to mutate the already-certified witness.
-            self.emit_sat_verdict(result, assumptions)?
+            // Direct queries emit here. A named-core redirect nested under
+            // plain check-sat leaves the affine model Pending for that outer
+            // query's sole SAT funnel.
+            self.publish_or_defer_assumption_sat(assumptions, publication)?
         } else {
             result
         };
 
         if result == SolveResult::Sat {
+            let public_roots = self.independent_gate_query_roots();
             debug_assert!(
-                self.last_model.is_some(),
-                "BUG: check_sat_assuming returned SAT without populating last_model"
+                self.last_model.is_some()
+                    || (publication == AssumptionSatPublication::DeferToPlainCheckSat
+                        && self.has_current_pending_certificate_model_transport(&public_roots)),
+                "BUG: assumption solve returned SAT without a model or exact Pending transport"
             );
         }
         if result.is_unsat() {
@@ -1153,11 +1239,20 @@ impl Executor {
         }
 
         // #7912 postcondition: every SAT result has been validated at some level.
-        // Mirrors the postcondition in check_sat_guarded().
+        // Mirrors the postcondition in check_sat_guarded(). A deferred
+        // named-core solve is deliberately still a proposal: an ordinary
+        // candidate model (or an affine Pending model) is its transport to the
+        // outer plain-check-sat funnel, which performs the sole public
+        // validation after restoring the authored assertion stack.
         debug_assert!(
             result != SolveResult::Sat
                 || self.last_model_validated
                 || self.skip_model_eval
+                || (publication == AssumptionSatPublication::DeferToPlainCheckSat
+                    && (self.last_model.is_some()
+                        || self.has_current_pending_certificate_model_transport(
+                            &self.independent_gate_query_roots(),
+                        )))
                 || (self.ctx.assertions.is_empty() && assumptions.is_empty()),
             "BUG: check_sat_assuming returned SAT without any model validation path — \
              last_model_validated={}, skip_model_eval={}, assertions={}, assumptions={}",
@@ -1172,7 +1267,7 @@ impl Executor {
             self.capture_trail_provenance();
         }
 
-        Ok(self.finish_check_sat_assuming_result(assumptions, result))
+        Ok(self.finish_check_sat_assuming_result(assumptions, result, publication))
     }
 
     /// Quantified `check-sat-assuming` fallback.
@@ -1191,6 +1286,7 @@ impl Executor {
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
         let mut combined_assertions = base_assertions.to_vec();
         combined_assertions.extend(assumptions.iter().copied());
@@ -1208,7 +1304,7 @@ impl Executor {
                 // SatCertificate. Quantified logics are non-authoritative, so the
                 // authoritative-failclosed gate keeps genuine quantifier coverage
                 // gaps as Sat.
-                self.emit_sat_verdict(SolveResult::Sat, assumptions)
+                self.publish_or_defer_assumption_sat(assumptions, publication)
             }
             SolveResult::Unsat(_) => {
                 self.last_assumption_core = Some(assumptions.to_vec());
@@ -1282,32 +1378,28 @@ impl Executor {
         }
         let mut combined_assertions = base_assertions.to_vec();
         combined_assertions.extend(core.iter().copied());
-        let original_assertions = std::mem::replace(&mut self.ctx.assertions, combined_assertions);
-        let saved_assumptions = self.last_assumptions.take();
-        let verify = self.solve_current_assertions_with_quantifier_support();
-        self.last_assumptions = saved_assumptions;
-        self.ctx.assertions = original_assertions;
-        match verify {
-            Ok(SolveResult::Unsat(_)) => {
-                // Confirmed. Restore the core (the verify pass may have
-                // clobbered executor state) and drop any model the verify
-                // solve left behind — it would describe the reduced problem.
-                self.last_assumption_core = Some(core);
-                self.last_model = None;
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
-                    eprintln!("c phase-trace dt-assumption-core reverify=confirmed");
-                }
-                Ok(result)
+        let verified = self
+            .checked_exact_unsat_solve(combined_assertions.clone(), 2_000)
+            .is_some_and(|checked| checked.consume(self, &combined_assertions));
+        if verified {
+            // Confirmed. Restore the core (the verify pass may have
+            // been preceded by an untrusted direct-engine nomination) and
+            // drop any model from that nomination. The checked verifier is
+            // isolated and transports no solver state.
+            self.last_assumption_core = Some(core);
+            self.last_model = None;
+            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                eprintln!("c phase-trace dt-assumption-core reverify=confirmed");
             }
-            _ => {
-                self.last_assumption_core = None;
-                self.last_model = None;
-                self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
-                    eprintln!("c phase-trace dt-assumption-core reverify=FAILED demote=unknown");
-                }
-                Ok(SolveResult::Unknown)
+            Ok(result)
+        } else {
+            self.last_assumption_core = None;
+            self.last_model = None;
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                eprintln!("c phase-trace dt-assumption-core reverify=FAILED demote=unknown");
             }
+            Ok(SolveResult::Unknown)
         }
     }
 
@@ -1354,11 +1446,15 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
         result: SolveResult,
+        publication: AssumptionSatPublication,
     ) -> SolveResult {
         if result.is_sat() {
+            let public_roots = self.independent_gate_query_roots();
             debug_assert!(
-                self.last_model.is_some(),
-                "BUG: check_sat_assuming returned SAT without populating last_model"
+                self.last_model.is_some()
+                    || (publication == AssumptionSatPublication::DeferToPlainCheckSat
+                        && self.has_current_pending_certificate_model_transport(&public_roots)),
+                "BUG: assumption solve returned SAT without a model or exact Pending transport"
             );
         }
         if result.is_unsat() {
@@ -1459,15 +1555,112 @@ mod solve_session_reset_tests {
     use super::*;
 
     #[test]
+    fn deferred_publication_carries_ground_candidate_to_outer_sat_funnel() {
+        let mut exec = Executor::new();
+        let named_assertion = exec.ctx.terms.true_term();
+        exec.last_model = Some(crate::executor::model::Model::empty());
+        exec.last_model_validated = false;
+
+        let proposed = exec
+            .publish_or_defer_assumption_sat(
+                &[named_assertion],
+                AssumptionSatPublication::DeferToPlainCheckSat,
+            )
+            .expect("deferred publication does not error");
+
+        assert_eq!(proposed, SolveResult::Sat);
+        assert!(exec.last_model.is_some());
+        assert!(!exec.last_model_validated);
+        assert!(exec.last_sat_certificate.is_none());
+
+        // Plain check-sat restores the original named assertion stack before
+        // consuming the proposal through its sole public SAT funnel.
+        exec.ctx.assertions.push(named_assertion);
+        let emitted = exec
+            .emit_sat_verdict(proposed, &[])
+            .expect("outer SAT funnel does not error");
+        assert_eq!(emitted, SolveResult::Sat);
+        assert!(exec.last_model_validated);
+        assert!(exec.last_sat_certificate.is_some());
+    }
+
+    #[test]
     fn solve_session_reset_revokes_result_authorization_markers() {
         let mut exec = Executor::new();
         exec.sat_validated_by_mod_div_or_branch = true;
         exec.nested_array_row_reduction_unsat = true;
+        exec.dt_cert_grant_active = true;
+        exec.finite_table_cert_grant_active = true;
+        exec.const_interp_cert_grant_active = true;
+        exec.mbqi_sat_cert_grant_active = true;
+        exec.bv_quantifier_full_domain_proof = true;
+        let pin = exec.ctx.terms.true_term();
+        let mut pins = HashMap::default();
+        pins.insert(pin, crate::executor::model::EvalValue::Bool(true));
+        let finite_package = crate::executor::mbqi::FiniteTableWitnessState::for_test(
+            &exec,
+            &exec.ctx.assertions,
+            crate::executor::model::Model::empty(),
+            pins,
+        )
+        .expect("live finite-table pin package");
+        exec.finite_table_cert_witness_state = Some(finite_package);
 
         exec.reset_solve_session_state();
 
         assert!(!exec.sat_validated_by_mod_div_or_branch);
         assert!(!exec.nested_array_row_reduction_unsat);
+        assert!(!exec.dt_cert_grant_active);
+        assert!(!exec.finite_table_cert_grant_active);
+        assert!(!exec.const_interp_cert_grant_active);
+        assert!(!exec.mbqi_sat_cert_grant_active);
+        assert!(!exec.bv_quantifier_full_domain_proof);
+        assert!(exec.finite_table_cert_witness_state.is_none());
+        assert!(exec.const_interp_cert_witness_state.is_none());
+    }
+
+    #[test]
+    fn internal_retry_revokes_orphaned_finite_table_witness() {
+        let mut exec = Executor::new();
+        exec.finite_table_cert_grant_active = true;
+        let finite_package = crate::executor::mbqi::FiniteTableWitnessState::for_test(
+            &exec,
+            &exec.ctx.assertions,
+            crate::executor::model::Model::empty(),
+            Default::default(),
+        )
+        .expect("empty finite-table pin package");
+        exec.finite_table_cert_witness_state = Some(finite_package);
+
+        assert!(!exec.prepare_check_sat_internal_state());
+
+        assert!(!exec.finite_table_cert_grant_active);
+        assert!(
+            exec.finite_table_cert_witness_state.is_none(),
+            "a later retry must not consume an earlier attempt's parked model"
+        );
+    }
+
+    #[test]
+    fn solve_session_reset_cannot_defer_quantified_gate_to_stale_dt_grant() {
+        let mut exec = Executor::new();
+        let body = exec.ctx.terms.mk_bool(true);
+        let forall = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        exec.ctx.assertions.push(forall);
+        exec.dt_cert_grant_active = true;
+
+        exec.reset_solve_session_state();
+        let result = exec.apply_quantified_model_failclosed_gate(SolveResult::Sat);
+
+        assert_eq!(result, SolveResult::Unknown);
+        assert_ne!(
+            exec.last_statistics
+                .get_string("model_check_gate.quantified"),
+            Some("deferred-certified-dt")
+        );
     }
 }
 

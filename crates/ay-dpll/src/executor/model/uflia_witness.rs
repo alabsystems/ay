@@ -384,12 +384,14 @@ impl Executor {
         for (leaf, value) in assignments {
             self.pin_int_leaf_value(&mut model, leaf, &value);
         }
-        self.last_model = Some(model);
         if fixed > 0 {
+            model.revoke_cegqi_uf_recompletion();
+            self.cegqi_uf_recompletion_grant = None;
             self.last_model_validated = false;
             self.last_statistics
                 .set_int("uflia_witness.bounded_leaves_filled", fixed as u64);
         }
+        self.last_model = Some(model);
         fixed
     }
 
@@ -559,6 +561,7 @@ impl Executor {
         // unchanged pipeline over the completed model before any certificate
         // can be minted (#7912 postcondition).
         self.last_model_validated = false;
+        self.revoke_cegqi_uf_recompletion_authority();
         self.last_statistics
             .set_int("uflia_witness.free_uf_point_completed", 1);
         true
@@ -678,6 +681,12 @@ impl Executor {
         let mut heads: Vec<String> = diseq_pairs.keys().cloned().collect();
         heads.sort();
         for head in heads {
+            // A quantified SAT certificate already fixed the complete graph,
+            // including its default. It is not a free-point model that this
+            // witness-repair pass may extend.
+            if model.has_certified_total_uf(&head) {
+                continue;
+            }
             if model
                 .euf_model
                 .as_ref()
@@ -1109,12 +1118,15 @@ impl Executor {
             return false;
         }
         // A conflicted table is deliberately opaque to every consumer; never
-        // add a row to one.
+        // add a row to one. Likewise, a certificate-constructed total table is
+        // immutable: changing any chain head would invalidate the certificate
+        // and could change the output layer's else row.
         if left.iter().any(|(_, f, _)| {
-            model
-                .euf_model
-                .as_ref()
-                .is_some_and(|e| e.function_table_conflicts.contains(f))
+            model.has_certified_total_uf(f)
+                || model
+                    .euf_model
+                    .as_ref()
+                    .is_some_and(|e| e.function_table_conflicts.contains(f))
         }) {
             return false;
         }
@@ -1237,6 +1249,11 @@ impl Executor {
     /// `int_values`), so solver-side evaluation, the independent gate's view
     /// and the model printer all observe ONE value.
     fn pin_int_app_value(&mut self, model: &mut Model, app: TermId, value: &BigInt) {
+        if let TermData::App(sym, _) = self.ctx.terms.get(app) {
+            if model.has_certified_total_uf(sym.name()) {
+                return;
+            }
+        }
         let const_term = self.ctx.terms.mk_int(value.clone());
         super::eval_memo_clear();
         if let Some(euf) = model.euf_model.as_mut() {
@@ -1273,6 +1290,9 @@ impl Executor {
         arg_value: &BigInt,
         result_value: &BigInt,
     ) {
+        if model.has_certified_total_uf(name) {
+            return;
+        }
         let Some(euf) = model.euf_model.as_mut() else {
             return;
         };
@@ -1324,7 +1344,9 @@ mod tests {
     use ay_core::term::Symbol;
     use ay_core::{Sort, TermId};
     use num_bigint::BigInt;
+    use num_rational::BigRational;
 
+    use crate::executor::model::{EvalValue, Model};
     use crate::executor::Executor;
 
     /// `0 <= x` and `(< x 7)` — the shape the mathsat Hash family asserts for
@@ -1403,7 +1425,7 @@ mod tests {
             "the test binary must run with the lever at its default OFF"
         );
         let (exec, x, _) = hash_family_bounds_executor();
-        let model = crate::executor::model::Model::empty();
+        let model = Model::empty();
         let ranges = exec.asserted_int_ranges();
         let peers = exec.asserted_int_diseq_peers();
         assert_eq!(
@@ -1448,5 +1470,49 @@ mod tests {
         assert!(exec
             .unary_uf_application_index_with_limit(&unary_ufs, 2)
             .is_some());
+    }
+
+    #[test]
+    fn witness_repair_cannot_mutate_a_certified_total_uf() {
+        let mut exec = Executor::new();
+        let one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let f_one = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+        let mut model = Model::empty();
+        model
+            .install_certified_total_uf(
+                "f".to_string(),
+                vec![Sort::Int],
+                Sort::Int,
+                Vec::new(),
+                EvalValue::Rational(BigRational::from_integer(BigInt::from(0))),
+            )
+            .expect("well-typed certified total UF");
+        let before = model
+            .euf_model
+            .as_ref()
+            .expect("rendered table")
+            .function_tables["f"]
+            .clone();
+
+        exec.pin_int_app_value(&mut model, f_one, &BigInt::from(7));
+        exec.add_uf_table_row(&mut model, "f", f_one, &BigInt::from(1), &BigInt::from(7));
+
+        assert_eq!(
+            model
+                .euf_model
+                .as_ref()
+                .expect("rendered table")
+                .function_tables["f"],
+            before,
+            "post-certificate repair must not change the printed total table"
+        );
+        assert!(!model.completed_values.contains_key(&f_one));
+        assert_eq!(
+            exec.evaluate_term(&model, f_one),
+            EvalValue::Rational(BigRational::from_integer(BigInt::from(0)))
+        );
     }
 }

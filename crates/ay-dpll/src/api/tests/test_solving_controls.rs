@@ -21,6 +21,49 @@ fn test_timeout_setting() {
 }
 
 #[test]
+fn native_decision_routes_preserve_parsed_publication_controls() {
+    const PARSED_MEMORY_MIB: usize = 2_048;
+    const PARSED_MEMORY_BYTES: usize = PARSED_MEMORY_MIB * 1024 * 1024;
+    let options =
+        format!("(set-option :timeout 60000) (set-option :max-memory {PARSED_MEMORY_MIB})");
+
+    let mut solver = Solver::new(Logic::QfUf);
+    solver.parse_smtlib2(&options).expect("parsed controls");
+    let truth = solver.bool_const(true);
+    solver.assert_term(truth);
+
+    for result in [
+        solver.check_sat(),
+        solver.check_sat_assuming(&[truth]),
+        solver.check_sat_interruptible(|| false),
+    ] {
+        assert!(result.is_sat(), "unexpected native result: {result}");
+        assert_eq!(solver.executor.timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(solver.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
+        assert_eq!(solver.executor.current_solve_deadline(), None);
+    }
+
+    let mut optimizer = Solver::new(Logic::QfLia);
+    optimizer
+        .parse_smtlib2(&options)
+        .expect("parsed optimization controls");
+    let x = optimizer.declare_const("x", Sort::Int);
+    let zero = optimizer.int_const(0);
+    let one = optimizer.int_const(1);
+    let lower = optimizer.ge(x, zero);
+    let upper = optimizer.le(x, one);
+    optimizer.assert_term(lower);
+    optimizer.assert_term(upper);
+    optimizer.maximize(x);
+
+    let result = optimizer.optimize_check();
+    assert!(result.is_sat(), "unexpected optimize result: {result}");
+    assert_eq!(optimizer.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(optimizer.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
+    assert_eq!(optimizer.executor.current_solve_deadline(), None);
+}
+
+#[test]
 fn test_interrupt_flag() {
     let solver = Solver::new(Logic::QfLia);
     assert!(!solver.is_interrupted());
@@ -159,7 +202,7 @@ fn preflight_unknown_retires_prior_model_certificate_and_optimum() {
     // therefore fixes the origin to `InterruptFlag`.
     assert_eq!(
         solver.executor.unknown_reason(),
-        Some(crate::UnknownReason::Interrupted)
+        Some(UnknownReason::Interrupted)
     );
     assert_eq!(
         solver.executor.unknown_origin(),
@@ -353,6 +396,7 @@ fn test_check_sat_with_details_sat_has_model_validated() {
     assert!(details.unknown_reason.is_none());
     assert!(details.verification.sat_model_validated);
     assert!(!details.verification.unsat_proof_available);
+    assert!(!details.verification.unsat_proof_strictly_verified);
     assert_eq!(details.verification.unsat_proof_checker_failures, 0);
 }
 
@@ -1022,6 +1066,22 @@ fn test_check_sat_with_details_proofs_enabled_verification_level() {
     assert!(details.verification_level.has_proof_checking());
 }
 
+#[test]
+fn proof_checked_level_requires_and_reports_strict_unsat_authority() {
+    let mut solver = Solver::new(Logic::QfUf);
+    solver.set_verification_level(VerificationLevel::ProofChecked);
+    let p = solver.declare_const("p", Sort::Bool);
+    let not_p = solver.not(p);
+    solver.assert_term(p);
+    solver.assert_term(not_p);
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.is_unsat());
+    assert!(details.verification_level.has_proof_checking());
+    assert!(details.verification.unsat_proof_available);
+    assert!(details.verification.unsat_proof_strictly_verified);
+}
+
 /// Verify that set_random_seed is callable and the solver still produces
 /// correct results (#6961).
 #[test]
@@ -1663,6 +1723,10 @@ fn test_unsat_result_retains_chokepoint_emission_witness() {
     assert!(verified.is_unsat());
     assert!(
         verified.has_unsat_emission_witness(),
-        "strict-proof-certified Unsat must retain its one-shot witness"
+        "query-authorized Unsat must retain its one-shot witness"
+    );
+    assert!(
+        !verified.was_unsat_strictly_verified(),
+        "ordinary QF_LIA publication must not claim a checked refutation"
     );
 }

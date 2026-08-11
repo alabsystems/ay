@@ -29,8 +29,11 @@ impl Solver {
     /// [`bvudiv`]: Solver::bvudiv
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvudiv(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvudiv", a)?;
+        let b_id = self.resolve_term("bvudiv", b)?;
         self.expect_same_bitvec_width("bvudiv", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvudiv(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvudiv(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed division
@@ -54,8 +57,11 @@ impl Solver {
     /// [`bvsdiv`]: Solver::bvsdiv
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsdiv(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsdiv", a)?;
+        let b_id = self.resolve_term("bvsdiv", b)?;
         self.expect_same_bitvec_width("bvsdiv", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsdiv(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvsdiv(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector unsigned remainder
@@ -79,8 +85,11 @@ impl Solver {
     /// [`bvurem`]: Solver::bvurem
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvurem(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvurem", a)?;
+        let b_id = self.resolve_term("bvurem", b)?;
         self.expect_same_bitvec_width("bvurem", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvurem(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvurem(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed remainder
@@ -104,7 +113,10 @@ impl Solver {
     /// [`bvsrem`]: Solver::bvsrem
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsrem(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsrem", a)?;
+        let b_id = self.resolve_term("bvsrem", b)?;
         self.expect_same_bitvec_width("bvsrem", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsrem(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvsrem(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 }

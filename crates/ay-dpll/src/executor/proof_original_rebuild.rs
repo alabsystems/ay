@@ -58,7 +58,11 @@ use ay_core::{
 use ay_frontend::command::Term as FrontendTerm;
 use num_bigint::BigInt;
 
-use super::proof_surface_syntax::{collect_surface_term_overrides, strip_frontend_annotations};
+use super::proof_surface_syntax::{
+    collect_surface_term_overrides, strip_frontend_annotations, surface_override_map_is_bounded,
+    surface_override_roots_have_bounded_work,
+};
+use super::proof_trust_surgery_provenance::OriginalSourceIndex;
 use super::Executor;
 
 /// How a single disjunct of the original disjunction gets eliminated.
@@ -259,7 +263,15 @@ impl Executor {
         // canonical assertion terms (the assertion stack itself may hold
         // substituted forms). Fail-closed on any assertion that does not
         // re-elaborate.
-        let parsed_assertions: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
+        let parsed_stack = self.ctx.assertions_parsed();
+        if !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
+            parsed_stack
+                .iter()
+                .flat_map(|parsed| [parsed, parsed, parsed]),
+        ) {
+            return;
+        }
+        let parsed_assertions: Vec<FrontendTerm> = parsed_stack.to_vec();
         if parsed_assertions.is_empty() {
             return;
         }
@@ -298,8 +310,8 @@ impl Executor {
                 originals.push((canonical, parsed.clone()));
                 continue;
             }
-            let stripped = strip_frontend_annotations(parsed).clone();
-            let Some(canonical) = self.ctx.elaborate_surface_subterm(&stripped) else {
+            let stripped = strip_frontend_annotations(parsed);
+            let Some(canonical) = self.ctx.elaborate_surface_subterm(stripped) else {
                 return;
             };
             originals.push((canonical, parsed.clone()));
@@ -348,8 +360,7 @@ impl Executor {
         // The grant is unchanged in kind: it authorizes the raw re-intern of an
         // assertion THE AUTHOR WROTE, and a foreign injected axiom is never a
         // parsed assertion so it is still never added here.
-        let parsed_forms: Vec<FrontendTerm> = originals.iter().map(|(_, p)| p.clone()).collect();
-        for parsed in &parsed_forms {
+        for (_, parsed) in &originals {
             if !matches!(strip_frontend_annotations(parsed), FrontendTerm::App(_, _)) {
                 continue;
             }
@@ -1138,6 +1149,10 @@ impl Executor {
     /// assertions. Such an assume cannot be matched to the problem's premises
     /// by an external checker.
     fn reachable_non_original_assume(proof: &Proof, originals: &[(TermId, FrontendTerm)]) -> bool {
+        let source_index = OriginalSourceIndex::new(originals);
+        if !source_index.is_valid() {
+            return true;
+        }
         let n = proof.steps.len();
         let mut on_path = vec![false; n];
         let mut stack: Vec<usize> = Vec::new();
@@ -1174,7 +1189,7 @@ impl Executor {
                     push(*clause2, &mut on_path, &mut stack);
                 }
                 ProofStep::Assume(term) => {
-                    if !originals.iter().any(|(c, _)| c == term) {
+                    if !source_index.contains(*term) {
                         return true;
                     }
                 }
@@ -1437,10 +1452,9 @@ impl Executor {
         // stores its literals as or-disjuncts whose surface form is
         // `(not Ai)`) — so everything prints with the problem file's own
         // syntax and the checker can match the premises.
-        *proof = new_proof;
-        let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
         let mut pairs: Vec<(TermId, FrontendTerm)> =
             vec![(originals[disj_idx].0, originals[disj_idx].1.clone())];
+        let mut suppressed = Vec::new();
         for (&canonical_lit, surface) in disjuncts.iter().zip(candidate.surface_literals.iter()) {
             pairs.push((canonical_lit, surface.clone()));
         }
@@ -1456,7 +1470,7 @@ impl Executor {
             // export the rebuild replaces — would corrupt the bridge and
             // resolution literal prints.
             if spec.distinct.is_some() {
-                overrides.remove(&spec.term);
+                suppressed.push(spec.term);
                 continue;
             }
             // A conjunct bound registers its ROOT's surface: the assume is
@@ -1468,6 +1482,23 @@ impl Executor {
                 originals[spec.original_idx].1.clone(),
             ));
         }
+        if !surface_override_roots_have_bounded_work(
+            &self.ctx.terms,
+            pairs.iter().map(|(canonical, _)| *canonical),
+        ) {
+            return false;
+        }
+        if self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| !surface_override_map_is_bounded(overrides))
+        {
+            return false;
+        }
+        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
+        for term in suppressed {
+            overrides.remove(&term);
+        }
         for (canonical, parsed) in &pairs {
             // Placeholder (native-API) surfaces register NO override: the
             // sentinel string is not a printable spelling — the canonical
@@ -1475,8 +1506,13 @@ impl Executor {
             if is_api_placeholder(parsed) {
                 continue;
             }
-            collect_surface_term_overrides(&mut self.ctx, *canonical, parsed, &mut overrides);
+            if !collect_surface_term_overrides(&mut self.ctx, *canonical, parsed, &mut overrides)
+                || !surface_override_map_is_bounded(&overrides)
+            {
+                return false;
+            }
         }
+        *proof = new_proof;
         self.last_proof_term_overrides = Some(overrides);
         true
     }
@@ -2450,8 +2486,22 @@ impl Executor {
         // Success: swap the proof and register surface overrides for the
         // assumed originals, so the assumes — and the literals the chains
         // extract from them — print with the problem file's own syntax.
-        *proof = new_proof;
-        let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
+        if !surface_override_roots_have_bounded_work(
+            &self.ctx.terms,
+            lit_specs
+                .iter()
+                .map(|&spec| originals[bound_specs[spec].original_idx].0),
+        ) {
+            return false;
+        }
+        if self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| !surface_override_map_is_bounded(overrides))
+        {
+            return false;
+        }
+        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
         let mut registered: Vec<usize> = Vec::new();
         for &si in &lit_specs {
             let orig_idx = bound_specs[si].original_idx;
@@ -2465,8 +2515,13 @@ impl Executor {
             if is_api_placeholder(&parsed) {
                 continue;
             }
-            collect_surface_term_overrides(&mut self.ctx, canonical, &parsed, &mut overrides);
+            if !collect_surface_term_overrides(&mut self.ctx, canonical, &parsed, &mut overrides)
+                || !surface_override_map_is_bounded(&overrides)
+            {
+                return false;
+            }
         }
+        *proof = new_proof;
         self.last_proof_term_overrides = Some(overrides);
         true
     }
@@ -2865,8 +2920,20 @@ impl Executor {
             Ok(q) if q.trust_count == 0 => {}
             _ => return false,
         }
-        *proof = new_proof;
-        let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
+        if !surface_override_roots_have_bounded_work(
+            &self.ctx.terms,
+            used_originals.iter().map(|&index| originals[index].0),
+        ) {
+            return false;
+        }
+        if self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| !surface_override_map_is_bounded(overrides))
+        {
+            return false;
+        }
+        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
         let mut registered: Vec<usize> = Vec::new();
         for &orig_idx in used_originals {
             if registered.contains(&orig_idx) {
@@ -2879,8 +2946,13 @@ impl Executor {
             if is_api_placeholder(&parsed) {
                 continue;
             }
-            collect_surface_term_overrides(&mut self.ctx, canonical, &parsed, &mut overrides);
+            if !collect_surface_term_overrides(&mut self.ctx, canonical, &parsed, &mut overrides)
+                || !surface_override_map_is_bounded(&overrides)
+            {
+                return false;
+            }
         }
+        *proof = new_proof;
         self.last_proof_term_overrides = Some(overrides);
         true
     }
@@ -3312,8 +3384,8 @@ impl Executor {
             return false;
         }
 
-        *proof = new_proof;
         if self_contained_surface {
+            *proof = new_proof;
             for raw in raw_authored_to_record {
                 self.record_rebuilt_authored_proof_premise(raw);
             }
@@ -3323,7 +3395,17 @@ impl Executor {
             self.last_proof_term_overrides = None;
             return true;
         }
-        let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
+        if !surface_override_roots_have_bounded_work(&self.ctx.terms, needed.iter().copied()) {
+            return false;
+        }
+        if self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| !surface_override_map_is_bounded(overrides))
+        {
+            return false;
+        }
+        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
         // A substituted leaf carries a STALE surface override: the ordinary
         // export registered "print the substituted form the way the AUTHORED
         // assertion is spelled" so the (indefensible) `assume` at least looked
@@ -3359,8 +3441,13 @@ impl Executor {
                 overrides.remove(&term);
                 continue;
             }
-            collect_surface_term_overrides(&mut self.ctx, term, &parsed, &mut overrides);
+            if !collect_surface_term_overrides(&mut self.ctx, term, &parsed, &mut overrides)
+                || !surface_override_map_is_bounded(&overrides)
+            {
+                return false;
+            }
         }
+        *proof = new_proof;
         self.last_proof_term_overrides = Some(overrides);
         true
     }

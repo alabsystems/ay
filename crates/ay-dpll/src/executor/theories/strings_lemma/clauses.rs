@@ -510,7 +510,8 @@ impl Executor {
                         debug_assert!(
                             lemma.char_offset < s.chars().count(),
                             "BUG: ConstSplit char_offset {} >= constant y length {} — NF offset tracking error",
-                            lemma.char_offset, s.chars().count()
+                            lemma.char_offset,
+                            s.chars().count()
                         );
                         match s.chars().nth(lemma.char_offset) {
                             Some(ch) => self.ctx.terms.mk_string(ch.to_string()),
@@ -1181,12 +1182,14 @@ impl Executor {
                         debug_assert!(
                             lemma.char_offset <= chars.len(),
                             "BUG: ConstUnify char_offset {} > constant y length {} — substring silently truncated",
-                            lemma.char_offset, chars.len()
+                            lemma.char_offset,
+                            chars.len()
                         );
                         debug_assert!(
                             lemma.start_offset <= lemma.char_offset,
                             "BUG: ConstUnify start_offset {} > char_offset {} — inverted substring range",
-                            lemma.start_offset, lemma.char_offset
+                            lemma.start_offset,
+                            lemma.char_offset
                         );
                         let end = lemma.char_offset.min(chars.len());
                         let start = lemma.start_offset.min(end);

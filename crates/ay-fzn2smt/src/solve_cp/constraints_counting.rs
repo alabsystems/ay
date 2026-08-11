@@ -13,6 +13,7 @@ use ay_cp::propagator::Constraint;
 use ay_cp::Domain;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::linear_encoding_overflow;
 use super::CpContext;
 
 impl CpContext {
@@ -23,7 +24,7 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
         // sum(b_i) = count → sum(b_i) - count = 0
         let mut coeffs = vec![1i64; n];
@@ -44,6 +45,7 @@ impl CpContext {
         &mut self,
         xs: &[ay_cp::variable::IntVarId],
         y: ay_cp::variable::IntVarId,
+        context: &str,
     ) -> Result<Vec<ay_cp::variable::IntVarId>> {
         let mut indicators = Vec::with_capacity(xs.len());
         for &xi in xs {
@@ -51,7 +53,7 @@ impl CpContext {
             self.var_bounds.insert(b, (0, 1));
             // b ↔ (xi == y), i.e. b ↔ (xi - y = 0)
             // Full bidirectional reification: b=1 → xi=y AND xi=y → b=1
-            self.add_reif_eq(&[1, -1], &[xi, y], 0, b);
+            self.add_reif_eq(&[1, -1], &[xi, y], 0, b, context)?;
             indicators.push(b);
         }
         Ok(indicators)
@@ -65,7 +67,7 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
         // count <= sum(b_i) → -sum(b_i) + count <= 0
         let mut coeffs = vec![-1i64; n];
@@ -87,7 +89,7 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
         // sum(b_i) <= count → sum(b_i) - count <= 0
         let mut coeffs = vec![1i64; n];
@@ -109,7 +111,7 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
         // count < sum(b_i) → -sum(b_i) + count <= -1
         let mut coeffs = vec![-1i64; n];
@@ -131,7 +133,7 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
         // sum(b_i) < count → sum(b_i) - count <= -1
         let mut coeffs = vec![1i64; n];
@@ -152,11 +154,12 @@ impl CpContext {
         let xs = self.resolve_var_array(&c.args[0])?;
         let y = self.resolve_var(&c.args[1])?;
         let count = self.resolve_var(&c.args[2])?;
-        let indicators = self.count_eq_indicators(&xs, y)?;
+        let indicators = self.count_eq_indicators(&xs, y, &c.id)?;
         let n = indicators.len();
+        let n_i64 = i64::try_from(n).map_err(|_| linear_encoding_overflow(&c.id))?;
         // Create auxiliary sum variable
-        let sum_var = self.engine.new_int_var(Domain::new(0, n as i64), None);
-        self.var_bounds.insert(sum_var, (0, n as i64));
+        let sum_var = self.engine.new_int_var(Domain::new(0, n_i64), None);
+        self.var_bounds.insert(sum_var, (0, n_i64));
         // sum_var = sum(b_i)
         let mut eq_coeffs = vec![1i64; n];
         eq_coeffs.push(-1);
@@ -195,7 +198,7 @@ impl CpContext {
             let count_var = counts[idx];
             let val_var = self.get_const_var(val);
 
-            let indicators = self.count_eq_indicators(&xs, val_var)?;
+            let indicators = self.count_eq_indicators(&xs, val_var, &c.id)?;
             let n = indicators.len();
             // sum(b_i) = count_var → sum(b_i) - count_var = 0
             let mut coeffs = vec![1i64; n];
@@ -240,7 +243,7 @@ impl CpContext {
             max_val = max_val.max(ub);
         }
 
-        let range = max_val - min_val + 1;
+        let range = i128::from(max_val) - i128::from(min_val) + 1;
         if range > 10_000 || range <= 0 {
             self.mark_unsupported("fzn_nvalue");
             return Ok(());
@@ -260,7 +263,7 @@ impl CpContext {
                 let bi = self.engine.new_bool_var(None);
                 self.var_bounds.insert(bi, (0, 1));
                 // bi ↔ (xi == v): full bidirectional reification
-                self.add_reif_eq(&[1, -1], &[xi, val_var], 0, bi);
+                self.add_reif_eq(&[1, -1], &[xi, val_var], 0, bi, &c.id)?;
                 // appear >= bi (if any bi=1, appear must be 1)
                 self.engine.add_constraint(Constraint::LinearLe {
                     coeffs: vec![1, -1],

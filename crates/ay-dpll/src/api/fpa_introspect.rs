@@ -206,7 +206,8 @@ impl Solver {
     /// `Z3_fpa_get_numeral_*` / `Z3_fpa_is_numeral_*` accessor.
     #[must_use]
     pub fn fp_numeral_decode(&self, t: Term) -> Option<FpNumeral> {
-        let (eb, sb) = match self.sort_of(t) {
+        let t_id = self.resolve_term("fp_numeral_decode", t).ok()?;
+        let (eb, sb) = match self.terms().sort(t_id).clone() {
             Sort::FloatingPoint(eb, sb) => (eb, sb),
             _ => return None,
         };
@@ -217,7 +218,7 @@ impl Solver {
         }
         // Clone the node so the immutable borrow of the term store is released
         // before the per-child `Const` lookups below.
-        let node = self.terms().get(t.0).clone();
+        let node = self.terms().get(t_id).clone();
         match node {
             // (a) nullary special-value app: (_ +oo eb sb), (_ NaN eb sb), ...
             TermData::App(Symbol::Indexed(name, _indices), args) if args.is_empty() => {
@@ -295,14 +296,17 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("to_fp (real)", rm)?;
+        let real_id = self.resolve_term("to_fp (real)", real)?;
         self.expect_real("to_fp (real)", real)?;
         self.checked_fp_total_width("to_fp", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("to_fp", vec![eb, sb]),
-            vec![rm.0, real.0],
+            vec![rm_id, real_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Convert an `(Int exponent, Real significand)` pair to FP:
@@ -328,14 +332,18 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("to_fp (int real)", rm)?;
+        let exp_id = self.resolve_term("to_fp (int real)", exp)?;
+        let sig_id = self.resolve_term("to_fp (int real)", sig)?;
         self.expect_int("to_fp (exponent)", exp)?;
         self.expect_real("to_fp (significand)", sig)?;
         self.checked_fp_total_width("to_fp", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("to_fp", vec![eb, sb]),
-            vec![rm.0, exp.0, sig.0],
+            vec![rm_id, exp_id, sig_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 }

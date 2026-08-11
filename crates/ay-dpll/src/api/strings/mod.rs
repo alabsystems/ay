@@ -66,7 +66,8 @@ impl Solver {
     /// ```
     #[must_use = "this creates a term that is usually needed for assertions"]
     pub fn string_const(&mut self, value: &str) -> Term {
-        Term(self.terms_mut().mk_string(value.to_string()))
+        let result = self.terms_mut().mk_string(value.to_string());
+        self.wrap_term(result)
     }
 
     // =========================================================================
@@ -88,13 +89,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_concat(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("str.++", a)?;
+        let b_id = self.resolve_term("str.++", b)?;
         self.expect_string("str.++", a)?;
         self.expect_string("str.++", b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.++"),
-            vec![a.0, b.0],
-            Sort::String,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("str.++"), vec![a_id, b_id], Sort::String);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -116,12 +118,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_len(&mut self, s: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.len", s)?;
         self.expect_string("str.len", s)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.len"),
-            vec![s.0],
-            Sort::Int,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("str.len"), vec![s_id], Sort::Int);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -143,13 +145,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if sorts are wrong.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_at(&mut self, s: Term, idx: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.at", s)?;
+        let idx_id = self.resolve_term("str.at", idx)?;
         self.expect_string("str.at", s)?;
         self.expect_int("str.at", idx)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.at"),
-            vec![s.0, idx.0],
-            Sort::String,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("str.at"), vec![s_id, idx_id], Sort::String);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -179,14 +182,18 @@ impl Solver {
         offset: Term,
         len: Term,
     ) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.substr", s)?;
+        let offset_id = self.resolve_term("str.substr", offset)?;
+        let len_id = self.resolve_term("str.substr", len)?;
         self.expect_string("str.substr", s)?;
         self.expect_int("str.substr", offset)?;
         self.expect_int("str.substr", len)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.substr"),
-            vec![s.0, offset.0, len.0],
+            vec![s_id, offset_id, len_id],
             Sort::String,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -209,13 +216,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_contains(&mut self, s: Term, t: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.contains", s)?;
+        let t_id = self.resolve_term("str.contains", t)?;
         self.expect_string("str.contains", s)?;
         self.expect_string("str.contains", t)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.contains"),
-            vec![s.0, t.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("str.contains"), vec![s_id, t_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a string prefix test (`str.prefixof`), returning Bool.
@@ -234,13 +242,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_prefixof(&mut self, prefix: Term, s: Term) -> Result<Term, SolverError> {
+        let prefix_id = self.resolve_term("str.prefixof", prefix)?;
+        let s_id = self.resolve_term("str.prefixof", s)?;
         self.expect_string("str.prefixof", prefix)?;
         self.expect_string("str.prefixof", s)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.prefixof"),
-            vec![prefix.0, s.0],
+            vec![prefix_id, s_id],
             Sort::Bool,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Create a string suffix test (`str.suffixof`), returning Bool.
@@ -259,13 +270,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_suffixof(&mut self, suffix: Term, s: Term) -> Result<Term, SolverError> {
+        let suffix_id = self.resolve_term("str.suffixof", suffix)?;
+        let s_id = self.resolve_term("str.suffixof", s)?;
         self.expect_string("str.suffixof", suffix)?;
         self.expect_string("str.suffixof", s)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.suffixof"),
-            vec![suffix.0, s.0],
+            vec![suffix_id, s_id],
             Sort::Bool,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -291,14 +305,18 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if sorts are wrong.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_indexof(&mut self, s: Term, t: Term, start: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.indexof", s)?;
+        let t_id = self.resolve_term("str.indexof", t)?;
+        let start_id = self.resolve_term("str.indexof", start)?;
         self.expect_string("str.indexof", s)?;
         self.expect_string("str.indexof", t)?;
         self.expect_int("str.indexof", start)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.indexof"),
-            vec![s.0, t.0, start.0],
+            vec![s_id, t_id, start_id],
             Sort::Int,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -323,14 +341,18 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if any argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_replace(&mut self, s: Term, from: Term, to: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.replace", s)?;
+        let from_id = self.resolve_term("str.replace", from)?;
+        let to_id = self.resolve_term("str.replace", to)?;
         self.expect_string("str.replace", s)?;
         self.expect_string("str.replace", from)?;
         self.expect_string("str.replace", to)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.replace"),
-            vec![s.0, from.0, to.0],
+            vec![s_id, from_id, to_id],
             Sort::String,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Create a replace-all expression (`str.replace_all`).
@@ -354,14 +376,18 @@ impl Solver {
         from: Term,
         to: Term,
     ) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.replace_all", s)?;
+        let from_id = self.resolve_term("str.replace_all", from)?;
+        let to_id = self.resolve_term("str.replace_all", to)?;
         self.expect_string("str.replace_all", s)?;
         self.expect_string("str.replace_all", from)?;
         self.expect_string("str.replace_all", to)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("str.replace_all"),
-            vec![s.0, from.0, to.0],
+            vec![s_id, from_id, to_id],
             Sort::String,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -385,12 +411,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_to_int(&mut self, s: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.to_int", s)?;
         self.expect_string("str.to_int", s)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.to_int"),
-            vec![s.0],
-            Sort::Int,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("str.to_int"), vec![s_id], Sort::Int);
+        Ok(self.wrap_term(result))
     }
 
     /// Convert an integer to a string (`str.from_int`), returning String.
@@ -410,11 +436,11 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `Int`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_from_int(&mut self, n: Term) -> Result<Term, SolverError> {
+        let n_id = self.resolve_term("str.from_int", n)?;
         self.expect_int("str.from_int", n)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.from_int"),
-            vec![n.0],
-            Sort::String,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("str.from_int"), vec![n_id], Sort::String);
+        Ok(self.wrap_term(result))
     }
 }

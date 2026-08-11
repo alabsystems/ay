@@ -24,9 +24,10 @@ fn solver_with_active_witness() -> (Solver, Term, Term, Term) {
     let witness = solver
         .executor
         .array_ext_witness_cache
-        .pair_witness(solver.executor.terms(), a.0, b.0)
+        .pair_witness(solver.executor.terms(), a.id(), b.id())
         .expect("array solve should mint an active extensionality witness");
-    (solver, a, b, Term::from_raw(witness.0))
+    let witness = solver.wrap_term(witness);
+    (solver, a, b, witness)
 }
 
 fn equality_at(solver: &mut Solver, a: Term, b: Term, index: Term) -> Term {
@@ -65,7 +66,7 @@ fn active_witness_cannot_be_registered_as_hard_soft_or_objective_input() {
     let invalid = Term::from_raw(u32::MAX);
     assert!(matches!(
         solver.try_assert_term(invalid),
-        Err(SolverError::InvalidArgument {
+        Err(SolverError::InvalidTermHandle {
             operation: "assert_term",
             ..
         })
@@ -94,7 +95,7 @@ fn retired_witness_in_bypassed_permanent_assertion_fails_closed() {
         .executor
         .context_mut()
         .assertions
-        .push(pinned_equal.0);
+        .push(pinned_equal.id());
 
     let result = solver.check_sat();
     assert!(result.is_unknown(), "captured witness must fail closed");
@@ -110,7 +111,7 @@ fn retired_witness_in_bypassed_objective_fails_closed() {
     // solver-owned identity before inspecting its sort or optimizing it.
     solver.executor.context_mut().add_objective(Objective {
         direction: ObjectiveDirection::Minimize,
-        term: witness.0,
+        term: witness.id(),
     });
 
     let result = solver.optimize_check();
@@ -130,7 +131,7 @@ fn retired_witness_in_bypassed_soft_constraint_fails_closed() {
         .executor
         .context_mut()
         .replace_soft_constraints(vec![SoftAssertion {
-            term: pinned_equal.0,
+            term: pinned_equal.id(),
             weight: 1,
             id: None,
         }]);

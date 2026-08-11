@@ -15,7 +15,7 @@
 //! Design follows OR-Tools CP-SAT `IntegerTrail` (ortools/sat/integer.h)
 //! and Pumpkin's trail (pumpkin-solver/src/engine/).
 
-use crate::domain::{Domain, DomainWipeout};
+use crate::domain::{Domain, DomainEnumerationError, DomainWipeout};
 use crate::propagator::Explanation;
 use crate::variable::IntVarId;
 use ay_sat::Literal;
@@ -123,8 +123,24 @@ impl IntegerTrail {
     }
 
     /// Enumerate all currently allowed values in the variable's domain.
+    ///
+    /// # Panics
+    ///
+    /// Panics before allocation if the domain exceeds the eager enumeration
+    /// limit. Use [`try_values`](Self::try_values) for untrusted domains.
     pub fn values(&self, var: IntVarId) -> Vec<i64> {
-        self.current_domains[var.index()].values()
+        self.try_values(var)
+            .expect("domain is too large for eager value enumeration")
+    }
+
+    /// Fallible eager enumeration of the variable's current domain.
+    pub fn try_values(&self, var: IntVarId) -> Result<Vec<i64>, DomainEnumerationError> {
+        self.current_domains[var.index()].try_values()
+    }
+
+    /// Values excluded from the variable's bounding interval.
+    pub(crate) fn missing_values(&self, var: IntVarId) -> Vec<i64> {
+        self.current_domains[var.index()].missing_values()
     }
 
     /// Current decision level.

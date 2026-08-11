@@ -345,14 +345,15 @@ impl Context {
         self.track_scoped_symbol(&name);
         self.symbols.insert(
             name,
-            SymbolInfo {
-                term: Some(term),
-                sort: sort.clone(),
-                arg_sorts: vec![],
-                public_sort: PublicSort::from_engine(sort),
-                public_arg_sorts: vec![],
-                internal_name: None,
-            },
+            SymbolInfo::fresh(
+                Some(term),
+                sort.clone(),
+                vec![],
+                PublicSort::from_engine(sort),
+                vec![],
+                None,
+                super::super::DeclarationKind::SolverInternal,
+            ),
         );
     }
 

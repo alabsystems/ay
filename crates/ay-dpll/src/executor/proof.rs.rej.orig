@@ -1,0 +1,8 @@
+@@ -588,6 +588,7 @@
+         self.replace_with_exact_authored_affine_euf_refutation(&mut proof);
+         self.replace_with_exact_authored_bv_refutation(&mut proof);
+         self.replace_with_exact_authored_store_permutation_refutation(&mut proof);
++        self.collapse_double_negated_trust_lemma_literals(&mut proof);
+ 
+         // Proof validation (#4393): validates all non-Hole steps via partial
+         // checker. Replaces the old check_proof + Hole-skip pattern that skipped

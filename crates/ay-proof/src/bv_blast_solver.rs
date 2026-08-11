@@ -332,29 +332,36 @@ fn expand_dag_to_resolution(
         lits_by_lrat.insert(*lrat_id, lits.iter().map(lit_from_sat).collect());
     }
 
-    let mut steps: Vec<ResolutionStep> = Vec::new();
-    let mut next_step_id = nclauses;
-    let mut expansion_work = 0_usize;
+    let mut state = RupExpansionState {
+        steps: Vec::new(),
+        next_step_id: nclauses,
+        work: 0,
+    };
 
     for rup in &dag.derived {
-        check_rup_expansion_budget(limits, steps.len(), expansion_work)?;
+        check_rup_expansion_budget(limits, state.steps.len(), state.work)?;
         let target: Vec<Lit> = rup.clause.iter().map(lit_from_sat).collect();
         let final_premise_id = expand_one_rup_step(
             rup,
             &target,
             &lits_by_lrat,
             &lrat_to_premise,
-            &mut steps,
-            &mut next_step_id,
+            &mut state,
             limits,
-            &mut expansion_work,
         )?;
         // Register this derived clause so later steps can cite it.
         lrat_to_premise.insert(rup.id, final_premise_id);
         lits_by_lrat.insert(rup.id, target);
     }
 
-    Ok(Refutation { steps })
+    Ok(Refutation { steps: state.steps })
+}
+
+/// Mutable output and accounting shared by each RUP expansion.
+struct RupExpansionState {
+    steps: Vec<ResolutionStep>,
+    next_step_id: u32,
+    work: usize,
 }
 
 fn check_rup_expansion_budget(
@@ -397,10 +404,8 @@ fn expand_one_rup_step(
     target: &[Lit],
     lits_by_lrat: &std::collections::HashMap<u64, Vec<Lit>>,
     lrat_to_premise: &std::collections::HashMap<u64, u32>,
-    steps: &mut Vec<ResolutionStep>,
-    next_step_id: &mut u32,
+    state: &mut RupExpansionState,
     limits: Option<RupExpansionLimits>,
-    expansion_work: &mut usize,
 ) -> Result<u32, BvSolvedExportError> {
     // ── 1. RUP replay to discover per-hint unit literals. ──
     // Trail value: var → assigned bool. Assume ¬target.
@@ -413,8 +418,8 @@ fn expand_one_rup_step(
     let mut hint_units: Vec<Option<Lit>> = Vec::with_capacity(rup.rup_hints.len());
     let mut conflict_at: Option<usize> = None;
     for (i, &h) in rup.rup_hints.iter().enumerate() {
-        *expansion_work = expansion_work.saturating_add(1);
-        check_rup_expansion_budget(limits, steps.len(), *expansion_work)?;
+        state.work = state.work.saturating_add(1);
+        check_rup_expansion_budget(limits, state.steps.len(), state.work)?;
         let clause = lits_by_lrat
             .get(&h)
             .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
@@ -472,8 +477,8 @@ fn expand_one_rup_step(
 
     // Walk hints before the conflict, in reverse, resolving on their unit vars.
     for j in (0..conflict_idx).rev() {
-        *expansion_work = expansion_work.saturating_add(1);
-        check_rup_expansion_budget(limits, steps.len(), *expansion_work)?;
+        state.work = state.work.saturating_add(1);
+        check_rup_expansion_budget(limits, state.steps.len(), state.work)?;
         let Some(unit) = hint_units[j] else {
             continue; // no-op / satisfied hint contributes nothing
         };
@@ -491,22 +496,24 @@ fn expand_one_rup_step(
         let hint_premise = *lrat_to_premise
             .get(&hint_id)
             .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-        if limits.is_some_and(|limits| steps.len() >= limits.max_steps) {
+        if limits.is_some_and(|limits| state.steps.len() >= limits.max_steps) {
             return Err(BvSolvedExportError::ResourceLimit {
                 resource: "expanded resolution steps",
                 limit: limits.map_or(0, |limits| limits.max_steps),
-                actual: steps.len().saturating_add(1),
+                actual: state.steps.len().saturating_add(1),
             });
         }
-        let step_id = *next_step_id;
-        *next_step_id = next_step_id
-            .checked_add(1)
-            .ok_or(BvSolvedExportError::ResourceLimit {
-                resource: "resolution step id space",
-                limit: u32::MAX as usize,
-                actual: usize::MAX,
-            })?;
-        steps.push(ResolutionStep {
+        let step_id = state.next_step_id;
+        state.next_step_id =
+            state
+                .next_step_id
+                .checked_add(1)
+                .ok_or(BvSolvedExportError::ResourceLimit {
+                    resource: "resolution step id space",
+                    limit: u32::MAX as usize,
+                    actual: usize::MAX,
+                })?;
+        state.steps.push(ResolutionStep {
             id: step_id,
             clause: new_resolvent.clone(),
             rule: ResRule::Resolution,

@@ -184,6 +184,58 @@ fn test_cegqi_instantiator_creation() {
 }
 
 #[test]
+fn test_cegqi_counterexample_variable_cannot_alias_user_declaration() {
+    let mut terms = TermStore::new();
+
+    let user_declaration = terms.mk_var("__ce_x", Sort::Int);
+    let x_var = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let body = terms.mk_ge(x_var, zero);
+    let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
+
+    let inst = CegqiInstantiator::new(forall, &mut terms).unwrap();
+    let ce_var = inst.bound_to_ce["x"];
+
+    assert_ne!(
+        ce_var, user_declaration,
+        "a user declaration must not alias an internal counterexample witness"
+    );
+    assert!(
+        matches!(terms.get(ce_var), TermData::Var(name, _) if name.starts_with("__ay_ce_x!")),
+        "counterexample witness should use the reserved internal namespace"
+    );
+    let TermData::Var(ce_name, _) = terms.get(ce_var) else {
+        panic!("counterexample witness must be a free variable");
+    };
+    let ce_name = ce_name.clone();
+    assert_eq!(
+        terms.mk_var(ce_name, Sort::Int),
+        ce_var,
+        "counterexample witness must be registered for interface/model consumers"
+    );
+}
+
+#[test]
+fn test_cegqi_counterexample_variables_are_distinct_across_quantifiers() {
+    let mut terms = TermStore::new();
+
+    let x_var = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let nonnegative = terms.mk_ge(x_var, zero);
+    let positive = terms.mk_gt(x_var, zero);
+    let first = terms.mk_forall(vec![("x".to_string(), Sort::Int)], nonnegative);
+    let second = terms.mk_forall(vec![("x".to_string(), Sort::Int)], positive);
+
+    let first_inst = CegqiInstantiator::new(first, &mut terms).unwrap();
+    let second_inst = CegqiInstantiator::new(second, &mut terms).unwrap();
+
+    assert_ne!(
+        first_inst.bound_to_ce["x"], second_inst.bound_to_ce["x"],
+        "separate quantifiers must receive separate counterexample witnesses"
+    );
+}
+
+#[test]
 fn test_ce_lemma_creation() {
     let mut terms = TermStore::new();
 
@@ -199,7 +251,7 @@ fn test_ce_lemma_creation() {
     assert!(ce_lemma.is_some());
     let ce_lemma = ce_lemma.unwrap();
 
-    // The CE lemma should be: Not(__ce_x >= 0)
+    // The CE lemma should be the negated comparison at the internal CE witness.
     // Note: mk_ge(a, b) creates (<= b a), so we check for either >= or <=
     let data = terms.get(ce_lemma);
     match data {
@@ -214,9 +266,9 @@ fn test_ce_lemma_creation() {
                         "Expected comparison, got {}",
                         sym.name()
                     );
-                    // One arg should be __ce_x, the other should be 0
+                    // One arg should be the internal CE witness, the other 0.
                     let has_ce_var = args.iter().any(|&arg| {
-                        matches!(terms.get(arg), TermData::Var(name, _) if name.starts_with("__ce_"))
+                        matches!(terms.get(arg), TermData::Var(name, _) if name.starts_with("__ay_ce_"))
                     });
                     let has_zero = args.iter().any(|&arg| {
                         matches!(terms.get(arg), TermData::Const(ay_core::term::Constant::Int(n)) if *n == 0.into())
@@ -324,8 +376,8 @@ fn test_let_binding_with_shadowing() {
     let inst = CegqiInstantiator::new(forall, &mut terms).unwrap();
     let ce_var = *inst.bound_to_ce.get("x").unwrap();
     assert!(
-        matches!(terms.get(ce_var), TermData::Var(name, _) if name == "__ce_x"),
-        "Expected CE variable __ce_x"
+        matches!(terms.get(ce_var), TermData::Var(name, _) if name.starts_with("__ay_ce_x!")),
+        "Expected a fresh CE variable in the reserved internal namespace"
     );
     let ce_lemma = inst.create_ce_lemma(&mut terms);
 
@@ -379,7 +431,7 @@ fn test_exists_quantifier_is_forall_flag() {
     let ce_lemma = inst.create_ce_lemma(&mut terms);
     assert!(ce_lemma.is_some());
 
-    // For exists, CE lemma should NOT be negated: phi(__ce_x) directly
+    // For exists, the CE lemma is phi(internal-witness), without negation.
     let ce_lemma = ce_lemma.unwrap();
     let data = terms.get(ce_lemma);
 
@@ -394,9 +446,9 @@ fn test_exists_quantifier_is_forall_flag() {
                 sym.name()
             );
             assert_eq!(args.len(), 2);
-            // One arg should be __ce_x
+            // One arg should be the internal CE witness.
             let has_ce_var = args.iter().any(|&arg| {
-                matches!(terms.get(arg), TermData::Var(name, _) if name.starts_with("__ce_"))
+                matches!(terms.get(arg), TermData::Var(name, _) if name.starts_with("__ay_ce_"))
             });
             assert!(has_ce_var, "Expected CE variable in exists lemma");
         }

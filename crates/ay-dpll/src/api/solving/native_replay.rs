@@ -24,13 +24,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::api::types::{
-    FuncDecl, LimitKind, Logic, NativeReplayArtifact, NativeReplayAssertion,
-    NativeReplayCheckedReplaySummary, NativeReplayDeclaration, NativeReplayEvent,
-    NativeReplayEventKind, NativeReplayEvidenceManifest, NativeReplayFunctionDeclaration,
-    NativeReplayMetadata, NativeReplayModelSummary, NativeReplayProofSummary,
-    NativeReplayResourceUsage, NativeReplaySolveSummary, NativeReplaySolverIdentity,
-    NativeReplayStatistics, NativeReplayTermNode, NativeReplayUnknownProgress, Term,
-    NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA, NATIVE_REPLAY_SCHEMA,
+    FrontendFuncDeclIdentity, FuncDecl, LimitKind, Logic, NativeReplayAdmissionToken,
+    NativeReplayArtifact, NativeReplayAssertion, NativeReplayCheckedReplaySummary,
+    NativeReplayDeclaration, NativeReplayEvent, NativeReplayEventKind,
+    NativeReplayEvidenceManifest, NativeReplayFunctionDeclaration, NativeReplayMetadata,
+    NativeReplayModelSummary, NativeReplayProofSummary, NativeReplayResourceUsage,
+    NativeReplaySolveSummary, NativeReplaySolverIdentity, NativeReplayStatistics,
+    NativeReplaySymbolIdentity, NativeReplaySymbolKind, NativeReplayTermNode,
+    NativeReplayUnknownProgress, Term, NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA,
+    NATIVE_REPLAY_SCHEMA,
 };
 use crate::api::{ProofAcceptanceMode, Solver, SolverError, UnsatProofArtifact};
 
@@ -86,6 +88,7 @@ impl Solver {
             .filter(|l| !crate::logic_detection::declared_logic_routes_as_all(l))
             .map(str::to_string);
         let selected_route = logic.as_deref().map(|logic| format!("native-api:{logic}"));
+        let mut replay_gaps = Vec::new();
         let mut declarations: Vec<_> = self
             .var_names
             .iter()
@@ -93,10 +96,25 @@ impl Solver {
                 self.var_sorts
                     .get(&term)
                     .cloned()
-                    .map(|sort| NativeReplayDeclaration {
-                        name: name.clone(),
-                        term,
-                        sort,
+                    .map(|sort| {
+                        let core_name =
+                            authenticated_native_constant_core_name(self, name, term).unwrap_or_else(
+                                || {
+                                    replay_gaps.push(format!(
+                                        "native declaration `{name}` lacks exact live frontend identity metadata"
+                                    ));
+                                    // Deliberately cannot authenticate as an allocator-private
+                                    // declaration. The replay validator will reject this artifact
+                                    // instead of guessing an identity relation.
+                                    format!("__ay_native_replay_unauthenticated_{}", term.0)
+                                },
+                            );
+                        NativeReplayDeclaration {
+                            name: name.clone(),
+                            core_name,
+                            term,
+                            sort,
+                        }
                     })
             })
             .collect();
@@ -156,9 +174,23 @@ impl Solver {
                 needed_functions.insert(name.to_string());
             }
         }
+        let datatype_declarations = datatype_declarations_from_events(&self.native_replay_events);
         let mut function_declarations =
-            function_declarations_from_events(&self.native_replay_events);
-        function_declarations.retain(|declaration| needed_functions.contains(&declaration.name));
+            function_declarations_from_events(self, &self.native_replay_events, &mut replay_gaps);
+        function_declarations.retain(|declaration| {
+            needed_functions.contains(&declaration.name)
+                || self
+                    .native_fun_signatures
+                    .get(&declaration.name)
+                    .is_some_and(|registration| needed_functions.contains(&registration.core_name))
+        });
+        let symbol_identities = export_native_replay_symbol_identities(
+            self,
+            &declarations,
+            &function_declarations,
+            &datatype_declarations,
+            &mut replay_gaps,
+        );
 
         let terms = replay_terms
             .into_iter()
@@ -186,7 +218,6 @@ impl Solver {
             .filter(|detail| detail.to_ascii_lowercase().contains("unsupported"))
             .map(|detail| vec![detail.clone()])
             .unwrap_or_default();
-        let mut replay_gaps = Vec::new();
         if solve.is_none() {
             replay_gaps.push("solve details were not captured".to_string());
         }
@@ -204,10 +235,12 @@ impl Solver {
             events: self.native_replay_events.clone(),
             declarations,
             function_declarations,
+            symbol_identities,
             assertions,
             terms,
             solve: solve_summary,
             checked_replay: None,
+            admission_token: None,
             panic_payload: None,
             unsupported_atoms,
             replay_gaps,
@@ -316,6 +349,54 @@ impl Solver {
         Ok((details, Some(proof)))
     }
 
+    /// Strictly replay an artifact and seal the resulting evidence in memory.
+    ///
+    /// This is the only workflow that can make
+    /// [`NativeReplayEvidenceManifest::admitted`] true. The supplied identity
+    /// may contribute the owning backend's executable SHA-256, but its engine,
+    /// AY revision, and AY version must exactly match this replay build and the
+    /// artifact's native route. This API validates and binds the SHA-256 claim;
+    /// measuring the owning executable remains the backend's responsibility.
+    /// The effective timeout is recorded into the returned artifact before
+    /// replay so the sealed options digest describes the execution that
+    /// actually ran.
+    ///
+    /// Diagnostic [`NativeReplayArtifact::with_checked_replay`] summaries do
+    /// not carry this authority, and diagnostic JSON deliberately cannot
+    /// serialize or restore it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the solver identity is not the current replay
+    /// identity, its binary SHA-256 is missing or malformed, the artifact is
+    /// malformed, or an UNSAT result lacks complete strict proof authority.
+    pub fn replay_native_replay_artifact_for_evidence(
+        mut artifact: NativeReplayArtifact,
+        solver_identity: NativeReplaySolverIdentity,
+        timeout: Duration,
+    ) -> Result<NativeReplayArtifact, SolverError> {
+        validate_native_replay_evidence_solver_identity(&artifact, &solver_identity)?;
+        require_native_replay_evidence_identity_table(&artifact)?;
+
+        // A caller-supplied summary/token is never an input to the authoritative
+        // execution. Record the exact effective millisecond timeout and rerun.
+        artifact.checked_replay = None;
+        artifact.admission_token = None;
+        let caller_timeout_ms = timeout.as_millis().min(u128::from(u64::MAX));
+        artifact.timeout_ms = Some(artifact.timeout_ms.map_or(caller_timeout_ms, |recorded| {
+            recorded.min(caller_timeout_ms)
+        }));
+
+        let (details, _) = Self::replay_native_replay_artifact_impl(&artifact, None, true)?;
+        let details = Self::require_native_replay_proof_authority(details)?;
+        artifact.checked_replay = Some(checked_replay_summary_from_details(
+            artifact.solve.as_ref(),
+            &details,
+        ));
+        artifact.admission_token = Some(native_replay_admission_token(&artifact, solver_identity)?);
+        Ok(artifact)
+    }
+
     fn replay_native_replay_artifact_impl(
         artifact: &NativeReplayArtifact,
         caller_timeout: Option<Duration>,
@@ -342,18 +423,17 @@ impl Solver {
             solver.set_timeout(Some(timeout));
         }
 
-        for datatype in datatype_declarations_from_events(&artifact.events) {
-            solver.try_declare_datatype(&datatype)?;
-        }
-        for fun in &artifact.function_declarations {
-            solver.try_declare_fun(&fun.name, &fun.domain, fun.range.clone())?;
-        }
+        let (identity_remap, predeclared_constants) =
+            replay_native_declarations_in_event_order(artifact, &mut solver)?;
+        validate_native_replay_declaration_sorts(artifact, &solver, &identity_remap)?;
 
         let declarations: HashMap<_, _> = artifact
             .declarations
             .iter()
             .map(|decl| (decl.term, decl))
             .collect();
+        let source_nodes: HashMap<_, _> =
+            artifact.terms.iter().map(|node| (node.id, node)).collect();
         let mut term_map: HashMap<TermId, TermId> = HashMap::default();
         // Export stores the dependency closure in deterministic topological
         // order. Preserve it here instead of cloning/sorting the entire slice.
@@ -364,14 +444,23 @@ impl Solver {
                     node.id.0
                 )));
             }
-            let replayed = rebuild_term_node(&mut solver, node, &declarations, &term_map)?;
+            let remapped_node = identity_remap.remap_term_node(node)?;
+            let replayed = rebuild_term_node(
+                &mut solver,
+                node,
+                &remapped_node,
+                &declarations,
+                &source_nodes,
+                &term_map,
+                &predeclared_constants,
+            )?;
             let actual_sort = solver.terms().sort(replayed);
-            if actual_sort != &node.sort {
+            if actual_sort != &remapped_node.sort {
                 return Err(SolverError::InvalidArgument {
                     operation: "native_replay",
                     message: format!(
                         "term {} records sort {}, but reconstruction produced {actual_sort}",
-                        node.id.0, node.sort
+                        node.id.0, remapped_node.sort
                     ),
                 });
             }
@@ -382,17 +471,18 @@ impl Solver {
         assertions.sort_by_key(|assertion| assertion.index);
         for assertion in assertions {
             let term = map_term(assertion.term, &term_map)?;
+            let term = solver.wrap_term(term);
             if let Some(name) = assertion.name {
-                solver.try_assert_named(Term(term), &name)?;
+                solver.try_assert_named(term, &name)?;
             } else {
-                solver.try_assert_term(Term(term))?;
+                solver.try_assert_term(term)?;
             }
         }
 
         let details = if let Some(assumptions) = final_check_sat_assumptions(&artifact.events) {
             let assumptions = assumptions
                 .iter()
-                .map(|&term| map_term(term, &term_map).map(Term))
+                .map(|&term| map_term(term, &term_map).map(|id| solver.wrap_term(id)))
                 .collect::<Result<Vec<_>, SolverError>>()?;
             solver.check_sat_assuming_with_details(&assumptions).solve
         } else {
@@ -422,6 +512,7 @@ impl Solver {
         );
         let accepted = proof_checking_active
             && details.verification.unsat_proof_available
+            && details.verification.unsat_proof_strictly_verified
             && details.verification.unsat_proof_checker_failures == 0
             && checker_failures == Some(0)
             && stats.proof_complete
@@ -439,12 +530,14 @@ impl Solver {
                 "UNSAT replay lacks strict proof authority \
                  (checker_active={proof_checking_active}, \
                  artifact_available={}, summary_checker_failures={}, \
+                 strictly_verified={}, \
                  raw_checker_failures={checker_failures:?}, \
                  proof_complete={}, proof_trust={trust_fallbacks:?}, \
                  checked_steps={checked_steps:?}, total_steps={total_steps:?}, \
                  skipped_holes={skipped_holes:?})",
                 details.verification.unsat_proof_available,
                 details.verification.unsat_proof_checker_failures,
+                details.verification.unsat_proof_strictly_verified,
                 stats.proof_complete,
             ),
         })
@@ -462,6 +555,56 @@ impl Solver {
         let artifact = NativeReplayArtifact::from_json_str(json)?;
         Self::replay_native_replay_artifact(&artifact)
     }
+}
+
+/// Resolve a native constant's public API key to its exact live core identity.
+///
+/// Export must not infer this relation from spelling alone: the private core
+/// name is meaningful only when the frontend records one unique, live,
+/// nullary uninterpreted declaration whose bound term is the exported Var.
+fn authenticated_native_constant_core_name(
+    solver: &Solver,
+    public_name: &str,
+    term: TermId,
+) -> Option<String> {
+    let context = solver.executor.context();
+    let mut matches = context.symbols_iter().filter(|(surface, info)| {
+        surface.as_str() == public_name
+            && info.term == Some(term)
+            && info.arg_sorts.is_empty()
+            && info.sort == *solver.terms().sort(term)
+            && info.declaration_kind() == ay_frontend::DeclarationKind::Uninterpreted
+            && context.effective_declaration_kind(info.declaration_id())
+                == Some(ay_frontend::DeclarationKind::Uninterpreted)
+    });
+    let (surface, info) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    let core_name = context.symbol_identity_name(surface, info);
+    if !matches!(solver.terms().get(term), TermData::Var(name, _) if name == core_name) {
+        return None;
+    }
+
+    let mut owners = context.symbols_iter().filter(|(surface, candidate)| {
+        context.symbol_identity_name(surface, candidate) == core_name
+    });
+    let (owner_surface, owner) = owners.next()?;
+    if owner_surface.as_str() != public_name
+        || owner.declaration_id() != info.declaration_id()
+        || owner.declaration_kind() != info.declaration_kind()
+        || owners.next().is_some()
+    {
+        return None;
+    }
+    Some(core_name.to_string())
+}
+
+fn is_allocator_private_declaration_identity(name: &str) -> bool {
+    name.strip_prefix("__ay_overload_").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]
@@ -486,6 +629,7 @@ mod proof_required_authority_tests {
     #[test]
     fn proof_required_authority_rejects_holes_and_checker_failures() {
         let details = strict_boolean_unsat_details();
+        assert!(details.verification.unsat_proof_strictly_verified);
         let _ = Solver::require_native_replay_proof_authority(details.clone())
             .expect("strict complete Boolean proof must carry authority");
         let assert_rejected = |details| {
@@ -503,6 +647,12 @@ mod proof_required_authority_tests {
             .get_int("proof_checker_total_steps")
             .expect("strict checker total");
         assert!(total > 0);
+
+        let mut ordinary_authority = details.clone();
+        ordinary_authority
+            .verification
+            .unsat_proof_strictly_verified = false;
+        assert_rejected(ordinary_authority);
 
         // Model the partial checker's intentional Hole behavior: it can report
         // zero failures while skipping one step. The proof-required boundary
@@ -569,9 +719,15 @@ mod proof_required_authority_tests {
 }
 
 impl NativeReplayArtifact {
-    /// Attach checked replay status produced from replaying this artifact.
+    /// Attach diagnostic checked-replay status supplied by the caller.
+    ///
+    /// This convenience method is intentionally non-authoritative: it clears
+    /// any in-memory admission token. Use
+    /// [`Solver::replay_native_replay_artifact_for_evidence`] when a compiler
+    /// verifier backend needs an admissible manifest.
     #[must_use]
     pub fn with_checked_replay(mut self, replay: &crate::api::types::SolveDetails) -> Self {
+        self.admission_token = None;
         self.checked_replay = Some(checked_replay_summary_from_details(
             self.solve.as_ref(),
             replay,
@@ -582,10 +738,14 @@ impl NativeReplayArtifact {
     /// Build a fail-closed content-addressed evidence manifest for this artifact.
     #[must_use]
     pub fn evidence_manifest(&self) -> NativeReplayEvidenceManifest {
-        let engine = self.selected_route.as_deref().unwrap_or("native-api");
-        self.evidence_manifest_with_solver_identity(NativeReplaySolverIdentity::current_for_engine(
-            engine,
-        ))
+        let solver_identity = self
+            .admission_token
+            .as_ref()
+            .map(|token| token.solver_identity.clone())
+            .unwrap_or_else(|| {
+                NativeReplaySolverIdentity::current_for_engine(native_replay_expected_engine(self))
+            });
+        self.evidence_manifest_with_solver_identity(solver_identity)
     }
 
     /// Build a fail-closed content-addressed evidence manifest with an explicit
@@ -617,6 +777,11 @@ impl NativeReplayArtifact {
                 .function_declarations
                 .iter()
                 .map(function_declaration_json)
+                .collect::<Vec<_>>(),
+            "symbol_identities": self
+                .symbol_identities
+                .iter()
+                .map(symbol_identity_json)
                 .collect::<Vec<_>>(),
             "assertions": self.assertions.iter().map(assertion_json).collect::<Vec<_>>(),
             "terms": self.terms.iter().map(term_node_json).collect::<Vec<_>>(),
@@ -708,9 +873,18 @@ impl NativeReplayEvidenceManifest {
         let problem_sha256 = sha256_json(&native_replay_problem_binding_json(artifact));
         let options_sha256 = sha256_json(&native_replay_options_binding_json(artifact));
         let replay_artifact_sha256 = sha256_json(&artifact.to_json_value());
+        let checked_summary_sha256 = native_replay_checked_summary_sha256(checked);
         let checked_result = native_replay_checked_result(checked);
-        let admission_rejection_reasons =
-            native_replay_manifest_rejection_reasons(artifact, &solver_identity, checked);
+        let admission_rejection_reasons = native_replay_manifest_rejection_reasons(
+            artifact,
+            &solver_identity,
+            checked,
+            &solver_identity_sha256,
+            &problem_sha256,
+            &options_sha256,
+            &checked_summary_sha256,
+            &replay_artifact_sha256,
+        );
         let unknown_reason = checked
             .and_then(|summary| {
                 summary
@@ -743,15 +917,26 @@ impl NativeReplayEvidenceManifest {
             replay_gaps: artifact.replay_gaps.clone(),
             admission_rejection_reasons,
             manifest_sha256: String::new(),
+            admission_seal_sha256: None,
         };
-        manifest.manifest_sha256 = sha256_json(&manifest.to_json_body());
+        let may_admit = manifest.admission_rejection_reasons.is_empty();
+        let body_sha256 = sha256_json(&manifest.to_json_body_with_admitted(may_admit));
+        manifest.manifest_sha256.clone_from(&body_sha256);
+        if may_admit {
+            manifest.admission_seal_sha256 = Some(body_sha256);
+        }
         manifest
     }
 
     /// Whether a compiler verifier backend may admit this manifest.
     #[must_use]
     pub fn admitted(&self) -> bool {
-        self.admission_rejection_reasons.is_empty()
+        if !self.admission_rejection_reasons.is_empty() {
+            return false;
+        }
+        let expected = sha256_json(&self.to_json_body_with_admitted(true));
+        self.admission_seal_sha256.as_deref() == Some(expected.as_str())
+            && self.manifest_sha256 == expected
     }
 
     /// Convert the manifest to stable JSON.
@@ -776,6 +961,10 @@ impl NativeReplayEvidenceManifest {
     }
 
     fn to_json_body(&self) -> Value {
+        self.to_json_body_with_admitted(self.admitted())
+    }
+
+    fn to_json_body_with_admitted(&self, admitted: bool) -> Value {
         json!({
             "schema": self.schema,
             "solver_identity": solver_identity_json(&self.solver_identity),
@@ -792,7 +981,7 @@ impl NativeReplayEvidenceManifest {
             "unsupported_atoms": self.unsupported_atoms,
             "replay_gaps": self.replay_gaps,
             "admission_rejection_reasons": self.admission_rejection_reasons,
-            "admitted": self.admitted(),
+            "admitted": admitted,
         })
     }
 }
@@ -803,6 +992,106 @@ fn ay_revision() -> String {
         .or(option_env!("GIT_SHA"))
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn native_replay_expected_selected_route(artifact: &NativeReplayArtifact) -> Option<String> {
+    artifact
+        .logic
+        .as_deref()
+        .map(|logic| format!("native-api:{logic}"))
+}
+
+fn native_replay_expected_engine(artifact: &NativeReplayArtifact) -> String {
+    native_replay_expected_selected_route(artifact).unwrap_or_else(|| "native-api".to_string())
+}
+
+fn well_formed_sha256(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn validate_native_replay_evidence_solver_identity(
+    artifact: &NativeReplayArtifact,
+    solver_identity: &NativeReplaySolverIdentity,
+) -> Result<(), SolverError> {
+    let expected_route = native_replay_expected_selected_route(artifact);
+    if artifact.selected_route.as_deref() != expected_route.as_deref() {
+        return Err(native_replay_evidence_error(format!(
+            "artifact selected route {:?} does not match its current native route {:?}",
+            artifact.selected_route, expected_route
+        )));
+    }
+
+    let expected =
+        NativeReplaySolverIdentity::current_for_engine(native_replay_expected_engine(artifact));
+    if solver_identity.engine != expected.engine
+        || solver_identity.ay_revision != expected.ay_revision
+        || solver_identity.ay_version != expected.ay_version
+    {
+        return Err(native_replay_evidence_error(format!(
+            "solver identity does not match the current replay build/route \
+             (expected engine={}, revision={}, version={})",
+            expected.engine, expected.ay_revision, expected.ay_version
+        )));
+    }
+    match solver_identity.solver_binary_sha256.as_deref() {
+        Some(hash) if well_formed_sha256(hash) => Ok(()),
+        Some(_) => Err(native_replay_evidence_error(
+            "solver binary sha256 is malformed",
+        )),
+        None => Err(native_replay_evidence_error(
+            "solver binary sha256 is missing",
+        )),
+    }
+}
+
+fn native_replay_evidence_requires_identity_table(artifact: &NativeReplayArtifact) -> bool {
+    !artifact.declarations.is_empty()
+        || !artifact.function_declarations.is_empty()
+        || artifact
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, NativeReplayEventKind::DeclareDatatype { .. }))
+}
+
+fn require_native_replay_evidence_identity_table(
+    artifact: &NativeReplayArtifact,
+) -> Result<(), SolverError> {
+    if native_replay_evidence_requires_identity_table(artifact)
+        && artifact.symbol_identities.is_empty()
+    {
+        return Err(native_replay_evidence_error(
+            "compiler evidence requires an authenticated symbol identity table",
+        ));
+    }
+    Ok(())
+}
+
+fn native_replay_checked_summary_sha256(
+    checked: Option<&NativeReplayCheckedReplaySummary>,
+) -> String {
+    let value = checked.map_or(Value::Null, checked_replay_json);
+    sha256_json(&value)
+}
+
+fn native_replay_admission_token(
+    artifact: &NativeReplayArtifact,
+    solver_identity: NativeReplaySolverIdentity,
+) -> Result<NativeReplayAdmissionToken, SolverError> {
+    if artifact.checked_replay.is_none() {
+        return Err(native_replay_evidence_error(
+            "strict replay did not produce a checked replay summary",
+        ));
+    }
+    Ok(NativeReplayAdmissionToken {
+        solver_identity_sha256: solver_identity.identity_sha256(),
+        problem_sha256: sha256_json(&native_replay_problem_binding_json(artifact)),
+        options_sha256: sha256_json(&native_replay_options_binding_json(artifact)),
+        checked_summary_sha256: native_replay_checked_summary_sha256(
+            artifact.checked_replay.as_ref(),
+        ),
+        replay_artifact_sha256: sha256_json(&artifact.to_json_value()),
+        solver_identity,
+    })
 }
 
 fn native_replay_problem_binding_json(artifact: &NativeReplayArtifact) -> Value {
@@ -816,6 +1105,11 @@ fn native_replay_problem_binding_json(artifact: &NativeReplayArtifact) -> Value 
             .function_declarations
             .iter()
             .map(function_declaration_json)
+            .collect::<Vec<_>>(),
+        "symbol_identities": artifact
+            .symbol_identities
+            .iter()
+            .map(symbol_identity_json)
             .collect::<Vec<_>>(),
         "assertions": artifact.assertions.iter().map(assertion_json).collect::<Vec<_>>(),
         "terms": artifact.terms.iter().map(term_node_json).collect::<Vec<_>>(),
@@ -852,15 +1146,74 @@ fn native_replay_manifest_rejection_reasons(
     artifact: &NativeReplayArtifact,
     solver_identity: &NativeReplaySolverIdentity,
     checked: Option<&NativeReplayCheckedReplaySummary>,
+    solver_identity_sha256: &str,
+    problem_sha256: &str,
+    options_sha256: &str,
+    checked_summary_sha256: &str,
+    replay_artifact_sha256: &str,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    if native_replay_evidence_requires_identity_table(artifact)
+        && artifact.symbol_identities.is_empty()
+    {
+        reasons.push(
+            "artifact lacks the authenticated symbol identity table required for evidence"
+                .to_string(),
+        );
+    }
+    let expected_route = native_replay_expected_selected_route(artifact);
+    if artifact.selected_route.as_deref() != expected_route.as_deref() {
+        reasons.push("artifact selected route does not match its native logic route".to_string());
+    }
+    let expected_identity =
+        NativeReplaySolverIdentity::current_for_engine(native_replay_expected_engine(artifact));
+    if solver_identity.engine != expected_identity.engine {
+        reasons.push("solver identity engine does not match the current replay route".to_string());
+    }
+    if solver_identity.ay_revision != expected_identity.ay_revision {
+        reasons
+            .push("solver identity revision does not match the current replay build".to_string());
+    }
+    if solver_identity.ay_version != expected_identity.ay_version {
+        reasons.push("solver identity version does not match the current replay build".to_string());
+    }
     if solver_identity.ay_revision.is_empty() || solver_identity.ay_revision == "unknown" {
         reasons.push("solver identity ay revision is unknown".to_string());
     }
     match &solver_identity.solver_binary_sha256 {
-        Some(hash) if hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) => {}
+        Some(hash) if well_formed_sha256(hash) => {}
         Some(_) => reasons.push("solver binary sha256 is malformed".to_string()),
         None => reasons.push("solver binary sha256 is missing".to_string()),
+    }
+    match artifact.admission_token.as_ref() {
+        Some(token) => {
+            if &token.solver_identity != solver_identity
+                || token.solver_identity_sha256.as_str() != solver_identity_sha256
+            {
+                reasons.push(
+                    "authoritative replay token solver identity binding does not match".to_string(),
+                );
+            }
+            if token.problem_sha256.as_str() != problem_sha256 {
+                reasons
+                    .push("authoritative replay token problem binding does not match".to_string());
+            }
+            if token.options_sha256.as_str() != options_sha256 {
+                reasons
+                    .push("authoritative replay token options binding does not match".to_string());
+            }
+            if token.checked_summary_sha256.as_str() != checked_summary_sha256 {
+                reasons.push(
+                    "authoritative replay token checked-summary binding does not match".to_string(),
+                );
+            }
+            if token.replay_artifact_sha256.as_str() != replay_artifact_sha256 {
+                reasons.push(
+                    "authoritative replay token full-artifact binding does not match".to_string(),
+                );
+            }
+        }
+        None => reasons.push("authoritative replay token is missing".to_string()),
     }
     if let Some(payload) = &artifact.panic_payload {
         reasons.push(format!("artifact captured panic payload: {payload}"));
@@ -905,7 +1258,9 @@ fn native_replay_manifest_rejection_reasons(
 }
 
 fn function_declarations_from_events(
+    solver: &Solver,
     events: &[NativeReplayEvent],
+    replay_gaps: &mut Vec<String>,
 ) -> Vec<NativeReplayFunctionDeclaration> {
     let mut declarations = Vec::new();
     for event in events {
@@ -923,14 +1278,69 @@ fn function_declarations_from_events(
             {
                 continue;
             }
+            let core_name = authenticated_native_function_core_name(solver, name, domain, range)
+                .unwrap_or_else(|| {
+                    replay_gaps.push(format!(
+                        "native function `{name}` lacks exact live frontend identity metadata"
+                    ));
+                    format!(
+                        "__ay_native_replay_unauthenticated_function_{}",
+                        declarations.len()
+                    )
+                });
             declarations.push(NativeReplayFunctionDeclaration {
                 name: name.clone(),
+                core_name,
                 domain: domain.clone(),
                 range: range.clone(),
             });
         }
     }
     declarations
+}
+
+fn authenticated_native_function_core_name(
+    solver: &Solver,
+    surface_name: &str,
+    domain: &[Sort],
+    range: &Sort,
+) -> Option<String> {
+    let registration = solver.native_fun_signatures.get(surface_name)?;
+    if registration.domain != domain || registration.range != *range {
+        return None;
+    }
+    let handle = FuncDecl::with_frontend_identity(
+        surface_name.to_string(),
+        registration.core_name.clone(),
+        domain.to_vec(),
+        range.clone(),
+        registration.identity.clone(),
+    );
+    if !solver.function_handle_is_current(&handle) {
+        return None;
+    }
+
+    let engine_domain: Vec<_> = domain
+        .iter()
+        .map(|sort| solver.lower_live_sort(sort))
+        .collect();
+    let engine_range = solver.lower_live_sort(range);
+    let context = solver.executor.context();
+    let mut matches = context.symbols_iter().filter(|(surface, info)| {
+        surface.as_str() == surface_name
+            && context.symbol_identity_name(surface, info) == registration.core_name
+            && info.arg_sorts == engine_domain
+            && info.sort == engine_range
+    });
+    let (_, info) = matches.next()?;
+    if matches.next().is_some()
+        || context.effective_declaration_kind(info.declaration_id())
+            != Some(info.declaration_kind())
+        || native_replay_symbol_kind(info.declaration_kind()).is_none()
+    {
+        return None;
+    }
+    Some(registration.core_name.clone())
 }
 
 fn datatype_declarations_from_events(events: &[NativeReplayEvent]) -> Vec<DatatypeSort> {
@@ -947,6 +1357,288 @@ fn datatype_declarations_from_events(events: &[NativeReplayEvent]) -> Vec<Dataty
         }
     }
     declarations
+}
+
+fn native_replay_symbol_kind(kind: ay_frontend::DeclarationKind) -> Option<NativeReplaySymbolKind> {
+    match kind {
+        ay_frontend::DeclarationKind::Uninterpreted => Some(NativeReplaySymbolKind::Uninterpreted),
+        ay_frontend::DeclarationKind::Theory => Some(NativeReplaySymbolKind::Theory),
+        ay_frontend::DeclarationKind::DatatypeConstructor => {
+            Some(NativeReplaySymbolKind::DatatypeConstructor)
+        }
+        ay_frontend::DeclarationKind::DatatypeSelector => {
+            Some(NativeReplaySymbolKind::DatatypeSelector)
+        }
+        ay_frontend::DeclarationKind::DatatypeTester => {
+            Some(NativeReplaySymbolKind::DatatypeTester)
+        }
+        ay_frontend::DeclarationKind::Defined
+        | ay_frontend::DeclarationKind::AdoptedDefinition
+        | ay_frontend::DeclarationKind::SolverInternal => None,
+    }
+}
+
+fn replay_symbol_identity(
+    surface_name: &str,
+    core_name: &str,
+    api_domain: &[Sort],
+    api_range: &Sort,
+    info: &ay_frontend::SymbolInfo,
+    datatype: Option<(&str, &str)>,
+) -> Option<NativeReplaySymbolIdentity> {
+    Some(NativeReplaySymbolIdentity {
+        surface_name: surface_name.to_string(),
+        core_name: core_name.to_string(),
+        api_domain: api_domain.to_vec(),
+        api_range: api_range.clone(),
+        public_domain: info.public_arg_sorts.clone(),
+        public_range: info.public_sort.clone(),
+        engine_domain: info.arg_sorts.clone(),
+        engine_range: info.sort.clone(),
+        kind: native_replay_symbol_kind(info.declaration_kind())?,
+        datatype_surface: datatype.map(|(surface, _)| surface.to_string()),
+        datatype_core: datatype.map(|(_, core)| core.to_string()),
+    })
+}
+
+fn export_native_replay_symbol_identities(
+    solver: &Solver,
+    declarations: &[NativeReplayDeclaration],
+    function_declarations: &[NativeReplayFunctionDeclaration],
+    datatypes: &[DatatypeSort],
+    replay_gaps: &mut Vec<String>,
+) -> Vec<NativeReplaySymbolIdentity> {
+    let context = solver.executor.context();
+    let mut identities = Vec::new();
+
+    for declaration in declarations {
+        let authenticated_core =
+            authenticated_native_constant_core_name(solver, &declaration.name, declaration.term);
+        let identity = authenticated_core
+            .as_deref()
+            .filter(|core_name| *core_name == declaration.core_name)
+            .and_then(|core_name| {
+                let mut matches = context.symbols_iter().filter(|(surface, info)| {
+                    surface.as_str() == declaration.name.as_str()
+                        && context.symbol_identity_name(surface, info) == core_name
+                        && info.term == Some(declaration.term)
+                        && info.declaration_kind() == ay_frontend::DeclarationKind::Uninterpreted
+                });
+                let (_, info) = matches.next()?;
+                if matches.next().is_none() {
+                    replay_symbol_identity(
+                        &declaration.name,
+                        core_name,
+                        &[],
+                        &declaration.sort,
+                        info,
+                        None,
+                    )
+                } else {
+                    None
+                }
+            });
+        if let Some(identity) = identity {
+            identities.push(identity);
+        } else {
+            replay_gaps.push(format!(
+                "native constant `{}` could not populate the authenticated identity table",
+                declaration.name
+            ));
+        }
+    }
+
+    for declaration in function_declarations {
+        let identity = authenticated_native_function_core_name(
+            solver,
+            &declaration.name,
+            &declaration.domain,
+            &declaration.range,
+        )
+        .filter(|core_name| core_name == &declaration.core_name)
+        .and_then(|core_name| {
+            context
+                .symbols_iter()
+                .find(|(surface, info)| {
+                    surface.as_str() == declaration.name.as_str()
+                        && context.symbol_identity_name(surface, info) == core_name
+                })
+                .and_then(|(_, info)| {
+                    replay_symbol_identity(
+                        &declaration.name,
+                        &core_name,
+                        &declaration.domain,
+                        &declaration.range,
+                        info,
+                        None,
+                    )
+                })
+        });
+        if let Some(identity) = identity {
+            identities.push(identity);
+        } else {
+            replay_gaps.push(format!(
+                "native function `{}` could not populate the authenticated identity table",
+                declaration.name
+            ));
+        }
+    }
+
+    for datatype in datatypes {
+        let datatype_api_sort = Sort::Datatype(datatype.clone());
+        let carrier_sort = solver.lower_live_sort(&Sort::Datatype(datatype.clone()));
+        let Sort::Uninterpreted(carrier_core) = &carrier_sort else {
+            replay_gaps.push(format!(
+                "datatype `{}` lacks one exact engine carrier",
+                datatype.name
+            ));
+            continue;
+        };
+        if !context.is_live_datatype_carrier(carrier_core) {
+            replay_gaps.push(format!(
+                "datatype `{}` engine carrier `{carrier_core}` is not live",
+                datatype.name
+            ));
+            continue;
+        }
+
+        for constructor in &datatype.constructors {
+            let constructor_domain: Vec<_> = constructor
+                .fields
+                .iter()
+                .map(|field| solver.lower_live_sort(&field.sort))
+                .collect();
+            let Some(constructor_info) = context.symbol_info_with_signature(
+                &constructor.name,
+                &constructor_domain,
+                &carrier_sort,
+            ) else {
+                replay_gaps.push(format!(
+                    "datatype constructor `{}::{}` lacks an exact live signature",
+                    datatype.name, constructor.name
+                ));
+                continue;
+            };
+            let constructor_core = context
+                .symbol_identity_name(&constructor.name, constructor_info)
+                .to_string();
+            let constructor_is_exact = constructor_info.declaration_kind()
+                == ay_frontend::DeclarationKind::DatatypeConstructor
+                && context
+                    .is_constructor(&constructor_core)
+                    .is_some_and(|(carrier, _)| carrier.as_str() == carrier_core.as_str())
+                && context
+                    .exact_datatype_member_info(&constructor_core)
+                    .is_some_and(|exact| {
+                        exact.declaration_id() == constructor_info.declaration_id()
+                    });
+            if !constructor_is_exact {
+                replay_gaps.push(format!(
+                    "datatype constructor `{}::{}` lacks exact member provenance",
+                    datatype.name, constructor.name
+                ));
+                continue;
+            }
+            if let Some(identity) = replay_symbol_identity(
+                &constructor.name,
+                &constructor_core,
+                &constructor
+                    .fields
+                    .iter()
+                    .map(|field| field.sort.clone())
+                    .collect::<Vec<_>>(),
+                &datatype_api_sort,
+                constructor_info,
+                Some((&datatype.name, carrier_core)),
+            ) {
+                identities.push(identity);
+            }
+
+            let Some(selector_cores) = context.constructor_selectors(&constructor_core) else {
+                replay_gaps.push(format!(
+                    "datatype constructor `{}::{}` lacks selector identity metadata",
+                    datatype.name, constructor.name
+                ));
+                continue;
+            };
+            if selector_cores.len() != constructor.fields.len() {
+                replay_gaps.push(format!(
+                    "datatype constructor `{}::{}` selector identity count disagrees with its declaration",
+                    datatype.name, constructor.name
+                ));
+                continue;
+            }
+            for (field, selector_core) in constructor.fields.iter().zip(selector_cores) {
+                let Some(selector_info) = context.exact_datatype_member_info(selector_core) else {
+                    replay_gaps.push(format!(
+                        "datatype selector `{}::{}` lacks exact member metadata",
+                        datatype.name, field.name
+                    ));
+                    continue;
+                };
+                if selector_info.declaration_kind()
+                    != ay_frontend::DeclarationKind::DatatypeSelector
+                    || context
+                        .dt_surface_name(selector_core)
+                        .unwrap_or(selector_core)
+                        != field.name
+                    || selector_info.arg_sorts.as_slice() != std::slice::from_ref(&carrier_sort)
+                    || selector_info.sort != solver.lower_live_sort(&field.sort)
+                {
+                    replay_gaps.push(format!(
+                        "datatype selector `{}::{}` has inconsistent live provenance",
+                        datatype.name, field.name
+                    ));
+                    continue;
+                }
+                if let Some(identity) = replay_symbol_identity(
+                    &field.name,
+                    selector_core,
+                    std::slice::from_ref(&datatype_api_sort),
+                    &field.sort,
+                    selector_info,
+                    Some((&datatype.name, carrier_core)),
+                ) {
+                    identities.push(identity);
+                }
+            }
+
+            let tester_surface = format!("is-{}", constructor.name);
+            let tester_core = format!("is-{constructor_core}");
+            let Some(tester_info) = context.exact_datatype_member_info(&tester_core) else {
+                replay_gaps.push(format!(
+                    "datatype tester `{tester_surface}` lacks exact member metadata"
+                ));
+                continue;
+            };
+            if tester_info.declaration_kind() != ay_frontend::DeclarationKind::DatatypeTester
+                || context
+                    .dt_surface_name(&tester_core)
+                    .unwrap_or(&tester_core)
+                    != tester_surface
+                || tester_info.arg_sorts.as_slice() != std::slice::from_ref(&carrier_sort)
+                || tester_info.sort != Sort::Bool
+            {
+                replay_gaps.push(format!(
+                    "datatype tester `{tester_surface}` has inconsistent live provenance"
+                ));
+                continue;
+            }
+            if let Some(identity) = replay_symbol_identity(
+                &tester_surface,
+                &tester_core,
+                std::slice::from_ref(&datatype_api_sort),
+                &Sort::Bool,
+                tester_info,
+                Some((&datatype.name, carrier_core)),
+            ) {
+                identities.push(identity);
+            }
+        }
+    }
+
+    identities.sort_by(|left, right| left.core_name.cmp(&right.core_name));
+    identities
 }
 
 struct ActiveAssertionMetadata {
@@ -1129,6 +1821,7 @@ fn solve_summary_from_details(
             available: details.verification.unsat_proof_available,
             clause_count: statistics.proof_clause_count,
             complete: statistics.proof_complete,
+            strictly_verified: details.verification.unsat_proof_strictly_verified,
             checker_failures: details.verification.unsat_proof_checker_failures,
             trust_fallbacks: statistics.get_int("proof_trust").unwrap_or(0),
         },
@@ -1211,8 +1904,11 @@ fn proof_evidence_status(result: &str, proof: &NativeReplayProofSummary) -> &'st
     if proof.checker_failures > 0 {
         return "checker-failed";
     }
-    if proof.available && proof.complete {
+    if proof.available && proof.complete && proof.strictly_verified {
         return "checked";
+    }
+    if proof.available && proof.complete {
+        return "available-unchecked";
     }
     if proof.available {
         return "available-incomplete";
@@ -1275,8 +1971,11 @@ fn validate_native_replay_identity_tables(
         nodes.insert(node.id, node);
     }
 
+    validate_native_replay_symbol_identity_table(artifact, &nodes)?;
+
     let mut declaration_terms = HashSet::default();
     let mut declaration_names = HashSet::default();
+    let mut declaration_core_names = HashSet::default();
     for declaration in &artifact.declarations {
         if !declaration_terms.insert(declaration.term) {
             return Err(native_replay_artifact_error(format!(
@@ -1288,6 +1987,26 @@ fn validate_native_replay_identity_tables(
             return Err(native_replay_artifact_error(format!(
                 "duplicate native constant declaration name `{}`",
                 declaration.name
+            )));
+        }
+        if ay_frontend::is_reserved_symbol(&declaration.name) {
+            return Err(native_replay_artifact_error(format!(
+                "native constant declaration name `{}` is reserved",
+                declaration.name
+            )));
+        }
+        if !declaration_core_names.insert(declaration.core_name.as_str()) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate native constant core identity `{}`",
+                declaration.core_name
+            )));
+        }
+        if declaration.core_name != declaration.name
+            && !is_allocator_private_declaration_identity(&declaration.core_name)
+        {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` claims an unauthorized private core identity `{}`",
+                declaration.name, declaration.core_name
             )));
         }
         let Some(node) = nodes.get(&declaration.term) else {
@@ -1302,19 +2021,10 @@ fn validate_native_replay_identity_tables(
                 declaration.name, declaration.term.0
             )));
         };
-        if node_name != &declaration.name {
+        if node_name != &declaration.core_name {
             return Err(native_replay_artifact_error(format!(
-                "declaration `{}` disagrees with term {} variable identity `{node_name}`",
-                declaration.name, declaration.term.0
-            )));
-        }
-        if declaration.sort.as_term_sort() != node.sort {
-            return Err(native_replay_artifact_error(format!(
-                "declaration `{}` lowers to sort {}, but term {} records {}",
-                declaration.name,
-                declaration.sort.as_term_sort(),
-                declaration.term.0,
-                node.sort
+                "declaration `{}` records core identity `{}`, but term {} uses `{node_name}`",
+                declaration.name, declaration.core_name, declaration.term.0
             )));
         }
         if node.is_datatype_constructor {
@@ -1343,6 +2053,1122 @@ fn validate_native_replay_identity_tables(
     Ok(())
 }
 
+fn serialized_symbol_uses_private_allocator_identity(name: &str) -> bool {
+    is_allocator_private_declaration_identity(name)
+        || name
+            .strip_prefix("is-")
+            .is_some_and(is_allocator_private_declaration_identity)
+}
+
+fn is_allocator_private_datatype_carrier_identity(name: &str) -> bool {
+    name.strip_prefix("__ay_datatype_sort_")
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn embedded_replay_function_identity(name: &str) -> Option<&str> {
+    name.strip_prefix("as-array[")
+        .and_then(|name| name.strip_suffix(']'))
+        .or_else(|| {
+            name.strip_prefix("map[")
+                .and_then(|name| name.strip_suffix(']'))
+        })
+}
+
+fn sort_uses_private_datatype_carrier(sort: &Sort) -> bool {
+    match sort {
+        Sort::Uninterpreted(name) => is_allocator_private_datatype_carrier_identity(name),
+        Sort::Array(array) => {
+            sort_uses_private_datatype_carrier(&array.index_sort)
+                || sort_uses_private_datatype_carrier(&array.element_sort)
+        }
+        Sort::Datatype(datatype) => datatype.constructors.iter().any(|constructor| {
+            constructor
+                .fields
+                .iter()
+                .any(|field| sort_uses_private_datatype_carrier(&field.sort))
+        }),
+        Sort::Seq(element) => sort_uses_private_datatype_carrier(element),
+        _ => false,
+    }
+}
+
+fn legacy_artifact_uses_private_declaration_identity(artifact: &NativeReplayArtifact) -> bool {
+    artifact.terms.iter().any(|node| {
+        sort_uses_private_datatype_carrier(&node.sort)
+            || match &node.data {
+                TermData::Var(name, _) => {
+                    node.is_datatype_constructor
+                        && serialized_symbol_uses_private_allocator_identity(name)
+                }
+                TermData::App(Symbol::Named(name), _) => {
+                    serialized_symbol_uses_private_allocator_identity(name)
+                        || embedded_replay_function_identity(name)
+                            .is_some_and(serialized_symbol_uses_private_allocator_identity)
+                }
+                TermData::Forall(vars, _, _) | TermData::Exists(vars, _, _) => vars
+                    .iter()
+                    .any(|(_, sort)| sort_uses_private_datatype_carrier(sort)),
+                _ => false,
+            }
+    })
+}
+
+fn validate_native_replay_symbol_identity_table(
+    artifact: &NativeReplayArtifact,
+    nodes: &HashMap<TermId, &NativeReplayTermNode>,
+) -> Result<(), SolverError> {
+    let datatype_declarations = datatype_declarations_from_events(&artifact.events);
+    let datatype_member_count: usize = datatype_declarations
+        .iter()
+        .map(|datatype| {
+            datatype
+                .constructors
+                .iter()
+                .map(|constructor| 2 + constructor.fields.len())
+                .sum::<usize>()
+        })
+        .sum();
+    let expected_count =
+        artifact.declarations.len() + artifact.function_declarations.len() + datatype_member_count;
+
+    // v1 artifacts before identity-table capture are compatible only when all
+    // declaration identities remained public. A private allocator spelling is
+    // not stable across replay declaration order and must fail closed.
+    if artifact.symbol_identities.is_empty() {
+        if artifact
+            .terms
+            .iter()
+            .any(|node| node.is_datatype_constructor)
+        {
+            return Err(native_replay_artifact_error(
+                "legacy artifact claims nullary datatype-constructor provenance without an authenticated identity row",
+            ));
+        }
+        if artifact.declarations.iter().any(|declaration| {
+            declaration.core_name != declaration.name
+                || ay_frontend::is_canonical_theory_operator_identity(&declaration.core_name)
+        }) || artifact.function_declarations.iter().any(|declaration| {
+            declaration.core_name != declaration.name
+                || ay_frontend::is_canonical_theory_operator_identity(&declaration.core_name)
+        }) || legacy_artifact_uses_private_declaration_identity(artifact)
+        {
+            return Err(native_replay_artifact_error(
+                "legacy artifact uses an unauthenticated private or canonical-theory declaration identity",
+            ));
+        }
+        return Ok(());
+    }
+
+    if artifact.symbol_identities.len() != expected_count {
+        return Err(native_replay_artifact_error(format!(
+            "native replay identity table has {} rows, expected {expected_count}",
+            artifact.symbol_identities.len()
+        )));
+    }
+
+    let mut core_names = HashSet::default();
+    let mut stable_keys = HashSet::default();
+    let mut datatype_carriers: HashMap<&str, &str> = HashMap::default();
+    let mut carrier_surfaces: HashMap<&str, &str> = HashMap::default();
+    for identity in &artifact.symbol_identities {
+        if !core_names.insert(identity.core_name.as_str()) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate replay symbol core identity `{}`",
+                identity.core_name
+            )));
+        }
+        if !stable_keys.insert((
+            identity.surface_name.as_str(),
+            identity.api_domain.as_slice(),
+            &identity.api_range,
+            identity.public_domain.as_slice(),
+            &identity.public_range,
+            identity.kind,
+        )) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate stable replay symbol identity for `{}`",
+                identity.surface_name
+            )));
+        }
+        let canonical_theory_core =
+            ay_frontend::is_canonical_theory_operator_identity(&identity.core_name);
+        if identity.kind == NativeReplaySymbolKind::Theory {
+            if !canonical_theory_core || identity.core_name != identity.surface_name {
+                return Err(native_replay_artifact_error(format!(
+                    "theory symbol `{}` does not own one raw canonical theory identity",
+                    identity.surface_name
+                )));
+            }
+        } else if canonical_theory_core {
+            return Err(native_replay_artifact_error(format!(
+                "non-theory symbol `{}` claims canonical theory identity `{}`",
+                identity.surface_name, identity.core_name
+            )));
+        }
+        let authorized_private_core =
+            is_allocator_private_declaration_identity(&identity.core_name)
+                || (identity.kind == NativeReplaySymbolKind::DatatypeTester
+                    && identity
+                        .core_name
+                        .strip_prefix("is-")
+                        .is_some_and(is_allocator_private_declaration_identity));
+        if identity.core_name != identity.surface_name && !authorized_private_core {
+            return Err(native_replay_artifact_error(format!(
+                "symbol `{}` claims unauthorized private core identity `{}`",
+                identity.surface_name, identity.core_name
+            )));
+        }
+
+        let is_datatype_member = matches!(
+            identity.kind,
+            NativeReplaySymbolKind::DatatypeConstructor
+                | NativeReplaySymbolKind::DatatypeSelector
+                | NativeReplaySymbolKind::DatatypeTester
+        );
+        match (
+            is_datatype_member,
+            identity.datatype_surface.as_deref(),
+            identity.datatype_core.as_deref(),
+        ) {
+            (true, Some(surface), Some(core)) => {
+                if core != surface && !is_allocator_private_datatype_carrier_identity(core) {
+                    return Err(native_replay_artifact_error(format!(
+                        "datatype `{surface}` claims unauthorized private carrier `{core}`"
+                    )));
+                }
+                let carrier_sort = Sort::Uninterpreted(core.to_string());
+                let owns_member = match identity.kind {
+                    NativeReplaySymbolKind::DatatypeConstructor => {
+                        identity.engine_range == carrier_sort
+                    }
+                    NativeReplaySymbolKind::DatatypeSelector
+                    | NativeReplaySymbolKind::DatatypeTester => {
+                        identity.engine_domain.as_slice() == std::slice::from_ref(&carrier_sort)
+                    }
+                    _ => false,
+                };
+                if !owns_member {
+                    return Err(native_replay_artifact_error(format!(
+                        "datatype member `{}` does not use its claimed carrier `{core}`",
+                        identity.surface_name
+                    )));
+                }
+                if let Some(previous) = datatype_carriers.insert(surface, core) {
+                    if previous != core {
+                        return Err(native_replay_artifact_error(format!(
+                            "datatype `{surface}` claims multiple exported carrier identities"
+                        )));
+                    }
+                }
+                if let Some(previous) = carrier_surfaces.insert(core, surface) {
+                    if previous != surface {
+                        return Err(native_replay_artifact_error(format!(
+                            "datatype carrier `{core}` is claimed by multiple public datatypes"
+                        )));
+                    }
+                }
+            }
+            (false, None, None) => {}
+            _ => {
+                return Err(native_replay_artifact_error(format!(
+                    "symbol `{}` has inconsistent datatype provenance",
+                    identity.surface_name
+                )));
+            }
+        }
+    }
+
+    for declaration in &artifact.declarations {
+        let node = nodes.get(&declaration.term).ok_or_else(|| {
+            native_replay_artifact_error(format!(
+                "declaration `{}` references missing term {}",
+                declaration.name, declaration.term.0
+            ))
+        })?;
+        let matching: Vec<_> = artifact
+            .symbol_identities
+            .iter()
+            .filter(|identity| {
+                identity.surface_name.eq(&declaration.name)
+                    && identity.core_name == declaration.core_name
+                    && identity.kind == NativeReplaySymbolKind::Uninterpreted
+                    && identity.api_domain.is_empty()
+                    && identity.api_range == declaration.sort
+                    && identity.public_domain.is_empty()
+                    && identity.engine_domain.is_empty()
+                    && identity.engine_range == node.sort
+            })
+            .collect();
+        if matching.len() != 1 {
+            return Err(native_replay_artifact_error(format!(
+                "constant declaration `{}` lacks one exact identity-table row",
+                declaration.name
+            )));
+        }
+    }
+
+    for declaration in &artifact.function_declarations {
+        let matching = artifact.symbol_identities.iter().filter(|identity| {
+            identity.surface_name.eq(&declaration.name)
+                && identity.core_name == declaration.core_name
+                && identity.api_domain == declaration.domain
+                && identity.api_range == declaration.range
+                && matches!(
+                    identity.kind,
+                    NativeReplaySymbolKind::Uninterpreted | NativeReplaySymbolKind::Theory
+                )
+                && identity.datatype_surface.is_none()
+        });
+        if matching.count() != 1 {
+            return Err(native_replay_artifact_error(format!(
+                "function declaration `{}` lacks one exact identity-table row",
+                declaration.name
+            )));
+        }
+    }
+
+    let mut expected_datatype_members: HashMap<(String, String, NativeReplaySymbolKind), usize> =
+        HashMap::default();
+    for datatype in &datatype_declarations {
+        for constructor in &datatype.constructors {
+            *expected_datatype_members
+                .entry((
+                    datatype.name.clone(),
+                    constructor.name.clone(),
+                    NativeReplaySymbolKind::DatatypeConstructor,
+                ))
+                .or_default() += 1;
+            *expected_datatype_members
+                .entry((
+                    datatype.name.clone(),
+                    format!("is-{}", constructor.name),
+                    NativeReplaySymbolKind::DatatypeTester,
+                ))
+                .or_default() += 1;
+            for field in &constructor.fields {
+                *expected_datatype_members
+                    .entry((
+                        datatype.name.clone(),
+                        field.name.clone(),
+                        NativeReplaySymbolKind::DatatypeSelector,
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+    for identity in artifact.symbol_identities.iter().filter(|identity| {
+        matches!(
+            identity.kind,
+            NativeReplaySymbolKind::DatatypeConstructor
+                | NativeReplaySymbolKind::DatatypeSelector
+                | NativeReplaySymbolKind::DatatypeTester
+        )
+    }) {
+        let datatype_surface = identity.datatype_surface.as_deref().unwrap_or_default();
+        let datatype = datatype_declarations
+            .iter()
+            .find(|datatype| datatype.name == datatype_surface)
+            .ok_or_else(|| {
+                native_replay_artifact_error(format!(
+                    "identity row `{}` names missing datatype `{datatype_surface}`",
+                    identity.surface_name
+                ))
+            })?;
+        let datatype_sort = Sort::Datatype(datatype.clone());
+        let api_signature_matches = match identity.kind {
+            NativeReplaySymbolKind::DatatypeConstructor => datatype
+                .constructors
+                .iter()
+                .find(|constructor| constructor.name == identity.surface_name)
+                .is_some_and(|constructor| {
+                    identity.api_domain
+                        == constructor
+                            .fields
+                            .iter()
+                            .map(|field| field.sort.clone())
+                            .collect::<Vec<_>>()
+                        && identity.api_range == datatype_sort
+                }),
+            NativeReplaySymbolKind::DatatypeSelector => {
+                let mut fields = datatype
+                    .constructors
+                    .iter()
+                    .flat_map(|constructor| &constructor.fields)
+                    .filter(|field| field.name == identity.surface_name);
+                fields.next().is_some_and(|field| {
+                    fields.next().is_none()
+                        && identity.api_domain.as_slice() == std::slice::from_ref(&datatype_sort)
+                        && identity.api_range == field.sort
+                })
+            }
+            NativeReplaySymbolKind::DatatypeTester => identity
+                .surface_name
+                .strip_prefix("is-")
+                .and_then(|constructor_name| {
+                    datatype
+                        .constructors
+                        .iter()
+                        .find(|constructor| constructor.name == constructor_name)
+                })
+                .is_some_and(|_| {
+                    identity.api_domain.as_slice() == std::slice::from_ref(&datatype_sort)
+                        && identity.api_range == Sort::Bool
+                }),
+            _ => false,
+        };
+        if !api_signature_matches {
+            return Err(native_replay_artifact_error(format!(
+                "datatype member `{}` has an API signature inconsistent with `{datatype_surface}`",
+                identity.surface_name
+            )));
+        }
+        let key = (
+            datatype_surface.to_string(),
+            identity.surface_name.clone(),
+            identity.kind,
+        );
+        let Some(remaining) = expected_datatype_members.get_mut(&key) else {
+            return Err(native_replay_artifact_error(format!(
+                "identity row `{}` is not a member of its claimed datatype",
+                identity.surface_name
+            )));
+        };
+        let Some(next) = remaining.checked_sub(1) else {
+            return Err(native_replay_artifact_error(format!(
+                "identity table repeats datatype member `{}`",
+                identity.surface_name
+            )));
+        };
+        *remaining = next;
+    }
+    if expected_datatype_members
+        .values()
+        .any(|&remaining| remaining != 0)
+    {
+        return Err(native_replay_artifact_error(
+            "native replay identity table omits a declared datatype member",
+        ));
+    }
+
+    // A positive nullary-constructor marker changes a Var from a free value to
+    // a datatype inhabitant. Authenticate that claim against one exact row;
+    // ordinary constants with the same spelling must never be accepted here.
+    for node in artifact
+        .terms
+        .iter()
+        .filter(|node| node.is_datatype_constructor)
+    {
+        let TermData::Var(core_name, _) = &node.data else {
+            // The outer identity-table validator already reports this shape.
+            continue;
+        };
+        let mut matching = artifact.symbol_identities.iter().filter(|identity| {
+            identity.core_name == core_name.as_str()
+                && identity.kind == NativeReplaySymbolKind::DatatypeConstructor
+                && identity.api_domain.is_empty()
+                && identity.engine_domain.is_empty()
+                && identity.engine_range == node.sort
+                && identity.datatype_surface.is_some()
+                && identity.datatype_core.is_some()
+        });
+        if matching.next().is_none() || matching.next().is_some() {
+            return Err(native_replay_artifact_error(format!(
+                "term {} lacks one exact nullary datatype-constructor identity row for `{core_name}`",
+                node.id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct NativeReplayIdentityRemap {
+    cores: HashMap<String, String>,
+    reverse_cores: HashMap<String, String>,
+    nullary_constructors: HashMap<String, String>,
+    carriers: HashMap<String, String>,
+    reverse_carriers: HashMap<String, String>,
+}
+
+impl NativeReplayIdentityRemap {
+    fn insert_core(&mut self, old: &str, new: &str) -> Result<(), SolverError> {
+        if let Some(existing) = self.cores.insert(old.to_string(), new.to_string()) {
+            if existing != new {
+                return Err(native_replay_artifact_error(format!(
+                    "exported core identity `{old}` maps to both `{existing}` and `{new}`"
+                )));
+            }
+        }
+        if let Some(existing) = self.reverse_cores.insert(new.to_string(), old.to_string()) {
+            if existing != old {
+                return Err(native_replay_artifact_error(format!(
+                    "rebuilt core identity `{new}` is claimed by both `{existing}` and `{old}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_carrier(&mut self, old: &str, new: &str) -> Result<(), SolverError> {
+        if let Some(existing) = self.carriers.insert(old.to_string(), new.to_string()) {
+            if existing != new {
+                return Err(native_replay_artifact_error(format!(
+                    "exported datatype carrier `{old}` maps to both `{existing}` and `{new}`"
+                )));
+            }
+        }
+        if let Some(existing) = self
+            .reverse_carriers
+            .insert(new.to_string(), old.to_string())
+        {
+            if existing != old {
+                return Err(native_replay_artifact_error(format!(
+                    "rebuilt datatype carrier `{new}` is claimed by both `{existing}` and `{old}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_nullary_constructor(&mut self, old: &str, new: &str) -> Result<(), SolverError> {
+        if self.cores.get(old).map(String::as_str) != Some(new) {
+            return Err(native_replay_artifact_error(format!(
+                "nullary datatype constructor `{old}` lacks its exact authenticated core remap"
+            )));
+        }
+        if let Some(existing) = self
+            .nullary_constructors
+            .insert(old.to_string(), new.to_string())
+        {
+            if existing != new {
+                return Err(native_replay_artifact_error(format!(
+                    "nullary datatype constructor `{old}` maps to both `{existing}` and `{new}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn remap_sort(&self, sort: &Sort) -> Result<Sort, SolverError> {
+        match sort {
+            Sort::Uninterpreted(name) => {
+                if let Some(mapped) = self.carriers.get(name) {
+                    Ok(Sort::Uninterpreted(mapped.clone()))
+                } else if is_allocator_private_datatype_carrier_identity(name) {
+                    Err(native_replay_artifact_error(format!(
+                        "private datatype carrier `{name}` lacks an authenticated remap row"
+                    )))
+                } else {
+                    Ok(sort.clone())
+                }
+            }
+            Sort::Array(array) => Ok(Sort::array(
+                self.remap_sort(&array.index_sort)?,
+                self.remap_sort(&array.element_sort)?,
+            )),
+            Sort::Datatype(datatype) => Ok(Sort::Datatype(DatatypeSort {
+                name: datatype.name.clone(),
+                constructors: datatype
+                    .constructors
+                    .iter()
+                    .map(|constructor| {
+                        Ok(DatatypeConstructor {
+                            name: constructor.name.clone(),
+                            fields: constructor
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    Ok(DatatypeField {
+                                        name: field.name.clone(),
+                                        sort: self.remap_sort(&field.sort)?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, SolverError>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, SolverError>>()?,
+            })),
+            Sort::Seq(element) => Ok(Sort::seq(self.remap_sort(element)?)),
+            _ => Ok(sort.clone()),
+        }
+    }
+
+    fn remap_public_sort(
+        &self,
+        sort: &ay_frontend::PublicSort,
+    ) -> Result<ay_frontend::PublicSort, SolverError> {
+        match sort {
+            ay_frontend::PublicSort::Core(sort) => {
+                Ok(ay_frontend::PublicSort::Core(self.remap_sort(sort)?))
+            }
+            ay_frontend::PublicSort::Array(index, element) => Ok(ay_frontend::PublicSort::Array(
+                Box::new(self.remap_public_sort(index)?),
+                Box::new(self.remap_public_sort(element)?),
+            )),
+            ay_frontend::PublicSort::Seq(element) => Ok(ay_frontend::PublicSort::Seq(Box::new(
+                self.remap_public_sort(element)?,
+            ))),
+            ay_frontend::PublicSort::FiniteSet(element) => Ok(ay_frontend::PublicSort::FiniteSet(
+                Box::new(self.remap_public_sort(element)?),
+            )),
+            ay_frontend::PublicSort::AmbiguousSet(element) => Ok(
+                ay_frontend::PublicSort::AmbiguousSet(Box::new(self.remap_public_sort(element)?)),
+            ),
+            ay_frontend::PublicSort::Unknown => Ok(ay_frontend::PublicSort::Unknown),
+            _ => Ok(sort.clone()),
+        }
+    }
+
+    fn remap_application_name(&self, name: &str) -> Result<String, SolverError> {
+        if let Some(mapped) = self.cores.get(name) {
+            return Ok(mapped.clone());
+        }
+        if let Some(function) = name
+            .strip_prefix("as-array[")
+            .and_then(|name| name.strip_suffix(']'))
+        {
+            if let Some(mapped) = self.cores.get(function) {
+                return Ok(format!("as-array[{mapped}]"));
+            }
+            if serialized_symbol_uses_private_allocator_identity(function) {
+                return Err(native_replay_artifact_error(format!(
+                    "embedded as-array identity `{function}` lacks an authenticated remap row"
+                )));
+            }
+        }
+        if let Some(function) = name
+            .strip_prefix("map[")
+            .and_then(|name| name.strip_suffix(']'))
+        {
+            if let Some(mapped) = self.cores.get(function) {
+                return Ok(format!("map[{mapped}]"));
+            }
+            if serialized_symbol_uses_private_allocator_identity(function) {
+                return Err(native_replay_artifact_error(format!(
+                    "embedded array-map identity `{function}` lacks an authenticated remap row"
+                )));
+            }
+        }
+        if serialized_symbol_uses_private_allocator_identity(name) {
+            return Err(native_replay_artifact_error(format!(
+                "private application identity `{name}` lacks an authenticated remap row"
+            )));
+        }
+        Ok(name.to_string())
+    }
+
+    fn remap_term_node(
+        &self,
+        node: &NativeReplayTermNode,
+    ) -> Result<NativeReplayTermNode, SolverError> {
+        let data = match &node.data {
+            TermData::Var(name, id) if node.is_datatype_constructor => {
+                let Some(mapped) = self.nullary_constructors.get(name).cloned() else {
+                    return Err(native_replay_artifact_error(format!(
+                        "nullary datatype constructor identity `{name}` lacks an exact authenticated remap row"
+                    )));
+                };
+                TermData::Var(mapped, *id)
+            }
+            TermData::App(Symbol::Named(name), args) => TermData::App(
+                Symbol::Named(self.remap_application_name(name)?),
+                args.clone(),
+            ),
+            // Binder spellings are not declaration identities. Replay gives
+            // every binder a fresh alpha identity after rebuilding its
+            // children, then rewrites only the exact source Var nodes captured
+            // by that lexical scope. Keeping the authored spelling here is
+            // necessary for that source-graph capture analysis.
+            TermData::Let(bindings, body) => TermData::Let(bindings.clone(), *body),
+            TermData::Forall(vars, body, triggers) => {
+                let vars = vars
+                    .iter()
+                    .map(|(name, sort)| Ok((name.clone(), self.remap_sort(sort)?)))
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                TermData::Forall(vars, *body, triggers.clone())
+            }
+            TermData::Exists(vars, body, triggers) => {
+                let vars = vars
+                    .iter()
+                    .map(|(name, sort)| Ok((name.clone(), self.remap_sort(sort)?)))
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                TermData::Exists(vars, *body, triggers.clone())
+            }
+            data => data.clone(),
+        };
+        Ok(NativeReplayTermNode {
+            id: node.id,
+            sort: self.remap_sort(&node.sort)?,
+            data,
+            is_datatype_constructor: node.is_datatype_constructor,
+        })
+    }
+}
+
+fn frontend_symbol_kind(kind: NativeReplaySymbolKind) -> ay_frontend::DeclarationKind {
+    match kind {
+        NativeReplaySymbolKind::Uninterpreted => ay_frontend::DeclarationKind::Uninterpreted,
+        NativeReplaySymbolKind::Theory => ay_frontend::DeclarationKind::Theory,
+        NativeReplaySymbolKind::DatatypeConstructor => {
+            ay_frontend::DeclarationKind::DatatypeConstructor
+        }
+        NativeReplaySymbolKind::DatatypeSelector => ay_frontend::DeclarationKind::DatatypeSelector,
+        NativeReplaySymbolKind::DatatypeTester => ay_frontend::DeclarationKind::DatatypeTester,
+    }
+}
+
+fn exact_replayed_nullary_constructor_term(
+    solver: &Solver,
+    identity: &str,
+    expected_sort: &Sort,
+) -> Option<TermId> {
+    let context = solver.executor.context();
+    let (carrier, _) = context.is_constructor(identity)?;
+    if !context.is_live_datatype_carrier(&carrier) {
+        return None;
+    }
+    let info = context.symbol_info_by_identity(identity)?;
+    let exact = context.exact_datatype_member_info(identity)?;
+    let expected_kind = ay_frontend::DeclarationKind::DatatypeConstructor;
+    if info.declaration_id() != exact.declaration_id()
+        || info.declaration_kind() != expected_kind
+        || exact.declaration_kind() != expected_kind
+        || context.effective_declaration_kind(info.declaration_id()) != Some(expected_kind)
+        || !info.arg_sorts.is_empty()
+        || !exact.arg_sorts.is_empty()
+        || &info.sort != expected_sort
+        || &exact.sort != expected_sort
+        || info.term != exact.term
+    {
+        return None;
+    }
+    let term = info.term?;
+    if solver.terms().sort(term) != expected_sort
+        || !matches!(solver.terms().get(term), TermData::Var(name, _) if name == identity)
+    {
+        return None;
+    }
+    Some(term)
+}
+
+fn replay_native_declarations_in_event_order(
+    artifact: &NativeReplayArtifact,
+    solver: &mut Solver,
+) -> Result<(NativeReplayIdentityRemap, HashMap<TermId, TermId>), SolverError> {
+    let mut remap = NativeReplayIdentityRemap::default();
+    let constants: HashMap<_, _> = artifact
+        .declarations
+        .iter()
+        .map(|declaration| (declaration.term, declaration))
+        .collect();
+    let functions: HashMap<_, _> = artifact
+        .function_declarations
+        .iter()
+        .map(|declaration| (declaration.name.as_str(), declaration))
+        .collect();
+    let nodes: HashMap<_, _> = artifact.terms.iter().map(|node| (node.id, node)).collect();
+    let expected_datatypes = datatype_declarations_from_events(&artifact.events);
+    let mut rebuilt_constants = HashMap::default();
+    let mut seen_constants = HashSet::default();
+    let mut seen_functions = HashSet::default();
+    let mut seen_datatypes = Vec::new();
+
+    for event in &artifact.events {
+        match &event.kind {
+            NativeReplayEventKind::DeclareConst { name, term, sort } => {
+                let Some(declaration) = constants.get(term).copied() else {
+                    continue;
+                };
+                let node = nodes.get(term).copied().ok_or_else(|| {
+                    native_replay_artifact_error(format!(
+                        "constant declaration event `{name}` references missing term {}",
+                        term.0
+                    ))
+                })?;
+                if name != &declaration.name || sort != &node.sort {
+                    return Err(native_replay_artifact_error(format!(
+                        "constant declaration event for term {} disagrees with its retained declaration",
+                        term.0
+                    )));
+                }
+                if !seen_constants.insert(*term) {
+                    return Err(native_replay_artifact_error(format!(
+                        "constant term {} has duplicate declaration events",
+                        term.0
+                    )));
+                }
+                let rebuilt = solver
+                    .try_declare_const(&declaration.name, declaration.sort.clone())?
+                    .id();
+                let rebuilt_core =
+                    authenticated_native_constant_core_name(solver, &declaration.name, rebuilt)
+                        .ok_or_else(|| {
+                            native_replay_artifact_error(format!(
+                        "replayed declaration `{}` lacks exact live frontend identity metadata",
+                        declaration.name
+                    ))
+                        })?;
+                authenticate_replayed_constant_identity(
+                    artifact,
+                    solver,
+                    declaration,
+                    rebuilt,
+                    &rebuilt_core,
+                    &mut remap,
+                )?;
+                rebuilt_constants.insert(*term, rebuilt);
+            }
+            NativeReplayEventKind::DeclareFun {
+                name,
+                domain,
+                range,
+            } => {
+                let Some(declaration) = functions.get(name.as_str()).copied() else {
+                    continue;
+                };
+                if domain != &declaration.domain || range != &declaration.range {
+                    return Err(native_replay_artifact_error(format!(
+                        "function declaration event `{name}` disagrees with its retained declaration"
+                    )));
+                }
+                if !seen_functions.insert(name.clone()) {
+                    return Err(native_replay_artifact_error(format!(
+                        "function `{name}` has duplicate declaration events"
+                    )));
+                }
+                let rebuilt =
+                    solver.try_declare_fun(name, &declaration.domain, declaration.range.clone())?;
+                authenticate_replayed_function_identity(
+                    artifact,
+                    solver,
+                    declaration,
+                    &rebuilt,
+                    &mut remap,
+                )?;
+            }
+            NativeReplayEventKind::DeclareDatatype { datatype } => {
+                if seen_datatypes.contains(datatype) {
+                    continue;
+                }
+                solver.try_declare_datatype(datatype)?;
+                authenticate_replayed_datatype_identity(artifact, solver, datatype, &mut remap)?;
+                seen_datatypes.push(datatype.clone());
+            }
+            _ => {}
+        }
+    }
+
+    if seen_constants.len() != artifact.declarations.len() {
+        return Err(native_replay_artifact_error(
+            "retained native constant lacks one declaration event",
+        ));
+    }
+    if seen_functions.len() != artifact.function_declarations.len() {
+        return Err(native_replay_artifact_error(
+            "retained native function lacks one declaration event",
+        ));
+    }
+    if seen_datatypes.len() != expected_datatypes.len() {
+        return Err(native_replay_artifact_error(
+            "retained native datatype lacks one declaration event",
+        ));
+    }
+    Ok((remap, rebuilt_constants))
+}
+
+fn authenticate_replayed_datatype_identity(
+    artifact: &NativeReplayArtifact,
+    solver: &Solver,
+    datatype: &DatatypeSort,
+    remap: &mut NativeReplayIdentityRemap,
+) -> Result<(), SolverError> {
+    if artifact.symbol_identities.is_empty() {
+        return Ok(());
+    }
+
+    let identities: Vec<_> = artifact
+        .symbol_identities
+        .iter()
+        .filter(|identity| identity.datatype_surface.as_deref() == Some(datatype.name.as_str()))
+        .collect();
+    let old_core = identities
+        .first()
+        .and_then(|identity| identity.datatype_core.as_deref())
+        .ok_or_else(|| {
+            native_replay_artifact_error(format!(
+                "replayed datatype `{}` lacks an authenticated carrier row",
+                datatype.name
+            ))
+        })?;
+    let rebuilt = solver.lower_live_sort(&Sort::Uninterpreted(datatype.name.clone()));
+    let Sort::Uninterpreted(new_carrier_core) = rebuilt else {
+        return Err(native_replay_artifact_error(format!(
+            "replayed datatype `{}` lacks one nominal engine carrier",
+            datatype.name
+        )));
+    };
+    if !solver
+        .executor
+        .context()
+        .is_live_datatype_carrier(&new_carrier_core)
+    {
+        return Err(native_replay_artifact_error(format!(
+            "replayed datatype `{}` carrier `{new_carrier_core}` is not live",
+            datatype.name
+        )));
+    }
+    remap.insert_carrier(old_core, &new_carrier_core)?;
+    let _ = remap.remap_sort(&Sort::Datatype(datatype.clone()))?;
+
+    for identity in identities {
+        for sort in &identity.api_domain {
+            let _ = remap.remap_sort(sort)?;
+        }
+        let _ = remap.remap_sort(&identity.api_range)?;
+        let engine_domain: Vec<_> = identity
+            .engine_domain
+            .iter()
+            .map(|sort| remap.remap_sort(sort))
+            .collect::<Result<Vec<_>, SolverError>>()?;
+        let engine_range = remap.remap_sort(&identity.engine_range)?;
+        let public_domain: Vec<_> = identity
+            .public_domain
+            .iter()
+            .map(|sort| remap.remap_public_sort(sort))
+            .collect::<Result<Vec<_>, SolverError>>()?;
+        let public_range = remap.remap_public_sort(&identity.public_range)?;
+        let expected_kind = frontend_symbol_kind(identity.kind);
+        let context = solver.executor.context();
+        let mut matches = context.symbols_iter().filter(|(surface, info)| {
+            surface.as_str() == identity.surface_name.as_str()
+                && info.arg_sorts == engine_domain
+                && info.sort == engine_range
+                && info.public_arg_sorts == public_domain
+                && info.public_sort == public_range
+                && info.declaration_kind() == expected_kind
+                && context.effective_declaration_kind(info.declaration_id()) == Some(expected_kind)
+        });
+        let (surface, info) = matches.next().ok_or_else(|| {
+            native_replay_artifact_error(format!(
+                "datatype member `{}` has no exact rebuilt declaration",
+                identity.surface_name
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(native_replay_artifact_error(format!(
+                "datatype member `{}` has an ambiguous rebuilt declaration",
+                identity.surface_name
+            )));
+        }
+        let new_member_core = context.symbol_identity_name(surface, info).to_string();
+        let exact = context
+            .exact_datatype_member_info(&new_member_core)
+            .is_some_and(|exact| {
+                exact.declaration_id() == info.declaration_id()
+                    && exact.declaration_kind() == expected_kind
+                    && exact.arg_sorts == engine_domain
+                    && exact.sort == engine_range
+            });
+        if !exact {
+            return Err(native_replay_artifact_error(format!(
+                "datatype member `{}` lacks exact rebuilt member provenance",
+                identity.surface_name
+            )));
+        }
+        let rebuilt_carrier = Sort::Uninterpreted(new_carrier_core.clone());
+        let carrier_matches = match identity.kind {
+            NativeReplaySymbolKind::DatatypeConstructor => engine_range == rebuilt_carrier,
+            NativeReplaySymbolKind::DatatypeSelector | NativeReplaySymbolKind::DatatypeTester => {
+                engine_domain.as_slice() == std::slice::from_ref(&rebuilt_carrier)
+            }
+            _ => false,
+        };
+        if !carrier_matches {
+            return Err(native_replay_artifact_error(format!(
+                "datatype member `{}` is not owned by its claimed carrier `{carrier}`",
+                identity.surface_name,
+                carrier = datatype.name
+            )));
+        }
+        let is_nullary_constructor = identity.kind == NativeReplaySymbolKind::DatatypeConstructor
+            && identity.api_domain.is_empty();
+        if is_nullary_constructor
+            && exact_replayed_nullary_constructor_term(solver, &new_member_core, &engine_range)
+                .is_none()
+        {
+            return Err(native_replay_artifact_error(format!(
+                "datatype constructor `{}` lacks exact live nullary-term provenance",
+                identity.surface_name
+            )));
+        }
+        remap.insert_core(&identity.core_name, &new_member_core)?;
+        if is_nullary_constructor {
+            remap.insert_nullary_constructor(&identity.core_name, &new_member_core)?;
+        }
+    }
+    Ok(())
+}
+
+fn authenticate_replayed_function_identity(
+    artifact: &NativeReplayArtifact,
+    solver: &Solver,
+    declaration: &NativeReplayFunctionDeclaration,
+    rebuilt: &FuncDecl,
+    remap: &mut NativeReplayIdentityRemap,
+) -> Result<(), SolverError> {
+    let identity = artifact.symbol_identities.iter().find(|identity| {
+        identity.core_name == declaration.core_name
+            && identity.surface_name.eq(&declaration.name)
+            && matches!(
+                identity.kind,
+                NativeReplaySymbolKind::Uninterpreted | NativeReplaySymbolKind::Theory
+            )
+    });
+    if artifact.symbol_identities.is_empty() {
+        remap.insert_core(&declaration.core_name, rebuilt.core_name())?;
+        return Ok(());
+    }
+    let Some(identity) = identity else {
+        return Err(native_replay_artifact_error(format!(
+            "function `{}` lacks an authenticated identity row",
+            declaration.name
+        )));
+    };
+    if identity.api_domain != declaration.domain
+        || identity.api_range != declaration.range
+        || rebuilt.domain != declaration.domain
+        || rebuilt.range != declaration.range
+    {
+        return Err(native_replay_artifact_error(format!(
+            "function `{}` has inconsistent exact native API sort identity",
+            declaration.name
+        )));
+    }
+    for sort in &identity.api_domain {
+        let _ = remap.remap_sort(sort)?;
+    }
+    let _ = remap.remap_sort(&identity.api_range)?;
+    let engine_domain: Vec<_> = identity
+        .engine_domain
+        .iter()
+        .map(|sort| remap.remap_sort(sort))
+        .collect::<Result<Vec<_>, SolverError>>()?;
+    let engine_range = remap.remap_sort(&identity.engine_range)?;
+    let public_domain: Vec<_> = identity
+        .public_domain
+        .iter()
+        .map(|sort| remap.remap_public_sort(sort))
+        .collect::<Result<Vec<_>, SolverError>>()?;
+    let public_range = remap.remap_public_sort(&identity.public_range)?;
+    let expected_kind = frontend_symbol_kind(identity.kind);
+    let context = solver.executor.context();
+    let mut matches = context.symbols_iter().filter(|(surface, info)| {
+        surface.as_str() == declaration.name.as_str()
+            && context.symbol_identity_name(surface, info) == rebuilt.core_name()
+            && info.arg_sorts == engine_domain
+            && info.sort == engine_range
+            && info.public_arg_sorts == public_domain
+            && info.public_sort == public_range
+            && info.declaration_kind() == expected_kind
+            && context.effective_declaration_kind(info.declaration_id()) == Some(expected_kind)
+    });
+    if matches.next().is_none() || matches.next().is_some() {
+        return Err(native_replay_artifact_error(format!(
+            "function `{}` did not rebuild to one exact live identity",
+            declaration.name
+        )));
+    }
+    remap.insert_core(&identity.core_name, rebuilt.core_name())
+}
+
+fn authenticate_replayed_constant_identity(
+    artifact: &NativeReplayArtifact,
+    solver: &Solver,
+    declaration: &NativeReplayDeclaration,
+    rebuilt: TermId,
+    rebuilt_core_name: &str,
+    remap: &mut NativeReplayIdentityRemap,
+) -> Result<(), SolverError> {
+    if artifact.symbol_identities.is_empty() {
+        return remap.insert_core(&declaration.core_name, rebuilt_core_name);
+    }
+    let identity = artifact
+        .symbol_identities
+        .iter()
+        .find(|identity| {
+            identity.core_name == declaration.core_name
+                && identity.surface_name.eq(&declaration.name)
+                && identity.kind == NativeReplaySymbolKind::Uninterpreted
+                && identity.engine_domain.is_empty()
+        })
+        .ok_or_else(|| {
+            native_replay_artifact_error(format!(
+                "constant `{}` lacks an authenticated identity row",
+                declaration.name
+            ))
+        })?;
+    if !identity.api_domain.is_empty() || identity.api_range != declaration.sort {
+        return Err(native_replay_artifact_error(format!(
+            "constant `{}` has inconsistent exact native API sort identity",
+            declaration.name
+        )));
+    }
+    let _ = remap.remap_sort(&identity.api_range)?;
+    let engine_range = remap.remap_sort(&identity.engine_range)?;
+    let public_range = remap.remap_public_sort(&identity.public_range)?;
+    let context = solver.executor.context();
+    let mut matches = context.symbols_iter().filter(|(surface, info)| {
+        surface.as_str() == declaration.name.as_str()
+            && info.term == Some(rebuilt)
+            && context.symbol_identity_name(surface, info) == rebuilt_core_name
+            && info.arg_sorts.is_empty()
+            && info.public_arg_sorts.is_empty()
+            && info.sort == engine_range
+            && info.public_sort == public_range
+            && info.declaration_kind() == ay_frontend::DeclarationKind::Uninterpreted
+            && context.effective_declaration_kind(info.declaration_id())
+                == Some(ay_frontend::DeclarationKind::Uninterpreted)
+    });
+    if matches.next().is_none() || matches.next().is_some() {
+        return Err(native_replay_artifact_error(format!(
+            "constant `{}` did not rebuild to its exact live identity",
+            declaration.name
+        )));
+    }
+    remap.insert_core(&identity.core_name, rebuilt_core_name)
+}
+
+/// Validate public declaration sorts only after replay has reconstructed the
+/// live nominal-sort registry.  Context-free lowering cannot distinguish two
+/// scoped datatype incarnations with the same surface name.
+fn validate_native_replay_declaration_sorts(
+    artifact: &NativeReplayArtifact,
+    solver: &Solver,
+    remap: &NativeReplayIdentityRemap,
+) -> Result<(), SolverError> {
+    let nodes: HashMap<_, _> = artifact.terms.iter().map(|node| (node.id, node)).collect();
+    for declaration in &artifact.declarations {
+        let node = nodes.get(&declaration.term).ok_or_else(|| {
+            native_replay_artifact_error(format!(
+                "declaration `{}` references missing term {}",
+                declaration.name, declaration.term.0
+            ))
+        })?;
+        let _ = remap.remap_sort(&declaration.sort)?;
+        let lowered = solver.lower_live_sort(&declaration.sort);
+        let recorded_sort = remap.remap_sort(&node.sort)?;
+        if lowered != recorded_sort {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` lowers in the replay context to sort {lowered}, but term {} records {recorded_sort}",
+                declaration.name, declaration.term.0
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn reason_phase(reason: &crate::UnknownReason) -> &'static str {
     match reason {
         crate::UnknownReason::Timeout
@@ -1356,9 +3182,12 @@ fn reason_phase(reason: &crate::UnknownReason) -> &'static str {
 
 fn rebuild_term_node(
     solver: &mut Solver,
+    source_node: &NativeReplayTermNode,
     node: &NativeReplayTermNode,
     declarations: &HashMap<TermId, &NativeReplayDeclaration>,
+    source_nodes: &HashMap<TermId, &NativeReplayTermNode>,
     term_map: &HashMap<TermId, TermId>,
+    predeclared_constants: &HashMap<TermId, TermId>,
 ) -> Result<TermId, SolverError> {
     match &node.data {
         TermData::Const(constant) => match constant {
@@ -1373,34 +3202,33 @@ fn rebuild_term_node(
         },
         TermData::Var(name, _) => {
             if let Some(decl) = declarations.get(&node.id) {
-                Ok(solver.try_declare_const(&decl.name, decl.sort.clone())?.0)
+                predeclared_constants.get(&node.id).copied().ok_or_else(|| {
+                    native_replay_artifact_error(format!(
+                        "constant `{}` was not rebuilt at its declaration event",
+                        decl.name
+                    ))
+                })
             } else if node.is_datatype_constructor {
                 // Nullary datatype constructors are stored as Vars. Reuse the
-                // term registered by the replayed datatype declaration so
-                // constructor distinctness/exhaustiveness applies to this node.
-                solver
-                    .executor
-                    .context()
-                    .symbol_info_by_identity(name)
-                    .and_then(|info| info.term)
-                    .ok_or_else(|| {
-                        native_replay_json_error(format!(
-                            "term {} claims nullary datatype-constructor provenance for missing constructor `{name}`",
-                            node.id
-                        ))
-                    })
+                // exact term registered by the authenticated replayed datatype
+                // declaration. A same-named ordinary constant is not enough.
+                exact_replayed_nullary_constructor_term(solver, name, &node.sort).ok_or_else(|| {
+                    native_replay_artifact_error(format!(
+                        "term {} claims nullary datatype-constructor provenance without one exact live constructor `{name}`",
+                        node.id.0
+                    ))
+                })
             } else {
-                if ay_frontend::is_reserved_symbol(name) {
-                    return Err(SolverError::InvalidArgument {
-                        operation: "native_replay",
-                        message: format!(
-                            "artifact contains undeclared variable in reserved namespace `{name}`"
-                        ),
-                    });
-                }
+                // An artifact Var not owned by a declaration is an identity in
+                // its own right, even when its old spelling happens to equal a
+                // declaration core allocated in this fresh replay. Reusing the
+                // spelling would let it alias that live declaration through
+                // name-based quantifier machinery. Give every such node a
+                // replay-local identity; enclosing binders subsequently replace
+                // the exact source nodes they capture with their own alpha vars.
                 Ok(solver
                     .terms_mut()
-                    .mk_fresh_named_var(name.clone(), node.sort.clone()))
+                    .mk_fresh_var("__ay_native_replay_var", node.sort.clone()))
             }
         }
         TermData::App(symbol, args) => {
@@ -1408,11 +3236,52 @@ fn rebuild_term_node(
             rebuild_application(solver, node, symbol, args, mapped)
         }
         TermData::Let(bindings, body) => {
-            let mapped_bindings = bindings
+            let mapped_values = bindings
                 .iter()
-                .map(|(name, term)| Ok((name.clone(), map_term(*term, term_map)?)))
+                .map(|(_, term)| map_term(*term, term_map))
                 .collect::<Result<Vec<_>, SolverError>>()?;
-            let mapped_body = map_term(*body, term_map)?;
+            let source_bindings = match &source_node.data {
+                TermData::Let(source_bindings, source_body) if source_body == body => {
+                    source_bindings
+                }
+                _ => {
+                    return Err(native_replay_term_error(
+                        node.id,
+                        "identity remap changed the shape of a let expression",
+                    ));
+                }
+            };
+            let source_expected = source_bindings
+                .iter()
+                .map(|(name, value)| {
+                    let value_node = source_nodes.get(value).ok_or_else(|| {
+                        native_replay_term_error(
+                            node.id,
+                            format!("let binding references missing term {}", value.0),
+                        )
+                    })?;
+                    Ok((name.clone(), value_node.sort.clone()))
+                })
+                .collect::<Result<Vec<_>, SolverError>>()?;
+            let captures =
+                capture_source_bound_terms(source_nodes, node.id, &source_expected, &[*body])?;
+            let replay_sorts = mapped_values
+                .iter()
+                .map(|value| solver.terms().sort(*value).clone())
+                .collect::<Vec<_>>();
+            let (alpha_names, substitutions) =
+                build_replay_alpha_bindings(solver, node.id, &replay_sorts, &captures, term_map)?;
+            let mapped_bindings = alpha_names
+                .into_iter()
+                .zip(mapped_values)
+                .collect::<Vec<_>>();
+            let rebuilt_body = map_term(*body, term_map)?;
+            let mapped_body = alpha_substitute_replay_term(
+                solver.terms_mut(),
+                rebuilt_body,
+                &substitutions,
+                node.id,
+            )?;
             if solver.terms().sort(mapped_body) != &node.sort {
                 return Err(native_replay_term_error(
                     node.id,
@@ -1446,23 +3315,274 @@ fn rebuild_term_node(
             Ok(solver.terms_mut().mk_ite(cond, then_term, else_term))
         }
         TermData::Forall(vars, body, triggers) => {
-            let body = map_term(*body, term_map)?;
-            let triggers = map_triggers(triggers, term_map)?;
-            validate_replay_quantifier(solver, node.id, vars, body, &triggers)?;
+            let (vars, body, triggers) = rebuild_alpha_quantifier(
+                solver,
+                source_node,
+                node,
+                vars,
+                *body,
+                triggers,
+                source_nodes,
+                term_map,
+            )?;
+            validate_replay_quantifier(solver, node.id, &vars, body, &triggers)?;
             Ok(solver
                 .terms_mut()
-                .mk_forall_with_triggers(vars.clone(), body, triggers))
+                .mk_forall_with_triggers(vars, body, triggers))
         }
         TermData::Exists(vars, body, triggers) => {
-            let body = map_term(*body, term_map)?;
-            let triggers = map_triggers(triggers, term_map)?;
-            validate_replay_quantifier(solver, node.id, vars, body, &triggers)?;
+            let (vars, body, triggers) = rebuild_alpha_quantifier(
+                solver,
+                source_node,
+                node,
+                vars,
+                *body,
+                triggers,
+                source_nodes,
+                term_map,
+            )?;
+            validate_replay_quantifier(solver, node.id, &vars, body, &triggers)?;
             Ok(solver
                 .terms_mut()
-                .mk_exists_with_triggers(vars.clone(), body, triggers))
+                .mk_exists_with_triggers(vars, body, triggers))
         }
         _ => unreplayable_term("future term kind", node.id),
     }
+}
+
+/// Rebuild one quantifier with a replay-local alpha identity for every binder.
+///
+/// Capture is computed over the serialized source DAG, before declaration-core
+/// remapping. That distinction is essential: a private declaration core can be
+/// rebuilt under a public spelling that happens to equal an unrelated binder.
+/// Matching after remapping would capture it accidentally. Conversely, a native
+/// caller may deliberately use a declared constant as a quantifier variable;
+/// the source TermId capture set lets us replace that occurrence contextually
+/// without ever reusing the live declaration term as the bound variable.
+fn rebuild_alpha_quantifier(
+    solver: &mut Solver,
+    source_node: &NativeReplayTermNode,
+    node: &NativeReplayTermNode,
+    replay_vars: &[(String, Sort)],
+    body: TermId,
+    triggers: &[Vec<TermId>],
+    source_nodes: &HashMap<TermId, &NativeReplayTermNode>,
+    term_map: &HashMap<TermId, TermId>,
+) -> Result<(Vec<(String, Sort)>, TermId, Vec<Vec<TermId>>), SolverError> {
+    let (source_vars, source_body, source_triggers) = match (&source_node.data, &node.data) {
+        (
+            TermData::Forall(source_vars, source_body, source_triggers),
+            TermData::Forall(_, replay_body, replay_triggers),
+        )
+        | (
+            TermData::Exists(source_vars, source_body, source_triggers),
+            TermData::Exists(_, replay_body, replay_triggers),
+        ) if source_body == replay_body && source_triggers == replay_triggers => {
+            (source_vars, *source_body, source_triggers)
+        }
+        _ => {
+            return Err(native_replay_term_error(
+                node.id,
+                "identity remap changed the shape of a quantifier",
+            ));
+        }
+    };
+    if source_body != body || source_triggers != triggers || source_vars.len() != replay_vars.len()
+    {
+        return Err(native_replay_term_error(
+            node.id,
+            "quantifier source and replay signatures disagree",
+        ));
+    }
+
+    let mut roots = Vec::with_capacity(1 + source_triggers.iter().map(Vec::len).sum::<usize>());
+    roots.push(source_body);
+    roots.extend(source_triggers.iter().flatten().copied());
+    let captures = capture_source_bound_terms(source_nodes, node.id, source_vars, &roots)?;
+    let replay_sorts = replay_vars
+        .iter()
+        .map(|(_, sort)| sort.clone())
+        .collect::<Vec<_>>();
+    let (alpha_names, substitutions) =
+        build_replay_alpha_bindings(solver, node.id, &replay_sorts, &captures, term_map)?;
+    let alpha_vars = alpha_names
+        .into_iter()
+        .zip(replay_sorts)
+        .collect::<Vec<_>>();
+
+    let mapped_body = map_term(body, term_map)?;
+    let body =
+        alpha_substitute_replay_term(solver.terms_mut(), mapped_body, &substitutions, node.id)?;
+    let mapped_triggers = map_triggers(triggers, term_map)?;
+    let triggers = mapped_triggers
+        .into_iter()
+        .map(|multi| {
+            multi
+                .into_iter()
+                .map(|trigger| {
+                    alpha_substitute_replay_term(
+                        solver.terms_mut(),
+                        trigger,
+                        &substitutions,
+                        node.id,
+                    )
+                })
+                .collect::<Result<Vec<_>, SolverError>>()
+        })
+        .collect::<Result<Vec<_>, SolverError>>()?;
+    Ok((alpha_vars, body, triggers))
+}
+
+/// Mint one fresh bound Var per lexical binder and translate serialized capture
+/// TermIds into substitutions over the already-rebuilt child DAG.
+fn build_replay_alpha_bindings(
+    solver: &mut Solver,
+    owner: TermId,
+    replay_sorts: &[Sort],
+    captures: &[Vec<TermId>],
+    term_map: &HashMap<TermId, TermId>,
+) -> Result<(Vec<String>, HashMap<TermId, TermId>), SolverError> {
+    if replay_sorts.len() != captures.len() {
+        return Err(native_replay_term_error(
+            owner,
+            "binder capture table has the wrong arity",
+        ));
+    }
+
+    let mut alpha_names = Vec::with_capacity(replay_sorts.len());
+    let mut substitutions = HashMap::default();
+    for (sort, captured) in replay_sorts.iter().zip(captures) {
+        let alpha = solver
+            .terms_mut()
+            .mk_fresh_var("__ay_native_replay_bound", sort.clone());
+        let alpha_name = match solver.terms().get(alpha) {
+            TermData::Var(name, _) => name.clone(),
+            _ => {
+                return Err(native_replay_term_error(
+                    owner,
+                    "fresh replay binder did not produce a variable",
+                ));
+            }
+        };
+        alpha_names.push(alpha_name);
+
+        for &source_term in captured {
+            let replay_term = map_term(source_term, term_map)?;
+            if let Some(previous) = substitutions.insert(replay_term, alpha) {
+                if previous != alpha {
+                    return Err(native_replay_term_error(
+                        owner,
+                        format!("source term {} is captured by two bindings", source_term.0),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((alpha_names, substitutions))
+}
+
+/// Simultaneously replace exact child identities throughout a rebuilt replay
+/// term, including quantifier triggers. Nested binders have already undergone
+/// their own alpha reconstruction because replay nodes are topologically
+/// ordered, so a replacement left in a nested body is precisely an occurrence
+/// captured by the current outer binder.
+fn alpha_substitute_replay_term(
+    terms: &mut TermStore,
+    root: TermId,
+    substitutions: &HashMap<TermId, TermId>,
+    owner: TermId,
+) -> Result<TermId, SolverError> {
+    fn visit(
+        terms: &mut TermStore,
+        term: TermId,
+        substitutions: &HashMap<TermId, TermId>,
+        cache: &mut HashMap<TermId, TermId>,
+        owner: TermId,
+    ) -> Result<TermId, SolverError> {
+        if let Some(&replacement) = substitutions.get(&term) {
+            return Ok(replacement);
+        }
+        if let Some(&rebuilt) = cache.get(&term) {
+            return Ok(rebuilt);
+        }
+
+        let data = terms.get(term).clone();
+        let sort = terms.sort(term).clone();
+        let rebuilt = match data {
+            TermData::Const(_) | TermData::Var(_, _) => term,
+            TermData::App(symbol, args) => {
+                let args = args
+                    .into_iter()
+                    .map(|arg| visit(terms, arg, substitutions, cache, owner))
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                terms.mk_app(symbol, args, sort)
+            }
+            TermData::Let(bindings, body) => {
+                let bindings = bindings
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Ok((name, visit(terms, value, substitutions, cache, owner)?))
+                    })
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                let body = visit(terms, body, substitutions, cache, owner)?;
+                terms.mk_let(bindings, body)
+            }
+            TermData::Not(inner) => {
+                let inner = visit(terms, inner, substitutions, cache, owner)?;
+                terms.mk_not(inner)
+            }
+            TermData::Ite(condition, then_term, else_term) => {
+                let condition = visit(terms, condition, substitutions, cache, owner)?;
+                let then_term = visit(terms, then_term, substitutions, cache, owner)?;
+                let else_term = visit(terms, else_term, substitutions, cache, owner)?;
+                terms.mk_ite(condition, then_term, else_term)
+            }
+            TermData::Forall(vars, body, triggers) => {
+                let body = visit(terms, body, substitutions, cache, owner)?;
+                let triggers = triggers
+                    .into_iter()
+                    .map(|multi| {
+                        multi
+                            .into_iter()
+                            .map(|trigger| visit(terms, trigger, substitutions, cache, owner))
+                            .collect::<Result<Vec<_>, SolverError>>()
+                    })
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                let quantifier = terms.mk_forall_with_triggers(vars, body, triggers);
+                terms.copy_quantifier_metadata(term, quantifier);
+                quantifier
+            }
+            TermData::Exists(vars, body, triggers) => {
+                let body = visit(terms, body, substitutions, cache, owner)?;
+                let triggers = triggers
+                    .into_iter()
+                    .map(|multi| {
+                        multi
+                            .into_iter()
+                            .map(|trigger| visit(terms, trigger, substitutions, cache, owner))
+                            .collect::<Result<Vec<_>, SolverError>>()
+                    })
+                    .collect::<Result<Vec<_>, SolverError>>()?;
+                let quantifier = terms.mk_exists_with_triggers(vars, body, triggers);
+                terms.copy_quantifier_metadata(term, quantifier);
+                quantifier
+            }
+            _ => {
+                return Err(native_replay_term_error(
+                    owner,
+                    "alpha-renaming encountered an unsupported future term kind",
+                ));
+            }
+        };
+        cache.insert(term, rebuilt);
+        Ok(rebuilt)
+    }
+
+    if substitutions.is_empty() {
+        return Ok(root);
+    }
+    let mut cache = HashMap::default();
+    visit(terms, root, substitutions, &mut cache, owner)
 }
 
 fn rebuild_application(
@@ -1512,7 +3632,10 @@ fn rebuild_application(
                 .symbol_info_by_identity(name)
                 .cloned();
             if let Some(declaration) = declaration {
-                let is_native_function = solver.native_fun_signatures.contains_key(name);
+                let is_native_function = solver
+                    .native_fun_signatures
+                    .values()
+                    .any(|registration| registration.core_name == *name);
                 if declaration.term.is_some() && !is_native_function {
                     return Err(native_replay_term_error(
                         node.id,
@@ -1531,7 +3654,11 @@ fn rebuild_application(
                     &actual_domain,
                     &node.sort,
                 )?;
-                let args: Vec<Term> = mapped_args.iter().copied().map(Term).collect();
+                let args: Vec<Term> = mapped_args
+                    .iter()
+                    .copied()
+                    .map(|id| solver.wrap_term(id))
+                    .collect();
                 let rebuilt = solver.try_apply(&function, &args).map_err(|error| {
                     native_replay_term_error(
                         node.id,
@@ -1540,7 +3667,13 @@ fn rebuild_application(
                         ),
                     )
                 })?;
-                return validate_rebuilt_application(solver, node, symbol, &mapped_args, rebuilt.0);
+                return validate_rebuilt_application(
+                    solver,
+                    node,
+                    symbol,
+                    &mapped_args,
+                    rebuilt.id(),
+                );
             }
 
             if let Some(function) = name
@@ -1584,15 +3717,16 @@ fn rebuild_const_array(
         ));
     };
 
+    let value = solver.wrap_term(*value);
     let rebuilt = solver
-        .try_const_array(array.index_sort.clone(), Term(*value))
+        .try_const_array(array.index_sort.clone(), value)
         .map_err(|error| {
             native_replay_term_error(
                 node.id,
                 format!("cannot reconstruct `const-array`: {error}"),
             )
         })?;
-    let actual_sort = solver.terms().sort(rebuilt.0);
+    let actual_sort = solver.terms().sort(rebuilt.id());
     if actual_sort != &node.sort {
         return Err(native_replay_term_error(
             node.id,
@@ -1602,7 +3736,7 @@ fn rebuild_const_array(
             ),
         ));
     }
-    Ok(rebuilt.0)
+    Ok(rebuilt.id())
 }
 
 fn rebuild_as_array(
@@ -1718,7 +3852,7 @@ fn authenticate_function_signature(
     let bindings: Vec<(String, TermId)> = arguments
         .iter()
         .enumerate()
-        .map(|(index, argument)| (format!("native_replay_function_arg_{index}"), argument.0))
+        .map(|(index, argument)| (format!("native_replay_function_arg_{index}"), argument.id()))
         .collect();
     let parsed = ay_frontend::Term::App(
         name.to_string(),
@@ -1729,7 +3863,7 @@ fn authenticate_function_signature(
     );
     let application = solver
         .executor
-        .context_mut()
+        .context_mut_internal()
         .elaborate_surface_subterm_with_bindings(&parsed, &bindings)
         .ok_or_else(|| {
             native_replay_term_error(
@@ -1755,19 +3889,44 @@ fn replayed_function_declaration(
     actual_domain: &[Sort],
     actual_range: &Sort,
 ) -> Result<FuncDecl, SolverError> {
-    let Some((declared_domain, declared_range)) = solver.native_fun_signatures.get(name) else {
+    let native_registration = solver
+        .native_fun_signatures
+        .iter()
+        .find(|(_, registration)| registration.core_name == name);
+    let Some((surface_name, registration)) = native_registration else {
         if registered.arg_sorts != actual_domain || &registered.sort != actual_range {
             return Err(native_replay_term_error(
                 node,
                 format!("registered datatype member `{name}` has a different signature"),
             ));
         }
-        return Ok(FuncDecl::new(
+        let context = solver.executor.context();
+        let surface_name = context
+            .symbols_iter()
+            .find_map(|(surface, info)| {
+                (context.symbol_identity_name(surface, info) == name).then(|| surface.clone())
+            })
+            .ok_or_else(|| {
+                native_replay_term_error(
+                    node,
+                    format!("registered function identity `{name}` has no public binding"),
+                )
+            })?;
+        let identity = FrontendFuncDeclIdentity::new(
+            context.source_context_stamp(),
+            registered.declaration_id().clone(),
+            registered.declaration_kind(),
+        );
+        return Ok(FuncDecl::with_frontend_identity(
+            surface_name,
             name.to_string(),
             registered.arg_sorts.clone(),
             registered.sort.clone(),
+            identity,
         ));
     };
+    let declared_domain = &registration.domain;
+    let declared_range = &registration.range;
     if declared_domain.len() != actual_domain.len() {
         return Err(native_replay_term_error(
             node,
@@ -1782,25 +3941,31 @@ fn replayed_function_declaration(
     let domain_matches = declared_domain
         .iter()
         .zip(actual_domain)
-        .all(|(declared, actual)| bind_native_replay_sort(declared, actual, &mut type_bindings));
-    if !domain_matches || !bind_native_replay_sort(declared_range, actual_range, &mut type_bindings)
+        .all(|(declared, actual)| {
+            bind_native_replay_sort(solver, declared, actual, &mut type_bindings)
+        });
+    if !domain_matches
+        || !bind_native_replay_sort(solver, declared_range, actual_range, &mut type_bindings)
     {
         return Err(native_replay_term_error(
             node,
             format!("function `{name}` has a different replayed signature"),
         ));
     }
-    Ok(FuncDecl::new(
-        name.to_string(),
+    Ok(FuncDecl::with_frontend_identity(
+        surface_name.clone(),
+        registration.core_name.clone(),
         declared_domain
             .iter()
             .map(|sort| instantiate_native_replay_sort(sort, &type_bindings))
             .collect(),
         instantiate_native_replay_sort(declared_range, &type_bindings),
+        registration.identity.clone(),
     ))
 }
 
 fn bind_native_replay_sort(
+    solver: &Solver,
     declared: &Sort,
     actual: &Sort,
     bindings: &mut HashMap<String, Sort>,
@@ -1815,8 +3980,9 @@ fn bind_native_replay_sort(
         },
         Sort::Array(declared) => match actual {
             Sort::Array(actual) => {
-                bind_native_replay_sort(&declared.index_sort, &actual.index_sort, bindings)
+                bind_native_replay_sort(solver, &declared.index_sort, &actual.index_sort, bindings)
                     && bind_native_replay_sort(
+                        solver,
                         &declared.element_sort,
                         &actual.element_sort,
                         bindings,
@@ -1825,10 +3991,10 @@ fn bind_native_replay_sort(
             _ => false,
         },
         Sort::Seq(declared) => match actual {
-            Sort::Seq(actual) => bind_native_replay_sort(declared, actual, bindings),
+            Sort::Seq(actual) => bind_native_replay_sort(solver, declared, actual, bindings),
             _ => false,
         },
-        _ => declared.as_term_sort() == actual.clone(),
+        _ => solver.lower_live_sort(declared) == *actual,
     }
 }
 
@@ -1873,7 +4039,7 @@ fn rebuild_builtin_application(
     };
     let rebuilt = solver
         .executor
-        .context_mut()
+        .context_mut_internal()
         .elaborate_surface_subterm_with_bindings(&parsed, &bindings)
         .ok_or_else(|| {
             native_replay_term_error(
@@ -1935,6 +4101,13 @@ fn native_replay_artifact_error(message: impl Into<String>) -> SolverError {
 fn native_replay_proof_error(message: impl Into<String>) -> SolverError {
     SolverError::InvalidArgument {
         operation: "native_replay_with_checked_proof",
+        message: message.into(),
+    }
+}
+
+fn native_replay_evidence_error(message: impl Into<String>) -> SolverError {
+    SolverError::InvalidArgument {
+        operation: "native_replay_for_evidence",
         message: message.into(),
     }
 }
@@ -2017,7 +4190,7 @@ fn validate_replay_quantifier(
 
     let expected: Vec<(String, Sort)> = vars
         .iter()
-        .map(|(name, sort)| (name.clone(), sort.as_term_sort()))
+        .map(|(name, sort)| (name.clone(), sort.clone()))
         .collect();
     let coverage = validate_bound_name_occurrences(solver.terms(), node, &expected, &roots)?;
     if coverage
@@ -2039,32 +4212,75 @@ struct NativeReplayShadowScope {
     names: HashSet<usize>,
 }
 
+enum NativeReplayBinderGraph<'a> {
+    Live(&'a TermStore),
+    Source(&'a HashMap<TermId, &'a NativeReplayTermNode>),
+}
+
+impl NativeReplayBinderGraph<'_> {
+    fn node(&self, term: TermId) -> Option<(TermData, Sort)> {
+        match self {
+            Self::Live(terms) => Some((terms.get(term).clone(), terms.sort(term).clone())),
+            Self::Source(nodes) => nodes
+                .get(&term)
+                .map(|node| (node.data.clone(), node.sort.clone())),
+        }
+    }
+}
+
 struct NativeReplayBinderScan<'a> {
-    terms: &'a TermStore,
+    graph: NativeReplayBinderGraph<'a>,
     owner: TermId,
     expected: HashMap<String, (usize, Sort)>,
+    captured: Vec<HashSet<TermId>>,
     scopes: Vec<NativeReplayShadowScope>,
     shadow_cache: HashMap<(usize, usize), bool>,
     work: usize,
 }
 
 impl<'a> NativeReplayBinderScan<'a> {
-    fn new(
+    fn new_live(
         terms: &'a TermStore,
         owner: TermId,
         bindings: &[(String, Sort)],
     ) -> Result<Self, SolverError> {
+        Self::new(NativeReplayBinderGraph::Live(terms), owner, bindings)
+    }
+
+    fn new_source(
+        nodes: &'a HashMap<TermId, &'a NativeReplayTermNode>,
+        owner: TermId,
+        bindings: &[(String, Sort)],
+    ) -> Result<Self, SolverError> {
+        Self::new(NativeReplayBinderGraph::Source(nodes), owner, bindings)
+    }
+
+    fn new(
+        graph: NativeReplayBinderGraph<'a>,
+        owner: TermId,
+        bindings: &[(String, Sort)],
+    ) -> Result<Self, SolverError> {
         let mut scan = Self {
-            terms,
+            graph,
             owner,
             expected: HashMap::default(),
+            captured: (0..bindings.len()).map(|_| HashSet::default()).collect(),
             scopes: Vec::new(),
             shadow_cache: HashMap::default(),
             work: 0,
         };
         for (index, (name, sort)) in bindings.iter().enumerate() {
             scan.charge()?;
-            scan.expected.insert(name.clone(), (index, sort.clone()));
+            if scan
+                .expected
+                .insert(name.clone(), (index, sort.clone()))
+                .is_some()
+            {
+                return Err(native_replay_term_error(
+                    owner,
+                    format!("binder repeats binding `{name}`"),
+                ));
+            }
         }
         Ok(scan)
     }
@@ -2152,20 +4368,26 @@ impl<'a> NativeReplayBinderScan<'a> {
                 continue;
             }
             self.charge()?;
-            match self.terms.get(term).clone() {
+            let Some((data, actual_sort)) = self.graph.node(term) else {
+                return Err(native_replay_term_error(
+                    self.owner,
+                    format!("binder references missing term {}", term.0),
+                ));
+            };
+            match data {
                 TermData::Const(_) => {}
                 TermData::Var(candidate, _) => {
                     if let Some((index, expected)) = self.expected.get(&candidate).cloned() {
                         if !self.is_shadowed(scope, index)? {
-                            let actual = self.terms.sort(term);
-                            if actual != &expected {
+                            if actual_sort != expected {
                                 return Err(native_replay_term_error(
                                     self.owner,
                                     format!(
-                                        "bound variable `{candidate}` is declared as {expected} but occurs as {actual}"
+                                        "bound variable `{candidate}` is declared as {expected} but occurs as {actual_sort}"
                                     ),
                                 ));
                             }
+                            self.captured[index].insert(term);
                             found = true;
                         }
                     }
@@ -2218,7 +4440,7 @@ fn validate_bound_name_occurrences(
     expected: &[(String, Sort)],
     roots: &[TermId],
 ) -> Result<Vec<bool>, SolverError> {
-    let mut scan = NativeReplayBinderScan::new(terms, owner, expected)?;
+    let mut scan = NativeReplayBinderScan::new_live(terms, owner, expected)?;
     let mut root_cache = HashMap::default();
     roots
         .iter()
@@ -2231,6 +4453,33 @@ fn validate_bound_name_occurrences(
             Ok(found)
         })
         .collect()
+}
+
+/// Return the exact serialized Var TermIds captured by each binding, preserving
+/// binding order. Capture is resolved before declaration remapping and respects
+/// nested let/quantifier shadowing.
+fn capture_source_bound_terms(
+    nodes: &HashMap<TermId, &NativeReplayTermNode>,
+    owner: TermId,
+    expected: &[(String, Sort)],
+    roots: &[TermId],
+) -> Result<Vec<Vec<TermId>>, SolverError> {
+    let mut scan = NativeReplayBinderScan::new_source(nodes, owner, expected)?;
+    let mut root_cache = HashSet::default();
+    for &root in roots {
+        if root_cache.insert(root) {
+            let _ = scan.scan_root(root)?;
+        }
+    }
+    Ok(scan
+        .captured
+        .into_iter()
+        .map(|captured| {
+            let mut captured = captured.into_iter().collect::<Vec<_>>();
+            captured.sort_by_key(|term| term.0);
+            captured
+        })
+        .collect())
 }
 
 fn map_term(id: TermId, term_map: &HashMap<TermId, TermId>) -> Result<TermId, SolverError> {
@@ -2347,6 +4596,7 @@ fn datatype_sort_json(datatype: &DatatypeSort) -> Value {
 fn declaration_json(declaration: &NativeReplayDeclaration) -> Value {
     json!({
         "name": declaration.name,
+        "core_name": declaration.core_name,
         "term": declaration.term.0,
         "sort": declaration.sort.to_string(),
         "sort_data": sort_json(&declaration.sort),
@@ -2356,10 +4606,61 @@ fn declaration_json(declaration: &NativeReplayDeclaration) -> Value {
 fn function_declaration_json(declaration: &NativeReplayFunctionDeclaration) -> Value {
     json!({
         "name": declaration.name,
+        "core_name": declaration.core_name,
         "domain": declaration.domain.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "domain_data": declaration.domain.iter().map(sort_json).collect::<Vec<_>>(),
         "range": declaration.range.to_string(),
         "range_data": sort_json(&declaration.range),
+    })
+}
+
+fn symbol_kind_json(kind: NativeReplaySymbolKind) -> &'static str {
+    match kind {
+        NativeReplaySymbolKind::Uninterpreted => "uninterpreted",
+        NativeReplaySymbolKind::Theory => "theory",
+        NativeReplaySymbolKind::DatatypeConstructor => "datatype_constructor",
+        NativeReplaySymbolKind::DatatypeSelector => "datatype_selector",
+        NativeReplaySymbolKind::DatatypeTester => "datatype_tester",
+    }
+}
+
+fn public_sort_json(sort: &ay_frontend::PublicSort) -> Value {
+    match sort {
+        ay_frontend::PublicSort::Core(sort) => {
+            json!({ "kind": "core", "sort": sort_json(sort) })
+        }
+        ay_frontend::PublicSort::Array(index, element) => json!({
+            "kind": "array",
+            "index": public_sort_json(index),
+            "element": public_sort_json(element),
+        }),
+        ay_frontend::PublicSort::Seq(element) => {
+            json!({ "kind": "seq", "element": public_sort_json(element) })
+        }
+        ay_frontend::PublicSort::FiniteSet(element) => {
+            json!({ "kind": "finite_set", "element": public_sort_json(element) })
+        }
+        ay_frontend::PublicSort::AmbiguousSet(element) => {
+            json!({ "kind": "ambiguous_set", "element": public_sort_json(element) })
+        }
+        ay_frontend::PublicSort::Unknown => json!({ "kind": "unknown" }),
+        _ => json!({ "kind": "future", "debug": format!("{sort:?}") }),
+    }
+}
+
+fn symbol_identity_json(identity: &NativeReplaySymbolIdentity) -> Value {
+    json!({
+        "surface_name": identity.surface_name,
+        "core_name": identity.core_name,
+        "api_domain": identity.api_domain.iter().map(sort_json).collect::<Vec<_>>(),
+        "api_range": sort_json(&identity.api_range),
+        "public_domain": identity.public_domain.iter().map(public_sort_json).collect::<Vec<_>>(),
+        "public_range": public_sort_json(&identity.public_range),
+        "engine_domain": identity.engine_domain.iter().map(sort_json).collect::<Vec<_>>(),
+        "engine_range": sort_json(&identity.engine_range),
+        "kind": symbol_kind_json(identity.kind),
+        "datatype_surface": identity.datatype_surface,
+        "datatype_core": identity.datatype_core,
     })
 }
 
@@ -2462,6 +4763,7 @@ fn solve_json(solve: &NativeReplaySolveSummary) -> Value {
             "available": solve.proof.available,
             "clause_count": solve.proof.clause_count,
             "complete": solve.proof.complete,
+            "strictly_verified": solve.proof.strictly_verified,
             "checker_failures": solve.proof.checker_failures,
             "trust_fallbacks": solve.proof.trust_fallbacks,
         },
@@ -2693,6 +4995,19 @@ fn native_replay_artifact_from_json(value: &Value) -> Result<NativeReplayArtifac
             .iter()
             .map(function_declaration_from_json)
             .collect::<Result<Vec<_>, SolverError>>()?,
+        symbol_identities: match optional_field(object, "symbol_identities")? {
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| {
+                    native_replay_json_error(
+                        "native replay field `symbol_identities` must be an array".to_string(),
+                    )
+                })?
+                .iter()
+                .map(symbol_identity_from_json)
+                .collect::<Result<Vec<_>, SolverError>>()?,
+            None => Vec::new(),
+        },
         assertions: required_array(object, "assertions")?
             .iter()
             .map(assertion_from_json)
@@ -2707,6 +5022,9 @@ fn native_replay_artifact_from_json(value: &Value) -> Result<NativeReplayArtifac
         checked_replay: optional_field(object, "checked_replay")?
             .map(checked_replay_from_json)
             .transpose()?,
+        // Diagnostic JSON may retain a comparison summary, but never the
+        // in-process authority proving which exact artifact was replayed.
+        admission_token: None,
         panic_payload: optional_string(object, "panic_payload")?,
         unsupported_atoms: string_array(object, "unsupported_atoms")?,
         replay_gaps: string_array(object, "replay_gaps")?,
@@ -2731,8 +5049,13 @@ fn metadata_from_json(value: Option<&Value>) -> Result<NativeReplayMetadata, Sol
 
 fn declaration_from_json(value: &Value) -> Result<NativeReplayDeclaration, SolverError> {
     let object = json_object(value, "declaration")?;
+    let name = required_string(object, "name")?;
     Ok(NativeReplayDeclaration {
-        name: required_string(object, "name")?,
+        // v1 artifacts predating explicit private-core capture used the public
+        // name as their only identity. Preserve that safe legacy case; an old
+        // artifact whose node actually uses a private name fails validation.
+        core_name: optional_string(object, "core_name")?.unwrap_or_else(|| name.clone()),
+        name,
         term: required_term_id(object, "term")?,
         sort: sort_field(object, "sort", "sort_data")?,
     })
@@ -2742,10 +5065,77 @@ fn function_declaration_from_json(
     value: &Value,
 ) -> Result<NativeReplayFunctionDeclaration, SolverError> {
     let object = json_object(value, "function_declaration")?;
+    let name = required_string(object, "name")?;
     Ok(NativeReplayFunctionDeclaration {
-        name: required_string(object, "name")?,
+        core_name: optional_string(object, "core_name")?.unwrap_or_else(|| name.clone()),
+        name,
         domain: sort_array_field(object, "domain", "domain_data")?,
         range: sort_field(object, "range", "range_data")?,
+    })
+}
+
+fn symbol_kind_from_json(value: &str) -> Result<NativeReplaySymbolKind, SolverError> {
+    match value {
+        "uninterpreted" => Ok(NativeReplaySymbolKind::Uninterpreted),
+        "theory" => Ok(NativeReplaySymbolKind::Theory),
+        "datatype_constructor" => Ok(NativeReplaySymbolKind::DatatypeConstructor),
+        "datatype_selector" => Ok(NativeReplaySymbolKind::DatatypeSelector),
+        "datatype_tester" => Ok(NativeReplaySymbolKind::DatatypeTester),
+        other => Err(native_replay_json_error(format!(
+            "unsupported native replay symbol kind `{other}`"
+        ))),
+    }
+}
+
+fn public_sort_from_json(value: &Value) -> Result<ay_frontend::PublicSort, SolverError> {
+    let object = json_object(value, "public_sort")?;
+    match required_string(object, "kind")?.as_str() {
+        "core" => Ok(ay_frontend::PublicSort::Core(sort_from_json(
+            required_field(object, "sort")?,
+        )?)),
+        "array" => Ok(ay_frontend::PublicSort::Array(
+            Box::new(public_sort_from_json(required_field(object, "index")?)?),
+            Box::new(public_sort_from_json(required_field(object, "element")?)?),
+        )),
+        "seq" => Ok(ay_frontend::PublicSort::Seq(Box::new(
+            public_sort_from_json(required_field(object, "element")?)?,
+        ))),
+        "finite_set" => Ok(ay_frontend::PublicSort::FiniteSet(Box::new(
+            public_sort_from_json(required_field(object, "element")?)?,
+        ))),
+        "ambiguous_set" => Ok(ay_frontend::PublicSort::AmbiguousSet(Box::new(
+            public_sort_from_json(required_field(object, "element")?)?,
+        ))),
+        "unknown" => Ok(ay_frontend::PublicSort::Unknown),
+        other => Err(native_replay_json_error(format!(
+            "unsupported native replay public sort kind `{other}`"
+        ))),
+    }
+}
+
+fn symbol_identity_from_json(value: &Value) -> Result<NativeReplaySymbolIdentity, SolverError> {
+    let object = json_object(value, "symbol_identity")?;
+    Ok(NativeReplaySymbolIdentity {
+        surface_name: required_string(object, "surface_name")?,
+        core_name: required_string(object, "core_name")?,
+        api_domain: required_array(object, "api_domain")?
+            .iter()
+            .map(sort_from_json)
+            .collect::<Result<Vec<_>, SolverError>>()?,
+        api_range: sort_from_json(required_field(object, "api_range")?)?,
+        public_domain: required_array(object, "public_domain")?
+            .iter()
+            .map(public_sort_from_json)
+            .collect::<Result<Vec<_>, SolverError>>()?,
+        public_range: public_sort_from_json(required_field(object, "public_range")?)?,
+        engine_domain: required_array(object, "engine_domain")?
+            .iter()
+            .map(sort_from_json)
+            .collect::<Result<Vec<_>, SolverError>>()?,
+        engine_range: sort_from_json(required_field(object, "engine_range")?)?,
+        kind: symbol_kind_from_json(&required_string(object, "kind")?)?,
+        datatype_surface: optional_string(object, "datatype_surface")?,
+        datatype_core: optional_string(object, "datatype_core")?,
     })
 }
 
@@ -2897,6 +5287,7 @@ fn proof_summary_from_json(value: &Value) -> Result<NativeReplayProofSummary, So
         available: required_bool(object, "available")?,
         clause_count: required_u64(object, "clause_count")?,
         complete: required_bool(object, "complete")?,
+        strictly_verified: optional_bool(object, "strictly_verified")?.unwrap_or(false),
         checker_failures: required_u64(object, "checker_failures")?,
         trust_fallbacks: required_u64(object, "trust_fallbacks")?,
     })

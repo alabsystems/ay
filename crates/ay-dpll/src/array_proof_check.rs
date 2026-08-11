@@ -242,7 +242,7 @@ pub fn check_array_clause(terms: &TermStore, clause: &[TermId]) -> ArrayStepVerd
         solver.assert_term(negated);
     }
 
-    let result = solver.check_sat();
+    let result = solver.check_sat_internal_query();
     if result.is_unsat() {
         ArrayStepVerdict::Valid
     } else if result.is_sat() {

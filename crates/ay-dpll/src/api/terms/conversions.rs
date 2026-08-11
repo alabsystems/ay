@@ -26,8 +26,10 @@ impl Solver {
     /// [`int_to_real`]: Solver::int_to_real
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_int_to_real(&mut self, int_term: Term) -> Result<Term, SolverError> {
+        let int_id = self.resolve_term("int_to_real", int_term)?;
         self.expect_int("int_to_real", int_term)?;
-        Ok(Term(self.terms_mut().mk_to_real(int_term.0)))
+        let result = self.terms_mut().mk_to_real(int_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Convert a real term to an integer via floor (to_int).
@@ -50,8 +52,10 @@ impl Solver {
     /// [`real_to_int`]: Solver::real_to_int
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_real_to_int(&mut self, real_term: Term) -> Result<Term, SolverError> {
+        let real_id = self.resolve_term("real_to_int", real_term)?;
         self.expect_real("real_to_int", real_term)?;
-        Ok(Term(self.terms_mut().mk_to_int(real_term.0)))
+        let result = self.terms_mut().mk_to_int(real_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Test if a real term has an integer value (is_int).
@@ -75,7 +79,9 @@ impl Solver {
     /// [`is_int`]: Solver::is_int
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_is_int(&mut self, real_term: Term) -> Result<Term, SolverError> {
+        let real_id = self.resolve_term("is_int", real_term)?;
         self.expect_real("is_int", real_term)?;
-        Ok(Term(self.terms_mut().mk_is_int(real_term.0)))
+        let result = self.terms_mut().mk_is_int(real_id);
+        Ok(self.wrap_term(result))
     }
 }

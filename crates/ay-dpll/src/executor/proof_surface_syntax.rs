@@ -14,6 +14,10 @@ use ay_frontend::command::{
 };
 use ay_frontend::{Context, SExpr};
 
+#[path = "proof_surface_syntax_realify.rs"]
+mod realify;
+use realify::realify_real_context_numerals;
+
 pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
     match term {
         FrontendTerm::Annotated(inner, _) => strip_frontend_annotations(inner),
@@ -21,21 +25,89 @@ pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
     }
 }
 
+/// Bound canonical DAG work performed while collecting one source's surface
+/// overrides. Quantified roots search the canonical body once per binding,
+/// so that multiplicity is charged before `find_bound_var` runs.
+pub(super) fn surface_override_collection_work(
+    terms: &ay_core::TermStore,
+    canonical: TermId,
+) -> Option<usize> {
+    const MAX_COLLECTION_WORK: usize = 8 * 1024 * 1024;
+    let (root, traversals) = match terms.get(canonical) {
+        TermData::Forall(bindings, body, _) | TermData::Exists(bindings, body, _) => {
+            (*body, bindings.len().checked_add(2)?)
+        }
+        _ => (canonical, 2),
+    };
+    super::proof_trust_surgery_provenance::canonical_term_work(terms, root)?
+        .max(1)
+        .checked_mul(traversals)
+        .filter(|&work| work <= MAX_COLLECTION_WORK)
+}
+
+/// Bound aggregate canonical work for one override batch. Repeated roots are
+/// charged repeatedly because each collector invocation traverses them again.
+pub(super) fn surface_override_roots_have_bounded_work(
+    terms: &ay_core::TermStore,
+    roots: impl IntoIterator<Item = TermId>,
+) -> bool {
+    const MAX_ROOTS: usize = 8_192;
+    const MAX_WORK: usize = 32 * 1024 * 1024;
+    let mut root_count = 0usize;
+    roots
+        .into_iter()
+        .try_fold(0usize, |used, root| {
+            root_count = root_count.checked_add(1)?;
+            if root_count > MAX_ROOTS {
+                return None;
+            }
+            used.checked_add(surface_override_collection_work(terms, root)?.max(1))
+                .filter(|&next| next <= MAX_WORK)
+        })
+        .is_some()
+}
+
+/// Bound an existing override map before a rebuild clones it transactionally.
+pub(super) fn surface_override_map_is_bounded(overrides: &HashMap<TermId, String>) -> bool {
+    const MAX_OVERRIDES: usize = 8_192;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    overrides.len() <= MAX_OVERRIDES
+        && overrides
+            .values()
+            .try_fold(0usize, |bytes, spelling| bytes.checked_add(spelling.len()))
+            .is_some_and(|bytes| bytes <= MAX_BYTES)
+}
+
 pub(super) fn collect_surface_term_overrides(
     ctx: &mut Context,
     canonical: TermId,
     parsed: &FrontendTerm,
     overrides: &mut HashMap<TermId, String>,
+) -> bool {
+    if !super::proof_trust_surgery_surface_audit::surface_source_is_bounded(parsed) {
+        return false;
+    }
+    if surface_override_collection_work(&ctx.terms, canonical).is_none() {
+        return false;
+    }
+    collect_surface_term_overrides_prechecked(ctx, canonical, parsed, overrides);
+    true
+}
+
+fn collect_surface_term_overrides_prechecked(
+    ctx: &mut Context,
+    canonical: TermId,
+    parsed: &FrontendTerm,
+    overrides: &mut HashMap<TermId, String>,
 ) {
+    collect_root_surface_term_override(ctx, canonical, parsed, overrides);
     let parsed = strip_frontend_annotations(parsed);
-    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
-    overrides.insert(canonical, format_frontend_term(&echo));
 
     if let (FrontendTerm::App(op, args), TermData::Not(inner)) = (parsed, ctx.terms.get(canonical))
     {
         if op == "not" && args.len() == 1 {
             let inner = *inner;
-            collect_surface_term_overrides(ctx, inner, &args[0], overrides);
+            collect_surface_term_overrides_prechecked(ctx, inner, &args[0], overrides);
             return;
         }
     }
@@ -83,6 +155,27 @@ pub(super) fn collect_surface_term_overrides(
     collect_subterm_surface_overrides(ctx, parsed, overrides);
 }
 
+/// Record only the authored spelling of a whole assertion, without attaching
+/// surface spellings to any of its canonical subterms.
+///
+/// Certified theory rules must print their arrays, indices, and other
+/// load-bearing operands from the exact terms the checker validated.  A
+/// reintroduced authored premise still needs its top-level input spelling to
+/// match the problem, but recursively applying that spelling to a ROW lemma
+/// can change a checked canonical index such as `(+ x (- 1))` back into the
+/// source's `(+ (- x 1) 0)`.  Root-only collection preserves premise identity
+/// without contaminating independently certified theory steps.
+pub(super) fn collect_root_surface_term_override(
+    ctx: &mut Context,
+    canonical: TermId,
+    parsed: &FrontendTerm,
+    overrides: &mut HashMap<TermId, String>,
+) {
+    let parsed = strip_frontend_annotations(parsed);
+    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
+    overrides.insert(canonical, format_frontend_term(&echo));
+}
+
 /// Recover the exact fresh variable identity used by an elaborated binder.
 ///
 /// Quantifier variables are deliberately not entered in `TermStore`'s global
@@ -95,10 +188,15 @@ fn find_bound_var(
     canonical_name: &str,
     canonical_sort: &ay_core::Sort,
 ) -> Option<TermId> {
-    let mut stack = vec![body];
+    const MAX_CANONICAL_SCAN: usize = 100_000;
+    const MAX_CANONICAL_DEPTH: usize = 256;
+    let mut stack = vec![(body, 0usize)];
     let mut visited = HashSet::default();
     let mut found = None;
-    while let Some(term) = stack.pop() {
+    while let Some((term, depth)) = stack.pop() {
+        if depth > MAX_CANONICAL_DEPTH || visited.len() >= MAX_CANONICAL_SCAN {
+            return None;
+        }
         if !visited.insert(term) {
             continue;
         }
@@ -110,7 +208,29 @@ fn find_bound_var(
             }
             found = Some(term);
         }
-        stack.extend(ctx.terms.children(term));
+        let child_count = match ctx.terms.get(term) {
+            TermData::Const(_) | TermData::Var(..) => 0,
+            TermData::App(_, args) => args.len(),
+            TermData::Let(bindings, _) => bindings.len().checked_add(1)?,
+            TermData::Not(_) => 1,
+            TermData::Ite(..) => 3,
+            TermData::Forall(..) | TermData::Exists(..) => 1,
+            _ => return None,
+        };
+        if stack
+            .len()
+            .saturating_add(visited.len())
+            .saturating_add(child_count)
+            > MAX_CANONICAL_SCAN
+        {
+            return None;
+        }
+        stack.extend(
+            ctx.terms
+                .children(term)
+                .into_iter()
+                .map(|child| (child, depth + 1)),
+        );
     }
     found
 }
@@ -129,10 +249,35 @@ fn collect_bound_surface_overrides(
 ) {
     let parsed = strip_frontend_annotations(parsed);
     if let Some(canonical) = ctx.elaborate_surface_subterm_with_bindings(parsed, env) {
-        let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
-        overrides
-            .entry(canonical)
-            .or_insert_with(|| format_frontend_term(&echo));
+        if bound_override_respells_target(ctx, parsed, canonical, env) {
+            let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
+            let surface = format_frontend_term(&echo);
+            // A free atom whose authored and canonical Alethe spellings are
+            // identical needs no override. Keeping that identity entry would
+            // make an exact ground quantifier instance look surface-mutated to
+            // the rigid rule-role audit. Bound variables are the exception:
+            // their authored name can differ from the recovered canonical
+            // binder identity.
+            let bound_symbol = env.iter().any(|(_, bound)| *bound == canonical);
+            let identity_free_symbol = matches!(
+                (parsed, ctx.terms.get(canonical)),
+                (FrontendTerm::Symbol(surface), TermData::Var(canonical, _))
+                    if !bound_symbol && format_frontend_symbol(surface) == quote_symbol(canonical)
+            );
+            let identity_free_constant =
+                matches!(
+                    (parsed, ctx.terms.get(canonical)),
+                    (FrontendTerm::Const(_), TermData::Const(_))
+                ) && super::proof_trust_surgery_surface_audit::render_roots_have_bounded_payload(
+                    &ctx.terms,
+                    &[canonical],
+                    1,
+                    surface.len().saturating_mul(4).saturating_add(64),
+                ) && surface == ay_proof::format_term_alethe(&ctx.terms, canonical);
+            if !(identity_free_symbol || identity_free_constant) {
+                overrides.entry(canonical).or_insert(surface);
+            }
+        }
     }
     match parsed {
         FrontendTerm::App(_, args)
@@ -150,6 +295,90 @@ fn collect_bound_surface_overrides(
     }
 }
 
+/// `true` when attaching `parsed`'s surface spelling to `canonical` RE-SPELLS
+/// that term rather than RE-WRITING it.
+///
+/// A surface override replaces the printed form of ONE `TermId` EVERYWHERE in
+/// the exported document, so it is admissible only while the spelling still
+/// denotes what the id denotes. Elaboration FOLDS: `(+ x 0)` and `(* 1 x)`
+/// intern as the bare `x`, `(bvand x x)` as `x`, `(bvsub x x)` as a constant.
+/// Registering the composite spelling on the fold RESULT does not re-spell the
+/// composite — it renames the variable, so every occurrence the problem file
+/// spells `x` prints as `(+ x 0)`.
+///
+/// Inside a binder that is not cosmetic. The certified `sko_forall` printer
+/// re-reads these overrides in `register_substituted_surface_overrides` and
+/// installs the binder-substituted spelling on the Skolem WITNESS. A
+/// bound-variable override makes that spelling disagree with the `(choice
+/// ...)` the same pass already installed for the same witness, so
+/// `insert_skolem_override` reports `term tN acquired incompatible choice
+/// renderings` and the WHOLE document is replaced by the unverifiable marker.
+/// Measured on `(assert (not (forall ((x Int)) (or (<= (+ x 0) y) p))))`:
+/// `unsat` was still correct, but `(get-proof)` returned
+/// `(error "UNVERIFIABLE PROOF: ... acquired incompatible choice renderings")`
+/// instead of a certificate.
+///
+/// The admissibility test is exactly the containment a fold destroys: a
+/// COMPOSITE surface term may only be attached to a canonical term that
+/// STRICTLY CONTAINS every operand's canonical form. This still admits every
+/// genuine re-spelling — `(<= (+ x 0) y)` keeps its authored spelling on
+/// `(<= x y)` because both `x` and `y` occur strictly inside it, and a
+/// canonicalized `(=> a b)` keeps it on `(or (not a) b)` — while refusing
+/// every spelling whose own operand IS the target. Leaves (symbols,
+/// constants, nullary applications) have no operands and cannot re-write
+/// anything, so they are admitted unchanged; that keeps `define-fun`
+/// abbreviations printing under their authored name.
+///
+/// Fail-closed: an operand that does not re-elaborate is refused. Dropping an
+/// override can only make a term print in its canonical form, never change
+/// what the proof claims.
+fn bound_override_respells_target(
+    ctx: &mut Context,
+    parsed: &FrontendTerm,
+    canonical: TermId,
+    env: &[(String, TermId)],
+) -> bool {
+    let operands: &[FrontendTerm] = match parsed {
+        FrontendTerm::App(_, args)
+        | FrontendTerm::IndexedApp(_, _, args)
+        | FrontendTerm::QualifiedApp(_, _, args) => args,
+        _ => return true,
+    };
+    if operands.is_empty() {
+        return true;
+    }
+    for operand in operands {
+        let operand = strip_frontend_annotations(operand);
+        let Some(operand_id) = ctx.elaborate_surface_subterm_with_bindings(operand, env) else {
+            return false;
+        };
+        if !term_strictly_contains(&ctx.terms, canonical, operand_id) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `true` when `needle` occurs as a PROPER subterm of `haystack`.
+///
+/// Deliberately strict: `haystack == needle` is `false`, which is the whole
+/// point at the call site — a fold that returned one of its own operands has
+/// not produced a term the operand's spelling may rename.
+fn term_strictly_contains(terms: &ay_core::TermStore, haystack: TermId, needle: TermId) -> bool {
+    let mut stack: Vec<TermId> = terms.children(haystack);
+    let mut visited = HashSet::default();
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        if term == needle {
+            return true;
+        }
+        stack.extend(terms.children(term));
+    }
+    false
+}
+
 /// Connectives whose surface subterms are safe to re-elaborate for override
 /// collection: pure logical structure with no fresh-variable or
 /// side-constraint elaboration paths.
@@ -163,7 +392,7 @@ fn is_override_descent_connective(op: &str) -> bool {
 /// `true` when the parsed term contains no binding construct, so it is closed
 /// at the top level and re-elaborates (deterministically, via hash-consing)
 /// to the exact canonical `TermId` it produced when originally asserted.
-fn parsed_term_is_binder_free(term: &FrontendTerm) -> bool {
+pub(super) fn parsed_term_is_binder_free(term: &FrontendTerm) -> bool {
     let mut stack: Vec<&FrontendTerm> = vec![term];
     while let Some(t) = stack.pop() {
         match strip_frontend_annotations(t) {
@@ -259,135 +488,62 @@ pub(super) fn collect_deep_arith_surface_overrides(
     }
 }
 
-/// `true` when the parsed subterm is binder-free and elaborates to a
-/// Real-sorted canonical term (elaboration is hash-consed, so this only
-/// re-interns terms the assertion already created).
-fn subterm_is_real_sorted(ctx: &mut Context, term: &FrontendTerm) -> bool {
-    if !parsed_term_is_binder_free(term) {
-        return false;
-    }
-    ctx.elaborate_surface_subterm(term)
-        .is_some_and(|id| *ctx.terms.sort(id) == ay_core::Sort::Real)
-}
-
-/// Rewrite Int numerals that occur in Real arithmetic positions of a surface
-/// term into their decimal spelling (`5` → `5.0`).
+/// Collect a compositional surface spelling for every binder-free node of an
+/// authored array expression.
 ///
-/// Alethe checkers (Carcara) type a bare numeral leniently — `(>= x 3)` with
-/// `x : Real` parses — but type a compound all-numeral application as `Int`
-/// and reject it in a Real position: `(/ 5 2)` and `(< x (- 3 1))` both fail
-/// with "sort error: expected 'Real', got 'Int'". Since the surface-override
-/// echo reproduces the problem file's spelling verbatim, any such assertion
-/// used to produce an unparseable proof. This pass realifies exactly the
-/// numerals in Real context and leaves everything else — in particular every
-/// pure-Int assertion — byte-identical.
-///
-/// Real context is established by:
-/// - `/` (SMT-LIB real division): argument positions are always Real;
-/// - `+`, `-`, `*`: Real when inherited from the parent or when any sibling
-///   argument elaborates to a Real-sorted term;
-/// - comparisons / (dis)equality: Real when any argument elaborates to Real;
-/// - `ite`: branch positions inherit / infer Real; the condition never does.
-///
-/// `let` is descended THROUGH: a `let`-bound name cannot be re-elaborated in
-/// the global environment, so `let_env` carries each binding's Real-ness
-/// (computed from its value in the enclosing scope) for the body to read.
-/// Without this, every meti-tarski / hycomp assertion — which the problem files
-/// write as one big `(let ((?v_0 ...)) ...)` — fell into the catch-all arm and
-/// was echoed verbatim, so its numerals were never realified and the whole
-/// certificate was rejected at the parser.
-///
-/// Terms under QUANTIFIERS are still left unchanged (their subterms cannot be
-/// re-elaborated in the global environment, so no Real context is inferred).
-fn realify_real_context_numerals(
+/// Array proof printers compare a printed `store`/`select` with the separately
+/// printed base array, indices, and value that the strict checker certified.
+/// The generic collector records a whole `store` but deliberately stops at
+/// that theory boundary, which can leave its children canonical and make the
+/// two renderings disagree. This narrow collector is used only after an exact
+/// authored array premise has been authenticated; every inserted key is the
+/// term obtained by re-elaborating that precise source subtree.
+pub(super) fn collect_deep_array_surface_overrides(
     ctx: &mut Context,
-    term: &FrontendTerm,
-    real_ctx: bool,
-    let_env: &mut Vec<(String, bool)>,
-) -> FrontendTerm {
-    match term {
-        FrontendTerm::Annotated(inner, annotations) => FrontendTerm::Annotated(
-            Box::new(realify_real_context_numerals(ctx, inner, real_ctx, let_env)),
-            annotations.clone(),
-        ),
-        FrontendTerm::Const(FrontendConstant::Numeral(n)) if real_ctx => {
-            FrontendTerm::Const(FrontendConstant::Decimal(format!("{n}.0")))
-        }
-        FrontendTerm::App(op, args) => {
-            let arg_ctx: Vec<bool> = match op.as_str() {
-                "/" => vec![true; args.len()],
-                "+" | "-" | "*" => {
-                    let rc = real_ctx || args.iter().any(|a| surface_is_real(ctx, a, let_env));
-                    vec![rc; args.len()]
-                }
-                "<" | "<=" | ">" | ">=" | "=" | "distinct" => {
-                    let rc = args.iter().any(|a| surface_is_real(ctx, a, let_env));
-                    vec![rc; args.len()]
-                }
-                "ite" if args.len() == 3 => {
-                    let rc = real_ctx || args[1..].iter().any(|a| surface_is_real(ctx, a, let_env));
-                    vec![false, rc, rc]
-                }
-                _ => vec![false; args.len()],
-            };
-            FrontendTerm::App(
-                op.clone(),
-                args.iter()
-                    .zip(arg_ctx)
-                    .map(|(a, rc)| realify_real_context_numerals(ctx, a, rc, let_env))
-                    .collect(),
-            )
-        }
-        FrontendTerm::Let(bindings, body) => {
-            // SMT-LIB `let` binds in PARALLEL: every value is elaborated in the
-            // enclosing scope, so Real-ness is decided (and the values are
-            // realified) before any name is in scope.
-            let mut rebound = Vec::with_capacity(bindings.len());
-            let mut entries = Vec::with_capacity(bindings.len());
-            for (name, value) in bindings {
-                entries.push((name.clone(), surface_is_real(ctx, value, let_env)));
-                rebound.push((
-                    name.clone(),
-                    realify_real_context_numerals(ctx, value, false, let_env),
-                ));
-            }
-            let depth = let_env.len();
-            let_env.extend(entries);
-            let new_body = realify_real_context_numerals(ctx, body, real_ctx, let_env);
-            let_env.truncate(depth);
-            FrontendTerm::Let(rebound, Box::new(new_body))
-        }
-        other => other.clone(),
-    }
+    parsed: &FrontendTerm,
+    overrides: &mut HashMap<TermId, String>,
+) {
+    collect_deep_array_surface_overrides_inner(ctx, parsed, overrides, &mut HashSet::default());
 }
 
-/// Whether a surface subterm denotes a Real, consulting the `let` environment.
-///
-/// [`subterm_is_real_sorted`] answers by RE-ELABORATING the term, which fails
-/// outright for anything mentioning a `let`-bound name. This wrapper decides
-/// the shapes it can decide structurally — a bound name, and the arithmetic
-/// operators whose result sort is the join of their operands — and only falls
-/// back to re-elaboration for the rest. It is also the more reliable answer for
-/// `+`/`*`: `TermStore::mk_add`/`mk_mul` take the result sort from `args[0]`,
-/// so an elaborated `(+ 2 realVar)` reports `Int`.
-fn surface_is_real(ctx: &mut Context, term: &FrontendTerm, let_env: &[(String, bool)]) -> bool {
-    match strip_frontend_annotations(term) {
-        FrontendTerm::Symbol(name) => {
-            if let Some((_, is_real)) = let_env.iter().rev().find(|(n, _)| n == name) {
-                return *is_real;
+fn collect_deep_array_surface_overrides_inner(
+    ctx: &mut Context,
+    parsed: &FrontendTerm,
+    overrides: &mut HashMap<TermId, String>,
+    seen: &mut HashSet<TermId>,
+) {
+    let parsed = strip_frontend_annotations(parsed);
+    if parsed_term_is_binder_free(parsed)
+        && matches!(
+            parsed,
+            FrontendTerm::App(..) | FrontendTerm::IndexedApp(..) | FrontendTerm::QualifiedApp(..)
+        )
+    {
+        if let Some(canonical) = ctx.elaborate_surface_subterm(parsed) {
+            let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
+            // Walk is preorder.  Preserve the outermost authenticated source
+            // spelling when simplification collapses a parent and child onto
+            // the same TermId (for example `(+ (- x 1) 0)` and `(- x 1)`).
+            // The enclosing authored `store` contains that outer spelling,
+            // so replacing it while descending would make a separately
+            // printed certified ROW index disagree with the store operand.
+            if seen.insert(canonical) {
+                overrides.insert(canonical, format_frontend_term(&echo));
             }
-            subterm_is_real_sorted(ctx, term)
         }
-        FrontendTerm::App(op, args) => match op.as_str() {
-            "/" => true,
-            "+" | "-" | "*" | "abs" => args.iter().any(|a| surface_is_real(ctx, a, let_env)),
-            "ite" if args.len() == 3 => args[1..].iter().any(|a| surface_is_real(ctx, a, let_env)),
-            _ => subterm_is_real_sorted(ctx, term),
-        },
-        other => subterm_is_real_sorted(ctx, other),
+    }
+
+    match parsed {
+        FrontendTerm::App(_, args)
+        | FrontendTerm::IndexedApp(_, _, args)
+        | FrontendTerm::QualifiedApp(_, _, args) => {
+            for arg in args {
+                collect_deep_array_surface_overrides_inner(ctx, arg, overrides, seen);
+            }
+        }
+        _ => {}
     }
 }
-
 pub(super) fn format_frontend_term(term: &FrontendTerm) -> String {
     format_frontend_term_impl(term, false)
 }
@@ -395,6 +551,91 @@ pub(super) fn format_frontend_term(term: &FrontendTerm) -> String {
 /// Render an authored term without discarding SMT-LIB annotations.
 pub(super) fn format_authored_frontend_term(term: &FrontendTerm) -> String {
     format_frontend_term_impl(term, true)
+}
+
+/// Render the exact surface substitution used by a `forall_inst` step.
+///
+/// Binder values are rendered through the same override-aware Alethe printer
+/// as the step's `:args`.  The body walk accepts only the binder-free fragment
+/// supported by the strict quantifier checker; nested binding constructs fail
+/// closed.  This keeps a source spelling such as `(> x 0)` aligned with its
+/// ground instance even though the internal canonical term is `(< 0 x)`.
+pub(super) fn format_forall_instance_surface(
+    terms: &ay_core::TermStore,
+    parsed_forall: &FrontendTerm,
+    values: &[TermId],
+    overrides: &HashMap<TermId, String>,
+) -> Option<String> {
+    fn render(term: &FrontendTerm, substitution: &HashMap<String, String>) -> Option<String> {
+        match strip_frontend_annotations(term) {
+            FrontendTerm::Const(constant) => Some(format_frontend_constant(constant)),
+            FrontendTerm::Symbol(name) => Some(
+                substitution
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| format_frontend_symbol(name)),
+            ),
+            FrontendTerm::App(name, args) => {
+                let rendered = args
+                    .iter()
+                    .map(|arg| render(arg, substitution))
+                    .collect::<Option<Vec<_>>>()?;
+                let head = format_frontend_symbol(name);
+                Some(if rendered.is_empty() {
+                    head
+                } else {
+                    format!("({head} {})", rendered.join(" "))
+                })
+            }
+            FrontendTerm::IndexedApp(name, indices, args) => {
+                let rendered = args
+                    .iter()
+                    .map(|arg| render(arg, substitution))
+                    .collect::<Option<Vec<_>>>()?;
+                let head = format_indexed_head(name, indices);
+                Some(if rendered.is_empty() {
+                    head
+                } else {
+                    format!("({head} {})", rendered.join(" "))
+                })
+            }
+            FrontendTerm::QualifiedApp(identifier, sort, args) => {
+                let rendered = args
+                    .iter()
+                    .map(|arg| render(arg, substitution))
+                    .collect::<Option<Vec<_>>>()?;
+                let head = format_qualified_head(identifier, sort);
+                Some(if rendered.is_empty() {
+                    head
+                } else {
+                    format!("({head} {})", rendered.join(" "))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    let FrontendTerm::Forall(bindings, body) = strip_frontend_annotations(parsed_forall) else {
+        return None;
+    };
+    if bindings.len() != values.len() {
+        return None;
+    }
+    let mut substitution = HashMap::default();
+    for ((name, _), &value) in bindings.iter().zip(values) {
+        if substitution
+            .insert(
+                name.clone(),
+                ay_proof::format_term_alethe_with_overrides(terms, value, overrides),
+            )
+            .is_some()
+        {
+            // Duplicate surface binders cannot be represented by a name-keyed
+            // simultaneous substitution without choosing an identity.
+            return None;
+        }
+    }
+    render(body, &substitution)
 }
 
 fn format_frontend_term_impl(term: &FrontendTerm, preserve_annotations: bool) -> String {
@@ -633,59 +874,11 @@ fn format_frontend_constant(constant: &FrontendConstant) -> String {
         | FrontendConstant::Decimal(n)
         | FrontendConstant::Hexadecimal(n)
         | FrontendConstant::Binary(n) => n.clone(),
-        FrontendConstant::String(s) => format!("\"{}\"", s.replace('\"', "\"\"")),
+        FrontendConstant::String(s) => ay_core::string_literal(s),
         other => unreachable!("unsupported frontend constant in proof export override: {other:?}"),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn indexed_literal_and_same_spelled_symbol_format_distinctly() {
-        let parsed = FrontendTerm::App(
-            "distinct".to_string(),
-            vec![
-                FrontendTerm::Symbol("(_ bv0 8)".to_string()),
-                FrontendTerm::IndexedApp(
-                    "bv0".to_string(),
-                    vec![FrontendIndex::Numeral("8".to_string())],
-                    Vec::new(),
-                ),
-            ],
-        );
-        assert_eq!(
-            format_frontend_term(&parsed),
-            "(distinct |(_ bv0 8)| (_ bv0 8))"
-        );
-    }
-
-    #[test]
-    fn indexed_token_kinds_remain_distinct_when_formatted() {
-        for (index, expected) in [
-            (FrontendIndex::Numeral("8".to_string()), "8"),
-            (FrontendIndex::Decimal("0.5".to_string()), "0.5"),
-            (FrontendIndex::Symbol("8".to_string()), "|8|"),
-            (FrontendIndex::Hexadecimal("#x41".to_string()), "#x41"),
-            (FrontendIndex::Symbol("#x41".to_string()), "|#x41|"),
-        ] {
-            let term = FrontendTerm::IndexedApp("f".to_string(), vec![index], Vec::new());
-            assert_eq!(format_frontend_term(&term), format!("(_ f {expected})"));
-        }
-    }
-
-    #[test]
-    fn authored_formatter_preserves_pattern_annotations() {
-        let commands =
-            ay_frontend::parse("(assert (forall ((x X)) (! (= x x) :pattern ((as c X)) :qid q)))")
-                .expect("fixture parses");
-        let ay_frontend::Command::Assert(term) = &commands[0] else {
-            panic!("fixture must be an assertion")
-        };
-        assert_eq!(
-            format_authored_frontend_term(term),
-            "(forall ((x X)) (! (= x x) :pattern ((as c X)) :qid q))"
-        );
-    }
-}
+#[path = "proof_surface_syntax_tests.rs"]
+mod tests;

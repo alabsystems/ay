@@ -326,6 +326,7 @@ impl Executor {
                 self.last_result = Some(SolveResult::Unknown);
                 self.last_model = None;
                 self.last_proof = None;
+                self.clear_finite_enum_proof_state();
                 return Ok(SolveResult::Unknown);
             }
             // No cut installed: identical formula, mirror the blind path.

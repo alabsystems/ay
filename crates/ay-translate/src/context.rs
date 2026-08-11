@@ -13,7 +13,9 @@ use std::borrow::Borrow;
 use std::hash::Hash;
 
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_dpll::api::{FuncDecl, Logic, Solver, SolverError, Sort, Term, VerifiedSolveResult};
+use ay_dpll::api::{
+    FuncDecl, Logic, Solver, SolverCacheToken, SolverError, Sort, Term, VerifiedSolveResult,
+};
 
 use crate::ops::expect_result;
 
@@ -21,10 +23,20 @@ use crate::ops::expect_result;
 ///
 /// Owns the variable cache, function declaration cache, and fresh name counter.
 /// Can be paired with different solver instances across incremental sessions.
+/// Solver-local term and function handles are retained while sessions use the
+/// same handle-arena generation and automatically invalidated when a different
+/// solver is bound or the current solver is fully reset.
 pub struct TranslationState<V: Eq + Hash> {
-    vars: HashMap<V, Term>,
+    vars: HashMap<V, CachedVar>,
     declared_funcs: HashMap<String, FuncDecl>,
     fresh_counter: u32,
+    cache_token: Option<SolverCacheToken>,
+}
+
+struct CachedVar {
+    term: Term,
+    name: String,
+    sort: Sort,
 }
 
 impl<V: Eq + Hash> TranslationState<V> {
@@ -34,12 +46,43 @@ impl<V: Eq + Hash> TranslationState<V> {
             vars: HashMap::default(),
             declared_funcs: HashMap::default(),
             fresh_counter: 0,
+            cache_token: None,
         }
+    }
+
+    /// Bind solver-local caches to `token`, invalidating handles from a
+    /// different solver arena generation before they can be reused.
+    fn bind_solver(&mut self, token: SolverCacheToken) {
+        if self
+            .cache_token
+            .as_ref()
+            .is_some_and(|current| !current.is_current() || current != &token)
+        {
+            self.vars.clear();
+            self.declared_funcs.clear();
+        }
+        self.cache_token = Some(token);
+    }
+
+    fn cache_is_current(&self) -> bool {
+        self.cache_token
+            .as_ref()
+            .is_some_and(SolverCacheToken::is_current)
+    }
+
+    fn cache_is_bound_to(&self, token: &SolverCacheToken) -> bool {
+        self.cache_token
+            .as_ref()
+            .is_some_and(|current| current.is_current() && current == token)
     }
 
     /// Get the number of declared variables.
     pub fn var_count(&self) -> usize {
-        self.vars.len()
+        if self.cache_is_current() {
+            self.vars.len()
+        } else {
+            0
+        }
     }
 
     /// Check if a variable exists.
@@ -48,7 +91,7 @@ impl<V: Eq + Hash> TranslationState<V> {
         V: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.vars.contains_key(key)
+        self.cache_is_current() && self.vars.contains_key(key)
     }
 
     /// Get a variable if it exists.
@@ -57,16 +100,26 @@ impl<V: Eq + Hash> TranslationState<V> {
         V: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.vars.get(key).copied()
+        if !self.cache_is_current() {
+            return None;
+        }
+        self.vars.get(key).map(|cached| cached.term)
     }
 
     /// Get the number of declared functions.
     pub fn func_count(&self) -> usize {
-        self.declared_funcs.len()
+        if self.cache_is_current() {
+            self.declared_funcs.len()
+        } else {
+            0
+        }
     }
 
     /// Get a previously declared function by name.
     pub fn get_func(&self, name: &str) -> Option<&FuncDecl> {
+        if !self.cache_is_current() {
+            return None;
+        }
         self.declared_funcs.get(name)
     }
 }
@@ -85,15 +138,26 @@ pub trait TranslationHost<V: Eq + Hash> {
     /// Declare or retrieve a function by name.
     fn declare_or_get_fun(&mut self, name: &str, domain: &[Sort], range: Sort) -> FuncDecl;
 
-    /// Cache a function declaration or definition by name.
+    /// Fallible form of [`Self::declare_or_get_fun`].
     ///
-    /// Custom hosts that do not keep a function cache may use the default
-    /// no-op implementation. Hosts backed by [`TranslationState`] override it
-    /// so later expression translation can resolve `FuncApp` nodes by name.
-    fn cache_fun(&mut self, _name: String, _func: FuncDecl) {}
+    /// The default preserves compatibility with custom hosts whose declaration
+    /// API is infallible. State-backed AY hosts override it to reject a cached
+    /// name requested with a different signature.
+    fn try_declare_or_get_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        Ok(self.declare_or_get_fun(name, domain, range))
+    }
 
     /// Define a non-recursive function from already-translated parameter and
-    /// body terms, then cache the resulting function handle.
+    /// body terms.
+    ///
+    /// State-backed AY hosts override this method to cache the handle. Keeping
+    /// cache insertion out of the public trait surface prevents a handle made
+    /// by another solver from being injected into [`TranslationState`].
     fn try_define_fun_body(
         &mut self,
         name: &str,
@@ -101,11 +165,7 @@ pub trait TranslationHost<V: Eq + Hash> {
         range: Sort,
         body: Term,
     ) -> Result<FuncDecl, SolverError> {
-        let func = self
-            .solver()
-            .try_define_fun_body(name, params, range, body)?;
-        self.cache_fun(name.to_string(), func.clone());
-        Ok(func)
+        self.solver().try_define_fun_body(name, params, range, body)
     }
 }
 
@@ -118,14 +178,29 @@ pub trait TranslationTermHost<V: Eq + Hash>: TranslationHost<V> {
     /// Declare or retrieve a variable by key.
     fn get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Term;
 
+    /// Fallible form of [`Self::get_or_declare`].
+    fn try_get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Result<Term, SolverError> {
+        Ok(self.get_or_declare(key, name, sort))
+    }
+
     /// Get a previously declared variable by key.
     fn get_var(&self, key: &V) -> Option<Term>;
 
     /// Create a fresh declared constant with a unique name.
     fn fresh_const(&mut self, prefix: &str, sort: Sort) -> Term;
 
+    /// Fallible form of [`Self::fresh_const`].
+    fn try_fresh_const(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        Ok(self.fresh_const(prefix, sort))
+    }
+
     /// Create a fresh bound variable (not tracked in the model).
     fn fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Term;
+
+    /// Fallible form of [`Self::fresh_bound_var`].
+    fn try_fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        Ok(self.fresh_bound_var(prefix, sort))
+    }
 }
 
 /// Borrowed translation session combining a solver reference with state.
@@ -140,34 +215,103 @@ pub struct TranslationSession<'a, V: Eq + Hash> {
 impl<'a, V: Eq + Hash> TranslationSession<'a, V> {
     /// Create a session from borrowed solver and state.
     pub fn new(solver: &'a mut Solver, state: &'a mut TranslationState<V>) -> Self {
+        state.bind_solver(solver.cache_token());
         Self { solver, state }
+    }
+
+    fn bind_current_solver(&mut self) {
+        self.state.bind_solver(self.solver.cache_token());
+    }
+
+    fn cache_is_bound_to_current_solver(&self) -> bool {
+        self.state.cache_is_bound_to(&self.solver.cache_token())
     }
 
     /// Declare or retrieve a variable.
     pub fn get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Term {
-        if let Some(&term) = self.state.vars.get(&key) {
-            return term;
+        expect_result(
+            self.try_get_or_declare(key, name, sort),
+            "context.get_or_declare",
+        )
+    }
+
+    /// Fallible variable declaration/cache lookup.
+    ///
+    /// A source key already cached at another sort is rejected rather than
+    /// returning a mis-sorted term.
+    pub fn try_get_or_declare(
+        &mut self,
+        key: V,
+        name: &str,
+        sort: Sort,
+    ) -> Result<Term, SolverError> {
+        self.bind_current_solver();
+        if let Some(cached) = self.state.vars.get(&key) {
+            if cached.name == name && cached.sort == sort {
+                return Ok(cached.term);
+            }
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_const",
+                message: format!(
+                    "translation key is already cached as '{}' with sort {}, not '{name}' with sort {sort}",
+                    cached.name, cached.sort
+                ),
+            });
         }
-        let term = self.solver.declare_const(name, sort);
-        self.state.vars.insert(key, term);
-        term
+        let term = self.solver.try_declare_const(name, sort)?;
+        self.state.vars.insert(
+            key,
+            CachedVar {
+                term,
+                name: name.to_string(),
+                sort: self.solver.sort_of(term),
+            },
+        );
+        Ok(term)
     }
 
     /// Check if a variable exists.
     pub fn has_var(&self, key: &V) -> bool {
-        self.state.has_var(key)
+        self.cache_is_bound_to_current_solver() && self.state.has_var(key)
     }
 
     /// Get a variable if it exists.
     pub fn get_var(&self, key: &V) -> Option<Term> {
+        if !self.cache_is_bound_to_current_solver() {
+            return None;
+        }
         self.state.get_var(key)
     }
 
     /// Create a fresh declared constant with a unique name.
     pub fn fresh_const(&mut self, prefix: &str, sort: Sort) -> Term {
-        let name = format!("{}{}", prefix, self.state.fresh_counter);
-        self.state.fresh_counter += 1;
-        self.solver.declare_const(&name, sort)
+        expect_result(self.try_fresh_const(prefix, sort), "context.fresh_const")
+    }
+
+    /// Fallible fresh constant creation.
+    ///
+    /// Existing solver declarations are skipped, including declarations made
+    /// outside this translation state, so the returned term is genuinely new.
+    pub fn try_fresh_const(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        self.bind_current_solver();
+        if prefix.starts_with("__ay_") {
+            return Err(SolverError::InvalidArgument {
+                operation: "fresh_const",
+                message: format!("fresh-constant prefix '{prefix}' enters a reserved namespace"),
+            });
+        }
+
+        loop {
+            let suffix = self.next_fresh_suffix("fresh_const")?;
+            let name = format!("{prefix}{suffix}");
+            if self.solver.is_symbol_name_occupied(&name) {
+                continue;
+            }
+            // No mutation can interleave while this session holds `&mut
+            // Solver`, so an error here is not a name race and must be exposed
+            // rather than mistaken for another collision.
+            return self.solver.try_declare_const(&name, sort);
+        }
     }
 
     /// Create a fresh bound variable (not tracked in the model).
@@ -175,9 +319,30 @@ impl<'a, V: Eq + Hash> TranslationSession<'a, V> {
     /// Uses the solver's `fresh_var` API for quantifier/let-bound variables
     /// that should not appear in model output.
     pub fn fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Term {
-        let name = format!("_bv_{}{}", prefix, self.state.fresh_counter);
-        self.state.fresh_counter += 1;
-        self.solver.fresh_var(&name, sort)
+        expect_result(
+            self.try_fresh_bound_var(prefix, sort),
+            "context.fresh_bound_var",
+        )
+    }
+
+    /// Fallible fresh bound-variable creation.
+    pub fn try_fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        self.bind_current_solver();
+        let suffix = self.next_fresh_suffix("fresh_bound_var")?;
+        let name = format!("_bv_{prefix}{suffix}");
+        self.solver.try_fresh_var(&name, sort)
+    }
+
+    fn next_fresh_suffix(&mut self, operation: &'static str) -> Result<u32, SolverError> {
+        let suffix = self.state.fresh_counter;
+        self.state.fresh_counter =
+            suffix
+                .checked_add(1)
+                .ok_or_else(|| SolverError::InvalidArgument {
+                    operation,
+                    message: "translation fresh-name counter exhausted".to_string(),
+                })?;
+        Ok(suffix)
     }
 
     /// Create a boolean constant.
@@ -212,7 +377,11 @@ impl<'a, V: Eq + Hash> TranslationSession<'a, V> {
 
     /// Get the number of declared variables.
     pub fn var_count(&self) -> usize {
-        self.state.var_count()
+        if self.cache_is_bound_to_current_solver() {
+            self.state.var_count()
+        } else {
+            0
+        }
     }
 
     /// Declare or retrieve a function by name.
@@ -220,19 +389,60 @@ impl<'a, V: Eq + Hash> TranslationSession<'a, V> {
     /// Caches declarations so repeated calls with the same name return
     /// the same `FuncDecl` without re-declaring.
     pub fn declare_or_get_fun(&mut self, name: &str, domain: &[Sort], range: Sort) -> FuncDecl {
+        expect_result(
+            self.try_declare_or_get_fun(name, domain, range),
+            "context.declare_or_get_fun",
+        )
+    }
+
+    /// Fallible function declaration/cache lookup.
+    ///
+    /// A name already cached with another signature is rejected rather than
+    /// returning a handle that disagrees with the caller's requested sorts.
+    pub fn try_declare_or_get_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        self.bind_current_solver();
         if let Some(func) = self.state.declared_funcs.get(name) {
-            return func.clone();
+            if func.domain() == domain && func.range() == &range {
+                return Ok(func.clone());
+            }
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_fun",
+                message: format!("function name '{name}' is already cached with another signature"),
+            });
         }
-        let func = self.solver.try_declare_fun(name, domain, range);
-        let func = expect_result(func, "context.declare_or_get_fun");
+        let func = self.solver.try_declare_fun(name, domain, range)?;
         self.state
             .declared_funcs
             .insert(name.to_string(), func.clone());
-        func
+        Ok(func)
+    }
+
+    /// Define and cache a non-recursive function in this solver.
+    pub fn try_define_fun_body(
+        &mut self,
+        name: &str,
+        params: &[(&str, Term)],
+        range: Sort,
+        body: Term,
+    ) -> Result<FuncDecl, SolverError> {
+        self.bind_current_solver();
+        let func = self.solver.try_define_fun_body(name, params, range, body)?;
+        self.state
+            .declared_funcs
+            .insert(name.to_string(), func.clone());
+        Ok(func)
     }
 
     /// Get a previously declared function by name.
     pub fn get_func(&self, name: &str) -> Option<&FuncDecl> {
+        if !self.cache_is_bound_to_current_solver() {
+            return None;
+        }
         self.state.get_func(name)
     }
 
@@ -286,14 +496,33 @@ impl<V: Eq + Hash> TranslationHost<V> for TranslationSession<'_, V> {
         self.declare_or_get_fun(name, domain, range)
     }
 
-    fn cache_fun(&mut self, name: String, func: FuncDecl) {
-        self.state.declared_funcs.insert(name, func);
+    fn try_declare_or_get_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        TranslationSession::try_declare_or_get_fun(self, name, domain, range)
+    }
+
+    fn try_define_fun_body(
+        &mut self,
+        name: &str,
+        params: &[(&str, Term)],
+        range: Sort,
+        body: Term,
+    ) -> Result<FuncDecl, SolverError> {
+        TranslationSession::try_define_fun_body(self, name, params, range, body)
     }
 }
 
 impl<V: Eq + Hash> TranslationTermHost<V> for TranslationSession<'_, V> {
     fn get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Term {
-        self.get_or_declare(key, name, sort)
+        TranslationSession::get_or_declare(self, key, name, sort)
+    }
+
+    fn try_get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationSession::try_get_or_declare(self, key, name, sort)
     }
 
     fn get_var(&self, key: &V) -> Option<Term> {
@@ -304,8 +533,16 @@ impl<V: Eq + Hash> TranslationTermHost<V> for TranslationSession<'_, V> {
         Self::fresh_const(self, prefix, sort)
     }
 
+    fn try_fresh_const(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationSession::try_fresh_const(self, prefix, sort)
+    }
+
     fn fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Term {
         Self::fresh_bound_var(self, prefix, sort)
+    }
+
+    fn try_fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationSession::try_fresh_bound_var(self, prefix, sort)
     }
 }
 
@@ -378,14 +615,27 @@ impl<V: Eq + Hash> TranslationContext<V> {
         self.session().get_or_declare(key, name, sort)
     }
 
+    /// Fallible variable declaration/cache lookup.
+    pub fn try_get_or_declare(
+        &mut self,
+        key: V,
+        name: &str,
+        sort: Sort,
+    ) -> Result<Term, SolverError> {
+        self.session().try_get_or_declare(key, name, sort)
+    }
+
     /// Check if a variable exists.
     pub fn has_var(&self, key: &V) -> bool {
-        self.state.vars.contains_key(key)
+        self.state.cache_is_bound_to(&self.solver.cache_token()) && self.state.has_var(key)
     }
 
     /// Get a variable if it exists.
     pub fn get_var(&self, key: &V) -> Option<Term> {
-        self.state.vars.get(key).copied()
+        if !self.state.cache_is_bound_to(&self.solver.cache_token()) {
+            return None;
+        }
+        self.state.get_var(key)
     }
 
     /// Create a fresh declared constant with a unique name.
@@ -393,9 +643,19 @@ impl<V: Eq + Hash> TranslationContext<V> {
         self.session().fresh_const(prefix, sort)
     }
 
+    /// Fallible fresh constant creation.
+    pub fn try_fresh_const(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        self.session().try_fresh_const(prefix, sort)
+    }
+
     /// Create a fresh bound variable (not tracked in the model).
     pub fn fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Term {
         self.session().fresh_bound_var(prefix, sort)
+    }
+
+    /// Fallible fresh bound-variable creation.
+    pub fn try_fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        self.session().try_fresh_bound_var(prefix, sort)
     }
 
     /// Declare or retrieve a function by name.
@@ -403,9 +663,34 @@ impl<V: Eq + Hash> TranslationContext<V> {
         self.session().declare_or_get_fun(name, domain, range)
     }
 
+    /// Fallible function declaration/cache lookup.
+    pub fn try_declare_or_get_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        self.session().try_declare_or_get_fun(name, domain, range)
+    }
+
+    /// Define and cache a non-recursive function in this solver.
+    pub fn try_define_fun_body(
+        &mut self,
+        name: &str,
+        params: &[(&str, Term)],
+        range: Sort,
+        body: Term,
+    ) -> Result<FuncDecl, SolverError> {
+        self.session()
+            .try_define_fun_body(name, params, range, body)
+    }
+
     /// Get a previously declared function by name.
     pub fn get_func(&self, name: &str) -> Option<&FuncDecl> {
-        self.state.declared_funcs.get(name)
+        if !self.state.cache_is_bound_to(&self.solver.cache_token()) {
+            return None;
+        }
+        self.state.get_func(name)
     }
 
     /// Assert a constraint.
@@ -480,7 +765,11 @@ impl<V: Eq + Hash> TranslationContext<V> {
 
     /// Get the number of declared variables.
     pub fn var_count(&self) -> usize {
-        self.state.var_count()
+        if self.state.cache_is_bound_to(&self.solver.cache_token()) {
+            self.state.var_count()
+        } else {
+            0
+        }
     }
 }
 
@@ -493,14 +782,33 @@ impl<V: Eq + Hash> TranslationHost<V> for TranslationContext<V> {
         self.declare_or_get_fun(name, domain, range)
     }
 
-    fn cache_fun(&mut self, name: String, func: FuncDecl) {
-        self.state.declared_funcs.insert(name, func);
+    fn try_declare_or_get_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        TranslationContext::try_declare_or_get_fun(self, name, domain, range)
+    }
+
+    fn try_define_fun_body(
+        &mut self,
+        name: &str,
+        params: &[(&str, Term)],
+        range: Sort,
+        body: Term,
+    ) -> Result<FuncDecl, SolverError> {
+        TranslationContext::try_define_fun_body(self, name, params, range, body)
     }
 }
 
 impl<V: Eq + Hash> TranslationTermHost<V> for TranslationContext<V> {
     fn get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Term {
-        self.get_or_declare(key, name, sort)
+        TranslationContext::get_or_declare(self, key, name, sort)
+    }
+
+    fn try_get_or_declare(&mut self, key: V, name: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationContext::try_get_or_declare(self, key, name, sort)
     }
 
     fn get_var(&self, key: &V) -> Option<Term> {
@@ -511,8 +819,16 @@ impl<V: Eq + Hash> TranslationTermHost<V> for TranslationContext<V> {
         Self::fresh_const(self, prefix, sort)
     }
 
+    fn try_fresh_const(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationContext::try_fresh_const(self, prefix, sort)
+    }
+
     fn fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Term {
         Self::fresh_bound_var(self, prefix, sort)
+    }
+
+    fn try_fresh_bound_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        TranslationContext::try_fresh_bound_var(self, prefix, sort)
     }
 }
 

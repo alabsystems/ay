@@ -25,10 +25,12 @@ impl Executor {
         Ok(())
     }
 
-    /// Register a native constant globally and retire the preceding decision.
-    pub(crate) fn register_native_global_symbol(&mut self, name: String, term: TermId, sort: Sort) {
-        self.ctx.register_native_global_symbol(name, term, sort);
+    /// Allocate and register a native constant under one collision-safe core
+    /// identity, independently of SMT-LIB assertion scoping.
+    pub(crate) fn register_native_global_constant(&mut self, name: String, sort: Sort) -> TermId {
+        let term = self.ctx.register_native_global_constant(name, sort);
         self.invalidate_last_check_result();
+        term
     }
 
     /// Register a native function's surface alias globally and retire the
@@ -124,12 +126,21 @@ impl Executor {
     pub(super) fn invalidate_last_check_result(&mut self) {
         self.last_result = None;
         self.last_model = None;
+        // The pigeonhole witness describes ONE query's refutation. Leaving it
+        // set let a later solve rebuild its proof from a stale clique, which
+        // clobbered ~1100 unrelated proofs.
+        self.last_finite_enum_pigeonhole = None;
         self.last_sat_certificate = None;
         self.last_unsat_certificate = None;
+        self.last_command_unsat_admission = None;
+        self.unsat_query_epoch = None;
         self.last_assumptions = None;
         self.last_assumption_core = None;
         self.last_core_term_to_name = None;
         self.last_proof = None;
+        self.clear_finite_enum_proof_state();
+        self.last_unsat_proof_reconstruction_suppressed = false;
+        self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         self.proof_problem_assertion_provenance = None;
         self.quant_expansion_records.clear();
@@ -139,6 +150,7 @@ impl Executor {
         self.last_unknown_reason = None;
         self.last_unknown_origin = None;
         self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
         self.last_lrat_certificate = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
@@ -147,6 +159,7 @@ impl Executor {
         self.proof_check_result = None;
         self.pending_sat_unknown_reason = None;
         self.last_model_validated = false;
+        self.clear_quantified_sat_authority();
         self.last_validation_stats = None;
         self.model_validation_delegated_assertions.clear();
         self.dt_solver_added_axiom_terms.clear();
@@ -165,6 +178,32 @@ impl Executor {
         // front can never contaminate a different problem or corrupt lex / box /
         // single-objective / plain check-sat (none of which read this field).
         self.pareto_state = None;
+    }
+
+    /// Revoke every quantified-SAT grant together with the exact model-side
+    /// artifact that made it authoritative.
+    ///
+    /// These fields are one lifecycle unit. Clearing only a Boolean marker can
+    /// leave a parked model ready to overwrite a later query; clearing only the
+    /// model can let a stale marker suppress the mandatory quantified gate.
+    /// Certificate ground projections are owned by their exact `Model`, so
+    /// dropping/replacing that model drops the projection without an ambient
+    /// lifecycle sidecar. Public invalidation, assumption entry, and each
+    /// internal retry call this method before solving a different obligation
+    /// window.
+    pub(in crate::executor) fn clear_quantified_sat_authority(&mut self) {
+        self.revoke_quantified_model_confirmation_authority();
+        self.revoke_dt_sat_authority();
+        self.finite_table_cert_grant_active = false;
+        self.const_interp_cert_grant_active = false;
+        self.revoke_mbqi_sat_authority();
+        self.revoke_cegqi_uf_recompletion_authority();
+        self.revoke_bv_full_domain_sat_authority();
+        self.finite_table_cert_witness_state = None;
+        self.const_interp_cert_witness_state = None;
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
+        }
     }
 
     /// Close every decision-trace writer retained by an incremental SAT lane.
@@ -242,6 +281,41 @@ impl Executor {
         let _ = self.finalize_unknown_publication(SolveResult::Unknown);
     }
 
+    /// Publish and fully revoke an external stop observed at a result boundary.
+    ///
+    /// This is shared by definite-token admission and the interruptible
+    /// transaction's error path. An executor error does not authorize any
+    /// verdict, but a concurrently fired caller stop still owns the public
+    /// Unknown classification and must be recorded before local controls are
+    /// restored.
+    pub(crate) fn finalize_external_stop_for_publication(&mut self) -> Option<SolveResult> {
+        if !self.should_abort_theory_loop() {
+            return None;
+        }
+        if !self.is_producing_proofs() {
+            self.proof_tracker.disable();
+        }
+        Some(self.finalize_unknown_publication(SolveResult::Unknown))
+    }
+
+    /// Revoke a provisional definite verdict when a live external solve
+    /// control has fired before its publication capability is consumed.
+    ///
+    /// SAT and UNSAT use different certification funnels, but their final
+    /// native/text consumers share this last admission rule. Keeping it on the
+    /// executor preserves the typed interrupt/deadline/memory origin and routes
+    /// every rejection through the canonical artifact-revoking Unknown state.
+    pub(crate) fn decline_definite_publication_on_external_stop(
+        &mut self,
+        proposed: SolveResult,
+    ) -> SolveResult {
+        if proposed.is_unknown() {
+            return proposed;
+        }
+        self.finalize_external_stop_for_publication()
+            .unwrap_or(proposed)
+    }
+
     /// Apply the mandatory public Unknown boundary to a provisional result.
     ///
     /// This is intentionally idempotent. Every public solve route calls it
@@ -279,11 +353,31 @@ impl Executor {
     /// Returns `false` without changing state unless the current result is
     /// UNSAT. That precondition keeps result gates from accidentally upgrading
     /// a missing, SAT, or already-unknown result.
+    ///
+    /// The published reason is TYPED, and it is decided from the executor's own
+    /// proof rather than from the caller's intent. When the terminal derivation
+    /// chain is not trust-free the reason is
+    /// [`UnknownReason::ProofTrusted`]; otherwise the rejection is an ordinary
+    /// [`UnknownReason::Incomplete`]. This entry point previously hardcoded
+    /// `Incomplete`, which made a soundness gate's catch byte-identical to an
+    /// unsupported solver lane — the conflation
+    /// [`UnknownReason::SelfCheckRejected`]'s doc comment forbids. Reading the
+    /// evidence rather than trusting the caller keeps the label honest for
+    /// every gate that funnels through here (strict proofs, `--verify-firewall`,
+    /// missing-certificate rejection) without any of them having to assert a
+    /// classification it is not in a position to make.
     pub fn reject_last_unsat_as_unknown(&mut self) -> bool {
         if !self.last_result_is_unsat() {
             return false;
         }
-        self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+        // Evaluate BEFORE publishing: publication revokes the proof the
+        // predicate reads.
+        let origin = if self.unsat_proof_terminal_trust_detected() {
+            UnknownOrigin::TerminalTrust
+        } else {
+            UnknownOrigin::IncompleteSolverLane
+        };
+        self.publish_unknown_from_origin(origin);
         true
     }
 
@@ -292,6 +386,11 @@ impl Executor {
     /// queries are the sole case that may retain algorithmic enumeration state;
     /// the previously emitted result/model/certificate are still always cleared.
     pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
+        self.advance_query_authority_epoch();
+        #[cfg(test)]
+        {
+            self.last_authored_query_authority_seen = false;
+        }
         self.array_ext_witness_cache
             .begin_public_solve(&self.ctx.terms);
         // Proof output is optional; proof-backed UNSAT correctness is not.
@@ -390,6 +489,9 @@ impl Executor {
         // process entry point.
         Self {
             ctx: Context::new(),
+            query_authority_epoch: QueryAuthorityEpoch::fresh(),
+            #[cfg(test)]
+            last_authored_query_authority_seen: false,
             // No string lemma lowered yet — vacuously all-valid.
             string_lemma_kinds_all_valid: true,
             qfax_budget_multiplier: 1,
@@ -425,6 +527,8 @@ impl Executor {
             last_core_term_to_name: None,
             named_assert_rewrites: Default::default(),
             last_proof: None,
+            last_unsat_proof_reconstruction_suppressed: false,
+            quantified_proof_translation_incomplete: false,
             last_lrat_certificate: None,
             last_proof_term_overrides: None,
             proof_problem_assertion_provenance: None,
@@ -447,9 +551,13 @@ impl Executor {
             counterexample_style: crate::CounterexampleStyle::default(),
             proof_tracker: crate::proof_tracker::ProofTracker::new(),
             proof_output_requested: false,
+            proof_artifact_required: false,
             proof_reconstruction_step_budget: None,
             last_clause_trace: None,
             last_var_to_term: None,
+            last_checked_sat_refutation: None,
+            last_finite_enum_pigeonhole: None,
+            last_checked_finite_enum_pigeonhole: None,
             last_trail_provenance: None,
             last_clausification_proofs: None,
             last_original_clause_theory_proofs: None,
@@ -466,15 +574,19 @@ impl Executor {
             in_alternation_validation: false,
             in_closed_universal_precheck: false,
             in_quantified_model_gate: false,
+            quantified_model_confirmation: None,
             dt_cert_grant_active: false,
+            dt_cert_query_grant: None,
             finite_table_cert_grant_active: false,
             const_interp_cert_grant_active: false,
             mbqi_sat_cert_grant_active: false,
-            mbqi_sat_cert_pins: HashMap::default(),
-            finite_table_cert_pending_witness: None,
-            const_interp_cert_witness: Vec::new(),
+            mbqi_sat_cert_query_grant: None,
+            cegqi_uf_recompletion_grant: None,
+            finite_table_cert_witness_state: None,
+            const_interp_cert_witness_state: None,
             solve_deadline: SolveDeadlineCell::new(),
             quantifier_deadline_backstop_installed: false,
+            quantifier_deadline_policy: QuantifierDeadlinePolicy::RelaxToBackstop,
             quantifier_pipeline_engaged: false,
             active_solve_phase: None,
             active_solve_cost_center: None,
@@ -496,12 +608,14 @@ impl Executor {
             dt_lazy_splits: None,
             defer_model_validation: false,
             bv_quantifier_full_domain_proof: false,
+            bv_quantifier_full_domain_pending_evidence: None,
+            bv_quantifier_full_domain_query_grant: None,
             defer_counterexample_minimization: false,
             last_model_validated: false,
             last_sat_certificate: None,
             last_unsat_certificate: None,
+            last_command_unsat_admission: None,
             unsat_query_epoch: None,
-            next_unsat_query_epoch: 0,
             cegar_pending_lemma: None,
             cegar_rounds_remaining: 0,
             cegar_emitted_lemmas: HashSet::default(),
@@ -516,6 +630,7 @@ impl Executor {
             dt_egraph_assignment: std::cell::RefCell::new(None),
             dt_egraph_building: Cell::new(false),
             array_def_index: std::cell::RefCell::new(None),
+            div_witness_index_cache: Default::default(),
             select_by_array_index: std::cell::RefCell::new((0, Default::default())),
             required_terms_index: std::cell::RefCell::new(None),
             recorded_var_substitutions: HashMap::default(),
@@ -531,6 +646,7 @@ impl Executor {
             w7_int_defs: HashMap::default(),
             w4_work_deadline: Cell::new(None),
             self_check_authored_assertions: None,
+            independent_gate_authored_assertions: None,
             array_axiom_scope: None,
             row_seeded_terms: HashSet::default(),
             array_default_epsilon_by_sort: HashMap::default(),
@@ -678,7 +794,7 @@ impl Executor {
     #[must_use]
     pub fn with_verification_level(level: VerificationLevel) -> Self {
         let mut exec = Self::new();
-        exec.verification_level = level;
+        exec.set_verification_level(level);
         exec
     }
 
@@ -688,7 +804,11 @@ impl Executor {
         self.verification_level
     }
 
-    /// Set the verification level.
+    /// Set the minimum verification level requested for subsequent solves.
+    ///
+    /// `ProofChecked` and `FullyVerified` make UNSAT publication fail closed
+    /// unless the strict proof checker accepts the exact authored query. Proof
+    /// artifact output remains controlled separately by `set_produce_proofs`.
     pub fn set_verification_level(&mut self, level: VerificationLevel) {
         self.verification_level = level;
     }
@@ -725,8 +845,24 @@ impl Executor {
         &self.ctx
     }
 
-    /// Access the internal context mutably (for API module)
+    /// Access the internal context mutably.
+    ///
+    /// A mutable context escape can change assertions, declarations, scopes, or
+    /// the term graph without passing through [`Self::execute`]. Revoke every
+    /// artefact from the preceding decision before yielding it so safe external
+    /// code cannot keep a stale SAT result or model alive across such a change.
     pub fn context_mut(&mut self) -> &mut Context {
+        self.invalidate_last_check_result();
+        &mut self.ctx
+    }
+
+    /// Crate-internal context access for narrowly audited transactions that
+    /// already own their result-lifecycle handling.
+    ///
+    /// In particular, native term construction may append query terms without
+    /// changing the asserted problem, and MaxSMT must restore its temporary soft
+    /// set after a solve without discarding the result it just authenticated.
+    pub(crate) fn context_mut_internal(&mut self) -> &mut Context {
         &mut self.ctx
     }
 
@@ -770,12 +906,29 @@ impl Executor {
         self.proof_output_requested = enabled;
         if enabled {
             self.proof_tracker.enable();
+            self.proof_artifact_required = true;
+            self.proof_reconstruction_step_budget = None;
             // Proof export aligns Assume steps with the ORIGINAL parsed
             // surface syntax, so retention must be on whenever proofs are.
             self.ctx.set_retain_parsed_assertions(true);
         } else {
             self.proof_tracker.disable();
+            self.proof_artifact_required = false;
         }
+    }
+
+    /// Enable the synthesized default proof surface as a best-effort artifact.
+    ///
+    /// Unlike [`Self::set_produce_proofs`], this policy does not make a missing
+    /// translated proof change a sound verdict.  It is intentionally atomic so
+    /// an explicit API proof request cannot be confused with the CLI default by
+    /// merely observing that a reconstruction budget happens to be present.
+    pub fn set_best_effort_produce_proofs(&mut self, step_budget: u64) {
+        self.proof_output_requested = true;
+        self.proof_tracker.enable();
+        self.ctx.set_retain_parsed_assertions(true);
+        self.proof_artifact_required = false;
+        self.proof_reconstruction_step_budget = Some(step_budget);
     }
 
     /// Configure whether the frontend context retains the original parsed AST
@@ -812,7 +965,13 @@ impl Executor {
     /// `(get-proof)`) must NOT set a budget. Deterministic by construction:
     /// a step count, never wall time (#A2b).
     pub fn set_proof_reconstruction_step_budget(&mut self, budget: Option<u64>) {
-        self.proof_reconstruction_step_budget = budget;
+        // This legacy tuning hook may bound only best-effort production.  An
+        // explicit proof request remains mandatory regardless of call order.
+        self.proof_reconstruction_step_budget = if self.proof_artifact_required {
+            None
+        } else {
+            budget
+        };
     }
 
     /// Search-time proof bookkeeping work budget for SAT solvers created by
@@ -1060,7 +1219,7 @@ impl Executor {
     /// Returns None if the last result was not UNSAT or if proof production was disabled.
     #[must_use]
     pub fn last_proof(&self) -> Option<&Proof> {
-        if self.is_producing_proofs() {
+        if self.is_producing_proofs() && !self.last_unsat_proof_reconstruction_suppressed {
             self.last_proof.as_ref()
         } else {
             None
@@ -1131,6 +1290,10 @@ impl Executor {
     /// counterexample_style, learned clause limits, verification_level)
     /// are preserved.
     pub fn reset(&mut self) {
+        // Revoke every artifact authorized by the old problem before replacing
+        // its context. Keep this centralized so newly added result/proof/model
+        // authority cannot survive a direct API reset by omission.
+        self.invalidate_last_check_result();
         self.ctx = Context::new();
         self.array_ext_witness_cache.clear();
         // ctx (and its append-only TermStore) is replaced wholesale: term ids
@@ -1138,38 +1301,12 @@ impl Executor {
         *self.select_by_array_index.borrow_mut() = (0, Default::default());
         *self.array_def_index.borrow_mut() = None;
         *self.required_terms_index.borrow_mut() = None;
-        self.last_result = None;
-        self.last_model = None;
-        self.last_sat_certificate = None;
-        self.last_unsat_certificate = None;
-        self.unsat_query_epoch = None;
-        self.last_assumptions = None;
-        self.last_assumption_core = None;
-        self.last_core_term_to_name = None;
-        self.last_proof = None;
-        self.last_proof_term_overrides = None;
-        self.last_proof_quality = None;
-        self.last_unknown_reason = None;
-        self.pending_sat_unknown_reason = None;
         self.last_statistics = Statistics::default();
-        self.last_clause_trace = None;
-        self.last_var_to_term = None;
-        self.last_trail_provenance = None;
-        self.last_clausification_proofs = None;
-        self.last_original_clause_theory_proofs = None;
-        self.proof_problem_assertion_provenance = None;
-        self.quant_expansion_records.clear();
-        self.ematching_proof_records.clear();
         self.last_negations = None;
         self.incremental_mode = false;
         self.pivot_enum_depth = 0;
-        self.proof_check_result = None;
         self.defer_model_validation = false;
         self.defer_counterexample_minimization = false;
-        self.last_model_validated = false;
-        self.last_validation_stats = None;
-        self.model_validation_delegated_assertions.clear();
-        self.dt_solver_added_axiom_terms.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
         self.nra_algebraic_model.clear();
@@ -1188,15 +1325,8 @@ impl Executor {
         self.solve_interrupt = None;
         self.solve_deadline.set(None);
         self.quantifier_deadline_backstop_installed = false;
+        self.quantifier_deadline_policy = QuantifierDeadlinePolicy::RelaxToBackstop;
         self.quantifier_pipeline_engaged = false;
-        self.last_soft_cost = None;
-        self.last_soft_cost_optimal = true;
-        self.last_soft_violations = None;
-        self.finite_objective_values.clear();
-        self.unbounded_objectives.clear();
-        self.infinitesimal_objectives.clear();
-        self.unavailable_objectives.clear();
-        self.objective_certificates.clear();
         self.lemma_cache.clear();
         for_each_incremental_subsystem!(reset self);
     }
@@ -1207,6 +1337,32 @@ mod result_rejection_tests {
     use super::*;
     use crate::incremental_state::IncrementalTheoryState;
     use ay_sat::Solver as SatSolver;
+
+    #[test]
+    fn direct_reset_revokes_every_query_artifact() {
+        let mut executor = Executor::new();
+        let old_term = executor.ctx.terms.true_term();
+        assert_eq!(
+            executor
+                .emit_sat_verdict(SolveResult::Sat, &[])
+                .expect("mint a checked SAT certificate"),
+            SolveResult::Sat
+        );
+        executor.last_result = Some(SolveResult::Sat);
+        executor.last_model = Some(Model::empty());
+        executor.last_lrat_certificate = Some(vec![1]);
+        executor.last_proof_rebuild_originals.push(old_term);
+        executor.pareto_state = Some(optimization::ParetoState::default());
+
+        executor.reset();
+
+        assert!(executor.last_result.is_none());
+        assert!(executor.last_model.is_none());
+        assert!(executor.last_sat_certificate.is_none());
+        assert!(executor.last_lrat_certificate.is_none());
+        assert!(executor.last_proof_rebuild_originals.is_empty());
+        assert!(executor.pareto_state.is_none());
+    }
 
     #[test]
     fn rejecting_unsat_clears_certificates_and_canonicalizes_followup_queries() {

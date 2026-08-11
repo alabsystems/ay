@@ -251,7 +251,7 @@ fn test_unsat_core_includes_assumption_literals_after_check_sat_assuming() {
         .unsat_assumptions()
         .expect("unsat assumptions available");
     assert!(
-        failed.iter().all(|t| t.0 == lt.0),
+        failed.iter().all(|t| t.id() == lt.id()),
         "unsat assumptions must be a subset of the user's literals"
     );
 }

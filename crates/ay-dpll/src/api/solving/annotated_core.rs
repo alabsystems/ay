@@ -168,6 +168,7 @@ impl Solver {
                     theory,
                     clause,
                     self.terms(),
+                    &|term_id| self.wrap_term(term_id),
                 );
                 for term_id in clause {
                     // Strip negation to get the base atom

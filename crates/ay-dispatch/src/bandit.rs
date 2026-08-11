@@ -17,9 +17,8 @@
 //!
 //! Both implementations are generic over an engine-id type implementing
 //! [`EngineId`]. Rewards are expected in `[0.0, 1.0]`; values outside that
-//! range are clamped. Internal weights are stored in log-space when numerically
-//! convenient but exposed as normalised probabilities for inspection and
-//! logging.
+//! range are clamped. Internal reward totals or weights are stored in a
+//! numerically stable domain and projected to probabilities for sampling.
 //!
 //! # References
 //!
@@ -85,9 +84,10 @@ impl Rng {
 
 /// Multiplicative-weights (Hedge) bandit in the *full-information* setting.
 ///
-/// Keeps an unnormalised positive weight per arm. On each update the pulled
-/// arm's weight is multiplied by `exp(eta * reward)` where `eta` is the
-/// learning rate. Sampling is proportional to the normalised weights.
+/// Keeps a cumulative reward offset per arm. For sampling, each offset is
+/// projected to the relative weight `exp(eta * (reward - best_reward))`, which
+/// is equivalent to multiplying by `exp(eta * reward)` without overflowing or
+/// losing a temporarily underflowed arm's reward history.
 ///
 /// Full-information MW assumes the learner sees rewards for *all* arms each
 /// round; [`Self::update_all`] implements that. [`Self::update`] is a
@@ -95,6 +95,10 @@ impl Rng {
 /// reward `0.0`).
 #[derive(Debug, Clone)]
 pub struct MultiplicativeWeights<E: EngineId> {
+    // Cumulative rewards translated so that the best score is zero. Keeping
+    // these separately from the projected weights means an `exp` underflow is
+    // only a temporary sampling result, not lost learning history.
+    scores: FxHashMap<E, f64>,
     weights: FxHashMap<E, f64>,
     engines: Vec<E>,
     eta: f64,
@@ -122,12 +126,18 @@ impl<E: EngineId> MultiplicativeWeights<E> {
     #[must_use]
     pub fn new(engines: impl IntoIterator<Item = E>, eta: f64, seed: u64) -> Self {
         let (weights, engines) = Self::sorted_engines(engines);
+        let scores = engines
+            .iter()
+            .copied()
+            .map(|engine| (engine, 0.0))
+            .collect();
         let eta = if eta.is_finite() && eta > 0.0 {
             eta
         } else {
             0.1
         };
         Self {
+            scores,
             weights,
             engines,
             eta,
@@ -135,7 +145,13 @@ impl<E: EngineId> MultiplicativeWeights<E> {
         }
     }
 
-    /// Read-only view of the raw (unnormalised) weights.
+    /// Read-only view of the relative weights.
+    ///
+    /// The largest weight is `1.0`; other entries are the exponential
+    /// projection of their cumulative-reward gap from the leader. A very
+    /// large gap may therefore appear as zero when the projection underflows.
+    /// The cumulative score is retained separately, so later rewards can make
+    /// a zero-valued projected weight recover.
     #[must_use]
     pub fn weights(&self) -> &FxHashMap<E, f64> {
         &self.weights
@@ -143,9 +159,7 @@ impl<E: EngineId> MultiplicativeWeights<E> {
 
     /// Probability distribution over engines (normalised weights).
     ///
-    /// Returns an empty map if the bandit has no arms or all weights have
-    /// collapsed to zero (which should not happen under the `update` rules
-    /// but is guarded defensively).
+    /// Returns an empty map if the bandit has no arms.
     #[must_use]
     pub fn distribution(&self) -> FxHashMap<E, f64> {
         let sum: f64 = self
@@ -207,14 +221,15 @@ impl<E: EngineId> MultiplicativeWeights<E> {
 
     /// Update the weight of a single arm.
     ///
-    /// `reward` is clamped to `[0.0, 1.0]`. Numerical underflow is prevented
-    /// by renormalising when any weight drops below `1e-12`.
+    /// `reward` is clamped to `[0.0, 1.0]` (with NaN treated as zero). The
+    /// projected relative weights are refreshed from cumulative reward
+    /// offsets after the update.
     pub fn update(&mut self, engine: E, reward: f64) {
-        let r = reward.clamp(0.0, 1.0);
-        if let Some(w) = self.weights.get_mut(&engine) {
-            *w *= (self.eta * r).exp();
-        }
-        self.guard_underflow();
+        let Some(score) = self.scores.get_mut(&engine) else {
+            return;
+        };
+        *score += finite_reward(reward);
+        self.refresh_weights();
     }
 
     /// Update all arms from a full-information reward vector.
@@ -223,35 +238,33 @@ impl<E: EngineId> MultiplicativeWeights<E> {
     /// clamped.
     pub fn update_all(&mut self, rewards: &FxHashMap<E, f64>) {
         for engine in &self.engines {
-            let r = rewards.get(engine).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            if let Some(weight) = self.weights.get_mut(engine) {
-                *weight *= (self.eta * r).exp();
+            let reward = finite_reward(rewards.get(engine).copied().unwrap_or(0.0));
+            if let Some(score) = self.scores.get_mut(engine) {
+                *score += reward;
             }
         }
-        self.guard_underflow();
+        self.refresh_weights();
     }
 
-    fn guard_underflow(&mut self) {
-        let max = self
+    fn refresh_weights(&mut self) {
+        let max_score = self
             .engines
             .iter()
-            .filter_map(|engine| self.weights.get(engine))
+            .filter_map(|engine| self.scores.get(engine))
             .copied()
-            .fold(0.0_f64, f64::max);
-        if max < 1e-12 || !max.is_finite() {
-            // Renormalise: divide through by max (or reset to uniform).
-            if max.is_finite() && max > 0.0 {
-                for engine in &self.engines {
-                    if let Some(weight) = self.weights.get_mut(engine) {
-                        *weight /= max;
-                    }
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_score.is_finite() && max_score != 0.0 {
+            for engine in &self.engines {
+                if let Some(score) = self.scores.get_mut(engine) {
+                    *score -= max_score;
                 }
-            } else {
-                for engine in &self.engines {
-                    if let Some(weight) = self.weights.get_mut(engine) {
-                        *weight = 1.0;
-                    }
-                }
+            }
+        }
+        for engine in &self.engines {
+            if let (Some(score), Some(weight)) =
+                (self.scores.get(engine), self.weights.get_mut(engine))
+            {
+                *weight = (self.eta * *score).exp();
             }
         }
     }
@@ -388,7 +401,7 @@ impl<E: EngineId> Exp3<E> {
     /// `reward` is clamped to `[0.0, 1.0]`. If the arm has zero sampling
     /// probability (shouldn't happen with `gamma > 0`) the update is a no-op.
     pub fn update(&mut self, engine: E, reward: f64) {
-        let r = reward.clamp(0.0, 1.0);
+        let reward = finite_reward(reward);
         let dist = self.distribution();
         let Some(p) = dist.get(&engine).copied() else {
             return;
@@ -396,28 +409,47 @@ impl<E: EngineId> Exp3<E> {
         if p <= 0.0 {
             return;
         }
-        let estimate = r / p;
+        let estimate = reward / p;
         if let Some(l) = self.log_weights.get_mut(&engine) {
-            *l += self.eta * estimate;
+            let increment = self.eta * estimate;
+            *l += if increment.is_finite() {
+                increment
+            } else {
+                f64::MAX
+            };
         }
-        self.guard_overflow();
+        self.normalise_log_weights();
     }
 
-    fn guard_overflow(&mut self) {
-        // Keep log-weights bounded by subtracting the running max.
+    fn normalise_log_weights(&mut self) {
+        // Log-weights are translation-invariant. Keep their maximum at zero so
+        // repeated updates cannot overflow before `distribution` applies its
+        // own log-sum-exp stabilisation. Finite negative gaps are retained even
+        // when their exponential projection temporarily underflows: a later
+        // reward can then close or reverse the stored gap.
         let max_log = self
             .engines
             .iter()
             .filter_map(|engine| self.log_weights.get(engine))
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
-        if max_log.is_finite() && max_log > 50.0 {
+        if max_log.is_finite() && max_log != 0.0 {
             for engine in &self.engines {
                 if let Some(log_weight) = self.log_weights.get_mut(engine) {
                     *log_weight -= max_log;
                 }
             }
         }
+    }
+}
+
+/// Clamp a reward to the algorithm's domain. NaN carries no ordering
+/// information, so treat it as zero rather than poisoning every weight.
+fn finite_reward(reward: f64) -> f64 {
+    if reward.is_nan() {
+        0.0
+    } else {
+        reward.clamp(0.0, 1.0)
     }
 }
 
@@ -520,6 +552,61 @@ mod tests {
             counts[0] > counts[1] * 10,
             "A should vastly outnumber B: {counts:?}"
         );
+    }
+
+    #[test]
+    fn mw_large_learning_rate_does_not_reset_to_uniform() {
+        let mut mw = MultiplicativeWeights::new([Arm::A, Arm::B], 1_000.0, 1);
+        mw.update(Arm::A, 1.0);
+        let dist = mw.distribution();
+        assert!(dist[&Arm::A] > 0.999, "large update was lost: {dist:?}");
+    }
+
+    #[test]
+    fn mw_arm_recovers_after_extreme_underflow_pressure() {
+        let mut mw = MultiplicativeWeights::new([Arm::A, Arm::B], 1_000.0, 1);
+        mw.update(Arm::A, 1.0);
+        assert!(mw.distribution()[&Arm::A] > 0.999);
+
+        // Equal and then surpass A's cumulative reward. Although B's projected
+        // weight underflowed to zero, its cumulative score was not discarded.
+        mw.update(Arm::B, 1.0);
+        let tied = mw.distribution();
+        assert!(approx(tied[&Arm::A], 0.5, 1e-12), "not tied: {tied:?}");
+        assert!(approx(tied[&Arm::B], 0.5, 1e-12), "not tied: {tied:?}");
+
+        mw.update(Arm::B, 1.0);
+        let dist = mw.distribution();
+        assert!(dist[&Arm::B] > 0.999, "B did not recover: {dist:?}");
+    }
+
+    #[test]
+    fn nan_reward_is_a_no_op() {
+        let mut mw = MultiplicativeWeights::new([Arm::A, Arm::B], 0.5, 1);
+        mw.update(Arm::A, f64::NAN);
+        assert!(approx(mw.distribution()[&Arm::A], 0.5, 1e-12));
+
+        let mut exp3 = Exp3::new([Arm::A, Arm::B], 0.5, 0.05, 1);
+        exp3.update(Arm::A, f64::NAN);
+        assert!(approx(exp3.distribution()[&Arm::A], 0.5, 1e-12));
+    }
+
+    #[test]
+    fn exp3_arm_recovers_after_log_weight_underflow_pressure() {
+        let mut exp3 = Exp3::new([Arm::A, Arm::B], 1_000.0, 0.05, 1);
+        exp3.update(Arm::A, 1.0);
+        assert_eq!(exp3.log_weights[&Arm::A], 0.0);
+        assert_eq!(exp3.log_weights[&Arm::B], -2_000.0);
+
+        // B is sampled only through the exploration floor, so a reward of
+        // 0.05 has importance-weighted value 2.0 and exactly closes the gap.
+        exp3.update(Arm::B, 0.05);
+        assert!(approx(exp3.log_weights[&Arm::A], 0.0, 1e-9));
+        assert!(approx(exp3.log_weights[&Arm::B], 0.0, 1e-9));
+
+        exp3.update(Arm::B, 1.0);
+        let dist = exp3.distribution();
+        assert!(dist[&Arm::B] > 0.9, "B did not recover: {dist:?}");
     }
 
     #[test]

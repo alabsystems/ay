@@ -769,7 +769,6 @@ fn check_generation_memory(
 // ordering logic, suffix-bound code, or transition code with the generator.
 #[derive(Debug)]
 struct ReplayProblem {
-    num_variables: usize,
     lower_bounds: Vec<i128>,
     upper_bounds: Vec<Option<i128>>,
     coefficients_by_variable: Vec<Vec<(usize, i128)>>,
@@ -849,7 +848,6 @@ impl ReplayProblem {
             }
         }
         Ok(Self {
-            num_variables,
             lower_bounds,
             upper_bounds,
             coefficients_by_variable,

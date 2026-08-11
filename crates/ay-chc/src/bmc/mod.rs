@@ -9261,10 +9261,7 @@ impl BmcSolver {
         }
         let mut current = expr;
         let mut reversed = Vec::new();
-        loop {
-            let ChcExpr::Op(ChcOp::Select, args) = current else {
-                break;
-            };
+        while let ChcExpr::Op(ChcOp::Select, args) = current {
             let [array_expr, index_expr] = args.as_slice() else {
                 return None;
             };
@@ -10600,7 +10597,7 @@ impl BmcSolver {
     fn trace_fingerprint_value(sort: &ChcSort, nonce: usize) -> Option<SmtValue> {
         let n = i128::try_from(nonce).ok()?;
         match sort {
-            ChcSort::Bool => Some(SmtValue::Bool(nonce % 2 != 0)),
+            ChcSort::Bool => Some(SmtValue::Bool(!nonce.is_multiple_of(2))),
             ChcSort::Int => Some(SmtValue::Int(n.checked_neg()?.checked_sub(1)?)),
             ChcSort::BitVec(width) if *width != 0 => {
                 Some(SmtValue::BitVec((nonce as u128) & bv_mask(*width), *width))

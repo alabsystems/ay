@@ -22,7 +22,7 @@ fn test_fp_add_produces_fp_term() {
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RNE").unwrap();
     let sum = solver.try_fp_add(rm, x, y).unwrap();
-    let sort = solver.terms().sort(sum.0).clone();
+    let sort = solver.terms().sort(sum.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -33,7 +33,7 @@ fn test_fp_sub_produces_fp_term() {
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RNE").unwrap();
     let diff = solver.try_fp_sub(rm, x, y).unwrap();
-    let sort = solver.terms().sort(diff.0).clone();
+    let sort = solver.terms().sort(diff.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -44,7 +44,7 @@ fn test_fp_mul_produces_fp_term() {
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RTZ").unwrap();
     let prod = solver.try_fp_mul(rm, x, y).unwrap();
-    let sort = solver.terms().sort(prod.0).clone();
+    let sort = solver.terms().sort(prod.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -55,7 +55,7 @@ fn test_fp_div_produces_fp_term() {
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RNE").unwrap();
     let quot = solver.try_fp_div(rm, x, y).unwrap();
-    let sort = solver.terms().sort(quot.0).clone();
+    let sort = solver.terms().sort(quot.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -65,7 +65,7 @@ fn test_fp_sqrt_produces_fp_term() {
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RNE").unwrap();
     let root = solver.try_fp_sqrt(rm, x).unwrap();
-    let sort = solver.terms().sort(root.0).clone();
+    let sort = solver.terms().sort(root.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -75,7 +75,7 @@ fn test_fp_rem_produces_fp_term() {
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let rem = solver.try_fp_rem(x, y).unwrap();
-    let sort = solver.terms().sort(rem.0).clone();
+    let sort = solver.terms().sort(rem.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -87,7 +87,7 @@ fn test_fp_fma_produces_fp_term() {
     let c = solver.declare_const("c", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RNE").unwrap();
     let fma = solver.try_fp_fma(rm, a, b, c).unwrap();
-    let sort = solver.terms().sort(fma.0).clone();
+    let sort = solver.terms().sort(fma.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -97,7 +97,7 @@ fn test_fp_round_to_integral_produces_fp_term() {
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let rm = solver.try_fp_rounding_mode("RTN").unwrap();
     let rounded = solver.try_fp_round_to_integral(rm, x).unwrap();
-    let sort = solver.terms().sort(rounded.0).clone();
+    let sort = solver.terms().sort(rounded.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -106,7 +106,7 @@ fn test_fp_abs_produces_fp_term() {
     let mut solver = Solver::new(Logic::QfFp);
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let abs = solver.try_fp_abs(x).unwrap();
-    let sort = solver.terms().sort(abs.0).clone();
+    let sort = solver.terms().sort(abs.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -115,7 +115,7 @@ fn test_fp_neg_produces_fp_term() {
     let mut solver = Solver::new(Logic::QfFp);
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let neg = solver.try_fp_neg(x).unwrap();
-    let sort = solver.terms().sort(neg.0).clone();
+    let sort = solver.terms().sort(neg.id()).clone();
     assert_eq!(sort, Sort::FloatingPoint(8, 24));
 }
 
@@ -251,7 +251,7 @@ fn test_fp_is_nan_returns_bool_sort() {
     let mut solver = Solver::new(Logic::QfFp);
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let is_nan = solver.try_fp_is_nan(x).unwrap();
-    let sort = solver.terms().sort(is_nan.0).clone();
+    let sort = solver.terms().sort(is_nan.id()).clone();
     assert_eq!(sort, Sort::Bool);
 }
 
@@ -261,7 +261,7 @@ fn test_fp_eq_returns_bool_sort() {
     let x = solver.declare_const("x", Sort::FloatingPoint(8, 24));
     let y = solver.declare_const("y", Sort::FloatingPoint(8, 24));
     let eq = solver.try_fp_eq(x, y).unwrap();
-    let sort = solver.terms().sort(eq.0).clone();
+    let sort = solver.terms().sort(eq.id()).clone();
     assert_eq!(sort, Sort::Bool);
 }
 
@@ -283,7 +283,7 @@ fn test_fp_constants_produce_correct_sort() {
         (pzero, "+zero"),
         (nzero, "-zero"),
     ] {
-        let sort = solver.terms().sort(term.0).clone();
+        let sort = solver.terms().sort(term.id()).clone();
         assert_eq!(
             sort,
             Sort::FloatingPoint(8, 24),

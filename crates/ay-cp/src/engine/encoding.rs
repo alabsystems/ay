@@ -432,32 +432,32 @@ impl CpSatEngine {
                 // Big-M: x[i] + dx[i] - x[j] + M*b1 <= M
                 // b1=1: x[i]+dx[i]-x[j] <= 0  (enforced)
                 // b1=0: x[i]+dx[i]-x[j] <= M   (relaxed)
-                let m1 = (ub_xi + ub_dxi - lb_xj).max(0) + 1;
-                self.add_propagator(LinearLe::new(
+                let m1 = (i128::from(ub_xi) + i128::from(ub_dxi) - i128::from(lb_xj)).max(0) + 1;
+                self.add_propagator(LinearLe::new_wide(
                     vec![1, 1, -1, m1],
                     vec![x[i], dx[i], x[j], b1],
                     m1,
                 ));
 
                 // b2=1 → x[j] + dx[j] <= x[i]  (j left of i)
-                let m2 = (ub_xj + ub_dxj - lb_xi).max(0) + 1;
-                self.add_propagator(LinearLe::new(
+                let m2 = (i128::from(ub_xj) + i128::from(ub_dxj) - i128::from(lb_xi)).max(0) + 1;
+                self.add_propagator(LinearLe::new_wide(
                     vec![1, 1, -1, m2],
                     vec![x[j], dx[j], x[i], b2],
                     m2,
                 ));
 
                 // b3=1 → y[i] + dy[i] <= y[j]  (i below j)
-                let m3 = (ub_yi + ub_dyi - lb_yj).max(0) + 1;
-                self.add_propagator(LinearLe::new(
+                let m3 = (i128::from(ub_yi) + i128::from(ub_dyi) - i128::from(lb_yj)).max(0) + 1;
+                self.add_propagator(LinearLe::new_wide(
                     vec![1, 1, -1, m3],
                     vec![y[i], dy[i], y[j], b3],
                     m3,
                 ));
 
                 // b4=1 → y[j] + dy[j] <= y[i]  (j below i)
-                let m4 = (ub_yj + ub_dyj - lb_yi).max(0) + 1;
-                self.add_propagator(LinearLe::new(
+                let m4 = (i128::from(ub_yj) + i128::from(ub_dyj) - i128::from(lb_yi)).max(0) + 1;
+                self.add_propagator(LinearLe::new_wide(
                     vec![1, 1, -1, m4],
                     vec![y[j], dy[j], y[i], b4],
                     m4,

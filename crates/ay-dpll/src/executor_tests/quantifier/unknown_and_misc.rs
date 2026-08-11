@@ -3,6 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use ay_core::{Sort, Symbol};
+use num_bigint::BigInt;
 
 /// Test that unknown_reason returns correct reason for quantifier-related Unknown
 #[test]
@@ -37,6 +39,38 @@ fn test_unknown_reason_quantifiers() {
             "Reason should be a quantifier sub-reason, got: {r:?}"
         );
     }
+}
+
+/// A dead trigger controls instantiation only; it does not weaken the asserted
+/// first-order universal. In particular, an E-matching-only (`no_mbqi`)
+/// quantifier can have an impossible body even when its trigger head has no
+/// ground occurrence. The old vacuous-trigger shortcut fabricated SAT here.
+#[test]
+fn no_mbqi_dead_trigger_with_impossible_body_never_sat() {
+    let mut executor = Executor::new();
+    executor.ctx.set_logic("UFBV".to_string());
+
+    let bit = Sort::bitvec(1);
+    let x = executor.ctx.terms.mk_var("x", bit.clone());
+    let fx = executor.ctx.terms.mk_app(Symbol::named("f"), vec![x], bit);
+    let zero = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
+    let one = executor.ctx.terms.mk_bitvec(BigInt::from(1), 1);
+    let eq_zero = executor.ctx.terms.mk_eq(fx, zero);
+    let eq_one = executor.ctx.terms.mk_eq(fx, one);
+    let body = executor.ctx.terms.mk_and(vec![eq_zero, eq_one]);
+    let forall = executor.ctx.terms.mk_forall_with_triggers(
+        vec![("x".to_string(), Sort::bitvec(1))],
+        body,
+        vec![vec![fx]],
+    );
+    executor.ctx.terms.mark_no_mbqi(forall);
+    executor.ctx.assertions.push(forall);
+
+    let result = executor.check_sat();
+    assert!(
+        !matches!(result, Ok(SolveResult::Sat)),
+        "an impossible no_mbqi forall must never be reported sat: {result:?}"
+    );
 }
 /// Test that unknown_reason returns None when result is SAT or UNSAT
 #[test]
@@ -271,17 +305,15 @@ fn test_6045_13chain_ematching_budget_must_not_return_sat() {
     );
 }
 
-// #quantifier_consumer-arith LEG DISTINCTION regression (deductive-checks exec_spec_unverified
+// #quantifier_consumer-arith soundness regression (deductive-checks exec_spec_unverified
 // five_wrong): a spec-fn UF definition axiom over BV8 alongside a GROUND
-// refutation query whose atoms are pure BV comparisons over free constants.
-// The ground core is genuinely satisfiable (the DPLL core solves it), the
-// forall is a pointwise-completable UF definition, so the answer is `sat` —
-// the deductive-checks counterexample. The #quantifier_consumer-arith per-atom freedom gate used
-// to reject the nested `(= x1 x2)` atoms and fail closed to unknown; the
-// model-backed certificate (`quantifiers_supported_by_uf_completion_given_sat`)
-// restores completeness ONLY on the genuine-Sat leg.
+// counterexample query whose atoms are pure BV comparisons over free constants.
+// The formula is satisfiable, but a ground model plus one matched definition
+// point does not construct a total model for the universal: cost filtering and
+// presolve-model filtering can omit other indexed applications. Without an
+// independently materialized and re-checked interpretation, fail closed.
 #[test]
-fn test_bv_uf_definition_axiom_ground_counterexample_is_sat() {
+fn test_bv_uf_definition_axiom_ground_counterexample_fails_closed() {
     let smt = r#"
         (set-logic ALL)
         (declare-fun five ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
@@ -306,14 +338,14 @@ fn test_bv_uf_definition_axiom_ground_counterexample_is_sat() {
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(
         outputs,
-        vec!["sat"],
-        "ground BV counterexample under a completable UF-definition axiom must be sat"
+        vec!["unknown"],
+        "a syntactic UF-definition candidate must not grant sat"
     );
 }
 
 /// UNSAT twin of the test above: the wrapper body matches the spec exactly,
-/// so the refutation query has no counterexample. Pins that the model-backed
-/// certificate never flips a genuine UNSAT.
+/// so the refutation query has no counterexample. The sound UNSAT-only
+/// consequence probe still decides it.
 #[test]
 fn test_bv_uf_definition_axiom_valid_wrapper_is_unsat() {
     let smt = r#"
@@ -568,13 +600,12 @@ fn empty_universe_bv_uf_refutation_publishes_a_checkable_witness() {
 }
 
 /// (#eu-uf-interp) The SAME refutation shape as the test above, but with the
-/// `:pattern` deductive-checks actually attaches. The trigger changes which lane grants
-/// the `Sat` — a triggered `forall` is not "completely unhandled", so the
-/// singleton-witness decide is never consulted and the VACUOUS-TRIGGER
-/// certificate grants instead, on the bare model-existence claim that "the
-/// ground model extends by interpreting the never-grounded symbols freely".
-/// That claim was never cashed out, so the emitted witness was empty and the
-/// quantified gate deferred it to `unknown (incomplete)`. This is the shape the
+/// `:pattern` deductive-checks actually attaches. A triggered `forall` is not
+/// "completely unhandled", so this shape used to bypass the singleton theorem
+/// and rely on a bare model-extension claim. That claim was never cashed out:
+/// the emitted witness was empty and the quantified gate deferred it to
+/// `unknown (incomplete)`. Patterned and unpatterned forms must now use the
+/// same checked singleton-model transaction. This is the shape the
 /// trait-conformance controls actually send.
 #[test]
 fn vacuous_trigger_bv_uf_refutation_publishes_a_checkable_witness() {
@@ -612,7 +643,7 @@ fn assert_published_constant_witness_beats_100(model: &str) {
         .unwrap_or_else(|| panic!("published model names no interpretation for DT__dm:\n{model}"));
     let body = &model[start..];
     let body = match body[1..].find("(define-fun ") {
-        Some(next) => &body[..next + 1],
+        Some(next) => &body[..=next],
         None => body,
     };
     assert!(

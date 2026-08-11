@@ -247,10 +247,26 @@ impl Executor {
     /// trivially.
     #[must_use]
     pub(in crate::executor) fn unsat_proof_extensionality_certified(&self, proof: &Proof) -> bool {
+        if !proof.steps.iter().any(|step| {
+            matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::ArrayExtensionality,
+                    ..
+                } | ProofStep::Step {
+                    rule: AletheRule::ArrayExtDiffIntro,
+                    ..
+                }
+            )
+        }) {
+            return true;
+        }
         // Use exactly the same authored/export premise scope as the strict
         // checker. In addition to freshness, that shared scope covers active
         // check-sat assumptions and authenticated rebuilt source terms.
-        let problem = self.problem_assertions_for_strict_proof();
+        let problem = self
+            .finite_enum_scope_for_proof(proof)
+            .unwrap_or_else(|| self.complete_problem_assertions_for_strict_proof());
         ay_proof::validate_array_extensionality_provenance(proof, &self.ctx.terms, &problem).is_ok()
     }
 }

@@ -132,7 +132,7 @@ pub(super) struct CompositionStep {
 }
 
 /// Composition trace for a single surviving clause: the ordered chain of
-/// inlined-predicate applications `apply_defs` composed into it.
+/// inlined-predicate applications `apply_defs_tracked` composed into it.
 ///
 /// Soundness: this is only a HINT used to OFFER a reconstructed derivation
 /// chain. Every reconstructed entry is independently re-validated by the SMT
@@ -145,7 +145,7 @@ pub(super) struct ClauseTrace {
     /// The pre-inlining clause `C₀` (head = the composite clause's head).
     /// `None` until the clause is first inlined into.
     pub(super) original_clause: Option<HornClause>,
-    /// The composite clause `apply_defs` produced (head = `C₀`'s head, body
+    /// The composite clause `apply_defs_tracked` produced (head = `C₀`'s head, body
     /// collapsed, constraint = accumulated linking equalities). Its constraint
     /// determines every intermediate predicate's argument values given the
     /// surviving endpoints, so the back-translator recovers them by SMT even

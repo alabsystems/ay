@@ -9,8 +9,8 @@ use ay_core::{Sort, TermData, TermId};
 use ay_frontend::command::Term as ParsedTerm;
 use ay_frontend::Command;
 
-use crate::api::types::{NativeReplayEventKind, SolverError, Term};
-use crate::api::Solver;
+use crate::api::types::{FuncDeclIdentity, NativeReplayEventKind, SolverError, Term};
+use crate::api::{Solver, SolverCacheToken};
 use crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER;
 
 impl Solver {
@@ -34,16 +34,17 @@ impl Solver {
     /// [`assert_term`]: Solver::assert_term
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_assert_term(&mut self, term: Term) -> Result<(), SolverError> {
+        let term_id = self.resolve_term("assert_term", term)?;
         if let Some(message) = self
             .executor
-            .array_ext_witness_registration_error(&[term.0])
+            .array_ext_witness_registration_error(&[term_id])
         {
             return Err(SolverError::InvalidArgument {
                 operation: "assert_term",
                 message,
             });
         }
-        let sort = self.terms().sort(term.0).clone();
+        let sort = self.terms().sort(term_id).clone();
         if sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "assert_term",
@@ -60,18 +61,18 @@ impl Solver {
         // construction, while model output emits the lambda body.  Every
         // refusal below keeps the original quantified assertion unchanged.
         let asserted_term = self
-            .try_adopt_native_definitional_forall(term.0)
-            .unwrap_or(term.0);
+            .try_adopt_native_definitional_forall(term_id)
+            .unwrap_or(term_id);
 
         // Keep assertions_parsed aligned with assertions for proof-rewrite
         // invariants when assertions are added via the native API path.
-        let ctx = self.executor.context_mut();
+        let ctx = self.executor.context_mut_internal();
         ctx.add_assertion_with_parsed(
             asserted_term,
             ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
         );
         self.record_native_replay_event(NativeReplayEventKind::Assert {
-            term: term.0,
+            term: term_id,
             name: None,
         });
         Ok(())
@@ -102,16 +103,17 @@ impl Solver {
     /// [`try_get_unsat_core`]: Solver::try_get_unsat_core
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_assert_named(&mut self, term: Term, name: &str) -> Result<(), SolverError> {
+        let term_id = self.resolve_term("assert_named", term)?;
         if let Some(message) = self
             .executor
-            .array_ext_witness_registration_error(&[term.0])
+            .array_ext_witness_registration_error(&[term_id])
         {
             return Err(SolverError::InvalidArgument {
                 operation: "assert_named",
                 message,
             });
         }
-        let sort = self.terms().sort(term.0).clone();
+        let sort = self.terms().sort(term_id).clone();
         if sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "assert_named",
@@ -122,18 +124,18 @@ impl Solver {
 
         self.executor.note_api_assertion_mutation();
 
-        let ctx = self.executor.context_mut();
+        let ctx = self.executor.context_mut_internal();
         // A native assertion's optional core name is metadata, not surface
         // syntax.  Reuse the anonymous native sentinel so strict proof
         // reconstruction derives from the exact asserted term instead of
         // trying to elaborate a fabricated `__ay_named_*` variable.
         ctx.add_assertion_with_parsed(
-            term.0,
+            term_id,
             ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
         );
-        ctx.register_named_term(name.to_string(), term.0);
+        ctx.register_named_term(name.to_string(), term_id);
         self.record_native_replay_event(NativeReplayEventKind::Assert {
-            term: term.0,
+            term: term_id,
             name: Some(name.to_string()),
         });
         Ok(())
@@ -219,7 +221,7 @@ impl Solver {
             .context()
             .assertions
             .iter()
-            .map(|&id| Term(id))
+            .map(|&id| self.wrap_term(id))
             .collect()
     }
 
@@ -249,6 +251,12 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_reset(&mut self) -> Result<(), SolverError> {
         self.executor.execute(&Command::Reset)?;
+        self.term_arena = crate::api::types::TermArenaStamp::fresh();
+        // A full reset discards the term/declaration arena. Rotate the cache
+        // generation and invalidate every clone of the old token before callers
+        // can inspect state holding old handles.
+        self.cache_token.invalidate();
+        self.cache_token = SolverCacheToken::new();
         self.scope_level = 0;
         self.var_names.clear();
         self.var_terms_by_name.clear();
@@ -368,25 +376,37 @@ impl Solver {
             }
             Some((name.clone(), args.clone(), candidate))
         };
-        let (name, param_terms, head, definition_body) =
+        let (core_name, param_terms, head, definition_body) =
             match (exact_head(self, sides[0]), exact_head(self, sides[1])) {
                 (Some((name, params, head)), None) => (name, params, head, sides[1]),
                 (None, Some((name, params, head))) => (name, params, head, sides[0]),
                 _ => return None,
             };
-        if self.defined_funs.contains_key(&name) {
+        let (name, registration) = self
+            .native_fun_signatures
+            .iter()
+            .find(|(_, registration)| registration.core_name == core_name)?;
+        // The frontend model-interpretation hook intentionally supports only
+        // declarations whose public and core names coincide. A builtin-name
+        // collision has a private identity and therefore remains an ordinary
+        // UF instead of being unsafely adopted through a spelling-keyed path.
+        if registration.core_name != *name || self.defined_funs.contains_key(name) {
             return None;
         }
-        let Some(sig) = self.native_fun_signatures.get(&name).cloned() else {
-            return None;
-        };
-        let (domain, range) = sig;
+        let domain = &registration.domain;
+        let range = &registration.range;
+        let core_domain: Vec<Sort> = domain
+            .iter()
+            .map(|sort| self.lower_live_sort(sort))
+            .collect();
+        let core_range = self.lower_live_sort(range);
+        let declaration_identity = registration.identity.clone();
         if domain.len() != vars.len()
-            || domain
+            || core_domain
                 .iter()
                 .zip(vars.iter())
-                .any(|(declared, (_, bound))| declared.as_term_sort() != *bound)
-            || range.as_term_sort() != *self.terms().sort(definition_body)
+                .any(|(declared, (_, bound))| *declared != *bound)
+            || core_range != *self.terms().sort(definition_body)
         {
             return None;
         }
@@ -427,7 +447,7 @@ impl Solver {
             let TermData::App(Symbol::Named(other), args) = self.terms().get(id) else {
                 continue;
             };
-            if other != &name {
+            if other != &core_name {
                 continue;
             }
             let args = args.clone();
@@ -461,12 +481,12 @@ impl Solver {
         let params: Vec<(String, Sort)> = vars.clone();
         if !self
             .executor
-            .context_mut()
+            .context_mut_internal()
             // Claim the pinned-uses exemption ONLY when there is something to
             // exempt.  With no pre-definition application the original
             // "no earlier constraint may mention it" check runs unchanged.
             .try_register_native_adopted_macro_interp(
-                &name,
+                name,
                 &params,
                 definition_body,
                 !stale_applications.is_empty(),
@@ -475,7 +495,7 @@ impl Solver {
             return None;
         }
         self.defined_funs.insert(
-            name,
+            name.clone(),
             super::super::DefinedFun {
                 params: params
                     .iter()
@@ -483,8 +503,9 @@ impl Solver {
                     .map(|((name, _), term)| (name.clone(), term))
                     .collect(),
                 body: definition_body,
-                return_sort: range.as_term_sort(),
+                return_sort: core_range,
                 assertion_derived: true,
+                identity: FuncDeclIdentity::Frontend(declaration_identity),
             },
         );
 
@@ -497,15 +518,15 @@ impl Solver {
         // and because the scan above is complete and closed, any model of the
         // pins extends to a model of the original `forall` by reading `f` off
         // the definition body everywhere else, so no SAT is created either.
-        let mut replacement = Term(self.terms().true_term());
+        let mut replacement = self.wrap_term(self.terms().true_term());
         for (raw, args) in stale_applications {
             let subst: ay_core::kani_compat::DetHashMap<TermId, TermId> =
                 param_terms.iter().copied().zip(args).collect();
             let expanded = self.substitute_defined_fun_body(definition_body, &subst);
-            let pin = self.eq(Term(raw), Term(expanded));
+            let pin = self.eq(self.wrap_term(raw), self.wrap_term(expanded));
             replacement = self.and(replacement, pin);
         }
-        Some(replacement.0)
+        Some(replacement.id())
     }
 }
 

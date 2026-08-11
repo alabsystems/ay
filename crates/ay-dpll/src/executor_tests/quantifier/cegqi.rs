@@ -5,6 +5,52 @@
 use super::*;
 
 #[test]
+fn test_cegqi_internal_counterexample_name_cannot_alias_user_constant() {
+    // The formula is inconsistent over Int: no single `a` can equal every
+    // integer.  Historically CEGQI interned its witness as `__ce_x`, allowing
+    // the user declaration below to alias the internal counterexample and
+    // incorrectly constrain the validity check.
+    let input = r#"
+        (set-logic AUFLIA)
+        (declare-const __ce_x Int)
+        (declare-const a Int)
+        (assert (= __ce_x 0))
+        (assert (= a 0))
+        (assert (forall ((x Int)) (= x a)))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_cegqi_counterexample_assumption_is_not_an_ematching_ground_source() {
+    // The temporary CEGQI search assumption is `(f ce) < 0`. It must not feed
+    // `ce` back into E-matching for the same universal: doing so adds the
+    // logically opposite instance `0 <= (f ce)` and manufactures UNSAT from
+    // the solver's own auxiliary assumptions. A constant nonnegative function
+    // is a concrete model of this input.
+    let input = r#"
+        (set-logic ALL)
+        (declare-fun f (Int) Int)
+        (declare-const x Int)
+        (assert (forall ((i Int)) (<= 0 (f i))))
+        (assert (= (f x) 5))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs, vec!["sat"]);
+}
+
+#[test]
 fn test_cegqi_valid_implication() {
     // forall x. (x > 0) => (x >= 1) is valid for integers
     // CE lemma: Not((e > 0) => (e >= 1)) = (e > 0) AND Not(e >= 1) = (e > 0) AND (e < 1)
@@ -40,6 +86,19 @@ fn test_cegqi_invalid_strict_positive() {
     // Invalid forall: enumerative instantiation with x=0 produces false,
     // proving the formula unsatisfiable.
     assert_eq!(outputs, vec!["unsat"]);
+
+    let exported = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("certified UNSAT must retain an exportable proof")
+        .expect("Alethe export must succeed");
+    let forall_inst = exported
+        .lines()
+        .find(|line| line.contains(":rule forall_inst"))
+        .expect("proof must contain the authored forall instantiation");
+    assert!(
+        forall_inst.contains("(> 0 0)"),
+        "the instance must use the source quantifier's surface orientation: {forall_inst}"
+    );
 }
 #[test]
 fn test_cegqi_valid_nonstrict_positive() {
@@ -402,16 +461,17 @@ fn test_wfcegqi_batch_unsat_no_wrong_sat() {
 /// the quantifier's NEGATION as the CE lemma, the ground lane consumes that
 /// equality as a DEFINITIONAL substitution (`k2 := A[c]`), rewrites away the
 /// genuine assertion `a(k2)` and constant-folds the residue to a bare `false`.
-/// The CE strip in `disambiguate_cegqi_unsat_ext` then deletes the real
+/// The CE strip in `disambiguate_cegqi_unsat` then deletes the real
 /// assertions (they now mention the CE variable) and KEEPS the CE-derived
 /// `false`, so the "ground-minus-CE" probe re-solves `{true,false}` and reports
 /// a GLOBAL unsat — a conflict that depends ENTIRELY on the CE lemma, which per
 /// `cegqi/mod.rs` ("forall: UNSAT on CE lemma -> SAT") means the quantifier
 /// HOLDS.
 ///
-/// `cegqi_probe_unsat_is_attributable` now requires the probe set to still carry
-/// every CE-free ground conjunct of the pre-instantiation snapshot; `(a k2)` is
-/// absent, so the UNSAT is unattributable and fails closed to Unknown.
+/// The sealed CEGQI UNSAT certifier now ignores the contaminated live probe and
+/// reconstructs a fresh set from the snapshot ground core plus provenance-tagged
+/// universal instances. That authorized set is satisfiable here, so the raw
+/// probe's UNSAT receives no certificate and fails closed to Unknown.
 ///
 /// Each variant below is the same semantic shape written differently, so the fix
 /// cannot be a syntactic special case. `sat` would also be correct here; only
@@ -494,8 +554,158 @@ fn test_cegqi_entailed_inner_forall_witness_is_sat() {
     assert_eq!(
         outputs.last().map(String::as_str),
         Some("sat"),
-        "witnessed instance must stay SAT (this is the self-refutation control)"
+        "witnessed instance must stay SAT (this is the self-refutation control); reason={:?}",
+        exec.unknown_reason()
     );
+}
+
+/// A per-group UF pin proves that a suitable default completion M′ exists; it
+/// does not prove that the finite table retained from the G0 solve already
+/// prints that completion. The finite-table certificate must install the exact
+/// M′ it proves, with the mandatory independent model gate enabled.
+/// Direct and nested reads must both observe its exception and `else = 0`.
+#[test]
+fn test_cegqi_uf_recompletion_never_validates_the_wrong_retained_model() {
+    let input = r#"
+        (set-option :produce-models true)
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (assert (= (f 0) 1))
+        (assert (forall ((x Int)) (or (= x 0) (= (f x) 0))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.last().map(String::as_str), Some("sat"));
+
+    let value_command = parse("(get-value ((f 0) (f 1) (f 2) (+ (f 2) 2)))")
+        .unwrap()
+        .pop()
+        .expect("get-value command");
+    let values = exec
+        .execute(&value_command)
+        .expect("get-value execution")
+        .expect("get-value output");
+    assert_eq!(values, "(((f 0) 1) ((f 1) 0) ((f 2) 0) ((+ (f 2) 2) 2))");
+
+    let model_command = parse("(get-model)")
+        .unwrap()
+        .pop()
+        .expect("get-model command");
+    let rendered = exec
+        .execute(&model_command)
+        .expect("get-model execution")
+        .expect("get-model output");
+    assert!(
+        rendered.contains("(define-fun f ((x0 Int)) Int\n    (ite (= x0 0) 1 0))"),
+        "printed model must expose the same certified total interpretation: {rendered}"
+    );
+}
+
+/// The certified finite-table model is semantic data, not a map keyed by one
+/// preferred SMT-LIB spelling. Exercise both a negative rational exception and
+/// a Real-valued default through the complete solve/get-value/get-model path.
+#[test]
+fn test_cegqi_real_uf_recompletion_preserves_typed_exception_and_default() {
+    let input = r#"
+        (set-option :produce-models true)
+        (set-logic UFLRA)
+        (declare-fun f (Real) Real)
+        (assert (= (f (- (/ 1.0 2.0))) (/ 3.0 2.0)))
+        (assert (forall ((x Real))
+            (or (= x (- (/ 1.0 2.0))) (= (f x) (- (/ 1.0 4.0))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.last().map(String::as_str), Some("sat"));
+
+    let value_command = parse("(get-value ((f (- (/ 1.0 2.0))) (f 2.0) (+ (f 2.0) (/ 1.0 2.0))))")
+        .unwrap()
+        .pop()
+        .expect("get-value command");
+    let values = exec
+        .execute(&value_command)
+        .expect("get-value execution")
+        .expect("get-value output");
+    assert_eq!(
+        values,
+        "(((f (- (/ 1.0 2.0))) (/ 3.0 2.0)) ((f 2.0) (- (/ 1.0 4.0))) ((+ (f 2.0) (/ 1.0 2.0)) (/ 1.0 4.0)))"
+    );
+
+    let model_command = parse("(get-model)")
+        .unwrap()
+        .pop()
+        .expect("get-model command");
+    let rendered = exec
+        .execute(&model_command)
+        .expect("get-model execution")
+        .expect("get-model output");
+    assert!(
+        rendered.contains("(define-fun f ((x0 Real)) Real"),
+        "missing Real UF definition: {rendered}"
+    );
+    assert!(
+        rendered.contains("(ite (= x0 (- (/ 1.0 2.0))) (/ 3.0 2.0) (- (/ 1.0 4.0)))"),
+        "printed model must preserve the typed exception and default: {rendered}"
+    );
+}
+
+/// Fixed-semantics arithmetic operators are not model-completable UFs. A
+/// spelling denylist once omitted several of these heads, allowing the CEGQI
+/// M′ certificate to replace their theory meaning with a constant function and
+/// publish SAT for false universals. Positive frontend declaration evidence is
+/// now required for every re-completed head.
+#[test]
+fn test_cegqi_never_recompletes_interpreted_arithmetic_heads() {
+    let cases = [
+        (
+            "to_real",
+            r#"
+                (set-logic AUFLIRA)
+                (assert (forall ((x Int)) (= (to_real x) 0.0)))
+                (check-sat)
+            "#,
+        ),
+        (
+            "to_int",
+            r#"
+                (set-logic AUFLIRA)
+                (assert (forall ((x Real)) (= (to_int x) 0)))
+                (check-sat)
+            "#,
+        ),
+        (
+            "is_int",
+            r#"
+                (set-logic AUFLIRA)
+                (assert (forall ((x Real)) (is_int x)))
+                (check-sat)
+            "#,
+        ),
+        (
+            "rem",
+            r#"
+                (set-logic UFLIA)
+                (assert (forall ((x Int)) (= (rem x 2) 0)))
+                (check-sat)
+            "#,
+        ),
+    ];
+
+    for (name, input) in cases {
+        let commands = parse(input).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).unwrap();
+        assert_eq!(
+            outputs.last().map(String::as_str),
+            Some("unsat"),
+            "fixed-semantics head {name} must retain its theory meaning; reason={:?}",
+            exec.unknown_reason()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,5 +812,52 @@ fn test_quantified_gate_still_failcloses_live_inner_binder() {
         Some("unknown"),
         "a LIVE inner binder is not vacuous: the gate must still fail closed \
          rather than publish an uncertified `sat` (#satgate-vacuous-binder)"
+    );
+}
+
+/// A source declaration that reuses a map-target builtin spelling is still a
+/// free function. Its private core identity must prevent both quantified-model
+/// completion and the strict ground `evaluate` proof rule from assigning the
+/// builtin meaning of integer remainder to it.
+#[test]
+fn test_cegqi_declared_rem_is_not_builtin_ground_evaluate() {
+    let input = r#"
+        (set-option :produce-models true)
+        (set-logic ALL)
+        (declare-fun rem (Int Int) Int)
+        (assert (forall ((x Int)) (= (rem x 2) 0)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "the free declaration has the constant-zero interpretation; reason={:?}",
+        exec.unknown_reason()
+    );
+
+    let value_command = parse("(get-value ((rem 7 2) (rem 99 2)))")
+        .unwrap()
+        .pop()
+        .expect("get-value command");
+    let values = exec
+        .execute(&value_command)
+        .expect("get-value execution")
+        .expect("get-value output");
+    assert_eq!(values, "(((rem 7 2) 0) ((rem 99 2) 0))");
+
+    let model_command = parse("(get-model)")
+        .unwrap()
+        .pop()
+        .expect("get-model command");
+    let rendered = exec
+        .execute(&model_command)
+        .expect("get-model execution")
+        .expect("get-model output");
+    assert!(
+        rendered.contains("(define-fun rem ((x0 Int) (x1 Int)) Int\n    0)"),
+        "printed model must expose the certified free-UF interpretation: {rendered}"
     );
 }

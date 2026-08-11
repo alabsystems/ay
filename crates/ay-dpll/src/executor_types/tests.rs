@@ -109,6 +109,11 @@ fn unknown_reason_code_and_name_are_stable_consumer_values() {
             "Internal error",
         ),
         (UnknownReason::Unknown, "unknown", "Unknown"),
+        (
+            UnknownReason::ProofTrusted,
+            "proof_trusted",
+            "Strict proofs WITHHELD a trust-bearing UNSAT",
+        ),
     ];
 
     assert_eq!(
@@ -144,6 +149,7 @@ fn unknown_reason_registry_is_exhaustive_and_has_unique_codes() {
             UnknownReason::UnsupportedMixedCollection => 1 << 15,
             UnknownReason::InternalError => 1 << 16,
             UnknownReason::Unknown => 1 << 17,
+            UnknownReason::ProofTrusted => 1 << 18,
         }
     }
 
@@ -151,7 +157,7 @@ fn unknown_reason_registry_is_exhaustive_and_has_unique_codes() {
         .iter()
         .copied()
         .fold(0_u32, |bits, reason| bits | variant_bit(reason));
-    assert_eq!(registered_variants, (1_u32 << 18) - 1);
+    assert_eq!(registered_variants, (1_u32 << 19) - 1);
 
     let unique_codes = UnknownReason::ALL
         .iter()
@@ -263,6 +269,11 @@ fn unknown_origin_inventory_names_real_production_source_anchors() {
             UnknownOrigin::UntaggedSolverUnknown,
             include_str!("../executor/lifecycle.rs"),
             "UnknownReason::Unknown",
+        ),
+        (
+            UnknownOrigin::TerminalTrust,
+            include_str!("../executor/unsat_cert.rs"),
+            "UnknownOrigin::TerminalTrust",
         ),
     ];
 

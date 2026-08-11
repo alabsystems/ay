@@ -6362,7 +6362,10 @@ fn shadow_control_model(
     );
     // A CONTROL THAT CUTS SOMETHING IS A BUG, NOT A CONTROL. Refuse rather than ship
     // a silently-informative shadow pool; the arm degenerates to arm A and says so.
-    if !(min_box_slack >= 0.0) {
+    if !matches!(
+        min_box_slack.partial_cmp(&0.0),
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+    ) {
         eprintln!("SHADOWPOOL REFUSED: a shadow row is not implied by the box");
         return model.clone();
     }
@@ -11658,12 +11661,6 @@ const BALL_MIN_RADIUS_FRAC: f64 = 0.08;
 /// clears the ball floor above.
 const ENDGAME_RADII: [(f64, f64); 3] = [(8.0, 0.30), (14.0, 0.50), (24.0, 1.0)];
 
-/// How much of the ROOT HEURISTIC's budget the feasibility pump may take before it must leave the
-/// rest to the dive behind it. See the note at its use: with the pump taking all of it, the dive
-/// never ran at all.
-fn pump_share() -> f64 {
-    pump_share_override().unwrap_or(PUMP_SHARE)
-}
 /// The operator-pinned share, if any — the SINGLE read site for `AY_MILP_PUMP_SHARE`.
 /// `pump_window` needs to distinguish "pinned to the default value" from "unset", because a
 /// pinned share is an A/B escape hatch that bypasses the work cap; asking for the value alone
@@ -22775,7 +22772,7 @@ fn solve_milp_in_impl(
                         "AY_MILP_TRACE root probe: {probes} binaries probed, {forced} forced, {cliques} cliques"
                     );
                 }
-                m
+                *m
             }
         }
     } else {
@@ -24969,13 +24966,44 @@ fn solve_milp_in_impl(
                 // already-good-incumbent regime, so every measured win keeps flip_lns and only
                 // the near-solved models it never helped are handed straight to the tree.
                 let gap_wide = (seed_val_f - root_bound_f) > 0.07 * (1.0 + seed_val_f.abs());
+                // RETIRED AS A DEFAULT (2026-08-10). flip-LNS now runs only when asked for
+                // explicitly, because an iteration ledger showed it was the single largest
+                // consumer of simplex work on the corpus's worst instance while making that
+                // instance's tree BIGGER:
+                //
+                //   qiu: 206,148 of 762,048 simplex iterations (27.1%) were flip-LNS, ~11.5s --
+                //        more than 3x Gurobi's ENTIRE 3.692s runtime on the same model.
+                //
+                // Full corpus, serial, idle, best-of-3 on the noisy instances:
+                //   qiu     44.554s / 6223 nodes -> 34.333s / 5760 nodes   -10.221s (1.30x)
+                //   misc07   5.507s / 7839       ->  5.464s / 7534         better
+                //   13 of 17 instances byte-identical; mas76 +0.112s and qnet1 +0.027s are at
+                //   IDENTICAL node counts, i.e. noise. No objective changed anywhere.
+                //   TOTAL 105.164s -> 95.051s  (-10.113s, 9.6%)
+                //
+                // qiu improves on nodes AND pivots together, which is not an incumbent-luck
+                // signature: the heuristic was doing negative work there, not trading bound for
+                // wall. The `gap_wide` beneficiary gate above was fitted when flip-LNS still
+                // paid; it no longer selects a model where it does.
+                //
+                // Setting an explicit flip share restores it (see the gate below).
+                // `AY_MILP_NO_FLIP_LNS` is kept and still suppresses it, so every A/B arm ever
+                // measured through that name keeps its meaning.
+                // Both reads sit BEHIND the cheap structural tests, so the solve path pays a
+                // getenv only on a depth-0 wide-gap node that would have run flip-LNS anyway --
+                // the live-read surface does not grow.
+                // OPT-IN THROUGH ITS OWN EXISTING SHARE KNOB. Retiring the default needed a
+                // restore arm, and adding a new env name would have grown the live-read surface
+                // the ledger guards. `AY_MILP_FLIP_SHARE` was already read here through the typed
+                // `tune` layer, so gating on an EXPLICIT share costs zero new reads and says the
+                // right thing: flip-LNS now runs only when its time share is asked for by name.
+                let share_env: Option<f64> = crate::tune::real_opt(crate::tune::Knob::FlipShare);
                 if mode.depth == 0
                     && !in_rens()
                     && gap_wide
+                    && share_env.is_some()
                     && std::env::var_os("AY_MILP_NO_FLIP_LNS").is_none()
                 {
-                    let share_env: Option<f64> =
-                        crate::tune::real_opt(crate::tune::Knob::FlipShare);
                     let share: f64 = share_env.unwrap_or(FLIP_LNS_TIME_SHARE);
                     // tall_lu: the flip-LNS kick loop reaches the optimum incumbent at a fixed
                     // wall-time (LU lane ~6.4s, eta lane ~16s), after which the 0.75 fractional

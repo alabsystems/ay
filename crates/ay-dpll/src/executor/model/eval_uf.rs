@@ -8,8 +8,9 @@
 
 use ay_bv::BvModel;
 use ay_core::term::TermData;
-use ay_core::{Sort, TermId};
+use ay_core::{Sort, Symbol, TermId};
 use ay_euf::EufModel;
+use ay_model_check::ModelValue;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
@@ -51,6 +52,223 @@ impl Executor {
             },
             EvalValue::Unknown => None,
         }
+    }
+
+    /// Render one datatype argument through the same concrete surface-value
+    /// vocabulary used by the certified model printer.
+    ///
+    /// The e-graph assignment and total ground reconstruction remain the
+    /// primary authorities. A literal constructor tree is exact even when it
+    /// was introduced only by a post-SAT `eval`; otherwise the final arm is
+    /// the legacy concrete completion used by get-model itself. Every returned
+    /// spelling is subsequently checked for row collisions and against all
+    /// certified ground assertions before it can authorize SAT.
+    pub(in crate::executor) fn certified_dt_surface_value(
+        &self,
+        model: &Model,
+        term: TermId,
+    ) -> Option<String> {
+        let sort = self.ctx.terms.sort(term);
+        let sort_name = self.datatype_sort_name(sort)?;
+        if let Some(rendered) = self.dt_egraph_value(model, term) {
+            return Some(rendered);
+        }
+        if let Some(value) = model.dt_ground.get(&term) {
+            return self.format_gate_model_value(value, sort);
+        }
+        if let Some(value) = self.certified_dt_literal_model_value(model, term, 64) {
+            return self.format_gate_model_value(&value, sort);
+        }
+        // Some interactive-DT candidates deliberately have neither total-DT
+        // pins nor a self-checking e-graph assignment, while the ordinary
+        // printer can still choose a concrete constructor completion from
+        // committed testers/EUF classes.  Reuse that exact final surface
+        // resolver so a certified table row, get-model constant, and eval all
+        // denote one M'. Duplicate rendered rows are rejected atomically by
+        // the installer, and the certificate rechecks every ground assertion
+        // after installation; an incoherent completion therefore withholds
+        // SAT rather than publishing a different model.
+        self.resolve_dt_value(&sort_name, term, model)
+    }
+
+    /// Convert an explicit constructor tree to the exact gate/printer value.
+    /// Non-literal datatype leaves must already occur in `dt_ground`; scalar
+    /// leaves use the same fail-closed EvalValue -> ModelValue conversion as
+    /// total datatype construction.
+    fn certified_dt_literal_model_value(
+        &self,
+        model: &Model,
+        term: TermId,
+        depth: u32,
+    ) -> Option<ModelValue> {
+        if depth == 0 {
+            return None;
+        }
+        if let Some(value) = model.dt_ground.get(&term) {
+            return Some(value.clone());
+        }
+        self.datatype_sort_name(self.ctx.terms.sort(term))?;
+        let (ctor, ctor_args) = match self.ctx.terms.get(term) {
+            TermData::Var(name, _) => {
+                let (_datatype, ctor) = self.ctx.is_constructor(name)?;
+                (ctor, Vec::new())
+            }
+            TermData::App(symbol, args) => {
+                let (_datatype, ctor) = self.ctx.is_constructor(symbol.name())?;
+                (ctor, args.clone())
+            }
+            _ => return None,
+        };
+        let fields = self.ctx.constructor_selector_info(&ctor)?;
+        if fields.len() != ctor_args.len()
+            || ctor_args
+                .iter()
+                .zip(fields)
+                .any(|(&arg, (_selector, sort))| self.ctx.terms.sort(arg) != sort)
+        {
+            return None;
+        }
+        let mut values = Vec::with_capacity(ctor_args.len());
+        for (&arg, (_selector, sort)) in ctor_args.iter().zip(fields) {
+            let value = if self.datatype_sort_name(sort).is_some() {
+                self.certified_dt_literal_model_value(model, arg, depth - 1)?
+            } else {
+                let evaluated = self.evaluate_term(model, arg);
+                super::dt_construct::eval_to_mv(&evaluated, sort)?
+            };
+            values.push(value);
+        }
+        Some(ModelValue::Datatype { ctor, args: values })
+    }
+
+    /// Read a certificate-constructed total UF interpretation using exact
+    /// typed values. This is deliberately separate from ordinary EUF table
+    /// extraction, whose raw string keys can have several equivalent SMT-LIB
+    /// spellings and whose tables are only partial artifacts.
+    fn evaluate_certified_total_uf_app(
+        &self,
+        model: &Model,
+        name: &str,
+        args: &[TermId],
+        result_sort: &Sort,
+    ) -> Option<EvalValue> {
+        let interpretation = model.certified_total_ufs.by_symbol.get(name)?;
+        if args.len() != interpretation.arg_sorts.len()
+            || result_sort != &interpretation.result_sort
+            || interpretation.rendered_rows.len() != interpretation.rows.len()
+            || interpretation
+                .rows
+                .iter()
+                .any(|(key, _)| key.len() != args.len())
+            || interpretation
+                .rendered_rows
+                .iter()
+                .any(|(key, _)| key.len() != args.len())
+            || args
+                .iter()
+                .zip(&interpretation.arg_sorts)
+                .any(|(&arg, sort)| self.ctx.terms.sort(arg) != sort)
+        {
+            return None;
+        }
+
+        let argument_matches_sort = |value: &EvalValue, sort: &Sort| match (value, sort) {
+            (EvalValue::Rational(r), Sort::Int) => r.is_integer(),
+            (EvalValue::Rational(_), Sort::Real) | (EvalValue::Algebraic(_), Sort::Real) => true,
+            (EvalValue::Element(atom), Sort::Datatype(_) | Sort::Uninterpreted(_)) => {
+                !atom.is_empty() && !atom.starts_with('@') && !atom.contains('?')
+            }
+            _ => false,
+        };
+        let result_matches_sort = |value: &EvalValue| match (value, result_sort) {
+            (EvalValue::Bool(_), Sort::Bool) | (EvalValue::Rational(_), Sort::Real) => true,
+            (EvalValue::Rational(r), Sort::Int) => r.is_integer(),
+            _ => false,
+        };
+        let actual: Vec<EvalValue> = args
+            .iter()
+            .map(|&arg| self.evaluate_term(model, arg))
+            .collect();
+        // A fresh post-SAT query may contain a non-nullary constructor
+        // application that was not among the assertion roots used to build
+        // `dt_pins`. Whenever the whole signature is over declared datatypes,
+        // prefer the same single-source surface constructor values that
+        // get-model prints. This makes both a rendered exception and the
+        // explicit rendered default denote exactly the function published to
+        // an external model checker. `Unknown` and an abstract Element may be
+        // rescued only by this exact structural resolver; a value of any
+        // other kind is a sort violation and fails closed.
+        let is_declared_dt_interpretation = interpretation
+            .arg_sorts
+            .iter()
+            .all(|sort| self.datatype_sort_name(sort).is_some());
+        let surface_recoverable = actual
+            .iter()
+            .all(|value| matches!(value, EvalValue::Element(_) | EvalValue::Unknown));
+        if is_declared_dt_interpretation && surface_recoverable {
+            let rendered_actual: Option<Vec<String>> = args
+                .iter()
+                .map(|&arg| self.certified_dt_surface_value(model, arg))
+                .collect();
+            if let Some(rendered_actual) = rendered_actual {
+                if rendered_actual.iter().any(|rendered| {
+                    rendered.is_empty()
+                        || rendered.contains('@')
+                        || rendered.contains('?')
+                        || rendered.contains("ay.value-unavailable")
+                }) {
+                    return None;
+                }
+                let result = interpretation
+                    .rendered_rows
+                    .iter()
+                    .position(|(key, _)| key == &rendered_actual)
+                    .map(|index| interpretation.rows[index].1.clone())
+                    .unwrap_or_else(|| interpretation.default.clone());
+                return result_matches_sort(&result).then_some(result);
+            }
+        }
+        if actual
+            .iter()
+            .zip(&interpretation.arg_sorts)
+            .any(|(value, sort)| !argument_matches_sort(value, sort))
+        {
+            // In particular, do not treat an unresolved abstract datatype
+            // element as an unlisted point: it may denote an exception row.
+            // Likewise a wrong-kind scalar is not evidence for the default.
+            return None;
+        }
+
+        // Row lookup is exact and tri-state. In particular, a Real argument
+        // may be algebraic while certificate rows are rational exceptions.
+        // If exact comparison reaches its refinement cap, the argument may or
+        // may not be an exception point, so returning the default would be
+        // unsound; fail closed instead.
+        let mut undecided_row = false;
+        for (key, value) in &interpretation.rows {
+            let mut row_undecided = false;
+            let mut row_mismatch = false;
+            for (expected, observed) in key.iter().zip(&actual) {
+                match Self::eval_values_equal_exact(expected, observed) {
+                    Some(true) => {}
+                    Some(false) => {
+                        row_mismatch = true;
+                        break;
+                    }
+                    None => row_undecided = true,
+                }
+            }
+            if !row_mismatch && !row_undecided {
+                return result_matches_sort(value).then(|| value.clone());
+            }
+            if !row_mismatch && row_undecided {
+                undecided_row = true;
+            }
+        }
+        if undecided_row || !result_matches_sort(&interpretation.default) {
+            return None;
+        }
+        Some(interpretation.default.clone())
     }
 
     /// Whether a term is an interpreted ARITHMETIC composite (`+ - * div mod
@@ -471,11 +689,12 @@ impl Executor {
     pub(super) fn evaluate_uninterpreted_app(
         &self,
         model: &Model,
-        name: &str,
+        symbol: &Symbol,
         args: &[TermId],
         sort: &Sort,
         term_id: TermId,
     ) -> EvalValue {
+        let name = symbol.name();
         let context_dependent =
             super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id);
         // Equality-only Seq carriers are solved through EUF, whose raw
@@ -556,6 +775,17 @@ impl Executor {
             if let Some(witness) = self.array_extensional_witness_index(model, args[0], args[1]) {
                 return witness;
             }
+        }
+        // A quantified SAT certificate may replace the ground candidate's UF
+        // with an explicitly total table + else value. That constructed M' is
+        // the model the certificate proved, so it must take precedence over
+        // stale per-application SAT/LIA/EUF values from the incoming M. A
+        // malformed total table fails closed to Unknown; falling through to M
+        // would silently publish a different, potentially false witness.
+        if model.certified_total_ufs.by_symbol.contains_key(name) {
+            return self
+                .evaluate_certified_total_uf_app(model, name, args, sort)
+                .unwrap_or(EvalValue::Unknown);
         }
         // An uninterpreted-sort UF application's OWN committed element
         // (`term_values[term_id]`) is authoritative over the arg-keyed function
@@ -793,7 +1023,7 @@ impl Executor {
         // Only extract from constant terms to avoid recursion (#5432).
         // Restrict to DT-internal symbols (selectors) to prevent
         // circular self-validation of non-DT apps (#5494).
-        if !self.is_dt_internal_symbol(name) {
+        if !self.is_exact_dt_internal_symbol(name) {
             return EvalValue::Unknown;
         }
         // Resolve `(sel var)` through an asserted equality

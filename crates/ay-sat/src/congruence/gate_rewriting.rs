@@ -524,7 +524,7 @@ impl CongruenceClosure {
             // 33 MB input reaching 82.75 GB, which can take the machine down.
             if bound_enabled
                 && budget_ticks > CONGRUENCE_RUNAWAY_ITERATIONS
-                && budget_ticks % 64 == 0
+                && budget_ticks.is_multiple_of(64)
                 && ay_sys::process_memory_exceeded()
             {
                 self.stats.memory_abandoned_closures =
@@ -541,7 +541,7 @@ impl CongruenceClosure {
                 budget_ticks = budget_ticks.wrapping_add(1);
                 if bound_enabled
                     && budget_ticks > CONGRUENCE_RUNAWAY_ITERATIONS
-                    && budget_ticks % 64 == 0
+                    && budget_ticks.is_multiple_of(64)
                     && ay_sys::process_memory_exceeded()
                 {
                     self.stats.memory_abandoned_closures =

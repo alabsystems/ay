@@ -2,47 +2,26 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Publication-boundary coverage for datatype collapses without a strict
+//! Publication-boundary coverage for finite-enum pigeonhole certificates.
+//!
+//! A direct binary disequality clique carries enough authored premise identity
+//! to rebuild the finite-cardinality argument as a strict native proof: one
+//! `DatatypeEnumPigeonhole` lemma, one `Assume` per edge, and one n-ary
+//! resolution. The pinned external Alethe calculus has no datatype-
+//! exhaustiveness rule, so its diagnostic rendering honestly keeps that lemma
+//! as `hole`; the serializable native bundle remains the portable strict
 //! certificate.
+//! Evidence hidden in one n-ary `distinct` assertion deliberately does not take
+//! that shortcut: the individual edge is not itself an authored premise, so
+//! publication must remain fail-closed rather than cite invented assumptions.
 //!
-//! The former premise-binding fallback replaced a bare `trust` leaf with an
-//! attributed `hole` plus an n-ary resolution. That was useful diagnostic
-//! output, but it is not a proof: the hole still owns the entire UNSAT claim.
-//! That remains true, and this file still pins it — the published document for
-//! these pigeonholes is NOT externally checkable.
-//!
-//! WHY THE EXPECTATION MOVED (was: `unknown` + revoked artifacts).
-//! These queries are GENUINELY UNSAT, and trivially so: `places` constants are
-//! asserted `distinct` while each is constrained to one of the THREE nullary
-//! constructors of `Unit`, so any `places > 3` is a pigeonhole violation. Both
-//! sizes exercised here (6 and 24) are far past the threshold, and z3 confirms
-//! `unsat` for both. The old `unknown` was therefore a CHECKER-COVERAGE
-//! downgrade, not a solver limit: AY decided the problem correctly and then
-//! discarded the answer at the publication funnel, because the datatype
-//! cardinality argument exports as a `Generic` theory lemma and
-//! `check_proof_strict` rejects those BY RULE NAME.
-//!
-//! AY has since gained the deferred-trust discharge path
-//! (`Executor::discharge_trust_steps_for_certification`). It replaces "reject
-//! by name" with "verify": a fresh forged-UNSAT guard must not re-decide the
-//! problem as definitive SAT, every NON-trust step must still clear the full
-//! strict boundary, and each deferred trust clause must be independently
-//! discharged — here through the context-dependent fallback, which re-decides
-//! the ORIGINAL authored assertions in a fresh `Executor` and requires UNSAT.
-//! So the VERDICT is certified by an independent re-solve and `unsat` publishes.
-//!
-//! THE PROOF IS STILL NOT EXTERNALLY CHECKABLE. The re-solve certifies the
-//! CONCLUSION, not the document: the exported certificate is unchanged and
-//! still terminates in `(step t0 (cl false) :rule hole)` — the hole owns the
-//! whole UNSAT claim, exactly as the paragraph above says. `check_proof_strict`
-//! must keep REJECTING it, which is why `--self-check` / `--strict-proofs`
-//! answer `unknown` for these queries while default mode answers `unsat`. The
-//! strict-rejection assertion below is what will fire if AY ever learns a real
-//! datatype-cardinality proof rule, demanding this file be promoted.
+//! Both shapes are genuinely UNSAT. The distinction here is proof authority,
+//! not solver semantics: direct roots publish `unsat`; unsupported premise
+//! decomposition publishes `unknown` and revokes the artifact.
 
+use ay_core::{ProofStep, TheoryLemmaKind};
 use ay_dpll::Executor;
 use ay_frontend::parse;
-use ay_proof::check_proof_strict;
 use ntest::timeout;
 
 fn pigeonhole_script(places: usize) -> String {
@@ -67,10 +46,8 @@ fn pigeonhole_script(places: usize) -> String {
     script
 }
 
-/// Assert the published shape for a pigeonhole of `places` constants over the
-/// 3-constructor `Unit`: a certified-verdict `unsat` whose DOCUMENT is still
-/// unproved. `places` must exceed 3 for the instance to be UNSAT.
-fn assert_certified_unsat_with_uncheckable_proof(places: usize) {
+/// Assert that a pigeonhole encoded as one n-ary `distinct` remains fail-closed.
+fn assert_nary_distinct_pigeonhole_declines_publication(places: usize) {
     assert!(
         places > 3,
         "instance is only UNSAT when it overflows Unit's 3 constructors"
@@ -81,46 +58,111 @@ fn assert_certified_unsat_with_uncheckable_proof(places: usize) {
     let outputs = exec
         .execute_all(&commands)
         .expect("execute datatype pigeonhole");
-    // Genuinely UNSAT: `places` pairwise-distinct constants cannot fit in the
-    // 3 inhabitants of `Unit`.
-    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
-
-    // The verdict is certified (independent re-solve), so artifacts publish
-    // rather than being revoked.
-    let proof = exec
-        .last_proof()
-        .expect("a certified UNSAT must publish its proof artifacts");
+    assert_eq!(outputs.first().map(String::as_str), Some("unknown"));
     assert!(
         outputs
             .get(1)
-            .is_some_and(|output| !output.contains("proof is not available")),
-        "get-proof must succeed after certified publication: {outputs:?}"
+            .is_some_and(|output| output.contains("proof is not available")),
+        "get-proof must disclose revocation after fail-closed publication: {outputs:?}"
     );
-
-    // SOUNDNESS GUARD (the point of this file): the premise-binding fallback
-    // must NOT dress a hole up as a checkable derivation. The hole still owns
-    // the UNSAT claim, so strict checking must keep rejecting the document.
-    let strict = check_proof_strict(proof, exec.terms());
     assert!(
-        strict.is_err(),
-        "the datatype cardinality argument has no strict rule; the checker \
-         must not accept a fabricated certificate: {strict:?}"
+        exec.last_proof().is_none(),
+        "an unknown verdict must not expose the rejected proof artifact"
+    );
+}
+
+fn direct_binary_pigeonhole_script(constructors: usize) -> String {
+    let places = constructors + 1;
+    let mut script = String::from(
+        "(set-option :produce-proofs true)\n\
+         (set-option :check-proofs-strict true)\n\
+         (set-logic QF_DT)\n\
+         (declare-datatype Unit (",
+    );
+    for index in 0..constructors {
+        script.push_str(&format!("(u{index})"));
+    }
+    script.push_str("))\n");
+    for index in 0..places {
+        script.push_str(&format!("(declare-fun p{index} () Unit)\n"));
+    }
+    for left in 0..places {
+        for right in (left + 1)..places {
+            script.push_str(&format!("(assert (not (= p{left} p{right})))\n"));
+        }
+    }
+    script.push_str("(check-sat)\n(get-proof)\n");
+    script
+}
+
+/// Assert that direct authored edge premises produce the dedicated strict rule.
+fn assert_direct_binary_pigeonhole_has_internal_strict_proof(constructors: usize) {
+    assert!(constructors > 0);
+    let commands = parse(&direct_binary_pigeonhole_script(constructors))
+        .expect("parse direct finite-enum pigeonhole");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute direct finite-enum pigeonhole");
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+
+    let proof = exec
+        .last_proof()
+        .expect("strictly certified UNSAT must retain its proof");
+    assert!(proof.steps.iter().any(|step| {
+        matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::DatatypeEnumPigeonhole,
+                ..
+            }
+        )
+    }));
+    assert!(
+        proof.steps.iter().all(|step| !matches!(
+            step,
+            ProofStep::Step {
+                rule: ay_core::AletheRule::Trust | ay_core::AletheRule::Hole,
+                ..
+            } | ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                ..
+            }
+        )),
+        "the direct pigeonhole proof must contain no trust-family step: {proof:?}"
     );
     let alethe = outputs.get(1).expect("get-proof output");
     assert!(
-        alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
+        alethe.contains(":rule hole"),
+        "the unsupported external calculus gap must stay explicit:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule dt_enum_pigeonhole"),
+        "get-proof must not invent an unknown wire rule:\n{alethe}"
     );
 }
 
 #[test]
 #[timeout(30_000)]
-fn test_unsupported_datatype_pigeonhole_publishes_uncheckable_certificate() {
-    assert_certified_unsat_with_uncheckable_proof(6);
+fn test_nary_distinct_datatype_pigeonhole_declines_strict_publication() {
+    assert_nary_distinct_pigeonhole_declines_publication(6);
 }
 
 #[test]
 #[timeout(60_000)]
-fn test_large_unsupported_datatype_pigeonhole_publishes_uncheckable_certificate() {
-    assert_certified_unsat_with_uncheckable_proof(24);
+fn test_large_nary_distinct_datatype_pigeonhole_declines_strict_publication() {
+    assert_nary_distinct_pigeonhole_declines_publication(24);
+}
+
+#[test]
+#[timeout(30_000)]
+fn test_direct_binary_datatype_pigeonhole_publishes_internal_strict_proof() {
+    assert_direct_binary_pigeonhole_has_internal_strict_proof(3);
+}
+
+#[test]
+#[timeout(60_000)]
+fn test_larger_direct_binary_datatype_pigeonhole_publishes_internal_strict_proof() {
+    // 33 values over 32 constructors exercise a 528-edge n-ary resolution.
+    assert_direct_binary_pigeonhole_has_internal_strict_proof(32);
 }

@@ -139,6 +139,10 @@ impl InprocessingEngines {
                 probe!("congruence", CongruenceClosure::new(num_vars)),
                 probe!("sweeper", Sweeper::new(num_vars)),
             );
+            // The last probe updates the common baseline just like every
+            // preceding expansion; consume it so diagnostic-only builds do
+            // not report the final assignment as dead.
+            let _ = last;
             drop((probes, more));
         }
         let mut definition_kitten = Kitten::new();

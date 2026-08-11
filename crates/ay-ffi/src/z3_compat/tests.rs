@@ -8,148 +8,7 @@ use std::{ffi::CString, ptr};
 
 use super::*;
 
-#[test]
-fn bounded_ffi_text_readers_enforce_scan_and_file_limits() {
-    assert_eq!(MAX_FFI_PARSER_SOURCE_BYTES, 1024 * 1024 * 1024);
-    const { assert!(MAX_FFI_PARSER_SOURCE_BYTES > MAX_FFI_TEXT_BYTES) };
-    let exact = CString::new("abcd").expect("test text must not contain an interior NUL");
-    let oversized = CString::new("abcde").expect("test text must not contain an interior NUL");
-    let invalid = CString::from_vec_with_nul(vec![0xff, 0])
-        .expect("invalid UTF-8 fixture must still be NUL-terminated");
-    unsafe {
-        assert_eq!(
-            ffi_read_utf8_with_limit(exact.as_ptr(), 4),
-            Ok("abcd".to_string())
-        );
-        assert_eq!(
-            ffi_read_utf8_with_limit(oversized.as_ptr(), 4),
-            Err(FfiTextError::TooLong(4))
-        );
-        assert_eq!(
-            ffi_read_utf8_with_limit(invalid.as_ptr(), 4),
-            Err(FfiTextError::InvalidUtf8)
-        );
-        assert_eq!(
-            ffi_read_utf8_with_limit(ptr::null(), 4),
-            Err(FfiTextError::Null)
-        );
-    }
-
-    let file = tempfile::NamedTempFile::new().expect("create bounded-reader test file");
-    std::fs::write(file.path(), b"abcde").expect("write bounded-reader test file");
-    assert!(ffi_read_text_file_with_limit(
-        file.path()
-            .to_str()
-            .expect("temporary test path must be valid UTF-8"),
-        4,
-    )
-    .expect_err("oversized test file must be rejected")
-    .contains("maximum 4 bytes"));
-}
-
-#[cfg(unix)]
-#[test]
-fn bounded_file_reader_rejects_nonregular_sources_without_blocking() {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::{symlink, OpenOptionsExt as _};
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let temp = tempfile::tempdir().expect("create nonregular-source test directory");
-    let regular = temp.path().join("input.smt2");
-    let alias = temp.path().join("input-link.smt2");
-    std::fs::write(&regular, "(assert true)").expect("write regular source fixture");
-    symlink(&regular, &alias).expect("create source symlink fixture");
-    assert_eq!(
-        ffi_read_text_file_with_limit(
-            alias
-                .to_str()
-                .expect("temporary symlink path must be valid UTF-8"),
-            1024,
-        )
-        .expect("regular symlink target must be readable"),
-        "(assert true)"
-    );
-
-    let fifo = temp.path().join("input.fifo");
-    let fifo_c = CString::new(fifo.as_os_str().as_bytes())
-        .expect("temporary FIFO path must not contain an interior NUL");
-    // SAFETY: `fifo_c` is a valid NUL-terminated path and the mode is a valid
-    // permission bitmask. The fresh temporary path does not already exist.
-    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-
-    let (sender, receiver) = mpsc::channel();
-    let fifo_for_reader = fifo.clone();
-    let reader = std::thread::spawn(move || {
-        let result = ffi_read_text_file_with_limit(
-            fifo_for_reader
-                .to_str()
-                .expect("temporary FIFO path must be valid UTF-8"),
-            1024,
-        );
-        let _ = sender.send(result);
-    });
-    let result = match receiver.recv_timeout(Duration::from_secs(2)) {
-        Ok(result) => result,
-        Err(error) => {
-            // Unblock a regressed blocking FIFO open so the spawned thread can
-            // terminate before this test reports the timeout.
-            let _writer = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo);
-            let _ = receiver.recv_timeout(Duration::from_secs(2));
-            let _ = reader.join();
-            panic!("bounded file reader blocked on FIFO: {error}");
-        }
-    };
-    reader.join().expect("bounded-reader worker must not panic");
-    assert!(result
-        .expect_err("FIFO source must be rejected")
-        .contains("not a regular file"));
-    assert!(ffi_read_text_file_with_limit("/dev/null", 1024)
-        .expect_err("character device source must be rejected")
-        .contains("not a regular file"));
-}
-
-#[test]
-fn parser_source_envelope_is_larger_than_scalar_ffi_text_envelope() {
-    unsafe {
-        let cfg = Z3_mk_config();
-        let ctx = Z3_mk_context(cfg);
-        Z3_del_config(cfg);
-        let oversized = CString::new(vec![b'x'; MAX_FFI_TEXT_BYTES + 1])
-            .expect("generated parser source must not contain an interior NUL");
-
-        let parser_text = ffi_read_bounded_parser_text(oversized.as_ptr())
-            .expect("parser envelope must accept the oversized scalar fixture");
-        assert_eq!(parser_text.len(), MAX_FFI_TEXT_BYTES + 1);
-        drop(parser_text);
-
-        assert_eq!(Z3_mk_string(ctx, oversized.as_ptr()), 0);
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
-
-        Z3_del_context(ctx);
-    }
-}
-
-#[test]
-fn ast_vector_resize_rejects_unbounded_allocation_without_mutation() {
-    unsafe {
-        let cfg = Z3_mk_config();
-        let ctx = Z3_mk_context(cfg);
-        Z3_del_config(cfg);
-        let vector = Z3_mk_ast_vector(ctx);
-        Z3_ast_vector_resize(ctx, vector, 2);
-        assert_eq!(Z3_ast_vector_size(ctx, vector), 2);
-
-        Z3_ast_vector_resize(ctx, vector, u32::MAX);
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
-        assert_eq!(Z3_ast_vector_size(ctx, vector), 2);
-
-        Z3_del_context(ctx);
-    }
-}
+mod bounded_io;
 
 /// Empty solver checks are vacuously valid SAT, not consumer-rejected UNDEF.
 /// This exercises the actual C ABI path rather than the local lbool mapper.
@@ -814,6 +673,52 @@ fn test_ast_term_roundtrip() {
             assert_ne!(ast, 0, "valid term should not map to null Z3_ast");
             assert_eq!(checked_ast_to_term(&*ctx, ast), Some(term));
         }
+        Z3_del_context(ctx);
+    }
+}
+
+/// A same-context salt is not authority for whichever term later reuses a raw
+/// slot. The AST arena must retain the original exact capability, reject it
+/// after reset, and assign a distinct AST identity to the reincarnated term.
+#[test]
+fn stale_same_context_ast_cannot_alias_recycled_raw_term_id() {
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+
+        let stale_term = (*ctx).solver.declare_const("before-reset", Sort::Bool);
+        let stale_ast = term_to_ast(&*ctx, stale_term);
+        assert_eq!(checked_ast_to_term(&*ctx, stale_ast), Some(stale_term));
+        assert_eq!(
+            term_to_ast(&*ctx, stale_term),
+            stale_ast,
+            "re-exporting one exact term must preserve Z3 AST identity"
+        );
+
+        (*ctx).solver.try_reset().expect("full native reset");
+        let current_term = (*ctx).solver.declare_const("after-reset", Sort::Bool);
+        assert_eq!(
+            stale_term.to_raw(),
+            current_term.to_raw(),
+            "test must exercise raw TermId reuse"
+        );
+        assert_ne!(stale_term, current_term, "birth authority must rotate");
+        assert_eq!(
+            term_to_ast(&*ctx, stale_term),
+            0,
+            "an internal stale capability must fail closed at export"
+        );
+
+        let current_ast = term_to_ast(&*ctx, current_term);
+        assert_ne!(stale_ast, current_ast, "reincarnations need distinct ASTs");
+        assert_eq!(
+            checked_ast_to_term(&*ctx, stale_ast),
+            None,
+            "stale AST must not reauthenticate the recycled slot"
+        );
+        assert_eq!(checked_ast_to_term(&*ctx, current_ast), Some(current_term));
+
         Z3_del_context(ctx);
     }
 }

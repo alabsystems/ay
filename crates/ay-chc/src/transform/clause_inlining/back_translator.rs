@@ -1730,6 +1730,37 @@ impl InliningBackTranslator {
             ClauseHead::False => return None,
         };
 
+        // A repeated variable in the head — `P(x, y, x)`, which is legal CHC —
+        // gives two FORMAL PARAMETERS THE SAME NAME. `PredicateInterpretation`
+        // is applied by zipping `vars` against the call's actual arguments and
+        // running a FIRST-MATCH substitution, so a duplicated name makes the
+        // interpretation bind to the wrong argument position: the invariant
+        // silently constrains argument #2 when it should constrain #0. A
+        // tautological clause then reports "implication failed", and the
+        // already-proved SAFE verdict is demoted to `unknown`
+        // (tools/ay-ask/repro_refcell.smt2 in the model-checker-consumer tree).
+        //
+        // The meaning of a repeated head variable is that those positions are
+        // EQUAL, so make each repeat a FRESH parameter and carry that equality
+        // explicitly. Parameter names become distinct and no constraint is lost.
+        let mut seen_names: Vec<String> = Vec::with_capacity(head_vars.len());
+        let mut dedup_equalities: Vec<ChcExpr> = Vec::new();
+        let mut head_vars_deduped: Vec<ChcVar> = Vec::with_capacity(head_vars.len());
+        for (idx, v) in head_vars.iter().enumerate() {
+            if seen_names.iter().any(|n| n == &v.name) {
+                let fresh = ChcVar::new(format!("__dedup_a{idx}_{}", v.name), v.sort.clone());
+                dedup_equalities.push(ChcExpr::eq(
+                    ChcExpr::var(fresh.clone()),
+                    ChcExpr::var(v.clone()),
+                ));
+                head_vars_deduped.push(fresh);
+            } else {
+                seen_names.push(v.name.clone());
+                head_vars_deduped.push(v.clone());
+            }
+        }
+        let head_vars = head_vars_deduped;
+
         // Start with the body constraint
         let constraint = clause
             .body
@@ -1739,6 +1770,13 @@ impl InliningBackTranslator {
 
         if clause.body.predicates.is_empty() {
             // Fact clause: interpretation is just the body constraint
+            let constraint = if dedup_equalities.is_empty() {
+                constraint
+            } else {
+                let mut parts = vec![constraint];
+                parts.extend(dedup_equalities.iter().cloned());
+                ChcExpr::and_all(parts)
+            };
             return Self::close_synthesized_interpretation(PredicateInterpretation::new(
                 head_vars, constraint,
             ));
@@ -1762,6 +1800,7 @@ impl InliningBackTranslator {
             conjuncts.push(Arc::new(applied));
         }
 
+        conjuncts.extend(dedup_equalities.into_iter().map(Arc::new));
         let formula = if conjuncts.len() == 1 {
             Arc::unwrap_or_clone(conjuncts.pop().unwrap())
         } else {
@@ -1882,7 +1921,7 @@ impl InliningBackTranslator {
     // ======================================================================
     // Derivation-chain expansion (#chc25-deriv-expansion).
     //
-    // A surviving *composite* clause is one built by `apply_defs` inlining a
+    // A surviving *composite* clause is one built by `apply_defs_tracked` inlining a
     // chain of INPUT clauses into a single clause. When the engine refutes with
     // it, the derivation witness has ONE entry per composite step; to replay on
     // the input clauses, that entry must expand into the chain of input-clause
@@ -2849,7 +2888,7 @@ impl InliningBackTranslator {
     /// Rebuild the fresh linking variables inlining projected away, by
     /// EVALUATING the definitions the inliner recorded for them.
     ///
-    /// When `apply_defs` substitutes a definition into a caller it replaces each
+    /// When `apply_defs_tracked` substitutes a definition into a caller it replaces each
     /// head argument by a fresh variable and equates that variable to the call
     /// argument. The surviving clause then existentially projects the fresh
     /// variable away, so a ground derivation over the surviving clause carries

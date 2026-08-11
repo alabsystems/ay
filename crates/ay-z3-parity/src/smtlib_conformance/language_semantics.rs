@@ -860,7 +860,7 @@ fn authenticate_rules(
         let requirement_id = format!("{}.{}", dimension.id, rule.id);
         let requirement = requirements
             .get(requirement_id.as_str())
-            .ok_or_else(|| format!("{} has no canonical source row", requirement_id))?;
+            .ok_or_else(|| format!("{requirement_id} has no canonical source row"))?;
         let expected_locator = format!(
             "{}:anchor-sha256={}",
             rule.path,
@@ -1359,7 +1359,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err(format!(
             "{} timeout must be between 1ns and 3600 seconds",
             flavor.cli_name()
@@ -2139,14 +2139,10 @@ fn row_from_output(spec: &CaseSpec, output: GuardedTranscriptOutput) -> Validato
     let stdout_utf8 = String::from_utf8(output.stdout);
     let stderr_utf8 = String::from_utf8(output.stderr);
     let streams_valid = stdout_utf8.is_ok() && stderr_utf8.is_ok();
-    let stdout = stdout_utf8.map_or_else(
-        |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        |value| value,
-    );
-    let stderr = stderr_utf8.map_or_else(
-        |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        |value| value,
-    );
+    let stdout =
+        stdout_utf8.unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    let stderr =
+        stderr_utf8.unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
     let process = ProcessObservation {
         stdin_complete: output.stdin_complete,
         timed_out: output.timed_out,

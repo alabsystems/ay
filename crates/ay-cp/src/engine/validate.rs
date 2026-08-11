@@ -13,6 +13,7 @@ use std::collections::BTreeMap as HashMap;
 
 use crate::propagator::Constraint;
 use crate::variable::IntVarId;
+use num_bigint::BigInt;
 
 use super::CpSatEngine;
 
@@ -62,7 +63,7 @@ fn validate_constraint(
 
         Constraint::LinearLe { coeffs, vars, rhs } => {
             let sum = linear_sum(coeffs, vars, assignment);
-            if sum > *rhs {
+            if sum > BigInt::from(*rhs) {
                 Err(format!("LinearLe violated: sum={sum} > rhs={rhs}"))
             } else {
                 Ok(())
@@ -71,7 +72,7 @@ fn validate_constraint(
 
         Constraint::LinearEq { coeffs, vars, rhs } => {
             let sum = linear_sum(coeffs, vars, assignment);
-            if sum != *rhs {
+            if sum != BigInt::from(*rhs) {
                 Err(format!("LinearEq violated: sum={sum} != rhs={rhs}"))
             } else {
                 Ok(())
@@ -80,7 +81,7 @@ fn validate_constraint(
 
         Constraint::LinearGe { coeffs, vars, rhs } => {
             let sum = linear_sum(coeffs, vars, assignment);
-            if sum < *rhs {
+            if sum < BigInt::from(*rhs) {
                 Err(format!("LinearGe violated: sum={sum} < rhs={rhs}"))
             } else {
                 Ok(())
@@ -133,23 +134,23 @@ fn validate_constraint(
             // Verify: at every time point, sum of demands of active tasks <= capacity.
             // Active tasks at time t: start[i] <= t < start[i] + duration[i].
             let n = starts.len();
-            let mut events: Vec<(i64, i64)> = Vec::new(); // (time, demand_delta)
+            let mut events: Vec<(i128, i128)> = Vec::new(); // (time, demand_delta)
             for i in 0..n {
                 let s = val(assignment, starts[i]);
                 let d = val(assignment, durations[i]);
                 let r = val(assignment, demands[i]);
                 if d > 0 && r > 0 {
-                    events.push((s, r));
-                    events.push((s + d, -r));
+                    events.push((i128::from(s), i128::from(r)));
+                    events.push((i128::from(s) + i128::from(d), -i128::from(r)));
                 }
             }
             // Half-open intervals are active on [start, start + duration), so
             // tasks ending at time t must be removed before tasks starting at t.
             events.sort_by_key(|&(t, delta)| (t, delta > 0));
-            let mut load: i64 = 0;
+            let mut load = 0i128;
             for &(t, delta) in &events {
                 load += delta;
-                if load > *capacity {
+                if load > i128::from(*capacity) {
                     return Err(format!(
                         "Cumulative violated at time {t}: load={load} > capacity={capacity}"
                     ));
@@ -276,10 +277,10 @@ fn validate_constraint(
         Constraint::PairwiseNeq { x, y, offset } => {
             let vx = val(assignment, *x);
             let vy = val(assignment, *y);
-            if vx - vy == *offset {
+            let difference = i128::from(vx) - i128::from(vy);
+            if difference == i128::from(*offset) {
                 Err(format!(
-                    "PairwiseNeq violated: x={vx} - y={vy} = {} == offset={offset}",
-                    vx - vy
+                    "PairwiseNeq violated: x={vx} - y={vy} = {difference} == offset={offset}",
                 ))
             } else {
                 Ok(())
@@ -288,7 +289,7 @@ fn validate_constraint(
 
         Constraint::LinearNotEqual { coeffs, vars, rhs } => {
             let sum = linear_sum(coeffs, vars, assignment);
-            if sum == *rhs {
+            if sum == BigInt::from(*rhs) {
                 Err(format!("LinearNotEqual violated: sum={sum} == rhs={rhs}"))
             } else {
                 Ok(())
@@ -308,8 +309,10 @@ fn validate_constraint(
                     let dxj = val(assignment, dx[j]);
                     let dyj = val(assignment, dy[j]);
                     // Two rectangles overlap if they overlap on both axes
-                    let x_overlap = xi < xj + dxj && xj < xi + dxi;
-                    let y_overlap = yi < yj + dyj && yj < yi + dyi;
+                    let x_overlap = i128::from(xi) < i128::from(xj) + i128::from(dxj)
+                        && i128::from(xj) < i128::from(xi) + i128::from(dxi);
+                    let y_overlap = i128::from(yi) < i128::from(yj) + i128::from(dyj)
+                        && i128::from(yj) < i128::from(yi) + i128::from(dyi);
                     if x_overlap && y_overlap {
                         return Err(format!(
                             "Diffn violated: rect {i} ({xi},{yi},{dxi},{dyi}) \
@@ -327,11 +330,11 @@ fn validate_constraint(
                 let si = val(assignment, starts[i]);
                 for j in (i + 1)..n {
                     let sj = val(assignment, starts[j]);
-                    if !(si + durations[i] <= sj || sj + durations[j] <= si) {
+                    let end_i = i128::from(si) + i128::from(durations[i]);
+                    let end_j = i128::from(sj) + i128::from(durations[j]);
+                    if !(end_i <= i128::from(sj) || end_j <= i128::from(si)) {
                         return Err(format!(
-                            "Disjunctive violated: task {i} [{si}, {}) overlaps task {j} [{sj}, {})",
-                            si + durations[i],
-                            sj + durations[j]
+                            "Disjunctive violated: task {i} [{si}, {end_i}) overlaps task {j} [{sj}, {end_j})"
                         ));
                     }
                 }
@@ -349,11 +352,11 @@ fn val(assignment: &HashMap<IntVarId, i64>, var: IntVarId) -> i64 {
 }
 
 /// Compute a linear sum: sum(coeffs[i] * val(vars[i])).
-fn linear_sum(coeffs: &[i64], vars: &[IntVarId], assignment: &HashMap<IntVarId, i64>) -> i64 {
+fn linear_sum(coeffs: &[i64], vars: &[IntVarId], assignment: &HashMap<IntVarId, i64>) -> BigInt {
     coeffs
         .iter()
         .zip(vars.iter())
-        .map(|(c, v)| c * val(assignment, *v))
+        .map(|(c, v)| BigInt::from(*c) * val(assignment, *v))
         .sum()
 }
 

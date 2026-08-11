@@ -93,6 +93,10 @@ fn main() {
     }
 }
 
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Debug preserves the bytes of a non-Unicode command-line argument"
+)]
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args> {
     let mut catalog = None;
     let mut seed = None;
@@ -132,7 +136,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args> {
             Some("--force") if !force => force = true,
             Some("--force") => return Err(ToolError::new("--force was provided more than once")),
             Some("--help" | "-h") => return Err(ToolError::new(USAGE)),
-            Some(flag) => return Err(ToolError::new(format!("unknown argument {flag:?}"))),
+            Some(flag) => return Err(ToolError::new(format!("unknown argument {flag}"))),
             None => {
                 return Err(ToolError::new(format!(
                     "argument is not valid Unicode: {flag:?}"
@@ -276,10 +280,9 @@ fn read_bytes(path: &Path, label: &str) -> Result<Vec<u8>> {
 }
 
 fn identity_for_exact_bytes(path: &Path, bytes: &[u8]) -> Result<CampaignIdentity> {
-    let id = path
-        .to_str()
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| ToolError::new(format!("path is not nonempty Unicode: {path:?}")))?;
+    let id = path.to_str().filter(|id| !id.is_empty()).ok_or_else(|| {
+        ToolError::new(format!("path is not nonempty Unicode: {}", path.display()))
+    })?;
     Ok(CampaignIdentity {
         id: id.to_owned(),
         sha256: Some(sha256_hex(bytes)),

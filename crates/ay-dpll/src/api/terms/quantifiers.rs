@@ -33,7 +33,13 @@ impl Solver {
     /// [`forall`]: Solver::forall
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_forall(&mut self, vars: &[Term], body: Term) -> Result<Term, SolverError> {
-        let body_sort = self.terms().sort(body.0).clone();
+        let body_id = self.resolve_term("forall", body)?;
+        let var_ids = vars
+            .iter()
+            .copied()
+            .map(|var| self.resolve_term("forall", var))
+            .collect::<Result<Vec<_>, _>>()?;
+        let body_sort = self.terms().sort(body_id).clone();
         if body_sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "forall",
@@ -44,8 +50,8 @@ impl Solver {
 
         let mut seen = HashSet::default();
         let mut core_vars = Vec::with_capacity(vars.len());
-        for var in vars {
-            let name = match self.terms().get(var.0) {
+        for &var_id in &var_ids {
+            let name = match self.terms().get(var_id) {
                 TermData::Var(name, _) => name.clone(),
                 other => {
                     return Err(SolverError::InvalidArgument {
@@ -55,17 +61,18 @@ impl Solver {
                 }
             };
 
-            if !seen.insert(var.0) {
+            if !seen.insert(var_id) {
                 return Err(SolverError::InvalidArgument {
                     operation: "forall",
                     message: format!("duplicate bound variable: {name}"),
                 });
             }
 
-            let sort = self.terms().sort(var.0).clone();
+            let sort = self.terms().sort(var_id).clone();
             core_vars.push((name, sort));
         }
-        Ok(Term(self.terms_mut().mk_forall(core_vars, body.0)))
+        let result = self.terms_mut().mk_forall(core_vars, body_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Mark a `forall` term as "E-matching only" — excluded from MBQI/CEGQI
@@ -77,7 +84,9 @@ impl Solver {
     /// [`ay_core::TermStore::mark_no_mbqi`]. Sound/conservative: skipping
     /// instantiation can only lose proofs, never produce a wrong-UNSAT.
     pub fn mark_no_mbqi(&mut self, term: Term) {
-        self.terms_mut().mark_no_mbqi(term.0);
+        if let Ok(id) = self.resolve_term("mark_no_mbqi", term) {
+            self.terms_mut().mark_no_mbqi(id);
+        }
     }
 
     /// Attach a `:qid` (quantifier identifier) to a `Forall`/`Exists` `term`.
@@ -85,25 +94,31 @@ impl Solver {
     /// never changes the asserted formula's semantics or any sat/unsat verdict.
     /// Read back with [`Self::quantifier_id`]. See [`ay_core::TermStore::set_quantifier_id`].
     pub fn set_quantifier_id(&mut self, term: Term, qid: &str) {
-        self.terms_mut().set_quantifier_id(term.0, qid.to_string());
+        if let Ok(id) = self.resolve_term("set_quantifier_id", term) {
+            self.terms_mut().set_quantifier_id(id, qid.to_string());
+        }
     }
 
     /// The `:qid` attached to `term`, if any (see [`Self::set_quantifier_id`]).
     #[must_use]
     pub fn quantifier_id(&self, term: Term) -> Option<String> {
-        self.terms().quantifier_id(term.0).map(str::to_string)
+        let id = self.resolve_term("quantifier_id", term).ok()?;
+        self.terms().quantifier_id(id).map(str::to_string)
     }
 
     /// Attach a `:skolemid` to a `Forall`/`Exists` `term`. No-op unless `term`
     /// is a quantifier. Metadata only. Read back with [`Self::skolem_id`].
     pub fn set_skolem_id(&mut self, term: Term, skid: &str) {
-        self.terms_mut().set_skolem_id(term.0, skid.to_string());
+        if let Ok(id) = self.resolve_term("set_skolem_id", term) {
+            self.terms_mut().set_skolem_id(id, skid.to_string());
+        }
     }
 
     /// The `:skolemid` attached to `term`, if any (see [`Self::set_skolem_id`]).
     #[must_use]
     pub fn skolem_id(&self, term: Term) -> Option<String> {
-        self.terms().skolem_id(term.0).map(str::to_string)
+        let id = self.resolve_term("skolem_id", term).ok()?;
+        self.terms().skolem_id(id).map(str::to_string)
     }
 
     /// Try to create a constant-bounded integer universal quantifier.
@@ -159,7 +174,9 @@ impl Solver {
         upper_exclusive: &BigInt,
         body: Term,
     ) -> Result<Term, SolverError> {
-        let var_sort = self.terms().sort(var.0).clone();
+        let var_id = self.resolve_term("forall_int_range", var)?;
+        let body_id = self.resolve_term("forall_int_range", body)?;
+        let var_sort = self.terms().sort(var_id).clone();
         if var_sort != Sort::Int {
             return Err(SolverError::SortMismatch {
                 operation: "forall_int_range",
@@ -168,7 +185,7 @@ impl Solver {
             });
         }
 
-        let body_sort = self.terms().sort(body.0).clone();
+        let body_sort = self.terms().sort(body_id).clone();
         if body_sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "forall_int_range",
@@ -177,7 +194,7 @@ impl Solver {
             });
         }
 
-        if !matches!(self.terms().get(var.0), TermData::Var(_, _)) {
+        if !matches!(self.terms().get(var_id), TermData::Var(_, _)) {
             return Err(SolverError::InvalidArgument {
                 operation: "forall_int_range",
                 message: "expected variable term".to_string(),
@@ -234,7 +251,23 @@ impl Solver {
         body: Term,
         triggers: &[&[Term]],
     ) -> Result<Term, SolverError> {
-        let body_sort = self.terms().sort(body.0).clone();
+        let body_id = self.resolve_term("forall_with_triggers", body)?;
+        let var_ids = vars
+            .iter()
+            .copied()
+            .map(|var| self.resolve_term("forall_with_triggers", var))
+            .collect::<Result<Vec<_>, _>>()?;
+        let trigger_ids = triggers
+            .iter()
+            .map(|multi| {
+                multi
+                    .iter()
+                    .copied()
+                    .map(|term| self.resolve_term("forall_with_triggers", term))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body_sort = self.terms().sort(body_id).clone();
         if body_sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "forall_with_triggers",
@@ -246,8 +279,8 @@ impl Solver {
         let mut seen = HashSet::default();
         let mut bound_names: HashSet<String> = HashSet::default();
         let mut core_vars = Vec::with_capacity(vars.len());
-        for var in vars {
-            let name = match self.terms().get(var.0) {
+        for &var_id in &var_ids {
+            let name = match self.terms().get(var_id) {
                 TermData::Var(name, _) => name.clone(),
                 other => {
                     return Err(SolverError::InvalidArgument {
@@ -257,43 +290,42 @@ impl Solver {
                 }
             };
 
-            if !seen.insert(var.0) {
+            if !seen.insert(var_id) {
                 return Err(SolverError::InvalidArgument {
                     operation: "forall_with_triggers",
                     message: format!("duplicate bound variable: {name}"),
                 });
             }
 
-            let sort = self.terms().sort(var.0).clone();
+            let sort = self.terms().sort(var_id).clone();
             bound_names.insert(name.clone());
             core_vars.push((name, sort));
         }
 
         let mut core_triggers: Vec<Vec<TermId>> = Vec::new();
-        for multi in triggers {
+        for multi in trigger_ids {
             let mut multi_terms: Vec<TermId> = Vec::new();
-            for t in *multi {
-                let TermData::App(_, _) = self.terms().get(t.0) else {
+            for term_id in multi {
+                let TermData::App(_, _) = self.terms().get(term_id) else {
                     continue;
                 };
-                if !contains_bound_var(self.terms(), t.0, &bound_names) {
+                if !contains_bound_var(self.terms(), term_id, &bound_names) {
                     return Err(SolverError::InvalidTrigger {
                         operation: "forall_with_triggers",
                         message: "trigger must contain at least one bound variable".to_string(),
                     });
                 }
-                multi_terms.push(t.0);
+                multi_terms.push(term_id);
             }
             if !multi_terms.is_empty() {
                 core_triggers.push(multi_terms);
             }
         }
 
-        Ok(Term(self.terms_mut().mk_forall_with_triggers(
-            core_vars,
-            body.0,
-            core_triggers,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_forall_with_triggers(core_vars, body_id, core_triggers);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an existentially quantified formula: `(exists ((x S) ...) body)`.
@@ -323,7 +355,13 @@ impl Solver {
     /// [`exists`]: Solver::exists
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_exists(&mut self, vars: &[Term], body: Term) -> Result<Term, SolverError> {
-        let body_sort = self.terms().sort(body.0).clone();
+        let body_id = self.resolve_term("exists", body)?;
+        let var_ids = vars
+            .iter()
+            .copied()
+            .map(|var| self.resolve_term("exists", var))
+            .collect::<Result<Vec<_>, _>>()?;
+        let body_sort = self.terms().sort(body_id).clone();
         if body_sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "exists",
@@ -334,8 +372,8 @@ impl Solver {
 
         let mut seen = HashSet::default();
         let mut core_vars = Vec::with_capacity(vars.len());
-        for var in vars {
-            let name = match self.terms().get(var.0) {
+        for &var_id in &var_ids {
+            let name = match self.terms().get(var_id) {
                 TermData::Var(name, _) => name.clone(),
                 other => {
                     return Err(SolverError::InvalidArgument {
@@ -345,17 +383,18 @@ impl Solver {
                 }
             };
 
-            if !seen.insert(var.0) {
+            if !seen.insert(var_id) {
                 return Err(SolverError::InvalidArgument {
                     operation: "exists",
                     message: format!("duplicate bound variable: {name}"),
                 });
             }
 
-            let sort = self.terms().sort(var.0).clone();
+            let sort = self.terms().sort(var_id).clone();
             core_vars.push((name, sort));
         }
-        Ok(Term(self.terms_mut().mk_exists(core_vars, body.0)))
+        let result = self.terms_mut().mk_exists(core_vars, body_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an existentially quantified formula with trigger patterns.
@@ -395,7 +434,23 @@ impl Solver {
         body: Term,
         triggers: &[&[Term]],
     ) -> Result<Term, SolverError> {
-        let body_sort = self.terms().sort(body.0).clone();
+        let body_id = self.resolve_term("exists_with_triggers", body)?;
+        let var_ids = vars
+            .iter()
+            .copied()
+            .map(|var| self.resolve_term("exists_with_triggers", var))
+            .collect::<Result<Vec<_>, _>>()?;
+        let trigger_ids = triggers
+            .iter()
+            .map(|multi| {
+                multi
+                    .iter()
+                    .copied()
+                    .map(|term| self.resolve_term("exists_with_triggers", term))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body_sort = self.terms().sort(body_id).clone();
         if body_sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
                 operation: "exists_with_triggers",
@@ -407,8 +462,8 @@ impl Solver {
         let mut seen = HashSet::default();
         let mut bound_names: HashSet<String> = HashSet::default();
         let mut core_vars = Vec::with_capacity(vars.len());
-        for var in vars {
-            let name = match self.terms().get(var.0) {
+        for &var_id in &var_ids {
+            let name = match self.terms().get(var_id) {
                 TermData::Var(name, _) => name.clone(),
                 other => {
                     return Err(SolverError::InvalidArgument {
@@ -418,7 +473,7 @@ impl Solver {
                 }
             };
 
-            if !seen.insert(var.0) {
+            if !seen.insert(var_id) {
                 return Err(SolverError::InvalidArgument {
                     operation: "exists_with_triggers",
                     message: format!("duplicate bound variable: {name}"),
@@ -426,35 +481,34 @@ impl Solver {
             }
 
             bound_names.insert(name.clone());
-            let sort = self.terms().sort(var.0).clone();
+            let sort = self.terms().sort(var_id).clone();
             core_vars.push((name, sort));
         }
 
         let mut core_triggers: Vec<Vec<TermId>> = Vec::new();
-        for multi in triggers {
+        for multi in trigger_ids {
             let mut multi_terms: Vec<TermId> = Vec::new();
-            for t in *multi {
-                let TermData::App(_, _) = self.terms().get(t.0) else {
+            for term_id in multi {
+                let TermData::App(_, _) = self.terms().get(term_id) else {
                     continue;
                 };
-                if !contains_bound_var(self.terms(), t.0, &bound_names) {
+                if !contains_bound_var(self.terms(), term_id, &bound_names) {
                     return Err(SolverError::InvalidTrigger {
                         operation: "exists_with_triggers",
                         message: "trigger must contain at least one bound variable".to_string(),
                     });
                 }
-                multi_terms.push(t.0);
+                multi_terms.push(term_id);
             }
             if !multi_terms.is_empty() {
                 core_triggers.push(multi_terms);
             }
         }
 
-        Ok(Term(self.terms_mut().mk_exists_with_triggers(
-            core_vars,
-            body.0,
-            core_triggers,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_exists_with_triggers(core_vars, body_id, core_triggers);
+        Ok(self.wrap_term(result))
     }
 }
 

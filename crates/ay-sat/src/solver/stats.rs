@@ -4,6 +4,7 @@
 
 //! Solver statistics, queries, debug diagnostics, and clause database access.
 
+use super::inprocessing::FactorSkipReason;
 use super::solver_stats::{
     BcpLearned1963IdentityRecord, InprocessingPassAccounting, RephaseAttribution,
     RestartAttribution, BCP_LEARNED_1963_IDENTITY_ACTIVITY_BUCKETS,
@@ -1024,7 +1025,7 @@ impl Solver {
     /// cache locality (CaDiCaL arenatype=3). Triggered after reduce_db when
     /// dead space exceeds the adaptive threshold.
     pub fn factor_skip_breakdown(&self) -> Vec<(&'static str, u64)> {
-        crate::solver::inprocessing::FactorSkipReason::TAGS
+        FactorSkipReason::TAGS
             .iter()
             .zip(self.cold.factor_skip_counts)
             .map(|(&tag, n)| (tag, n))

@@ -202,6 +202,47 @@ fn test_parse_float_literal() {
 }
 
 #[test]
+fn parses_exponent_only_float_literals() {
+    let input = "float: large = 3e8;\nfloat: small = -2E-3;\nsolve satisfy;\n";
+    let model = parse_flatzinc(input).expect("exponent-only floats are valid FlatZinc");
+
+    assert!(matches!(model.parameters[0].value, Expr::Float(v) if v == 300_000_000.0));
+    assert!(matches!(model.parameters[1].value, Expr::Float(v) if (v + 0.002).abs() < 1e-12));
+}
+
+#[test]
+fn rejects_float_literals_that_overflow_to_infinity() {
+    for literal in ["1e9999", "-1E9999", "1.0e9999"] {
+        let input = format!("float: overflow = {literal};\nsolve satisfy;\n");
+        let error = parse_flatzinc(&input)
+            .expect_err("finite-looking float overflow must not enter the model as infinity");
+        assert!(
+            matches!(error, ParseError::InvalidFloat { .. }),
+            "unexpected error for {literal}: {error}"
+        );
+    }
+}
+
+#[test]
+fn parses_prefixed_integer_literals() {
+    let input =
+        "int: hex = 0x7f;\nint: oct = 0o17;\nint: min = -0x8000000000000000;\nsolve satisfy;\n";
+    let model = parse_flatzinc(input).expect("prefixed integers are valid FlatZinc");
+
+    assert_eq!(model.parameters[0].value, Expr::Int(127));
+    assert_eq!(model.parameters[1].value, Expr::Int(15));
+    assert_eq!(model.parameters[2].value, Expr::Int(i64::MIN));
+}
+
+#[test]
+fn rejects_out_of_range_prefixed_integer() {
+    let error = parse_flatzinc("int: overflow = 0x8000000000000000;\nsolve satisfy;\n")
+        .expect_err("positive value above i64::MAX must be rejected");
+
+    assert!(matches!(error, ParseError::InvalidInt { .. }));
+}
+
+#[test]
 fn test_parse_string_literal() {
     let input = r#"int: n = 1;
 solve satisfy;
@@ -225,6 +266,31 @@ fn unknown_unicode_escape_is_preserved_without_mojibake() {
     let input = "constraint label(\"\\\\é\");\nsolve satisfy;\n";
     let model = parse_flatzinc(input).expect("should parse escaped Unicode string");
     assert_eq!(model.constraints[0].args[0], Expr::Str("\\é".to_string()));
+}
+
+#[test]
+fn unicode_string_does_not_shift_following_error_column() {
+    let mut lexer = lexer::Lexer::new("\"é\" @");
+    let string = lexer.next_token().expect("string token");
+    assert!(matches!(string.token, lexer::Token::StringLit(_)));
+
+    let error = lexer.next_token().expect_err("@ is not a FlatZinc token");
+    assert!(matches!(
+        error,
+        ParseError::UnexpectedToken {
+            line: 1,
+            col: 5,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_raw_newline_in_string_literal() {
+    let error = parse_flatzinc("constraint label(\"first\nsecond\");\nsolve satisfy;\n")
+        .expect_err("FlatZinc strings cannot contain raw newlines");
+
+    assert!(matches!(error, ParseError::UnexpectedToken { line: 1, .. }));
 }
 
 #[test]

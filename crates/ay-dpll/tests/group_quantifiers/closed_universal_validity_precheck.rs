@@ -187,3 +187,59 @@ fn uninterpreted_sort_var_equality_never_unsat() {
     "#;
     assert_not_unsat(smt, "uninterpreted-sort var equality universal");
 }
+
+/// A partial arithmetic operator may still refute a universal at a concrete
+/// point where its semantics are fully defined.  The literal-witness lane must
+/// reach `y = 3` and use the fixed fact `(rem 2 3) = 2`.
+#[test]
+#[timeout(20000)]
+fn defined_rem_literal_witness_is_unsat() {
+    let smt = r#"
+        (set-logic UFLIA)
+        (assert (forall ((y Int)) (= (rem 2 y) 0)))
+        (check-sat)
+    "#;
+    assert_unsat(smt, "defined rem literal witness");
+}
+
+/// The same lane must not treat an under-specified zero-divisor application as
+/// false.  This universal is satisfiable by choosing the value of `(rem 0 0)`
+/// to be zero; all nonzero divisor instances already equal zero.
+#[test]
+#[timeout(20000)]
+fn rem_zero_divisor_literal_witness_never_refutes() {
+    let smt = r#"
+        (set-logic UFLIA)
+        (assert (forall ((y Int)) (= (rem 0 y) 0)))
+        (check-sat)
+    "#;
+    assert_not_unsat(smt, "under-specified rem-by-zero instance");
+}
+
+/// Integer `mod` has the same under-specified zero-divisor contract as `rem`.
+/// Literal probing may use every nonzero `y`, but must not manufacture a
+/// refutation from the unconstrained value `(mod 0 0)`.
+#[test]
+#[timeout(20000)]
+fn mod_zero_divisor_literal_witness_never_refutes() {
+    let smt = r#"
+        (set-logic UFLIA)
+        (assert (forall ((y Int)) (= (mod 0 y) 0)))
+        (check-sat)
+    "#;
+    assert_not_unsat(smt, "under-specified mod-by-zero instance");
+}
+
+/// Integer `div` is likewise fixed at nonzero divisors and under-specified at
+/// zero.  Choosing `(div 0 0) = 0` satisfies this universal, so a literal
+/// witness must never turn it into UNSAT.
+#[test]
+#[timeout(20000)]
+fn div_zero_divisor_literal_witness_never_refutes() {
+    let smt = r#"
+        (set-logic UFLIA)
+        (assert (forall ((y Int)) (= (div 0 y) 0)))
+        (check-sat)
+    "#;
+    assert_not_unsat(smt, "under-specified div-by-zero instance");
+}

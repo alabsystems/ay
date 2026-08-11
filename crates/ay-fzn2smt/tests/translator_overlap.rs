@@ -700,10 +700,10 @@ fn count_leq_geq_overlap_uses_minizinc_argument_order() {
 #[test]
 fn inverse_overlap_enforces_one_based_index_ranges() {
     let source = r#"
-        var int: f1;
-        var int: f2;
-        var int: g1;
-        var int: g2;
+        var 0..3: f1;
+        var 0..3: f2;
+        var 0..3: g1;
+        var 0..3: g2;
         constraint fzn_inverse([f1, f2], [g1, g2]);
         solve satisfy;
     "#;
@@ -735,9 +735,9 @@ fn inverse_overlap_enforces_one_based_index_ranges() {
 #[test]
 fn circuit_overlap_enforces_one_based_successor_ranges() {
     let source = r#"
-        var int: s1;
-        var int: s2;
-        var int: s3;
+        var 0..4: s1;
+        var 0..4: s2;
+        var 0..4: s3;
         constraint fzn_circuit([s1, s2, s3]);
         solve satisfy;
     "#;
@@ -942,7 +942,7 @@ fn array_int_element_overlap_rejects_empty_array() {
 #[test]
 fn array_int_element_overlap_enforces_one_based_index_range() {
     let source = r#"
-        var int: idx;
+        var 0..4: idx;
         var 0..40: val;
         constraint array_int_element(idx, [10, 20, 30], val);
         solve satisfy;
@@ -967,7 +967,7 @@ fn array_int_element_overlap_enforces_one_based_index_range() {
 #[test]
 fn array_var_int_element_overlap_enforces_one_based_index_range() {
     let source = r#"
-        var int: idx;
+        var 0..4: idx;
         var 0..40: x;
         var 0..40: y;
         var 0..40: z;
@@ -995,7 +995,7 @@ fn array_var_int_element_overlap_enforces_one_based_index_range() {
 #[test]
 fn array_var_int_element_overlap_rejects_zero_index_by_guard() {
     let source = r#"
-        var int: idx;
+        var 0..3: idx;
         var 0..40: x;
         var 0..40: y;
         var 0..40: z;
@@ -1037,7 +1037,7 @@ fn named_array_var_int_element_fixed_slots_proxy_is_cp_supported() {
 }
 
 #[test]
-fn named_array_var_int_element_missing_fixed_slot_fails_closed() {
+fn named_array_var_int_element_materialized_slot_is_cp_supported() {
     let source = r#"
         array [1..3] of var 1..3: xs;
         var 1..3: idx;
@@ -1050,18 +1050,17 @@ fn named_array_var_int_element_missing_fixed_slot_fails_closed() {
     let model = parse_model(source);
 
     let unsupported = solve_cp::unsupported_constraints(&model)
-        .expect("CP translator should inspect missing fixed-slot element model");
-    assert_eq!(
-        unsupported,
-        vec!["array_var_int_element".to_string()],
-        "missing fixed slot should keep the named array element path fail-closed"
+        .expect("CP translator should inspect materialized array element model");
+    assert!(
+        unsupported.is_empty(),
+        "bounded uninitialized slots should be materialized for named array elements, got {unsupported:?}"
     );
 }
 
 #[test]
 fn array_bool_element_overlap_enforces_one_based_index_range() {
     let source = r#"
-        var int: idx;
+        var 0..3: idx;
         var bool: val;
         constraint array_bool_element(idx, [true, false], val);
         solve satisfy;
@@ -1086,7 +1085,7 @@ fn array_bool_element_overlap_enforces_one_based_index_range() {
 #[test]
 fn array_var_bool_element_overlap_rejects_zero_index_by_guard() {
     let source = r#"
-        var int: idx;
+        var 0..3: idx;
         var bool: a;
         var bool: b;
         var bool: val;
@@ -1146,7 +1145,7 @@ fn array_set_element_overlap_rejects_empty_array() {
 fn array_set_element_overlap_uses_declared_index_range() {
     let source = r#"
         array [0..1] of set of int: arr = [{0}, {1}];
-        var int: idx;
+        var -1..2: idx;
         var set of 0..1: result;
         constraint array_set_element(idx, arr, result);
         solve satisfy;
@@ -1178,7 +1177,7 @@ fn array_set_element_set_var_literal_overlap_is_supported() {
     let source = r#"
         var set of 0..1: a;
         var set of 0..1: b;
-        var int: idx;
+        var 0..3: idx;
         var set of 0..1: result;
         constraint array_set_element(idx, [a, b], result);
         solve satisfy;
@@ -1240,7 +1239,7 @@ fn array_set_element_named_set_var_array_overlap_is_supported() {
         var set of 0..1: a;
         var set of 0..1: b;
         array [1..2] of var set of 0..1: arr = [a, b];
-        var int: idx;
+        var 0..3: idx;
         var set of 0..1: result;
         constraint array_set_element(idx, arr, result);
         solve satisfy;

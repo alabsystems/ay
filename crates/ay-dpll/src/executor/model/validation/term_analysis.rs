@@ -19,6 +19,18 @@ use super::{
 use crate::executor::model::{Executor, Model, EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE};
 
 impl Executor {
+    /// Whether an internal-looking core spelling is the exact identity of a
+    /// live source/native declaration rather than a solver auxiliary.
+    ///
+    /// The frontend deliberately assigns `__ay_overload_*` identities to
+    /// builtin-colliding declarations. Prefix-only classification would then
+    /// skip the user's assertion from model validation. Require both the
+    /// allocator's narrow namespace and positive live declaration metadata;
+    /// arbitrary `__ay_*` witnesses remain internal.
+    fn is_live_private_binding_identity(&self, name: &str) -> bool {
+        name.starts_with("__ay_overload_") && self.ctx.symbol_info_by_identity(name).is_some()
+    }
+
     /// Check whether a term tree contains an internal encoding symbol.
     /// Internal symbols (`__ay_*`) are auxiliary encoding artifacts and are
     /// excluded from top-level model validation.
@@ -1382,7 +1394,9 @@ impl Executor {
         stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
             match self.ctx.terms.get(term_id) {
                 TermData::App(sym, args) => {
-                    if sym.name().starts_with("__ay_") {
+                    if sym.name().starts_with("__ay_")
+                        && !self.is_live_private_binding_identity(sym.name())
+                    {
                         return true;
                     }
                     args.iter().any(|&arg| self.contains_internal_symbol(arg))
@@ -1993,7 +2007,7 @@ impl Executor {
                 TermData::App(sym, args) => {
                     let name = sym.name();
                     // Internal symbol check
-                    if name.starts_with("__ay_") {
+                    if name.starts_with("__ay_") && !self.is_live_private_binding_identity(name) {
                         f |= TERM_FLAG_INTERNAL;
                     }
                     // Array term check
@@ -2081,9 +2095,21 @@ impl Executor {
                     // supplied no hard constraints, every relaxation clause
                     // mentions one, and skipping them all degrades a genuine SAT
                     // to Unknown via the "all assertions skipped" rejection.
+                    //
+                    // EXCEPTION (#reserved-div-witness): the mod/div elimination
+                    // pass uses reserved `__ay_zerodiv_*` and `__ay_symdiv_*`
+                    // Int variables as the actual LIA values of under-specified
+                    // division applications. They are
+                    // ordinary model-valued arithmetic leaves, not opaque
+                    // Skolems. Validate them directly: a missing LIA value then
+                    // fails closed instead of letting an assertion be skipped.
+                    let is_model_valued_div_witness = matches!(self.ctx.terms.sort(tid), Sort::Int)
+                        && (name.starts_with("__ay_zerodiv_") || name.starts_with("__ay_symdiv_"));
                     if name.starts_with("__ay_")
                         && !name.starts_with("__ay_eqdv")
                         && !name.starts_with("__ay_soft_")
+                        && !is_model_valued_div_witness
+                        && !self.is_live_private_binding_identity(name)
                     {
                         f |= TERM_FLAG_INTERNAL;
                     }

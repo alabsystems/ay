@@ -491,8 +491,8 @@ impl Executor {
             Reverse((remaining, u32::MAX - degree[v], v as u32))
         };
         let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::with_capacity(n);
-        for v in 0..n {
-            heap.push(key(remaining[v], v, &degree));
+        for (v, &count) in remaining.iter().enumerate() {
+            heap.push(key(count, v, &degree));
         }
 
         let mut done = 0usize;
@@ -744,9 +744,11 @@ impl Executor {
         let mut model = Model::empty();
         model.lia_model = Some(ay_lia::LiaModel { values: lia_values });
         if !tables.is_empty() {
-            let mut euf = ay_euf::EufModel::default();
-            euf.function_tables = tables;
-            euf.function_table_terms = table_terms;
+            let euf = ay_euf::EufModel {
+                function_tables: tables,
+                function_table_terms: table_terms,
+                ..ay_euf::EufModel::default()
+            };
             model.euf_model = Some(euf);
         }
         self.last_model = Some(model);

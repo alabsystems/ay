@@ -4,10 +4,14 @@
 
 use super::*;
 use crate::domain::Domain;
+use crate::encoder::OrderEncodingCapacityError;
 
 #[cfg(debug_assertions)]
 #[path = "tests_validate.rs"]
 mod tests_validate;
+
+#[path = "tests_cumulative.rs"]
+mod tests_cumulative;
 
 /// Helper: create a singleton-domain (constant) integer variable.
 fn const_var(engine: &mut CpSatEngine, val: i64) -> IntVarId {
@@ -46,6 +50,11 @@ fn test_sparse_domain_registration_preserves_membership() {
 fn test_sparse_domain_root_holes_excluded() {
     let mut engine = CpSatEngine::new();
     let x = engine.new_int_var(Domain::from_values(&[1, 3, 5]), Some("x"));
+    assert_eq!(
+        engine.encoder.num_literals(),
+        0,
+        "sparse holes must not allocate SAT literals before capacity preflight"
+    );
 
     engine.add_constraint(Constraint::LinearGe {
         coeffs: vec![1],
@@ -714,176 +723,6 @@ fn test_element_with_linear() {
     }
 }
 
-// ============= Cumulative constraint integration tests =============
-
-#[test]
-fn test_cumulative_sat_sequential() {
-    // Two tasks that can be scheduled sequentially on a single resource.
-    let mut engine = CpSatEngine::new();
-    let s0 = engine.new_int_var(Domain::new(0, 5), Some("s0"));
-    let s1 = engine.new_int_var(Domain::new(0, 5), Some("s1"));
-    let durs = const_vars(&mut engine, &[3, 2]);
-    let dems = const_vars(&mut engine, &[1, 1]);
-
-    engine.add_constraint(Constraint::Cumulative {
-        starts: vec![s0, s1],
-        durations: durs,
-        demands: dems,
-        capacity: 1,
-    });
-
-    match engine.solve() {
-        CpSolveResult::Sat(assignment) => {
-            let s0_val = assignment.iter().find(|(v, _)| *v == s0).unwrap().1;
-            let s1_val = assignment.iter().find(|(v, _)| *v == s1).unwrap().1;
-            let overlap = s0_val < s1_val + 2 && s1_val < s0_val + 3;
-            assert!(
-                !overlap,
-                "tasks overlap: s0={s0_val} (dur 3), s1={s1_val} (dur 2)"
-            );
-        }
-        other => panic!("expected SAT, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_cumulative_sat_parallel() {
-    // Two tasks that can run in parallel because capacity is large enough.
-    let mut engine = CpSatEngine::new();
-    let s0 = engine.new_int_var(Domain::new(0, 5), Some("s0"));
-    let s1 = engine.new_int_var(Domain::new(0, 5), Some("s1"));
-    let durs = const_vars(&mut engine, &[3, 2]);
-    let dems = const_vars(&mut engine, &[1, 1]);
-
-    engine.add_constraint(Constraint::Cumulative {
-        starts: vec![s0, s1],
-        durations: durs,
-        demands: dems,
-        capacity: 2,
-    });
-
-    match engine.solve() {
-        CpSolveResult::Sat(assignment) => {
-            let s0_val = assignment.iter().find(|(v, _)| *v == s0).unwrap().1;
-            let s1_val = assignment.iter().find(|(v, _)| *v == s1).unwrap().1;
-            assert!((0..=5).contains(&s0_val), "s0 out of range: {s0_val}");
-            assert!((0..=5).contains(&s1_val), "s1 out of range: {s1_val}");
-        }
-        other => panic!("expected SAT, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_cumulative_unsat_overload() {
-    // Three tasks that can't fit on a resource of capacity 2.
-    // All 3 tasks have compulsory part at t=1 -> load=3 > 2.
-    let mut engine = CpSatEngine::new();
-    let s0 = engine.new_int_var(Domain::new(0, 1), Some("s0"));
-    let s1 = engine.new_int_var(Domain::new(0, 1), Some("s1"));
-    let s2 = engine.new_int_var(Domain::new(0, 1), Some("s2"));
-    let durs = const_vars(&mut engine, &[3, 3, 3]);
-    let dems = const_vars(&mut engine, &[1, 1, 1]);
-
-    engine.add_constraint(Constraint::Cumulative {
-        starts: vec![s0, s1, s2],
-        durations: durs,
-        demands: dems,
-        capacity: 2,
-    });
-
-    match engine.solve() {
-        CpSolveResult::Unsat => {}
-        other => panic!("expected UNSAT, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_cumulative_with_alldiff() {
-    // Job-shop-like: 3 tasks on a single machine.
-    let mut engine = CpSatEngine::new();
-    let s0 = engine.new_int_var(Domain::new(0, 4), Some("s0"));
-    let s1 = engine.new_int_var(Domain::new(0, 4), Some("s1"));
-    let s2 = engine.new_int_var(Domain::new(0, 4), Some("s2"));
-    let durs = const_vars(&mut engine, &[2, 2, 2]);
-    let dems = const_vars(&mut engine, &[1, 1, 1]);
-
-    engine.add_constraint(Constraint::Cumulative {
-        starts: vec![s0, s1, s2],
-        durations: durs,
-        demands: dems,
-        capacity: 1,
-    });
-    engine.add_constraint(Constraint::AllDifferent(vec![s0, s1, s2]));
-
-    match engine.solve() {
-        CpSolveResult::Sat(assignment) => {
-            let s0_val = assignment.iter().find(|(v, _)| *v == s0).unwrap().1;
-            let s1_val = assignment.iter().find(|(v, _)| *v == s1).unwrap().1;
-            let s2_val = assignment.iter().find(|(v, _)| *v == s2).unwrap().1;
-
-            let mut starts_durs = [(s0_val, 2i64), (s1_val, 2), (s2_val, 2)];
-            starts_durs.sort_by_key(|&(s, _)| s);
-            for pair in starts_durs.windows(2) {
-                assert!(
-                    pair[0].0 + pair[0].1 <= pair[1].0,
-                    "tasks overlap: ({}, dur {}) and ({}, dur {})",
-                    pair[0].0,
-                    pair[0].1,
-                    pair[1].0,
-                    pair[1].1
-                );
-            }
-
-            let start_vals = vec![s0_val, s1_val, s2_val];
-            let mut sorted = start_vals.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                3,
-                "start times not all-different: {start_vals:?}"
-            );
-        }
-        other => panic!("expected SAT, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_cumulative_with_linear() {
-    // Two tasks with a makespan constraint.
-    let mut engine = CpSatEngine::new();
-    let s0 = engine.new_int_var(Domain::new(0, 3), Some("s0"));
-    let s1 = engine.new_int_var(Domain::new(0, 4), Some("s1"));
-    let durs = const_vars(&mut engine, &[3, 2]);
-    let dems = const_vars(&mut engine, &[1, 1]);
-
-    engine.add_constraint(Constraint::Cumulative {
-        starts: vec![s0, s1],
-        durations: durs,
-        demands: dems,
-        capacity: 1,
-    });
-    engine.add_constraint(Constraint::LinearLe {
-        coeffs: vec![1, 1],
-        vars: vec![s0, s1],
-        rhs: 5,
-    });
-
-    match engine.solve() {
-        CpSolveResult::Sat(assignment) => {
-            let s0_val = assignment.iter().find(|(v, _)| *v == s0).unwrap().1;
-            let s1_val = assignment.iter().find(|(v, _)| *v == s1).unwrap().1;
-            let overlap = s0_val < s1_val + 2 && s1_val < s0_val + 3;
-            assert!(!overlap, "tasks overlap: s0={s0_val}, s1={s1_val}");
-            assert!(
-                s0_val + s1_val <= 5,
-                "linear violated: {s0_val} + {s1_val} > 5"
-            );
-        }
-        other => panic!("expected SAT, got {other:?}"),
-    }
-}
-
 // ── Phase 2 gate tests: golomb-6 ──────────────────
 // Note: test_20queens_sat already defined above (line 177).
 
@@ -1307,6 +1146,22 @@ fn test_diffn_variable_sizes() {
     }
 }
 
+#[test]
+fn test_diffn_extreme_big_m_overlap_unsat() {
+    let mut engine = CpSatEngine::new();
+    let x = const_vars(&mut engine, &[1, 1]);
+    let y = const_vars(&mut engine, &[0, 0]);
+    let dx = const_vars(&mut engine, &[i64::MAX, 1]);
+    let dy = const_vars(&mut engine, &[1, 1]);
+
+    engine.add_constraint(Constraint::Diffn { x, y, dx, dy });
+
+    assert!(
+        matches!(engine.solve(), CpSolveResult::Unsat),
+        "overlapping rectangles must remain UNSAT when a Big-M bound exceeds i64"
+    );
+}
+
 /// Regression test: incremental optimization loop must find improving solutions.
 ///
 /// Simulates the optimization loop manually: solve, add upper bound, solve again.
@@ -1648,6 +1503,68 @@ fn test_validate_accepts_valid_assignment() {
     engine.debug_validate_assignment(&[(x, 1), (y, 2), (z, 3)]);
 }
 
+#[test]
+fn test_pairwise_neq_extreme_offset_and_difference() {
+    let mut violated = CpSatEngine::new();
+    let x = violated.new_int_var(Domain::singleton(i64::MIN), Some("x"));
+    let y = violated.new_int_var(Domain::singleton(0), Some("y"));
+    violated.add_constraint(Constraint::PairwiseNeq {
+        x,
+        y,
+        offset: i64::MIN,
+    });
+    assert!(matches!(violated.solve(), CpSolveResult::Unsat));
+
+    let mut satisfied = CpSatEngine::new();
+    let x = satisfied.new_int_var(Domain::singleton(i64::MIN), Some("x"));
+    let y = satisfied.new_int_var(Domain::singleton(i64::MAX), Some("y"));
+    satisfied.add_constraint(Constraint::PairwiseNeq { x, y, offset: 0 });
+    assert!(matches!(satisfied.solve(), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn test_alldifferent_pigeon_hole_extreme_values() {
+    let mut engine = CpSatEngine::new();
+    let x = engine.new_int_var(Domain::singleton(i64::MIN), Some("x"));
+    let y = engine.new_int_var(Domain::singleton(i64::MAX), Some("y"));
+    engine.add_constraint(Constraint::AllDifferent(vec![x, y]));
+    assert!(matches!(engine.solve(), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn test_shifted_alldifferent_extreme_shifted_bounds() {
+    for fixed in [i64::MIN, i64::MAX] {
+        let mut engine = CpSatEngine::new();
+        let vars: Vec<_> = (0..3)
+            .map(|i| engine.new_int_var(Domain::singleton(fixed), Some(&format!("x{i}"))))
+            .collect();
+        for i in 0..vars.len() {
+            for j in (i + 1)..vars.len() {
+                engine.add_constraint(Constraint::PairwiseNeq {
+                    x: vars[i],
+                    y: vars[j],
+                    offset: i as i64 - j as i64,
+                });
+            }
+        }
+        assert!(matches!(engine.solve(), CpSolveResult::Sat(_)));
+    }
+}
+
+#[test]
+fn test_disjunctive_extreme_endpoints_detect_overlap() {
+    for fixed in [i64::MIN, i64::MAX] {
+        let mut engine = CpSatEngine::new();
+        let a = engine.new_int_var(Domain::singleton(fixed), Some("a"));
+        let b = engine.new_int_var(Domain::singleton(fixed), Some("b"));
+        engine.add_constraint(Constraint::Disjunctive {
+            starts: vec![a, b],
+            durations: vec![1, 1],
+        });
+        assert!(matches!(engine.solve(), CpSolveResult::Unsat));
+    }
+}
+
 /// Regression test for #5910 (accap pattern): incremental optimization with
 /// element constraints and boolean selection variables must not produce false
 /// UNSAT from stale theory lemmas persisting across incremental solves.
@@ -1815,4 +1732,80 @@ fn test_solve_under_assumptions_lns_primitive() {
         CpSolveResult::Sat(a) => assert_eq!(val(&a, x), 3),
         other => panic!("expected Sat, got {other:?}"),
     }
+}
+
+#[test]
+fn oversized_order_encoding_fails_closed_before_compilation() {
+    let mut engine = CpSatEngine::new();
+    let upper = crate::encoder::MAX_PREALLOCATED_ORDER_LITERALS as i64;
+    let variable = engine.new_int_var(Domain::new(0, upper), Some("huge"));
+
+    assert!(matches!(
+        engine.try_pre_compile(),
+        Err(OrderEncodingCapacityError::LiteralLimitExceeded { .. })
+    ));
+    assert!(!engine.pre_compile());
+    assert!(matches!(engine.solve(), CpSolveResult::Unknown));
+    assert!(matches!(
+        engine.solve_under_assumptions(&[(variable, 0)]),
+        CpSolveResult::Unknown
+    ));
+    assert!(matches!(
+        engine.solve_pure_sat_only(),
+        CpSolveResult::Unknown
+    ));
+}
+
+#[test]
+fn order_encoding_handles_i64_max_without_a_wrapped_sentinel() {
+    let mut engine = CpSatEngine::new();
+    let variable = engine.new_int_var(Domain::new(i64::MAX - 2, i64::MAX), Some("endpoint"));
+    let assignment = match engine.solve() {
+        CpSolveResult::Sat(assignment) => assignment,
+        other => panic!("small endpoint domain should solve, got {other:?}"),
+    };
+    let value = assignment
+        .iter()
+        .find_map(|&(candidate, value)| (candidate == variable).then_some(value))
+        .expect("endpoint variable must be assigned");
+    assert!((i64::MAX - 2..=i64::MAX).contains(&value));
+}
+
+#[test]
+fn variables_added_after_preallocation_fail_closed_in_every_solve_variant() {
+    let mut engine = CpSatEngine::new();
+    let _first = engine.new_int_var(Domain::new(0, 1), Some("first"));
+    assert!(engine.pre_compile());
+
+    let late = engine.new_int_var(Domain::new(10, 11), Some("late"));
+    engine.add_constraint(Constraint::LinearEq {
+        coeffs: vec![1],
+        vars: vec![late],
+        rhs: 11,
+    });
+
+    assert!(matches!(
+        engine.try_pre_compile(),
+        Err(
+            OrderEncodingCapacityError::VariablesAddedAfterPreallocation {
+                allocated: 1,
+                registered: 2,
+            }
+        )
+    ));
+    assert!(matches!(engine.solve(), CpSolveResult::Unknown));
+    assert!(matches!(
+        engine.solve_under_assumptions(&[]),
+        CpSolveResult::Unknown
+    ));
+    assert!(matches!(
+        engine.solve_pure_sat_only(),
+        CpSolveResult::Unknown
+    ));
+
+    // The zero-variable preallocation state must be tracked explicitly too.
+    let mut empty = CpSatEngine::new();
+    assert!(empty.pre_compile());
+    empty.new_bool_var(Some("late"));
+    assert!(matches!(empty.solve(), CpSolveResult::Unknown));
 }

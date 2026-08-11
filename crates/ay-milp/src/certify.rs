@@ -102,7 +102,9 @@ pub(crate) fn certified_weak_dual_row(
     // This is the authority. The construction is only a proposal; the public
     // certificate checker independently recombines true model facts.
     row.verify(model).ok()?;
-    (!deadline.is_some_and(|limit| std::time::Instant::now() >= limit)).then_some(row)
+    deadline
+        .is_none_or(|limit| std::time::Instant::now() < limit)
+        .then_some(row)
 }
 
 /// Build the weak-duality proposal without independently recombining it.
@@ -692,7 +694,7 @@ pub(crate) fn solve_dense(
 ///
 /// A 5.3x overrun of the caller's own deadline, with branch-and-bound never
 /// entered. `sample(1)` put 100% of the process here: `hybrid_pb_lp::try_solve_certified`
-/// -> `certify_bounded` -> `solve_dense`. The lane was passed a correct 600 ms
+/// -> `certify_bounded_by` -> `solve_dense`. The lane was passed a correct 600 ms
 /// slice and simply could not observe it.
 ///
 /// A deadline that a lane cannot poll is not a budget, it is a wish. Polling at
@@ -767,7 +769,7 @@ pub(crate) fn m_column(lp: &FloatLp, j: usize) -> Vec<(usize, BigRational)> {
 
 /// The exact primal point of a basis under `lower`/`upper`, with no certificate.
 ///
-/// A branch-and-bound leaf cannot use [`certify_bounded`]: that builds a
+/// A branch-and-bound leaf cannot use [`certify_bounded_by`]: that builds a
 /// certificate whose multipliers reference the MODEL's column bounds, while the
 /// leaf lives inside a branched box, so the identity legitimately fails to close.
 /// What the leaf actually needs is the exact POINT — which the caller then
@@ -1606,26 +1608,12 @@ mod true_model_basis_tests {
     }
 }
 
-/// As [`certify`], but under a branch-and-bound node's tightened bounds.
+/// As [`certify`], but under a branch-and-bound node's tightened bounds and a
+/// caller deadline.
 ///
-/// The certificate is still checked against the ORIGINAL `model`, so a node's
-/// certificate proves a statement about the node, not about the model — the
-/// caller is responsible for only ever using it that way.
-/// Unbudgeted variant, retained for the two in-tree callers that hold no
-/// deadline of their own (`certify` and the branch-and-bound leaf path).
-pub(crate) fn certify_bounded(
-    model: &Model,
-    lp: &FloatLp,
-    cand: &Candidate,
-    lower: &[f64],
-    upper: &[f64],
-) -> Option<CertifiedOptimum> {
-    certify_bounded_by(model, lp, cand, lower, upper, None)
-}
-
-/// [`certify_bounded`] under a caller deadline.
-///
-/// The two exact dense solves inside are the whole cost, and until this
+/// The certificate is checked against the original `model`; it proves a
+/// statement about the node, so callers must use it only for that node. The
+/// two exact dense solves inside are the whole cost, and until this
 /// existed neither could be interrupted — see [`solve_dense_by`] for the
 /// measured `control30-3-2-3` overrun that made a 600 ms lane slice into a
 /// 15.9 s one on a 3 s budget. Expiry returns `None`, which is the ordinary
@@ -2303,7 +2291,7 @@ impl SparseExactLu {
                     continue; // stale listing: the entry cancelled away earlier
                 };
                 stamp[r] = k as u32;
-                if swept % SPARSE_LU_DEADLINE_STRIDE == 0
+                if swept.is_multiple_of(SPARSE_LU_DEADLINE_STRIDE)
                     && deadline.is_some_and(|d| std::time::Instant::now() >= d)
                 {
                     return None;

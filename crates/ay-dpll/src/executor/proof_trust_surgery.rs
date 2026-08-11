@@ -2,12 +2,9 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Insert-and-remap surgery for trust-bearing proofs whose RESOLUTION
-//! SKELETON is sound: instead of re-proving the contradiction from scratch
-//! (the full-rebuild passes in `proof_original_rebuild`), this pass keeps the
-//! exported derivation and surgically replaces each defective site with a
-//! certified derivation, remapping the downstream consumers onto the new
-//! steps.
+//! Insert-and-remap surgery for proofs whose resolution skeleton is sound.
+//! Instead of re-proving the contradiction, this pass replaces each defective
+//! site with a certified derivation and remaps its downstream consumers.
 //!
 //! Four site classes are repaired (the "n-ary distinct + Int trichotomy"
 //! trust class plus the normalized-assume print defects, which need NO trust
@@ -54,10 +51,8 @@
 //!    proof as `assume` steps at all and the equality itself is exported as a
 //!    premiseless unproved unit. Repaired by re-introducing exactly those
 //!    ORIGINAL assertions into the assumption prologue and closing the unit
-//!    against them with the certified EUF recipe
-//!    (`eq_transitive`/`eq_congruent`) plus one resolution per re-introduced
-//!    premise. Re-introducing an original assertion is faithful; nothing is
-//!    invented and no clause is weakened.
+//!    against them with a certified EUF recipe plus one resolution per
+//!    premise; no assertion is invented.
 //!
 //! A `trust`-kind theory lemma that a LATER, idempotent export stage certifies
 //! in place (an array read-over-write schema re-tag, or a Skolemized
@@ -67,11 +62,8 @@
 //! already applied. Before that, a single array backbone leaf vetoed the
 //! repair of every genuinely defective leaf sharing the proof with it.
 //!
-//! The pass rebuilds the step list in one pass (assumes hoisted first, as
-//! Alethe requires), remapping every kept step's premises through an
-//! old-id → new-id map. It is fail-closed at every site: any unrecognized
-//! trust step, unbridgeable assume, dangling premise, or failed certificate
-//! verification leaves the proof byte-identical.
+//! The pass hoists assumptions, rebuilds/remaps the step list in one pass, and
+//! leaves the proof byte-identical on any unrecognized or unverifiable site.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
@@ -79,11 +71,32 @@ use ay_core::{
     AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId, TheoryLemmaKind,
     TheoryLit,
 };
-use ay_frontend::command::{Index as FrontendIndex, Term as FrontendTerm};
+use ay_frontend::command::Term as FrontendTerm;
 
 use super::proof_euf_lemma::{EufLemmaPlan, EufTarget};
 use super::proof_surface_syntax::strip_frontend_annotations;
+use super::proof_trust_surgery_ite::ProvenanceItePlan;
+use super::proof_trust_surgery_provenance::{
+    canonical_term_work as quant_canonical_term_work, prepare_rebuilt_premise_append,
+    retained_surface_plan_mix_is_safe, surface_or_decomposition_matches, surface_source_is_bounded,
+    surgery_sources_are_bounded, OriginalSourceIndex, SurgeryPlanningBudget,
+    MAX_PROVENANCE_REPAIR_TERMS,
+};
+use super::proof_trust_surgery_provenance_or::{surface_override_policy_allows, ProvenanceOrPlan};
 use super::Executor;
+
+#[path = "proof_trust_surgery_quant_plan.rs"]
+mod quant_plan;
+#[path = "proof_trust_surgery_quant_surface.rs"]
+mod quant_surface;
+#[path = "proof_trust_surgery_surface_intern.rs"]
+mod surface_intern;
+#[path = "proof_trust_surgery_surface_plans.rs"]
+mod surface_plans;
+#[path = "proof_trust_surgery_taut_surface.rs"]
+mod taut_surface;
+#[path = "proof_trust_surgery_volume.rs"]
+mod volume;
 
 /// Whether two terms are equal modulo binary-equality argument orientation
 /// (recursively). Carcara's default mode tolerates exactly this difference
@@ -117,86 +130,6 @@ fn eq_flip_equivalent(terms: &ay_core::TermStore, a: TermId, b: TermId) -> bool 
         }
         _ => false,
     }
-}
-
-/// Whether `raw` and `canon` are top-level binary-equality orientation
-/// flips of each other, possibly under exactly one matching `not` (the
-/// bridgeable per-literal shape of [`AndDistinctKind::OrPerm`]): both
-/// `(= a b)` / `(= b a)` and `(not (= a b))` / `(not (= b a))`. Exact
-/// equality does NOT qualify (callers handle it separately).
-fn eq_top_flip(terms: &ay_core::TermStore, raw: TermId, canon: TermId) -> bool {
-    let (raw, canon) = match (terms.get(raw), terms.get(canon)) {
-        (TermData::Not(x), TermData::Not(y)) => (*x, *y),
-        _ => (raw, canon),
-    };
-    match (terms.get(raw), terms.get(canon)) {
-        (TermData::App(sa, xa), TermData::App(sb, xb)) => {
-            matches!(sa, Symbol::Named(n) if n == "=")
-                && sa == sb
-                && xa.len() == 2
-                && xb.len() == 2
-                && xa[0] == xb[1]
-                && xa[1] == xb[0]
-        }
-        _ => false,
-    }
-}
-
-/// Match a raw-interned `or`-conjunct against its canonical export when the
-/// canonicalization REORDERED the disjuncts and/or FLIPPED binary-equality
-/// orientations (#C2b). Returns the `(raw disjunct, canonical disjunct)`
-/// pairing over the UNIQUE raw disjuncts in first-occurrence order — an
-/// injective alignment where each pair is either identical or a top-level
-/// orientation flip — or `None` when the two terms do not align (fail-open:
-/// the caller keeps the assume as-is).
-fn or_perm_lits(
-    terms: &ay_core::TermStore,
-    raw: TermId,
-    canon: TermId,
-) -> Option<Vec<(TermId, TermId)>> {
-    if raw == canon {
-        return None;
-    }
-    let (TermData::App(sr, rdis), TermData::App(sc, cdis)) = (terms.get(raw), terms.get(canon))
-    else {
-        return None;
-    };
-    if !matches!(sr, Symbol::Named(n) if n == "or") || sr != sc {
-        return None;
-    }
-    let (rdis, cdis) = (rdis.clone(), cdis.clone());
-    // The canonical export DEDUPLICATES repeated disjuncts: align the
-    // UNIQUE raw disjuncts (first-occurrence order) against the canonical
-    // list (the emitter contracts the raw duplicates away first).
-    let mut uniq: Vec<TermId> = Vec::with_capacity(rdis.len());
-    for &r in &rdis {
-        if !uniq.contains(&r) {
-            uniq.push(r);
-        }
-    }
-    if uniq.len() != cdis.len() {
-        return None;
-    }
-    let mut used = vec![false; cdis.len()];
-    let mut lits: Vec<(TermId, TermId)> = Vec::with_capacity(uniq.len());
-    for &r in &uniq {
-        // Exact matches first, orientation flips second: equal raw
-        // disjuncts must pair with equal canonical disjuncts, so the
-        // preference order cannot mispair an exact literal onto a flip
-        // slot another literal needs.
-        let slot = cdis
-            .iter()
-            .enumerate()
-            .position(|(j, &c)| !used[j] && c == r)
-            .or_else(|| {
-                cdis.iter()
-                    .enumerate()
-                    .position(|(j, &c)| !used[j] && eq_top_flip(terms, r, c))
-            })?;
-        used[slot] = true;
-        lits.push((r, cdis[slot]));
-    }
-    Some(lits)
 }
 
 /// Fully expand `let` bindings in a surface term (SMT-LIB parallel-binding
@@ -267,6 +200,8 @@ fn expand_surface_lets(
 #[cfg(test)]
 mod surface_let_tests {
     use super::*;
+    use ay_frontend::command::Index as FrontendIndex;
+    use ay_frontend::parse;
 
     #[test]
     fn expansion_descends_into_structured_indexed_terms() {
@@ -351,6 +286,551 @@ mod surface_let_tests {
                     && then_term != else_term
         ));
     }
+
+    #[test]
+    fn raw_intern_preserves_private_identity_for_declared_builtin_spellings() {
+        use ay_frontend::command::Constant as SurfaceConstant;
+
+        let cases = [
+            (
+                "(declare-fun = (Int Int) Bool)",
+                "=",
+                vec![
+                    FrontendTerm::Const(SurfaceConstant::Numeral("0".to_string())),
+                    FrontendTerm::Const(SurfaceConstant::Numeral("1".to_string())),
+                ],
+            ),
+            (
+                "(declare-fun rem (Int Int) Int)",
+                "rem",
+                vec![
+                    FrontendTerm::Const(SurfaceConstant::Numeral("5".to_string())),
+                    FrontendTerm::Const(SurfaceConstant::Numeral("2".to_string())),
+                ],
+            ),
+            (
+                "(declare-fun to_int (Real) Int)",
+                "to_int",
+                vec![FrontendTerm::Const(SurfaceConstant::Decimal(
+                    "1.5".to_string(),
+                ))],
+            ),
+        ];
+
+        for (declaration, head, args) in cases {
+            let mut executor = Executor::new();
+            let commands = parse(declaration).expect("declaration parses");
+            executor
+                .execute_all(&commands)
+                .expect("declaration executes");
+
+            let surface = FrontendTerm::App(head.to_string(), args);
+            let elaborated = executor
+                .ctx
+                .elaborate_surface_subterm(&surface)
+                .expect("declared application elaborates");
+            let raw = executor
+                .raw_intern_surface(&surface)
+                .expect("declared application raw-interns");
+            let expected_identity = executor
+                .ctx
+                .symbol_iter()
+                .find(|(surface, _)| surface.as_str() == head)
+                .map(|(surface, info)| executor.ctx.symbol_identity_name(surface, info))
+                .expect("declaration remains live");
+
+            assert_ne!(
+                expected_identity, head,
+                "builtin-colliding declarations require a private identity"
+            );
+            assert!(matches!(
+                executor.ctx.terms.get(elaborated),
+                TermData::App(Symbol::Named(identity), _) if identity == expected_identity
+            ));
+            assert!(matches!(
+                executor.ctx.terms.get(raw),
+                TermData::App(Symbol::Named(identity), _) if identity == expected_identity
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_ematching_forall_preserves_private_declaration_identity() {
+        use ay_frontend::command::Constant as SurfaceConstant;
+
+        let mut executor = Executor::new();
+        let commands = parse(
+            "(declare-fun rem (Int Int) Int)\n\
+             (assert (forall ((x Int)) (= (rem x 2) 0)))",
+        )
+        .expect("quantified private-UF fixture parses");
+        let ay_frontend::Command::Assert(parsed_forall) = &commands[1] else {
+            panic!("fixture must contain an asserted forall");
+        };
+        let parsed_forall = parsed_forall.clone();
+        executor
+            .execute_all(&commands)
+            .expect("quantified private-UF fixture executes");
+
+        let canonical_forall = executor.ctx.assertions[0];
+        let private_identity = executor
+            .ctx
+            .symbol_iter()
+            .find(|(surface, _)| surface.as_str() == "rem")
+            .map(|(surface, info)| executor.ctx.symbol_identity_name(surface, info).to_string())
+            .expect("rem declaration remains live");
+        assert_ne!(private_identity, "rem");
+
+        let five = executor.ctx.terms.mk_int(5.into());
+        let ground_surface = FrontendTerm::App(
+            "=".to_string(),
+            vec![
+                FrontendTerm::App(
+                    "rem".to_string(),
+                    vec![
+                        FrontendTerm::Const(SurfaceConstant::Numeral("5".to_string())),
+                        FrontendTerm::Const(SurfaceConstant::Numeral("2".to_string())),
+                    ],
+                ),
+                FrontendTerm::Const(SurfaceConstant::Numeral("0".to_string())),
+            ],
+        );
+        let ground_instance = executor
+            .raw_intern_surface(&ground_surface)
+            .expect("authenticated ground instance raw-interns");
+        let rebuilt = executor
+            .build_raw_ematching_forall_source(
+                canonical_forall,
+                &parsed_forall,
+                &[five],
+                ground_instance,
+            )
+            .expect("binder lifting preserves the authenticated private head");
+
+        let TermData::Forall(_, raw_body, _) = executor.ctx.terms.get(rebuilt).clone() else {
+            panic!("proof repair must rebuild a forall");
+        };
+        let mut pending = vec![raw_body];
+        let mut found_private_head = false;
+        while let Some(term) = pending.pop() {
+            if matches!(
+                executor.ctx.terms.get(term),
+                TermData::App(Symbol::Named(identity), _) if identity == &private_identity
+            ) {
+                found_private_head = true;
+                break;
+            }
+            pending.extend(executor.ctx.terms.children(term));
+        }
+        assert!(
+            found_private_head,
+            "rebuilt quantified proof source lost private declaration identity"
+        );
+    }
+
+    #[test]
+    fn rebuilt_private_equality_does_not_authorize_canonical_builtin_collision() {
+        let mut executor = Executor::new();
+        let commands = parse(
+            "(declare-fun = (Int Int) Bool)\n\
+             (assert (= 0 1))",
+        )
+        .expect("fixture parses");
+        executor.execute_all(&commands).expect("fixture executes");
+
+        // The rebuild captures both the canonical authored root and any raw
+        // source reconstruction that proof surgery may assume.
+        executor.rebuild_trust_leaf_proof_from_original_assertions(&mut Proof::new());
+        let private_equality = executor
+            .last_proof_rebuild_originals
+            .iter()
+            .copied()
+            .find(|&term| {
+                matches!(
+                    executor.ctx.terms.get(term),
+                    TermData::App(Symbol::Named(identity), _)
+                        if identity != "="
+                            && executor.ctx.dt_surface_name(identity) == Some("=")
+                )
+            })
+            .expect("rebuilt authored premise retains the private declaration identity");
+        let args = match executor.ctx.terms.get(private_equality).clone() {
+            TermData::App(_, args) => args,
+            _ => unreachable!("matched an application above"),
+        };
+        let canonical_builtin = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), args, Sort::Bool);
+        assert!(!executor
+            .problem_assertions_for_strict_proof()
+            .contains(&canonical_builtin));
+
+        // Source spelling alone must not authorize the canonical builtin: the
+        // problem asserted a free UF application instead. Assumption authority
+        // is validated before terminal-proof shape, so this minimal proof
+        // isolates the exact scope decision under test.
+        let mut forged = Proof::new();
+        forged.add_assume(canonical_builtin, None);
+        assert!(matches!(
+            executor.check_proof_strict_with_datatypes(&forged),
+            Err(ay_proof::ProofCheckError::UnauthorizedAssumption {
+                term,
+                ..
+            }) if term == canonical_builtin
+        ));
+    }
+
+    fn normalized_authored_or_fixture() -> (Executor, Vec<(TermId, FrontendTerm)>, TermId, TermId) {
+        let mut executor = Executor::new();
+        let commands = parse(
+            "(declare-const p Bool)\n\
+             (declare-const n Int)\n\
+             (declare-const x Int)\n\
+             (declare-const y Int)\n\
+             (declare-const z Int)\n\
+             (assert (=> p (=> (< 0 n) (= (+ x 0) (+ y 0)))))",
+        )
+        .expect("normalized authored-or fixture parses");
+        executor
+            .execute_all(&commands)
+            .expect("normalized authored-or fixture executes");
+        let canonical = executor.ctx.assertions[0];
+        let parsed = executor.ctx.assertions_parsed()[0].clone();
+
+        let TermData::App(Symbol::Named(source_name), source_disjuncts) =
+            executor.ctx.terms.get(canonical).clone()
+        else {
+            panic!("canonical implication must be a packed or")
+        };
+        assert_eq!(source_name, "or");
+        assert_eq!(source_disjuncts.len(), 3);
+        let source_guard = source_disjuncts
+            .iter()
+            .copied()
+            .find(|&term| {
+                matches!(
+                    executor.ctx.terms.get(term),
+                    TermData::Not(atom)
+                        if matches!(
+                            executor.ctx.terms.get(*atom),
+                            TermData::App(Symbol::Named(name), args)
+                                if name == "<" && args.len() == 2
+                        )
+                )
+            })
+            .expect("canonical implication contains its negated strict guard");
+        let guard = match executor.ctx.terms.get(source_guard) {
+            TermData::Not(atom) => *atom,
+            _ => unreachable!("source guard was matched above"),
+        };
+        let guard_args = match executor.ctx.terms.get(guard).clone() {
+            TermData::App(_, args) => args,
+            _ => unreachable!("source guard atom was matched above"),
+        };
+        // Mirror #7956 exactly: implication clausification dualizes the raw
+        // `(not (< 0 n))` disjunct to the equivalent `(<= n 0)` literal.
+        let normalized_guard = executor.ctx.terms.mk_app(
+            Symbol::named("<="),
+            [guard_args[1], guard_args[0]],
+            Sort::Bool,
+        );
+        let raw_not_guard = executor.ctx.terms.mk_not_raw(guard);
+        assert_ne!(
+            normalized_guard, raw_not_guard,
+            "fixture must exercise the checked arithmetic bridge"
+        );
+        let target_disjuncts: Vec<TermId> = source_disjuncts
+            .iter()
+            .map(|&term| {
+                if term == source_guard {
+                    normalized_guard
+                } else {
+                    term
+                }
+            })
+            .collect();
+        let target = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("or"), target_disjuncts, Sort::Bool);
+        let z = executor
+            .ctx
+            .terms
+            .lookup("z")
+            .expect("declared z remains interned");
+        (executor, vec![(canonical, parsed)], target, z)
+    }
+
+    #[test]
+    fn normalized_authored_implication_derives_exact_packed_or() {
+        let (mut executor, originals, target, _) = normalized_authored_or_fixture();
+        let plan = executor
+            .plan_normalized_authored_or(&[target], &originals)
+            .expect("the authenticated implication must align with the packed proof target");
+        assert!(matches!(
+            executor.ctx.terms.get(plan.source_or),
+            TermData::App(Symbol::Named(name), _) if name == "or"
+        ));
+        assert_eq!(
+            plan.literals
+                .iter()
+                .filter(|literal| literal.bridge_atom.is_some())
+                .count(),
+            1,
+            "only the negated strict comparison may need normalization"
+        );
+
+        let mut proof = Proof::new();
+        let source = proof.add_assume(plan.source_or, None);
+        let unit = executor
+            .emit_normalized_authored_or(&mut proof, &plan, source)
+            .expect("the planned implication/or bridge emits");
+        assert!(matches!(
+            &proof.steps[unit.0 as usize],
+            ProofStep::Step {
+                clause,
+                rule: AletheRule::Contraction,
+                ..
+            } if clause.as_slice() == [target]
+        ));
+        let authenticated = ay_proof::authenticate_premise_clauses_strict_with_context(
+            &proof,
+            &executor.ctx.terms,
+            None,
+            None,
+            &[plan.source_or],
+        )
+        .expect("every implication, arithmetic, packing, and resolution step replays");
+        assert_eq!(authenticated.clause(unit), Some([target].as_slice()));
+        assert_eq!(
+            ay_proof::terminal_trust_report(&proof).trust_rule_on_path,
+            0
+        );
+    }
+
+    #[test]
+    fn normalized_authored_implication_refuses_forged_guard_or_equality() {
+        let (mut executor, originals, target, z) = normalized_authored_or_fixture();
+        let TermData::App(Symbol::Named(name), disjuncts) = executor.ctx.terms.get(target).clone()
+        else {
+            panic!("fixture target must be a packed or")
+        };
+        assert_eq!(name, "or");
+        let eq_pos = disjuncts
+            .iter()
+            .position(|&term| decode_binary_equality(&executor.ctx.terms, term).is_some())
+            .expect("target contains its raw equality");
+        let guard_pos = disjuncts
+            .iter()
+            .position(|&term| {
+                matches!(
+                    executor.ctx.terms.get(term),
+                    TermData::App(Symbol::Named(op), args) if op == "<=" && args.len() == 2
+                )
+            })
+            .expect("target contains its normalized guard");
+
+        let (eq_lhs, _) = decode_binary_equality(&executor.ctx.terms, disjuncts[eq_pos])
+            .expect("equality position was checked");
+        let wrong_equality = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [eq_lhs, z], Sort::Bool);
+        let guard_args = match executor.ctx.terms.get(disjuncts[guard_pos]).clone() {
+            TermData::App(_, args) => args,
+            _ => unreachable!("guard position was checked"),
+        };
+        let one = executor.ctx.terms.mk_int(1.into());
+        let wrong_guard =
+            executor
+                .ctx
+                .terms
+                .mk_app(Symbol::named("<="), [guard_args[0], one], Sort::Bool);
+
+        for (label, position, replacement) in [
+            ("equality", eq_pos, wrong_equality),
+            ("guard", guard_pos, wrong_guard),
+        ] {
+            let mut forged_disjuncts = disjuncts.clone();
+            forged_disjuncts[position] = replacement;
+            let forged =
+                executor
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named("or"), forged_disjuncts, Sort::Bool);
+            assert!(
+                executor
+                    .plan_normalized_authored_or(&[forged], &originals)
+                    .is_none(),
+                "a forged {label} must not align with the authenticated source"
+            );
+        }
+    }
+
+    fn authored_array_ite_fixture() -> (Executor, Vec<(TermId, FrontendTerm)>, TermId, TermId) {
+        let mut executor = Executor::new();
+        let commands = parse(
+            "(declare-const a (Array Int Int))\n\
+             (declare-const x Int)\n\
+             (declare-const v Int)\n\
+             (declare-const wrong Int)\n\
+             (assert (= a (store ((as const (Array Int Int)) 0) 0 v)))\n\
+             (assert (= x 0))",
+        )
+        .expect("authored array-ite fixture parses");
+        executor
+            .execute_all(&commands)
+            .expect("authored array-ite fixture executes");
+        let originals: Vec<(TermId, FrontendTerm)> = executor
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .zip(executor.ctx.assertions_parsed().iter().cloned())
+            .collect();
+        let array_equality = originals[0].0;
+        let guard = originals[1].0;
+        let a = executor.ctx.terms.lookup("a").expect("a is interned");
+        let x = executor.ctx.terms.lookup("x").expect("x is interned");
+        let v = executor.ctx.terms.lookup("v").expect("v is interned");
+        let wrong = executor
+            .ctx
+            .terms
+            .lookup("wrong")
+            .expect("wrong is interned");
+        let zero = executor.ctx.terms.mk_int(0.into());
+        let read = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("select"), [a, x], Sort::Int);
+        let then_branch = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [v, read], Sort::Bool);
+        let else_branch = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [zero, read], Sort::Bool);
+        let ite = executor.ctx.terms.mk_ite(guard, then_branch, else_branch);
+        let not_equality = executor.ctx.terms.mk_not_raw(array_equality);
+        let target =
+            executor
+                .ctx
+                .terms
+                .mk_app(Symbol::named("or"), [not_equality, ite], Sort::Bool);
+        (executor, originals, target, wrong)
+    }
+
+    #[test]
+    fn authored_array_ite_derives_packed_unit_from_row_chain() {
+        let (mut executor, originals, target, _) = authored_array_ite_fixture();
+        let plan = executor
+            .plan_authored_array_ite(&[target], &originals)
+            .expect("the exact authored equality and guard must certify the array ITE");
+        assert_eq!(
+            ay_proof::recognize_array_theory_lemma(&executor.ctx.terms, &plan.congruence_clause,),
+            Some(TheoryLemmaKind::ArrayRowChain)
+        );
+        assert_eq!(
+            ay_proof::recognize_array_select_store(&executor.ctx.terms, &plan.row1_clause),
+            Some(true)
+        );
+
+        let mut proof = Proof::new();
+        let equality_assume = proof.add_assume(plan.array_equality, None);
+        let guard_assume = proof.add_assume(plan.guard_source, None);
+        let unit = executor
+            .emit_authored_array_ite(&mut proof, &plan, equality_assume, guard_assume)
+            .expect("the checked ROW/ITE/OR derivation emits");
+        let authenticated = ay_proof::authenticate_premise_clauses_strict_with_context(
+            &proof,
+            &executor.ctx.terms,
+            None,
+            None,
+            &[plan.array_equality, plan.guard_source],
+        )
+        .expect("every ROW, ITE, OR, and resolution step replays");
+        assert_eq!(authenticated.clause(unit), Some([target].as_slice()));
+        assert_eq!(
+            ay_proof::terminal_trust_report(&proof).trust_rule_on_path,
+            0
+        );
+    }
+
+    #[test]
+    fn authored_array_ite_refuses_forged_then_branch() {
+        let (mut executor, originals, target, wrong) = authored_array_ite_fixture();
+        assert!(
+            executor
+                .plan_authored_array_ite(&[target], &originals[..1])
+                .is_none(),
+            "the array equality alone must not authorize the ITE guard"
+        );
+        assert!(
+            executor
+                .plan_authored_array_ite(&[target], &originals[1..])
+                .is_none(),
+            "the guard alone must not authorize the array equality"
+        );
+        let TermData::App(Symbol::Named(op), disjuncts) = executor.ctx.terms.get(target).clone()
+        else {
+            panic!("fixture target must be an or")
+        };
+        assert_eq!(op, "or");
+        let ite_position = disjuncts
+            .iter()
+            .position(|&term| matches!(executor.ctx.terms.get(term), TermData::Ite(..)))
+            .expect("fixture target contains its ITE");
+        let TermData::Ite(guard, _, else_branch) =
+            executor.ctx.terms.get(disjuncts[ite_position]).clone()
+        else {
+            unreachable!("ITE position was checked")
+        };
+        let read = match executor.ctx.terms.get(else_branch).clone() {
+            TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => args[1],
+            _ => panic!("fixture else branch is an equality"),
+        };
+        let forged_then = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [wrong, read], Sort::Bool);
+        let forged_ite = executor.ctx.terms.mk_ite(guard, forged_then, else_branch);
+        let mut forged_disjuncts = disjuncts;
+        forged_disjuncts[ite_position] = forged_ite;
+        let forged = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("or"), forged_disjuncts, Sort::Bool);
+        assert!(
+            executor
+                .plan_authored_array_ite(&[forged], &originals)
+                .is_none(),
+            "a forged then branch must not pass the strict ROW matcher"
+        );
+    }
+
+    #[test]
+    fn native_ematching_body_preflight_rejects_excess_depth() {
+        let mut terms = ay_core::TermStore::new();
+        let mut body = terms.mk_bool(true);
+        for _ in 0..=256 {
+            body = terms.mk_app(Symbol::named("native_depth"), [body], Sort::Bool);
+        }
+        assert!(quant_canonical_term_work(&terms, body).is_none());
+    }
+
+    #[test]
+    fn legacy_ite_scan_preflight_rejects_excess_arity() {
+        let mut terms = ay_core::TermStore::new();
+        let atom = terms.mk_bool(true);
+        let body = terms.mk_app(
+            Symbol::named("legacy_ite_wide"),
+            vec![atom; 100_001],
+            Sort::Bool,
+        );
+        assert!(quant_canonical_term_work(&terms, body).is_none());
+    }
 }
 
 /// The two operands of a top-level binary `(= a b)` application, or `None`.
@@ -368,46 +848,6 @@ fn atom_of(terms: &ay_core::TermStore, lit: TermId) -> TermId {
         TermData::Not(inner) => *inner,
         _ => lit,
     }
-}
-
-/// Step indices reachable from an empty-clause conclusion (the only steps
-/// the printer emits).
-fn live_steps(proof: &Proof) -> Vec<bool> {
-    let n = proof.steps.len();
-    let mut live = vec![false; n];
-    let mut stack: Vec<usize> = Vec::new();
-    for (idx, step) in proof.steps.iter().enumerate() {
-        let empty = match step {
-            ProofStep::Step { clause, .. }
-            | ProofStep::Resolution { clause, .. }
-            | ProofStep::TheoryLemma { clause, .. } => clause.is_empty(),
-            _ => false,
-        };
-        if empty && !live[idx] {
-            live[idx] = true;
-            stack.push(idx);
-        }
-    }
-    while let Some(idx) = stack.pop() {
-        let mut push = |p: ProofId| {
-            let i = p.0 as usize;
-            if i < n && !live[i] {
-                live[i] = true;
-                stack.push(i);
-            }
-        };
-        match &proof.steps[idx] {
-            ProofStep::Step { premises, .. } => premises.iter().copied().for_each(&mut push),
-            ProofStep::Resolution {
-                clause1, clause2, ..
-            } => {
-                push(*clause1);
-                push(*clause2);
-            }
-            _ => {}
-        }
-    }
-    live
 }
 
 /// Whether `t` is a PURE linear-arithmetic term: numerals, arithmetic
@@ -523,8 +963,8 @@ enum AssumePlan {
     QuantExpansion {
         /// The original `forall` assertion (a genuine problem premise).
         forall_term: TermId,
-        /// Its parsed surface form (for raw instance construction).
-        parsed: FrontendTerm,
+        /// Index of its parsed authored source in `originals`.
+        assertion_index: usize,
         /// Canonical conjuncts of the expansion (the old assume's term).
         conjs: Vec<TermId>,
         /// Folded instance term -> binder values (in binder order).
@@ -689,20 +1129,27 @@ fn lift_surface_binders_from_ground(
             FrontendTerm::App(source_head, source_args),
             FrontendTerm::App(substituted_head, substituted_args),
         ) if source_head == substituted_head && source_args.len() == substituted_args.len() => {
-            let ground_args: Vec<TermId> = match terms.get(ground) {
-                TermData::Not(inner) if source_head == "not" && source_args.len() == 1 => {
-                    vec![*inner]
-                }
-                TermData::Ite(cond, then_term, else_term)
-                    if source_head == "ite" && source_args.len() == 3 =>
-                {
-                    vec![*cond, *then_term, *else_term]
-                }
-                TermData::App(Symbol::Named(ground_head), args) if ground_head == source_head => {
-                    args.clone()
-                }
-                _ => return None,
-            };
+            // `ground` was built by `raw_intern_surface` and authenticated
+            // byte-exactly by `build_raw_ematching_forall_source` before this
+            // reverse lift. Preserve its exact core symbol: a declaration whose
+            // legal surface spelling collides with a builtin deliberately has a
+            // private identity, and rebuilding from `source_head` would silently
+            // turn that UF back into the builtin during proof repair.
+            let (ground_symbol, ground_args): (Option<Symbol>, Vec<TermId>) =
+                match terms.get(ground) {
+                    TermData::Not(inner) if source_head == "not" && source_args.len() == 1 => {
+                        (None, vec![*inner])
+                    }
+                    TermData::Ite(cond, then_term, else_term)
+                        if source_head == "ite" && source_args.len() == 3 =>
+                    {
+                        (None, vec![*cond, *then_term, *else_term])
+                    }
+                    TermData::App(symbol, args) if source_head != "not" && source_head != "ite" => {
+                        (Some(symbol.clone()), args.clone())
+                    }
+                    _ => return None,
+                };
             if ground_args.len() != source_args.len() {
                 return None;
             }
@@ -727,7 +1174,7 @@ fn lift_surface_binders_from_ground(
                 return Some(terms.mk_ite_raw(rebuilt[0], rebuilt[1], rebuilt[2]));
             }
             let sort = terms.sort(ground).clone();
-            Some(terms.mk_app(Symbol::named(source_head), rebuilt, sort))
+            Some(terms.mk_app(ground_symbol?, rebuilt, sort))
         }
         (
             FrontendTerm::IndexedApp(source_name, source_indices, source_args),
@@ -962,6 +1409,8 @@ struct IteLiftPlan {
     lifted_else: TermId,
     /// The trust clause's single literal `(ite cond A B)`.
     goal: TermId,
+    /// The term-level `(ite cond u v)` named by both branch equalities.
+    ite_term: TermId,
     /// `(= s u)` / `(= s v)` (the `ite_intro` definition equalities;
     /// `s = (ite cond u v)` is the term-level ite inside `orig`).
     eq_then: TermId,
@@ -990,6 +1439,63 @@ struct OrUnitPlan {
     /// Per non-`L` disjunct, in decomposition order: (resolution pivot
     /// atom, the complementary ORIGINAL assertion discharging it).
     eliminations: Vec<(TermId, TermId)>,
+}
+
+/// A singleton trust clause whose term is the canonical packed `or` form of
+/// one exact authored, right-associated implication chain. The canonical
+/// authored `or` is assumed and decomposed; independently checked linear
+/// bridges normalize comparison literals, and `or_neg` packs the resulting
+/// exact disjunct set back into the unit the existing proof consumes. The
+/// Alethe printer replays that internal `or` decomposition as `implies_pos`
+/// steps so the premise still prints exactly like the authored implication.
+///
+/// This is deliberately a source-authenticated plan, not a general
+/// implication simplifier: `source_or` is the canonical half of an exact
+/// authenticated `(canonical, parsed)` entry from `originals`, and every source
+/// literal must align one-to-one with an exact target disjunct.
+struct NormalizedAuthoredOrPlan {
+    /// Canonical `(or (not A0) (not A1) ... C)` for the authored implication.
+    source_or: TermId,
+    /// Exact disjuncts of `source_or`.
+    source_disjuncts: Vec<TermId>,
+    /// Canonical packed `(or (not A0) (not A1) ... C)` consumed by the old
+    /// proof's downstream steps.
+    target_or: TermId,
+    /// Exact canonical disjuncts of `target_or`.
+    target_disjuncts: Vec<TermId>,
+    /// Source literals aligned with the target disjuncts.
+    literals: Vec<NormalizedAuthoredOrLiteral>,
+}
+
+struct NormalizedAuthoredOrLiteral {
+    source: TermId,
+    canonical: TermId,
+    /// The source literal's atom when a checked two-literal LRA bridge is
+    /// needed. `None` means `source == canonical`.
+    bridge_atom: Option<TermId>,
+}
+
+/// A singleton packed disjunction `(or (not E) (ite G T F))` whose then arm
+/// follows from two exact authored premises, the array equality `E` and guard
+/// `G`, through the strict `ArrayRowChain` schema.  The else arm is irrelevant
+/// once `G` is discharged; ordinary `ite_neg2` and `or_neg` steps lift the
+/// certified array fact back to the original singleton term.
+struct AuthoredArrayItePlan {
+    target_or: TermId,
+    array_equality: TermId,
+    /// Raw-interned exact source spelling of the authored arithmetic guard.
+    /// This remains a distinct proof premise when elaboration normalized the
+    /// guard's arithmetic expression.
+    guard_source: TermId,
+    /// Canonical guard consumed by the certified ROW and ITE rules.
+    guard: TermId,
+    then_branch: TermId,
+    ite_term: TermId,
+    select_congruence: TermId,
+    store_hit: TermId,
+    congruence_clause: Vec<TermId>,
+    row1_clause: Vec<TermId>,
+    transitivity_clause: Vec<TermId>,
 }
 
 /// How a recognized preprocessor-derived EUF-transitivity TAUTOLOGY unit
@@ -1093,13 +1599,17 @@ struct TrichotomyPlan {
 impl Executor {
     /// See the module docs. Returns `true` (proof swapped) only when EVERY
     /// reachable defect was repaired with a certified derivation.
-    pub(super) fn try_rebuild_with_trust_surgery(
+    pub(in crate::executor) fn try_rebuild_with_trust_surgery(
         &mut self,
         proof: &mut Proof,
         originals: &[(TermId, FrontendTerm)],
     ) -> bool {
+        let source_index = OriginalSourceIndex::new(originals);
+        if !source_index.is_valid() || !surgery_sources_are_bounded(&self.ctx.terms, originals) {
+            return false;
+        }
         let n = proof.steps.len();
-        if n == 0 {
+        if n == 0 || n > 100_000 {
             return false;
         }
         // Subproof anchors are out of scope for index-remap surgery.
@@ -1114,7 +1624,9 @@ impl Executor {
         // Only steps REACHABLE from an empty-clause step matter: dead steps
         // are never printed, so the surgery neither plans for them nor
         // copies them (a dead defective step must not veto the repair).
-        let live = live_steps(proof);
+        let Some(live) = taut_surface::live_steps(proof) else {
+            return false;
+        };
 
         // Consumer map: step index -> indices of LIVE steps that use it.
         let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1155,7 +1667,13 @@ impl Executor {
         // assumes, and the no-plans-at-all case is rejected after it.
         let mut trichotomies: HashMap<usize, TrichotomyPlan> = HashMap::default();
         let mut ite_lifts: HashMap<usize, IteLiftPlan> = HashMap::default();
+        let mut provenance_ite_lifts: HashMap<usize, ProvenanceItePlan> = HashMap::default();
+        let mut exact_provenance_or_assumes: HashMap<usize, TermId> = HashMap::default();
+        let mut provenance_or_plans: HashMap<usize, ProvenanceOrPlan> = HashMap::default();
         let mut or_units: HashMap<usize, OrUnitPlan> = HashMap::default();
+        let mut normalized_authored_ors: HashMap<usize, NormalizedAuthoredOrPlan> =
+            HashMap::default();
+        let mut authored_array_ites: HashMap<usize, AuthoredArrayItePlan> = HashMap::default();
         let mut taut_units: HashMap<usize, OrTautologyPlan> = HashMap::default();
         let mut euf_lemmas: HashMap<usize, EufLemmaPlan> = HashMap::default();
         let mut quant_negations: HashMap<usize, QuantNegationPlan> = HashMap::default();
@@ -1163,6 +1681,8 @@ impl Executor {
         let mut subst_eqs: HashMap<usize, SubstEqPlan> = HashMap::default();
         let mut deferred_leaves: HashSet<usize> = HashSet::default();
         let mut or_split_of: HashMap<usize, usize> = HashMap::default();
+        let mut quant_surface_authority = quant_surface::QuantSurfaceAuthority::new(&source_index);
+        let mut quant_plan_count = 0usize;
         for idx in 0..n {
             if !live[idx] {
                 continue;
@@ -1176,44 +1696,104 @@ impl Executor {
                     rule: AletheRule::Trust,
                     clause,
                     ..
-                } => clause.clone(),
-                ProofStep::TheoryLemma { kind, clause, .. } if kind.is_trust() => clause.clone(),
+                } => clause.as_slice(),
+                ProofStep::TheoryLemma { kind, clause, .. } if kind.is_trust() => clause.as_slice(),
                 _ => continue,
             };
-            if let Some(plan) = self.plan_trichotomy(proof, &clause, &consumers[idx], idx) {
+            if clause.len() > MAX_PROVENANCE_REPAIR_TERMS
+                || !quant_surface_authority
+                    .planning_budget()
+                    .spend_work(clause.len().saturating_add(1))
+                || !self.spend_trust_clause_terms(clause, &mut quant_surface_authority)
+            {
+                return false;
+            }
+            if let Some(plan) = self.plan_trichotomy(proof, clause, &consumers[idx], idx) {
                 or_split_of.insert(plan.or_split_idx, idx);
                 trichotomies.insert(idx, plan);
-            } else if let Some(plan) = self.plan_ite_lift(&clause, originals) {
+            } else if let Some(plan) = self.plan_provenance_ite_lift(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
+                provenance_ite_lifts.insert(idx, plan);
+            } else if let Some(plan) = self.plan_ite_lift(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
                 ite_lifts.insert(idx, plan);
-            } else if let Some(plan) = self.plan_or_unit(&clause, originals) {
+            } else if let Some(plan) = self.plan_normalized_authored_or(clause, originals) {
+                normalized_authored_ors.insert(idx, plan);
+            } else if let Some(plan) = self.plan_authored_array_ite(clause, originals) {
+                authored_array_ites.insert(idx, plan);
+            } else if let Some(orig) = self.plan_exact_provenance_or_assume(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
+                exact_provenance_or_assumes.insert(idx, orig);
+            } else if let Some(plan) = self.plan_provenance_or(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
+                provenance_or_plans.insert(idx, plan);
+            } else if let Some(plan) = self.plan_or_unit(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
                 or_units.insert(idx, plan);
-            } else if let Some(plan) = self.plan_or_transitivity_tautology(&clause) {
+            } else if let Some(plan) = self.plan_or_transitivity_tautology(clause) {
                 taut_units.insert(idx, plan);
-            } else if let Some(plan) = self.plan_euf_lemma(&clause) {
+            } else if let Some(plan) =
+                self.plan_euf_lemma_with_budget(clause, quant_surface_authority.planning_budget())
+            {
                 // EUF congruence/substitution-chain lemma (bare or
                 // or-wrapped), re-derived via the eq_congruent /
                 // eq_transitive / eq_congruent_pred toolkit (#C2).
                 euf_lemmas.insert(idx, plan);
-            } else if let Some(plan) = self.plan_ematching_quant_negation(&clause, originals) {
+            } else if let Some(plan) = self.plan_ematching_quant_negation(
+                clause,
+                originals,
+                &mut quant_surface_authority,
+                &mut quant_plan_count,
+            ) {
                 // A direct E-matching instance plus an original arithmetic
                 // premise refutes the authored forall.  Rebuild the exact
                 // forall_inst + Farkas chain instead of exporting trust.
                 quant_negations.insert(idx, plan);
-            } else if let Some(plan) = self.plan_quant_consequence(&clause, originals) {
+            } else if let Some(plan) = self.plan_quant_consequence(
+                clause,
+                originals,
+                &mut quant_surface_authority,
+                &mut quant_plan_count,
+            ) {
                 // A preprocessing-folded consequence of a quantifier-
                 // expansion instance (#quant-expansion-proof): re-derived
                 // from the ORIGINAL forall premise via forall_inst plus a
                 // re-verified la_generic combination with the consumed
                 // original premises.
                 quant_consequences.insert(idx, plan);
-            } else if let Some(plan) = self.plan_substituted_equality(&clause, originals) {
+            } else if let Some(plan) = self.plan_substituted_equality(
+                clause,
+                originals,
+                &source_index,
+                quant_surface_authority.planning_budget(),
+            ) {
                 // A preprocessing COLLAPSE: the assertions defining the two
                 // sides were substituted away, so the equality they entail
                 // arrives as a premiseless trust unit. Re-derived from the
                 // ORIGINAL equality assertions with the certified EUF toolkit
                 // (#array-collapse-promotion).
                 subst_eqs.insert(idx, plan);
-            } else if self.trust_leaf_certified_downstream(&proof.steps[idx], &clause) {
+            } else if self.trust_leaf_certified_downstream(&proof.steps[idx], clause) {
                 // Not a defect this pass may touch: a LATER, idempotent
                 // pipeline stage re-tags this leaf into a strict-checkable
                 // theory kind (see `trust_leaf_certified_downstream`). Copy it
@@ -1224,6 +1804,52 @@ impl Executor {
                 return false;
             }
         }
+        let has_ite_lift_plans = !ite_lifts.is_empty() || !provenance_ite_lifts.is_empty();
+        let mut keeps_surface_overrides = has_ite_lift_plans
+            || !normalized_authored_ors.is_empty()
+            || !authored_array_ites.is_empty()
+            || !or_units.is_empty()
+            || !exact_provenance_or_assumes.is_empty()
+            || !provenance_or_plans.is_empty()
+            || !subst_eqs.is_empty()
+            || !taut_units.is_empty()
+            || !euf_lemmas.is_empty();
+        let mut surface_audit = if keeps_surface_overrides {
+            let Some(mut audit) = self.plan_retained_surface_audit(
+                originals,
+                &ite_lifts,
+                &provenance_ite_lifts,
+                &exact_provenance_or_assumes,
+                &provenance_or_plans,
+                &or_units,
+                &subst_eqs,
+            ) else {
+                return false;
+            };
+            for plan in normalized_authored_ors.values() {
+                if !audit.require_original(&mut self.ctx, originals, plan.source_or) {
+                    return false;
+                }
+                audit.protect_operand(&mut self.ctx.terms, plan.source_or);
+            }
+            for plan in authored_array_ites.values() {
+                if !audit.require_original(&mut self.ctx, originals, plan.array_equality)
+                    || !audit.require_original_as(
+                        &mut self.ctx,
+                        originals,
+                        plan.guard,
+                        plan.guard_source,
+                    )
+                {
+                    return false;
+                }
+                audit.protect_operand(&mut self.ctx.terms, plan.array_equality);
+                audit.protect_operand(&mut self.ctx.terms, plan.guard_source);
+            }
+            Some(audit)
+        } else {
+            None
+        };
         let mut quant_source_replacements: HashMap<TermId, TermId> = HashMap::default();
         for plan in quant_negations.values() {
             if let Some(previous) =
@@ -1239,23 +1865,12 @@ impl Executor {
         // trichotomy / assume-bridge classes purge them to protect their
         // rigid raw-interned shapes. Mixing the two disciplines in one proof
         // is unsupported: fail closed.
-        if (!ite_lifts.is_empty() || !or_units.is_empty()) && !trichotomies.is_empty() {
-            return false;
-        }
-        // The substituted-equality repair re-introduces ORIGINAL assertions as
-        // assumes and therefore shares the ite-lift / or-unit discipline (the
-        // surface overrides must survive so those assumes print like the
-        // problem file). Mixing it with the override-purging classes is
-        // unsupported: fail closed.
-        if !subst_eqs.is_empty() && (!trichotomies.is_empty() || !ite_lifts.is_empty()) {
-            return false;
-        }
-
         // (2) Plan every assume: originals-faithful assumes are kept; the
         // two repairable classes get bridge plans; anything else that is not
         // an original assertion aborts.
         let mut assume_plans: HashMap<usize, AssumePlan> = HashMap::default();
         let mut kept_surface_sensitive_assume = false;
+        let mut print_faithful_cache: HashMap<TermId, bool> = HashMap::default();
         for (idx, step) in proof.steps.iter().enumerate() {
             if !live[idx] {
                 continue;
@@ -1264,10 +1879,19 @@ impl Executor {
                 continue;
             };
             let term = *term;
-            let Some((_, parsed)) = originals.iter().find(|(c, _)| *c == term) else {
-                if quant_source_replacements.contains_key(&term) {
-                    continue;
+            if quant_source_replacements.contains_key(&term) {
+                if !self.spend_quant_source_assume(term, &mut quant_surface_authority) {
+                    return false;
                 }
+                continue;
+            }
+            if !quant_surface_authority
+                .planning_budget()
+                .spend_terms(&self.ctx.terms, &[term])
+            {
+                return false;
+            }
+            let Some((_, parsed)) = source_index.get(originals, term) else {
                 // A mid-proof assume of a PREPROCESSOR-DERIVED formula: no
                 // checker can match it to a problem premise. Repairable when
                 // it is a recorded finite-domain quantifier expansion (the
@@ -1275,7 +1899,12 @@ impl Executor {
                 // #quant-expansion-proof), a self-contained EUF-transitivity
                 // tautology (re-derived from nothing), or an or-wrapped EUF
                 // lemma; otherwise fail closed.
-                if let Some(plan) = self.classify_quant_expansion(term, originals) {
+                if let Some(plan) = self.classify_quant_expansion(
+                    term,
+                    originals,
+                    &mut quant_surface_authority,
+                    &mut quant_plan_count,
+                ) {
                     assume_plans.insert(idx, plan);
                     continue;
                 }
@@ -1283,7 +1912,9 @@ impl Executor {
                     taut_units.insert(idx, plan);
                     continue;
                 }
-                if let Some(plan) = self.plan_euf_lemma(&[term]) {
+                if let Some(plan) = self
+                    .plan_euf_lemma_with_budget(&[term], quant_surface_authority.planning_budget())
+                {
                     if plan.or_term().is_some() {
                         euf_lemmas.insert(idx, plan);
                         continue;
@@ -1291,24 +1922,29 @@ impl Executor {
                 }
                 return false;
             };
-            let parsed = parsed.clone();
-            // Surface overrides survive only the ite-lift surgery: when they
-            // are kept, an override-covered bound literal already prints
-            // right and must NOT be planned (a plan would trip the ite-lift
-            // exclusivity abort); when they are purged, it MUST be bridged
-            // (its post-purge canonical print no longer matches the file).
-            let overrides_kept = !ite_lifts.is_empty();
-            match self.classify_assume(term, &parsed, overrides_kept) {
+            // Surface-preserving repairs (ITE and authored-OR families) keep
+            // overrides: an override-covered bound already prints correctly
+            // and must not acquire a raw normalization bridge. Override-
+            // purging repairs require that bridge instead. Mixing the two
+            // disciplines fails closed below.
+            let overrides_kept = keeps_surface_overrides;
+            match self.classify_assume(term, parsed, overrides_kept) {
                 Ok(Some(plan)) => {
                     assume_plans.insert(idx, plan);
                 }
                 Ok(None) => {
-                    let surface = self
+                    if overrides_kept
+                        && surface_audit.as_mut().is_none_or(|audit| {
+                            !audit.require_original(&mut self.ctx, originals, term)
+                        })
+                    {
+                        return false;
+                    }
+                    let has_surface = self
                         .last_proof_term_overrides
                         .as_ref()
-                        .and_then(|overrides| overrides.get(&term))
-                        .cloned();
-                    if let Some(surface) = surface {
+                        .is_some_and(|overrides| overrides.contains_key(&term));
+                    if has_surface {
                         // The surface collector installs a whole-term entry
                         // for every assertion, including terms whose raw
                         // source tree is already the canonical tree modulo
@@ -1319,45 +1955,86 @@ impl Executor {
                         // interning proves that the surviving Assume actually
                         // depends on another rewrite (or cannot represent the
                         // source without a binder-aware derivation).
-                        let raw = self.raw_intern_surface(&parsed);
-                        let print_faithful = raw.is_some_and(|raw| {
-                            surface == ay_proof::format_term_alethe(&self.ctx.terms, raw)
-                                && eq_flip_equivalent(&self.ctx.terms, raw, term)
-                        });
+                        let print_faithful = if let Some(&cached) = print_faithful_cache.get(&term)
+                        {
+                            cached
+                        } else {
+                            if !quant_surface_authority
+                                .planning_budget()
+                                .spend_surface(term, parsed)
+                                || !quant_surface_authority
+                                    .planning_budget()
+                                    .spend_terms(&self.ctx.terms, &[term])
+                            {
+                                return false;
+                            }
+                            let raw = self.raw_intern_surface(parsed);
+                            let rendered = raw.map(|raw| {
+                                (raw, ay_proof::format_term_alethe(&self.ctx.terms, raw))
+                            });
+                            let faithful = rendered.is_some_and(|(raw, rendered)| {
+                                self.last_proof_term_overrides
+                                    .as_ref()
+                                    .and_then(|overrides| overrides.get(&term))
+                                    == Some(&rendered)
+                                    && eq_flip_equivalent(&self.ctx.terms, raw, term)
+                            });
+                            print_faithful_cache.insert(term, faithful);
+                            faithful
+                        };
                         kept_surface_sensitive_assume |= !print_faithful;
                     }
                 }
                 Err(()) => return false,
             }
         }
+        // Standalone tautology/EUF plans can be discovered only while
+        // classifying mid-proof assumes. They emit surface-sensitive rules
+        // too, so the retained-map decision is finalized only now.
+        keeps_surface_overrides |= !taut_units.is_empty() || !euf_lemmas.is_empty();
         // Trichotomy and assume-bridge repairs clear the entire surface
         // override map. A surviving original Assume that depended on one of
         // those spellings would then cease to match the authored premise
         // (implication, xor, binary-distinct, and nested-rewrite surfaces are
         // deliberately outside the bridge classifier). Keep the old proof
         // visible instead of silently stripping its premise identity.
-        let will_purge_overrides = ite_lifts.is_empty()
-            && or_units.is_empty()
+        let has_quant_plans = !quant_negations.is_empty()
+            || !quant_consequences.is_empty()
+            || assume_plans
+                .values()
+                .any(|p| matches!(p, AssumePlan::QuantExpansion { .. }));
+        let will_purge_overrides = !keeps_surface_overrides
             && subst_eqs.is_empty()
-            && (!trichotomies.is_empty() || !assume_plans.is_empty());
+            && (!trichotomies.is_empty() || !assume_plans.is_empty() || has_quant_plans);
         if kept_surface_sensitive_assume && will_purge_overrides {
             return false;
         }
-        // See the exclusivity note above: assume bridges assume the override
-        // purge, ite lifts require the overrides. Fail closed on the mix.
-        if !ite_lifts.is_empty() && !assume_plans.is_empty() {
+        // See the exclusivity note above: assume bridges require the override
+        // purge, while ITE/authored-OR repairs retain overrides. Fail closed on
+        // the mix.
+        if !surface_override_policy_allows(keeps_surface_overrides, !assume_plans.is_empty()) {
             return false;
         }
         // Quant-expansion plans purge the overrides and re-collect only their
         // own re-added originals; the ite-lift / or-unit classes keep the
         // whole override map. Mixing the two disciplines is unsupported:
         // fail closed.
-        let has_quant_plans = !quant_negations.is_empty()
-            || !quant_consequences.is_empty()
-            || assume_plans
-                .values()
-                .any(|p| matches!(p, AssumePlan::QuantExpansion { .. }));
-        if has_quant_plans && (!ite_lifts.is_empty() || !or_units.is_empty()) {
+        // Standalone quant repair prepares its complete replacement map before
+        // proof mutation.  Retained-surface repair uses a different rendering
+        // discipline, so the two remain deliberately exclusive.
+        if !retained_surface_plan_mix_is_safe(
+            keeps_surface_overrides,
+            !deferred_leaves.is_empty(),
+            has_quant_plans,
+        ) {
+            return false;
+        }
+        if has_quant_plans
+            && (!trichotomies.is_empty()
+                || assume_plans
+                    .values()
+                    .any(|plan| !matches!(plan, AssumePlan::QuantExpansion { .. })))
+        {
             return false;
         }
         // The substituted-equality repair keeps the overrides (see above), so
@@ -1366,18 +2043,57 @@ impl Executor {
         if !subst_eqs.is_empty() && (!assume_plans.is_empty() || has_quant_plans) {
             return false;
         }
+        if keeps_surface_overrides && !trichotomies.is_empty() {
+            return false;
+        }
+        let mut prepared_surface_overrides = None;
+        if keeps_surface_overrides {
+            let mut replaced_steps = HashSet::default();
+            for index in ite_lifts
+                .keys()
+                .chain(provenance_ite_lifts.keys())
+                .chain(normalized_authored_ors.keys())
+                .chain(authored_array_ites.keys())
+                .chain(exact_provenance_or_assumes.keys())
+                .chain(provenance_or_plans.keys())
+                .chain(or_units.keys())
+                .chain(taut_units.keys())
+                .chain(euf_lemmas.keys())
+                .chain(subst_eqs.keys())
+            {
+                replaced_steps.insert(*index);
+            }
+            let audit = surface_audit.take().unwrap_or_default();
+            let Some(effective) = self.finalize_retained_surface_overrides(
+                proof,
+                &live,
+                &replaced_steps,
+                audit,
+                &taut_units,
+                &euf_lemmas,
+            ) else {
+                return false;
+            };
+            prepared_surface_overrides = Some(effective);
+        }
         // Nothing to repair at all: keep the proof byte-identical. (The
         // trust-free defective-assume case — the caller's
         // `reachable_non_original_assume` trigger — lands here with a
         // non-empty `assume_plans` and proceeds.)
         if trichotomies.is_empty()
             && ite_lifts.is_empty()
+            && provenance_ite_lifts.is_empty()
+            && exact_provenance_or_assumes.is_empty()
+            && provenance_or_plans.is_empty()
+            && or_units.is_empty()
             && assume_plans.is_empty()
+            && normalized_authored_ors.is_empty()
+            && authored_array_ites.is_empty()
             && taut_units.is_empty()
             && euf_lemmas.is_empty()
+            && subst_eqs.is_empty()
             && quant_negations.is_empty()
             && quant_consequences.is_empty()
-            && subst_eqs.is_empty()
         {
             return false;
         }
@@ -1478,26 +2194,51 @@ impl Executor {
         // conjunct aborts the surgery and keeps the proof byte-identical).
         let mut quant_chains: HashMap<(usize, usize), QuantInstanceChain> = HashMap::default();
         {
-            let mut pattern_targets: Vec<(usize, usize)> =
-                unit_patterns.values().copied().collect();
+            let mut pattern_targets = Vec::new();
+            let mut seen_targets = HashSet::default();
+            for &(assume_index, position) in unit_patterns.values() {
+                if !matches!(
+                    assume_plans.get(&assume_index),
+                    Some(AssumePlan::QuantExpansion { .. })
+                ) {
+                    continue;
+                }
+                if !seen_targets.insert((assume_index, position)) {
+                    continue;
+                }
+                if pattern_targets.len() >= quant_surface::MAX_QUANT_SURFACE_CHAINS {
+                    return false;
+                }
+                pattern_targets.push((assume_index, position));
+            }
             pattern_targets.sort_unstable();
-            pattern_targets.dedup();
             for (a_idx, pos) in pattern_targets {
                 let Some(AssumePlan::QuantExpansion {
-                    parsed,
+                    forall_term,
+                    assertion_index,
                     conjs,
                     instances,
-                    ..
                 }) = assume_plans.get(&a_idx)
                 else {
                     continue;
                 };
+                let Some((source, parsed)) = originals.get(*assertion_index) else {
+                    return false;
+                };
+                if source != forall_term {
+                    return false;
+                }
                 let target = conjs[pos];
                 let Some(values) = instances.get(&target).cloned() else {
                     return false;
                 };
-                let parsed = parsed.clone();
-                let Some(chain) = self.build_quant_instance_chain(&parsed, &values, target) else {
+                if !quant_surface_authority.spend_chain_source(*forall_term, parsed) {
+                    return false;
+                }
+                if !quant_surface_authority.spend_solver_attempt(&self.ctx.terms, &values) {
+                    return false;
+                }
+                let Some(chain) = self.build_quant_instance_chain(parsed, &values, target) else {
                     return false;
                 };
                 quant_chains.insert((a_idx, pos), chain);
@@ -1510,6 +2251,50 @@ impl Executor {
             if *dropped && !consumers[idx].iter().all(|c| unit_patterns.contains_key(c)) {
                 return false;
             }
+        }
+
+        let prepared_quant_surface_overrides = if has_quant_plans {
+            let Some(overrides) = self.prepare_quant_surface_overrides(
+                &mut quant_surface_authority,
+                proof,
+                &live,
+                originals,
+                quant_surface::QuantSurfacePlans {
+                    assumes: &assume_plans,
+                    chains: &quant_chains,
+                    consequences: &quant_consequences,
+                    negations: &quant_negations,
+                },
+            ) else {
+                return false;
+            };
+            Some(overrides)
+        } else {
+            None
+        };
+
+        if !volume::emitted_proof_volume_is_bounded(
+            proof,
+            &live,
+            &self.ctx.terms,
+            volume::EmittedVolumePlans {
+                trichotomies: &trichotomies,
+                ite_lifts: &ite_lifts,
+                provenance_ite_lifts: &provenance_ite_lifts,
+                exact_or_assumes: &exact_provenance_or_assumes,
+                provenance_or_plans: &provenance_or_plans,
+                or_units: &or_units,
+                taut_units: &taut_units,
+                euf_lemmas: &euf_lemmas,
+                subst_eqs: &subst_eqs,
+                quant_negations: &quant_negations,
+                quant_consequences: &quant_consequences,
+                assume_plans: &assume_plans,
+                unit_patterns: &unit_patterns,
+                quant_chains: &quant_chains,
+            },
+        ) {
+            return false;
         }
 
         // (4) Rebuild: hoisted assumes first, then a single ordered walk
@@ -1561,11 +2346,50 @@ impl Executor {
                 }
             }
         }
+        // A normalized authored-or plan assumes the exact canonical original.
+        // Its surface override retains the authored implication spelling;
+        // hoist and deduplicate the premise before emitting any derivation.
+        for plan in normalized_authored_ors.values() {
+            if !lift_assume.contains_key(&plan.source_or) {
+                let id = new_proof.add_assume(plan.source_or, None);
+                lift_assume.insert(plan.source_or, id);
+            }
+        }
+        for plan in authored_array_ites.values() {
+            for term in [plan.array_equality, plan.guard_source] {
+                if !lift_assume.contains_key(&term) {
+                    let id = new_proof.add_assume(term, None);
+                    lift_assume.insert(term, id);
+                }
+            }
+        }
         for plan in ite_lifts.values() {
             for t in std::iter::once(plan.orig).chain(plan.bound) {
                 if !lift_assume.contains_key(&t) {
                     let id = new_proof.add_assume(t, None);
                     lift_assume.insert(t, id);
+                }
+            }
+        }
+        for plan in provenance_ite_lifts.values() {
+            for t in std::iter::once(plan.orig).chain(plan.supports.iter().copied()) {
+                if !lift_assume.contains_key(&t) {
+                    let id = new_proof.add_assume(t, None);
+                    lift_assume.insert(t, id);
+                }
+            }
+        }
+        for &orig in exact_provenance_or_assumes.values() {
+            if !lift_assume.contains_key(&orig) {
+                let id = new_proof.add_assume(orig, None);
+                lift_assume.insert(orig, id);
+            }
+        }
+        for plan in provenance_or_plans.values() {
+            for &source in plan.authored_sources() {
+                if !lift_assume.contains_key(&source) {
+                    let id = new_proof.add_assume(source, None);
+                    lift_assume.insert(source, id);
                 }
             }
         }
@@ -1597,8 +2421,7 @@ impl Executor {
         }
         // Quant-expansion assumes were hoisted as the ORIGINAL forall term:
         // register them under that term so consequence plans can share them,
-        // then hoist any forall / support original a consequence plan needs
-        // that the proof did not assume (#quant-expansion-proof).
+        // then hoist any forall/support original absent from the old proof.
         for (idx, plan) in &assume_plans {
             if let AssumePlan::QuantExpansion { forall_term, .. } = plan {
                 if let Some(&id) = assume_new_id.get(idx) {
@@ -1607,10 +2430,10 @@ impl Executor {
             }
         }
         for plan in quant_consequences.values() {
-            for t in std::iter::once(plan.forall_term).chain(plan.supports.iter().copied()) {
-                if !lift_assume.contains_key(&t) {
-                    let id = new_proof.add_assume(t, None);
-                    lift_assume.insert(t, id);
+            for term in std::iter::once(plan.forall_term).chain(plan.supports.iter().copied()) {
+                if !lift_assume.contains_key(&term) {
+                    let id = new_proof.add_assume(term, None);
+                    lift_assume.insert(term, id);
                 }
             }
         }
@@ -1682,6 +2505,30 @@ impl Executor {
                 trichotomy_clause.insert(idx, r2);
                 // The trust step itself is never referenced by anything but
                 // its or-split (verified during planning): no mapping.
+                continue;
+            }
+            if let Some(plan) = provenance_ite_lifts.get(&idx) {
+                let Some(derived) =
+                    self.emit_provenance_ite_lift(&mut new_proof, plan, &lift_assume)
+                else {
+                    return false;
+                };
+                map[idx] = Some(derived);
+                continue;
+            }
+            if let Some(orig) = exact_provenance_or_assumes.get(&idx) {
+                let Some(&assume_id) = lift_assume.get(orig) else {
+                    return false;
+                };
+                map[idx] = Some(assume_id);
+                continue;
+            }
+            if let Some(plan) = provenance_or_plans.get(&idx) {
+                let Some(derived) = self.emit_provenance_or(&mut new_proof, plan, &lift_assume)
+                else {
+                    return false;
+                };
+                map[idx] = Some(derived);
                 continue;
             }
             if let Some(plan) = ite_lifts.get(&idx) {
@@ -1883,6 +2730,35 @@ impl Executor {
                 map[idx] = Some(cur);
                 continue;
             }
+            if let Some(plan) = normalized_authored_ors.get(&idx) {
+                let Some(&assume_id) = lift_assume.get(&plan.source_or) else {
+                    return false;
+                };
+                let Some(unit) = self.emit_normalized_authored_or(&mut new_proof, plan, assume_id)
+                else {
+                    return false;
+                };
+                map[idx] = Some(unit);
+                continue;
+            }
+            if let Some(plan) = authored_array_ites.get(&idx) {
+                let (Some(&equality_assume), Some(&guard_assume)) = (
+                    lift_assume.get(&plan.array_equality),
+                    lift_assume.get(&plan.guard_source),
+                ) else {
+                    return false;
+                };
+                let Some(unit) = self.emit_authored_array_ite(
+                    &mut new_proof,
+                    plan,
+                    equality_assume,
+                    guard_assume,
+                ) else {
+                    return false;
+                };
+                map[idx] = Some(unit);
+                continue;
+            }
             if let Some(plan) = taut_units.get(&idx) {
                 let unit = match taut_unit_of_term.get(&plan.term) {
                     Some(&u) => u,
@@ -1934,10 +2810,6 @@ impl Executor {
                 continue;
             }
             if let Some(plan) = quant_consequences.get(&idx) {
-                // Derive the instance from the original forall's assume,
-                // then close onto the trust unit with the re-verified
-                // la_generic combination and one resolution per consumed
-                // original premise (#quant-expansion-proof).
                 let Some(&assume_id) = lift_assume.get(&plan.forall_term) else {
                     return false;
                 };
@@ -1957,25 +2829,25 @@ impl Executor {
                     lia: None,
                 });
                 let inst_pivot = atom_of(&self.ctx.terms, plan.chain.target);
-                let mut cur = new_proof.add_resolution(
+                let mut current = new_proof.add_resolution(
                     plan.lemma[1..].to_vec(),
                     inst_pivot,
                     lemma_id,
                     inst_unit,
                 );
-                for (i, &support) in plan.supports.iter().enumerate() {
+                for (index, &support) in plan.supports.iter().enumerate() {
                     let Some(&support_id) = lift_assume.get(&support) else {
                         return false;
                     };
                     let pivot = atom_of(&self.ctx.terms, support);
-                    cur = new_proof.add_resolution(
-                        plan.lemma[i + 2..].to_vec(),
+                    current = new_proof.add_resolution(
+                        plan.lemma[index + 2..].to_vec(),
                         pivot,
-                        cur,
+                        current,
                         support_id,
                     );
                 }
-                map[idx] = Some(cur);
+                map[idx] = Some(current);
                 continue;
             }
             if let Some(&(a_idx, pos)) = unit_patterns.get(&idx) {
@@ -2434,7 +3306,11 @@ impl Executor {
                     else {
                         return false;
                     };
-                    let id = new_proof.add_resolution(clause.clone(), *pivot, c1, c2);
+                    let pivot = quant_source_replacements
+                        .get(pivot)
+                        .copied()
+                        .unwrap_or(*pivot);
+                    let id = new_proof.add_resolution(clause.clone(), pivot, c1, c2);
                     map[idx] = Some(id);
                 }
                 ProofStep::TheoryLemma { .. } => {
@@ -2456,7 +3332,9 @@ impl Executor {
             if deferred_leaves.is_empty() || report.trust_rule_on_path > 0 {
                 return false;
             }
-            let live_new = live_steps(&new_proof);
+            let Some(live_new) = taut_surface::live_steps(&new_proof) else {
+                return false;
+            };
             for (i, step) in new_proof.steps.iter().enumerate() {
                 if !live_new[i] {
                     continue;
@@ -2493,7 +3371,13 @@ impl Executor {
             || has_or_perm
             || !deferred_leaves.is_empty()
             || !subst_eqs.is_empty()
-            || !quant_negations.is_empty()
+            || !normalized_authored_ors.is_empty()
+            || !authored_array_ites.is_empty()
+            || has_quant_plans
+            || has_ite_lift_plans
+            || !exact_provenance_or_assumes.is_empty()
+            || !provenance_or_plans.is_empty()
+            || !or_units.is_empty()
         {
             // Deferred-certified leaves are still `Generic` at this point in
             // the pipeline, and the strict checker rightly refuses that kind.
@@ -2553,137 +3437,137 @@ impl Executor {
                 .filter(|plan| plan.defining_source.is_some())
                 .map(|plan| plan.orig),
         );
+        rebuilt_authored_premises.extend(
+            provenance_ite_lifts
+                .values()
+                .filter(|plan| plan.defining_source.is_some())
+                .map(|plan| plan.orig),
+        );
         rebuilt_authored_premises.extend(quant_negations.values().map(|plan| plan.forall_term));
-
+        rebuilt_authored_premises.extend(
+            authored_array_ites
+                .values()
+                .filter(|plan| plan.guard_source != plan.guard)
+                .map(|plan| plan.guard_source),
+        );
         // Success. Override-purge discipline: every term the trichotomy /
         // assume-bridge surgery prints is raw-interned or canonical; a stale
         // surface override collected during the ordinary export could corrupt
         // the rigid `la_disequality` / `distinct_elim` / `and_pos` literal
-        // shapes. The ite-lift surgery is the opposite: its re-added original
-        // assume MUST print with the problem file's surface syntax (Carcara
-        // matches assumes syntactically), so the overrides are kept — every
-        // step of the lift derivation is built from the same canonical
-        // subterms, so the override map keeps the printout globally
-        // consistent.
-        *proof = new_proof;
-        fn collect(
-            ctx: &mut ay_frontend::Context,
-            originals: &[(TermId, FrontendTerm)],
-            canonical: TermId,
-            overrides: &mut HashMap<TermId, String>,
-        ) {
-            if let Some((canonical, parsed)) = originals.iter().find(|(c, _)| *c == canonical) {
-                let (canonical, parsed) = (*canonical, parsed.clone());
-                super::proof_surface_syntax::collect_surface_term_overrides(
-                    ctx, canonical, &parsed, overrides,
-                );
-                super::proof_surface_syntax::collect_deep_arith_surface_overrides(
-                    ctx, &parsed, overrides,
-                );
-            }
-        }
-        if ite_lifts.is_empty() && or_units.is_empty() {
-            // Tautology-ONLY surgeries keep the collected overrides: their
-            // derivations are built purely from subterms of the (already
-            // consistently printed) tautological term, while the SURVIVING
-            // original assumes still need their surface spellings to match
-            // the problem file. The purge below protects the rigid
-            // raw-interned shapes of the trichotomy / assume-bridge classes
-            // only.
-            if !trichotomies.is_empty() || !assume_plans.is_empty() {
-                self.last_proof_term_overrides = None;
-            }
+        // shapes. Surface-preserving ITE/authored-OR surgery is the opposite:
+        // each re-added original Assume must print with the problem file's
+        // syntax (Carcara matches assumes syntactically), so overrides remain.
+        // Their derivations use the same canonical subterms throughout.
+        let mut next_surface_overrides = if keeps_surface_overrides {
+            let Some(overrides) = prepared_surface_overrides else {
+                return false;
+            };
+            Some(overrides)
+        } else if has_quant_plans {
+            let Some(overrides) = prepared_quant_surface_overrides else {
+                return false;
+            };
+            Some(overrides)
+        } else if !trichotomies.is_empty() || !assume_plans.is_empty() {
+            None
         } else {
-            // The preprocessor consumed the re-added originals before the
-            // ordinary export collected overrides for them: collect the
-            // surface spellings now so the re-added assumes (and every
-            // derivation occurrence of their subterms) print like the
-            // problem file.
-            let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
-            for plan in ite_lifts.values() {
-                collect(&mut self.ctx, originals, plan.orig, &mut overrides);
-                if let Some(bound) = plan.bound {
-                    collect(&mut self.ctx, originals, bound, &mut overrides);
-                }
-                // Re-interned surface premise: collect via its canonical
-                // source, then copy the source's whole-assertion spelling
-                // onto the premise term itself.
-                if let Some(source) = plan.defining_source {
-                    collect(&mut self.ctx, originals, source, &mut overrides);
-                    if let Some(s) = overrides.get(&source).cloned() {
-                        overrides.insert(plan.orig, s);
+            self.last_proof_term_overrides.clone()
+        };
+        // The array-ITE repair re-introduces its exact authored array equality
+        // and guard after preprocessing consumed them. Recollect ONLY their
+        // root spellings: the assumes must match the input, while recursive
+        // source overrides would alter the canonical array/index operands of
+        // the independently certified ROW derivation at Alethe export.
+        if !authored_array_ites.is_empty() {
+            let Some(overrides) = next_surface_overrides.as_mut() else {
+                return false;
+            };
+            let authored_roots: HashSet<TermId> = originals.iter().map(|(term, _)| *term).collect();
+            for plan in authored_array_ites.values() {
+                // Existing export state may already contain recursively
+                // collected spellings from these assertions. Strip every
+                // non-premise node in the certified fragment so ROW/chain/ITE
+                // printers see precisely the terms the strict checker saw.
+                // Whole authored roots are preserved and restored below.
+                let mut stack = vec![plan.target_or, plan.ite_term];
+                stack.extend(plan.congruence_clause.iter().copied());
+                stack.extend(plan.row1_clause.iter().copied());
+                stack.extend(plan.transitivity_clause.iter().copied());
+                let mut visited = HashSet::default();
+                while let Some(term) = stack.pop() {
+                    if !visited.insert(term) {
+                        continue;
                     }
+                    if !authored_roots.contains(&term) {
+                        overrides.remove(&term);
+                    }
+                    stack.extend(self.ctx.terms.children(term));
                 }
-            }
-            for plan in or_units.values() {
-                collect(&mut self.ctx, originals, plan.orig, &mut overrides);
-                for &(_, comp) in &plan.eliminations {
-                    collect(&mut self.ctx, originals, comp, &mut overrides);
+                if plan.guard_source != plan.guard {
+                    overrides.remove(&plan.guard);
                 }
-            }
-            self.last_proof_term_overrides = Some(overrides);
-        }
-        // The substituted-equality repair likewise re-introduces ORIGINAL
-        // premises the preprocessor consumed: collect exactly their surface
-        // spellings so the hoisted assumes print like the problem file.
-        if !subst_eqs.is_empty() {
-            let mut targets: Vec<TermId> = subst_eqs
-                .values()
-                .flat_map(|plan| plan.hyps.iter().copied())
-                .collect();
-            targets.sort_unstable();
-            targets.dedup();
-            let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
-            for t in targets {
-                collect(&mut self.ctx, originals, t, &mut overrides);
-            }
-            self.last_proof_term_overrides = Some(overrides);
-        }
-        // Quant-expansion surgeries re-introduce ORIGINAL premises (the
-        // forall and any consequence supports) that the purge above may have
-        // stripped: re-collect exactly their surface spellings so the
-        // re-added assumes — and every derivation occurrence of the forall
-        // term — print like the problem file (#quant-expansion-proof). The
-        // rigid raw-interned instance chains reference no overridden term.
-        if has_quant_plans {
-            let mut quant_override_targets: Vec<TermId> = Vec::new();
-            for plan in assume_plans.values() {
-                if let AssumePlan::QuantExpansion { forall_term, .. } = plan {
-                    quant_override_targets.push(*forall_term);
-                }
-            }
-            for plan in quant_consequences.values() {
-                quant_override_targets.push(plan.forall_term);
-                quant_override_targets.extend(plan.supports.iter().copied());
-            }
-            for plan in quant_negations.values() {
-                quant_override_targets.extend(plan.supports.iter().copied());
-            }
-            let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
-            for t in quant_override_targets {
-                collect(&mut self.ctx, originals, t, &mut overrides);
-            }
-            for plan in quant_negations.values() {
-                let Some((_, parsed)) = originals.get(plan.assertion_index) else {
+                let canonical = plan.array_equality;
+                let Some((_, parsed)) = originals.iter().find(|(term, _)| *term == canonical)
+                else {
                     return false;
                 };
-                super::proof_surface_syntax::collect_surface_term_overrides(
+                super::proof_surface_syntax::collect_root_surface_term_override(
                     &mut self.ctx,
-                    plan.forall_term,
+                    canonical,
                     parsed,
-                    &mut overrides,
+                    overrides,
                 );
-                super::proof_surface_syntax::collect_deep_arith_surface_overrides(
+                super::proof_surface_syntax::collect_deep_array_surface_overrides(
                     &mut self.ctx,
                     parsed,
-                    &mut overrides,
+                    overrides,
                 );
             }
-            self.last_proof_term_overrides = Some(overrides);
         }
-        for premise in rebuilt_authored_premises {
-            self.record_rebuilt_authored_proof_premise(premise);
+        // The canonical source premise must retain the exact authored
+        // implication spelling.  Conversely, the independently derived target
+        // must print as its packed `or`; a stale whole-term override would turn
+        // the `or_neg`/resolution conclusion back into an implication.  Do this
+        // last so the substitution and quantifier collectors above cannot
+        // accidentally restore the target override.  Planning already rejects
+        // targets that are themselves authored canonical premises.
+        if !normalized_authored_ors.is_empty() {
+            let Some(overrides) = next_surface_overrides.as_mut() else {
+                return false;
+            };
+            for plan in normalized_authored_ors.values() {
+                let Some((_, parsed)) = originals.iter().find(|(term, _)| *term == plan.source_or)
+                else {
+                    return false;
+                };
+                if !super::proof_surface_syntax::collect_surface_term_overrides(
+                    &mut self.ctx,
+                    plan.source_or,
+                    parsed,
+                    overrides,
+                ) {
+                    return false;
+                }
+            }
+            for plan in normalized_authored_ors.values() {
+                overrides.remove(&plan.target_or);
+            }
         }
+        if next_surface_overrides.as_ref().is_some_and(|overrides| {
+            !super::proof_surface_syntax::surface_override_map_is_bounded(overrides)
+        }) {
+            return false;
+        }
+        let Some(rebuilt_authored_premises) = prepare_rebuilt_premise_append(
+            &mut self.last_proof_rebuild_originals,
+            &rebuilt_authored_premises,
+        ) else {
+            return false;
+        };
+        *proof = new_proof;
+        self.last_proof_term_overrides = next_surface_overrides;
+        self.last_proof_rebuild_originals
+            .extend(rebuilt_authored_premises);
         true
     }
 
@@ -2814,19 +3698,14 @@ impl Executor {
         })
     }
 
-    /// Recognize a trust step's clause as a lifted term-ite input
-    /// `(cl (ite c A B))` where some ORIGINAL assertion `P` contains a
-    /// term-level ite `s = (ite c u v)` with `A = P[s/u]` and `B = P[s/v]`
-    /// (re-canonicalized substitution — exact `TermId` equality, so the match
-    /// cannot be approximate). Both opaque-atom transfer lemmas
-    /// `(cl (not (= s u)) (not P) A)` / `(cl (not (= s v)) (not P) B)` are
-    /// pre-verified `[1, 1, 1]` Farkas certificates (fail-closed), and every
-    /// constructed connective is shape-checked against constant-fold
-    /// surprises.
+    /// Recognize exact term-ITE lifting from an authored assertion and
+    /// pre-verify both branch transfers as Farkas certificates.
     fn plan_ite_lift(
         &mut self,
         clause: &[TermId],
         originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
     ) -> Option<IteLiftPlan> {
         if clause.len() != 1 {
             return None;
@@ -2835,17 +3714,25 @@ impl Executor {
         let TermData::Ite(cond, lifted_then, lifted_else) = *self.ctx.terms.get(goal) else {
             return None;
         };
-        for &(orig, _) in originals {
+        for (orig, parsed) in originals {
+            let orig = *orig;
+            if !source_index.contains(orig) {
+                continue;
+            }
+            if !planning.spend_surface(orig, parsed)
+                || !planning.spend_terms(&self.ctx.terms, &[orig])
+            {
+                return None;
+            }
             // Collect the term-level ite subterms of `orig` that share the
             // lifted condition.
             let mut candidates: Vec<(TermId, TermId, TermId)> = Vec::new();
             let mut stack = vec![orig];
-            let mut seen: Vec<TermId> = Vec::new();
+            let mut seen = HashSet::default();
             while let Some(t) = stack.pop() {
-                if seen.contains(&t) {
+                if !seen.insert(t) {
                     continue;
                 }
-                seen.push(t);
                 match self.ctx.terms.get(t) {
                     TermData::Not(inner) => stack.push(*inner),
                     TermData::Ite(c, a, b) => {
@@ -2859,6 +3746,9 @@ impl Executor {
                 }
             }
             for (ite_term, u, v) in candidates {
+                if !planning.spend_terms(&self.ctx.terms, &[orig, orig]) {
+                    return None;
+                }
                 let then_subst = self.ctx.terms.substitute(orig, &[ite_term], &[u]);
                 let else_subst = self.ctx.terms.substitute(orig, &[ite_term], &[v]);
                 if then_subst != lifted_then || else_subst != lifted_else {
@@ -2884,6 +3774,7 @@ impl Executor {
                     lifted_then,
                     lifted_else,
                     goal,
+                    ite_term,
                     eq_then,
                     eq_else,
                     ite_def,
@@ -2892,39 +3783,37 @@ impl Executor {
                 });
             }
         }
-        // Defined-equality substitution variant: an original `(= d (ite c u
-        // v))` defines `d`, a SECOND original `P(d)` bounds it, and the
-        // lifted clause is `(ite c P[d/u] P[d/v])`. Elaboration itself lifts
-        // the defining equality to the formula-level `(ite c (= d u) (= d
-        // v))`, so the surface equality is recovered from the PARSED
-        // original: its operands re-elaborate and the equality re-interns
-        // (surface operand order) as the derivation's premise `P` — an
-        // opaque-atom linear equality the transfer lemmas can carry. The
-        // `ite_intro` derivation runs on that premise; the transfer lemmas
-        // gain the bound original as a fourth certified literal.
+        // Defined-equality variant: `(= d (ite c u v))` plus an authored
+        // bound `P(d)` derives the two lifted branches through `ite_intro`.
         for (canonical, parsed) in originals {
-            let (canonical, stripped) = (*canonical, strip_frontend_annotations(parsed).clone());
-            let FrontendTerm::App(op, sides) = &stripped else {
+            let canonical = *canonical;
+            if !source_index.contains(canonical) {
+                continue;
+            }
+            if !planning.spend_surface(canonical, parsed) {
+                return None;
+            }
+            let stripped = strip_frontend_annotations(parsed);
+            let FrontendTerm::App(op, sides) = stripped else {
                 continue;
             };
             if op != "=" || sides.len() != 2 {
                 continue;
             }
             for ite_side in [0usize, 1] {
-                let ite_surface = strip_frontend_annotations(&sides[ite_side]).clone();
-                let def_surface = strip_frontend_annotations(&sides[1 - ite_side]).clone();
-                let FrontendTerm::App(iop, iargs) = &ite_surface else {
+                let ite_surface = strip_frontend_annotations(&sides[ite_side]);
+                let def_surface = strip_frontend_annotations(&sides[1 - ite_side]);
+                let FrontendTerm::App(iop, iargs) = ite_surface else {
                     continue;
                 };
                 if iop != "ite" || iargs.len() != 3 {
                     continue;
                 }
-                let iargs = iargs.clone();
                 let (Some(c), Some(u), Some(v), Some(defined)) = (
                     self.ctx.elaborate_surface_subterm(&iargs[0]),
                     self.ctx.elaborate_surface_subterm(&iargs[1]),
                     self.ctx.elaborate_surface_subterm(&iargs[2]),
-                    self.ctx.elaborate_surface_subterm(&def_surface),
+                    self.ctx.elaborate_surface_subterm(def_surface),
                 ) else {
                     continue;
                 };
@@ -2958,7 +3847,7 @@ impl Executor {
                 ) {
                     continue;
                 }
-                let Some(authored_raw) = self.raw_intern_surface(&stripped) else {
+                let Some(authored_raw) = self.raw_intern_surface(stripped) else {
                     continue;
                 };
                 if authored_raw != p_raw {
@@ -2969,8 +3858,11 @@ impl Executor {
                     continue;
                 }
                 for &(bound, _) in originals {
-                    if bound == canonical {
+                    if bound == canonical || !source_index.contains(bound) {
                         continue;
+                    }
+                    if !planning.spend_terms(&self.ctx.terms, &[bound, bound]) {
+                        return None;
                     }
                     let then_subst = self.ctx.terms.substitute(bound, &[defined], &[u]);
                     let else_subst = self.ctx.terms.substitute(bound, &[defined], &[v]);
@@ -2995,6 +3887,7 @@ impl Executor {
                         lifted_then,
                         lifted_else,
                         goal,
+                        ite_term,
                         eq_then,
                         eq_else,
                         ite_def,
@@ -3011,7 +3904,7 @@ impl Executor {
     /// for `orig` containing the term-level `ite_term = (ite cond u v)`.
     /// Fail-closed: `None` when any raw application does not intern with the
     /// exact expected shape.
-    fn build_ite_lift_connectives(
+    pub(super) fn build_ite_lift_connectives(
         &mut self,
         orig: TermId,
         cond: TermId,
@@ -3067,6 +3960,629 @@ impl Executor {
         Some((eq_then, eq_else, ite_def, and_term, intro_eq))
     }
 
+    /// Recognize a singleton trust clause as the packed canonical `or` of an
+    /// exact authored right-associated implication chain.
+    ///
+    /// Authority comes from the immutable `(canonical, parsed)` original pair.
+    /// The canonical half is the exact internal premise; the parsed half must
+    /// still be a right-associated implication chain of the same width.  This
+    /// separation is intentional: the strict checker sees the canonical
+    /// packed `or`, while the Alethe printer replays its decomposition through
+    /// `implies_pos` so the external premise retains the authored spelling.
+    /// Only an exact comparison dual may differ between source and target, and
+    /// that two-literal bridge is independently Farkas-validated.
+    fn plan_normalized_authored_or(
+        &mut self,
+        clause: &[TermId],
+        originals: &[(TermId, FrontendTerm)],
+    ) -> Option<NormalizedAuthoredOrPlan> {
+        let [target_or] = clause else {
+            return None;
+        };
+        let target_or = *target_or;
+        let TermData::App(Symbol::Named(op), target_disjuncts) = self.ctx.terms.get(target_or)
+        else {
+            return None;
+        };
+        if op != "or" || target_disjuncts.len() < 2 {
+            return None;
+        }
+        let target_disjuncts = target_disjuncts.clone();
+        if !matches!(self.ctx.terms.sort(target_or), Sort::Bool)
+            || target_disjuncts
+                .iter()
+                .any(|&term| !matches!(self.ctx.terms.sort(term), Sort::Bool))
+        {
+            return None;
+        }
+        let mut distinct = target_disjuncts.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != target_disjuncts.len() {
+            return None;
+        }
+
+        // Removing the target's whole-term surface override is necessary for
+        // the derived packed `or` to print as an `or`.  Never do that when the
+        // same term is itself an authored premise: a shared TermId would make
+        // the surviving assume print differently from the input assertion.
+        if originals
+            .iter()
+            .any(|(canonical, _)| *canonical == target_or)
+        {
+            return None;
+        }
+
+        for (source_or, parsed) in originals {
+            // Re-authenticate the pair locally.  The caller already assembled
+            // it from the immutable parsed/original stacks, but this check
+            // prevents a forged `(TermId, surface)` tuple from granting premise
+            // authority to the plan.
+            if self.ctx.elaborate_surface_subterm(parsed) != Some(*source_or) {
+                continue;
+            }
+            let Some(plan) = self.plan_normalized_authored_or_from_source(
+                *source_or,
+                target_or,
+                &target_disjuncts,
+                parsed,
+            ) else {
+                continue;
+            };
+            return Some(plan);
+        }
+        None
+    }
+
+    fn plan_normalized_authored_or_from_source(
+        &mut self,
+        source_or: TermId,
+        target_or: TermId,
+        target_disjuncts: &[TermId],
+        parsed: &FrontendTerm,
+    ) -> Option<NormalizedAuthoredOrPlan> {
+        if source_or == target_or {
+            return None;
+        }
+
+        let TermData::App(Symbol::Named(source_op), source_disjuncts) =
+            self.ctx.terms.get(source_or)
+        else {
+            return None;
+        };
+        if source_op != "or" || source_disjuncts.len() != target_disjuncts.len() {
+            return None;
+        }
+        let source_disjuncts = source_disjuncts.clone();
+        if source_disjuncts.len() < 2
+            || !matches!(self.ctx.terms.sort(source_or), Sort::Bool)
+            || source_disjuncts
+                .iter()
+                .any(|&term| !matches!(self.ctx.terms.sort(term), Sort::Bool))
+        {
+            return None;
+        }
+        let mut distinct_source = source_disjuncts.clone();
+        distinct_source.sort_unstable();
+        distinct_source.dedup();
+        if distinct_source.len() != source_disjuncts.len() {
+            return None;
+        }
+
+        // Retain the source-language guard: an arbitrary authored `or` with
+        // the same canonical term must not enter the implication-specific
+        // printer bridge.  The final consequent accounts for the last
+        // disjunct, hence links + 1 must equal the flat canonical width.
+        let mut current_surface = strip_frontend_annotations(parsed);
+        let mut implication_links = 0usize;
+        while let FrontendTerm::App(head, operands) = current_surface {
+            if head != "=>" || operands.len() != 2 {
+                break;
+            }
+            implication_links = implication_links.checked_add(1)?;
+            current_surface = strip_frontend_annotations(&operands[1]);
+        }
+        if implication_links == 0 || implication_links + 1 != source_disjuncts.len() {
+            return None;
+        }
+
+        let mut used_target = vec![false; target_disjuncts.len()];
+        let mut aligned: Vec<Option<(TermId, Option<TermId>)>> = vec![None; source_disjuncts.len()];
+
+        // Exact identities always win.  Doing this as a separate pass prevents
+        // an earlier arithmetic literal from consuming a target that a later
+        // source literal shares exactly.
+        for (source_position, &source) in source_disjuncts.iter().enumerate() {
+            if let Some(position) = target_disjuncts
+                .iter()
+                .enumerate()
+                .position(|(position, &target)| !used_target[position] && target == source)
+            {
+                used_target[position] = true;
+                aligned[source_position] = Some((source, None));
+            }
+        }
+
+        // The sole non-exact alignment is an exact syntactic comparison dual
+        // (`not (< a b)` versus `(<= b a)`, and the seven polarity/head
+        // variants).  No general arithmetic-equivalence search is admitted.
+        for (source_position, &source) in source_disjuncts.iter().enumerate() {
+            if aligned[source_position].is_some() {
+                continue;
+            }
+            let mut bridged = None;
+            for (position, &target) in target_disjuncts.iter().enumerate() {
+                if used_target[position] {
+                    continue;
+                }
+                let Some(bridge_atom) = self.comparison_dual_source_literal(source, target) else {
+                    continue;
+                };
+                bridged = Some((position, target, bridge_atom));
+                break;
+            }
+            let (position, canonical, bridge_atom) = bridged?;
+            used_target[position] = true;
+            aligned[source_position] = Some((canonical, Some(bridge_atom)));
+        }
+        if used_target.iter().any(|used| !*used) {
+            return None;
+        }
+        let literals: Option<Vec<NormalizedAuthoredOrLiteral>> = source_disjuncts
+            .iter()
+            .copied()
+            .zip(aligned)
+            .map(|(source, alignment)| {
+                alignment.map(|(canonical, bridge_atom)| NormalizedAuthoredOrLiteral {
+                    source,
+                    canonical,
+                    bridge_atom,
+                })
+            })
+            .collect();
+
+        Some(NormalizedAuthoredOrPlan {
+            source_or,
+            source_disjuncts,
+            target_or,
+            target_disjuncts: target_disjuncts.to_vec(),
+            literals: literals?,
+        })
+    }
+
+    /// Emit a [`NormalizedAuthoredOrPlan`], returning the exact singleton
+    /// `(cl target_or)` unit consumed by the old trust step's users.
+    fn emit_normalized_authored_or(
+        &mut self,
+        new_proof: &mut Proof,
+        plan: &NormalizedAuthoredOrPlan,
+        source_assume: ProofId,
+    ) -> Option<ProofId> {
+        let mut clause = plan.source_disjuncts.clone();
+        let mut current = new_proof.add_rule_step(
+            AletheRule::Or,
+            clause.clone(),
+            vec![source_assume],
+            Vec::new(),
+        );
+
+        // Normalize only the comparison literals whose pair certificates were
+        // independently checked during planning.
+        for literal in &plan.literals {
+            let Some(bridge_atom) = literal.bridge_atom else {
+                continue;
+            };
+            let position = clause.iter().position(|&term| term == literal.source)?;
+            let _ = clause.remove(position);
+            if !clause.contains(&literal.canonical) {
+                clause.push(literal.canonical);
+            }
+            let source_complement = complement_of(&mut self.ctx.terms, literal.source);
+            let bridge = Self::add_pair_lemma(new_proof, literal.canonical, source_complement);
+            current = new_proof.add_resolution(clause.clone(), bridge_atom, current, bridge);
+        }
+        if clause.len() != plan.target_disjuncts.len()
+            || clause
+                .iter()
+                .any(|term| !plan.target_disjuncts.contains(term))
+        {
+            return None;
+        }
+
+        // Pack the exact flat clause back into the singleton or-term.  This is
+        // the same checked `or_neg` + contraction recipe used by the existing
+        // or-wrapped EUF tautology emitter.
+        for &disjunct in &plan.target_disjuncts {
+            let position = clause.iter().position(|&term| term == disjunct)?;
+            let _ = clause.remove(position);
+            let not_disjunct = self.ctx.terms.mk_not_raw(disjunct);
+            let or_neg = new_proof.add_rule_step(
+                AletheRule::OrNeg,
+                vec![plan.target_or, not_disjunct],
+                Vec::new(),
+                Vec::new(),
+            );
+            clause.push(plan.target_or);
+            current = new_proof.add_resolution(clause.clone(), disjunct, current, or_neg);
+        }
+        let unit = new_proof.add_rule_step(
+            AletheRule::Contraction,
+            vec![plan.target_or],
+            vec![current],
+            Vec::new(),
+        );
+        Some(unit)
+    }
+
+    /// Recognize a preprocessor-produced Boolean ITE wrapper around one exact
+    /// read-over-write consequence of two authored premises.
+    fn plan_authored_array_ite(
+        &mut self,
+        clause: &[TermId],
+        originals: &[(TermId, FrontendTerm)],
+    ) -> Option<AuthoredArrayItePlan> {
+        let [target_or] = clause else {
+            return None;
+        };
+        let target_or = *target_or;
+        let TermData::App(Symbol::Named(op), disjuncts) = self.ctx.terms.get(target_or) else {
+            return None;
+        };
+        if op != "or"
+            || disjuncts.len() != 2
+            || !matches!(self.ctx.terms.sort(target_or), Sort::Bool)
+        {
+            return None;
+        }
+        let disjuncts = disjuncts.clone();
+        if originals
+            .iter()
+            .any(|(canonical, _)| *canonical == target_or)
+        {
+            return None;
+        }
+        let (array_equality, ite_term) = match (
+            self.ctx.terms.get(disjuncts[0]),
+            self.ctx.terms.get(disjuncts[1]),
+        ) {
+            (TermData::Not(equality), TermData::Ite(..)) => (*equality, disjuncts[1]),
+            (TermData::Ite(..), TermData::Not(equality)) => (*equality, disjuncts[0]),
+            _ => return None,
+        };
+        let (array_lhs, array_rhs) = decode_binary_equality(&self.ctx.terms, array_equality)?;
+        let TermData::Ite(guard, then_branch, else_branch) = self.ctx.terms.get(ite_term).clone()
+        else {
+            return None;
+        };
+        if [array_equality, guard, then_branch, else_branch, ite_term]
+            .into_iter()
+            .any(|term| !matches!(self.ctx.terms.sort(term), Sort::Bool))
+        {
+            return None;
+        }
+
+        // Both discharged units must be immutable authored assertions, not
+        // merely terms with a convenient spelling. Re-elaborate each exact
+        // `(canonical, parsed)` pair locally before granting premise authority.
+        let mut guard_surface = None;
+        for required in [array_equality, guard] {
+            let mut authenticated = false;
+            for (canonical, parsed) in originals {
+                if *canonical == required
+                    && self.ctx.elaborate_surface_subterm(parsed) == Some(required)
+                {
+                    authenticated = true;
+                    if required == guard {
+                        guard_surface = Some(parsed.clone());
+                    }
+                    break;
+                }
+            }
+            if !authenticated {
+                return None;
+            }
+        }
+        let guard_source = self.raw_intern_surface(&guard_surface?)?;
+        if !matches!(self.ctx.terms.sort(guard_source), Sort::Bool) {
+            return None;
+        }
+        if guard_source != guard {
+            let source_complement = complement_of(&mut self.ctx.terms, guard_source);
+            if !self.pair_lemma_valid(guard, source_complement) {
+                return None;
+            }
+        }
+
+        let (guard_lhs, guard_rhs) = decode_binary_equality(&self.ctx.terms, guard)?;
+        let (then_lhs, then_rhs) = decode_binary_equality(&self.ctx.terms, then_branch)?;
+        let same_pair =
+            |a: TermId, b: TermId, c: TermId, d: TermId| (a == c && b == d) || (a == d && b == c);
+
+        // Identify exactly one orientation in which the authored array
+        // equality relates an array root to `store(base, i, v)`, the ITE guard
+        // equates `i` with the read index, and the then arm equates `v` with a
+        // read of that same root.  Ambiguous shapes fail closed.
+        let mut shapes = Vec::new();
+        for (array, stored) in [(array_lhs, array_rhs), (array_rhs, array_lhs)] {
+            let TermData::App(Symbol::Named(store_op), store_args) = self.ctx.terms.get(stored)
+            else {
+                continue;
+            };
+            if store_op != "store" || store_args.len() != 3 {
+                continue;
+            }
+            let store_index = store_args[1];
+            let store_value = store_args[2];
+            for (value, read) in [(then_lhs, then_rhs), (then_rhs, then_lhs)] {
+                if value != store_value {
+                    continue;
+                }
+                let TermData::App(Symbol::Named(select_op), select_args) = self.ctx.terms.get(read)
+                else {
+                    continue;
+                };
+                if select_op != "select" || select_args.len() != 2 || select_args[0] != array {
+                    continue;
+                }
+                let read_index = select_args[1];
+                if !same_pair(guard_lhs, guard_rhs, store_index, read_index) {
+                    continue;
+                }
+                let shape = (stored, store_index, store_value, read, read_index);
+                if !shapes.contains(&shape) {
+                    shapes.push(shape);
+                }
+            }
+        }
+        let [(stored, _store_index, store_value, array_read, read_index)] = shapes.as_slice()
+        else {
+            return None;
+        };
+        let (stored, store_value, array_read, read_index) =
+            (*stored, *store_value, *array_read, *read_index);
+
+        let not_equality = self.ctx.terms.mk_not_raw(array_equality);
+        let not_guard = self.ctx.terms.mk_not_raw(guard);
+        if !disjuncts.contains(&not_equality)
+            || !matches!(self.ctx.terms.get(not_equality), TermData::Not(inner) if *inner == array_equality)
+            || !matches!(self.ctx.terms.get(not_guard), TermData::Not(inner) if *inner == guard)
+        {
+            return None;
+        }
+        let stored_read = self.ctx.terms.mk_app(
+            Symbol::named("select"),
+            [stored, read_index],
+            self.ctx.terms.sort(store_value).clone(),
+        );
+        let select_congruence =
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("="), [array_read, stored_read], Sort::Bool);
+        let store_hit =
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("="), [stored_read, store_value], Sort::Bool);
+        let not_select_congruence = self.ctx.terms.mk_not_raw(select_congruence);
+        let not_store_hit = self.ctx.terms.mk_not_raw(store_hit);
+        let congruence_clause = vec![not_equality, select_congruence];
+        let row1_clause = vec![not_guard, store_hit];
+        let transitivity_clause = vec![not_select_congruence, not_store_hit, then_branch];
+
+        if ay_proof::recognize_array_theory_lemma(&self.ctx.terms, &congruence_clause)
+            != Some(TheoryLemmaKind::ArrayRowChain)
+            || ay_proof::recognize_array_select_store(&self.ctx.terms, &row1_clause) != Some(true)
+        {
+            return None;
+        }
+
+        // Plan-time validation uses the same strict fragment checker as the
+        // final whole-proof gate. The emitter cannot widen the recognized
+        // congruence, conditional ROW1, or transitivity shapes merely by
+        // attaching the desired rule tags.
+        let mut fragment = Proof::new();
+        let congruence = fragment.add_theory_lemma_with_kind(
+            "array",
+            congruence_clause.clone(),
+            TheoryLemmaKind::ArrayRowChain,
+        );
+        let row1 = fragment.add_theory_lemma_with_kind(
+            "array",
+            row1_clause.clone(),
+            TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        );
+        let transitivity = fragment.add_rule_step(
+            AletheRule::EqTransitive,
+            transitivity_clause.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let authenticated = ay_proof::authenticate_premise_clauses_strict_with_context(
+            &fragment,
+            &self.ctx.terms,
+            None,
+            None,
+            &[],
+        )
+        .ok()?;
+        if authenticated.clause(congruence) != Some(congruence_clause.as_slice())
+            || authenticated.clause(row1) != Some(row1_clause.as_slice())
+            || authenticated.clause(transitivity) != Some(transitivity_clause.as_slice())
+        {
+            return None;
+        }
+
+        Some(AuthoredArrayItePlan {
+            target_or,
+            array_equality,
+            guard_source,
+            guard,
+            then_branch,
+            ite_term,
+            select_congruence,
+            store_hit,
+            congruence_clause,
+            row1_clause,
+            transitivity_clause,
+        })
+    }
+
+    /// Emit the strict ROW consequence, discharge its two authored premises,
+    /// then lift the resulting then-arm unit through `ite_neg2` and `or_neg`.
+    fn emit_authored_array_ite(
+        &mut self,
+        new_proof: &mut Proof,
+        plan: &AuthoredArrayItePlan,
+        equality_assume: ProofId,
+        guard_assume: ProofId,
+    ) -> Option<ProofId> {
+        let [not_equality, select_congruence]: [TermId; 2] =
+            plan.congruence_clause.clone().try_into().ok()?;
+        let [not_guard, store_hit]: [TermId; 2] = plan.row1_clause.clone().try_into().ok()?;
+        let [not_select_congruence, not_store_hit, then_branch]: [TermId; 3] =
+            plan.transitivity_clause.clone().try_into().ok()?;
+        if select_congruence != plan.select_congruence
+            || store_hit != plan.store_hit
+            || then_branch != plan.then_branch
+            || !matches!(self.ctx.terms.get(not_equality), TermData::Not(inner) if *inner == plan.array_equality)
+            || !matches!(self.ctx.terms.get(not_guard), TermData::Not(inner) if *inner == plan.guard)
+            || !matches!(self.ctx.terms.get(not_select_congruence), TermData::Not(inner) if *inner == plan.select_congruence)
+            || !matches!(self.ctx.terms.get(not_store_hit), TermData::Not(inner) if *inner == plan.store_hit)
+        {
+            return None;
+        }
+        let guard_unit = if plan.guard_source == plan.guard {
+            guard_assume
+        } else {
+            let source_complement = complement_of(&mut self.ctx.terms, plan.guard_source);
+            if !self.pair_lemma_valid(plan.guard, source_complement) {
+                return None;
+            }
+            let bridge = Self::add_pair_lemma(new_proof, plan.guard, source_complement);
+            new_proof.add_resolution(
+                vec![plan.guard],
+                atom_of(&self.ctx.terms, plan.guard_source),
+                guard_assume,
+                bridge,
+            )
+        };
+        let congruence = new_proof.add_theory_lemma_with_kind(
+            "array",
+            plan.congruence_clause.clone(),
+            TheoryLemmaKind::ArrayRowChain,
+        );
+        let congruence_unit = new_proof.add_resolution(
+            vec![plan.select_congruence],
+            plan.array_equality,
+            congruence,
+            equality_assume,
+        );
+        let row1 = new_proof.add_theory_lemma_with_kind(
+            "array",
+            plan.row1_clause.clone(),
+            TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        );
+        let store_hit_unit =
+            new_proof.add_resolution(vec![plan.store_hit], plan.guard, row1, guard_unit);
+        let transitivity = new_proof.add_rule_step(
+            AletheRule::EqTransitive,
+            plan.transitivity_clause.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let without_congruence = new_proof.add_resolution(
+            vec![not_store_hit, plan.then_branch],
+            plan.select_congruence,
+            transitivity,
+            congruence_unit,
+        );
+        let then_unit = new_proof.add_resolution(
+            vec![plan.then_branch],
+            plan.store_hit,
+            without_congruence,
+            store_hit_unit,
+        );
+
+        let not_then = self.ctx.terms.mk_not_raw(plan.then_branch);
+        let ite_neg2 = new_proof.add_rule_step(
+            AletheRule::IteNeg2,
+            vec![plan.ite_term, not_guard, not_then],
+            Vec::new(),
+            Vec::new(),
+        );
+        let ite_without_guard = new_proof.add_resolution(
+            vec![plan.ite_term, not_then],
+            plan.guard,
+            ite_neg2,
+            guard_unit,
+        );
+        let ite_unit = new_proof.add_resolution(
+            vec![plan.ite_term],
+            plan.then_branch,
+            ite_without_guard,
+            then_unit,
+        );
+
+        let not_ite = self.ctx.terms.mk_not_raw(plan.ite_term);
+        let or_neg = new_proof.add_rule_step(
+            AletheRule::OrNeg,
+            vec![plan.target_or, not_ite],
+            Vec::new(),
+            Vec::new(),
+        );
+        Some(new_proof.add_resolution(vec![plan.target_or], plan.ite_term, ite_unit, or_neg))
+    }
+
+    /// Recognize the exact Boolean dual of one canonical arithmetic
+    /// comparison literal and return its resolution pivot atom.
+    fn comparison_dual_source_literal(&mut self, source: TermId, target: TermId) -> Option<TermId> {
+        let (source_atom, negated) = match self.ctx.terms.get(source) {
+            TermData::Not(atom) => (*atom, true),
+            _ => (source, false),
+        };
+        let TermData::App(Symbol::Named(head), args) = self.ctx.terms.get(source_atom) else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let head = head.clone();
+        let args = args.clone();
+        let (dual_head, swap) = match head.as_str() {
+            "<" => ("<=", true),
+            "<=" => ("<", true),
+            ">" => ("<=", false),
+            ">=" => ("<", false),
+            _ => return None,
+        };
+        if self.ctx.terms.sort(args[0]) != self.ctx.terms.sort(args[1])
+            || !matches!(self.ctx.terms.sort(args[0]), Sort::Int | Sort::Real)
+            || !matches!(self.ctx.terms.sort(source), Sort::Bool)
+            || !matches!(self.ctx.terms.sort(target), Sort::Bool)
+        {
+            return None;
+        }
+        let (lhs, rhs) = if swap {
+            (args[1], args[0])
+        } else {
+            (args[0], args[1])
+        };
+        let dual_atom = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named(dual_head), [lhs, rhs], Sort::Bool);
+        let exact_target = if negated {
+            dual_atom
+        } else {
+            self.ctx.terms.mk_not_raw(dual_atom)
+        };
+        if exact_target != target {
+            return None;
+        }
+        let source_complement = complement_of(&mut self.ctx.terms, source);
+        self.pair_lemma_valid(target, source_complement)
+            .then_some(source_atom)
+    }
+
     /// Recognize a preprocessor-derived unit trust step `(cl L)`: an
     /// original disjunctive assertion contains `L`, and every OTHER disjunct
     /// is the syntactic complement of another original assertion (so plain
@@ -3077,19 +4593,40 @@ impl Executor {
         &mut self,
         clause: &[TermId],
         originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
     ) -> Option<OrUnitPlan> {
         if clause.len() != 1 {
             return None;
         }
         let lit = clause[0];
-        'orig: for &(orig, _) in originals {
+        'orig: for (orig, parsed) in originals {
+            if !planning.spend_work(1) {
+                return None;
+            }
+            let orig = *orig;
+            if !source_index.contains(orig) {
+                continue;
+            }
             let TermData::App(Symbol::Named(op), ds) = self.ctx.terms.get(orig) else {
                 continue;
             };
-            if op != "or" || ds.len() < 2 || !ds.contains(&lit) {
+            if op != "or"
+                || ds.len() < 2
+                || ds.len() > MAX_PROVENANCE_REPAIR_TERMS
+                || !ds.contains(&lit)
+            {
                 continue;
             }
+            if !planning.spend_surface(orig, parsed)
+                || !planning.spend_terms(&self.ctx.terms, &[orig])
+            {
+                return None;
+            }
             let disjuncts = ds.clone();
+            if !surface_or_decomposition_matches(&mut self.ctx, parsed, &disjuncts) {
+                continue;
+            }
             let mut atoms: Vec<TermId> = disjuncts
                 .iter()
                 .map(|&d| atom_of(&self.ctx.terms, d))
@@ -3105,7 +4642,7 @@ impl Executor {
                     continue;
                 }
                 let comp = complement_of(&mut self.ctx.terms, d);
-                if !originals.iter().any(|&(c, _)| c == comp) {
+                if !source_index.contains(comp) {
                     continue 'orig;
                 }
                 eliminations.push((atom_of(&self.ctx.terms, d), comp));
@@ -3140,6 +4677,8 @@ impl Executor {
         &mut self,
         clause: &[TermId],
         originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
     ) -> Option<SubstEqPlan> {
         if clause.len() != 1 {
             return None;
@@ -3155,8 +4694,15 @@ impl Executor {
         // equalities, deduplicated so one assertion cannot supply two clause
         // literals (the EUF planner rejects duplicated literals anyway).
         let mut hyps: Vec<TermId> = Vec::new();
-        for (canonical, _) in originals {
-            if hyps.contains(canonical) || *canonical == target {
+        let mut seen = HashSet::default();
+        for (canonical, parsed) in originals {
+            if !planning.spend_work(1) {
+                return None;
+            }
+            if *canonical == target
+                || !source_index.contains(*canonical)
+                || !seen.insert(*canonical)
+            {
                 continue;
             }
             let Some((a, b)) = decode_binary_equality(&self.ctx.terms, *canonical) else {
@@ -3165,12 +4711,23 @@ impl Executor {
             if a == b {
                 continue;
             }
+            if !planning.spend_surface(*canonical, parsed)
+                || !planning.spend_terms(&self.ctx.terms, &[*canonical])
+            {
+                return None;
+            }
+            if !self.surface_equality_source_is_print_faithful(*canonical, parsed) {
+                continue;
+            }
+            if hyps.len() >= MAX_PROVENANCE_REPAIR_TERMS {
+                return None;
+            }
             hyps.push(*canonical);
         }
         if hyps.is_empty() {
             return None;
         }
-        let plan = self.plan_substituted_equality_over(target, &hyps)?;
+        let plan = self.plan_substituted_equality_over(target, &hyps, planning)?;
         // Second pass over only the hypotheses the recipe actually used: it
         // keeps the emitted lemma minimal (no `weakening` over unrelated
         // assertions) and avoids re-introducing assumes the derivation never
@@ -3194,7 +4751,7 @@ impl Executor {
             return Some(plan);
         }
         Some(
-            self.plan_substituted_equality_over(target, &used)
+            self.plan_substituted_equality_over(target, &used, planning)
                 .unwrap_or(plan),
         )
     }
@@ -3205,6 +4762,7 @@ impl Executor {
         &mut self,
         target: TermId,
         hyps: &[TermId],
+        planning: &mut SurgeryPlanningBudget,
     ) -> Option<SubstEqPlan> {
         let mut lemma = Vec::with_capacity(hyps.len() + 1);
         lemma.push(target);
@@ -3220,7 +4778,7 @@ impl Executor {
             }
             lemma.push(neg);
         }
-        let euf = self.plan_euf_lemma(&lemma)?;
+        let euf = self.plan_euf_lemma_with_budget(&lemma, planning)?;
         // Only the bare (flat-clause) target reproduces the synthesized clause
         // literal-for-literal; an `OrUnit` plan would derive a different term.
         if !matches!(euf.target, EufTarget::Bare { .. }) {
@@ -3322,7 +4880,10 @@ impl Executor {
         let TermData::App(Symbol::Named(op), disjuncts) = terms.get(term) else {
             return None;
         };
-        if op != "or" || disjuncts.len() < 2 {
+        if op != "or"
+            || disjuncts.len() < 2
+            || disjuncts.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+        {
             return None;
         }
         let disjuncts = disjuncts.clone();
@@ -3393,7 +4954,10 @@ impl Executor {
             let TermData::App(Symbol::Named(n), conjs) = terms.get(d) else {
                 continue;
             };
-            if n != "and" || conjs.is_empty() {
+            if n != "and"
+                || conjs.is_empty()
+                || conjs.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+            {
                 continue;
             }
             let conjs = conjs.clone();
@@ -3402,7 +4966,10 @@ impl Executor {
                 let TermData::App(Symbol::Named(cn), lits) = terms.get(c) else {
                     continue 'cand;
                 };
-                if cn != "or" || lits.is_empty() {
+                if cn != "or"
+                    || lits.is_empty()
+                    || lits.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+                {
                     continue 'cand;
                 }
                 let lits = lits.clone();
@@ -3688,6 +5255,9 @@ impl Executor {
         surf: &FrontendTerm,
         canonical: TermId,
     ) -> Option<(TermId, Option<TermId>)> {
+        if !surface_source_is_bounded(surf) {
+            return None;
+        }
         let stripped = strip_frontend_annotations(surf);
         let (inner, negated) = match stripped {
             FrontendTerm::App(op, operands) if op == "not" && operands.len() == 1 => {
@@ -3781,7 +5351,7 @@ impl Executor {
     /// `(cl (not r) c)` (positive literals) / `(cl e' c)` with `r = (not e)`,
     /// `c = (not e')` (negated literals — the clause the caller resolves on
     /// pivot `e`). Returns `(outer resolution pivot, bridge step)`. Callers
-    /// guarantee the flip shape (see [`eq_top_flip`]).
+    /// guarantee the top-level equality-flip shape.
     fn add_eq_flip_bridge(
         &mut self,
         new_proof: &mut Proof,
@@ -3836,12 +5406,18 @@ impl Executor {
     /// bridge plans (expanded n-ary `distinct`, arithmetic-normalized `and`).
     /// Such proofs are checker-invalid even with ZERO trust steps: the
     /// caller uses this as a rebuild trigger alongside the trust report.
-    pub(super) fn reachable_normalized_assume(
+    pub(in crate::executor) fn reachable_normalized_assume(
         &mut self,
         proof: &Proof,
         originals: &[(TermId, FrontendTerm)],
     ) -> bool {
-        let live = live_steps(proof);
+        let source_index = OriginalSourceIndex::new(originals);
+        if !source_index.is_valid() {
+            return true;
+        }
+        let Some(live) = taut_surface::live_steps(proof) else {
+            return true;
+        };
         for (idx, step) in proof.steps.iter().enumerate() {
             if !live[idx] {
                 continue;
@@ -3849,7 +5425,10 @@ impl Executor {
             let ProofStep::Assume(term) = step else {
                 continue;
             };
-            let Some((_, parsed)) = originals.iter().find(|(c, _)| c == term) else {
+            let Some((_, parsed)) = source_index.get(originals, *term) else {
+                if source_index.is_ambiguous(*term) {
+                    return true;
+                }
                 continue; // non-original assumes are the sibling trigger's job
             };
             // A whole-term override can make the Assume itself match while
@@ -3857,8 +5436,7 @@ impl Executor {
             // inconsistent with that printed spelling (notably a
             // deduplicated conjunction). Classification, not the presence of
             // an override, decides whether a bridge is required.
-            let parsed = parsed.clone();
-            if matches!(self.classify_assume(*term, &parsed, true), Ok(Some(_))) {
+            if matches!(self.classify_assume(*term, parsed, true), Ok(Some(_))) {
                 return true;
             }
         }
@@ -3874,13 +5452,19 @@ impl Executor {
         parsed: &FrontendTerm,
         overrides_kept: bool,
     ) -> Result<Option<AssumePlan>, ()> {
+        if !surface_source_is_bounded(parsed) {
+            return Err(());
+        }
         // A `let`-wrapped surface (common in SMT-COMP inputs) hides the
         // repairable shape: expand the bindings first (pure substitution;
         // fail-closed on any capture risk). External checkers compare
         // against the same expansion (carcara: `--expand-let-bindings`).
         let expanded;
         let parsed = if matches!(strip_frontend_annotations(parsed), FrontendTerm::Let(..)) {
-            match expand_surface_lets(parsed, &std::collections::HashMap::new()) {
+            match expand_surface_lets(
+                strip_frontend_annotations(parsed),
+                &std::collections::HashMap::new(),
+            ) {
                 Some(e) => {
                     expanded = e;
                     &expanded
@@ -3896,6 +5480,14 @@ impl Executor {
         };
         match head.as_str() {
             "distinct" if operands.len() >= 3 => {
+                let pair_count = operands
+                    .len()
+                    .checked_mul(operands.len() - 1)
+                    .map(|count| count / 2)
+                    .ok_or(())?;
+                if pair_count > taut_surface::MAX_EMITTED_CLAUSE_WIDTH {
+                    return Err(());
+                }
                 let mut xs = Vec::with_capacity(operands.len());
                 for op in operands {
                     xs.push(self.ctx.elaborate_surface_subterm(op).ok_or(())?);
@@ -3920,10 +5512,10 @@ impl Executor {
                 if name != "and" {
                     return Err(());
                 }
-                let conjs = conjs.clone();
-                if conjs.len() != xs.len() * (xs.len() - 1) / 2 {
+                if conjs.len() != pair_count {
                     return Err(());
                 }
+                let conjs = conjs.clone();
                 let mut k = 0;
                 for i in 0..xs.len() {
                     for j in (i + 1)..xs.len() {
@@ -3957,10 +5549,13 @@ impl Executor {
                 }))
             }
             "and" => {
+                if operands.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH {
+                    return Err(());
+                }
                 let TermData::App(Symbol::Named(name), conjs) = self.ctx.terms.get(term) else {
                     return Err(());
                 };
-                if name != "and" {
+                if name != "and" || conjs.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH {
                     return Err(());
                 }
                 let conjs = conjs.clone();
@@ -4085,73 +5680,50 @@ impl Executor {
         }
     }
 
-    /// Raw-intern a surface term (QF-shaped: symbols, constants, `not`, and
-    /// plain applications) so it PRINTS exactly like the problem file even
-    /// where elaboration folds it (e.g. `(= c c)` -> `true`). The sort is
-    /// taken from the term's own elaboration. `None` fail-closed on binders
-    /// or anything that does not elaborate.
-    pub(super) fn raw_intern_surface(&mut self, surf: &FrontendTerm) -> Option<TermId> {
-        let stripped = strip_frontend_annotations(surf);
-        match stripped {
-            FrontendTerm::Symbol(_) | FrontendTerm::Const(_) => {
-                self.ctx.elaborate_surface_subterm(stripped)
-            }
-            FrontendTerm::App(head, args) => {
-                let elab = self.ctx.elaborate_surface_subterm(stripped)?;
-                let raw_args = args
-                    .iter()
-                    .map(|a| self.raw_intern_surface(a))
-                    .collect::<Option<Vec<TermId>>>()?;
-                if head == "not" && raw_args.len() == 1 {
-                    return Some(self.ctx.terms.mk_not_raw(raw_args[0]));
-                }
-                if head == "ite" && raw_args.len() == 3 {
-                    return Some(
-                        self.ctx
-                            .terms
-                            .mk_ite_raw(raw_args[0], raw_args[1], raw_args[2]),
-                    );
-                }
-                let sort = self.ctx.terms.sort(elab).clone();
-                Some(self.ctx.terms.mk_app(Symbol::named(head), raw_args, sort))
-            }
-            FrontendTerm::IndexedApp(name, indices, args) => {
-                let elab = self.ctx.elaborate_surface_subterm(stripped)?;
-                if args.is_empty() {
-                    let [FrontendIndex::Numeral(width)] = indices.as_slice() else {
-                        return None;
-                    };
-                    let value = name.strip_prefix("bv")?;
-                    if value.is_empty()
-                        || !value.bytes().all(|byte| byte.is_ascii_digit())
-                        || width.parse::<u32>().ok().is_none_or(|bits| bits == 0)
-                    {
-                        return None;
-                    }
-                    // Preserve the decimal-BV class accepted by the former
-                    // flattened Symbol path. Other nullary indexed constants
-                    // canonicalize to unrelated core shapes and fail closed.
-                    return Some(elab);
-                }
-                let numeric_indices = indices
-                    .iter()
-                    .map(|index| match index {
-                        FrontendIndex::Numeral(value) => value.parse::<u32>().ok(),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                let raw_args = args
-                    .iter()
-                    .map(|arg| self.raw_intern_surface(arg))
-                    .collect::<Option<Vec<_>>>()?;
-                let sort = self.ctx.terms.sort(elab).clone();
-                Some(
-                    self.ctx
-                        .terms
-                        .mk_app(Symbol::indexed(name, numeric_indices), raw_args, sort),
-                )
-            }
+    /// Authenticate the declaration identity selected while elaborating one
+    /// surface application.
+    ///
+    /// `Ok(Some(symbol))` means elaboration retained the exact identity of one
+    /// live declaration with this surface name. `Ok(None)` means no live
+    /// declaration has the spelling, so rebuilding a builtin-shaped raw head
+    /// is safe. A live declaration whose identity is absent or ambiguous is an
+    /// authority mismatch and returns `Err(())`.
+    fn authenticated_surface_application_symbol(
+        &self,
+        surface_head: &str,
+        elaborated: TermId,
+    ) -> Result<Option<Symbol>, ()> {
+        let elaborated_symbol = match self.ctx.terms.get(elaborated) {
+            TermData::App(symbol @ Symbol::Named(_), _) => Some(symbol.clone()),
             _ => None,
+        };
+        let elaborated_identity = match elaborated_symbol.as_ref() {
+            Some(Symbol::Named(identity)) => Some(identity.as_str()),
+            _ => None,
+        };
+
+        let mut has_surface_declaration = false;
+        let mut exact_matches = 0_usize;
+        for (surface, info) in self.ctx.symbol_iter() {
+            if surface.as_str() != surface_head {
+                continue;
+            }
+            has_surface_declaration = true;
+            if elaborated_identity
+                .is_some_and(|identity| self.ctx.symbol_identity_name(surface, info) == identity)
+            {
+                exact_matches += 1;
+            }
+        }
+
+        match (has_surface_declaration, exact_matches) {
+            (false, 0) => Ok(None),
+            (true, 1) => elaborated_symbol.map(Some).ok_or(()),
+            // A declaration is live but elaboration either folded/expanded it
+            // away or did not select one unique identity. Reconstructing the
+            // source spelling as a canonical builtin would grant the wrong
+            // premise semantics, so proof repair must fail closed.
+            _ => Err(()),
         }
     }
 
@@ -4169,6 +5741,11 @@ impl Executor {
         conjs: &[TermId],
         operands: &[FrontendTerm],
     ) -> Result<Option<AssumePlan>, ()> {
+        if conjs.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+            || operands.len() > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+        {
+            return Err(());
+        }
         let mut units: Vec<AndDistinctUnit> = Vec::new();
         let mut raws: Vec<TermId> = Vec::with_capacity(operands.len());
         let mut k = 0usize;
@@ -4178,6 +5755,16 @@ impl Executor {
             let stripped = strip_frontend_annotations(surf);
             if let FrontendTerm::App(head, ops) = stripped {
                 if head == "distinct" && ops.len() >= 2 {
+                    let m = ops
+                        .len()
+                        .checked_mul(ops.len() - 1)
+                        .map(|count| count / 2)
+                        .ok_or(())?;
+                    if m > taut_surface::MAX_EMITTED_CLAUSE_WIDTH
+                        || k.checked_add(m).is_none_or(|end| end > conjs.len())
+                    {
+                        return Err(());
+                    }
                     let Some(xs) = ops
                         .iter()
                         .map(|op| self.ctx.elaborate_surface_subterm(op))
@@ -4213,10 +5800,6 @@ impl Executor {
                         return Ok(None);
                     }
                     // The canonical export is the pairwise `i < j` block.
-                    let m = xs.len() * (xs.len() - 1) / 2;
-                    if k + m > conjs.len() {
-                        return Ok(None);
-                    }
                     let mut kk = k;
                     for i in 0..xs.len() {
                         for j in (i + 1)..xs.len() {
@@ -4311,7 +5894,8 @@ impl Executor {
                         // flipped binary-equality orientations. The RAW
                         // disjunction (file order + orientations) is kept
                         // for the assume and bridged per-literal.
-                        let Some(lits) = or_perm_lits(&self.ctx.terms, raw, conj) else {
+                        let Some(lits) = taut_surface::or_perm_lits(&self.ctx.terms, raw, conj)
+                        else {
                             return Ok(None);
                         };
                         units.push(AndDistinctUnit {
@@ -4401,14 +5985,16 @@ impl Executor {
     /// is that assumed term. Repairs either use the immutable, index-aligned
     /// authored root directly or reconstruct exact raw source syntax; a
     /// normalized re-elaboration is never admitted as premise authority.
-    pub(super) fn try_rebuild_false_collapse(
+    pub(in crate::executor) fn try_rebuild_false_collapse(
         &mut self,
         proof: &mut Proof,
         originals: &[(TermId, FrontendTerm)],
         authored_originals: &[(TermId, FrontendTerm)],
     ) -> bool {
         // (1) Recognize the whole-proof collapse shape on the LIVE steps.
-        let live = live_steps(proof);
+        let Some(live) = taut_surface::live_steps(proof) else {
+            return false;
+        };
         let mut assume: Option<TermId> = None;
         let mut assume_count = 0usize;
         let mut false_step: Option<(TermId, TermId)> = None; // (clause lit, arg)
@@ -4545,7 +6131,12 @@ impl Executor {
             };
             if assume_count == 0 && wiring_ok {
                 return self.rebuild_consumed_equalities_collapse(proof, originals)
-                    || self.rebuild_congruence_collapse(proof, originals);
+                    || self.rebuild_congruence_collapse(proof, originals)
+                    // Last resort (#dt-premise-binding): neither certified
+                    // rebuild applies (e.g. a DATATYPE refutation — Alethe has
+                    // no datatype rules, and neither does any checker). Still
+                    // bind the premises: see the doc comment.
+                    || self.rebuild_premise_binding_collapse(proof, originals);
             }
             return false;
         }
@@ -5283,6 +6874,134 @@ impl Executor {
     /// orientation, both fail-closed), closed by one resolution per assumed
     /// equality. Any non-equality original or failed certificate keeps the
     /// honest trust step.
+    /// Last-resort Shape-C repair: BIND THE PREMISES even when the refutation
+    /// itself cannot be certified (#dt-premise-binding).
+    ///
+    /// Shape C is "the preprocessor consumed the assertions entirely", leaving
+    /// the bare `(cl false)` with NO assume and NO derivation. The two rebuilds
+    /// above re-prove such a collapse for arithmetic and congruence. A DATATYPE
+    /// collapse has no such rebuild and cannot get one: Alethe defines no
+    /// datatype rules, carcara implements none (181 rules, zero datatype), and
+    /// cvc5 itself refuses to emit Alethe for datatypes. So the refutation step
+    /// stays an unproved `hole`.
+    ///
+    /// But an unproved step is not the worst property of the exported artefact.
+    /// A bare `(cl false) :rule hole` mentions NOTHING from the problem, so it
+    /// checks IDENTICALLY AGAINST ANY INPUT FILE — it is not a weak proof of
+    /// this instance, it is not a proof of anything. This repair fixes exactly
+    /// that, without inventing a rule:
+    ///
+    /// ```text
+    /// (assume a0 A0) ... (assume aN AN)          <- must match problem premises
+    /// (step  t0 (cl (not A0) ... (not AN)) :rule hole)
+    /// (step  t1 (cl) :rule th_resolution ...)    <- CHECKED
+    /// ```
+    ///
+    /// A checker now verifies (a) every assume is a premise OF THIS PROBLEM,
+    /// and (b) the contradiction genuinely follows from the hole's clause plus
+    /// those premises. The hole also states its own content — "this premise set
+    /// is jointly unsatisfiable" — instead of "false, trust me", so the trusted
+    /// surface is one explicit clause a human can audit and a future rule can
+    /// discharge.
+    ///
+    /// SOUNDNESS: the emitted clause is the negation of the conjunction of the
+    /// problem's own assertions, which is exactly the claim "these are jointly
+    /// unsat" — the claim the solver already made by answering `unsat`. No new
+    /// assertion is introduced and no gate is relaxed; `terminal_trust.rs`
+    /// counts the `hole` exactly as it counted the `trust`, so nothing that
+    /// rejected the old proof accepts this one. Fail-closed: any original that
+    /// does not elaborate to a Bool-sorted term leaves the proof unchanged.
+    fn rebuild_premise_binding_collapse(
+        &mut self,
+        proof: &mut Proof,
+        originals: &[(TermId, FrontendTerm)],
+    ) -> bool {
+        if originals.is_empty() {
+            return false;
+        }
+        // Elaborate every original assertion. Totality is required: binding a
+        // SUBSET would claim a smaller premise set refutes the instance, which
+        // the solver has not established.
+        let mut premises: Vec<TermId> = Vec::with_capacity(originals.len());
+        for (_, parsed) in originals {
+            let stripped = strip_frontend_annotations(parsed);
+            let Some(t) = self.ctx.elaborate_surface_subterm(stripped) else {
+                return false;
+            };
+            if !matches!(self.ctx.terms.sort(t), Sort::Bool) {
+                return false;
+            }
+            premises.push(t);
+        }
+        // Full (not just adjacent) dedup. `Vec::dedup` drops only CONSECUTIVE
+        // repeats, so a file that asserts the same formula twice non-adjacently
+        // used to bind it twice — harmless for the claim (the conjunction is
+        // unchanged, so totality still holds) but it makes the closing
+        // resolution ambiguous: the second copy of `A` has no `(not A)` left to
+        // resolve against. Keep the first occurrence, in assertion order.
+        let mut seen: HashSet<TermId> = HashSet::default();
+        premises.retain(|&p| seen.insert(p));
+        if premises.is_empty() {
+            return false;
+        }
+
+        let clause: Vec<TermId> = premises
+            .iter()
+            .map(|&p| self.ctx.terms.mk_not_raw(p))
+            .collect();
+
+        let mut new_proof = Proof::new();
+        let assume_ids: Vec<ProofId> = premises
+            .iter()
+            .map(|&p| new_proof.add_assume(p, None))
+            .collect();
+        // Unproved by construction — prints as `hole`, the honest encoding for
+        // a step no checker can discharge. NOT a certified lemma.
+        let lemma = new_proof.add_step(ProofStep::TheoryLemma {
+            theory: "DT".to_string(),
+            clause: clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::Generic,
+            lia: None,
+        });
+        // ONE n-ary resolution, not a binary chain (#dt-premise-binding).
+        //
+        // This closed as `for i in 0..n { resolve(clause[i+1..], premises[i]) }`
+        // — n binary steps, step i printing the n-i literals it has left. That
+        // is TRIANGULAR text. Measured on the file that motivated the rebuild,
+        // QF_DT/20210312-Bouvier/vlsat3_b14.smt2 (n = 2,986): 105.6 MB of
+        // `.alethe`, 105.5 MB of it resolution steps whose lines decayed
+        // 75,252 → 61,678 → 36,896 → … → 83 chars. The by-default sibling
+        // emission is budgeted at 64 MiB of work (`executor/proof.rs`), so that
+        // document was not a big proof — it was NO PROOF: emission aborted with
+        // "work budget exhausted after 3502 steps" and the file was never
+        // written.
+        //
+        // Alethe `resolution`/`th_resolution` are n-ary, so the whole chain is
+        // one step whose premises are the lemma followed by every assume. Same
+        // claim, same premises, same `hole`: 193,103 bytes (547x smaller),
+        // inside the default budget, carcara 1.1.0 verdict `holey` in 0.01 s —
+        // `holey` being the best achievable here, as Alethe defines no
+        // datatype rules.
+        // The order (lemma first, then assumes in assertion order) is the order
+        // the checker folds in: the accumulator starts as the hole's clause
+        // `[(not A0) … (not An)]` and each assume `Ai` cancels its own literal,
+        // ending empty.
+        let mut chain: Vec<ProofId> = Vec::with_capacity(assume_ids.len() + 1);
+        chain.push(lemma);
+        chain.extend_from_slice(&assume_ids);
+        // Alethe requires >= 2 premises on a resolution (carcara: "expected at
+        // least 2 premises, got 1"). Lemma + >= 1 assume always satisfies it,
+        // but check rather than assume: a one-premise step would be rejected
+        // outright, i.e. no proof, which is worse than keeping the trust stub.
+        if chain.len() < 2 {
+            return false;
+        }
+        new_proof.add_rule_step(AletheRule::ThResolution, Vec::new(), chain, Vec::new());
+        *proof = new_proof;
+        true
+    }
+
     fn rebuild_consumed_equalities_collapse(
         &mut self,
         proof: &mut Proof,
@@ -5389,65 +7108,6 @@ impl Executor {
         true
     }
 
-    /// Recognize an exported assume as a recorded finite-domain quantifier
-    /// expansion (#quant-expansion-proof): the assume term must equal a
-    /// record's current replacement conjunction, the record's original must
-    /// be a `forall` that is a genuine problem premise (present in
-    /// `originals` with a `forall` surface). Fail-open `None` keeps the
-    /// caller's existing behavior.
-    fn classify_quant_expansion(
-        &self,
-        term: TermId,
-        originals: &[(TermId, FrontendTerm)],
-    ) -> Option<AssumePlan> {
-        let TermData::App(sym, conjs) = self.ctx.terms.get(term) else {
-            return None;
-        };
-        if sym.name() != "and" || conjs.is_empty() {
-            return None;
-        }
-        let conjs = conjs.clone();
-        for rec in &self.quant_expansion_records {
-            if !matches!(self.ctx.terms.get(rec.original), TermData::Forall(..)) {
-                continue;
-            }
-            // Pair with the ORIGINAL premise positionally: `originals` is
-            // index-aligned with the parsed assertion stack, and
-            // re-elaborating a `forall` surface mints fresh binder terms
-            // (the canonical ids differ), so an id lookup cannot work. The
-            // surface-shape gates below (a `forall` surface whose binder
-            // count matches the recorded values) plus the per-conjunct
-            // certificate validation and the external checker keep a
-            // misalignment fail-closed.
-            let Some((forall_canonical, parsed)) = originals.get(rec.assertion_index) else {
-                continue;
-            };
-            let forall_canonical = *forall_canonical;
-            if !matches!(self.ctx.terms.get(forall_canonical), TermData::Forall(..))
-                || !matches!(strip_frontend_annotations(parsed), FrontendTerm::Forall(..))
-            {
-                continue;
-            }
-            let mut instances: HashMap<TermId, Vec<TermId>> = HashMap::default();
-            for (vals, inst) in &rec.instances {
-                instances.entry(*inst).or_insert_with(|| vals.clone());
-            }
-            // The assume must be COVERED by this record: ground
-            // preprocessing may reorder/merge the expansion conjunction, so
-            // the match is per-conjunct set inclusion, not whole-term
-            // equality.
-            if conjs.iter().all(|c| instances.contains_key(c)) {
-                return Some(AssumePlan::QuantExpansion {
-                    forall_term: forall_canonical,
-                    parsed: parsed.clone(),
-                    conjs,
-                    instances,
-                });
-            }
-        }
-        None
-    }
-
     /// Whether `(cl (not a1) .. (not an) concl)` is a valid all-ones
     /// `la_generic` lemma per the independent LINEAR Farkas checker (the
     /// antecedent literals asserted true, the conclusion asserted false).
@@ -5543,6 +7203,9 @@ impl Executor {
         values: &[TermId],
         target: TermId,
     ) -> Option<QuantInstanceChain> {
+        if !surface_source_is_bounded(parsed_forall) {
+            return None;
+        }
         let stripped = strip_frontend_annotations(parsed_forall);
         let FrontendTerm::Forall(binders, body) = stripped else {
             return None;
@@ -5616,24 +7279,40 @@ impl Executor {
         values: &[TermId],
         instance: TermId,
     ) -> Option<QuantInstanceChain> {
+        if !surface_source_is_bounded(parsed) {
+            return None;
+        }
         if matches!(
             strip_frontend_annotations(parsed),
             FrontendTerm::Symbol(name) if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
         ) {
-            let TermData::Forall(bindings, body, _) = self.ctx.terms.get(forall_term).clone()
-            else {
-                return None;
-            };
-            if bindings.is_empty() || bindings.len() != values.len() {
-                return None;
-            }
-            let mut substitution = HashMap::default();
-            for ((name, sort), &value) in bindings.iter().zip(values) {
-                if self.ctx.terms.sort(value) != sort {
+            let (body, substitution) = {
+                let TermData::Forall(bindings, body, _) = self.ctx.terms.get(forall_term) else {
+                    return None;
+                };
+                if bindings.is_empty()
+                    || bindings.len() != values.len()
+                    || bindings.len() > MAX_PROVENANCE_REPAIR_TERMS
+                {
                     return None;
                 }
-                substitution.insert(name.clone(), value);
-            }
+                let binder_bytes = bindings
+                    .iter()
+                    .try_fold(0usize, |bytes, (name, _)| bytes.checked_add(name.len()))?;
+                if binder_bytes > 64 * 1024
+                    || quant_canonical_term_work(&self.ctx.terms, *body).is_none()
+                {
+                    return None;
+                }
+                let mut substitution = HashMap::default();
+                for ((name, sort), &value) in bindings.iter().zip(values) {
+                    if self.ctx.terms.sort(value) != sort {
+                        return None;
+                    }
+                    substitution.insert(name.clone(), value);
+                }
+                (*body, substitution)
+            };
             let phi = crate::ematching::subst_vars(&mut self.ctx.terms, body, &substitution);
             if phi != instance {
                 return None;
@@ -5667,6 +7346,9 @@ impl Executor {
         values: &[TermId],
         ground_instance: TermId,
     ) -> Option<TermId> {
+        if !surface_source_is_bounded(parsed) {
+            return None;
+        }
         if matches!(
             strip_frontend_annotations(parsed),
             FrontendTerm::Symbol(name) if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
@@ -5745,172 +7427,6 @@ impl Executor {
             return None;
         }
         Some(raw_forall)
-    }
-
-    /// Recognize `(cl (not Q))` as the folded result of refuting one exact,
-    /// authenticated direct E-matching instance of `Q` with one original
-    /// arithmetic assertion.  Every substitution and the all-ones Farkas
-    /// conflict are independently rechecked before a plan is returned.
-    fn plan_ematching_quant_negation(
-        &mut self,
-        clause: &[TermId],
-        originals: &[(TermId, FrontendTerm)],
-    ) -> Option<QuantNegationPlan> {
-        if clause.len() != 1 || self.ematching_proof_records.is_empty() {
-            return None;
-        }
-        let conclusion = clause[0];
-        let records = self.ematching_proof_records.clone();
-        for record in records.into_iter().take(4096) {
-            let source_negation = complement_of(&mut self.ctx.terms, record.quantifier);
-            if source_negation != conclusion {
-                continue;
-            }
-            let Some((forall_term, parsed)) = originals.get(record.assertion_index) else {
-                continue;
-            };
-            let forall_term = *forall_term;
-            if !matches!(self.ctx.terms.get(forall_term), TermData::Forall(..)) {
-                continue;
-            }
-            let Some(chain) = self.build_direct_ematching_instance_chain(
-                forall_term,
-                parsed,
-                &record.binding,
-                record.instance,
-            ) else {
-                continue;
-            };
-            let raw_instance = chain.phi;
-            let Some(raw_forall) = self.build_raw_ematching_forall_source(
-                forall_term,
-                parsed,
-                &record.binding,
-                raw_instance,
-            ) else {
-                continue;
-            };
-
-            let support = originals
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != record.assertion_index)
-                .map(|(_, (term, _))| *term)
-                .filter(|&term| {
-                    !matches!(
-                        self.ctx.terms.get(term),
-                        TermData::Forall(..) | TermData::Exists(..)
-                    )
-                })
-                .take(12)
-                .find(|&term| self.quant_conflict_valid(&[raw_instance, term]));
-            let Some(support) = support else {
-                continue;
-            };
-            let lemma = vec![
-                complement_of(&mut self.ctx.terms, raw_instance),
-                complement_of(&mut self.ctx.terms, support),
-            ];
-            return Some(QuantNegationPlan {
-                source_quantifier: record.quantifier,
-                assertion_index: record.assertion_index,
-                forall_term: raw_forall,
-                chain,
-                supports: vec![support],
-                lemma,
-            });
-        }
-        None
-    }
-
-    /// Recognize a trust unit `(cl L)` as a folded consequence of ONE
-    /// quantifier-expansion instance plus at most one original premise, and
-    /// pre-build its certified derivation (#quant-expansion-proof).
-    /// Fail-open `None` lets the caller's remaining plans (or the
-    /// fail-closed abort) decide.
-    fn plan_quant_consequence(
-        &mut self,
-        clause: &[TermId],
-        originals: &[(TermId, FrontendTerm)],
-    ) -> Option<QuantConsequencePlan> {
-        if clause.len() != 1 || self.quant_expansion_records.is_empty() {
-            return None;
-        }
-        let conclusion = clause[0];
-        // Candidate support premises: non-quantifier original assertions.
-        // The independent Farkas validation below is the real filter.
-        let supports: Vec<TermId> = originals
-            .iter()
-            .map(|(c, _)| *c)
-            .filter(|&c| {
-                !matches!(
-                    self.ctx.terms.get(c),
-                    TermData::Forall(..) | TermData::Exists(..)
-                )
-            })
-            .take(12)
-            .collect();
-        // Snapshot the record data to end the `self` borrow (bounded: the
-        // expansion caps instances at 4096 per quantifier).
-        let records: Vec<(usize, Vec<(Vec<TermId>, TermId)>)> = self
-            .quant_expansion_records
-            .iter()
-            .map(|r| (r.assertion_index, r.instances.clone()))
-            .collect();
-        let mut budget = 20_000usize;
-        for (assertion_index, instances) in records {
-            // Positional pairing with the parsed premise (see
-            // `classify_quant_expansion` for the alignment rationale).
-            let Some((forall_term, parsed)) = originals.get(assertion_index) else {
-                continue;
-            };
-            let forall_term = *forall_term;
-            if !matches!(self.ctx.terms.get(forall_term), TermData::Forall(..))
-                || !matches!(strip_frontend_annotations(parsed), FrontendTerm::Forall(..))
-            {
-                continue;
-            }
-            let parsed = parsed.clone();
-            for (values, inst) in instances {
-                if budget == 0 {
-                    return None;
-                }
-                budget -= 1;
-                // Instances folded to a constant carry no derivable content.
-                if matches!(self.ctx.terms.get(inst), TermData::Const(_)) {
-                    continue;
-                }
-                let used: Vec<TermId> = if self.quant_lemma_valid(&[inst], conclusion) {
-                    Vec::new()
-                } else {
-                    let Some(&support) = supports.iter().find(|&&s| {
-                        budget = budget.saturating_sub(1);
-                        self.quant_lemma_valid(&[inst, s], conclusion)
-                    }) else {
-                        continue;
-                    };
-                    vec![support]
-                };
-                // Build (and thereby validate) the instance derivation; a
-                // miss keeps searching other instances.
-                let Some(chain) = self.build_quant_instance_chain(&parsed, &values, inst) else {
-                    continue;
-                };
-                let mut lemma: Vec<TermId> = Vec::with_capacity(2 + used.len());
-                lemma.push(complement_of(&mut self.ctx.terms, inst));
-                for &s in &used {
-                    lemma.push(complement_of(&mut self.ctx.terms, s));
-                }
-                lemma.push(conclusion);
-                return Some(QuantConsequencePlan {
-                    forall_term,
-                    chain,
-                    supports: used,
-                    lemma,
-                });
-            }
-        }
-        None
     }
 
     /// Emit a plan-time-validated negative-forall derivation.  The forall is

@@ -8,9 +8,9 @@ use super::super::super::Executor;
 use crate::executor_types::{Result, SolveResult};
 use crate::preprocess::PreprocessingPass;
 // #8529: Use deterministic hash sets in all builds.
-use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
-use ay_core::{Sort, TermId, TheorySolver};
+use ay_core::{Sort, TermId, TheoryLit, TheorySolver};
 use ay_dt::DtSolver;
 
 /// Budget for post-`Sat` model-e-graph recheck lemma rounds per
@@ -31,6 +31,225 @@ enum DtModelRecheck {
     /// re-derivation). The model must not be accepted; the caller returns a
     /// sound `Unknown` (fail-closed).
     Inconclusive,
+}
+
+/// Whether duplicating an allocation of `measured_bytes` stays within
+/// `budget_bytes`.
+///
+/// A zero measurement means the platform could not report process usage; keep
+/// the existing fail-open measurement semantics in that case. `checked_sub`
+/// expresses `2 * measured_bytes <= budget_bytes` without multiplication
+/// overflow.
+fn snapshot_clone_fits_budget(measured_bytes: usize, budget_bytes: usize) -> bool {
+    measured_bytes == 0
+        || budget_bytes
+            .checked_sub(measured_bytes)
+            .is_some_and(|remaining| measured_bytes <= remaining)
+}
+
+/// Replace a speculative AUFLIA term universe with the exact owned entry
+/// universe. Taking the snapshot by value is load-bearing: `TermStore::clone`
+/// mints a new rollback identity, so cloning here would break every checkpoint
+/// bound to the saved store and briefly allocate a third full term universe.
+fn restore_dt_auflia_entry_terms(current: &mut ay_core::TermStore, entry: ay_core::TermStore) {
+    *current = entry;
+}
+
+/// Executor-owned state that a discarded lazy-DT sub-solve may mutate.
+///
+/// The public query does not restart between the lazy attempt and its eager
+/// fallback. Restoring only assertions/terms is therefore insufficient: a
+/// validation bypass, refinement lemma, model-repair latch, or TermId-keyed
+/// memo from the failed attempt can change what the eager authority accepts.
+/// Keep the transaction boundary explicit and shared by both lazy lanes.
+#[derive(Clone)]
+struct DtLazyAttemptState {
+    last_assumptions: Option<Vec<TermId>>,
+    last_assumption_core: Option<Vec<TermId>>,
+    last_core_term_to_name: Option<HashMap<TermId, String>>,
+    nra_algebraic_model: HashMap<TermId, ay_nra::RealAlgebraicValue>,
+    model_validation_delegated_assertions: HashSet<TermId>,
+    dt_solver_added_axiom_terms: HashSet<TermId>,
+    row_seeded_terms: HashSet<TermId>,
+    recorded_var_substitutions: HashMap<TermId, TermId>,
+    array_default_epsilon_by_sort: HashMap<Sort, TermId>,
+    array_default_diag_by_sort: HashMap<Sort, String>,
+    qfax_refinement_clause: Option<Vec<(TermId, bool)>>,
+    last_rejected_array_assertion: Option<TermId>,
+    cegar_pending_lemma: Option<TermId>,
+    cegar_rounds_remaining: u32,
+    cegar_emitted_lemmas: HashSet<TermId>,
+    array_ext_shadow: crate::executor::ArrayExtShadow,
+    array_ext_witness_cache: crate::executor::ArrayExtWitnessCache,
+    array_axiom_scope: Option<(HashSet<TermId>, usize)>,
+    dt_lazy_splits: Option<(Vec<(String, Vec<String>, bool)>, Vec<(TermId, Vec<TermId>)>)>,
+    active_support_axioms: Vec<TheoryLit>,
+    conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
+    prop_semantic_verify_memo: crate::verification::PropSemanticVerifyMemo,
+    named_assert_rewrites: HashMap<TermId, TermId>,
+    lemma_cache: Vec<(ay_core::TheoryLemma, usize)>,
+    uflia_repair_candidates: Vec<crate::executor::model::Model>,
+    uflia_repair_conflict_tables: Vec<String>,
+    last_degrade_was_datatype_array: bool,
+    nested_array_row_reduction_unsat: bool,
+    uflia_congruence_lane: bool,
+    uflia_congruence_gate_rejected: bool,
+    qfax_retry_done: bool,
+    uflia_congruence_retry_done: bool,
+    uflia_model_repair_done: bool,
+    sat_validated_by_mod_div_or_branch: bool,
+    defer_model_validation: bool,
+    skip_model_eval: bool,
+    read_pin_repair_done: bool,
+    dt_array_injectivity_gate_bypass: bool,
+    original_problem_had_quantifiers: bool,
+    in_nested_array_residue_probe: bool,
+    residue_probe_failures: u32,
+    mod_div_or_branch_rescue_depth: u8,
+}
+
+impl DtLazyAttemptState {
+    fn capture(executor: &Executor) -> Self {
+        Self {
+            last_assumptions: executor.last_assumptions.clone(),
+            last_assumption_core: executor.last_assumption_core.clone(),
+            last_core_term_to_name: executor.last_core_term_to_name.clone(),
+            nra_algebraic_model: executor.nra_algebraic_model.clone(),
+            model_validation_delegated_assertions: executor
+                .model_validation_delegated_assertions
+                .clone(),
+            dt_solver_added_axiom_terms: executor.dt_solver_added_axiom_terms.clone(),
+            row_seeded_terms: executor.row_seeded_terms.clone(),
+            recorded_var_substitutions: executor.recorded_var_substitutions.clone(),
+            array_default_epsilon_by_sort: executor.array_default_epsilon_by_sort.clone(),
+            array_default_diag_by_sort: executor.array_default_diag_by_sort.clone(),
+            qfax_refinement_clause: executor.qfax_refinement_clause.clone(),
+            last_rejected_array_assertion: executor.last_rejected_array_assertion,
+            cegar_pending_lemma: executor.cegar_pending_lemma,
+            cegar_rounds_remaining: executor.cegar_rounds_remaining,
+            cegar_emitted_lemmas: executor.cegar_emitted_lemmas.clone(),
+            array_ext_shadow: executor.array_ext_shadow.clone(),
+            array_ext_witness_cache: executor.array_ext_witness_cache.clone(),
+            array_axiom_scope: executor.array_axiom_scope.clone(),
+            dt_lazy_splits: executor.dt_lazy_splits.clone(),
+            active_support_axioms: executor.active_support_axioms.clone(),
+            conflict_semantic_verify_memo: executor.conflict_semantic_verify_memo.clone(),
+            prop_semantic_verify_memo: executor.prop_semantic_verify_memo.clone(),
+            named_assert_rewrites: executor.named_assert_rewrites.clone(),
+            lemma_cache: executor.lemma_cache.replay_lemmas().to_vec(),
+            uflia_repair_candidates: executor.uflia_repair_candidates.clone(),
+            uflia_repair_conflict_tables: executor.uflia_repair_conflict_tables.clone(),
+            last_degrade_was_datatype_array: executor.last_degrade_was_datatype_array,
+            nested_array_row_reduction_unsat: executor.nested_array_row_reduction_unsat,
+            uflia_congruence_lane: executor.uflia_congruence_lane,
+            uflia_congruence_gate_rejected: executor.uflia_congruence_gate_rejected,
+            qfax_retry_done: executor.qfax_retry_done,
+            uflia_congruence_retry_done: executor.uflia_congruence_retry_done,
+            uflia_model_repair_done: executor.uflia_model_repair_done,
+            sat_validated_by_mod_div_or_branch: executor.sat_validated_by_mod_div_or_branch,
+            defer_model_validation: executor.defer_model_validation,
+            skip_model_eval: executor.skip_model_eval,
+            read_pin_repair_done: executor.read_pin_repair_done,
+            dt_array_injectivity_gate_bypass: executor.dt_array_injectivity_gate_bypass,
+            original_problem_had_quantifiers: executor.original_problem_had_quantifiers,
+            in_nested_array_residue_probe: executor.in_nested_array_residue_probe,
+            residue_probe_failures: executor.residue_probe_failures,
+            mod_div_or_branch_rescue_depth: executor.mod_div_or_branch_rescue_depth,
+        }
+    }
+
+    fn restore(&self, executor: &mut Executor) {
+        executor.last_assumptions.clone_from(&self.last_assumptions);
+        executor
+            .last_assumption_core
+            .clone_from(&self.last_assumption_core);
+        executor
+            .last_core_term_to_name
+            .clone_from(&self.last_core_term_to_name);
+        executor
+            .nra_algebraic_model
+            .clone_from(&self.nra_algebraic_model);
+        executor
+            .model_validation_delegated_assertions
+            .clone_from(&self.model_validation_delegated_assertions);
+        executor
+            .dt_solver_added_axiom_terms
+            .clone_from(&self.dt_solver_added_axiom_terms);
+        executor.row_seeded_terms.clone_from(&self.row_seeded_terms);
+        executor
+            .recorded_var_substitutions
+            .clone_from(&self.recorded_var_substitutions);
+        executor
+            .array_default_epsilon_by_sort
+            .clone_from(&self.array_default_epsilon_by_sort);
+        executor
+            .array_default_diag_by_sort
+            .clone_from(&self.array_default_diag_by_sort);
+        executor
+            .qfax_refinement_clause
+            .clone_from(&self.qfax_refinement_clause);
+        executor.last_rejected_array_assertion = self.last_rejected_array_assertion;
+        executor.cegar_pending_lemma = self.cegar_pending_lemma;
+        executor.cegar_rounds_remaining = self.cegar_rounds_remaining;
+        executor
+            .cegar_emitted_lemmas
+            .clone_from(&self.cegar_emitted_lemmas);
+        executor.array_ext_shadow.clone_from(&self.array_ext_shadow);
+        executor
+            .array_axiom_scope
+            .clone_from(&self.array_axiom_scope);
+        executor.dt_lazy_splits.clone_from(&self.dt_lazy_splits);
+        executor
+            .active_support_axioms
+            .clone_from(&self.active_support_axioms);
+        executor
+            .conflict_semantic_verify_memo
+            .clone_from(&self.conflict_semantic_verify_memo);
+        executor
+            .prop_semantic_verify_memo
+            .clone_from(&self.prop_semantic_verify_memo);
+        executor
+            .named_assert_rewrites
+            .clone_from(&self.named_assert_rewrites);
+        executor.lemma_cache.clear();
+        for (lemma, scope) in &self.lemma_cache {
+            let _ = executor.lemma_cache.record_lemma(lemma.clone(), *scope);
+        }
+        executor
+            .uflia_repair_candidates
+            .clone_from(&self.uflia_repair_candidates);
+        executor
+            .uflia_repair_conflict_tables
+            .clone_from(&self.uflia_repair_conflict_tables);
+        executor.last_degrade_was_datatype_array = self.last_degrade_was_datatype_array;
+        executor.nested_array_row_reduction_unsat = self.nested_array_row_reduction_unsat;
+        executor.uflia_congruence_lane = self.uflia_congruence_lane;
+        executor.uflia_congruence_gate_rejected = self.uflia_congruence_gate_rejected;
+        executor.qfax_retry_done = self.qfax_retry_done;
+        executor.uflia_congruence_retry_done = self.uflia_congruence_retry_done;
+        executor.uflia_model_repair_done = self.uflia_model_repair_done;
+        executor.sat_validated_by_mod_div_or_branch = self.sat_validated_by_mod_div_or_branch;
+        executor.defer_model_validation = self.defer_model_validation;
+        executor.skip_model_eval = self.skip_model_eval;
+        executor.read_pin_repair_done = self.read_pin_repair_done;
+        executor.dt_array_injectivity_gate_bypass = self.dt_array_injectivity_gate_bypass;
+        executor.original_problem_had_quantifiers = self.original_problem_had_quantifiers;
+        executor.in_nested_array_residue_probe = self.in_nested_array_residue_probe;
+        executor.residue_probe_failures = self.residue_probe_failures;
+        executor.mod_div_or_branch_rescue_depth = self.mod_div_or_branch_rescue_depth;
+    }
+
+    /// Restore proof/term provenance only after the speculative proof ledger
+    /// has been rolled back successfully.
+    ///
+    /// Keeping this separate from [`Self::restore`] is load-bearing: when a
+    /// proof checkpoint cannot be restored, the fallback retains the
+    /// speculative terms and must retain their extensionality witnesses too.
+    fn restore_witness_cache(&self, executor: &mut Executor) {
+        executor
+            .array_ext_witness_cache
+            .clone_from(&self.array_ext_witness_cache);
+    }
 }
 
 impl Executor {
@@ -938,6 +1157,69 @@ impl Executor {
         self.solve_with_dt_axioms(Some(Sort::Int), Self::solve_auf_lia)
     }
 
+    /// Revoke verdict/output artifacts produced by a discarded lazy-DT solve.
+    ///
+    /// This is deliberately narrower than `invalidate_last_check_result`:
+    /// fallback is an internal retry of the SAME public query, so its immutable
+    /// UNSAT epoch, Pareto frontier, and proof-source provenance must survive.
+    /// Tracker-correlated provenance is either retained with the AUFLIA guard's
+    /// terms or restored from the entry snapshot before a real term rollback.
+    /// The SAT-reconstruction bundle (`last_clause_trace`, var/trail maps,
+    /// negations, and clause annotations) is deliberately discarded: it is
+    /// output from the failed SAT run, not `ProofTracker` provenance, and the
+    /// eager fallback must rebuild the whole bundle from its own clause DB.
+    fn revoke_dt_lazy_attempt_artifacts(&mut self) {
+        self.last_result = None;
+        self.last_model = None;
+        self.last_sat_certificate = None;
+        self.last_unsat_certificate = None;
+        self.last_assumption_core = None;
+        self.last_proof = None;
+        self.clear_finite_enum_proof_state();
+        self.last_lrat_certificate = None;
+        self.last_proof_quality = None;
+        self.last_unknown_reason = None;
+        self.last_unknown_origin = None;
+        self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
+        self.last_var_to_term = None;
+        self.last_trail_provenance = None;
+        self.last_negations = None;
+        self.last_clausification_proofs = None;
+        self.last_original_clause_theory_proofs = None;
+        self.proof_check_result = None;
+        self.proof_check_ok = false;
+        self.pending_sat_unknown_reason = None;
+        self.last_model_validated = false;
+        self.clear_quantified_sat_authority();
+        self.last_validation_stats = None;
+        self.model_validation_delegated_assertions.clear();
+        self.dt_solver_added_axiom_terms.clear();
+        self.last_soft_cost = None;
+        self.last_soft_cost_optimal = true;
+        self.last_soft_violations = None;
+        self.finite_objective_values.clear();
+        self.unbounded_objectives.clear();
+        self.infinitesimal_objectives.clear();
+        self.unavailable_objectives.clear();
+        self.objective_certificates.clear();
+    }
+
+    /// Drop indexes whose entries are derived from the current TermStore.
+    ///
+    /// A lazy-DT fallback shrinks the store, so preserving any suffix-derived
+    /// entry would let a subsequently recycled numeric `TermId` inherit facts
+    /// about the discarded term. Snapshot-keyed model indexes are cleared as
+    /// well: rebuilding them is cheap compared with making their shrink
+    /// detection part of this rollback's soundness argument.
+    fn clear_dt_lazy_rebuildable_term_indexes(&mut self) {
+        self.reset_array_congruence_caches();
+        *self.select_by_array_index.borrow_mut() = (0, Default::default());
+        *self.array_def_index.borrow_mut() = None;
+        *self.required_terms_index.borrow_mut() = None;
+        ay_euf::clear_bool_arg_repair_candidates();
+    }
+
     /// Lazy DT + LIA lane (campaign L1a): solve the DT+LIA(+Array) residual
     /// with the eager depth-3 selector/array axiom flood REPLACED by a SPARSE
     /// on-demand DT axiom set materialized at only the occurrence-driven
@@ -964,8 +1246,9 @@ impl Executor {
     /// - a lane `Sat` the independent fail-closed gate ground-REFUTES is demoted
     ///   to a lane miss (the relevance-miss backstop) → eager fallback;
     /// - the incremental gate is CLAMPED (non-incremental scope only);
-    /// - on any Unknown the entry assertions AND term store are restored, so the
-    ///   eager authority runs over the exact state it would have seen.
+    /// - on any Unknown the entry assertions are restored; the term/proof
+    ///   ledgers are restored together unless the measured AUFLIA proof-step
+    ///   guard retains both, in which case no recycled ID can dangle.
     ///
     /// Returns `Ok(Some(_))` only for a definitive Sat/Unsat.
     ///
@@ -997,52 +1280,103 @@ impl Executor {
         if !self.dt_auflia_lazy_eligible() {
             return Ok(None);
         }
+        // The exact rollback snapshot below roughly doubles the TermStore
+        // footprint. Decline this OPTIONAL lane before cloning when less than
+        // that headroom remains; the eager authority below is unchanged.
+        if !self.dt_auflia_snapshot_preflight() {
+            return Ok(None);
+        }
 
         // Entry snapshots (mirror `try_solve_dt_lazy` isolation).
         let entry_assertions = self.ctx.assertions.clone();
         let entry_pre_lift = std::mem::take(&mut self.dt_pre_lift_assertions);
         let entry_terms_len = self.ctx.terms.len();
-        let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
+        // `solve_uf_lia`/`solve_auf_lia` may restore a failed detour by
+        // replacing `ctx.terms` with a clone. That deliberately changes the
+        // TermStore rollback identity, so an entry checkpoint cannot safely
+        // compose across this call graph. This lane is opt-in; pay for an exact
+        // store snapshot rather than making identity replacement a panic edge.
+        let entry_terms = self.ctx.terms.clone();
         let entry_proof_steps = self.proof_tracker.num_steps();
         let entry_var_substitutions = self.recorded_var_substitutions.clone();
         let entry_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
         let entry_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
-        let rollback_on_fallback = |this: &mut Self| {
-            // #dt-auflia-rollback-proof-gate: test user-requested proof OUTPUT,
-            // not `produce_proofs_enabled()`. The latter ORs in
-            // `proof_tracker.is_enabled()`, which `begin_public_solve` turns on
-            // unconditionally for every public decision, so since 66538b006 this
-            // condition has been `true` on every real run and the guard degraded
-            // to "never roll back once any proof step was recorded" — which is
-            // essentially always. That is the mechanism audit_claims.py names for
-            // the SQ QF_Datatypes retraction (dt.rs:1011): the failed lazy
-            // attempt's scaffold survives and the pre-fix `unknown` returns.
-            //
-            // The guard's real job — never roll terms back out from under a
-            // proof that will be EXPORTED — is preserved: under `--proof` /
-            // `:produce-proofs true` / `--self-check` it still declines. The
-            // certificate half is already handled unconditionally below, exactly
-            // as in the try_solve_dt_lazy sibling.
-            if this.is_producing_proofs() && this.proof_tracker.num_steps() != entry_proof_steps {
-                return;
-            }
-            this.last_model = None;
-            this.last_validation_stats = None;
-            // #dt-lazy-cert-rollback: the discarded attempt may have run
-            // `emit_sat_verdict` and minted a one-shot emission certificate
-            // (`SatCertificate`/`UnsatCertificate`, added by 66538b006). Those
-            // certify a model this rollback is about to destroy, so they must go
-            // with it — otherwise the next verdict is judged against a witness
-            // for a solve that no longer exists.
-            this.last_sat_certificate = None;
-            this.last_unsat_certificate = None;
+        let entry_proof_checkpoint = self.proof_tracker.rollback_checkpoint();
+        let entry_proof_problem_assertion_provenance =
+            self.proof_problem_assertion_provenance.clone();
+        let entry_quant_expansion_records = self.quant_expansion_records.clone();
+        let entry_ematching_proof_records = self.ematching_proof_records.clone();
+        let entry_last_proof_rebuild_originals = self.last_proof_rebuild_originals.clone();
+        let entry_last_proof_term_overrides = self.last_proof_term_overrides.clone();
+        let entry_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
+        let entry_quantified_proof_translation_incomplete =
+            self.quantified_proof_translation_incomplete;
+        let entry_attempt_state = DtLazyAttemptState::capture(self);
+        let entry_lia_probe_state = ay_lia::save_probe_state();
+        // A fallback can occur only once: both call sites immediately return.
+        // Keep this closure `FnOnce` so restoring the entry store MOVES the
+        // snapshot instead of briefly holding a third full TermStore clone.
+        let rollback_on_fallback = move |this: &mut Self| {
+            // These move assignments make fallback one affine transaction:
+            // every call site consumes the same exact entry assertion window
+            // and pre-lift state together with the owned term universe below.
+            this.ctx.assertions = entry_assertions;
+            this.dt_pre_lift_assertions = entry_pre_lift;
+            // Only user-requested proof output prevents term rollback. The
+            // tracker is enabled for every public decision and is not by
+            // itself evidence that speculative terms must survive.
+            let proof_guard_blocks_term_rollback =
+                this.is_producing_proofs() && this.proof_tracker.num_steps() != entry_proof_steps;
+
+            // The inner attempt is not a public query result. Revoke its
+            // output artifacts and typed quantified-SAT authority without
+            // destroying the enclosing query's UNSAT/Pareto authority.
+            this.revoke_dt_lazy_attempt_artifacts();
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
-            this.recorded_var_substitutions = entry_var_substitutions.clone();
-            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort.clone();
-            this.array_default_diag_by_sort = entry_array_default_diag_by_sort.clone();
+            entry_attempt_state.restore(this);
+            this.recorded_var_substitutions = entry_var_substitutions;
+            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort;
+            this.array_default_diag_by_sort = entry_array_default_diag_by_sort;
+            ay_lia::restore_probe_state(entry_lia_probe_state);
             crate::executor::model::eval_memo_clear();
-            this.ctx.terms.rollback_to(entry_terms_checkpoint);
+
+            // Keep the measured AUFLIA proof-production guard: its fallback
+            // retains the speculative proof ledger, correlated provenance,
+            // and matching terms. Only user-visible result artifacts above are
+            // revoked on this path.
+            if proof_guard_blocks_term_rollback {
+                this.proof_tracker
+                    .restore_checkpoint_metadata(&entry_proof_checkpoint);
+                this.clear_dt_lazy_rebuildable_term_indexes();
+                return;
+            }
+
+            this.proof_problem_assertion_provenance = entry_proof_problem_assertion_provenance;
+            this.quant_expansion_records = entry_quant_expansion_records;
+            this.ematching_proof_records = entry_ematching_proof_records;
+            this.last_proof_rebuild_originals = entry_last_proof_rebuild_originals;
+            this.last_proof_term_overrides = entry_last_proof_term_overrides;
+            this.last_unsat_proof_reconstruction_suppressed = entry_proof_reconstruction_suppressed;
+            this.quantified_proof_translation_incomplete =
+                entry_quantified_proof_translation_incomplete;
+            // ProofIds and TermIds are parallel positional ledgers. Discard all
+            // proof-side references before TermStore can recycle its IDs.
+            // The witness cache is proof/term provenance too: restore it only
+            // when the corresponding speculative terms are actually removed.
+            // On the proof guard path above, retaining it keeps generated
+            // extensionality clauses reconstructible against the retained
+            // tracker ledger.
+            this.clear_dt_lazy_rebuildable_term_indexes();
+            if !this.proof_tracker.rollback_to(entry_proof_checkpoint) {
+                // A nested `take_proof`/reset moved the entry ledger away. A
+                // watermark cannot rebuild that prefix, so retain terms rather
+                // than risk dangling TermIds in the moved proof.
+                return;
+            }
+            this.array_ext_witness_cache = entry_attempt_state.array_ext_witness_cache;
+            restore_dt_auflia_entry_terms(&mut this.ctx.terms, entry_terms);
+            this.clear_dt_lazy_rebuildable_term_indexes();
             if std::env::var_os("AY_PHASE_TRACE").is_some() {
                 eprintln!("c phase-trace dt-auflia-lazy-rollback to={entry_terms_len}");
             }
@@ -1106,8 +1440,6 @@ impl Executor {
         if let Some(deadline) = saved_deadline {
             let now = ay_core::time::Instant::now();
             if deadline <= now {
-                self.ctx.assertions = entry_assertions;
-                self.dt_pre_lift_assertions = entry_pre_lift;
                 rollback_on_fallback(self);
                 return Ok(None);
             }
@@ -1168,52 +1500,29 @@ impl Executor {
         };
         match result {
             Ok(SolveResult::Unknown) => {
-                self.ctx.assertions = entry_assertions;
-                self.dt_pre_lift_assertions = entry_pre_lift;
                 rollback_on_fallback(self);
                 Ok(None)
             }
-            other => other.map(Some),
+            Err(error) => {
+                // An internal solver error publishes no verdict, but callers
+                // may keep and reuse the Executor. Preserve the same affine
+                // isolation contract as an ordinary lane miss before
+                // propagating the error.
+                rollback_on_fallback(self);
+                Err(error)
+            }
+            Ok(result) => Ok(Some(result)),
         }
     }
 
-    /// Incremental-safe entry to the lazy DT+LIA lane — LIFTS the
-    /// `#dt-lazy-incremental-gate` (433fc661) for live push/pop sessions
-    /// (campaign L2 / the 13th re-attribution; `AY_DT_LAZY_AUFLIA_INCR`,
-    /// unset/`0` ⇒ the gate stays CLAMPED, byte-identical to today).
+    /// Entry to the lazy DT+LIA lane with the incremental case clamped.
     ///
-    /// WHY THE GATE EXISTED (433fc661, the cardinal-sin edge): under a live
-    /// incremental session the lane's term-store rollback contract is
-    /// unenforceable — the persistent `IncrementalTheoryState`
-    /// (encoded_assertions, tseitin term_to_var, theory lemmas, the persistent
-    /// SAT solvers, …) outlives the lane across check-sats, and the inner solve
-    /// itself routes to the PERSISTENT pipeline under `incremental_mode`. After
-    /// a fallback rollback later terms recycle the freed TermIds and the stale
-    /// persistent encodings alias them to unrelated SAT literals → WRONG-UNSAT
-    /// (proven on a push/pop-wrapped satisfiable QF_DT query).
-    ///
-    /// HOW THIS LIFTS IT SAFELY — a scope-local single-shot sub-solve, the
-    /// proven `maxsmt_scoped_check_sat` / `try_lia_eager_assume_unsat_probe`
-    /// pattern (approach #2, no TermId-recycling exposure): the WHOLE persistent
-    /// incremental substrate is TAKEN OUT for the window and `incremental_mode`
-    /// cleared, so the lane runs as a fresh non-incremental solve over the live
-    /// `ctx.assertions` (which the frontend keeps as the exact current active
-    /// set — the same invariant the two probes above rely on) with NO
-    /// persistent map to pollute. On return the term store is rolled back to the
-    /// pre-lane watermark — a PURE ORACLE: nothing the lane minted survives —
-    /// and the incremental substrate (whose maps reference only pre-lane
-    /// TermIds, none of them freed) is restored byte-for-byte. The recycle
-    /// hazard is therefore STRUCTURALLY IMPOSSIBLE: no surviving persistent
-    /// encoding can reference a freed TermId.
-    ///
-    /// FAIL-CLOSED (0-FA + never wrong-UNSAT): only a definitive `Unsat` is
-    /// trusted — sound because the lane adds only datatype-tautology axioms
-    /// (exhaustiveness / exclusivity / reconstruction) over the EXACT current
-    /// assertion set, so a lane Unsat ⇒ genuine Unsat. `Sat` / `Unknown` / `Err`
-    /// demote to a lane miss (→ eager authority), so the lazy lane can never
-    /// publish a Sat on the incremental path. Proof production disables the lane
-    /// (the oracle rollback would dangle proof-step TermIds); the verification-consumer
-    /// driver and the SMT-COMP (`--z3-mode`) configuration never enable proofs.
+    /// Persistent solver maps make speculative TermStore recycling unsafe, and
+    /// mandatory internal proof tracking means disabling user-facing proof
+    /// output does not remove the proof's `TermId` dependencies. Incremental
+    /// sessions therefore stay on the eager authority until this optimization
+    /// can export a self-contained authored-scope proof without shrinking the
+    /// term store.
     pub(in crate::executor) fn try_solve_dt_auflia_lazy_maybe_incremental(
         &mut self,
         solve_fn: fn(&mut Self) -> Result<SolveResult>,
@@ -1233,76 +1542,14 @@ impl Executor {
             // Non-incremental: the original single-shot lane, unchanged path.
             return self.try_solve_dt_auflia_lazy(solve_fn);
         }
-        // Shadow-first: default OFF keeps the incremental gate clamped exactly
-        // as before (byte-identical when `AY_DT_LAZY_AUFLIA_INCR` is unset/0).
-        if std::env::var_os("AY_DT_LAZY_AUFLIA_INCR").is_none_or(|v| v == "0") {
-            return Ok(None);
-        }
-        // Fail-closed on proof production: the pure-oracle term rollback below
-        // would dangle any proof-step TermId the attempt recorded.
-        if self.produce_proofs_enabled() {
-            return Ok(None);
-        }
-
-        // Snapshot the term-store watermark BEFORE the lane mints anything.
-        let oracle_checkpoint = self.ctx.terms.rollback_checkpoint();
-        let saved_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
-        let saved_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
-        // Suspend the persistent incremental substrate for the window.
-        let saved_incremental = self.incremental_mode;
-        let saved_theory = self.incr_theory_state.take();
-        let saved_bv = self.incr_bv_state.take();
-        let saved_assertions = self.ctx.assertions.clone();
-        let saved_pre_lift = std::mem::take(&mut self.dt_pre_lift_assertions);
-        self.incremental_mode = false;
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
-            eprintln!("c phase-trace dt-auflia-lazy-incr-suspend");
-        }
-
-        // Run the lane as a fresh non-incremental solve: the in-lane gate now
-        // reads false (mode cleared + state taken) so it proceeds single-shot.
-        let inner = self.try_solve_dt_auflia_lazy(solve_fn);
-
-        // Restore the incremental substrate byte-for-byte. Its maps reference
-        // only pre-lane TermIds (all below the watermark), so the oracle
-        // rollback below cannot dangle any of them.
-        self.incremental_mode = saved_incremental;
-        self.incr_theory_state = saved_theory;
-        self.incr_bv_state = saved_bv;
-        self.ctx.assertions = saved_assertions;
-        self.dt_pre_lift_assertions = saved_pre_lift;
-
-        // The oracle term rollback is valid ONLY when the inner lane did NOT
-        // roll back itself. The lane rolls back exactly on its `Ok(None)`
-        // Unknown/deadline fallback, which BUMPS the store's rollback
-        // generation (see `TermStore::rollback_to`), making our pre-lane
-        // checkpoint stale — so on that path we must NOT touch the store (the
-        // inner already restored it to this same watermark, nothing is left to
-        // undo). Every non-`Ok(None)` return (a definitive verdict from
-        // `occurs_check`/the inner solve, or an `Err`) provably skipped the
-        // inner rollback, so the pre-lane checkpoint is still current and the
-        // oracle rollback frees exactly the lane's scratch material. Proof
-        // production is off here, so the certificate holds no live TermIds.
-        if !matches!(&inner, Ok(None)) {
-            self.last_model = None;
-            self.last_validation_stats = None;
-            self.clear_dt_theory_model();
-            self.dt_egraph_assignment.replace(None);
-            self.array_default_epsilon_by_sort = saved_array_default_epsilon_by_sort;
-            self.array_default_diag_by_sort = saved_array_default_diag_by_sort;
-            crate::executor::model::eval_memo_clear();
-            self.ctx.terms.rollback_to(oracle_checkpoint);
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
-                eprintln!("c phase-trace dt-auflia-lazy-incr-oracle-rollback");
-            }
-        }
-
-        // Fail-closed: trust ONLY a definitive Unsat on the incremental path.
-        match inner {
-            Ok(Some(SolveResult::Unsat(cert))) => Ok(Some(SolveResult::Unsat(cert))),
-            Ok(_) => Ok(None),
-            Err(e) => Err(e),
-        }
+        // Fail closed: internal proof tracking is mandatory even when
+        // user-facing proof output is disabled. The former optional oracle
+        // rolled its TermStore back after accepting an inner UNSAT, leaving the
+        // strict authored-scope proof with recycled TermIds. Suspending the
+        // persistent SAT state does not solve that proof-translation problem.
+        // Keep this incremental optimization clamped until it can return a
+        // self-contained authored-scope proof without shrinking its term store.
+        Ok(None)
     }
 
     /// Eligibility for the lazy DT+LIA lane: at least one declared datatype has
@@ -1323,6 +1570,34 @@ impl Executor {
                 Sort::Datatype(dt) => dt_names.contains(dt.name.as_str()),
                 _ => false,
             })
+    }
+
+    /// Whether an exact AUFLIA rollback snapshot fits the active memory
+    /// envelope.
+    ///
+    /// This is predictive rather than reactive: cloning a store that already
+    /// consumes more than half of any enforced budget can cross the hard limit
+    /// before the ordinary periodic checks get a chance to return `Unknown`.
+    /// Returning `false` only skips an optional speculative lane and leaves the
+    /// eager solver as the verdict authority.
+    fn dt_auflia_snapshot_preflight(&self) -> bool {
+        if self.external_stop_reason().is_some()
+            || ay_core::TermStore::global_memory_exceeded()
+            || ay_sys::process_memory_exceeded_at_percent(50)
+            || crate::memory::memory_exceeded(self.memory_limit())
+        {
+            return false;
+        }
+        if let Some(limit) = self.memory_limit() {
+            let current = crate::memory::current_memory_bytes();
+            if !snapshot_clone_fits_budget(current, limit) {
+                return false;
+            }
+        }
+        snapshot_clone_fits_budget(
+            self.ctx.terms.true_memory_bytes(),
+            ay_core::TermStore::per_engine_budget(),
+        )
     }
 
     /// Materialize the SPARSE on-demand DT axioms at the occurrence-driven
@@ -1673,28 +1948,27 @@ impl Executor {
         // export and the attempt's recorded variable substitutions) are
         // dropped, so no TermId above the watermark survives anywhere.
         //
-        // PROOF-PRODUCTION INTERACTION (read this before touching): the
-        // proof tracker may retain the attempt's axiom/clausification terms,
-        // which rollback would dangle. The tracker is ADD-ONLY within a
-        // solve (push/pop/reset fire only on user commands; `take_proof`
-        // only on a stored UNSAT, and this closure runs only on the lane's
-        // Unknown fallback), and every step recorded BEFORE the entry
-        // watermark can only reference pre-watermark TermIds — so an
-        // UNCHANGED `num_steps` proves the attempt recorded nothing and
-        // rollback is safe even with proof production on. When steps WERE
-        // recorded, we skip the rollback (fail-safe: the pre-#dt-lazy-
-        // isolation behavior, sound but scaffold-polluted). NOTE the
-        // DEFAULT CLI (`ay file.smt2` without --z3-mode) synthesizes
-        // `set_produce_proofs(true)`, so on any default-mode run where the
-        // attempt records proof steps this whole fix is INERT and the
-        // pre-fix unknown persists; the SMT-COMP configuration (--z3-mode)
-        // never enables proofs and always takes the rollback.
+        // PROOF-PRODUCTION INTERACTION (read this before touching): proof
+        // steps and their assumption/lemma/name maps contain TermIds minted by
+        // the attempt. The paired proof-tracker checkpoint is rolled back
+        // BEFORE the TermStore checkpoint, removing the entire dependent
+        // ledger (including speculative nested scopes). This keeps fallback
+        // isolation active in both proof and non-proof modes without dangling
+        // IDs or preserving failed-lane scaffolding.
         let entry_terms_len = self.ctx.terms.len();
         let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
-        let entry_proof_steps = self.proof_tracker.num_steps();
-        let entry_var_substitutions = self.recorded_var_substitutions.clone();
-        let entry_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
-        let entry_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
+        let entry_proof_checkpoint = self.proof_tracker.rollback_checkpoint();
+        let entry_proof_problem_assertion_provenance =
+            self.proof_problem_assertion_provenance.clone();
+        let entry_quant_expansion_records = self.quant_expansion_records.clone();
+        let entry_ematching_proof_records = self.ematching_proof_records.clone();
+        let entry_last_proof_rebuild_originals = self.last_proof_rebuild_originals.clone();
+        let entry_last_proof_term_overrides = self.last_proof_term_overrides.clone();
+        let entry_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
+        let entry_quantified_proof_translation_incomplete =
+            self.quantified_proof_translation_incomplete;
+        let entry_attempt_state = DtLazyAttemptState::capture(self);
+        let entry_lia_probe_state = ay_lia::save_probe_state();
         let rollback_on_fallback = |this: &mut Self| {
             // #dt-lazy-isolation, repaired 2026-08-07.
             //
@@ -1707,31 +1981,44 @@ impl Executor {
             // returned. Measured cost: 99 answers on MV QF_Datatypes, with SQ and
             // MV QF_Datatypes lost outright.
             //
-            // The guard existed because rolling terms back under recorded proof
-            // steps dangles them. That is handled directly now: the certificates
-            // minted by the discarded attempt are cleared below, so the rollback
-            // is self-consistent and always safe to run.
+            // The old guard existed because rolling terms back under recorded
+            // proof steps dangles them. The proof-ledger checkpoint below now
+            // removes those steps and every correlated ProofId map first, so
+            // this lane can always restore its TermStore isolation contract.
             //
             // Note this is the try_solve_dt_lazy lane ONLY. The sibling
             // try_solve_dt_auflia_lazy guard above must stay — enabling it
             // regresses FP/BV/NRA (measured: 14 FP failures).
-            this.last_model = None;
-            this.last_validation_stats = None;
-            // #dt-lazy-cert-rollback: the discarded attempt may have run
-            // `emit_sat_verdict` and minted a one-shot emission certificate
-            // (`SatCertificate`/`UnsatCertificate`, added by 66538b006). Those
-            // certify a model this rollback is about to destroy, so they must go
-            // with it — otherwise the next verdict is judged against a witness
-            // for a solve that no longer exists.
-            this.last_sat_certificate = None;
-            this.last_unsat_certificate = None;
+            // Revoke only the discarded attempt's result artifacts. The active
+            // public UNSAT epoch and Pareto state belong to the enclosing query.
+            this.revoke_dt_lazy_attempt_artifacts();
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
-            this.recorded_var_substitutions = entry_var_substitutions.clone();
-            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort.clone();
-            this.array_default_diag_by_sort = entry_array_default_diag_by_sort.clone();
+            entry_attempt_state.restore(this);
+            ay_lia::restore_probe_state(entry_lia_probe_state.clone());
             crate::executor::model::eval_memo_clear();
+            this.proof_problem_assertion_provenance =
+                entry_proof_problem_assertion_provenance.clone();
+            this.quant_expansion_records = entry_quant_expansion_records.clone();
+            this.ematching_proof_records = entry_ematching_proof_records.clone();
+            this.last_proof_rebuild_originals = entry_last_proof_rebuild_originals.clone();
+            this.last_proof_term_overrides = entry_last_proof_term_overrides.clone();
+            this.last_unsat_proof_reconstruction_suppressed = entry_proof_reconstruction_suppressed;
+            this.quantified_proof_translation_incomplete =
+                entry_quantified_proof_translation_incomplete;
+            this.clear_dt_lazy_rebuildable_term_indexes();
+            if !this
+                .proof_tracker
+                .rollback_to(entry_proof_checkpoint.clone())
+            {
+                // The checkpoint's prefix was moved out by a nested proof
+                // reset/take. Keep the speculative terms so no escaped proof
+                // can dangle; eager fallback remains sound, just less isolated.
+                return;
+            }
+            entry_attempt_state.restore_witness_cache(this);
             this.ctx.terms.rollback_to(entry_terms_checkpoint);
+            this.clear_dt_lazy_rebuildable_term_indexes();
             if std::env::var_os("AY_PHASE_TRACE").is_some() {
                 eprintln!("c phase-trace dt-lazy-rollback to={entry_terms_len}");
             }
@@ -1883,7 +2170,9 @@ impl Executor {
             return false;
         };
         for (name, info) in self.ctx.symbol_iter() {
-            if !info.arg_sorts.is_empty() || self.is_dt_internal_symbol(name) {
+            if !info.arg_sorts.is_empty()
+                || self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
+            {
                 continue;
             }
             let Some(term_id) = info.term else {
@@ -2122,5 +2411,277 @@ impl Executor {
             );
         }
         Some((dt_registry, bases))
+    }
+}
+
+#[cfg(test)]
+mod rollback_artifact_tests {
+    use ay_core::Proof;
+
+    use super::*;
+    use crate::executor::optimization::ParetoState;
+
+    #[test]
+    fn auflia_snapshot_preflight_checks_exact_doubling_boundary() {
+        assert!(snapshot_clone_fits_budget(0, 0));
+        assert!(snapshot_clone_fits_budget(50, 100));
+        assert!(!snapshot_clone_fits_budget(51, 100));
+        assert!(snapshot_clone_fits_budget(usize::MAX / 2, usize::MAX));
+        assert!(!snapshot_clone_fits_budget(usize::MAX / 2 + 1, usize::MAX));
+    }
+
+    #[test]
+    fn auflia_fallback_moves_the_exact_entry_term_store() {
+        let mut executor = Executor::new();
+        let entry_terms = executor.ctx.terms.clone();
+        let entry_len = entry_terms.len();
+        let entry_stamp = entry_terms.snapshot_stamp();
+        let entry_checkpoint = entry_terms.rollback_checkpoint();
+
+        let scratch = executor
+            .ctx
+            .terms
+            .mk_var("__test_dt_auflia_speculative", Sort::Int);
+        assert!(scratch.index() >= entry_len);
+
+        restore_dt_auflia_entry_terms(&mut executor.ctx.terms, entry_terms);
+
+        assert_eq!(executor.ctx.terms.len(), entry_len);
+        assert_eq!(executor.ctx.terms.snapshot_stamp(), entry_stamp);
+        // The opaque checkpoint is bound to the saved store's physical
+        // identity. This succeeds only because fallback moved that exact store;
+        // a clone at restore time would panic as a foreign universe.
+        executor.ctx.terms.rollback_to(entry_checkpoint);
+    }
+
+    #[test]
+    fn discarded_lazy_attempt_preserves_enclosing_query_authority() {
+        let mut executor = Executor::new();
+        executor.begin_unsat_query_epoch(&[]);
+        executor.pareto_state = Some(ParetoState::default());
+        executor.last_assumptions = Some(vec![TermId(7)]);
+        executor.last_core_term_to_name = Some(Default::default());
+        executor.last_result = Some(SolveResult::Sat);
+        executor.last_proof = Some(Proof::new());
+        executor.last_model_validated = true;
+        executor.dt_cert_grant_active = true;
+        executor.finite_table_cert_grant_active = true;
+        executor.const_interp_cert_grant_active = true;
+        executor.bv_quantifier_full_domain_proof = true;
+
+        executor.revoke_dt_lazy_attempt_artifacts();
+
+        assert!(executor.active_unsat_query_requires_strict_proof());
+        assert!(executor.pareto_state.is_some());
+        assert_eq!(executor.last_assumptions, Some(vec![TermId(7)]));
+        assert!(executor.last_core_term_to_name.is_some());
+        assert!(executor.last_result.is_none());
+        assert!(executor.last_proof.is_none());
+        assert!(!executor.last_model_validated);
+        assert!(!executor.dt_cert_grant_active);
+        assert!(!executor.finite_table_cert_grant_active);
+        assert!(!executor.const_interp_cert_grant_active);
+        assert!(!executor.bv_quantifier_full_domain_proof);
+    }
+
+    #[test]
+    fn discarded_lazy_attempt_clears_every_rebuildable_term_index() {
+        let mut executor = Executor::new();
+        let term = executor.ctx.terms.true_term();
+        executor
+            .cached_store_eqs
+            .push((term, term, term, term, term));
+        executor.store_eq_scan_hwm = 17;
+        executor
+            .cached_select_indices_by_array
+            .insert(term, vec![term]);
+        executor.select_index_scan_hwm = 19;
+        {
+            let mut index = executor.select_by_array_index.borrow_mut();
+            index.0 = 23;
+            index.1.insert(term, vec![term]);
+        }
+        let mut required = HashSet::default();
+        required.insert(term);
+        *executor.required_terms_index.borrow_mut() =
+            Some((vec![term], Some(vec![term]), required));
+
+        executor.clear_dt_lazy_rebuildable_term_indexes();
+
+        assert!(executor.cached_store_eqs.is_empty());
+        assert_eq!(executor.store_eq_scan_hwm, 0);
+        assert!(executor.cached_select_indices_by_array.is_empty());
+        assert_eq!(executor.select_index_scan_hwm, 0);
+        let select_index = executor.select_by_array_index.borrow();
+        assert_eq!(select_index.0, 0);
+        assert!(select_index.1.is_empty());
+        assert!(executor.array_def_index.borrow().is_none());
+        assert!(executor.required_terms_index.borrow().is_none());
+    }
+
+    #[test]
+    fn discarded_lazy_attempt_restores_validation_and_retry_state() {
+        let mut executor = Executor::new();
+        let entry_lemma = ay_core::TheoryLemma::new(vec![TheoryLit::new(TermId(5), true)]);
+        assert!(executor.lemma_cache.record_lemma(entry_lemma, 0));
+        executor.qfax_refinement_clause = Some(vec![(TermId(7), true)]);
+        executor.last_rejected_array_assertion = Some(TermId(8));
+        executor.cegar_pending_lemma = Some(TermId(9));
+        executor.qfax_retry_done = true;
+        executor.uflia_congruence_retry_done = true;
+        executor.uflia_model_repair_done = true;
+        executor.sat_validated_by_mod_div_or_branch = true;
+        executor.defer_model_validation = true;
+        executor.skip_model_eval = true;
+        executor.read_pin_repair_done = true;
+        executor.dt_array_injectivity_gate_bypass = true;
+        executor.original_problem_had_quantifiers = true;
+        executor.in_nested_array_residue_probe = true;
+        executor.residue_probe_failures = 7;
+        executor.mod_div_or_branch_rescue_depth = 2;
+        executor.last_degrade_was_datatype_array = true;
+        executor.nested_array_row_reduction_unsat = true;
+        executor.uflia_congruence_lane = true;
+        executor.uflia_congruence_gate_rejected = true;
+        let entry = DtLazyAttemptState::capture(&executor);
+
+        let speculative_lemma = ay_core::TheoryLemma::new(vec![TheoryLit::new(TermId(50), false)]);
+        assert!(executor.lemma_cache.record_lemma(speculative_lemma, 1));
+        executor.qfax_refinement_clause = None;
+        executor.last_rejected_array_assertion = None;
+        executor.cegar_pending_lemma = None;
+        executor.qfax_retry_done = false;
+        executor.uflia_congruence_retry_done = false;
+        executor.uflia_model_repair_done = false;
+        executor.sat_validated_by_mod_div_or_branch = false;
+        executor.defer_model_validation = false;
+        executor.skip_model_eval = false;
+        executor.read_pin_repair_done = false;
+        executor.dt_array_injectivity_gate_bypass = false;
+        executor.original_problem_had_quantifiers = false;
+        executor.in_nested_array_residue_probe = false;
+        executor.residue_probe_failures = 0;
+        executor.mod_div_or_branch_rescue_depth = 0;
+        executor.last_degrade_was_datatype_array = false;
+        executor.nested_array_row_reduction_unsat = false;
+        executor.uflia_congruence_lane = false;
+        executor.uflia_congruence_gate_rejected = false;
+
+        entry.restore(&mut executor);
+
+        assert_eq!(executor.lemma_cache.len(), 1);
+        let restored_lemma = &executor.lemma_cache.replay_lemmas()[0];
+        assert_eq!(
+            restored_lemma.0.clause,
+            vec![TheoryLit::new(TermId(5), true)]
+        );
+        assert_eq!(restored_lemma.1, 0);
+        assert_eq!(
+            executor.qfax_refinement_clause,
+            Some(vec![(TermId(7), true)])
+        );
+        assert_eq!(executor.last_rejected_array_assertion, Some(TermId(8)));
+        assert_eq!(executor.cegar_pending_lemma, Some(TermId(9)));
+        assert!(executor.qfax_retry_done);
+        assert!(executor.uflia_congruence_retry_done);
+        assert!(executor.uflia_model_repair_done);
+        assert!(executor.sat_validated_by_mod_div_or_branch);
+        assert!(executor.defer_model_validation);
+        assert!(executor.skip_model_eval);
+        assert!(executor.read_pin_repair_done);
+        assert!(executor.dt_array_injectivity_gate_bypass);
+        assert!(executor.original_problem_had_quantifiers);
+        assert!(executor.in_nested_array_residue_probe);
+        assert_eq!(executor.residue_probe_failures, 7);
+        assert_eq!(executor.mod_div_or_branch_rescue_depth, 2);
+        assert!(executor.last_degrade_was_datatype_array);
+        assert!(executor.nested_array_row_reduction_unsat);
+        assert!(executor.uflia_congruence_lane);
+        assert!(executor.uflia_congruence_gate_rejected);
+    }
+
+    #[test]
+    fn discarded_lazy_attempt_restores_witness_cache_in_second_phase() {
+        let mut executor = Executor::new();
+        let array_sort = Sort::Array(Box::new(ay_core::ArraySort::new(Sort::Int, Sort::Int)));
+        let entry_lhs = executor
+            .ctx
+            .terms
+            .mk_var("__test_dt_lazy_entry_lhs", array_sort.clone());
+        let entry_rhs = executor
+            .ctx
+            .terms
+            .mk_var("__test_dt_lazy_entry_rhs", array_sort.clone());
+        let entry_witness = crate::executor::theories::array_extensionality_witness(
+            &mut executor.ctx.terms,
+            &mut executor.array_ext_witness_cache,
+            entry_lhs,
+            entry_rhs,
+        )
+        .expect("entry array pair should mint a witness");
+        let entry = DtLazyAttemptState::capture(&executor);
+
+        let speculative_lhs = executor
+            .ctx
+            .terms
+            .mk_var("__test_dt_lazy_speculative_lhs", array_sort.clone());
+        let speculative_rhs = executor
+            .ctx
+            .terms
+            .mk_var("__test_dt_lazy_speculative_rhs", array_sort);
+        let speculative_witness = crate::executor::theories::array_extensionality_witness(
+            &mut executor.ctx.terms,
+            &mut executor.array_ext_witness_cache,
+            speculative_lhs,
+            speculative_rhs,
+        )
+        .expect("speculative array pair should mint a witness");
+
+        entry.restore(&mut executor);
+        assert_eq!(
+            executor.array_ext_witness_cache.pair_witness(
+                &executor.ctx.terms,
+                speculative_lhs,
+                speculative_rhs,
+            ),
+            Some(speculative_witness),
+            "ordinary attempt-state restore must leave proof-coupled cache entries in place"
+        );
+
+        entry.restore_witness_cache(&mut executor);
+        assert_eq!(
+            executor.array_ext_witness_cache.pair_witness(
+                &executor.ctx.terms,
+                entry_lhs,
+                entry_rhs,
+            ),
+            Some(entry_witness)
+        );
+        assert_eq!(
+            executor.array_ext_witness_cache.pair_witness(
+                &executor.ctx.terms,
+                speculative_lhs,
+                speculative_rhs,
+            ),
+            None,
+            "second-phase restore must discard speculative witness provenance"
+        );
+    }
+
+    #[test]
+    fn incremental_lazy_auflia_oracle_is_clamped_with_mandatory_proofs() {
+        fn must_not_run(_: &mut Executor) -> Result<SolveResult> {
+            panic!("clamped incremental lane called its speculative solver")
+        }
+
+        let mut executor = Executor::new();
+        executor.incremental_mode = true;
+        executor.proof_tracker.enable();
+
+        let result = executor
+            .try_solve_dt_auflia_lazy_maybe_incremental(must_not_run)
+            .expect("clamped lane cannot fail");
+
+        assert!(result.is_none());
     }
 }

@@ -262,22 +262,10 @@ fn test_get_assignment_sat_model_named_term() {
     term_to_var.insert(a, 0);
 
     exec.last_result = Some(SolveResult::Sat);
-    exec.last_model = Some(Model {
-        sat_model: vec![true],
-        term_to_var,
-        bool_overrides: HashMap::default(),
-        euf_model: None,
-        array_model: None,
-        lra_model: None,
-        lia_model: None,
-        bv_model: None,
-        fp_model: None,
-        string_model: None,
-        seq_model: None,
-        completed_values: HashMap::default(),
-        dt_ground: HashMap::default(),
-        dt_pins: HashMap::default(),
-    });
+    let mut model = Model::empty();
+    model.sat_model = vec![true];
+    model.term_to_var = term_to_var;
+    exec.last_model = Some(model);
 
     assert_eq!(exec.get_assignment(), "((n1 true))");
 }
@@ -794,4 +782,30 @@ fn serialized_script_marks_datatype_sorts_fail_visible() {
     // script accepted by AY's own parser/executor.
     let replay = run_script_collect(&script);
     assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
+}
+
+#[test]
+fn public_assertion_dump_disambiguates_reincarnated_datatype_carriers() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-logic ALL)
+            (push 1)
+            (declare-datatype ScopedDumpDt ((scoped-dump-ctor)))
+            (pop 1)
+            (declare-datatype ScopedDumpDt ((scoped-dump-ctor)))
+            (declare-const scoped-dump-value ScopedDumpDt)
+            (assert (= scoped-dump-value scoped-dump-value))
+        "#,
+    )
+    .expect("parse scoped datatype dump fixture");
+    exec.execute_all(&commands)
+        .expect("execute scoped datatype dump fixture");
+
+    let output = exec.assertions_sexpr_for(&exec.ctx.assertions);
+    assert!(output.contains("__ay_datatype_sort_"), "{output}");
+    assert!(
+        !output.contains("(declare-fun scoped-dump-value () ScopedDumpDt)"),
+        "distinct declaration epochs must not collapse to one sort spelling: {output}"
+    );
 }

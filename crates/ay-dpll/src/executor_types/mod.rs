@@ -147,6 +147,33 @@ pub enum UnknownReason {
     /// had already caught and reported as a bland "incomplete", so nobody
     /// noticed. Never fold this back into `Incomplete`.
     SelfCheckRejected,
+    /// **A computed UNSAT was WITHHELD because its proof is not trust-free.**
+    ///
+    /// The soundness gate of #8759. Under strict proofs, an `unsat` is only
+    /// admissible when the terminal derivation chain reaching the empty clause
+    /// is independently checkable end to end. This reason means it was not:
+    /// a `:rule trust`/`hole` step or trust-kind theory lemma is reachable from
+    /// the empty clause, or an `assume` leaf on that path is not backed by the
+    /// problem's provenance (a laundered free axiom), or the proof references
+    /// sequence-theory content no external checker can parse. AY reached
+    /// `unsat` and refused to stand behind it.
+    ///
+    /// This is NOT [`Self::Incomplete`]. `Incomplete` means a lane could not
+    /// decide the problem — nothing was computed and nothing was withheld.
+    /// This variant means a verdict WAS computed and a soundness gate took it
+    /// away, which is the same class of fact as [`Self::SelfCheckRejected`] and
+    /// carries the same warning: **never fold this back into `Incomplete`.**
+    /// It was folded in once — ay 0.6 deleted this variant in 66538b006 and
+    /// left the gate publishing the generic reason from the CLI driver only —
+    /// and the result was that a withheld unsound UNSAT became byte-identical
+    /// to an unsupported logic, with the distinction surviving nowhere but a
+    /// free-form transcript string.
+    ///
+    /// It is also distinct from [`Self::SelfCheckRejected`]: that one is the
+    /// mandatory certification funnel refuting a verdict it could not certify;
+    /// this one is the strict-proof gate refusing a verdict that certified but
+    /// whose presentation nobody else can check.
+    ProofTrusted,
     /// E-matching round budget or per-round instantiation limit exhausted.
     /// The solver could not explore all possible instantiations within budget.
     QuantifierRoundLimit,
@@ -200,6 +227,9 @@ pub enum UnknownOrigin {
     IncompleteSolverLane,
     /// Mandatory verdict certification could not confirm the result.
     VerdictCertification,
+    /// The strict-proof gate found the terminal derivation chain of a computed
+    /// UNSAT was not trust-free, and withheld the verdict.
+    TerminalTrust,
     /// The E-matching round budget was exhausted.
     EmatchingRoundBudget,
     /// Required quantifier instantiation was deferred.
@@ -229,7 +259,7 @@ pub enum UnknownOrigin {
 impl UnknownOrigin {
     /// Closed origin inventory. Its order is identical to
     /// [`UnknownReason::ALL`], making the bijection mechanically checkable.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::SolveDeadline,
         Self::DeterministicResourceBudget,
         Self::MemoryBudget,
@@ -248,6 +278,7 @@ impl UnknownOrigin {
         Self::UnsupportedMixedCollection,
         Self::ExecutorFailure,
         Self::UntaggedSolverUnknown,
+        Self::TerminalTrust,
     ];
 
     /// Stable evidence code for this exact production origin.
@@ -259,6 +290,7 @@ impl UnknownOrigin {
             Self::InterruptFlag => "interrupt_flag",
             Self::IncompleteSolverLane => "incomplete_solver_lane",
             Self::VerdictCertification => "verdict_certification",
+            Self::TerminalTrust => "terminal_trust",
             Self::EmatchingRoundBudget => "ematching_round_budget",
             Self::DeferredInstantiation => "deferred_instantiation",
             Self::UnhandledQuantifier => "unhandled_quantifier",
@@ -283,6 +315,7 @@ impl UnknownOrigin {
             Self::InterruptFlag => UnknownReason::Interrupted,
             Self::IncompleteSolverLane => UnknownReason::Incomplete,
             Self::VerdictCertification => UnknownReason::SelfCheckRejected,
+            Self::TerminalTrust => UnknownReason::ProofTrusted,
             Self::EmatchingRoundBudget => UnknownReason::QuantifierRoundLimit,
             Self::DeferredInstantiation => UnknownReason::QuantifierDeferred,
             Self::UnhandledQuantifier => UnknownReason::QuantifierUnhandled,
@@ -314,6 +347,9 @@ impl UnknownOrigin {
             Self::IncompleteSolverLane => "executor/check_sat.rs::check_sat_guarded",
             Self::VerdictCertification => {
                 "executor/unsat_cert.rs::reject_uncertified_verdict_for_publication"
+            }
+            Self::TerminalTrust => {
+                "executor/unsat_cert.rs::decline_trust_bearing_unsat_under_strict_proofs"
             }
             Self::EmatchingRoundBudget
             | Self::DeferredInstantiation
@@ -362,7 +398,7 @@ impl UnknownReason {
     ///
     /// This uniform policy prevents the reason taxonomy from accidentally
     /// granting authority to stale artifacts from an earlier decision.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Timeout,
         Self::ResourceLimit,
         Self::MemoryLimit,
@@ -381,6 +417,7 @@ impl UnknownReason {
         Self::UnsupportedMixedCollection,
         Self::InternalError,
         Self::Unknown,
+        Self::ProofTrusted,
     ];
 
     /// The single production origin authorized to publish this reason.
@@ -392,6 +429,7 @@ impl UnknownReason {
             Self::Interrupted => UnknownOrigin::InterruptFlag,
             Self::Incomplete => UnknownOrigin::IncompleteSolverLane,
             Self::SelfCheckRejected => UnknownOrigin::VerdictCertification,
+            Self::ProofTrusted => UnknownOrigin::TerminalTrust,
             Self::QuantifierRoundLimit => UnknownOrigin::EmatchingRoundBudget,
             Self::QuantifierDeferred => UnknownOrigin::DeferredInstantiation,
             Self::QuantifierUnhandled => UnknownOrigin::UnhandledQuantifier,
@@ -420,6 +458,7 @@ impl UnknownReason {
             Self::Interrupted => "interrupted",
             Self::Incomplete => "incomplete",
             Self::SelfCheckRejected => "self_check_rejected",
+            Self::ProofTrusted => "proof_trusted",
             Self::QuantifierRoundLimit => "quantifier_round_limit",
             Self::QuantifierDeferred => "quantifier_deferred",
             Self::QuantifierUnhandled => "quantifier_unhandled",
@@ -444,6 +483,7 @@ impl UnknownReason {
             Self::Interrupted => "Interrupted",
             Self::Incomplete => "Incomplete",
             Self::SelfCheckRejected => "Self-check REJECTED a computed verdict",
+            Self::ProofTrusted => "Strict proofs WITHHELD a trust-bearing UNSAT",
             Self::QuantifierRoundLimit => "Quantifier round limit",
             Self::QuantifierDeferred => "Quantifier deferred",
             Self::QuantifierUnhandled => "Quantifier unhandled",
@@ -485,6 +525,13 @@ impl std::fmt::Display for UnknownReason {
             // refuted by AY's own checker, i.e. a caught wrong answer. It must
             // be greppable and must never be mistaken for an unsupported logic.
             Self::SelfCheckRejected => write!(f, "(incomplete self-check-rejected)"),
+            // NOT plain "incomplete", for the same reason as the line above: a
+            // withheld trust-bearing UNSAT is a caught soundness hazard, not an
+            // undecided problem. This is the exact text the `ay` CLI has always
+            // printed for `--strict-proofs`, so the typed reason and the
+            // transcript string now agree by construction rather than by
+            // coincidence.
+            Self::ProofTrusted => write!(f, "(incomplete proof-trusted)"),
             Self::QuantifierRoundLimit => write!(f, "(incomplete quantifier-round-limit)"),
             Self::QuantifierDeferred => write!(f, "(incomplete quantifier-deferred)"),
             Self::QuantifierUnhandled => write!(f, "(incomplete quantifier-unhandled)"),

@@ -66,11 +66,14 @@
 //!    `x` (after accounting for the sign of `c`); equalities and disequalities
 //!    contribute their boundary point.
 //!
-//! # Soundness gate
+//! # Candidate regression gate
 //!
 //! See [`selfcheck::equivalence_self_check`]. The output is verified against the
-//! input by an independent ground evaluator before being returned; on any
-//! failure the result is discarded and the procedure refuses (fail-closed).
+//! input on a finite deterministic ground battery before being returned; on any
+//! observed failure the result is discarded. This check is complete in the
+//! eliminated variable after each sampled assignment, but it does not prove the
+//! outer equivalence for all free-variable assignments and must not be used as
+//! public verdict authority by itself.
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
@@ -88,14 +91,16 @@ mod tests;
 /// Outcome of a quantifier-elimination attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QeResult {
-    /// Elimination succeeded and the result passed the equivalence self-check.
+    /// Elimination succeeded and the result passed the bounded differential
+    /// check.
     ///
     /// The contained term is a quantifier-free LIA formula over the free
     /// variables of the input (everything except the eliminated variable),
-    /// logically equivalent to `∃x. φ`.
+    /// intended to be logically equivalent to `∃x. φ`. Public decision
+    /// paths require separate exact-source or equivalence authority.
     Eliminated(TermId),
     /// The input is outside the supported fragment, or the eliminated result
-    /// failed the equivalence self-check. Either way the caller must keep the
+    /// failed the bounded differential check. Either way the caller must keep the
     /// original quantified formula. This is the fail-closed outcome.
     NotSupported,
 }
@@ -110,8 +115,8 @@ pub enum QeResult {
 ///   [`TermData::Var`] of sort [`Sort::Int`].
 ///
 /// # Returns
-/// * [`QeResult::Eliminated`] with the quantifier-free equivalent, **only**
-///   after it has passed the equivalence self-check.
+/// * [`QeResult::Eliminated`] with the quantifier-free candidate, **only**
+///   after it has passed the bounded differential check.
 /// * [`QeResult::NotSupported`] if the input is out of fragment or the
 ///   self-check fails (fail-closed).
 pub fn eliminate_exists(terms: &mut TermStore, body: TermId, var: TermId) -> QeResult {
@@ -144,7 +149,9 @@ pub fn eliminate_exists(terms: &mut TermStore, body: TermId, var: TermId) -> QeR
         return QeResult::NotSupported;
     };
 
-    // HARD soundness gate: independently verify `result ≡ ∃x.φ` before use.
+    // Bounded differential gate: reject every observed mismatch. This does not
+    // discharge the universal free-variable equivalence obligation; callers at
+    // a public verdict boundary need separate symbolic authority.
     if selfcheck::equivalence_self_check(terms, &literals, var, result) {
         QeResult::Eliminated(result)
     } else {

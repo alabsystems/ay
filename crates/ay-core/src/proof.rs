@@ -26,6 +26,10 @@ use crate::term::TermId;
 use num_rational::Rational64;
 use serde::{Deserialize, Serialize};
 
+mod fp;
+
+pub use fp::FpOp;
+
 /// Farkas annotation for arithmetic theory lemmas
 ///
 /// When an arithmetic theory (LRA/LIA) produces an UNSAT conflict, the
@@ -171,126 +175,6 @@ pub struct CuttingPlaneAnnotation {
     pub farkas: FarkasAnnotation,
     /// Divisor for the cutting-plane rounding step (must be > 0)
     pub divisor: i64,
-}
-
-/// IEEE 754 floating-point operation for FP→BV proof annotation.
-///
-/// Each variant corresponds to an SMT-LIB floating-point operation that the
-/// FP solver lowers to bitvector circuits. Carrying the operation type in the
-/// proof allows the checker and printer to emit `fp_to_bv` instead of the
-/// unverified `trust` fallback.
-///
-/// Reference: SMT-LIB FloatingPoint theory definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum FpOp {
-    /// Floating-point addition (`fp.add`)
-    Add,
-    /// Floating-point subtraction (`fp.sub`)
-    Sub,
-    /// Floating-point multiplication (`fp.mul`)
-    Mul,
-    /// Floating-point division (`fp.div`)
-    Div,
-    /// Floating-point square root (`fp.sqrt`)
-    Sqrt,
-    /// Floating-point negation (`fp.neg`)
-    Neg,
-    /// Floating-point absolute value (`fp.abs`)
-    Abs,
-    /// Fused multiply-add (`fp.fma`)
-    Fma,
-    /// IEEE 754 equality (`fp.eq`)
-    Eq,
-    /// Floating-point less-than (`fp.lt`)
-    Lt,
-    /// Floating-point less-or-equal (`fp.leq`)
-    Le,
-    /// Floating-point greater-than (`fp.gt`)
-    Gt,
-    /// Floating-point greater-or-equal (`fp.geq`)
-    Ge,
-    /// Convert to real (`fp.to_real`)
-    ToReal,
-    /// Convert from real (to_fp from Real)
-    FromReal,
-    /// Convert to signed bitvector (`fp.to_sbv`)
-    ToSbv,
-    /// Convert to unsigned bitvector (`fp.to_ubv`)
-    ToUbv,
-    /// Convert from signed bitvector (to_fp from signed BV)
-    FromSbv,
-    /// Convert from unsigned bitvector (`to_fp_unsigned`)
-    FromUbv,
-    /// Round to integral (`fp.roundToIntegral`)
-    RoundToIntegral,
-    /// Floating-point minimum (`fp.min`)
-    Min,
-    /// Floating-point maximum (`fp.max`)
-    Max,
-    /// Floating-point remainder (`fp.rem`)
-    Rem,
-    /// Classification: isNaN (`fp.isNaN`)
-    IsNaN,
-    /// Classification: isInfinite (`fp.isInfinite`)
-    IsInfinite,
-    /// Classification: isZero (`fp.isZero`)
-    IsZero,
-    /// Classification: isNormal (`fp.isNormal`)
-    IsNormal,
-    /// Classification: isSubnormal (`fp.isSubnormal`)
-    IsSubnormal,
-    /// Classification: isPositive (`fp.isPositive`)
-    IsPositive,
-    /// Classification: isNegative (`fp.isNegative`)
-    IsNegative,
-    /// SMT-LIB structural equality on FP sort (`=` on FloatingPoint)
-    StructuralEq,
-    /// Convert to IEEE BV representation (`fp.to_ieee_bv`)
-    ToIeeeBv,
-    /// Convert from FP to FP (to_fp from FloatingPoint)
-    FromFp,
-}
-
-impl std::fmt::Display for FpOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Add => "fp.add",
-            Self::Sub => "fp.sub",
-            Self::Mul => "fp.mul",
-            Self::Div => "fp.div",
-            Self::Sqrt => "fp.sqrt",
-            Self::Neg => "fp.neg",
-            Self::Abs => "fp.abs",
-            Self::Fma => "fp.fma",
-            Self::Eq => "fp.eq",
-            Self::Lt => "fp.lt",
-            Self::Le => "fp.leq",
-            Self::Gt => "fp.gt",
-            Self::Ge => "fp.geq",
-            Self::ToReal => "fp.to_real",
-            Self::FromReal => "to_fp_real",
-            Self::ToSbv => "fp.to_sbv",
-            Self::ToUbv => "fp.to_ubv",
-            Self::FromSbv => "to_fp_sbv",
-            Self::FromUbv => "to_fp_unsigned",
-            Self::RoundToIntegral => "fp.roundToIntegral",
-            Self::Min => "fp.min",
-            Self::Max => "fp.max",
-            Self::Rem => "fp.rem",
-            Self::IsNaN => "fp.isNaN",
-            Self::IsInfinite => "fp.isInfinite",
-            Self::IsZero => "fp.isZero",
-            Self::IsNormal => "fp.isNormal",
-            Self::IsSubnormal => "fp.isSubnormal",
-            Self::IsPositive => "fp.isPositive",
-            Self::IsNegative => "fp.isNegative",
-            Self::StructuralEq => "fp_structural_eq",
-            Self::ToIeeeBv => "fp.to_ieee_bv",
-            Self::FromFp => "to_fp_fp",
-        };
-        f.write_str(s)
-    }
 }
 
 /// Type of BV gate for bit-blast proof annotation.
@@ -675,6 +559,30 @@ pub enum TheoryLemmaKind {
     /// declarations; without them this kind fails closed in strict mode).
     DatatypeDistinct,
 
+    /// Finite-enum pigeonhole: `(cl (= t1 t2) (= t1 t3) ... (= t_{m-1} t_m))`,
+    /// the COMPLETE graph of equalities over `m` distinct terms of a datatype
+    /// sort whose `k` constructors are ALL NULLARY, with `m > k`.
+    ///
+    /// Such a sort's carrier is exactly its `k` constructor constants, so any
+    /// `m > k` terms of it must contain an equal pair — the disjunction holds in
+    /// every model. AY's native checker names this rule
+    /// `dt_enum_pigeonhole`; the pinned external Alethe calculus has no
+    /// datatype-exhaustiveness rule, so its diagnostic rendering remains an
+    /// honest `hole` rather than emitting an unknown rule name.
+    ///
+    /// WHY THIS EXISTS: `add_finite_enum_pigeonhole_conflict` refutes an instance
+    /// by finding a `k+1` clique in the disequality graph, then discarded the
+    /// clique and pushed bare `false` as a `Generic` lemma. `[false]` is not a
+    /// tautology and carries no argument, so strict mode had to reject it and
+    /// every discharge lane failed — correct refutations of the QF_DT Bouvier
+    /// `vlsat3` family published as `unknown`. This kind carries the argument the
+    /// solver actually used.
+    ///
+    /// Validated by `ay-proof` against the datatype registry, which supplies both
+    /// the constructor count and the nullarity that makes the carrier finite;
+    /// without those declarations this kind fails closed in strict mode.
+    DatatypeEnumPigeonhole,
+
     /// Datatype selector projection: `(cl (= (sel_i (C a_0 .. a_n)) a_i))` where
     /// `sel_i` is the field-`i` selector of constructor `C` — reading the `i`-th
     /// field of a constructor application yields its `i`-th argument. Uses Alethe
@@ -823,6 +731,34 @@ pub enum TheoryLemmaKind {
     /// that six or more RoundingMode-sorted values cannot all be distinct.
     /// Uses AY's `fp_rounding_mode_domain` proof rule.
     RoundingModeDomain,
+
+    /// Floating-point clause proved valid by EXACT IEEE-754 evaluation.
+    ///
+    /// The claim: after substituting the bindings the clause itself carries —
+    /// each negated equality `(not (= v g))` whose `v` is a variable and whose
+    /// `g` is a ground term licenses replacing `v` by `g` in every literal, by
+    /// congruence — the clause is TRUE under EVERY assignment of whatever
+    /// variables remain, and those remaining variables span a domain the
+    /// checker enumerates exhaustively within a fixed bit budget.
+    ///
+    /// This is the FP counterpart of [`Self::StringGroundEval`], and unlike
+    /// [`Self::FpClassification`] it is not restricted to sign/class/comparison
+    /// identities: `ay-proof` carries its own exact-rational IEEE-754 kernel
+    /// (`fp.add`/`sub`/`mul`/`div`/`fma`/`sqrt`, all five rounding modes, and
+    /// the `to_fp` / `to_fp_unsigned` conversions from bitvector bit patterns,
+    /// signed/unsigned bitvector integers, reals, and other FP formats), so a
+    /// refutation like `(cl (fp.eq (fp.add RNE +zero +zero) +zero))` is
+    /// re-decided rather than trusted.
+    ///
+    /// SOUNDNESS IS RE-DERIVED, NOT LABELLED. The validator evaluates the
+    /// clause itself; the producer's kind annotation carries no authority. Any
+    /// operator the kernel does not implement, any variable it cannot
+    /// enumerate inside the budget, any non-Boolean literal, and any
+    /// assignment falsifying the clause all fail closed (reject).
+    ///
+    /// Alethe has no rule for exact FP evaluation, so this internal
+    /// certificate renders as an honest `hole` on that wire.
+    FpGroundEval,
 }
 
 impl TheoryLemmaKind {
@@ -857,6 +793,7 @@ impl TheoryLemmaKind {
             Self::StringGroundEval => "string_ground_eval",
             Self::RegexIntersectEmpty => "regex_intersect_empty",
             Self::DatatypeDistinct => "dt_distinct",
+            Self::DatatypeEnumPigeonhole => "dt_enum_pigeonhole",
             Self::DatatypeSelectorProject => "dt_project",
             Self::DatatypeTesterEval => "dt_tester",
             Self::OrderIteTautology => "order_ite_tautology",
@@ -869,6 +806,7 @@ impl TheoryLemmaKind {
             Self::NraUnivariateUnsat => "nra_univariate_unsat",
             Self::Generic => "trust",
             Self::RoundingModeDomain => "fp_rounding_mode_domain",
+            Self::FpGroundEval => "fp_ground_eval",
         }
     }
 

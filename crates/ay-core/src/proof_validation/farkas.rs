@@ -13,6 +13,10 @@ use thiserror::Error;
 
 use crate::{Constant, FarkasAnnotation, Symbol, TermData, TermId, TermStore, TheoryLit};
 
+mod recovery;
+
+pub use recovery::recover_single_equality_farkas;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 /// Errors returned when a Farkas certificate fails structural or semantic validation.

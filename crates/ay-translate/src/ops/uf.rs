@@ -33,7 +33,20 @@ pub fn declare<V>(
 where
     V: Eq + Hash,
 {
-    ctx.declare_or_get_fun(name, domain, range)
+    expect_result(try_declare(ctx, name, domain, range), "uf.declare")
+}
+
+/// Fallible [`declare`] returning a `SolverError` instead of panicking.
+pub fn try_declare<V>(
+    ctx: &mut impl TranslationHost<V>,
+    name: &str,
+    domain: &[Sort],
+    range: Sort,
+) -> Result<FuncDecl, SolverError>
+where
+    V: Eq + Hash,
+{
+    ctx.try_declare_or_get_fun(name, domain, range)
 }
 
 /// Define a non-recursive function for inline expansion.

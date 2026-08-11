@@ -14,8 +14,8 @@ fn test_single_solution() {
 
     let solutions = solver.enumerate();
     assert_eq!(solutions.len(), 1);
-    assert!(solutions[0].is_true(1));
-    assert!(solutions[0].is_true(2));
+    assert_eq!(solutions[0].is_true(1), Some(true));
+    assert_eq!(solutions[0].is_true(2), Some(true));
 }
 
 #[test]
@@ -31,8 +31,12 @@ fn test_two_solutions() {
     assert_eq!(solutions.len(), 2);
 
     // Should have x1=T,x2=F and x1=F,x2=T
-    let has_10 = solutions.iter().any(|s| s.is_true(1) && !s.is_true(2));
-    let has_01 = solutions.iter().any(|s| !s.is_true(1) && s.is_true(2));
+    let has_10 = solutions
+        .iter()
+        .any(|s| s.is_true(1) == Some(true) && s.is_true(2) == Some(false));
+    let has_01 = solutions
+        .iter()
+        .any(|s| s.is_true(1) == Some(false) && s.is_true(2) == Some(true));
     assert!(has_10, "Should have solution x1=T, x2=F");
     assert!(has_01, "Should have solution x1=F, x2=T");
 }
@@ -60,6 +64,54 @@ fn test_all_assignments() {
     let solutions = solver.enumerate();
     // Two solutions: x1=T and x1=F
     assert_eq!(solutions.len(), 2);
+}
+
+#[test]
+fn declared_internal_variables_are_enumerated_even_when_absent_from_clauses() {
+    let mut free = AllSatSolver::new();
+    free.try_ensure_num_vars(2).unwrap();
+    let free_solutions = free.try_enumerate().unwrap();
+    assert_eq!(free.num_vars(), 2);
+    assert_eq!(free_solutions.len(), 4);
+    assert!(free_solutions
+        .iter()
+        .all(|solution| solution.get(1).is_some() && solution.get(2).is_some()));
+
+    let mut partially_constrained = AllSatSolver::new();
+    partially_constrained.try_ensure_num_vars(2).unwrap();
+    partially_constrained.try_add_clause(vec![1]).unwrap();
+    let solutions = partially_constrained.try_enumerate().unwrap();
+    assert_eq!(solutions.len(), 2);
+    assert!(solutions
+        .iter()
+        .all(|solution| solution.get(1) == Some(true)));
+    assert!(solutions
+        .iter()
+        .any(|solution| solution.get(2) == Some(false)));
+    assert!(solutions
+        .iter()
+        .any(|solution| solution.get(2) == Some(true)));
+}
+
+#[test]
+fn declared_internal_variable_count_has_typed_backend_and_resource_errors() {
+    let mut oversized = AllSatSolver::new();
+    assert_eq!(
+        oversized
+            .try_ensure_num_vars(MAX_INTERNAL_VARIABLE_INDEX as usize + 1)
+            .unwrap_err(),
+        AllSatInputError::InternalVariableCountExceedsLimit {
+            variable_count: MAX_INTERNAL_VARIABLE_INDEX as usize + 1,
+            max_variable: MAX_INTERNAL_VARIABLE_INDEX,
+        }
+    );
+
+    let external = SatSolver::new(1);
+    let mut external = AllSatSolver::from_solver(external);
+    assert_eq!(
+        external.try_ensure_num_vars(1).unwrap_err(),
+        AllSatInputError::VariableRegistrationUnsupportedBackend
+    );
 }
 
 #[test]
@@ -94,7 +146,158 @@ fn test_projected_enumeration() {
     let solutions = solver.enumerate_with_config(config);
     // Only one projected solution: x1=T
     assert_eq!(solutions.len(), 1);
-    assert!(solutions[0].is_true(1));
+    assert_eq!(solutions[0].is_true(1), Some(true));
+}
+
+#[test]
+fn internal_projection_rejects_zero_and_variables_above_formula_range() {
+    let mut solver = AllSatSolver::new();
+    solver.add_clause(vec![1, 2]);
+
+    for (projection, expected) in [
+        (
+            vec![0],
+            AllSatInputError::InternalProjectionVariableOutOfRange {
+                variable: 0,
+                max_variable: 2,
+            },
+        ),
+        (
+            vec![3],
+            AllSatInputError::InternalProjectionVariableOutOfRange {
+                variable: 3,
+                max_variable: 2,
+            },
+        ),
+    ] {
+        let report = solver.enumerate_report_with_config(AllSatConfig {
+            projection: Some(projection),
+            ..Default::default()
+        });
+        assert!(report.solutions.is_empty());
+        assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+        assert_eq!(report.stats.input_error, Some(expected));
+        assert_eq!(report.stats.sat_calls, 0);
+    }
+}
+
+#[test]
+fn duplicate_projection_variables_are_rejected() {
+    let mut solver = AllSatSolver::new();
+    solver.add_clause(vec![1]);
+    let report = solver.enumerate_report_with_config(AllSatConfig {
+        projection: Some(vec![1, 1]),
+        ..Default::default()
+    });
+
+    assert!(report.solutions.is_empty());
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(
+        report.stats.input_error,
+        Some(AllSatInputError::DuplicateProjectionVariable(1))
+    );
+}
+
+#[test]
+fn empty_projection_has_one_projected_model() {
+    let mut solver = AllSatSolver::new();
+    solver.add_clause(vec![1, -1]);
+    let report = solver.enumerate_report_with_config(AllSatConfig {
+        projection: Some(Vec::new()),
+        ..Default::default()
+    });
+
+    assert_eq!(report.solutions.len(), 1);
+    assert_eq!(report.stats.outcome, AllSatOutcome::Exhaustive);
+}
+
+#[test]
+fn report_and_fallible_collection_expose_a_cap() {
+    let config = AllSatConfig {
+        max_solutions: Some(1),
+        ..Default::default()
+    };
+    let mut report_solver = AllSatSolver::new();
+    report_solver.add_clause(vec![1, -1]);
+    let report = report_solver.enumerate_report_with_config(config.clone());
+    assert_eq!(report.solutions.len(), 1);
+    assert_eq!(report.stats.outcome, AllSatOutcome::Capped);
+
+    let mut exact_solver = AllSatSolver::new();
+    exact_solver.add_clause(vec![1, -1]);
+    let error = exact_solver.try_enumerate_with_config(config).unwrap_err();
+    assert_eq!(error.outcome, AllSatOutcome::Capped);
+    assert_eq!(error.solutions_found, 1);
+}
+
+#[test]
+fn signed_clause_boundaries_are_typed_and_legacy_calls_fail_closed() {
+    let mut solver = AllSatSolver::new();
+    assert_eq!(
+        solver.try_add_clause(vec![0]).unwrap_err(),
+        AllSatInputError::InvalidClauseLiteral(0)
+    );
+    assert_eq!(
+        solver.try_add_clause(vec![i32::MIN]).unwrap_err(),
+        AllSatInputError::InvalidClauseLiteral(i32::MIN)
+    );
+
+    // `try_add_clause` is non-mutating on error, so a later valid formula is
+    // still usable.
+    solver.try_add_clause(vec![1]).unwrap();
+    assert_eq!(solver.try_enumerate().unwrap().len(), 1);
+
+    let mut compatibility_solver = AllSatSolver::new();
+    compatibility_solver.add_clause(vec![0]);
+    let report = compatibility_solver.enumerate_report();
+    assert!(report.solutions.is_empty());
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(
+        report.stats.input_error,
+        Some(AllSatInputError::InvalidClauseLiteral(0))
+    );
+}
+
+#[test]
+fn sparse_high_internal_identifier_is_rejected_before_dense_allocation() {
+    let mut solver = AllSatSolver::new();
+    assert_eq!(
+        solver.try_add_clause(vec![i32::MAX]).unwrap_err(),
+        AllSatInputError::InternalVariableIndexExceedsLimit {
+            variable: i32::MAX as u32,
+            max_variable: MAX_INTERNAL_VARIABLE_INDEX,
+        }
+    );
+
+    solver.add_clause(vec![i32::MAX]);
+    let report = solver.enumerate_report();
+    assert!(report.solutions.is_empty());
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(report.stats.sat_calls, 0);
+}
+
+#[test]
+fn cap_probe_distinguishes_exact_boundary_from_an_additional_model() {
+    let config = AllSatConfig {
+        max_solutions: Some(1),
+        ..Default::default()
+    };
+
+    let mut exact = AllSatSolver::new();
+    exact.add_clause(vec![1]);
+    let exact_report = exact.enumerate_report_with_config(config.clone());
+    assert_eq!(exact_report.solutions.len(), 1);
+    assert_eq!(exact_report.stats.outcome, AllSatOutcome::Exhaustive);
+    assert_eq!(exact_report.stats.allsat_cap_hits, 0);
+    assert_eq!(exact_report.stats.sat_calls, 2);
+
+    let mut over = AllSatSolver::new();
+    over.add_clause(vec![1, -1]);
+    let over_report = over.enumerate_report_with_config(config);
+    assert_eq!(over_report.solutions.len(), 1);
+    assert_eq!(over_report.stats.outcome, AllSatOutcome::Capped);
+    assert_eq!(over_report.stats.allsat_cap_hits, 1);
+    assert_eq!(over_report.stats.sat_calls, 2);
 }
 
 #[test]
@@ -104,19 +307,19 @@ fn test_count() {
     // (x1 OR x2) - has 3 solutions
     solver.add_clause(vec![1, 2]);
 
-    assert_eq!(solver.count(), 3);
+    assert_eq!(solver.count().unwrap(), 3);
 }
 
 #[test]
 fn test_is_sat() {
     let mut solver = AllSatSolver::new();
     solver.add_clause(vec![1, 2]);
-    assert!(solver.is_sat());
+    assert!(solver.is_sat().unwrap());
 
     let mut solver2 = AllSatSolver::new();
     solver2.add_clause(vec![1]);
     solver2.add_clause(vec![-1]);
-    assert!(!solver2.is_sat());
+    assert!(!solver2.is_sat().unwrap());
 }
 
 #[test]
@@ -124,12 +327,12 @@ fn test_unique_solution() {
     let mut solver = AllSatSolver::new();
     solver.add_clause(vec![1]);
     solver.add_clause(vec![2]);
-    assert!(solver.has_unique_solution());
+    assert!(solver.has_unique_solution().unwrap());
 
     let mut solver2 = AllSatSolver::new();
     solver2.add_clause(vec![1, 2]);
     solver2.add_clause(vec![-1, -2]);
-    assert!(!solver2.has_unique_solution()); // Has 2 solutions
+    assert!(!solver2.has_unique_solution().unwrap()); // Has 2 solutions
 }
 
 #[test]
@@ -151,24 +354,53 @@ fn test_iterator_early_termination() {
 
 #[test]
 fn test_solution_to_literals() {
-    let solution = Solution {
-        assignment: vec![false, true, false, true], // x1=T, x2=F, x3=T
-    };
+    let solution = Solution::new(
+        vec![false, true, false, true], // x1=T, x2=F, x3=T
+        SolutionIndexing::OneBased,
+    );
 
-    let lits = solution.to_literals(&[1, 2, 3]);
+    let lits = solution.to_literals(&[1, 2, 3]).unwrap();
     assert_eq!(lits, vec![1, -2, 3]);
 }
 
 #[test]
-fn test_solution_satisfies() {
-    let solution = Solution {
-        assignment: vec![false, true, false], // x1=T, x2=F
-    };
+fn solution_to_literals_rejects_unrepresentable_variables() {
+    let solution = Solution::new(vec![false, true], SolutionIndexing::OneBased);
 
-    assert!(solution.satisfies(1)); // x1 is true
-    assert!(!solution.satisfies(-1)); // NOT x1 is false
-    assert!(!solution.satisfies(2)); // x2 is false
-    assert!(solution.satisfies(-2)); // NOT x2 is true
+    assert_eq!(
+        solution.to_literals(&[0]).unwrap_err(),
+        SolutionLiteralError::VariableOutOfRange(0)
+    );
+    assert_eq!(
+        solution.to_literals(&[i32::MAX as u32 + 1]).unwrap_err(),
+        SolutionLiteralError::VariableOutOfRange(i32::MAX as u32 + 1)
+    );
+    assert_eq!(
+        solution.to_literals(&[2]).unwrap_err(),
+        SolutionLiteralError::VariableMissing(2)
+    );
+}
+
+#[test]
+fn test_solution_satisfies() {
+    let solution = Solution::new(
+        vec![false, true, false], // x1=T, x2=F
+        SolutionIndexing::OneBased,
+    );
+
+    assert!(solution.satisfies(1).unwrap()); // x1 is true
+    assert!(!solution.satisfies(-1).unwrap()); // NOT x1 is false
+    assert!(!solution.satisfies(2).unwrap()); // x2 is false
+    assert!(solution.satisfies(-2).unwrap()); // NOT x2 is true
+    assert_eq!(solution.is_true(99), None);
+    assert_eq!(
+        solution.satisfies(-99).unwrap_err(),
+        SolutionLiteralError::VariableMissing(99)
+    );
+    assert_eq!(
+        solution.satisfies(i32::MIN).unwrap_err(),
+        SolutionLiteralError::VariableOutOfRange(i32::MIN.unsigned_abs())
+    );
 }
 
 #[test]
@@ -278,6 +510,166 @@ fn test_from_solver_basic() {
 }
 
 #[test]
+fn external_enumeration_is_scoped_repeatable_and_zero_based() {
+    use ay_sat::{Literal, Solver as SatSolver, Variable};
+
+    let mut sat = SatSolver::new(2);
+    sat.add_clause(vec![
+        Literal::positive(Variable::new(0)),
+        Literal::positive(Variable::new(1)),
+    ]);
+    sat.add_clause(vec![
+        Literal::negative(Variable::new(0)),
+        Literal::negative(Variable::new(1)),
+    ]);
+
+    let mut solver = AllSatSolver::from_solver(sat);
+    let first = solver.try_enumerate().unwrap();
+    assert_eq!(first.len(), 2);
+    for solution in &first {
+        assert_eq!(solution.indexing(), SolutionIndexing::ZeroBased);
+        assert_eq!(solution.assignment.len(), 2);
+        assert!(solution.get(0).is_some());
+        assert_eq!(
+            solution.to_literals(&[1]).unwrap_err(),
+            SolutionLiteralError::IndexingMismatch(SolutionIndexing::ZeroBased)
+        );
+        assert_eq!(
+            solution.satisfies(1).unwrap_err(),
+            SolutionLiteralError::IndexingMismatch(SolutionIndexing::ZeroBased)
+        );
+    }
+
+    // Scoped blockers are removed after exhaustion, so all queries see the
+    // original external formula.
+    assert_eq!(solver.try_enumerate().unwrap().len(), 2);
+    assert!(solver.is_sat().unwrap());
+
+    {
+        let mut iter = solver.iter();
+        assert!(iter.next().is_some());
+        assert_eq!(iter.outcome(), AllSatOutcome::InProgress);
+        // Drop before exhaustion; Drop must retract the active blocker scope.
+    }
+    assert_eq!(solver.stats().outcome, AllSatOutcome::IteratorDropped);
+    assert_eq!(solver.try_enumerate().unwrap().len(), 2);
+}
+
+#[test]
+fn external_callback_panic_retracts_blocking_scope() {
+    use ay_sat::{Literal, Solver as SatSolver, Variable};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let mut sat = SatSolver::new(1);
+    sat.add_clause(vec![
+        Literal::positive(Variable::new(0)),
+        Literal::negative(Variable::new(0)),
+    ]);
+    let mut solver = AllSatSolver::from_solver(sat);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        solver.enumerate_with_callback(AllSatConfig::default(), |_| {
+            panic!("intentional callback panic")
+        });
+    }));
+    assert!(panic.is_err());
+    assert_eq!(solver.stats().outcome, AllSatOutcome::IteratorDropped);
+    assert_eq!(solver.try_enumerate().unwrap().len(), 2);
+}
+
+#[test]
+fn external_solver_can_be_recovered_after_early_iterator_drop() {
+    use ay_sat::{Literal, SatResult, Solver as SatSolver, Variable};
+
+    let mut sat = SatSolver::new(1);
+    sat.add_clause(vec![Literal::positive(Variable::new(0))]);
+    let mut allsat = AllSatSolver::from_solver(sat);
+    {
+        let mut iter = allsat.iter();
+        assert!(iter.next().is_some());
+    }
+
+    let mut recovered = allsat
+        .try_into_solver()
+        .unwrap_or_else(|_allsat| panic!("external backend must be recoverable"));
+    assert!(matches!(recovered.solve().into_inner(), SatResult::Sat(_)));
+}
+
+#[test]
+fn external_scope_pop_failure_is_reported_as_invalid_input() {
+    use ay_sat::Solver as SatSolver;
+
+    let mut solver = AllSatSolver::from_solver(SatSolver::new(1));
+    {
+        let mut iter = solver.iter();
+        let SolverBackend::External(sat_solver) = &mut iter.solver.backend else {
+            unreachable!("test constructed the external backend")
+        };
+        assert!(sat_solver.pop(), "iterator must have pushed a scope");
+        iter.finish(AllSatOutcome::Exhaustive);
+        assert_eq!(iter.outcome(), AllSatOutcome::InvalidInput);
+        assert_eq!(
+            iter.run_stats.input_error,
+            Some(AllSatInputError::BackendScopePopFailed)
+        );
+    }
+    assert_eq!(solver.stats().outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(
+        solver.stats().input_error,
+        Some(AllSatInputError::BackendScopePopFailed)
+    );
+    let report = solver.enumerate_report();
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(report.stats.sat_calls, 0);
+    assert!(
+        solver.try_into_solver().is_err(),
+        "a solver whose enumeration scope could not be retracted must not be exposed"
+    );
+}
+
+#[test]
+fn external_projection_rejects_variables_at_or_above_user_count() {
+    use ay_sat::Solver as SatSolver;
+
+    let mut solver = AllSatSolver::from_solver(SatSolver::new(2));
+    let report = solver.enumerate_report_with_config(AllSatConfig {
+        projection: Some(vec![2]),
+        ..Default::default()
+    });
+
+    assert!(report.solutions.is_empty());
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(
+        report.stats.input_error,
+        Some(AllSatInputError::ExternalProjectionVariableOutOfRange {
+            variable: 2,
+            variable_count: 2,
+        })
+    );
+    assert_eq!(report.stats.sat_calls, 0);
+}
+
+#[test]
+fn signed_clause_addition_is_rejected_for_external_backends() {
+    use ay_sat::Solver as SatSolver;
+
+    let mut solver = AllSatSolver::from_solver(SatSolver::new(1));
+    assert_eq!(
+        solver.try_add_clause(vec![1]).unwrap_err(),
+        AllSatInputError::ClauseAdditionUnsupportedBackend
+    );
+
+    solver.add_clause(vec![1]);
+    let report = solver.enumerate_report();
+    assert!(report.solutions.is_empty());
+    assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
+    assert_eq!(
+        report.stats.input_error,
+        Some(AllSatInputError::ClauseAdditionUnsupportedBackend)
+    );
+}
+
+#[test]
 fn test_from_solver_projected() {
     use ay_sat::{Literal, Solver as SatSolver, Variable};
 
@@ -301,7 +693,7 @@ fn test_from_solver_projected() {
         1,
         "Projected to x0, only one distinct assignment"
     );
-    assert!(solutions[0].is_true(0));
+    assert_eq!(solutions[0].is_true(0), Some(true));
 }
 
 #[test]
@@ -316,6 +708,79 @@ fn test_from_solver_unsat() {
     let mut solver = AllSatSolver::from_solver(sat);
     let solutions = solver.enumerate();
     assert_eq!(solutions.len(), 0);
+}
+
+fn conflict_budget_exhausted_solver() -> AllSatSolver {
+    // Pigeonhole 5 -> 4 is small but requires search. A zero conflict budget
+    // therefore deterministically stops at the first search conflict.
+    const PIGEONS: usize = 5;
+    const HOLES: usize = 4;
+    let mut sat = SatSolver::new(PIGEONS * HOLES);
+    for pigeon in 0..PIGEONS {
+        sat.add_clause(
+            (0..HOLES)
+                .map(|hole| Literal::positive(Variable::new((pigeon * HOLES + hole) as u32)))
+                .collect(),
+        );
+    }
+    for hole in 0..HOLES {
+        for first in 0..PIGEONS {
+            for second in first + 1..PIGEONS {
+                sat.add_clause(vec![
+                    Literal::negative(Variable::new((first * HOLES + hole) as u32)),
+                    Literal::negative(Variable::new((second * HOLES + hole) as u32)),
+                ]);
+            }
+        }
+    }
+    sat.set_preprocess_enabled(false);
+    sat.set_conflict_budget(Some(0));
+    AllSatSolver::from_solver(sat)
+}
+
+#[test]
+fn callback_reports_backend_unknown() {
+    let mut solver = conflict_budget_exhausted_solver();
+    let stats = solver.enumerate_with_callback(AllSatConfig::default(), |_| true);
+
+    assert_eq!(stats.outcome, AllSatOutcome::SolverUnknown);
+    assert_eq!(stats.solutions_found, 0);
+    assert_eq!(stats.sat_calls, 1);
+    assert_eq!(solver.stats().outcome, AllSatOutcome::SolverUnknown);
+}
+
+#[test]
+fn iterator_is_terminal_after_backend_unknown() {
+    let mut solver = conflict_budget_exhausted_solver();
+    {
+        let mut iter = solver.iter();
+        assert!(iter.next().is_none());
+        assert_eq!(iter.outcome(), AllSatOutcome::SolverUnknown);
+        assert!(iter.next().is_none());
+    }
+
+    assert_eq!(solver.stats().sat_calls, 1);
+    assert_eq!(solver.stats().outcome, AllSatOutcome::SolverUnknown);
+}
+
+#[test]
+fn enumeration_predicates_fail_closed_on_backend_unknown() {
+    let mut count_solver = conflict_budget_exhausted_solver();
+    let count_error = count_solver.count().unwrap_err();
+    assert_eq!(count_error.outcome, AllSatOutcome::SolverUnknown);
+    assert_eq!(count_error.solutions_found, 0);
+
+    let mut sat_solver = conflict_budget_exhausted_solver();
+    assert_eq!(
+        sat_solver.is_sat().unwrap_err().outcome,
+        AllSatOutcome::SolverUnknown
+    );
+
+    let mut unique_solver = conflict_budget_exhausted_solver();
+    assert_eq!(
+        unique_solver.has_unique_solution().unwrap_err().outcome,
+        AllSatOutcome::SolverUnknown
+    );
 }
 
 // ==========================================================================
@@ -353,6 +818,27 @@ fn test_enumerate_with_callback_early_stop() {
 
     assert_eq!(count, 2);
     assert_eq!(stats.solutions_found, 2);
+    assert_eq!(stats.outcome, AllSatOutcome::CallbackStopped);
+    assert_eq!(solver.stats().outcome, AllSatOutcome::CallbackStopped);
+}
+
+#[test]
+fn test_exhausted_iterator_does_not_resolve() {
+    let mut solver = AllSatSolver::new();
+    solver.add_clause(vec![1]);
+
+    {
+        let mut iter = solver.iter();
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    // One SAT call finds the model and one proves exhaustion. Repeated calls
+    // after `None` must be side-effect free.
+    assert_eq!(solver.stats().sat_calls, 2);
+    assert_eq!(solver.stats().outcome, AllSatOutcome::Exhaustive);
 }
 
 #[test]
@@ -392,7 +878,7 @@ fn test_enumerate_with_callback_projected() {
         true
     });
     assert_eq!(collected.len(), 1);
-    assert!(collected[0].is_true(1));
+    assert_eq!(collected[0].is_true(1), Some(true));
 }
 
 #[test]
@@ -509,6 +995,7 @@ fn test_iterator_cap_hit_increments_stats() {
     };
     let mut iter = solver.iter_with_config(config);
     while iter.next().is_some() {}
+    drop(iter);
 
     // Stats should record the cap hit
     assert_eq!(solver.stats().allsat_cap_hits, 1);
@@ -578,7 +1065,7 @@ fn test_xor_chain() {
 
     // Verify each solution has odd parity
     for sol in &solutions {
-        let count = (1..=3).filter(|&v| sol.is_true(v)).count();
+        let count = (1..=3).filter(|&v| sol.is_true(v) == Some(true)).count();
         assert!(count % 2 == 1, "XOR chain should have odd parity");
     }
 }

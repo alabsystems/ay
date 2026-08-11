@@ -12051,7 +12051,7 @@ mod post_filter_census_tests {
     #[test]
     fn the_census_helper_decides_exactly_what_the_bare_comparison_did() {
         let mut seed = 0x00C6_F117_u64;
-        let mut rnd = |s: &mut u64| {
+        let rnd = |s: &mut u64| {
             *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             ((*s >> 33) as f64 / (1u64 << 31) as f64) - 0.5
         };

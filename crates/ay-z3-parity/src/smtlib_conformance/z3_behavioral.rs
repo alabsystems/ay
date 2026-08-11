@@ -31,16 +31,20 @@ const STREAM_LIMIT: usize = 1024 * 1024;
 const ARTIFACT_FILE_LIMIT: usize = 256;
 const ARTIFACT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 const TACTIC_COUNT: usize = 118;
+#[cfg(test)]
 const Z3_5_HELP_FIXTURE_SHA256: &str =
     "26765e7d789867158b226672f183d9a28a1ce65d07a4ed46465b275a33f48e5b";
+#[cfg(test)]
 const Z3_5_HELP_SIMPLIFIER_FIXTURE_SHA256: &str =
     "b274b48cbd8722b061f8d69e0af7ff0e8734d06287c3e8a712369d66911c9c92";
+#[cfg(test)]
 const Z3_5_HELP_TACTIC_FIXTURE_SHA256: &str =
     "10b8bedc54c73b8943fae20aaee07b1117940cd38b86edba2183110facb29ca6";
 const BASE_CASE_COUNT: usize = 338;
 const EXPECTED_SOURCE_OWNER_COUNT: usize = z3_source_inventory::EXPECTED_OBSERVABLE_ITEMS;
 const EXPECTED_CASE_COUNT: usize = BASE_CASE_COUNT + EXPECTED_SOURCE_OWNER_COUNT;
 const EXPECTED_UNRESOLVED_COMMAND_OWNERS: usize = 57;
+#[cfg(test)]
 const EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERS: usize = 63;
 const EXPECTED_UNRESOLVED_SOURCE_OWNERS: usize = 301;
 const EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS: usize = 496;
@@ -49,6 +53,7 @@ const EXPECTED_OWNERSHIP_SHA256: &str =
     "03c1110cf963723ebb37c64c292bb0435f1fc86487818a286a5799bb03121fac";
 const EXPECTED_AUDITED_GAP_UNIVERSE_OWNERSHIP_SHA256: &str =
     "a11767c6a15546d1739add25a4e10ce5487269e58db88f8969e0a20c8c2c31d4";
+#[cfg(test)]
 const EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERSHIP_SHA256: &str =
     "80fa62d97c35766652f1841ae4dfe541aade80cdf2052ff754a7ace81c7f0260";
 const EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERSHIP_SHA256: &str =
@@ -1020,7 +1025,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("z3-behavioral timeout must be between 1ns and 3600 seconds".to_string());
     }
     let subject = contract
@@ -1412,15 +1417,16 @@ fn capture_artifact_manifest(
 }
 
 fn artifact_manifest_text(artifacts: &[ArtifactObservation]) -> String {
-    artifacts
-        .iter()
-        .map(|artifact| {
-            format!(
-                "{}\t{}\t{}\n",
-                artifact.path, artifact.size, artifact.sha256
-            )
-        })
-        .collect()
+    let mut manifest = String::new();
+    for artifact in artifacts {
+        manifest.push_str(&artifact.path);
+        manifest.push('\t');
+        manifest.push_str(&artifact.size.to_string());
+        manifest.push('\t');
+        manifest.push_str(&artifact.sha256);
+        manifest.push('\n');
+    }
+    manifest
 }
 
 fn row_from_pair(
@@ -2939,6 +2945,7 @@ fn ownership_sha256(cases: &[CaseSpec]) -> String {
     sha256_bytes(lines.concat().as_bytes())
 }
 
+#[cfg(test)]
 fn unresolved_ownership_sha256(cases: &[CaseSpec]) -> String {
     let mut lines = cases
         .iter()

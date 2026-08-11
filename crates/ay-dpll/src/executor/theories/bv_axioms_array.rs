@@ -4496,12 +4496,12 @@ impl Executor {
             }
             if packed_debug {
                 safe_eprintln!(
-                "[abv-packed-mux] candidates={} emitted_clauses={} candidate_limit_hit={} clause_limit_hit={}",
-                mux_bridge_candidates.len(),
-                mux_emitted_clauses,
-                mux_bridge_candidates.len() >= PACKED_MUX_BRIDGE_CANDIDATE_LIMIT,
-                mux_clause_limit_hit
-            );
+                    "[abv-packed-mux] candidates={} emitted_clauses={} candidate_limit_hit={} clause_limit_hit={}",
+                    mux_bridge_candidates.len(),
+                    mux_emitted_clauses,
+                    mux_bridge_candidates.len() >= PACKED_MUX_BRIDGE_CANDIDATE_LIMIT,
+                    mux_clause_limit_hit
+                );
             }
         }
 

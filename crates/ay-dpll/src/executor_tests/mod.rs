@@ -35,6 +35,7 @@ mod lra_lazy_session;
 mod lra_opt_certificates;
 mod map;
 mod model;
+mod model_roundtrip;
 mod multiset;
 mod mv_printer;
 mod no_fabricated_values;

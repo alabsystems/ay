@@ -26,13 +26,9 @@ use super::super::Executor;
 use super::solve_harness::TheoryModels;
 use super::MAX_SPLITS_LIA;
 use crate::combined_solvers::{UfSeqLiaSolver, UfSeqSolver};
-use crate::ematching::collect_quantifiers;
-use crate::executor::model::Model;
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
-use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::{Symbol, TermData, TermId};
-use num_bigint::BigInt;
 
 impl Executor {
     /// Solve using the combined EUF+Seq theory (QF_SEQ).
@@ -392,31 +388,6 @@ impl Executor {
                     || solve_deadline.expired()
             }
         );
-        if matches!(result, Ok(SolveResult::Unknown))
-            && features.has_int_div_mod
-            && !self.assertions_contain_native_seq_ops()
-            && self.quantifier_consumer_seq_mod_completion_candidate()
-        {
-            self.last_model = Some(Model {
-                sat_model: Vec::new(),
-                term_to_var: HashMap::default(),
-                bool_overrides: HashMap::default(),
-                euf_model: None,
-                array_model: None,
-                lra_model: None,
-                lia_model: None,
-                bv_model: None,
-                fp_model: None,
-                string_model: None,
-                seq_model: None,
-                completed_values: HashMap::default(),
-                dt_ground: HashMap::default(),
-                dt_pins: HashMap::default(),
-            });
-            self.last_model_validated = true;
-            self.last_unknown_reason = None;
-            return Ok(SolveResult::Sat);
-        }
         result
     }
 
@@ -631,127 +602,6 @@ impl Executor {
             }
         }
         false
-    }
-
-    fn quantifier_consumer_seq_mod_completion_candidate(&mut self) -> bool {
-        if self.assertions_have_simple_int_contradiction(&self.ctx.assertions) {
-            return false;
-        }
-
-        let mut saw_quantifier = false;
-        let mut quantifiers = Vec::new();
-        for assertion in self.ctx.assertions.clone() {
-            quantifiers.clear();
-            collect_quantifiers(&mut self.ctx.terms, assertion, &mut quantifiers);
-            if quantifiers.is_empty() {
-                if !self.quantifier_consumer_ground_assertion_supported_by_completion(assertion) {
-                    return false;
-                }
-                continue;
-            }
-            saw_quantifier = true;
-            if quantifiers
-                .iter()
-                .any(|&quantifier| !self.quantifier_supported_by_uf_completion(quantifier))
-            {
-                return false;
-            }
-        }
-
-        if !saw_quantifier {
-            return false;
-        }
-
-        if self.has_forced_concrete_quantifier_consumer_mod_contradiction() {
-            return false;
-        }
-
-        true
-    }
-
-    pub(in crate::executor) fn has_forced_concrete_quantifier_consumer_mod_contradiction(
-        &self,
-    ) -> bool {
-        let equalities = self.quantifier_consumer_ground_equalities();
-        for &assertion in &self.ctx.assertions {
-            let body = match self.ctx.terms.get(assertion) {
-                TermData::Forall(_, body, _) => *body,
-                _ => assertion,
-            };
-            let Some((uf_term, mod_term)) = self.quantifier_consumer_mod_definition_sides(body)
-            else {
-                continue;
-            };
-            let Some(uf_value) = equalities.get(&uf_term) else {
-                continue;
-            };
-            let TermData::App(_, mod_args) = self.ctx.terms.get(mod_term) else {
-                continue;
-            };
-            let Some(dividend) = equalities.get(&mod_args[0]) else {
-                continue;
-            };
-            let Some(divisor) = equalities.get(&mod_args[1]) else {
-                continue;
-            };
-            if divisor == &BigInt::from(0) {
-                continue;
-            }
-            let expected = ((dividend % divisor) + divisor) % divisor;
-            if &expected != uf_value {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn quantifier_consumer_mod_definition_sides(&self, body: TermId) -> Option<(TermId, TermId)> {
-        let TermData::App(sym, args) = self.ctx.terms.get(body) else {
-            return None;
-        };
-        if sym.name() != "=" || args.len() != 2 {
-            return None;
-        }
-        self.quantifier_consumer_mod_definition_ordered(args[0], args[1])
-            .or_else(|| self.quantifier_consumer_mod_definition_ordered(args[1], args[0]))
-    }
-
-    fn quantifier_consumer_mod_definition_ordered(
-        &self,
-        uf_term: TermId,
-        mod_term: TermId,
-    ) -> Option<(TermId, TermId)> {
-        let TermData::App(uf_sym, uf_args) = self.ctx.terms.get(uf_term) else {
-            return None;
-        };
-        let TermData::App(mod_sym, mod_args) = self.ctx.terms.get(mod_term) else {
-            return None;
-        };
-        (uf_sym.name() == "logic_bucket__ix"
-            && uf_args.len() == 2
-            && mod_sym.name() == "mod"
-            && mod_args.len() == 2)
-            .then_some((uf_term, mod_term))
-    }
-
-    fn quantifier_consumer_ground_equalities(&self) -> HashMap<TermId, BigInt> {
-        let mut equalities = HashMap::default();
-        for &assertion in &self.ctx.assertions {
-            let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
-                continue;
-            };
-            if sym.name() != "=" || args.len() != 2 {
-                continue;
-            }
-            for (term, value_term) in [(args[0], args[1]), (args[1], args[0])] {
-                if let TermData::Const(ay_core::Constant::Int(value)) =
-                    self.ctx.terms.get(value_term)
-                {
-                    equalities.insert(term, value.clone());
-                }
-            }
-        }
-        equalities
     }
 
     /// Check whether live assertions contain active datatype operations.

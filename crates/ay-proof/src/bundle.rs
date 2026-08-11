@@ -15,14 +15,17 @@
 //! The bundle carries only what the strict checker reads: the ordered proof
 //! steps, a positional `(TermData, Sort)` term table (so every embedded
 //! [`TermId`] resolves), the boolean-constant ids, the variable counter, and the
-//! problem's asserted obligation term ids (so a consumer can bind the proof's
+//! proof-authorized obligation term ids (so a consumer can bind the proof's
 //! `assume` axioms to the obligation it claims to discharge), and the datatype
-//! declaration context needed by the corresponding strict proof rules.
+//! declaration context needed by the corresponding strict proof rules. The
+//! obligation ids may be an authenticated UNSAT-core subset of the producer's
+//! full assertion list.
 //!
 //! Re-checking establishes that the bundle is internally sound; it does NOT
 //! authenticate the producer's claimed problem context. A consumer binding a
-//! schema-v2 bundle to an independently obtained problem must compare the
-//! assertions together with `datatype_declarations`, `constructor_selectors`,
+//! schema-v2 bundle to an independently obtained problem must verify that every
+//! obligation assertion is a member of the intended problem and compare
+//! `datatype_declarations`, `constructor_selectors`,
 //! and the complete free-symbol declaration context (exact named/indexed
 //! identity plus argument and result sorts). Canonical assertion text alone is
 //! insufficient: the same printed term can acquire different meaning from a
@@ -66,8 +69,10 @@ pub struct SerializableProofBundle {
     pub false_term: Option<TermId>,
     /// Variable counter at export time (book-keeping; not read by the checker).
     pub var_counter: u32,
-    /// The problem's asserted obligation term ids (the formulas the solver was
-    /// asked to refute). A consumer binds the proof's `assume` axioms to these.
+    /// Proof-authorized obligation term ids. These may be an authenticated
+    /// UNSAT-core subset of the full formulas submitted to the solver. A
+    /// consumer binds the proof's `assume` axioms to these and must verify that
+    /// every entry belongs to the intended external problem.
     pub obligation_assertions: Vec<TermId>,
     /// Datatype declarations needed to validate constructor-distinctness
     /// lemmas: `(datatype_name, constructors)`.
@@ -90,7 +95,7 @@ pub struct BundleReCheck {
 }
 
 impl SerializableProofBundle {
-    /// Assemble a bundle from a live proof, its term store, and the asserted
+    /// Assemble a bundle from a live proof, its term store, and the authorized
     /// obligation term ids. Snapshots the checker-relevant term table.
     ///
     /// `terms` must be a real solver store (true/false constants initialized);

@@ -457,42 +457,46 @@ impl Context {
         bound_sort_parameters: &[String],
     ) -> Result<()> {
         match sort {
-            ParsedSort::Simple(name) if bound_sort_parameters.contains(name) => return Ok(()),
-            ParsedSort::Simple(name) if self.sort_parameters.contains(name) => return Ok(()),
-            ParsedSort::Simple(name) if name == "Bool" => return Ok(()),
+            ParsedSort::Simple(name) if bound_sort_parameters.contains(name) => Ok(()),
+            ParsedSort::Simple(name) if self.sort_parameters.contains(name) => Ok(()),
+            ParsedSort::Simple(name) if name == "Bool" => Ok(()),
             ParsedSort::Simple(name) if name == "Int" => {
                 if policy.arithmetic.has_integers() {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    logic_violation(logic, "the integer theory is excluded")
                 }
-                return logic_violation(logic, "the integer theory is excluded");
             }
             ParsedSort::Simple(name) if name == "Real" => {
                 if policy.arithmetic.has_reals() {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    logic_violation(logic, "the real theory is excluded")
                 }
-                return logic_violation(logic, "the real theory is excluded");
             }
             ParsedSort::Simple(name) => {
                 if let Some(core) = self.sort_defs.get(name) {
-                    return self.validate_core_sort(logic, policy, core);
+                    Self::validate_core_sort(logic, policy, core)
+                } else if is_non_registry_theory_sort(name) {
+                    logic_violation(logic, "an excluded theory sort is used")
+                } else if policy.expansion == ExpansionPolicy::ConstantsOnly {
+                    logic_violation(logic, "free sorts are excluded")
+                } else {
+                    Ok(())
                 }
-                if is_non_registry_theory_sort(name) {
-                    return logic_violation(logic, "an excluded theory sort is used");
-                }
-                if policy.expansion == ExpansionPolicy::ConstantsOnly {
-                    return logic_violation(logic, "free sorts are excluded");
-                }
-                return Ok(());
             }
             ParsedSort::Indexed(name, indices) if name == "BitVec" => {
                 if !policy.bitvectors {
-                    return logic_violation(logic, "the bit-vector theory is excluded");
+                    logic_violation(logic, "the bit-vector theory is excluded")
+                } else {
+                    let width =
+                        single_numeral_index(indices).and_then(|text| text.parse::<u64>().ok());
+                    if width == Some(0) {
+                        logic_violation(logic, "zero-width bit-vectors are excluded")
+                    } else {
+                        Ok(())
+                    }
                 }
-                let width = single_numeral_index(indices).and_then(|text| text.parse::<u64>().ok());
-                if width == Some(0) {
-                    return logic_violation(logic, "zero-width bit-vectors are excluded");
-                }
-                return Ok(());
             }
             ParsedSort::Parameterized(name, arguments) if name == "Array" => {
                 if arguments.len() != 2 || policy.arrays == ArrayPolicy::None {
@@ -505,7 +509,7 @@ impl Context {
                 for argument in arguments {
                     self.validate_logic_sort(logic, policy, argument, bound_sort_parameters)?;
                 }
-                return Ok(());
+                Ok(())
             }
             ParsedSort::Parameterized(name, arguments) => {
                 if is_non_registry_theory_sort(name) {
@@ -517,15 +521,13 @@ impl Context {
                 for argument in arguments {
                     self.validate_logic_sort(logic, policy, argument, bound_sort_parameters)?;
                 }
-                return Ok(());
+                Ok(())
             }
-            ParsedSort::Indexed(_, _) => {
-                return logic_violation(logic, "an excluded indexed sort is used");
-            }
+            ParsedSort::Indexed(_, _) => logic_violation(logic, "an excluded indexed sort is used"),
         }
     }
 
-    fn validate_core_sort(&self, logic: &str, policy: LogicPolicy, sort: &CoreSort) -> Result<()> {
+    fn validate_core_sort(logic: &str, policy: LogicPolicy, sort: &CoreSort) -> Result<()> {
         match sort {
             CoreSort::Bool => Ok(()),
             CoreSort::Int if policy.arithmetic.has_integers() => Ok(()),
@@ -537,8 +539,8 @@ impl Context {
                 {
                     return logic_violation(logic, "the array sort is outside the logic language");
                 }
-                self.validate_core_sort(logic, policy, &array.index_sort)?;
-                self.validate_core_sort(logic, policy, &array.element_sort)
+                Self::validate_core_sort(logic, policy, &array.index_sort)?;
+                Self::validate_core_sort(logic, policy, &array.element_sort)
             }
             CoreSort::Uninterpreted(_) if policy.expansion != ExpansionPolicy::ConstantsOnly => {
                 Ok(())
@@ -738,13 +740,12 @@ impl Context {
                     return logic_violation(logic, "mixed integer/real coercions are excluded");
                 }
             }
-            "<" | "<=" | ">" | ">=" | "=" => {
+            "<" | "<=" | ">" | ">=" | "="
                 if policy.arithmetic.is_difference()
                     && arguments.iter().any(is_arithmetic_root)
-                    && !is_difference_atom(arguments)
-                {
-                    return logic_violation(logic, "the atom is outside difference logic");
-                }
+                    && !is_difference_atom(arguments) =>
+            {
+                return logic_violation(logic, "the atom is outside difference logic");
             }
             _ => {}
         }

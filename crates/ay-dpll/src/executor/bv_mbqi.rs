@@ -32,6 +32,7 @@ use ay_core::{BitVecSort, Sort, Symbol, TermData, TermId, TermStore};
 use num_bigint::BigInt;
 
 use super::model::EvalValue;
+use super::quantifier_loop::result_mapping::CheckedGroundDecision;
 use super::Executor;
 use crate::ematching::subst_vars;
 use crate::executor_types::{Result, SolveResult};
@@ -54,7 +55,7 @@ const BV_EXHAUSTIVE_MAX_WIDTH: u32 = 8;
 /// and Sat cannot be concluded (fail-closed).
 const BV_EXHAUSTIVE_TOTAL_CAP: u64 = 1 << 16;
 
-/// Verdict of the SYMBOLIC, model-relative check of a single `forall`.
+/// Verdict of the symbolic entailment check of a single `forall`.
 ///
 /// Enumeration can only prove a `forall` by visiting every value of every
 /// binder, so it is confined to narrow binders (`BV_EXHAUSTIVE_MAX_WIDTH`).
@@ -62,17 +63,113 @@ const BV_EXHAUSTIVE_TOTAL_CAP: u64 = 1 << 16;
 /// regardless of width — a width-32 binder is 4.3 billion values to enumerate
 /// but an ordinary bit-blasted query to refute.
 enum BvForallCheck {
-    /// The skolemized negation is UNSAT under the pinned model ⇒ NO binder
-    /// value falsifies the body ⇒ the `forall` HOLDS under that model. This is
-    /// a proof over the binder's ENTIRE domain, exactly like an exhaustive
-    /// enumeration, so it carries the same authority to conclude Sat.
+    /// The ground premise conjoined with the skolemized negation has a sealed,
+    /// strict-proof UNSAT decision, so the premise entails the `forall` over
+    /// the binder's entire domain.
     Holds,
-    /// The negation is SAT: these binder values falsify the body under the
-    /// pinned model. A model-BASED counterexample — the "MB" in MBQI — rather
-    /// than a blind sample from the boundary heuristic.
-    Counterexample(Vec<TermId>),
     /// Undecided; fail closed to the enumeration path.
     Unknown,
+}
+
+/// Linear evidence that BV-MBQI discharged every quantified obligation in one
+/// exact authored root window over its complete binder domain.
+///
+/// Construction is private to this module. The query-authority boundary may
+/// consume the token, but no sibling module can mint it from a raw solver
+/// result, Boolean proof marker, or caller-selected root slice.
+#[must_use = "checked BV full-domain SAT authority must be consumed or discarded"]
+#[derive(Debug)]
+pub(in crate::executor) struct CheckedBvFullDomainSatAuthority {
+    query_epoch: crate::executor::QueryAuthorityEpoch,
+    source_context_stamp: ay_frontend::SourceContextStamp,
+    roots: Box<[TermId]>,
+    root_entries: Box<[Option<ay_core::term::TermEntryStamp>]>,
+}
+
+impl CheckedBvFullDomainSatAuthority {
+    fn for_current(executor: &Executor, roots: &[TermId]) -> Option<Self> {
+        let root_entries: Box<[Option<ay_core::term::TermEntryStamp>]> = roots
+            .iter()
+            .map(|&root| executor.ctx.terms.entry_stamp(root))
+            .collect();
+        (!roots.is_empty() && root_entries.iter().all(Option::is_some)).then(|| Self {
+            query_epoch: executor.query_authority_epoch.clone(),
+            source_context_stamp: executor.ctx.source_context_stamp(),
+            roots: roots.into(),
+            root_entries,
+        })
+    }
+
+    pub(in crate::executor) fn into_current_roots(
+        self,
+        executor: &Executor,
+    ) -> Option<Box<[TermId]>> {
+        (self
+            .query_epoch
+            .is_same_epoch(&executor.query_authority_epoch)
+            && self.source_context_stamp == executor.ctx.source_context_stamp()
+            && self.root_entries.iter().all(Option::is_some)
+            && self.root_entries.iter().copied().eq(self
+                .roots
+                .iter()
+                .map(|&root| executor.ctx.terms.entry_stamp(root))))
+        .then_some(self.roots)
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor) fn for_test(executor: &Executor, roots: &[TermId]) -> Self {
+        Self::for_current(executor, roots).expect("test roots must be live and nonempty")
+    }
+}
+
+/// Check that the roots bound into a BV authority token contain exactly the
+/// quantified obligations this refinement pass discharged. Ground siblings
+/// are allowed because their SAT/model evidence is checked by the ordinary
+/// emission funnel; any additional or missing quantifier prevents authority.
+fn authority_roots_exactly_cover_bv_foralls(
+    terms: &TermStore,
+    roots: &[TermId],
+    certified_foralls: &[TermId],
+) -> bool {
+    if roots.is_empty() || certified_foralls.is_empty() {
+        return false;
+    }
+    let certified: HashSet<TermId> = certified_foralls.iter().copied().collect();
+    if certified.len() != certified_foralls.len()
+        || certified
+            .iter()
+            .any(|&term| !matches!(terms.get(term), TermData::Forall(..)))
+    {
+        return false;
+    }
+
+    let mut found: HashSet<TermId> = HashSet::default();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut pending = roots.to_vec();
+    while let Some(term) = pending.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
+                found.insert(term);
+                pending.push(*body);
+            }
+            TermData::App(_, args) => pending.extend(args.iter().copied()),
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(condition, then_term, else_term) => {
+                pending.push(*condition);
+                pending.push(*then_term);
+                pending.push(*else_term);
+            }
+            TermData::Let(bindings, body) => {
+                pending.extend(bindings.iter().map(|(_, value)| *value));
+                pending.push(*body);
+            }
+            _ => {}
+        }
+    }
+    found == certified
 }
 
 /// BV boundary candidate generator.
@@ -149,6 +246,22 @@ impl BvCandidateGenerator {
 
         result
     }
+}
+
+/// Deterministic BV literal candidates for a checked false-instance search.
+///
+/// Candidate synthesis is completeness-only: callers must independently
+/// evaluate or solve every substituted instance before it can authorize a
+/// verdict. Keeping this helper beside BV-MBQI ensures the exact-source
+/// closed-forall lane uses the same width-normalized boundaries and
+/// body-constant neighbours as ordinary BV instantiation.
+pub(in crate::executor) fn synthesize_bv_refutation_candidates(
+    terms: &TermStore,
+    body: TermId,
+    width: u32,
+) -> Vec<BigInt> {
+    let body_constants = extract_bv_body_constants(terms, body, width);
+    BvCandidateGenerator::new(width, body_constants).boundary_candidates()
 }
 
 /// Analyze a quantifier body to extract BV constants used in comparisons.
@@ -258,47 +371,17 @@ fn all_vars_are_bv(vars: &[(String, Sort)]) -> bool {
 }
 
 impl Executor {
-    /// BV-specific MBQI refinement for quantified BV formulas.
+    /// Prove one BV `forall` from the current ground consequence set.
     ///
-    /// Called from `try_mbqi_refinement` when unhandled quantifiers have BV-sorted
-    /// bound variables. Uses BV boundary heuristics (0, MAX, body constants, model
-    /// neighbors) to generate targeted instantiations.
+    /// Skolemize the binders and check `G ∧ ¬body[skolems]`, where `G` is the
+    /// quantifier-free slice of the current assertions. A sealed strict-proof
+    /// UNSAT decision proves `G ⊨ forall binders. body`, over the full BV domain.
     ///
-    /// Returns `Some(result)` if BV-MBQI resolved the formula (SAT or UNSAT),
-    /// or `None` if it did not find a definitive result.
-    /// Decide one `forall` against the current model SYMBOLICALLY.
-    ///
-    /// Builds `x1 = M(x1) ∧ … ∧ xn = M(xn) ∧ ¬body[skolem]` and solves it as an
-    /// isolated ground problem:
-    ///
-    /// * **UNSAT** ⇒ no assignment to the binders falsifies the body while the
-    ///   model's symbols hold their values ⇒ the `forall` holds under the model.
-    /// * **SAT** ⇒ the skolem constants' values ARE a counterexample.
-    ///
-    /// ## Why the UNSAT direction is sound
-    ///
-    /// If `M_eqs ∧ ¬body[skolem]` is UNSAT then every assignment satisfying
-    /// `M_eqs` satisfies `body` for EVERY value of the skolems — the skolems are
-    /// fresh and unconstrained, so they range over the full domain. The model
-    /// satisfies its own equalities, so the `forall` holds under it.
-    ///
-    /// This argument does not depend on which symbols were pinned, which is what
-    /// makes it safe: pinning FEWER symbols only makes UNSAT harder to reach
-    /// (never wrongly reachable), so a symbol the model does not value simply
-    /// costs completeness. That is why only leaf symbols are pinned and never
-    /// compound terms — a set of equalities binding distinct variables to one
-    /// value each is satisfiable by construction, so the premise can never be
-    /// vacuously UNSAT and mint a `Holds` out of a contradictory pin set.
-    ///
-    /// ## Why the SAT direction is sound
-    ///
-    /// The instance is added conjunctively, and the caller only ever passes
-    /// foralls in conjunctive position, so any ground instance is ENTAILED by
-    /// the asserted universal: asserting it cannot turn a satisfiable problem
-    /// unsatisfiable. This holds even if the counterexample used a value for an
-    /// unpinned symbol that differs from the model's — an entailed instance is
-    /// always safe to add, it is merely less targeted.
-    fn bv_symbolic_model_check(
+    /// SAT is intentionally non-authoritative here. The old implementation
+    /// transported its nested model to extract a counterexample, but that model
+    /// was not bound to the enclosing query. SAT therefore falls through to the
+    /// ordinary, sound boundary/exhaustive enumeration path.
+    fn bv_symbolic_entailment_check(
         &mut self,
         vars: &[(String, Sort)],
         body: TermId,
@@ -312,14 +395,12 @@ impl Executor {
 
         // Skolemize the binders to fresh, unconstrained constants.
         let mut subst: HashMap<String, TermId> = HashMap::default();
-        let mut skolems: Vec<TermId> = Vec::with_capacity(vars.len());
         for (name, sort) in vars {
             let fresh = self
                 .ctx
                 .terms
                 .mk_fresh_var(&format!("bvmbqi!{name}"), sort.clone());
             subst.insert(name.clone(), fresh);
-            skolems.push(fresh);
         }
         let skolem_body = subst_vars(&mut self.ctx.terms, body, &subst);
         let neg = self.ctx.terms.mk_not(skolem_body);
@@ -347,96 +428,28 @@ impl Executor {
         }
         sub_assertions.push(neg);
 
-        // Solve in isolation, saving every piece of state the ground solve
-        // perturbs so the enclosing solve is unaffected on every path.
-        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, sub_assertions.clone());
-        let saved_theory_state = self.incr_theory_state.take();
-        let saved_bv_state = self.incr_bv_state.take();
-        let saved_model = self.last_model.take();
-        let saved_model_validated = self.last_model_validated;
-        let saved_validation_stats = self.last_validation_stats.take();
-        let saved_unknown_reason = self.last_unknown_reason;
-        let saved_defer = self.defer_model_validation;
-        // The ground sub-solve runs the full check pipeline, so it also writes
-        // `last_result` and `skip_model_eval`. Leaving those perturbed leaks the
-        // sub-solve's verdict into the enclosing quantifier loop, which then
-        // mis-maps the outer result.
-        let saved_last_result = self.last_result.take();
-        let saved_skip_model_eval = self.skip_model_eval;
-        self.defer_model_validation = false;
-
-        let (detected, _) = self.detect_logic_category(&sub_assertions);
-        let sub_category = if matches!(detected, LogicCategory::Other) {
-            fallback_category
+        // Only a strict, sealed UNSAT decision establishes the entailment. The
+        // former in-place solve also extracted a SAT counterexample model, but
+        // that model had no checked transport back into the enclosing query.
+        // A SAT/Unknown probe therefore falls through to sound enumeration.
+        if self
+            .checked_ground_solve(sub_assertions.clone(), fallback_category, 2_000)
+            .is_some_and(|decision| match decision {
+                CheckedGroundDecision::Unsat(checked) => checked.consume(self, &sub_assertions),
+                CheckedGroundDecision::Sat(_) => false,
+            })
+        {
+            BvForallCheck::Holds
         } else {
-            detected
-        };
-        let sub_result = self.solve_for_category(sub_category);
-
-        // Read the counterexample out BEFORE the model is restored.
-        let verdict = match sub_result {
-            Ok(SolveResult::Unsat(_)) => BvForallCheck::Holds,
-            Ok(SolveResult::Sat) => {
-                // Read the raw values out first: building the constant terms
-                // needs `&mut self.ctx.terms`, which cannot overlap the borrow
-                // of `self.last_model`.
-                let mut raw: Vec<(BigInt, u32)> = Vec::with_capacity(skolems.len());
-                let mut complete = true;
-                match self.last_model {
-                    Some(ref model) => {
-                        for &sk in &skolems {
-                            let width = match self.ctx.terms.sort(sk) {
-                                Sort::BitVec(bv_sort) => bv_sort.width,
-                                _ => {
-                                    complete = false;
-                                    break;
-                                }
-                            };
-                            match model.bv_model.as_ref().and_then(|m| m.values.get(&sk)) {
-                                Some(val) => raw.push((val.clone(), width)),
-                                None => {
-                                    // The model does not value this skolem, so
-                                    // there is no counterexample to extract.
-                                    // Fail closed rather than invent one.
-                                    complete = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    None => complete = false,
-                }
-                if complete {
-                    let values: Vec<TermId> = raw
-                        .into_iter()
-                        .map(|(val, width)| self.ctx.terms.mk_bitvec(val, width))
-                        .collect();
-                    BvForallCheck::Counterexample(values)
-                } else {
-                    BvForallCheck::Unknown
-                }
-            }
-            _ => BvForallCheck::Unknown,
-        };
-
-        self.ctx.assertions = saved_assertions;
-        self.incr_theory_state = saved_theory_state;
-        self.incr_bv_state = saved_bv_state;
-        self.last_model = saved_model;
-        self.last_model_validated = saved_model_validated;
-        self.last_validation_stats = saved_validation_stats;
-        self.last_unknown_reason = saved_unknown_reason;
-        self.defer_model_validation = saved_defer;
-        self.last_result = saved_last_result;
-        self.skip_model_eval = saved_skip_model_eval;
-
-        verdict
+            BvForallCheck::Unknown
+        }
     }
 
     pub(in crate::executor) fn try_bv_mbqi_refinement(
         &mut self,
         bv_quantifiers: &[TermId],
         category: LogicCategory,
+        authority_roots: &[TermId],
     ) -> Option<Result<SolveResult>> {
         if bv_quantifiers.is_empty() {
             return None;
@@ -539,26 +552,10 @@ impl Executor {
                     .is_some_and(|total| total <= u128::from(BV_EXHAUSTIVE_TOTAL_CAP));
 
                 if !enumerable && !model_less {
-                    match self.bv_symbolic_model_check(&vars, body, category) {
+                    match self.bv_symbolic_entailment_check(&vars, body, category) {
                         BvForallCheck::Holds => {
                             // Proven over the binders' entire domain — the same
                             // authority an exhaustive enumeration would carry.
-                            continue;
-                        }
-                        BvForallCheck::Counterexample(values) => {
-                            let var_names: Vec<String> =
-                                vars.iter().map(|(n, _)| n.clone()).collect();
-                            let subst_map: HashMap<String, TermId> = var_names
-                                .iter()
-                                .cloned()
-                                .zip(values.iter().copied())
-                                .collect();
-                            let ground_body = subst_vars(&mut self.ctx.terms, body, &subst_map);
-                            if seen_instantiations.insert(ground_body) {
-                                new_instantiations.push(ground_body);
-                            }
-                            all_satisfied = false;
-                            all_entailed = false;
                             continue;
                         }
                         BvForallCheck::Unknown => {
@@ -769,9 +766,20 @@ impl Executor {
                 // candidate set is the carrier itself. Preserve either proof
                 // across assertion restoration, while sampled enumeration and
                 // model-less passes remain fail-closed.
-                self.bv_quantifier_full_domain_proof =
-                    all_satisfied && (all_entailed || all_exhaustive) && !model_less;
-                if all_satisfied && all_exhaustive && !model_less {
+                let full_domain_proof = all_satisfied
+                    && (all_entailed || all_exhaustive)
+                    && !model_less
+                    && authority_roots_exactly_cover_bv_foralls(
+                        &self.ctx.terms,
+                        authority_roots,
+                        bv_quantifiers,
+                    );
+                let evidence = full_domain_proof
+                    .then(|| CheckedBvFullDomainSatAuthority::for_current(self, authority_roots))
+                    .flatten();
+                self.bv_quantifier_full_domain_proof = evidence.is_some();
+                self.bv_quantifier_full_domain_pending_evidence = evidence;
+                if all_satisfied && all_exhaustive && !model_less && full_domain_proof {
                     return Some(Ok(SolveResult::Sat));
                 }
                 break;

@@ -278,6 +278,8 @@ pub(crate) unsafe fn user_propagator_check(
     // Convert registration-time pending lemmas (from `created_eh` firings)
     // before the first solve — they are user axioms and must constrain it.
     {
+        // SAFETY: `s` is null or a live, exclusively used solver handle under
+        // this function's contract; `as_mut` handles the null case.
         let pending: Vec<PendingLemma> = match unsafe { s.as_mut() } {
             Some(handle) => match handle.propagator.as_mut() {
                 Some(prop) => std::mem::take(&mut prop.pending),
@@ -302,6 +304,8 @@ pub(crate) unsafe fn user_propagator_check(
                 })
             };
             if ok == 0 {
+                // SAFETY: `c`/`s` retain the validity required by this
+                // function, and no context borrow is live on this exit path.
                 return unsafe {
                     propagator_unknown(
                         c,
@@ -358,6 +362,8 @@ pub(crate) unsafe fn user_propagator_check(
         // `Z3_model_eval` take their own scoped borrows.
         let model = unsafe { Z3_solver_get_model(c, s) };
         if model.is_null() {
+            // SAFETY: `c`/`s` remain valid and the model call above completed
+            // its scoped context borrow before this fail-closed update.
             return unsafe {
                 propagator_unknown(
                     c,
@@ -373,6 +379,8 @@ pub(crate) unsafe fn user_propagator_check(
             // SAFETY: same invariant as ffi_guard_*: `c` is a live context
             // pointer and no other borrow is outstanding in this block.
             let Some(ctx) = (unsafe { c.as_mut() }) else {
+                // SAFETY: a null `c` is accepted by the guarded error helper;
+                // no context reference exists in this `else` branch.
                 return unsafe {
                     propagator_unknown(
                         c,
@@ -394,6 +402,8 @@ pub(crate) unsafe fn user_propagator_check(
             // from this context's arena; `&mut v` is a valid out-slot.
             let ok = unsafe { Z3_model_eval(c, model, t_ast, true, &raw mut v) };
             if !ok || v == 0 {
+                // SAFETY: model evaluation has released its scoped context
+                // borrow; `c`/`s` remain the caller-owned live handles.
                 return unsafe {
                     propagator_unknown(
                         c,
@@ -429,6 +439,8 @@ pub(crate) unsafe fn user_propagator_check(
             })
         };
         if classified == 0 {
+            // SAFETY: classification's guard has returned, so there is no
+            // outstanding context borrow; `c`/`s` retain caller validity.
             return unsafe {
                 propagator_unknown(
                     c,
@@ -451,7 +463,7 @@ pub(crate) unsafe fn user_propagator_check(
             new_registrations: Vec::new(),
         };
         let cbp: Z3_solver_callback = &raw mut cb;
-        // SAFETY (all callback invocations below): the fn pointers were
+        // SAFETY: all callback fn pointers below were
         // supplied through `Z3_solver_propagate_*` whose contracts require
         // valid `extern "C"` functions; `cbp` points to a live stack object
         // that outlives the round; no `&mut Z3Context` is outstanding.
@@ -506,6 +518,8 @@ pub(crate) unsafe fn user_propagator_check(
         //     passed the user theory. The artefacts (model/stats) materialized
         //     by the accepting solve in (1) are exactly this model's.
         let new_regs: Vec<Z3_ast> = new_registrations.into_iter().filter(|&e| e != 0).collect();
+        // SAFETY: `s` is a live solver handle under this function's contract;
+        // callbacks have returned, so this shared inspection cannot alias them.
         let candidate_still_authoritative = unsafe { s.as_ref() }.is_some_and(|handle| {
             handle.last_check_outcome == Some(super::SolverCheckOutcome::Sat)
                 && handle.last_model.is_some()
@@ -544,6 +558,8 @@ pub(crate) unsafe fn user_propagator_check(
             })
         };
         if converted == 0 {
+            // SAFETY: the conversion guard has released `c`; both raw handles
+            // remain valid for the fail-closed outcome update.
             return unsafe {
                 propagator_unknown(
                     c,
@@ -553,6 +569,8 @@ pub(crate) unsafe fn user_propagator_check(
             };
         }
         // Re-check any pending lemmas a created_eh just recorded.
+        // SAFETY: callbacks and guarded context work have completed; `s` is a
+        // live, exclusively used solver handle or null as permitted here.
         let pending: Vec<PendingLemma> = match unsafe { s.as_mut() } {
             Some(handle) => match handle.propagator.as_mut() {
                 Some(prop) => std::mem::take(&mut prop.pending),
@@ -578,6 +596,8 @@ pub(crate) unsafe fn user_propagator_check(
                 })
             };
             if ok == 0 {
+                // SAFETY: the guard above has released the context borrow and
+                // `c`/`s` remain valid for the fail-closed outcome update.
                 return unsafe {
                     propagator_unknown(
                         c,
@@ -598,6 +618,8 @@ pub(crate) unsafe fn user_propagator_check(
         // the candidate model still satisfied them: re-solving would loop on
         // the identical state. Honest `unknown`, never a forced verdict.
         if !progress {
+            // SAFETY: no callback or context borrow is active; handles retain
+            // the validity established by this function's caller.
             return unsafe {
                 propagator_unknown(
                     c,
@@ -608,6 +630,8 @@ pub(crate) unsafe fn user_propagator_check(
             };
         }
     }
+    // SAFETY: the loop exits with no callback or scoped borrow active, and the
+    // caller-provided handles remain valid for the final outcome update.
     unsafe {
         propagator_unknown(
             c,
@@ -1089,7 +1113,11 @@ fn level0_units_conflict(clauses: &[Vec<i32>], num_vars: usize) -> bool {
             match unassigned_count {
                 0 => return true, // every literal false: conflict
                 1 => {
-                    let lit = unassigned.expect("exactly one unassigned literal");
+                    let Some(lit) = unassigned else {
+                        // Defensive fail-closed path if the count and witness
+                        // ever diverge due to a future encoder change.
+                        return true;
+                    };
                     assign[lit.unsigned_abs() as usize] = Some(lit > 0);
                     changed = true;
                 }

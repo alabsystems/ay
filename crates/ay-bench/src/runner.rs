@@ -2588,7 +2588,7 @@ pub fn preflight_eval_benchmark_inventory(eval_id: &str) -> Result<EvalBenchmark
 }
 
 fn ensure_unique_benchmark_paths(files: &[PathBuf], source: &str) -> Result<()> {
-    let mut seen = std::collections::BTreeMap::new();
+    let mut seen = BTreeMap::new();
     for file in files {
         let canonical = std::fs::canonicalize(file)
             .with_bench_context(|| format!("canonicalizing {source} entry {}", file.display()))?;

@@ -43,13 +43,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if `x` is not a FloatingPoint sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_to_sbv(&mut self, rm: Term, x: Term, width: u32) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.to_sbv", rm)?;
+        let x_id = self.resolve_term("fp.to_sbv", x)?;
         self.expect_fp("fp.to_sbv", x)?;
         let sort = Sort::BitVec(BitVecSort { width });
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("fp.to_sbv", vec![width]),
-            vec![rm.0, x.0],
+            vec![rm_id, x_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Convert FP to unsigned bitvector: ((_ fp.to_ubv w) rm x).
@@ -64,13 +67,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if `x` is not a FloatingPoint sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_to_ubv(&mut self, rm: Term, x: Term, width: u32) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.to_ubv", rm)?;
+        let x_id = self.resolve_term("fp.to_ubv", x)?;
         self.expect_fp("fp.to_ubv", x)?;
         let sort = Sort::BitVec(BitVecSort { width });
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("fp.to_ubv", vec![width]),
-            vec![rm.0, x.0],
+            vec![rm_id, x_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Convert FP to real: (fp.to_real x).
@@ -84,12 +90,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if `x` is not a FloatingPoint sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_to_real(&mut self, x: Term) -> Result<Term, SolverError> {
+        let x_id = self.resolve_term("fp.to_real", x)?;
         self.expect_fp("fp.to_real", x)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.to_real"),
-            vec![x.0],
-            Sort::Real,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.to_real"), vec![x_id], Sort::Real);
+        Ok(self.wrap_term(result))
     }
 
     /// Convert FP to IEEE 754 bitvector (bit-pattern reinterpretation): (fp.to_ieee_bv x).
@@ -97,14 +103,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if `x` is not a FloatingPoint sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_to_ieee_bv(&mut self, x: Term) -> Result<Term, SolverError> {
+        let x_id = self.resolve_term("fp.to_ieee_bv", x)?;
         let (eb, sb) = self.expect_fp("fp.to_ieee_bv", x)?;
         let width = self.checked_fp_total_width("fp.to_ieee_bv", eb, sb)?;
         let sort = Sort::BitVec(BitVecSort { width });
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.to_ieee_bv"),
-            vec![x.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.to_ieee_bv"), vec![x_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Construct FP from sign, exponent, significand bitvectors: (fp sign exp sig).
@@ -126,6 +132,9 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let sign_id = self.resolve_term("fp", sign)?;
+        let exp_id = self.resolve_term("fp", exp)?;
+        let sig_id = self.resolve_term("fp", sig)?;
         self.checked_fp_total_width("fp", eb, sb)?;
         let sign_width = self.expect_bitvec_width("fp (sign)", sign)?;
         let exp_width = self.expect_bitvec_width("fp (exponent)", exp)?;
@@ -141,11 +150,10 @@ impl Solver {
             });
         }
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp"),
-            vec![sign.0, exp.0, sig.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp"), vec![sign_id, exp_id, sig_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Convert bitvector to FP (interpret as IEEE 754): ((_ to_fp eb sb) rm bv).
@@ -166,14 +174,17 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("to_fp", rm)?;
+        let bv_id = self.resolve_term("to_fp", bv)?;
         self.expect_bitvec("to_fp", bv)?;
         self.checked_fp_total_width("to_fp", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("to_fp", vec![eb, sb]),
-            vec![rm.0, bv.0],
+            vec![rm_id, bv_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Convert unsigned bitvector to FP: ((_ to_fp_unsigned eb sb) rm bv).
@@ -194,14 +205,17 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("to_fp_unsigned", rm)?;
+        let bv_id = self.resolve_term("to_fp_unsigned", bv)?;
         self.expect_bitvec("to_fp_unsigned", bv)?;
         self.checked_fp_total_width("to_fp_unsigned", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("to_fp_unsigned", vec![eb, sb]),
-            vec![rm.0, bv.0],
+            vec![rm_id, bv_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Convert FP to different precision: ((_ to_fp eb sb) rm fp).
@@ -222,14 +236,17 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("to_fp", rm)?;
+        let fp_id = self.resolve_term("to_fp", fp)?;
         self.expect_fp("to_fp (fp)", fp)?;
         self.checked_fp_total_width("to_fp", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("to_fp", vec![eb, sb]),
-            vec![rm.0, fp.0],
+            vec![rm_id, fp_id],
             sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // --- FP rounded arithmetic operations ---
@@ -242,13 +259,15 @@ impl Solver {
     /// Try to create FP addition with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_add(&mut self, rm: Term, a: Term, b: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.add", rm)?;
+        let a_id = self.resolve_term("fp.add", a)?;
+        let b_id = self.resolve_term("fp.add", b)?;
         let (eb, sb) = self.expect_same_fp("fp.add", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.add"),
-            vec![rm.0, a.0, b.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.add"), vec![rm_id, a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP subtraction with rounding mode: `(fp.sub rm a b)`.
@@ -259,13 +278,15 @@ impl Solver {
     /// Try to create FP subtraction with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_sub(&mut self, rm: Term, a: Term, b: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.sub", rm)?;
+        let a_id = self.resolve_term("fp.sub", a)?;
+        let b_id = self.resolve_term("fp.sub", b)?;
         let (eb, sb) = self.expect_same_fp("fp.sub", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.sub"),
-            vec![rm.0, a.0, b.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.sub"), vec![rm_id, a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP multiplication with rounding mode: `(fp.mul rm a b)`.
@@ -276,13 +297,15 @@ impl Solver {
     /// Try to create FP multiplication with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_mul(&mut self, rm: Term, a: Term, b: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.mul", rm)?;
+        let a_id = self.resolve_term("fp.mul", a)?;
+        let b_id = self.resolve_term("fp.mul", b)?;
         let (eb, sb) = self.expect_same_fp("fp.mul", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.mul"),
-            vec![rm.0, a.0, b.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.mul"), vec![rm_id, a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP division with rounding mode: `(fp.div rm a b)`.
@@ -293,13 +316,15 @@ impl Solver {
     /// Try to create FP division with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_div(&mut self, rm: Term, a: Term, b: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.div", rm)?;
+        let a_id = self.resolve_term("fp.div", a)?;
+        let b_id = self.resolve_term("fp.div", b)?;
         let (eb, sb) = self.expect_same_fp("fp.div", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.div"),
-            vec![rm.0, a.0, b.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.div"), vec![rm_id, a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP square root with rounding mode: `(fp.sqrt rm a)`.
@@ -310,13 +335,14 @@ impl Solver {
     /// Try to create FP square root with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_sqrt(&mut self, rm: Term, a: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.sqrt", rm)?;
+        let a_id = self.resolve_term("fp.sqrt", a)?;
         let (eb, sb) = self.expect_fp("fp.sqrt", a)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.sqrt"),
-            vec![rm.0, a.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.sqrt"), vec![rm_id, a_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP fused multiply-add with rounding mode: `(fp.fma rm a b c)`.
@@ -330,6 +356,10 @@ impl Solver {
     /// Try to create FP fused multiply-add with rounding mode (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_fma(&mut self, rm: Term, a: Term, b: Term, c: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.fma", rm)?;
+        let a_id = self.resolve_term("fp.fma", a)?;
+        let b_id = self.resolve_term("fp.fma", b)?;
+        let c_id = self.resolve_term("fp.fma", c)?;
         let (eb, sb) = self.expect_same_fp("fp.fma", a, b)?;
         let (eb_c, sb_c) = self.expect_fp("fp.fma", c)?;
         if eb != eb_c || sb != sb_c {
@@ -340,11 +370,10 @@ impl Solver {
             });
         }
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.fma"),
-            vec![rm.0, a.0, b.0, c.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.fma"), vec![rm_id, a_id, b_id, c_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP remainder: `(fp.rem a b)`.
@@ -357,13 +386,14 @@ impl Solver {
     /// Try to create FP remainder (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_rem(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.rem", a)?;
+        let b_id = self.resolve_term("fp.rem", b)?;
         let (eb, sb) = self.expect_same_fp("fp.rem", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.rem"),
-            vec![a.0, b.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.rem"), vec![a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP round-to-integral: `(fp.roundToIntegral rm a)`.
@@ -375,13 +405,14 @@ impl Solver {
     /// Try to create FP round-to-integral (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_round_to_integral(&mut self, rm: Term, a: Term) -> Result<Term, SolverError> {
+        let rm_id = self.resolve_term("fp.roundToIntegral", rm)?;
+        let a_id = self.resolve_term("fp.roundToIntegral", a)?;
         let (eb, sb) = self.expect_fp("fp.roundToIntegral", a)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.roundToIntegral"),
-            vec![rm.0, a.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.roundToIntegral"), vec![rm_id, a_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     // --- FP/BV bridge operations for crypto and DSP analysis (#8332) ---
@@ -421,6 +452,7 @@ impl Solver {
         eb: u32,
         sb: u32,
     ) -> Result<Term, SolverError> {
+        let bv_id = self.resolve_term("bv_to_fp_reinterpret", bv_expr)?;
         let bv_width = self.expect_bitvec_width("bv_to_fp_reinterpret", bv_expr)?;
         let expected_width = self.checked_fp_total_width("bv_to_fp_reinterpret", eb, sb)?;
         if bv_width != expected_width {
@@ -434,11 +466,10 @@ impl Solver {
         }
         let sort = Sort::FloatingPoint(eb, sb);
         // 1-arg to_fp: reinterpret BV bits as IEEE 754 FP
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("to_fp", vec![eb, sb]),
-            vec![bv_expr.0],
-            sort,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::indexed("to_fp", vec![eb, sb]), vec![bv_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Classify an FP expression, returning a BV3 value.

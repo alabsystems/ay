@@ -106,7 +106,7 @@ fn run_sequence(terms: &TermStore, atoms: &[TermId], seed: u64, warm: bool) -> V
             }
             4..=7 => {
                 let atom = atoms[(xorshift(&mut rng) as usize) % atoms.len()];
-                let value = xorshift(&mut rng) % 2 == 0;
+                let value = xorshift(&mut rng).is_multiple_of(2);
                 solver.assert_literal(atom, value);
             }
             _ => {
@@ -169,7 +169,7 @@ fn warm_pop_keeps_heap_warm_cold_pop_marks_stale() {
 
         solver.assert_literal(sum_le_10, true);
         let r = solver.check();
-        assert!(crate::tests::is_sat_like(&r), "base check must be sat-like");
+        assert!(is_sat_like(&r), "base check must be sat-like");
         assert!(
             !solver.heap_stale,
             "after a full check the heap must be freshly built (warm={warm})"
@@ -178,10 +178,7 @@ fn warm_pop_keeps_heap_warm_cold_pop_marks_stale() {
         solver.push();
         solver.assert_literal(x_ge_3, true);
         let r = solver.check();
-        assert!(
-            crate::tests::is_sat_like(&r),
-            "pushed check must be sat-like"
-        );
+        assert!(is_sat_like(&r), "pushed check must be sat-like");
         assert!(!solver.heap_stale, "heap current before pop (warm={warm})");
         solver.pop();
 
@@ -199,7 +196,7 @@ fn warm_pop_keeps_heap_warm_cold_pop_marks_stale() {
 
         let r = solver.check();
         assert!(
-            crate::tests::is_sat_like(&r),
+            is_sat_like(&r),
             "post-pop check must be sat-like (warm={warm})"
         );
     }
@@ -237,7 +234,7 @@ fn warm_nested_push_pop_unsat_then_sat() {
     solver.assert_literal(y_ge_3, true);
     let result = solver.check();
     assert!(
-        crate::tests::is_sat_like(&result),
+        is_sat_like(&result),
         "outer scope should be sat-like, got {result:?}"
     );
 
@@ -255,7 +252,7 @@ fn warm_nested_push_pop_unsat_then_sat() {
     solver.pop();
     let result = solver.check();
     assert!(
-        crate::tests::is_sat_like(&result),
+        is_sat_like(&result),
         "after inner pop should be sat-like again, got {result:?}"
     );
     solver.pop();
@@ -286,7 +283,7 @@ fn warm_nonbasic_violation_after_pop_strict_bounds() {
         solver.push();
         solver.assert_literal(x_ge_5, true);
         let r = solver.check();
-        assert!(crate::tests::is_sat_like(&r), "x>=5 sat-like (warm={warm})");
+        assert!(is_sat_like(&r), "x>=5 sat-like (warm={warm})");
         solver.pop();
 
         // Scope 2 after pop: x <= 0 while x's VALUE is still 5 (values are
@@ -295,7 +292,7 @@ fn warm_nonbasic_violation_after_pop_strict_bounds() {
         solver.assert_literal(x_le_0, true);
         let r = solver.check();
         assert!(
-            crate::tests::is_sat_like(&r),
+            is_sat_like(&r),
             "x<=0 alone must be sat-like even with stale value 5 (warm={warm}), got {r:?}"
         );
 
@@ -311,7 +308,7 @@ fn warm_nonbasic_violation_after_pop_strict_bounds() {
 
         let r = solver.check();
         assert!(
-            crate::tests::is_sat_like(&r),
+            is_sat_like(&r),
             "empty scope after pop must be sat-like (warm={warm}), got {r:?}"
         );
     }

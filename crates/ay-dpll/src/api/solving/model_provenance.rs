@@ -92,7 +92,7 @@ impl Solver {
     fn collect_assertion_term_ids(&self, assertions: &[Term]) -> HashSet<ay_core::TermId> {
         let terms = self.terms();
         let mut seen = HashSet::default();
-        let mut stack: Vec<ay_core::TermId> = assertions.iter().map(|a| a.0).collect();
+        let mut stack: Vec<ay_core::TermId> = assertions.iter().map(|term| term.id()).collect();
 
         while let Some(tid) = stack.pop() {
             if seen.insert(tid) {
@@ -122,7 +122,7 @@ impl Solver {
     ) -> AssignmentReason {
         // Trail-based classification (incremental mode)
         if let Some(trail) = trail {
-            if let Some(var_idx) = self.executor.last_model_term_to_var(term.0) {
+            if let Some(var_idx) = self.executor.last_model_term_to_var(term.id()) {
                 if let Some((level, is_propagated, antecedent_vars)) = trail.get(&var_idx) {
                     return if *is_propagated {
                         // Convert SAT variable indices to Term handles (#8307)
@@ -132,7 +132,7 @@ impl Solver {
                             .filter_map(|&var_idx| {
                                 var_to_term
                                     .and_then(|vtm| vtm.get(&var_idx))
-                                    .map(|&tid| Term(tid))
+                                    .map(|&tid| self.wrap_term(tid))
                             })
                             .collect();
                         AssignmentReason::Propagation { antecedent_terms }
@@ -149,7 +149,7 @@ impl Solver {
         // O(1) lookup in precomputed set instead of per-variable recursive walk.
         if assertions.is_empty() {
             AssignmentReason::Default
-        } else if assertion_term_ids.contains(&term.0) {
+        } else if assertion_term_ids.contains(&term.id()) {
             AssignmentReason::Decision { level: 0 }
         } else {
             AssignmentReason::Default

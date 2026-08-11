@@ -125,6 +125,107 @@ fn test_bv_bitblast_accepts_bounded_semantic_tautology() {
         .expect("bounded BV tautology should pass strict semantic checking");
 }
 
+/// The strict BV semantic memo may only ever record a COMPLETED, ACCEPTING
+/// decision, keyed by the exact clause it was computed for.
+///
+/// `validate_bv_bitblast_semantics` memoizes so the ~30 whole-proof
+/// `check_proof_strict*` revert gates run during proof finalization do not
+/// re-decide one unchanged lemma over and over (MEASURED at b0a836719b on the
+/// 28 `shl_is_mul_by_pow2` queries: 226 entries into the decision procedure for
+/// 28 distinct decisions, 41.3 s of 53.2 s redundant). That is only sound
+/// because a rejection is never recorded — the proof-producing checker is
+/// deadline-bounded, so a failure is a fact about one attempt, not about the
+/// clause — and because the key is the clause itself.
+#[test]
+fn test_bv_bitblast_memoizes_accepted_clauses_and_never_rejected_ones() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(2));
+    let tautology = terms.mk_app(ay_core::Symbol::named("="), vec![bv, bv], Sort::Bool);
+    let zero = terms.mk_bitvec(BigInt::from(0), 2);
+    let falsifiable = terms.mk_app(ay_core::Symbol::named("="), vec![bv, zero], Sort::Bool);
+
+    assert!(!terms.strict_bv_semantics_validated(&[tautology]));
+    assert!(!terms.strict_bv_semantics_validated(&[falsifiable]));
+
+    validate_theory_lemma_strict(&terms, vec![tautology], TheoryLemmaKind::BvBitBlast)
+        .expect("bounded BV tautology should pass strict semantic checking");
+    assert!(
+        terms.strict_bv_semantics_validated(&[tautology]),
+        "an ACCEPTED clause must be memoized, otherwise every later whole-proof \
+         re-check repeats the identical decision procedure"
+    );
+
+    validate_theory_lemma_strict(&terms, vec![falsifiable], TheoryLemmaKind::BvBitBlast)
+        .expect_err("falsifiable BV equality must be rejected");
+    assert!(
+        !terms.strict_bv_semantics_validated(&[falsifiable]),
+        "a REJECTED clause must never enter the memo"
+    );
+    validate_theory_lemma_strict(&terms, vec![falsifiable], TheoryLemmaKind::BvBitBlast)
+        .expect_err("a rejected clause must be re-decided, and rejected, every time");
+
+    // The memo is keyed by the exact clause: an accepted unit clause must not
+    // vouch for a different clause that merely contains it.
+    assert!(!terms.strict_bv_semantics_validated(&[tautology, falsifiable]));
+    assert!(!terms.strict_bv_semantics_validated(&[falsifiable, tautology]));
+    assert!(!terms.strict_bv_semantics_validated(&[]));
+    validate_theory_lemma_strict(
+        &terms,
+        vec![tautology, falsifiable],
+        TheoryLemmaKind::BvBitBlast,
+    )
+    .expect("a clause containing a memoized tautology is still decided on its own merits");
+}
+
+/// The strict BV semantic memo may only ever skip the SEMANTIC decision — the
+/// structural schema checks must run on every single call.
+///
+/// This is what keeps the memo key free of the gate annotation. The semantic
+/// question ("does this clause hold under every assignment?") depends only on
+/// the store and the clause, but the schema question ("does this clause
+/// actually reference the operator the lemma claims to be about, at that
+/// width?") also depends on the annotation. A memo consulted BEFORE the schema
+/// checks would let one accepted clause launder every future gate annotation
+/// attached to it, so a forged `BvBitBlastGate` would be accepted on its second
+/// presentation having been rejected on its first.
+#[test]
+fn test_bv_bitblast_memo_never_skips_the_structural_gate_check() {
+    let mut terms = TermStore::new();
+    let bv = terms.mk_var("bv", Sort::bitvec(2));
+    // A genuine tautology, but one that mentions no `bvand` whatsoever.
+    let tautology = terms.mk_app(ay_core::Symbol::named("="), vec![bv, bv], Sort::Bool);
+
+    let forged = TheoryLemmaKind::BvBitBlastGate {
+        gate_type: BvGateType::And,
+        width: 2,
+    };
+    let before = validate_theory_lemma_strict(&terms, vec![tautology], forged)
+        .expect_err("a gate annotation with no matching operator must be rejected");
+    assert!(
+        matches!(before, ProofCheckError::InvalidTheoryLemma { .. }),
+        "expected InvalidTheoryLemma, got {before:?}"
+    );
+
+    // Accept the very same clause under the un-annotated kind, which memoizes
+    // its SEMANTIC decision.
+    validate_theory_lemma_strict(&terms, vec![tautology], TheoryLemmaKind::BvBitBlast)
+        .expect("bounded BV tautology should pass strict semantic checking");
+    assert!(
+        terms.strict_bv_semantics_validated(&[tautology]),
+        "precondition: the accepting decision must actually be memoized, or this \
+         test cannot observe the memo skipping anything"
+    );
+
+    let after = validate_theory_lemma_strict(&terms, vec![tautology], forged).expect_err(
+        "the memo records a SEMANTIC verdict only; the gate-annotation schema check \
+         must still run and still reject this clause",
+    );
+    assert!(
+        matches!(after, ProofCheckError::InvalidTheoryLemma { .. }),
+        "expected InvalidTheoryLemma, got {after:?}"
+    );
+}
+
 #[test]
 fn test_bv_bitblast_accepts_wide_clause_with_checked_lrat_refutation() {
     let mut terms = TermStore::new();
@@ -2609,6 +2710,9 @@ fn bool_tautology_accepts_positive_gate_packed_clauses_and_rejects_near_misses()
     // is also the more faithful test.
     let integer = terms.mk_var("integer", Sort::Int);
     let ill_sorted_and = terms.mk_app(ay_core::Symbol::named("and"), vec![p, integer], Sort::Bool);
+    // Bypass the typed `mk_not_raw` constructor too: the adversarial term is
+    // intentionally ill-sorted, so using that constructor would trip its
+    // debug assertion before the strict checker gets the malformed input.
     let not_integer = terms.mk_app(ay_core::Symbol::named("not"), vec![integer], Sort::Bool);
     let ill_sorted = terms.mk_app(
         ay_core::Symbol::named("or"),

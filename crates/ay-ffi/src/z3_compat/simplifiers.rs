@@ -300,8 +300,12 @@ pub unsafe extern "C" fn Z3_simplifier_and_then(
     // prior `Z3_mk_simplifier`/combinator call and kept alive in the context's
     // `simplifier_handle_cache`. The Z3 C API is single-threaded per context, so
     // this shared read does not race. `as_ref` null-checks.
-    let first = unsafe { s1.as_ref() }.map(|h| h.tactic.clone());
-    let second = unsafe { s2.as_ref() }.map(|h| h.tactic.clone());
+    let (first, second) = unsafe {
+        (
+            s1.as_ref().map(|h| h.tactic.clone()),
+            s2.as_ref().map(|h| h.tactic.clone()),
+        )
+    };
 
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ptr` handles the
     // null case internally and catches any unwinding panic.
@@ -382,16 +386,20 @@ pub unsafe extern "C" fn Z3_solver_add_simplifier(
     // SAFETY: each handle, when non-null, is a live handle kept in `c`'s arena;
     // the Z3 C API is single-threaded per context, so these shared reads do not
     // race. `as_ref` null-checks.
-    let solver_data = unsafe { solver.as_ref() }.map(|h| {
+    let (solver_data, simp) = unsafe {
         (
-            h.assertions.clone(),
-            h.scope_markers.clone(),
-            h.tracked.clone(),
-            h.tracked_scope_markers.clone(),
-            h.tactic.clone(),
+            solver.as_ref().map(|h| {
+                (
+                    h.assertions.clone(),
+                    h.scope_markers.clone(),
+                    h.tracked.clone(),
+                    h.tracked_scope_markers.clone(),
+                    h.tactic.clone(),
+                )
+            }),
+            simplifier.as_ref().map(|h| h.tactic.clone()),
         )
-    });
-    let simp = unsafe { simplifier.as_ref() }.map(|h| h.tactic.clone());
+    };
 
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
     unsafe {

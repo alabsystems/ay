@@ -457,7 +457,15 @@ fn test_extract_euf_chain_transitivity() {
 
     // Transitivity clause: (not (= a b)), (not (= b c)), (= a c)
     let clause = vec![not_eq_ab, not_eq_bc, eq_ac];
-    let chain = extract_euf_chain(&clause, &terms, false);
+    let arena = TermArenaStamp::fresh();
+    let wrap = |id| {
+        Term::authenticated(
+            id,
+            arena,
+            terms.entry_stamp(id).expect("test term must be live"),
+        )
+    };
+    let chain = extract_euf_chain(&clause, &terms, false, &wrap);
 
     assert_eq!(chain.len(), 3, "chain should have 3 steps: {chain:?}");
 
@@ -468,12 +476,12 @@ fn test_extract_euf_chain_transitivity() {
     assert_eq!(chain[2].reason, CongruenceReason::Direct);
 
     // Verify term handles
-    assert_eq!(chain[0].left.0, a);
-    assert_eq!(chain[0].right.0, b);
-    assert_eq!(chain[1].left.0, b);
-    assert_eq!(chain[1].right.0, c);
-    assert_eq!(chain[2].left.0, a);
-    assert_eq!(chain[2].right.0, c);
+    assert_eq!(chain[0].left.id(), a);
+    assert_eq!(chain[0].right.id(), b);
+    assert_eq!(chain[1].left.id(), b);
+    assert_eq!(chain[1].right.id(), c);
+    assert_eq!(chain[2].left.id(), a);
+    assert_eq!(chain[2].right.id(), c);
 }
 
 /// Direct unit test for `extract_euf_chain`: congruence clause
@@ -504,19 +512,27 @@ fn test_extract_euf_chain_congruence() {
 
     // Congruence clause: (not (= a b)), (= f(a) f(b))
     let clause = vec![not_eq_ab, eq_fa_fb];
-    let chain = extract_euf_chain(&clause, &terms, true);
+    let arena = TermArenaStamp::fresh();
+    let wrap = |id| {
+        Term::authenticated(
+            id,
+            arena,
+            terms.entry_stamp(id).expect("test term must be live"),
+        )
+    };
+    let chain = extract_euf_chain(&clause, &terms, true, &wrap);
 
     assert_eq!(chain.len(), 2, "chain should have 2 steps: {chain:?}");
 
     // First step is Direct (premise: a = b)
     assert_eq!(chain[0].reason, CongruenceReason::Direct);
-    assert_eq!(chain[0].left.0, a);
-    assert_eq!(chain[0].right.0, b);
+    assert_eq!(chain[0].left.id(), a);
+    assert_eq!(chain[0].right.id(), b);
 
     // Second step is Congruence (conclusion: f(a) = f(b))
     assert_eq!(chain[1].reason, CongruenceReason::Congruence);
-    assert_eq!(chain[1].left.0, fa);
-    assert_eq!(chain[1].right.0, fb);
+    assert_eq!(chain[1].left.id(), fa);
+    assert_eq!(chain[1].right.id(), fb);
 }
 
 /// extract_euf_chain with empty clause returns empty chain.
@@ -526,7 +542,14 @@ fn test_extract_euf_chain_empty() {
     use ay_core::TermStore;
 
     let terms = TermStore::new();
-    let chain = extract_euf_chain(&[], &terms, false);
+    let arena = TermArenaStamp::fresh();
+    let chain = extract_euf_chain(&[], &terms, false, &|id| {
+        Term::authenticated(
+            id,
+            arena,
+            terms.entry_stamp(id).expect("test term must be live"),
+        )
+    });
     assert!(chain.is_empty());
 }
 
@@ -718,7 +741,7 @@ fn test_model_provenance_antecedent_terms_incremental() {
         if !antecedent_terms.is_empty() {
             // Verify the antecedent terms are valid term handles
             for term in antecedent_terms {
-                assert!(term.0 .0 > 0, "antecedent term should be a valid TermId");
+                assert!(term.id().0 > 0, "antecedent term should be a valid TermId");
             }
         }
     }

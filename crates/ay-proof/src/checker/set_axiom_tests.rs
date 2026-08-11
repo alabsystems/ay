@@ -410,6 +410,40 @@ fn follows_a_chain_of_asserted_equalities() {
     assert!(validate_set_card_empty_by_assertion(&terms, STEP, &clause, Some(&registry)).is_ok());
 }
 
+#[test]
+fn metered_registry_closes_reverse_chain_in_linear_work() {
+    let mut terms = TermStore::new();
+    let chain_len = 128_usize;
+    let sets: Vec<TermId> = (0..=chain_len)
+        .map(|index| set_var(&mut terms, &format!("linear_set_{index}")))
+        .collect();
+    let empty = empty_literal(&mut terms);
+    // This order forced the old repeated-scan fixpoint to discover exactly one
+    // predecessor per pass: O(chain_len^2).
+    let mut assertions = Vec::new();
+    for index in 0..chain_len {
+        assertions.push(eq(&mut terms, sets[index], sets[index + 1]));
+    }
+    assertions.push(eq(&mut terms, sets[chain_len], empty));
+
+    let mut work = 0_usize;
+    let mut bytes = 0_usize;
+    let registry = EmptySetRegistry::collect_with_progress(
+        &terms,
+        &assertions,
+        &mut |work_delta, byte_delta| {
+            work += work_delta;
+            bytes += byte_delta;
+            true
+        },
+    )
+    .expect("a finite equality chain should fit an unbounded envelope");
+
+    assert!(registry.is_known_empty(&terms, sets[0]));
+    assert!(work < 20 * assertions.len(), "work was {work}");
+    assert!(bytes > 0);
+}
+
 /// THE soundness case for the registry. An equality under a NEGATION is not
 /// unconditional -- `(assert (not (= s empty)))` says the opposite -- so it
 /// must never seed the registry.

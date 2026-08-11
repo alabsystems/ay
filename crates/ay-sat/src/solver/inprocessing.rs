@@ -354,10 +354,8 @@ impl Solver {
         // per-clause sweep below: earlier clause rewrites in the same pass can
         // materialize new level-0 unit proofs that later explicit-only hint
         // collection needs to see immediately.
-        if self.cold.lrat_enabled {
-            if !self.materialize_level0_unit_proofs_interruptible() {
-                return false;
-            }
+        if self.cold.lrat_enabled && !self.materialize_level0_unit_proofs_interruptible() {
+            return false;
         }
 
         // Per-clause BVE occ notifications (#8364) replace the old bulk
@@ -544,11 +542,9 @@ impl Solver {
                     continue;
                 }
 
-                if self.cold.lrat_enabled {
-                    if !self.materialize_level0_unit_proofs_interruptible() {
-                        deadline_truncated = true;
-                        break;
-                    }
+                if self.cold.lrat_enabled && !self.materialize_level0_unit_proofs_interruptible() {
+                    deadline_truncated = true;
+                    break;
                 }
 
                 // Scan literals for level-0 assignments. Literals are copied into

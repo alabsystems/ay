@@ -70,8 +70,12 @@ mod quantifier_dpll_7150;
 mod quantifier_model_3441;
 #[path = "group_quantifiers/quantprod_model_production.rs"]
 mod quantprod_model_production;
+#[path = "group_quantifiers/scoped_macro_non_adoption.rs"]
+mod scoped_macro_non_adoption;
 #[path = "group_quantifiers/skolemization_5840.rs"]
 mod skolemization_5840;
+#[path = "group_quantifiers/ufbv_checked_projection_sat.rs"]
+mod ufbv_checked_projection_sat;
 #[path = "group_quantifiers/ufbv_deferred_default_mode_wrong_sat.rs"]
 mod ufbv_deferred_default_mode_wrong_sat;
 #[path = "group_quantifiers/ufbv_deferred_selfcheck_failclosed.rs"]

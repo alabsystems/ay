@@ -209,16 +209,14 @@ impl TermStore {
             if name == "*" && !args.is_empty() {
                 let args_clone = args.clone();
                 // Check if last argument is a constant (mk_mul places constants last)
-                // Safety: args.is_empty() check above guarantees last() returns Some
-                let last = *args_clone
-                    .last()
-                    .expect("mk_neg: args verified non-empty above");
-                if self.get_int(last).is_some() || self.get_rational(last).is_some() {
-                    // -(rest * c) → (rest * (-c))
-                    let neg_last = self.mk_neg(last);
-                    let mut new_args: Vec<TermId> = args_clone[..args_clone.len() - 1].to_vec();
-                    new_args.push(neg_last);
-                    return self.mk_mul(new_args);
+                if let Some(&last) = args_clone.last() {
+                    if self.get_int(last).is_some() || self.get_rational(last).is_some() {
+                        // -(rest * c) → (rest * (-c))
+                        let neg_last = self.mk_neg(last);
+                        let mut new_args: Vec<TermId> = args_clone[..args_clone.len() - 1].to_vec();
+                        new_args.push(neg_last);
+                        return self.mk_mul(new_args);
+                    }
                 }
             }
         }

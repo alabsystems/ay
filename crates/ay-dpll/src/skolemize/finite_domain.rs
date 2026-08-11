@@ -77,16 +77,14 @@ fn is_bound_var(terms: &TermStore, term: TermId, var_name: &str) -> bool {
 // #entailed-bound-expansion: the table of integer constants the problem's
 // quantifier-free consequences ENTAIL (see quantifier_loop::entailed_consts).
 //
-// Scoped, not ambient: `process_quantifiers` sets it immediately before its single
-// `expand_finite_domains()` call and clears it immediately after, so it is never
-// visible to a nested sub-solve (which runs on a SUBSET of the assertions that need
-// not entail these constants).
+// Scoped, not ambient: `process_quantifiers` installs it immediately before its
+// single `expand_finite_domains()` call.  The RAII scope below restores the
+// predecessor even if expansion unwinds, so it is never leaked into a nested
+// sub-solve (which runs on a SUBSET of the assertions that need not entail these
+// constants).
 thread_local! {
     static DERIVED: std::cell::RefCell<HashMap<TermId, BigInt>> =
         std::cell::RefCell::new(Default::default());
-}
-pub(crate) fn set_derived_consts(m: HashMap<TermId, BigInt>) {
-    DERIVED.with(|d| *d.borrow_mut() = m);
 }
 
 // #bool-ground-inst: ground Bool-sorted UF-argument terms of the CURRENT
@@ -107,15 +105,72 @@ pub(crate) fn set_derived_consts(m: HashMap<TermId, BigInt>) {
 // a pushed `f(c)=false` came back Unknown instead of UNSAT).
 //
 // Scoped like DERIVED: `expand_finite_domains()` (quantifier_loop/preprocess)
-// sets it from its own assertion set immediately before expanding and clears
-// it after, so no nested sub-solve sees stale candidates. (Even a stale
+// installs it from its own assertion set immediately before expanding.  RAII
+// restoration prevents a panic or early return from leaking candidates into a
+// later solve. (Even a stale
 // candidate would be sound — any ground Bool term denotes true or false — but
 // scoping keeps the instantiation set intentional and bounded.)
 thread_local! {
     static BOOL_GROUND: std::cell::RefCell<Vec<TermId>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-pub(crate) fn set_bool_ground_instantiation_candidates(v: Vec<TermId>) {
-    BOOL_GROUND.with(|b| *b.borrow_mut() = v);
+
+/// Panic-safe owner of one temporary finite-domain ambient-state replacement.
+///
+/// The fields are optional so production can scope DERIVED and BOOL_GROUND
+/// independently, while certificate replay can atomically replace both with
+/// empty state.  This type never escapes the module; callers receive an opaque
+/// `impl Drop` and therefore cannot forget restoration on an early return.
+struct FiniteDomainAmbientScope {
+    previous_derived: Option<HashMap<TermId, BigInt>>,
+    previous_bool_ground: Option<Vec<TermId>>,
+}
+
+impl Drop for FiniteDomainAmbientScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous_bool_ground.take() {
+            BOOL_GROUND.with(|state| *state.borrow_mut() = previous);
+        }
+        if let Some(previous) = self.previous_derived.take() {
+            DERIVED.with(|state| *state.borrow_mut() = previous);
+        }
+    }
+}
+
+fn replace_finite_domain_ambient(
+    derived: Option<HashMap<TermId, BigInt>>,
+    bool_ground: Option<Vec<TermId>>,
+) -> FiniteDomainAmbientScope {
+    let previous_derived = derived.map(|replacement| {
+        DERIVED.with(|state| std::mem::replace(&mut *state.borrow_mut(), replacement))
+    });
+    let previous_bool_ground = bool_ground.map(|replacement| {
+        BOOL_GROUND.with(|state| std::mem::replace(&mut *state.borrow_mut(), replacement))
+    });
+    FiniteDomainAmbientScope {
+        previous_derived,
+        previous_bool_ground,
+    }
+}
+
+/// Install derived integer constants for one expansion call and restore the
+/// predecessor on normal return or unwind.
+pub(crate) fn scoped_derived_consts(m: HashMap<TermId, BigInt>) -> impl Drop {
+    replace_finite_domain_ambient(Some(m), None)
+}
+
+/// Install the current assertion window's Bool instantiation candidates for
+/// one expansion call and restore the predecessor on normal return or unwind.
+pub(crate) fn scoped_bool_ground_instantiation_candidates(v: Vec<TermId>) -> impl Drop {
+    replace_finite_domain_ambient(None, Some(v))
+}
+
+/// Make certificate replay independent of every producer-side ambient hint.
+///
+/// Exact replay is a source theorem, so it must use only literal bounds and the
+/// canonical finite carriers.  Emptying both tables in one RAII scope prevents
+/// stale DERIVED facts or producer-selected Bool terms from influencing it.
+pub(crate) fn scoped_standalone_finite_domain_replay() -> impl Drop {
+    replace_finite_domain_ambient(Some(Default::default()), Some(Vec::new()))
 }
 /// A term's integer value: a syntactic literal, OR a value the problem's
 /// quantifier-free consequences PROVABLY ENTAIL (see
@@ -268,10 +323,7 @@ fn probe_range(
     var: &str,
     consts: Option<&HashMap<TermId, BigInt>>,
 ) -> Option<(i64, i64)> {
-    let saved = DERIVED.with(|d| d.borrow().clone());
-    DERIVED.with(|d| {
-        *d.borrow_mut() = consts.cloned().unwrap_or_default();
-    });
+    let _derived_scope = scoped_derived_consts(consts.cloned().unwrap_or_default());
     let mut lo: Option<i64> = None;
     let mut hi: Option<i64> = None;
     let mut any = false;
@@ -286,7 +338,6 @@ fn probe_range(
             }
         }
     }
-    DERIVED.with(|d| *d.borrow_mut() = saved);
     match (any, lo, hi) {
         (true, Some(l), Some(h))
             if interval_width(l, h) <= u128::from(MAX_FINITE_DOMAIN_COMBOS) =>
@@ -1320,12 +1371,26 @@ fn finite_domain_expand_impl(
         }
     }
 
+    // A conjunctively bounded-looking `forall` does NOT make Int a finite
+    // carrier. Enumerating only the points satisfying those conjuncts drops
+    // every outside-domain obligation and is not equivalent:
+    //
+    //   forall x,y:Int. 0<=x /\ x<=0 /\ 0<=y /\ y<=0
+    //
+    // is false, while the old generic box enumerated only `(0,0)` and folded
+    // the replacement to true. Exact guarded universal expansion is handled by
+    // the dedicated single-Int OR/implication path and the proved multi-Int
+    // guarded-box path above; if either refuses, fail closed to ordinary
+    // quantifier reasoning. This also excludes mixed Bool/BV+Int products.
+    if is_forall && vars.iter().any(|(_, sort)| *sort == Sort::Int) {
+        return None;
+    }
+
     // Check all vars have finite sorts and compute total combinations. An Int var
-    // is finite when BOUNDED — its per-var bounds are extracted from the body's
-    // conjuncts (#quant-multivar-int). The Int lower bound is carried so the value
-    // for combination index `i` is `lo + i`. (The single-Int-var case is handled by
-    // the specialized path above; this generalizes it to multiple Int vars, which
-    // the prior Bool/BV-only path rejected → the residue-drop false-UNSAT survived.)
+    // reaches this generic path only for `exists`, where a conjunctive guard is
+    // false outside the extracted interval and enumeration is exact. For
+    // `forall`, every Int-bearing case returned through a proved guarded route
+    // above or was rejected by the fail-closed check immediately above.
     let atoms = collect_and_atoms(terms, body);
     let mut domain_sizes: Vec<(String, Sort, i64, u64)> = Vec::with_capacity(vars.len());
     let mut total_combos: u64 = 1;

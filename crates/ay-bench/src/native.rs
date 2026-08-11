@@ -491,12 +491,14 @@ fn is_benchmark_file(path: &Path, domain: &str) -> bool {
 
 /// Returns true if the benchmark path needs decompression before solving.
 fn needs_decompression(path: &Path) -> bool {
-    let name = path
-        .file_name()
+    path.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    name.ends_with(".xz") || name.ends_with(".gz") || name.ends_with(".bz2")
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, extension)| {
+            extension.eq_ignore_ascii_case("xz")
+                || extension.eq_ignore_ascii_case("gz")
+                || extension.eq_ignore_ascii_case("bz2")
+        })
 }
 
 #[cfg(not(test))]
@@ -529,13 +531,17 @@ fn decompress_to_temp(
     timeout_sec: f64,
 ) -> Result<DecompressedInput> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("bench");
-    let lower_name = name.to_ascii_lowercase();
-    let (decompressed_name, decompress_cmd) = if lower_name.ends_with(".xz") {
-        (&name[..name.len() - ".xz".len()], "xz")
-    } else if lower_name.ends_with(".gz") {
-        (&name[..name.len() - ".gz".len()], "gzip")
-    } else if lower_name.ends_with(".bz2") {
-        (&name[..name.len() - ".bz2".len()], "bzip2")
+    let Some((decompressed_name, extension)) = name.rsplit_once('.') else {
+        return Err(BenchError::UnsupportedFormat {
+            path: path.to_path_buf(),
+        });
+    };
+    let decompress_cmd = if extension.eq_ignore_ascii_case("xz") {
+        "xz"
+    } else if extension.eq_ignore_ascii_case("gz") {
+        "gzip"
+    } else if extension.eq_ignore_ascii_case("bz2") {
+        "bzip2"
     } else {
         return Err(BenchError::UnsupportedFormat {
             path: path.to_path_buf(),
@@ -841,7 +847,7 @@ pub(crate) fn prepare_benchmark(
     let source_guard = TempFileGuard(Some(pinned_source_path.clone()));
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = source
             .read(&mut buffer)
@@ -972,7 +978,7 @@ pub(crate) fn current_benchmark_source_identity(path: &Path) -> Result<(String, 
 
     let mut hasher = Sha256::new();
     let mut size_bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = source
             .read(&mut buffer)
@@ -4717,6 +4723,7 @@ mod tests {
         assert!(needs_decompression(Path::new("test.cnf.xz")));
         assert!(needs_decompression(Path::new("test.cnf.gz")));
         assert!(needs_decompression(Path::new("test.cnf.bz2")));
+        assert!(needs_decompression(Path::new("test.CNF.GZ")));
         assert!(!needs_decompression(Path::new("test.cnf")));
         assert!(!needs_decompression(Path::new("test.smt2")));
     }
@@ -5771,7 +5778,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             file_list: Some(vec![benchmark.clone()]),
             shard: None,
             runs: 1,
-            reference_solvers: vec![(crate::native::reference_display_name(&reference), reference)],
+            reference_solvers: vec![(reference_display_name(&reference), reference)],
             run_class: None,
             solver_args: Vec::new(),
             sat_track: None,

@@ -1234,6 +1234,65 @@ fn test_bool_or_reif_true() {
 // --- circuit tests ---
 
 #[test]
+fn singleton_circuit_requires_its_self_loop() {
+    let fzn = "\
+        var 1..2: successor;\n\
+        constraint fzn_circuit([successor]);\n\
+        constraint int_eq(successor, 2);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Unsat));
+}
+
+#[test]
+fn declared_zero_based_circuit_uses_its_array_index_set() {
+    let fzn = "\
+        var 0..1: successor0;\n\
+        var 0..1: successor1;\n\
+        array [0..1] of var int: successors = [successor0, successor1];\n\
+        constraint fzn_circuit(successors);\n\
+        constraint int_eq(successor0, 1);\n\
+        constraint int_eq(successor1, 0);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn inline_circuit_does_not_infer_node_ids_from_shifted_domains() {
+    let fzn = "\
+        var 2..3: successor1;\n\
+        var 2..3: successor2;\n\
+        constraint fzn_circuit([successor1, successor2]);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Unsat));
+}
+
+#[test]
+fn extreme_successor_bounds_do_not_shift_the_circuit_index_set() {
+    let fzn = "\
+        var 9223372036854775807..9223372036854775807: x;\n\
+        var 9223372036854775807..9223372036854775807: y;\n\
+        constraint fzn_circuit([x, y]);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Unsat));
+}
+
+#[test]
+fn quadratic_global_decompositions_have_a_checked_work_limit() {
+    let fzn = "\
+        array [1..1025] of var 1..1025: x;\n\
+        array [1..1025] of var 1..1025: y;\n\
+        array [1..1025] of var 1..1025: dx;\n\
+        array [1..1025] of var 1..1025: dy;\n\
+        constraint fzn_circuit(x);\n\
+        constraint fzn_inverse(x, y);\n\
+        constraint fzn_diffn(x, y, dx, dy);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let unsupported = super::unsupported_constraints(&model).expect("translation must fail closed");
+    assert_eq!(unsupported, ["fzn_circuit", "fzn_inverse", "fzn_diffn"]);
+}
+
+#[test]
 fn test_circuit_4() {
     // circuit([x1, x2, x3, x4]): Hamiltonian cycle on 4 nodes.
     let fzn = "\
@@ -1291,9 +1350,9 @@ fn test_circuit_no_subcycles() {
 
 #[test]
 fn test_circuit_rejects_out_of_range_successor() {
-    // A circuit successor array is a 1-based permutation of node ids. The
-    // MTZ element path constrains non-root successors, but the root successor
-    // also needs an explicit 1..n range guard.
+    // A circuit successor array is a permutation of its declared index set.
+    // The MTZ element path constrains non-root successors, but the root
+    // successor also needs an explicit range guard.
     let fzn = "\
         var 4..4: x1;\n\
         var 3..3: x2;\n\
@@ -1308,6 +1367,52 @@ fn test_circuit_rejects_out_of_range_successor() {
 }
 
 // --- inverse tests ---
+
+#[test]
+fn declared_zero_based_inverse_uses_both_array_index_sets() {
+    let fzn = "\
+        var 1..1: x0;\n\
+        var 0..0: x1;\n\
+        var 1..1: y0;\n\
+        var 0..0: y1;\n\
+        array [0..1] of var int: x = [x0, x1];\n\
+        array [0..1] of var int: y = [y0, y1];\n\
+        constraint fzn_inverse(x, y);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn arbitrary_offset_inverse_channels_between_opposite_index_sets() {
+    // x[5]=9, x[6]=8 is inverted by y[8]=6, y[9]=5.
+    let fzn = "\
+        var 9..9: x5;\n\
+        var 8..8: x6;\n\
+        var 6..6: y8;\n\
+        var 5..5: y9;\n\
+        array [5..6] of var int: x = [x5, x6];\n\
+        array [8..9] of var int: y = [y8, y9];\n\
+        constraint fzn_inverse(x, y);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn inverse_rejects_mismatched_array_cardinalities() {
+    let fzn = "\
+        var 1..2: x;\n\
+        var 1..2: y1;\n\
+        var 1..2: y2;\n\
+        constraint fzn_inverse([x], [y1, y2]);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let err = super::unsupported_constraints(&model)
+        .expect_err("inverse arrays of different lengths must be rejected");
+    assert!(matches!(
+        err,
+        crate::error::Fzn2smtError::InverseArrayLengthMismatch { left: 1, right: 2 }
+    ));
+}
 
 #[test]
 fn test_inverse_3() {

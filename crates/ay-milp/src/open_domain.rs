@@ -234,7 +234,6 @@ impl MonotoneProjection {
                     residual.set_col_bounds(target, lb, ub);
                     target
                 }
-                _ => return Err(OpenDomainDecline::InvalidModel),
             };
             source_to_residual[column] = Some(target);
         }
@@ -815,10 +814,11 @@ fn exact_models_equal(left: &Model, right: &Model) -> bool {
     }
     for column in 0..left.num_cols() {
         let col = Col(column as u32);
+        let left_objective = left.obj_coeff_exact_at(column as u32, left.obj_coeff(col));
+        let right_objective = right.obj_coeff_exact_at(column as u32, right.obj_coeff(col));
         if left.col_kind(col) != right.col_kind(col)
             || left.col_bounds(col) != right.col_bounds(col)
-            || left.obj_coeff_exact_at(column as u32, left.obj_coeff(col))
-                != right.obj_coeff_exact_at(column as u32, right.obj_coeff(col))
+            || left_objective != right_objective
         {
             return false;
         }
@@ -827,9 +827,13 @@ fn exact_models_equal(left: &Model, right: &Model) -> bool {
         let row = Row(row_index as u32);
         let (left_terms, left_lb, left_ub) = left.row(row);
         let (right_terms, right_lb, right_ub) = right.row(row);
+        let left_lower = left.row_lb_exact(row_index, left_lb);
+        let right_lower = right.row_lb_exact(row_index, right_lb);
+        let left_upper = left.row_ub_exact(row_index, left_ub);
+        let right_upper = right.row_ub_exact(row_index, right_ub);
         if left_terms.len() != right_terms.len()
-            || left.row_lb_exact(row_index, left_lb) != right.row_lb_exact(row_index, right_lb)
-            || left.row_ub_exact(row_index, left_ub) != right.row_ub_exact(row_index, right_ub)
+            || left_lower != right_lower
+            || left_upper != right_upper
         {
             return false;
         }

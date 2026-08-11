@@ -27,6 +27,12 @@ impl CpSatEngine {
     /// constraints or tightening bounds via `add_upper_bound`/`add_lower_bound`.
     /// Search state (learned clauses, heuristic weights) is preserved.
     pub fn solve(&mut self) -> CpSolveResult {
+        if self.permanently_inconsistent {
+            return CpSolveResult::Unsat;
+        }
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
         // #5910: Reset state for incremental solving. trail.reset_all() restores
         // original bounds (backtrack_to(0) leaves stale level-0 entries).
         // clear_empty_clause() prevents a previous UNSAT from poisoning all
@@ -49,7 +55,12 @@ impl CpSatEngine {
         self.debug_constraints
             .extend(self.constraints.iter().cloned());
         self.compile_constraints();
-        self.encoder.pre_allocate_all(&mut self.sat);
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
+        if self.encoder.try_pre_allocate_all(&mut self.sat).is_err() {
+            return CpSolveResult::Unknown;
+        }
 
         // Start the SAT interrupt timer AFTER encoding completes (#5683).
         // This ensures encoding time does not consume the solving budget.
@@ -83,12 +94,23 @@ impl CpSatEngine {
     /// primitive for Large Neighborhood Search (freeze the incumbent outside a
     /// neighborhood, re-optimize inside it).
     pub fn solve_under_assumptions(&mut self, fixings: &[(IntVarId, i64)]) -> CpSolveResult {
+        if self.permanently_inconsistent {
+            return CpSolveResult::Unsat;
+        }
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
         self.trail.reset_all();
         self.sat.clear_empty_clause();
         self.detect_alldifferent();
         self.detect_shifted_alldifferent();
         self.compile_constraints();
-        self.encoder.pre_allocate_all(&mut self.sat);
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
+        if self.encoder.try_pre_allocate_all(&mut self.sat).is_err() {
+            return CpSolveResult::Unknown;
+        }
 
         if let Some(dl) = self.deadline {
             let remaining = dl.saturating_duration_since(Instant::now());
@@ -106,17 +128,11 @@ impl CpSatEngine {
         // Build assumption literals for each fixing: [x >= v] AND [x <= v].
         let mut assumptions = Vec::with_capacity(fixings.len() * 2);
         for &(var, val) in fixings {
-            // Encode x == val as [x >= val] AND NOT [x >= val+1]. Both are `is_ge`
-            // bound literals — the CpExtension's process_literal only decodes
-            // is_ge literals (a positive one tightens lb, a negated one tightens
-            // ub to v-1); it ignores is_le literals, so `get_or_create_le` here
-            // would be silently dropped and the fixing not enforced.
+            // `get_or_create_le` returns the negation of the corresponding
+            // `is_ge` literal, so the CP extension still decodes it as an upper
+            // bound. It also handles `i64::MAX` without overflowing `val + 1`.
             assumptions.push(self.encoder.get_or_create_ge(&mut self.sat, var, val));
-            assumptions.push(
-                self.encoder
-                    .get_or_create_ge(&mut self.sat, var, val + 1)
-                    .negated(),
-            );
+            assumptions.push(self.encoder.get_or_create_le(&mut self.sat, var, val));
         }
 
         if self.propagators.is_empty() && self.lazy_neqs.is_empty() {
@@ -342,11 +358,22 @@ impl CpSatEngine {
     /// drops all propagators and lazy neqs before solving. This is useful
     /// for diagnosing whether bugs are in the SAT encoding vs CP propagation.
     pub fn solve_pure_sat_only(&mut self) -> CpSolveResult {
+        if self.permanently_inconsistent {
+            return CpSolveResult::Unsat;
+        }
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
         self.trail.backtrack_to(0);
         self.detect_alldifferent();
         self.detect_shifted_alldifferent();
         self.compile_constraints();
-        self.encoder.pre_allocate_all(&mut self.sat);
+        if self.prepare_domain_holes().is_err() {
+            return CpSolveResult::Unknown;
+        }
+        if self.encoder.try_pre_allocate_all(&mut self.sat).is_err() {
+            return CpSolveResult::Unknown;
+        }
         // Drop all propagators — solve with SAT clauses only
         self.propagators.clear();
         self.dirty.clear();

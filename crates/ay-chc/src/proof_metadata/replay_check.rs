@@ -241,7 +241,7 @@ impl ChcPdrProofRun {
                         }
                     }
                     return Err(verification_error(format!(
-                        "checked replay obligation {} did not produce a native strict-Alethe \
+                        "checked replay obligation {} did not produce a native strict \
                          UNSAT certificate; staying metadata-only",
                         obligation.name
                     )));
@@ -251,12 +251,12 @@ impl ChcPdrProofRun {
                     ay_dpll::api::StrictProofVerdict::Verified(_)
                 ) {
                     return Err(verification_error(format!(
-                        "checked replay obligation {} native strict-Alethe verdict is not \
+                        "checked replay obligation {} native strict proof verdict is not \
                          Verified; staying metadata-only",
                         obligation.name
                     )));
                 }
-                // The gate above is AY's authoritative native strict Alethe
+                // The gate above is AY's authoritative native proof-IR strict
                 // self-check (`export_last_unsat_artifact().strict_verdict`),
                 // which includes the sound deferred-trust rescue: any trust
                 // step demoted from genuine BV/array theory reasoning is
@@ -264,8 +264,9 @@ impl ChcPdrProofRun {
                 // UNSAT) on AY's OWN executor — self-contained, no z3, no
                 // external checker. The proof bundle is serialized and
                 // digest-bound below as the PORTABLE certificate for downstream
-                // offline verification; note the plain offline
-                // `re_check_bundle_strict` is STRICTER than this gate (it
+                // offline verification. The separately hashed Alethe text is
+                // diagnostic and may honestly contain `hole`; note the plain
+                // offline `re_check_bundle_strict` is STRICTER than this gate (it
                 // rejects deferred-trust-rescued proofs), so it is not used as
                 // the admission gate here — doing so would fail-close legitimate
                 // BV/array-lemma LIA proofs the strict verdict soundly accepts.

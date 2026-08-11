@@ -35,6 +35,13 @@ pub(crate) fn format_sort(sort: &Sort) -> String {
     }
 }
 
+/// Format an engine sort at an SMT-LIB boundary using the owning frontend
+/// context's sticky nominal-carrier metadata.
+pub(crate) fn format_sort_surface(ctx: &ay_frontend::Context, sort: &Sort) -> String {
+    ctx.format_sort_surface(sort)
+        .unwrap_or_else(|| format_sort(sort))
+}
+
 /// Format a `Symbol` (function/constant name) for SMT-LIB output.
 pub(crate) fn format_symbol(sym: &Symbol) -> String {
     match sym {
@@ -62,6 +69,28 @@ pub(crate) fn format_model_atom(sort: &Sort, value: &str) -> String {
         Sort::Uninterpreted(_) | Sort::Datatype(_) => {
             if value.starts_with('@') {
                 format!("(as {} {})", quote_symbol(value), format_sort(sort))
+            } else {
+                quote_symbol(value)
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Context-aware model-atom formatter for public SMT-LIB output.
+pub(crate) fn format_model_atom_surface(
+    ctx: &ay_frontend::Context,
+    sort: &Sort,
+    value: &str,
+) -> String {
+    match sort {
+        Sort::Uninterpreted(_) | Sort::Datatype(_) => {
+            if value.starts_with('@') {
+                format!(
+                    "(as {} {})",
+                    quote_symbol(value),
+                    format_sort_surface(ctx, sort)
+                )
             } else {
                 quote_symbol(value)
             }
@@ -133,49 +162,37 @@ pub(crate) fn canonical_internal_atom(s: &str) -> String {
     }
 }
 
-/// Canonical default value of a sort, as SMT-LIB text, for a model slot that
-/// is genuinely UNCONSTRAINED by the formula (any value is a valid witness):
-/// unwritten array elements, empty (unconstrained) function-table bodies, and
-/// the dt-model canonical defaults route through here.
-///
-/// This is NOT a fallback for a value the evaluator failed to determine —
-/// printing a default for an `EvalValue::Unknown` is fabrication, and the
-/// former `format_value` that did exactly that (defaulting ANY sort at model
-/// print time) is removed (#no-fabricated-model-values). Values that exist
-/// only as completion defaults are inserted into the model itself BEFORE
-/// validation (model/completion.rs), so the printers read the same values the
-/// validation gate checked.
-pub(crate) fn format_default_value(sort: &Sort) -> String {
+/// Canonical default value of a sort at a public SMT-LIB boundary.
+/// Nominal sorts require their owning context so private carrier identities
+/// never leak. This is only for genuinely unconstrained model slots, never a
+/// fallback for failed evaluation.
+pub(crate) fn format_default_value_surface(ctx: &ay_frontend::Context, sort: &Sort) -> String {
     match sort {
         Sort::Bool => "false".to_string(),
         Sort::Int => "0".to_string(),
         Sort::Real => "0.0".to_string(),
         Sort::String => "\"\"".to_string(),
         Sort::RegLan => "re.none".to_string(),
-        Sort::BitVec(w) => format_bitvec(&num_bigint::BigInt::from(0), w.width),
-        Sort::FloatingPoint(eb, sb) => format!("(_ +zero {eb} {sb})"),
-        Sort::Array(arr) => {
-            // Recursive: const-array of default element value
-            format!(
-                "((as const {}) {})",
-                format_sort(sort),
-                format_default_value(&arr.element_sort)
-            )
+        Sort::BitVec(width) => format_bitvec(&num_bigint::BigInt::from(0), width.width),
+        Sort::FloatingPoint(exponent, significand) => {
+            format!("(_ +zero {exponent} {significand})")
         }
-        // `RoundingMode` is a FIXED 5-element FP domain, not an open
-        // uninterpreted universe: an `@RoundingMode!0` fresh element is not a
-        // valid value of the sort. Completion (`completion.rs`
-        // `unconstrained_default_value`) already fills RM defaults with a real
-        // mode before this printer is reached, so this arm is defensive — keep
-        // it symmetric so RM can never leak a non-mode token (#P0.2).
+        Sort::Array(array) => format!(
+            "((as const {}) {})",
+            format_sort_surface(ctx, sort),
+            format_default_value_surface(ctx, &array.element_sort)
+        ),
         Sort::Uninterpreted(name) if name == "RoundingMode" => {
-            format_model_atom(sort, "roundNearestTiesToEven")
+            format_model_atom_surface(ctx, sort, "roundNearestTiesToEven")
         }
-        Sort::Uninterpreted(name) => format_model_atom(sort, &format!("@{name}!0")),
-        Sort::Datatype(dt) => format_model_atom(sort, &format!("@{}!0", dt.name)),
-        Sort::Seq(_) => format!("(as seq.empty {})", format_sort(sort)),
-        // All current Sort variants handled above (#5692).
-        other => unreachable!("unhandled Sort variant in format_default_value(): {other:?}"),
+        Sort::Uninterpreted(name) => format_model_atom_surface(ctx, sort, &format!("@{name}!0")),
+        Sort::Datatype(datatype) => {
+            format_model_atom_surface(ctx, sort, &format!("@{}!0", datatype.name))
+        }
+        Sort::Seq(_) => format!("(as seq.empty {})", format_sort_surface(ctx, sort)),
+        other => {
+            unreachable!("unhandled Sort variant in format_default_value_surface(): {other:?}")
+        }
     }
 }
 

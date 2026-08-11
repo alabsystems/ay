@@ -14,8 +14,8 @@
 use ay_arrays::ArrayModel;
 use ay_bv::BvModel;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::term::{Constant, TermData};
-use ay_core::{Sort, TermId};
+use ay_core::term::{Constant, TermData, TermEntryStamp, TermStoreSnapshotStamp};
+use ay_core::{Sort, Symbol, TermId, TermStore};
 use ay_euf::EufModel;
 use ay_fp::{FpModel, FpModelValue};
 use ay_lia::LiaModel;
@@ -25,6 +25,7 @@ use ay_set::OP_CARD;
 use ay_strings::StringModel;
 use num_bigint::BigInt;
 use num_rational::BigRational;
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::executor_types::ModelValidationError;
@@ -49,16 +50,36 @@ mod eval_string;
 mod eval_uf;
 mod eval_var;
 mod independent_gate;
+pub(in crate::executor) use independent_gate::QuantifiedModelConfirmation;
 mod ite_fixup;
+mod ite_fixup_limits;
 mod minimize;
 mod output;
 mod output_format;
+mod output_objectives;
+mod projection_uf;
 pub(crate) mod sat_emit;
 mod set_materialize;
 mod string_materialize;
 pub(in crate::executor) mod string_witness;
 pub(in crate::executor) mod uflia_witness;
 mod validation;
+
+/// Whether term evaluation is currently running under a datatype-materializer
+/// pin set or lexical scoped binding.  Exact source-semantic certificates must
+/// decline in this state because `evaluate_term` is intentionally contextual.
+pub(in crate::executor) fn scoped_term_evaluation_override_active() -> bool {
+    dt_model::dt_field_override_active()
+}
+
+#[cfg(test)]
+pub(in crate::executor) fn with_scoped_term_evaluation_override_for_test<R>(
+    term: TermId,
+    value: EvalValue,
+    f: impl FnOnce() -> R,
+) -> R {
+    dt_model::with_scoped_term_override(term, value, f)
+}
 
 pub(in crate::executor) use dt_egraph_values::DtEgraphAssignment;
 pub(in crate::executor) use eval_array::ArrayDefIndexCache;
@@ -105,86 +126,18 @@ pub(super) fn debug_model() -> bool {
 ///      `term_id` is not a pure function of the model.
 /// (The former `AY_DISABLE_EVAL_MEMO=1` differential-check bypass is removed;
 /// the memo is always live inside a session.)
-mod eval_memo {
-    use super::EvalValue;
-    use ay_core::kani_compat::DetHashMap;
-    use ay_core::TermId;
-    use std::cell::RefCell;
-
-    struct Memo {
-        /// Number of nested active sessions; caching is live iff `> 0`.
-        depth: u32,
-        map: DetHashMap<TermId, EvalValue>,
-    }
-
-    thread_local! {
-        static EVAL_MEMO: RefCell<Memo> = RefCell::new(Memo {
-            depth: 0,
-            map: DetHashMap::default(),
-        });
-    }
-
-    /// RAII guard marking a region over which `evaluate_term` results may be
-    /// cached. Nesting is reference-counted; the OUTERMOST guard's `drop`
-    /// clears the map so no value outlives the pass that produced it.
-    pub(crate) struct EvalMemoSession {
-        active: bool,
-    }
-
-    impl EvalMemoSession {
-        pub(crate) fn new() -> Self {
-            EVAL_MEMO.with(|c| c.borrow_mut().depth += 1);
-            EvalMemoSession { active: true }
-        }
-    }
-
-    impl Drop for EvalMemoSession {
-        fn drop(&mut self) {
-            if !self.active {
-                return;
-            }
-            EVAL_MEMO.with(|c| {
-                let mut m = c.borrow_mut();
-                m.depth = m.depth.saturating_sub(1);
-                if m.depth == 0 {
-                    m.map.clear();
-                }
-            });
-        }
-    }
-
-    /// Look up a cached value; `None` if no session is active or on a miss.
-    pub(super) fn get(term_id: TermId) -> Option<EvalValue> {
-        EVAL_MEMO.with(|c| {
-            let m = c.borrow();
-            if m.depth == 0 {
-                None
-            } else {
-                m.map.get(&term_id).cloned()
-            }
-        })
-    }
-
-    /// Record a value; a no-op when no session is active.
-    pub(super) fn put(term_id: TermId, value: &EvalValue) {
-        EVAL_MEMO.with(|c| {
-            let mut m = c.borrow_mut();
-            if m.depth > 0 {
-                m.map.insert(term_id, value.clone());
-            }
-        });
-    }
-
-    /// Drop all cached values (keeps the session open). MUST be called on every
-    /// mutation of the model being validated so no cached value outlives its
-    /// model state.
-    pub(super) fn clear() {
-        EVAL_MEMO.with(|c| c.borrow_mut().map.clear());
-    }
-}
+mod eval_memo;
 
 pub(in crate::executor) use eval_guard::AssertionsFrozen;
+pub(in crate::executor::model) use eval_guard::EvalWorkBudget;
 pub(crate) use eval_memo::EvalMemoSession;
+pub(in crate::executor) use projection_uf::ProjectionUfModel;
+
+mod div_witness;
+#[allow(unused_imports)]
+pub(in crate::executor) use div_witness::{
+    DivWitnessCandidate, DivWitnessFamily, DivWitnessIndex, DivWitnessIndexCache,
+};
 
 /// Evaluation re-entrancy guard (`#eval-cycle-guard`).
 ///
@@ -219,231 +172,30 @@ pub(crate) use eval_memo::EvalMemoSession;
 ///     interrupt/deadline actually terminates long evaluation passes
 ///     (previously only the search loop polled the flag; model evaluation
 ///     ran to completion no matter what).
-mod eval_guard {
-    use ay_core::kani_compat::DetHashMap;
-    use ay_core::TermId;
-    use std::cell::RefCell;
-
-    struct GuardState {
-        /// Term under evaluation -> its entry depth on this thread's stack.
-        in_progress: DetHashMap<TermId, u32>,
-        /// Current evaluation-stack depth (frames with a live `Entered`).
-        depth: u32,
-        /// Lowest ENTRY DEPTH targeted by any cycle re-entry observed in the
-        /// current frame's scope (`u32::MAX` = none). Swapped per frame and
-        /// folded into the parent's scope on exit — the Tarjan-lowlink
-        /// discipline (#eval-lowlink).
-        min_reentry: u32,
-        /// Monotone counter bumped on external stop — results computed
-        /// across a stop are never memoized (unchanged from the original
-        /// poison semantics for stops).
-        stop_poison: u64,
-        /// Monotone count of MEMO-MISSING `evaluate_term` node visits on this
-        /// thread — the evaluator's unit of real work (a memo hit never
-        /// reaches `enter`). Throttles the external-stop poll, and is the
-        /// deterministic clock W4's search budget is measured against
-        /// (`Executor::w4_work_deadline`).
-        enters: u64,
-        /// Process-unique id of the current OUTERMOST evaluation frame
-        /// (assigned on every depth 0 -> 1 transition from the global
-        /// [`FRAME_GENERATION`] source). See [`top_frame_generation`].
-        top_generation: u64,
-    }
-
-    /// Process-global frame-generation source. Monotonic across ALL threads,
-    /// so a generation is never reused — even when solves run on fresh
-    /// dedicated-stack threads whose thread-locals restart from scratch.
-    static FRAME_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    thread_local! {
-        static STATE: RefCell<GuardState> = RefCell::new(GuardState {
-            in_progress: DetHashMap::default(),
-            depth: 0,
-            min_reentry: u32::MAX,
-            stop_poison: 0,
-            enters: 0,
-            top_generation: 0,
-        });
-    }
-
-    /// The process-unique id of the outermost `evaluate_term` frame currently
-    /// live on this thread, or `None` outside any evaluation.
-    ///
-    /// SOUNDNESS BASIS (borrow discipline, not convention): `evaluate_term`
-    /// takes `&self` on the executor and `ctx.assertions` /
-    /// `last_assumptions` are plain fields (no interior mutability), so for
-    /// the whole lifetime of one outermost frame no `&mut self` method can
-    /// run on this thread — the assertion set is FROZEN by the borrow
-    /// checker. A cache validated under generation G may therefore skip
-    /// re-validation for as long as `top_frame_generation()` still returns
-    /// G. (This is deliberately NOT keyed on eval-memo sessions: sessions
-    /// span `&mut self` regions that DO mutate assertions — the incremental
-    /// push/pop suite refuted that contract via the debug oracle.)
-    pub(in crate::executor) fn top_frame_generation() -> Option<u64> {
-        STATE.with(|s| {
-            let st = s.borrow();
-            (st.depth > 0).then_some(st.top_generation)
-        })
-    }
-
-    /// RAII token marking one term as under evaluation on this thread.
-    pub(super) struct Entered {
-        term: TermId,
-    }
-
-    impl Drop for Entered {
-        fn drop(&mut self) {
-            STATE.with(|s| {
-                let mut st = s.borrow_mut();
-                st.in_progress.remove(&self.term);
-                st.depth -= 1;
-            });
-        }
-    }
-
-    /// Mark `term` in-progress; `None` when it already is — a cycle. The
-    /// re-entry records the TARGET frame's entry depth in the current
-    /// frame's `min_reentry` scope: a frame's result is a pure function of
-    /// `(model, term)` iff every cycle observed during its computation
-    /// targeted a term at or below its own depth (the cycle is then
-    /// internal to its subtree and a fresh top-level evaluation reproduces
-    /// the identical fail-closed cuts). The former GLOBAL poison vetoed the
-    /// memo for the ENTIRE stack above any cycle — and the UF function
-    /// tables' self/congruent rows guarantee bottom cycles, so effectively
-    /// nothing memoized and sibling row resolutions re-walked whole trees:
-    /// the #eval-cycle-guard turned the old unbounded-memory divergence
-    /// into a bounded-memory EXPONENTIAL-TIME recomputation (the 30s
-    /// slice_index verification-consumer spins). Depth-scoped purity lets cycle heads
-    /// and self-contained subtrees memoize.
-    pub(super) fn enter(term: TermId) -> Option<Entered> {
-        STATE.with(|s| {
-            let mut st = s.borrow_mut();
-            st.enters = st.enters.saturating_add(1);
-            if let Some(&entry_depth) = st.in_progress.get(&term) {
-                st.min_reentry = st.min_reentry.min(entry_depth);
-                None
-            } else {
-                st.depth += 1;
-                if st.depth == 1 {
-                    // New outermost frame: mint its process-unique id.
-                    st.top_generation =
-                        1 + FRAME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                let d = st.depth;
-                st.in_progress.insert(term, d);
-                Some(Entered { term })
-            }
-        })
-    }
-
-    /// Depth of the innermost live frame (call between `enter` and drop).
-    pub(super) fn depth() -> u32 {
-        STATE.with(|s| s.borrow().depth)
-    }
-
-    /// Open a fresh `min_reentry` scope for the current frame, returning the
-    /// parent's value to restore-fold on exit.
-    pub(super) fn swap_min(new: u32) -> u32 {
-        STATE.with(|s| {
-            let mut st = s.borrow_mut();
-            std::mem::replace(&mut st.min_reentry, new)
-        })
-    }
-
-    pub(super) fn min_reentry() -> u32 {
-        STATE.with(|s| s.borrow().min_reentry)
-    }
-
-    /// Fold this frame's observations back into the parent's scope.
-    pub(super) fn fold_min(parent: u32) {
-        STATE.with(|s| {
-            let mut st = s.borrow_mut();
-            st.min_reentry = st.min_reentry.min(parent);
-        })
-    }
-
-    /// True on every 512th `enter` — throttles the external-stop poll to
-    /// keep the hot path free of clock reads.
-    pub(super) fn should_poll_stop() -> bool {
-        STATE.with(|s| s.borrow().enters & 511 == 0)
-    }
-
-    /// This thread's memo-missing node-visit count (see `GuardState::enters`).
-    pub(super) fn enters() -> u64 {
-        STATE.with(|s| s.borrow().enters)
-    }
-
-    thread_local! {
-        /// Nesting depth of live [`AssertionsFrozen`] guards on this thread.
-        static FREEZE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        /// Process-unique id of the outermost live freeze region.
-        static FREEZE_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-
-    /// Process-global freeze-generation source (never reused across threads).
-    static FREEZE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    /// RAII marker for a lexical region that PROMISES not to mutate
-    /// `ctx.assertions` / `last_assumptions` — placed only around passes that
-    /// interleave model mutation with many top-level `evaluate_term` calls
-    /// (each of which is its own frame, so the frame-generation fast path
-    /// cannot amortize across them; the read-pin repair loop re-ran the
-    /// O(constraints) def-index snapshot compare once per pin because of
-    /// exactly this).
-    ///
-    /// UNLIKE the borrow-checker-backed frame generation, this is a stated
-    /// contract — so it is defended the same way the (refuted) eval-memo
-    /// session keying was caught: `array_def_candidates` re-runs the full
-    /// byte-exact snapshot compare on every freeze-keyed fast hit in debug
-    /// builds. A guard placed around a region that does mutate assertions
-    /// fails loudly across the test batteries instead of serving a stale
-    /// definition set.
-    pub(in crate::executor) struct AssertionsFrozen(());
-
-    impl AssertionsFrozen {
-        pub(in crate::executor) fn new() -> Self {
-            FREEZE_DEPTH.with(|d| {
-                let depth = d.get();
-                if depth == 0 {
-                    FREEZE_GEN.with(|g| {
-                        g.set(
-                            1 + FREEZE_GENERATION
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                        );
-                    });
-                }
-                d.set(depth + 1);
-            });
-            AssertionsFrozen(())
-        }
-    }
-
-    impl Drop for AssertionsFrozen {
-        fn drop(&mut self) {
-            FREEZE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
-    }
-
-    /// The process-unique id of the outermost live assertions-freeze region on
-    /// this thread, or `None` when no guard is live.
-    pub(in crate::executor) fn assertions_freeze_generation() -> Option<u64> {
-        FREEZE_DEPTH.with(|d| (d.get() > 0).then(|| FREEZE_GEN.with(std::cell::Cell::get)))
-    }
-
-    pub(super) fn stop_poison() -> u64 {
-        STATE.with(|s| s.borrow().stop_poison)
-    }
-
-    pub(super) fn note_stop() {
-        STATE.with(|s| s.borrow_mut().stop_poison += 1);
-    }
-}
+mod eval_guard;
 
 /// Invalidate the `evaluate_term` result cache after a model mutation
 /// (`#eval-memo`). Free function so mutation sites that hold only `&mut Model`
 /// (not `&self`) can call it.
 pub(super) fn eval_memo_clear() {
     eval_memo::clear();
+}
+
+/// Evaluate one exact semantic obligation in a fresh memo universe.
+///
+/// This is intentionally closure-based so the isolation guard cannot be
+/// forgotten by a caller.  The nested session permits local DAG memoization,
+/// while the outer session and all of its entries are restored byte-for-byte
+/// after the closure returns or unwinds.
+pub(in crate::executor) fn with_isolated_eval_memo<R>(f: impl FnOnce() -> R) -> R {
+    let _isolation = eval_memo::IsolatedEvalMemo::new();
+    let _session = EvalMemoSession::new();
+    f()
+}
+
+#[cfg(test)]
+pub(in crate::executor) fn seed_eval_memo_for_test(term_id: TermId, value: EvalValue) {
+    eval_memo::seed_for_test(term_id, value);
 }
 
 /// This thread's monotone count of memo-missing `evaluate_term` node visits —
@@ -454,9 +206,30 @@ pub(crate) fn eval_node_visits() -> u64 {
     eval_guard::enters()
 }
 
+mod certificate_data;
+use certificate_data::{
+    eval_value_has_exact_sort, CertifiedConstInterpModel, CertifiedTotalUfInterpretation,
+    CertifiedTotalUfModel, FormulaNeutralFunctionDefaults, QuantifiedConfirmationModelSeal,
+    QuantifiedGrantModelSeal, StampedCertificatePin, StampedClosedValueGraph,
+};
+pub(in crate::executor) use certificate_data::{
+    CegqiUfModelEpoch, CertifiedConstInterpEntry, CertifiedConstInterpReadError,
+    FormulaNeutralFunctionDefaultEntry, FormulaNeutralFunctionDefaultReadError,
+    QuantifiedConfirmationModelEpoch, QuantifiedGrantModelEpoch,
+};
+
 /// A satisfying model from check-sat
 #[derive(Debug, Clone)]
 pub(super) struct Model {
+    /// Exact identity installed by a successful quantified-model check.
+    ///
+    /// It is not SAT authority by itself.  The independent gate also requires
+    /// the sealed executor capability carrying the matching public-query,
+    /// source-context, and ordered-root snapshot.
+    quantified_confirmation_seal: QuantifiedConfirmationModelSeal,
+    /// Replacement-sensitive identity retained by model-relative quantified
+    /// certificate grants across the final gate's one-shot seal cleanup.
+    quantified_grant_model_seal: QuantifiedGrantModelSeal,
     /// SAT variable assignments (indexed by variable)
     pub(super) sat_model: Vec<bool>,
     /// Reverse mapping from term IDs to SAT variables (for efficient lookup)
@@ -484,6 +257,24 @@ pub(super) struct Model {
     pub(super) string_model: Option<StringModel>,
     /// Optional Seq model (for QF_SEQ and related logics).
     pub(super) seq_model: Option<SeqModel>,
+    /// Exact total interpretations certified for quantified UF heads.
+    ///
+    /// These symbolic projections are result-local and are consulted before
+    /// finite EUF tables.  They are model data only; possession of this field
+    /// is not authority to emit SAT.
+    projection_ufs: ProjectionUfModel,
+    /// Exact typed table/default interpretations built by quantified SAT
+    /// certificates. Consulted before stale per-application ground values.
+    certified_total_ufs: CertifiedTotalUfModel,
+    /// Exact constant-function interpretations built by a quantified SAT
+    /// certificate.  The declaration bindings and stamped values travel with
+    /// this model and are shared by semantic clones; publication authority is
+    /// intentionally stored in the non-cloning seals above instead.
+    certified_const_interps: CertifiedConstInterpModel,
+    /// Canonical defaults for ordinary functions proved absent from the exact
+    /// quantified theorem roots. Kept separate from `euf_model` so adding an
+    /// output-only declaration cannot change strict-gate classification.
+    formula_neutral_function_defaults: FormulaNeutralFunctionDefaults,
     /// Completion-assigned values for declared constants that have no entry in
     /// any theory model (model/completion.rs, #no-fabricated-model-values).
     ///
@@ -504,31 +295,9 @@ pub(super) struct Model {
     pub(super) dt_pins: HashMap<TermId, EvalValue>,
 }
 
-impl Model {
-    /// An empty model: no SAT assignment and no theory sub-models.
-    ///
-    /// Used as the base for the trivially-SAT completion model (every declared
-    /// constant is unconstrained after preprocessing reduced the formula to
-    /// `true`) and by internal callers that synthesize partial models.
-    pub(super) fn empty() -> Self {
-        Model {
-            sat_model: Vec::new(),
-            term_to_var: HashMap::default(),
-            bool_overrides: HashMap::default(),
-            euf_model: None,
-            array_model: None,
-            lra_model: None,
-            lia_model: None,
-            bv_model: None,
-            fp_model: None,
-            string_model: None,
-            seq_model: None,
-            completed_values: HashMap::default(),
-            dt_ground: HashMap::default(),
-            dt_pins: HashMap::default(),
-        }
-    }
-}
+mod model_base;
+mod model_quantified;
+mod model_total_uf;
 
 /// Evaluated value from model evaluation
 #[derive(Debug, Clone)]
@@ -808,6 +577,19 @@ impl Executor {
         if self.w4_budget_exhausted() {
             return EvalValue::Unknown;
         }
+        // A checked projection is a total symbolic interpretation. Resolve it
+        // before every TermId-keyed source (datatype override/pin, result memo,
+        // EUF table, theory value, or completion fallback), so all consumers
+        // observe the selected argument rather than stale per-application
+        // state. The shared iterative walk fails closed on its resource cap.
+        match model
+            .projection_ufs
+            .peel_application_chain(&self.ctx.terms, term_id)
+        {
+            Ok(Some(projected_term)) => return self.evaluate_term(model, projected_term),
+            Ok(None) => {}
+            Err(_) => return EvalValue::Unknown,
+        }
         // Datatype-field re-evaluation override (#dt-field-soundness). When the
         // materialized datatype re-evaluator (`dt_mat_eval`) is active it pins every
         // datatype selector/recognizer subterm to its concrete model value here, so
@@ -820,6 +602,9 @@ impl Executor {
             if let Some(v) = dt_model::active_term_override_lookup(&self.ctx.terms, term_id) {
                 return v;
             }
+            if let Some(pin) = model.quantified_certificate_pin(&self.ctx.terms, term_id) {
+                return pin;
+            }
             // Cycle guard (#eval-cycle-guard): fail closed on re-entry. The
             // memo is bypassed in override mode, so no purity bookkeeping is
             // needed; re-entry observations flow into the enclosing frame's
@@ -831,6 +616,15 @@ impl Executor {
                 return EvalValue::Unknown;
             }
             return self.evaluate_term_inner(model, term_id);
+        }
+        // Certificate projections are model-owned and slot-authenticated.
+        // Consult only the `model` passed to this evaluation, before the
+        // TermId-only memo. A rollback can reuse the numeric slot; a mismatched
+        // birth stamp makes the retained model stale for that term and must
+        // fail closed instead of returning either the old pin or a memoized
+        // value for the discarded entry.
+        if let Some(pin) = model.quantified_certificate_pin(&self.ctx.terms, term_id) {
+            return pin;
         }
         // Result memo (perf-only, verdict-preserving; #eval-memo). Live only
         // inside an `EvalMemoSession` over an immutable model. A memoized
@@ -861,11 +655,13 @@ impl Executor {
         // our subtree), then fold observations into the parent's scope.
         let parent_min = eval_guard::swap_min(u32::MAX);
         let stop_before = eval_guard::stop_poison();
+        let work_budget_before = eval_guard::work_budget_poison();
         let v = self.evaluate_term_inner(model, term_id);
         let frame_min = eval_guard::min_reentry();
         if !self.w4_budget_exhausted()
             && frame_min >= eval_guard::depth()
             && eval_guard::stop_poison() == stop_before
+            && eval_guard::work_budget_poison() == work_budget_before
         {
             eval_memo::put(term_id, &v);
         }
@@ -877,17 +673,6 @@ impl Executor {
     /// the memoized `evaluate_term` wrapper so shared subterms are computed once.
     fn evaluate_term_inner(&self, model: &Model, term_id: TermId) -> EvalValue {
         stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
-            // The MBQI SAT certificate can exhibit a total interpretation that
-            // is richer than the lossy ground-theory model retained for output.
-            // Its ground pins are values in that exhibited interpretation and
-            // were installed only after every original assertion re-evaluated
-            // to true. Binder-dependent terms are excluded because one TermId
-            // can denote several beta instances.
-            if !dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id) {
-                if let Some(pin) = self.mbqi_sat_cert_pins.get(&term_id) {
-                    return pin.clone();
-                }
-            }
             // Total-datatype-model pins (#dt-total-model): a datatype-sorted
             // term, selector application, or tester application whose value the
             // datatype model-construction phase pinned evaluates to that pinned
@@ -910,14 +695,31 @@ impl Executor {
             // through to the completion defaults `(get-model)` is overriding,
             // and `(get-value)` would contradict the printed model.
             //
-            // Not a widening: the pins are live only between a grant and the
-            // next check-sat entry, and only on the route where the certificate
-            // supplied the whole model (`last_model` was `None`), so there is no
-            // theory-model value for a pin to override. The pinned value is a
-            // closed constant, so the recursive call terminates immediately.
-            if let Some(value) = self.const_interp_witness_value(term_id) {
-                if value != term_id {
+            // Model ownership is load-bearing: a separately passed or cloned
+            // model reads only its own package, never executor routing state.
+            // Once a package owns the symbol, stale identity or a conflicting
+            // application signature must stop here as `Unknown`; falling
+            // through would let a lower-priority raw table contradict the
+            // certified interpretation. The value is a closed, acyclic graph
+            // of scalar literals and const-arrays, so recursion cannot return
+            // to the interpreted head.
+            match self.const_interp_witness_value(model, term_id) {
+                Ok(Some(value)) if value != term_id => {
                     return self.evaluate_term(model, value);
+                }
+                Ok(Some(_)) | Err(_) => return EvalValue::Unknown,
+                Ok(None) => {}
+            }
+            if let TermData::App(symbol, arguments) = self.ctx.terms.get(term_id) {
+                match model.formula_neutral_function_default_for_application(
+                    &self.ctx,
+                    symbol,
+                    arguments,
+                    self.ctx.terms.sort(term_id),
+                ) {
+                    Ok(Some(value)) => return value,
+                    Err(_) => return EvalValue::Unknown,
+                    Ok(None) => {}
                 }
             }
             let term = self.ctx.terms.get(term_id);
@@ -1278,8 +1080,9 @@ impl Executor {
                         OP_CARD if args.len() == 1 => {
                             match self.set_card_model_count(model, args[0]) {
                                 Some(n) => EvalValue::Rational(BigRational::from(n)),
-                                None => self
-                                    .evaluate_uninterpreted_app(model, name, args, sort, term_id),
+                                None => {
+                                    self.evaluate_uninterpreted_app(model, sym, args, sort, term_id)
+                                }
                             }
                         }
                         // Array select: select(a, i) -> evaluate using array axioms,
@@ -1467,7 +1270,7 @@ impl Executor {
                         }
 
                         // Uninterpreted function application — delegated to eval_uf.rs
-                        _ => self.evaluate_uninterpreted_app(model, name, args, sort, term_id),
+                        _ => self.evaluate_uninterpreted_app(model, sym, args, sort, term_id),
                     }
                 }
 
@@ -1562,6 +1365,42 @@ impl Executor {
         };
 
         try_side(lhs, rhs).or_else(|| try_side(rhs, lhs))
+    }
+}
+
+#[cfg(test)]
+mod closed_value_graph_tests {
+    use super::*;
+
+    #[test]
+    fn nested_const_array_rechecks_child_stamp_while_root_is_current() {
+        let mut terms = TermStore::new();
+        let zero = terms.mk_int(BigInt::from(0));
+        let inner = terms.mk_const_array(Sort::Bool, zero);
+        let outer = terms.mk_const_array(Sort::Int, inner);
+        let outer_sort = terms.sort(outer).clone();
+        let outer_stamp = terms.entry_stamp(outer).expect("live outer value");
+        let mut graph = StampedClosedValueGraph::capture(&terms, outer, &outer_sort)
+            .expect("nested const-array is a closed value graph");
+        assert_eq!(graph.slots.len(), 3, "root and both descendants are pinned");
+        assert!(graph.is_current(&terms, outer, &outer_sort));
+
+        let unrelated = terms.mk_int(BigInt::from(1));
+        let unrelated_stamp = terms
+            .entry_stamp(unrelated)
+            .expect("live unrelated literal");
+        let child_slot = graph
+            .slots
+            .iter()
+            .position(|(term, _)| *term == inner)
+            .expect("inner const-array is reachable");
+        graph.slots[child_slot].1 = unrelated_stamp;
+
+        assert_eq!(terms.entry_stamp(outer), Some(outer_stamp));
+        assert!(
+            !graph.is_current(&terms, outer, &outer_sort),
+            "a root-only currentness check must not accept a stale child slot"
+        );
     }
 }
 

@@ -419,7 +419,7 @@ fn proof_solve_and_extract(
     // candidate generation + 2 validation checks per candidate, so this stays
     // within the cascade's budget shape).
     let t_solve = Instant::now();
-    let solve_result = solver.check_sat();
+    let solve_result = solver.check_sat_internal_query();
     if stats {
         safe_eprintln!(
             "[PROOF-ITP] solve: result_unsat={} dt={:.3}s a={} b={}",

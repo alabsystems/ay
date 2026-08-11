@@ -218,7 +218,9 @@ impl TermStore {
             (Some(lhs), Some(rhs)) => Some(self.mk_bvsub(vec![lhs, rhs])),
             (Some(result), None) => Some(result),
             (None, Some(result)) => Some(self.mk_bvneg(result)),
-            (None, None) => unreachable!("non-empty NAF has at least one component"),
+            // Defensive: decline the rewrite if a future NAF producer ever
+            // violates its non-empty contract.
+            (None, None) => None,
         }
     }
 

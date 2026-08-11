@@ -1868,7 +1868,7 @@ impl LpModel {
             }
 
             // L(y) and the closed-form inner minimiser.
-            aty.iter_mut().for_each(|a| *a = 0.0);
+            aty.fill(0.0);
             let mut l = 0.0f64;
             for (r, (coeffs, b)) in rows_f64.iter().enumerate() {
                 let yr = y[r];
@@ -1929,7 +1929,7 @@ impl LpModel {
                 norm += gr * gr;
                 g[r] = gr;
             }
-            if !(norm > 1e-12) {
+            if norm.partial_cmp(&1e-12) != Some(std::cmp::Ordering::Greater) {
                 break; // exact optimum of the relaxation, or a degenerate model
             }
             let step = lambda * ((target - l).max(1e-6)) / norm;

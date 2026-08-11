@@ -13,8 +13,17 @@
 
 use crate::command::Term as ParsedTerm;
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
+use ay_core::term::TermStoreSnapshotStamp;
 use ay_core::{Sort, TermId, TermStore};
+
+mod provenance;
+
+use provenance::ContextIdentity;
+pub use provenance::{
+    CheckedProjectionBinding, CheckedProjectionBindings, DeclarationId, DeclarationKind,
+    ProjectionBindingRejection, ProjectionBindingRequest, SourceContextStamp,
+};
 
 /// The reserved prefix for internal AY symbols.
 /// User declarations with this prefix are rejected.
@@ -167,6 +176,62 @@ pub fn is_reserved_op_name(name: &str) -> bool {
     RESERVED_OP_NAMES.contains(&name)
 }
 
+/// Why an elaborator-recognized operator spelling remains user-declarable.
+///
+/// Keeping this classification closed prevents a misspelled reason tag from
+/// silently changing the declaration-identity or theory-identity gates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExcludedDeclarableOpClass {
+    /// A Core/Ints/Reals operator that must remain a legal array-map target.
+    MapTarget,
+    /// A spelling recognized only as part of an indexed identifier.
+    IndexedOnly,
+    /// The match-expression wildcard binder, rather than an operator head.
+    PatternBinder,
+    /// An operator for which a live declaration takes precedence.
+    DeclaredShadowed,
+    /// A collection operator activated by a declaration at its native rank.
+    DeclarationActivated,
+}
+
+use ExcludedDeclarableOpClass::{
+    DeclarationActivated, DeclaredShadowed, IndexedOnly, MapTarget, PatternBinder,
+};
+
+impl ExcludedDeclarableOpClass {
+    const fn is_canonical_theory_identity(self) -> bool {
+        matches!(self, Self::MapTarget | Self::DeclarationActivated)
+    }
+}
+
+fn excluded_declarable_op_class(name: &str) -> Option<ExcludedDeclarableOpClass> {
+    EXCLUDED_DECLARABLE_OP_NAMES
+        .iter()
+        .find_map(|&(operator, class)| (operator == name).then_some(class))
+}
+
+/// Whether `name` is an exact core identity whose semantics are selected by a
+/// theory operator rather than by an ordinary uninterpreted declaration.
+///
+/// This is wider than [`is_reserved_op_name`]: Core/Ints/Reals operators remain
+/// legal array-map targets, so source declarations using those spellings are
+/// assigned private core identities instead of being rejected.  Their raw
+/// spellings nevertheless remain canonical theory identities.  Collection
+/// predicates in the declaration-activated class likewise request native
+/// theory semantics rather than an arbitrary UF interpretation.
+///
+/// `declared-shadowed` names are intentionally absent: once a live declaration
+/// owns one of those names, elaboration gives that declaration precedence over
+/// the builtin syntax. `indexed-only` names are classified by the `Symbol`
+/// shape at their consumer because their bare named forms remain ordinary
+/// declaration identities.
+#[doc(hidden)]
+pub fn is_canonical_theory_operator_identity(name: &str) -> bool {
+    is_reserved_op_name(name)
+        || excluded_declarable_op_class(name)
+            .is_some_and(ExcludedDeclarableOpClass::is_canonical_theory_identity)
+}
+
 /// Elaborator-recognized operator names that REMAIN user-declarable, each with
 /// its documented reason. This is the explicit complement of
 /// [`RESERVED_OP_NAMES`]: the drift-proof test
@@ -176,9 +241,9 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 /// exactly one of the two tables — adding a new match arm without classifying
 /// its name fails the test, so the forgery surface cannot silently widen.
 ///
-/// Reason tags:
+/// Exclusion classes:
 ///
-/// * `"map-target"` — SMT-LIB Core connectives and Ints/Reals operators. AY's
+/// * `MapTarget` — SMT-LIB Core connectives and Ints/Reals operators. AY's
 ///   higher-order `(_ map f)` feature REQUIRES its target `f` to be a declared
 ///   symbol (it is looked up in the symbol table), and pointwise boolean/
 ///   arithmetic array maps legitimately `declare-fun` these very names — e.g.
@@ -189,7 +254,7 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 ///   the reserved table closes. (Verified: `legit_map_not.smt2` — declare-fun
 ///   `not` + `((_ map not) s)` — still elaborates and answers `sat`.)
 ///
-/// * `"indexed-only"` — identifiers recognized solely inside `(_ …)` indexed
+/// * `IndexedOnly` — identifiers recognized solely inside `(_ …)` indexed
 ///   forms (`(_ map f)`, `(_ is C)`, `(_ divisible n)`, `(_ at-most k)`, …,
 ///   and the structured Char/FP special literals `(_ Char n)`/
 ///   `(_ +zero eb sb)`/`(_ NaN eb sb)`/… matched in `indexed.rs`. A plain
@@ -198,11 +263,11 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 ///   verified for `map`/`at-most`/`at-least`/`pble`/`pbge`/`pbeq`/`divisible`/
 ///   `re.^`, and for quoted-symbol FP-literal forgeries: sat/correct).
 ///
-/// * `"pattern-binder"` — `_`, matched in `term.rs` only as the wildcard
+/// * `PatternBinder` — `_`, matched in `term.rs` only as the wildcard
 ///   binder of a `(match …)` default case. It is not an operator and is never
 ///   elaborated as an application head, so it cannot conflate.
 ///
-/// * `"declared-shadowed"` — structurally recognized operators whose dispatcher
+/// * `DeclaredShadowed` — structurally recognized operators whose dispatcher
 ///   is reached only after declared-symbol resolution. This includes `const`,
 ///   the constant-array qualified identifier `((as const (Array ..)) v)`, and
 ///   Z3's legacy array-plugin set aliases (`union`, `intersection`, `setminus`,
@@ -215,7 +280,7 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 ///   user symbol, closing builtin conflation by shadowing rather than by
 ///   reservation.
 ///
-/// * `"declaration-activated"` — AY-extension collection predicates whose
+/// * `DeclarationActivated` — AY-extension collection predicates whose
 ///   `declare-fun` IS the documented activation route for the native
 ///   collection solvers: deductive-checks's encoder declares exactly these names via
 ///   the ay-dpll programmatic API (`try_declare_fun("set.subset", …)`, …) to
@@ -242,83 +307,93 @@ pub fn is_reserved_op_name(name: &str) -> bool {
 ///   answer `unsat`, which is CORRECT for the native predicate the
 ///   declaration requests (subset reflexivity holds in every model).
 #[rustfmt::skip]
-pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, &str)] = &[
+pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, ExcludedDeclarableOpClass)] = &[
     // SMT-LIB Core connectives (elaborate/app/core.rs)
-    ("and", "map-target"), ("or", "map-target"), ("not", "map-target"),
-    ("xor", "map-target"), ("=>", "map-target"), ("implies", "map-target"),
-    ("&&", "map-target"), ("||", "map-target"),
-    ("=", "map-target"), ("equals", "map-target"), ("equiv", "map-target"),
-    ("iff", "map-target"), ("distinct", "map-target"),
-    ("ite", "map-target"), ("if", "map-target"), ("if_then_else", "map-target"),
+    ("and", MapTarget), ("or", MapTarget), ("not", MapTarget),
+    ("xor", MapTarget), ("=>", MapTarget), ("implies", MapTarget),
+    ("&&", MapTarget), ("||", MapTarget),
+    ("=", MapTarget), ("equals", MapTarget), ("equiv", MapTarget),
+    ("iff", MapTarget), ("distinct", MapTarget),
+    ("ite", MapTarget), ("if", MapTarget), ("if_then_else", MapTarget),
     // Ints/Reals operators (elaborate/app/arithmetic.rs, app/core.rs)
-    ("+", "map-target"), ("-", "map-target"), ("*", "map-target"),
-    ("/", "map-target"), ("^", "map-target"), ("~", "map-target"),
-    ("**", "map-target"), ("div", "map-target"),
-    ("mod", "map-target"), ("rem", "map-target"), ("abs", "map-target"),
-    ("min", "map-target"), ("max", "map-target"),
-    ("<", "map-target"), ("<=", "map-target"), (">", "map-target"),
-    (">=", "map-target"),
-    ("to_int", "map-target"), ("to_real", "map-target"), ("is_int", "map-target"),
+    ("+", MapTarget), ("-", MapTarget), ("*", MapTarget),
+    ("/", MapTarget), ("^", MapTarget), ("~", MapTarget),
+    ("**", MapTarget), ("div", MapTarget),
+    ("mod", MapTarget), ("rem", MapTarget), ("abs", MapTarget),
+    ("min", MapTarget), ("max", MapTarget),
+    ("<", MapTarget), ("<=", MapTarget), (">", MapTarget),
+    (">=", MapTarget),
+    ("to_int", MapTarget), ("to_real", MapTarget), ("is_int", MapTarget),
     // Indexed-form-only identifiers (elaborate/indexed.rs)
-    ("map", "indexed-only"), ("is", "indexed-only"), ("divisible", "indexed-only"),
-    ("at-most", "indexed-only"), ("at-least", "indexed-only"),
-    ("pble", "indexed-only"), ("pbge", "indexed-only"), ("pbeq", "indexed-only"),
-    ("re.^", "indexed-only"),
+    ("map", IndexedOnly), ("is", IndexedOnly), ("divisible", IndexedOnly),
+    ("at-most", IndexedOnly), ("at-least", IndexedOnly),
+    ("pble", IndexedOnly), ("pbge", IndexedOnly), ("pbeq", IndexedOnly),
+    ("re.^", IndexedOnly),
     // Datatype field update `((_ update-field <sel>) record value)`
     // (elaborate/indexed.rs): matched ONLY inside the `(_ …)` indexed form, so a
     // bare `App(Named("update-field"), ..)` is never theory-matched and a user
     // declaration of `update-field` cannot conflate with the builtin.
-    ("update-field", "indexed-only"),
+    ("update-field", IndexedOnly),
     // Special-relations family (elaborate/indexed.rs): special ONLY as the
     // indexed identifier `(_ partial-order N)` &c. The bare name is a legal user
     // function — Verus's own cvc5 prelude declares `(declare-fun partial-order
     // (Height Height) Bool)` — so these must stay declarable, not reserved.
-    ("partial-order", "indexed-only"), ("linear-order", "indexed-only"),
-    ("tree-order", "indexed-only"), ("piecewise-linear-order", "indexed-only"),
+    ("partial-order", IndexedOnly), ("linear-order", IndexedOnly),
+    ("tree-order", IndexedOnly), ("piecewise-linear-order", IndexedOnly),
     // Char and FP special literals, matched only inside a structured `(_ …)` form
-    ("Char", "indexed-only"), ("char", "indexed-only"),
-    ("+zero", "indexed-only"), ("-zero", "indexed-only"),
-    ("+oo", "indexed-only"), ("-oo", "indexed-only"), ("NaN", "indexed-only"),
+    ("Char", IndexedOnly), ("char", IndexedOnly),
+    ("+zero", IndexedOnly), ("-zero", IndexedOnly),
+    ("+oo", IndexedOnly), ("-oo", IndexedOnly), ("NaN", IndexedOnly),
     // Match-case wildcard binder (term.rs), not an operator
-    ("_", "pattern-binder"),
+    ("_", PatternBinder),
     // Constant-array qualified identifier: declarable (CLEARSY benchmarks do);
     // its qualified.rs arm defers to the declared symbol (see doc above).
-    ("const", "declared-shadowed"),
+    ("const", DeclaredShadowed),
     // Z3 array-plugin set aliases: a declaration shadows the builtin before
     // app/set.rs dispatch, exactly as in Z3 5.0.0 (see doc above).
-    ("union", "declared-shadowed"),
-    ("intersection", "declared-shadowed"),
-    ("setminus", "declared-shadowed"),
-    ("complement", "declared-shadowed"),
-    ("subset", "declared-shadowed"),
+    ("union", DeclaredShadowed),
+    ("intersection", DeclaredShadowed),
+    ("setminus", DeclaredShadowed),
+    ("complement", DeclaredShadowed),
+    ("subset", DeclaredShadowed),
     // Declaration-activated collection theory ops (see doc comment above):
     // deductive-checks declares these to trigger the native solver; misuse fails
     // closed (probed).
-    ("set.subset", "declaration-activated"),
-    ("map.dom", "declaration-activated"),
-    ("map.subset", "declaration-activated"),
-    ("multiset.subset", "declaration-activated"),
+    ("set.subset", DeclarationActivated),
+    ("map.dom", DeclarationActivated),
+    ("map.subset", DeclarationActivated),
+    ("multiset.subset", DeclarationActivated),
 ];
 
 /// Check whether `name` is an elaborator-recognized operator name that is
 /// deliberately kept user-declarable (see [`EXCLUDED_DECLARABLE_OP_NAMES`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_excluded_declarable_op_name(name: &str) -> bool {
-    EXCLUDED_DECLARABLE_OP_NAMES
-        .iter()
-        .any(|&(op, _)| op == name)
+    excluded_declarable_op_class(name).is_some()
+}
+
+/// Whether a legal user declaration must receive a private core symbol even
+/// when it is the first declaration with that surface spelling.
+///
+/// Map-target names are also builtin operator spellings.  Keeping a user's
+/// first `(declare-fun rem ...)` as `Symbol::Named("rem")`, for example, makes
+/// the core DAG indistinguishable from builtin integer remainder.  That is
+/// unsafe for every independently checked rewrite or proof rule that assigns
+/// fixed semantics by core symbol.  Array-map still resolves the declaration
+/// through `SymbolInfo::internal_name`, while ordinary builtin syntax (with no
+/// declaration in scope) retains the canonical builtin spelling.
+pub(crate) fn declaration_requires_private_core_identity(name: &str) -> bool {
+    excluded_declarable_op_class(name) == Some(MapTarget)
 }
 
 /// Check whether `name` is a declaration-activated collection predicate (the
-/// `"declaration-activated"` rows of [`EXCLUDED_DECLARABLE_OP_NAMES`]): a name
+/// `DeclarationActivated` rows of [`EXCLUDED_DECLARABLE_OP_NAMES`]): a name
 /// whose `declare-fun` at the native collection signature is the documented
 /// activation route for AY's native set/map/multiset solvers, and which is
 /// rejected in every other declaration context (wrong signature,
 /// `declare-const`, `define-fun`, datatype ctor/selector/tester).
 pub(crate) fn is_declaration_activated_op_name(name: &str) -> bool {
-    EXCLUDED_DECLARABLE_OP_NAMES
-        .iter()
-        .any(|&(op, reason)| reason == "declaration-activated" && op == name)
+    excluded_declarable_op_class(name) == Some(DeclarationActivated)
 }
 
 /// Signature gate for the declaration-activated collection predicates: a
@@ -501,12 +576,164 @@ pub struct SymbolInfo {
     pub public_arg_sorts: Vec<PublicSort>,
     /// Instance-specific INTERNAL symbol name to use when building the term,
     /// when it differs from the user-facing surface name. This is set for
-    /// monomorphized parametric-datatype members and for every ordinary
-    /// declaration after the first overload of a surface name. The term then
-    /// carries a name-disjoint symbol, preventing distinct SMT-LIB signatures
-    /// from collapsing onto one core UF identity. The first ordinary
-    /// declaration keeps `None`, preserving its historical surface identity.
+    /// datatype members whose preferred identity was already used,
+    /// monomorphized parametric-datatype members, builtin-colliding map-target
+    /// declarations/definitions, and every ordinary source binding after the
+    /// first overload or scoped incarnation of a surface name. The term then
+    /// carries a name-disjoint symbol, preventing interpreted/user and distinct
+    /// SMT-LIB bindings from collapsing onto one core identity. A non-colliding
+    /// first ordinary binding keeps `None`, preserving its historical surface
+    /// identity.
     pub internal_name: Option<String>,
+    /// Stable identity of the declaration behind this surface binding.
+    declaration_id: DeclarationId,
+    /// Positive origin classification. Adopted definitions are overlaid by
+    /// [`Context::effective_declaration_kind`] while their justifying assertion
+    /// remains live.
+    declaration_kind: DeclarationKind,
+    /// How this surface binding entered the frontend symbol table.
+    ///
+    /// This is deliberately distinct from `declaration_kind`: a trusted native
+    /// alias may point at an ordinary uninterpreted declaration and share its
+    /// stable `DeclarationId`/semantic kind, but the alias is not itself a direct
+    /// authored declaration and must never become quantified-model projection
+    /// authority. Only `declare-const`/`declare-fun` set the direct-source origin.
+    binding_origin: SymbolBindingOrigin,
+}
+
+/// Private provenance for one symbol-table binding.
+///
+/// The enum is intentionally not exported. Downstream candidate producers get
+/// only the narrow observational predicate on [`SymbolInfo`]; the positive
+/// source checker still combines this bit with exact core identity, declaration
+/// identity/kind, signature, overload, and source/scope-epoch checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolBindingOrigin {
+    Other,
+    DirectSourceDeclaration,
+}
+
+impl SymbolInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fresh(
+        term: Option<TermId>,
+        sort: Sort,
+        arg_sorts: Vec<Sort>,
+        public_sort: PublicSort,
+        public_arg_sorts: Vec<PublicSort>,
+        internal_name: Option<String>,
+        declaration_kind: DeclarationKind,
+    ) -> Self {
+        Self::fresh_with_binding_origin(
+            term,
+            sort,
+            arg_sorts,
+            public_sort,
+            public_arg_sorts,
+            internal_name,
+            declaration_kind,
+            SymbolBindingOrigin::Other,
+        )
+    }
+
+    /// Construct the binding installed by a direct source `declare-const` or
+    /// `declare-fun`. This is the sole constructor for projection-eligible
+    /// binding origin; semantic eligibility is still checked independently.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fresh_direct_source_declaration(
+        term: Option<TermId>,
+        sort: Sort,
+        arg_sorts: Vec<Sort>,
+        public_sort: PublicSort,
+        public_arg_sorts: Vec<PublicSort>,
+        internal_name: Option<String>,
+        declaration_kind: DeclarationKind,
+    ) -> Self {
+        Self::fresh_with_binding_origin(
+            term,
+            sort,
+            arg_sorts,
+            public_sort,
+            public_arg_sorts,
+            internal_name,
+            declaration_kind,
+            SymbolBindingOrigin::DirectSourceDeclaration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_with_binding_origin(
+        term: Option<TermId>,
+        sort: Sort,
+        arg_sorts: Vec<Sort>,
+        public_sort: PublicSort,
+        public_arg_sorts: Vec<PublicSort>,
+        internal_name: Option<String>,
+        declaration_kind: DeclarationKind,
+        binding_origin: SymbolBindingOrigin,
+    ) -> Self {
+        Self {
+            term,
+            sort,
+            arg_sorts,
+            public_sort,
+            public_arg_sorts,
+            internal_name,
+            declaration_id: DeclarationId::fresh(),
+            declaration_kind,
+            binding_origin,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn alias_of(
+        term: Option<TermId>,
+        sort: Sort,
+        arg_sorts: Vec<Sort>,
+        public_sort: PublicSort,
+        public_arg_sorts: Vec<PublicSort>,
+        internal_name: Option<String>,
+        target: &Self,
+    ) -> Self {
+        Self {
+            term,
+            sort,
+            arg_sorts,
+            public_sort,
+            public_arg_sorts,
+            internal_name,
+            declaration_id: target.declaration_id.clone(),
+            declaration_kind: target.declaration_kind,
+            binding_origin: SymbolBindingOrigin::Other,
+        }
+    }
+
+    /// Stable identity of the declaration behind this binding.
+    #[must_use]
+    pub fn declaration_id(&self) -> &DeclarationId {
+        &self.declaration_id
+    }
+
+    /// Positive origin kind of this declaration.
+    ///
+    /// Use [`Context::effective_declaration_kind`] when an adopted
+    /// definitional macro must be distinguished from its free origin.
+    #[must_use]
+    pub fn declaration_kind(&self) -> DeclarationKind {
+        self.declaration_kind
+    }
+
+    /// Whether this binding was installed directly by a source
+    /// `declare-const`/`declare-fun`, rather than by an alias, definition,
+    /// datatype/theory registration, or solver-internal API.
+    ///
+    /// This predicate is only producer-side provenance. It is not sufficient
+    /// projection authority without the frontend's exact identity, kind,
+    /// signature, overload, and scope-epoch checks.
+    #[must_use]
+    pub fn is_direct_source_declaration(&self) -> bool {
+        self.binding_origin == SymbolBindingOrigin::DirectSourceDeclaration
+    }
 }
 
 /// Optimization direction for an objective term
@@ -679,6 +906,25 @@ pub enum AuthoredAssertionRef<'a> {
     Elaborated(TermId),
 }
 
+/// Sticky source-level description of one nominal engine carrier.
+///
+/// This metadata follows the term-store lifetime, not source scope: a retained
+/// term may still need to print its old sort after the declaration was popped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NominalSortSurface {
+    /// A zero-arity sort declaration or monomorphic datatype.
+    Simple(String),
+    /// One structurally keyed application of a parametric datatype template.
+    ParametricDatatype {
+        /// Legacy readable spelling retained for diagnostics only.
+        display: String,
+        /// Source template name.
+        template: String,
+        /// Exact engine arguments, recursively surfaced when printed.
+        arguments: Vec<Sort>,
+    },
+}
+
 /// Elaboration context
 // Trust: `Clone` lets an independent UNSAT re-discharge rebuild a fresh `Executor`
 // over a COPY of the full solving context (terms, assertions, logic, options) — the
@@ -686,6 +932,11 @@ pub enum AuthoredAssertionRef<'a> {
 // nested-ite obligations that a thin re-translate leaves Unknown.
 #[derive(Clone)]
 pub struct Context {
+    /// Identity of this independently mutable frontend context. Cloning a
+    /// context deliberately mints a fresh identity.
+    context_identity: ContextIdentity,
+    /// Revision of source declaration/scope semantics in this context.
+    source_revision: u64,
     /// The term store
     pub terms: TermStore,
     /// Symbol table: name -> info
@@ -710,6 +961,22 @@ pub struct Context {
     /// Never rewound by `pop`: an internal name cannot be reused while an old
     /// term bearing it may still exist in the term store.
     next_overload_identity: u64,
+    /// Core spellings already assigned to declarations in this term store.
+    /// Scope pop deliberately does not rewind this set: old native [`TermId`]
+    /// handles may survive the pop, so a later ordinary function or datatype
+    /// member must not hash-cons onto an old application's core identity. A
+    /// full context reset replaces both this set and the term store.
+    declaration_core_identities_used: HashSet<String>,
+    /// Monotonic source of private nominal sort identities. It shares the
+    /// context lifetime with `terms` and is never rewound by scope pop.
+    next_sort_identity: u64,
+    /// Nominal sort cores already assigned in this context's term-store
+    /// lifetime. Retained terms can outlive a scoped sort declaration, so a
+    /// later declaration must not reuse the old carrier spelling.
+    sort_core_identities_used: HashSet<String>,
+    /// Exact nominal carrier -> typed source-level rendering metadata.
+    /// Retained across `pop`; cleared only with the context/term store.
+    nominal_sort_surfaces: HashMap<String, NominalSortSurface>,
     /// Sort definitions: name -> sort
     sort_defs: HashMap<String, Sort>,
     /// Public identities for zero-arity sort synonyms.
@@ -760,6 +1027,8 @@ pub struct Context {
     /// OUTERMOST scope so `pop` can never remove the justifying assertion
     /// while the macro lives on; `reset-assertions` un-adopts explicitly.
     adopted_macro_interps: HashMap<String, (Vec<(String, Sort)>, TermId)>,
+    /// Exact declaration identity behind each adopted macro interpretation.
+    adopted_macro_declaration_ids: HashMap<String, DeclarationId>,
     /// Test-only fault injection for the transaction boundary between macro
     /// adoption and assertion re-elaboration.
     #[cfg(test)]
@@ -774,7 +1043,15 @@ pub struct Context {
     /// z3 4.15.4's exact accept/reject matrix (#P0.3).
     recursive_fun_names: ay_core::kani_compat::DetHashSet<String>,
     /// Datatype definitions: dt_name -> constructor_names
+    ///
+    /// This is a sticky semantic registry for the lifetime of `terms`.
+    /// `pop` removes a carrier from `live_datatype_carriers` but retains this
+    /// exact metadata so an authenticated old term can still be solved with
+    /// its datatype semantics if a native caller re-asserts it later.
     datatypes: HashMap<String, Vec<String>>,
+    /// Datatype carriers currently reachable through live source declarations
+    /// or live parametric-instance caches.
+    live_datatype_carriers: HashSet<String>,
     /// The full monomorphic declaration behind each `datatypes` entry, retained
     /// so an EXACTLY-identical re-declaration can be adopted as a no-op
     /// (`declare_datatype`), mirroring `try_declare_fun`'s adopt-identical
@@ -798,6 +1075,11 @@ pub struct Context {
     /// — a binder that shadows the constructor name binds a different term and
     /// can never fold unsoundly. (#rec-dt-expansion)
     nullary_ctor_terms: HashMap<String, TermId>,
+    /// Exact signature/identity record for every datatype member registered in
+    /// this term store. Live symbol tables remain scoped; proof, model, and
+    /// cached-instance consumers use this sticky registry only when they have
+    /// already authenticated an exact datatype-member identity.
+    datatype_member_symbols: HashMap<String, SymbolInfo>,
     /// Parametric (polymorphic) datatype templates: dt_name -> declaration.
     ///
     /// A `(declare-datatypes ((Name n)) ((par (T..) ..)))` with arity `n > 0`
@@ -805,12 +1087,24 @@ pub struct Context {
     /// `(Name A1 .. An)` is lazily monomorphized into a fresh instance sort and
     /// its constructors/selectors/testers (see `elaborate/datatypes.rs`).
     parametric_datatypes: HashMap<String, crate::command::DatatypeDec>,
+    /// Stable identity of each live parametric datatype declaration.
+    ///
+    /// The surface name is scoped and may be reused after `pop`, while retained
+    /// terms can still contain instances of the old template. Structural
+    /// instance caches therefore key on this identity, never on the spelling.
+    parametric_datatype_ids: HashMap<String, DeclarationId>,
     /// Reverse map for a registered parametric instance: mangled instance sort
-    /// name -> (template name, type arguments). Lets constructor-application
-    /// instance inference recover the type arguments of a nested instance sort
-    /// (e.g. unify the template field `(Lst T)` against an argument of sort
-    /// `Lst!{Int}` to learn `T = Int`).
-    parametric_instance_args: HashMap<String, (String, Vec<Sort>)>,
+    /// name -> (template identity, template name, type arguments). Lets
+    /// constructor-application instance inference recover the type arguments
+    /// of a nested instance sort (e.g. unify the template field `(Lst T)`
+    /// against an argument of sort `Lst!{Int}` to learn `T = Int`). The exact
+    /// template identity also makes scope cleanup immune to name reuse.
+    parametric_instance_args: HashMap<String, (DeclarationId, String, Vec<Sort>)>,
+    /// Structural parametric instance key -> exact nominal carrier core.
+    /// Unlike the legacy display-style mangle, this key cannot conflate a user
+    /// sort spelling with an Array/Seq/datatype argument of similar text, or a
+    /// popped template with a later declaration using the same surface name.
+    parametric_instance_sorts: HashMap<(DeclarationId, Vec<Sort>), String>,
     /// Internal term symbol name -> user-facing surface name. Covers both
     /// instance-mangled datatype members and ordinary declaration overloads,
     /// so serialization/model output never leaks private identities.
@@ -959,6 +1253,41 @@ pub struct Context {
     finite_set_typing_mode: FiniteSetTypingMode,
 }
 
+/// Opaque saved query view for one internal solver probe.
+///
+/// A probe sometimes has to solve an exact derived root vector in the original
+/// [`Context`] so a resulting model's `TermId`s remain in the same arena. Merely
+/// replacing [`Context::assertions`] is not enough: parsed assertion metadata,
+/// named terms, objectives, soft constraints, and schematic-query bookkeeping
+/// would still describe the enclosing public query. This affine value owns that
+/// complete query-local view while the derived roots are active.
+///
+/// Construction and restoration intentionally do not advance the source
+/// revision. Declarations and scopes are not changed, and the enclosing query
+/// must retain the same [`SourceContextStamp`] after restoration. The solver may
+/// append terms while the window is active; rollback, compaction, a cloned
+/// context, or a source mutation makes restoration report that the surrounding
+/// authority is no longer exact.
+#[doc(hidden)]
+#[must_use = "an internal query window must be restored on every exit path"]
+pub struct InternalQueryWindow {
+    source_context_stamp: SourceContextStamp,
+    term_prefix: TermStoreSnapshotStamp,
+    assertions: Vec<TermId>,
+    assertion_finite_set_metadata: Vec<PublicAssertionMetadata>,
+    assertions_parsed: Vec<ParsedTerm>,
+    retain_parsed_assertions: bool,
+    objectives: Vec<Objective>,
+    objective_finite_set_metadata: Vec<PublicAssertionMetadata>,
+    soft_constraints: Vec<SoftAssertion>,
+    soft_finite_set_metadata: Vec<PublicAssertionMetadata>,
+    named_terms: HashMap<String, TermId>,
+    polymorphic_assertions: Vec<PolymorphicAssertion>,
+    authored_assertions: Vec<AuthoredAssertion>,
+    materialized_polymorphic_assertions: usize,
+    polymorphic_instantiation_complete: bool,
+}
+
 /// Value for a solver option
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -986,8 +1315,8 @@ struct ScopeFrame {
     soft_constraint_count: usize,
     /// Named terms defined in this scope
     named_terms: Vec<String>,
-    /// Datatypes defined in this scope
-    datatypes: Vec<String>,
+    /// Datatypes defined in this scope: (internal carrier, surface declaration).
+    datatypes: Vec<(String, String)>,
     /// Constructors defined in this scope
     constructors: Vec<String>,
     /// Sort definitions in this scope
@@ -1019,6 +1348,20 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Invalidate every previously captured source/scope stamp.
+    ///
+    /// On the practically unreachable counter exhaustion boundary, rotate the
+    /// context identity instead of wrapping into a revision that could equal a
+    /// stale snapshot.
+    pub(super) fn advance_source_revision(&mut self) {
+        if let Some(next) = self.source_revision.checked_add(1) {
+            self.source_revision = next;
+        } else {
+            self.context_identity = ContextIdentity::fresh();
+            self.source_revision = 0;
+        }
+    }
+
     /// Iterate declared symbols (name -> info). Used by problem-dump
     /// debugging facilities (e.g. the LIA eager-probe benchmark extractor).
     pub fn symbols_iter(&self) -> impl Iterator<Item = (&String, &SymbolInfo)> {
@@ -1040,13 +1383,32 @@ impl Context {
         arg_sorts: &[Sort],
         ret_sort: &Sort,
     ) -> bool {
-        let sig_matches = |info: &SymbolInfo| info.arg_sorts == arg_sorts && &info.sort == ret_sort;
-        if self.symbols.get(name).is_some_and(sig_matches) {
-            return true;
-        }
-        self.overloaded_symbols
+        self.symbol_info_with_signature(name, arg_sorts, ret_sort)
+            .is_some()
+    }
+
+    /// Return the unique live declaration with this exact surface name and
+    /// signature. The associated core identity is available through
+    /// [`Self::symbol_identity_name`].
+    pub fn symbol_info_with_signature(
+        &self,
+        name: &str,
+        arg_sorts: &[Sort],
+        ret_sort: &Sort,
+    ) -> Option<&SymbolInfo> {
+        let candidates = self
+            .overloaded_symbols
             .get(name)
-            .is_some_and(|overloads| overloads.iter().any(sig_matches))
+            .map(Vec::as_slice)
+            .or_else(|| self.symbols.get(name).map(std::slice::from_ref))?;
+        let mut matches = candidates
+            .iter()
+            .filter(|info| info.arg_sorts == arg_sorts && &info.sort == ret_sort);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     /// Whether a declared symbol named `name` exists with EXACTLY this argument
@@ -1086,11 +1448,17 @@ impl Context {
         );
 
         Self {
+            context_identity: ContextIdentity::fresh(),
+            source_revision: 0,
             terms: TermStore::new(),
             symbols: HashMap::default(),
             internal_symbols: ay_core::kani_compat::DetHashSet::default(),
             overloaded_symbols: HashMap::default(),
             next_overload_identity: 0,
+            declaration_core_identities_used: HashSet::default(),
+            next_sort_identity: 0,
+            sort_core_identities_used: HashSet::default(),
+            nominal_sort_surfaces: HashMap::default(),
             sort_defs: HashMap::default(),
             public_sort_defs: HashMap::default(),
             parametric_sort_defs: HashMap::default(),
@@ -1105,17 +1473,22 @@ impl Context {
             expanding_sort_synonyms: Vec::new(),
             fun_defs: HashMap::default(),
             adopted_macro_interps: HashMap::default(),
+            adopted_macro_declaration_ids: HashMap::default(),
             #[cfg(test)]
             fail_next_assert_after_macro_adoption: false,
             recursive_fun_names: ay_core::kani_compat::DetHashSet::default(),
             datatypes: HashMap::default(),
+            live_datatype_carriers: HashSet::default(),
             monomorphic_datatype_decs: HashMap::default(),
             constructors: HashMap::default(),
             ctor_selectors: HashMap::default(),
             ctor_selector_info: HashMap::default(),
             nullary_ctor_terms: HashMap::default(),
+            datatype_member_symbols: HashMap::default(),
             parametric_datatypes: HashMap::default(),
+            parametric_datatype_ids: HashMap::default(),
             parametric_instance_args: HashMap::default(),
+            parametric_instance_sorts: HashMap::default(),
             dt_internal_surface: HashMap::default(),
             dt_field_surface: HashMap::default(),
             logic: None,
@@ -1152,7 +1525,10 @@ impl Context {
     /// (default off — z3 4.15.4 parity, which rejects ill-sorted operands).
     /// Enabling restores the #5115 BitVec-width zero-extension leniency.
     pub fn set_lenient_sort_coercions(&mut self, lenient: bool) {
-        self.lenient_sort_coercions = lenient;
+        if self.lenient_sort_coercions != lenient {
+            self.lenient_sort_coercions = lenient;
+            self.advance_source_revision();
+        }
     }
 
     /// Whether legacy lenient sort coercions are enabled (see
@@ -1167,7 +1543,10 @@ impl Context {
     /// [`FiniteSetTypingMode::Z3_5Strict`]. The default retains AY's older
     /// textual `Set` extension for compatibility.
     pub fn set_finite_set_typing_mode(&mut self, mode: FiniteSetTypingMode) {
-        self.finite_set_typing_mode = mode;
+        if self.finite_set_typing_mode != mode {
+            self.finite_set_typing_mode = mode;
+            self.advance_source_revision();
+        }
     }
 
     /// Current finite-set public typing policy.
@@ -1228,7 +1607,10 @@ impl Context {
 
     /// Set the logic for this context.
     pub fn set_logic(&mut self, logic: String) {
-        self.logic = Some(logic);
+        if self.logic.as_ref() != Some(&logic) {
+            self.logic = Some(logic);
+            self.advance_source_revision();
+        }
     }
 
     /// Install the logic the way an API CONSTRUCTOR does: the logic takes
@@ -1246,7 +1628,7 @@ impl Context {
     /// Propagates the same validation `Command::SetLogic` performs.
     pub fn set_initial_logic(&mut self, logic: &str) -> Result<()> {
         self.validate_logic_sort_parameter_conflicts(logic)?;
-        self.logic = Some(logic.to_string());
+        self.set_logic(logic.to_string());
         self.refresh_polymorphic_declarations()?;
         Ok(())
     }
@@ -1521,6 +1903,123 @@ impl Context {
         self.retain_parsed_assertions = retain;
     }
 
+    /// Replace the complete active query view with exact internal probe roots.
+    ///
+    /// This is a narrow cross-crate transaction primitive for solver probes
+    /// that must keep the original term arena. It hides every query-local input
+    /// that could strengthen, redirect, or misattribute the derived solve while
+    /// preserving declarations, options, and scope identities. `roots` must be
+    /// live Boolean terms in this context; validation happens before any state
+    /// is changed.
+    ///
+    /// The returned affine window must be passed to
+    /// [`Self::restore_internal_query_window`] on every exit path. In
+    /// particular, callers moving this context into another owner should put
+    /// the pair behind an RAII guard so unwinding cannot strand the enclosing
+    /// query in the temporary view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without mutation when a root is not live in this term
+    /// arena or is not Boolean-sorted.
+    #[doc(hidden)]
+    pub fn begin_internal_query_window(
+        &mut self,
+        roots: Vec<TermId>,
+    ) -> std::result::Result<InternalQueryWindow, ElaborateError> {
+        for &root in &roots {
+            if self.terms.entry_stamp(root).is_none() {
+                return Err(ElaborateError::Unsupported(format!(
+                    "internal query root {root} is not live in this term arena"
+                )));
+            }
+            let sort = self.terms.sort(root);
+            if sort != &Sort::Bool {
+                return Err(ElaborateError::SortMismatch {
+                    expected: "Bool".to_string(),
+                    actual: format!("{sort:?}"),
+                });
+            }
+        }
+
+        // Allocate the replacement metadata before taking any outer state so
+        // an allocation panic cannot leave a half-installed query window.
+        let probe_metadata = vec![PublicAssertionMetadata::default(); roots.len()];
+        let source_context_stamp = self.source_context_stamp();
+        let term_prefix = self.terms.snapshot_stamp();
+        let window = InternalQueryWindow {
+            source_context_stamp,
+            term_prefix,
+            assertions: std::mem::replace(&mut self.assertions, roots),
+            assertion_finite_set_metadata: std::mem::replace(
+                &mut self.assertion_finite_set_metadata,
+                probe_metadata,
+            ),
+            assertions_parsed: std::mem::take(&mut self.assertions_parsed),
+            retain_parsed_assertions: std::mem::replace(&mut self.retain_parsed_assertions, false),
+            objectives: std::mem::take(&mut self.objectives),
+            objective_finite_set_metadata: std::mem::take(&mut self.objective_finite_set_metadata),
+            soft_constraints: std::mem::take(&mut self.soft_constraints),
+            soft_finite_set_metadata: std::mem::take(&mut self.soft_finite_set_metadata),
+            named_terms: std::mem::take(&mut self.named_terms),
+            polymorphic_assertions: std::mem::take(&mut self.polymorphic_assertions),
+            authored_assertions: std::mem::take(&mut self.authored_assertions),
+            materialized_polymorphic_assertions: std::mem::replace(
+                &mut self.materialized_polymorphic_assertions,
+                0,
+            ),
+            polymorphic_instantiation_complete: std::mem::replace(
+                &mut self.polymorphic_instantiation_complete,
+                true,
+            ),
+        };
+        Ok(window)
+    }
+
+    /// Restore a query view saved by [`Self::begin_internal_query_window`].
+    ///
+    /// Restoration itself is allocation-free and always puts the saved vectors,
+    /// maps, and policy bits back. The Boolean result additionally authenticates
+    /// that the same source context and an append-only extension of the same
+    /// term arena survived the probe. Callers must discard every derived
+    /// verdict/model capability when it is `false`.
+    #[doc(hidden)]
+    pub fn restore_internal_query_window(&mut self, window: InternalQueryWindow) -> bool {
+        let source_is_current = window.source_context_stamp == self.source_context_stamp();
+        let term_prefix_is_current = window.term_prefix.is_append_only_prefix_of(&self.terms);
+        let InternalQueryWindow {
+            source_context_stamp: _,
+            term_prefix: _,
+            assertions,
+            assertion_finite_set_metadata,
+            assertions_parsed,
+            retain_parsed_assertions,
+            objectives,
+            objective_finite_set_metadata,
+            soft_constraints,
+            soft_finite_set_metadata,
+            named_terms,
+            polymorphic_assertions,
+            authored_assertions,
+            materialized_polymorphic_assertions,
+            polymorphic_instantiation_complete,
+        } = window;
+        self.assertions = assertions;
+        self.assertion_finite_set_metadata = assertion_finite_set_metadata;
+        self.assertions_parsed = assertions_parsed;
+        self.retain_parsed_assertions = retain_parsed_assertions;
+        self.objectives = objectives;
+        self.objective_finite_set_metadata = objective_finite_set_metadata;
+        self.soft_constraints = soft_constraints;
+        self.soft_finite_set_metadata = soft_finite_set_metadata;
+        self.named_terms = named_terms;
+        self.polymorphic_assertions = polymorphic_assertions;
+        self.authored_assertions = authored_assertions;
+        self.materialized_polymorphic_assertions = materialized_polymorphic_assertions;
+        self.polymorphic_instantiation_complete = polymorphic_instantiation_complete;
+        source_is_current && term_prefix_is_current
+    }
+
     /// Get the optimization objectives.
     pub fn objectives(&self) -> &[Objective] {
         &self.objectives
@@ -1592,12 +2091,12 @@ impl Context {
         }
     }
 
-    pub(crate) fn track_scoped_datatype(&mut self, name: String) {
+    pub(crate) fn track_scoped_datatype(&mut self, internal: String, surface: String) {
         if self.global_declarations_enabled() {
             return;
         }
         if let Some(frame) = self.scopes.last_mut() {
-            frame.datatypes.push(name);
+            frame.datatypes.push((internal, surface));
         }
     }
 
@@ -1755,7 +2254,10 @@ impl Context {
     /// [`ElaborateError::DatatypeMemberCollision`] (#reserved-ops).
     fn ambiguous_selector_names(&self) -> ay_core::kani_compat::DetHashSet<String> {
         let mut counts: HashMap<String, usize> = HashMap::default();
-        for selectors in self.ctor_selector_info.values() {
+        for (constructor, selectors) in &self.ctor_selector_info {
+            if !self.is_live_datatype_member_identity(constructor) {
+                continue;
+            }
             for (selector, _) in selectors {
                 let surface = self.dt_surface_name(selector).unwrap_or(selector);
                 *counts.entry(surface.to_string()).or_insert(0) += 1;

@@ -6,13 +6,13 @@
 
 use ay_frontend::command::Term as ParsedTerm;
 use ay_frontend::sexp::SExpr;
-use ay_frontend::{parse, Command, CommandResult};
+use ay_frontend::{parse, Command};
 
 use crate::api::types::{
     CrossCheckDisagreement, CrossCheckReport, CrossCheckRun, CrossCheckVariant, SolveResult,
     SolverError, VerificationSummary,
 };
-use crate::{Executor, ExecutorError};
+use crate::Executor;
 
 use crate::api::Solver;
 
@@ -63,6 +63,15 @@ impl CrossCheckScript {
                             command_name(&command)
                         ),
                     });
+                }
+                // `setup_commands` are replayed before the one solve command.
+                // Accepting a command after that solve would silently move it
+                // before the query and cross-check a different problem. Keep
+                // the single-query packet exact by requiring the solve to be
+                // terminal (follow-up queries retain their dedicated rejection
+                // above).
+                _ if solve_command.is_some() => {
+                    return Err(post_solve_command_error());
                 }
                 command => setup_commands.push(command),
             }
@@ -182,26 +191,25 @@ fn run_cross_check(
         executor.execute(&command).map_err(SolverError::from)?;
     }
 
-    let solve_request = match &script.solve_command {
-        SolveCommand::CheckSat => executor
-            .context_mut()
-            .process_command(&Command::CheckSat)
-            .map_err(ExecutorError::from)
-            .map_err(SolverError::from)?,
-        SolveCommand::CheckSatAssuming(terms) => executor
-            .context_mut()
-            .process_command(&Command::CheckSatAssuming(terms.clone()))
-            .map_err(ExecutorError::from)
-            .map_err(SolverError::from)?,
+    let solve_command = match &script.solve_command {
+        SolveCommand::CheckSat => Command::CheckSat,
+        SolveCommand::CheckSatAssuming(terms) => Command::CheckSatAssuming(terms.clone()),
     };
 
-    let result = match solve_request {
-        Some(CommandResult::CheckSat) => executor.check_sat().map_err(SolverError::from)?,
-        Some(CommandResult::CheckSatAssuming(assumptions)) => executor
-            .check_sat_assuming(&assumptions)
-            .map_err(SolverError::from)?,
-        _ => unreachable!("validated cross-check script must elaborate to one solve command"),
-    };
+    // Cross-check replay is a public authored decision, not a disposable
+    // executor probe. Route it through the same closed command boundary as the
+    // CLI so `begin_public_solve`, exact authored-root binding, strict UNSAT
+    // certification, and one-shot SAT/UNSAT capability consumption are all
+    // mandatory. Calling `Context::process_command` followed by raw
+    // `Executor::check_sat*` used to bypass that boundary and let an
+    // uncertified UNSAT participate in a reported disagreement.
+    executor
+        .execute_authored(&solve_command)
+        .map_err(SolverError::from)?;
+    let result = executor
+        .last_result()
+        .cloned()
+        .unwrap_or(SolveResult::Unknown);
 
     let verification = build_verification_summary(&executor, &result);
     let unknown_reason = if result.is_unknown() {
@@ -235,6 +243,16 @@ fn build_verification_summary(executor: &Executor, result: &SolveResult) -> Veri
     VerificationSummary {
         sat_model_validated: executor.was_model_validated(),
         unsat_proof_available: result.is_unsat() && executor.last_proof().is_some(),
+        // `run_cross_check` has already crossed `execute_authored`, whose text
+        // boundary consumes the exact one-shot certificate and records its
+        // sealed class. A bare surviving UNSAT proves admission, but does not
+        // distinguish strict proof checking from the exact semantic theorem.
+        unsat_proof_strictly_verified: result.is_unsat()
+            && executor.last_command_unsat_was_strictly_verified(),
+        unsat_independently_verified: result.is_unsat()
+            && executor.last_command_unsat_was_independently_verified(),
+        unsat_exact_semantically_verified: result.is_unsat()
+            && executor.last_command_unsat_was_exact_semantically_verified(),
         unsat_proof_checker_failures: statistics.get_int("proof_checker_failures").unwrap_or(0),
         sat_independent_checks: independent,
         sat_delegated_checks: delegated,
@@ -277,10 +295,18 @@ fn accepted_definite_result(run: &CrossCheckRun) -> Option<SolveResult> {
     // comparison — NOT a fresh public SAT emission, so it does not (and cannot)
     // carry an `emit_sat_verdict` `SatCertificate`. Replicate
     // `VerifiedSolveResult::accept_for_consumer` inline: a `Sat` is definite
-    // only if its model was validated; an `Unsat` is always definite.
+    // only if its model was validated, and an `Unsat` only if the authored
+    // command boundary recorded one of the complete exact-query certification
+    // classes. Keep the classes distinct in the public metadata.
     match &run.result {
         SolveResult::Sat if run.verification.sat_model_validated => Some(SolveResult::Sat),
-        SolveResult::Unsat(_) => Some(run.result.clone()),
+        SolveResult::Unsat(_)
+            if run.verification.unsat_proof_strictly_verified
+                || run.verification.unsat_independently_verified
+                || run.verification.unsat_exact_semantically_verified =>
+        {
+            Some(run.result.clone())
+        }
         _ => None,
     }
 }
@@ -345,6 +371,13 @@ fn multi_solve_error() -> SolverError {
     SolverError::InvalidArgument {
         operation: CROSS_CHECK_OPERATION,
         message: "expected exactly one check-sat or check-sat-assuming command".to_string(),
+    }
+}
+
+fn post_solve_command_error() -> SolverError {
+    SolverError::InvalidArgument {
+        operation: CROSS_CHECK_OPERATION,
+        message: "commands after check-sat or check-sat-assuming are unsupported".to_string(),
     }
 }
 

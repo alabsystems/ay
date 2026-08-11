@@ -15,6 +15,7 @@ use super::*;
 use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort, Symbol, TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::BigRational;
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// A trivial stub model: a fixed map from leaf `TermId` to value.
@@ -42,6 +43,13 @@ impl ModelView for StubModel {
 
 fn int(n: i64) -> BigInt {
     BigInt::from(n)
+}
+
+fn sqrt_two_between(lo: BigRational, hi: BigRational) -> ModelValue {
+    ModelValue::Algebraic(Box::new(
+        algebraic::Algebraic::root_of(algebraic::integer_poly(&[-2, 0, 1]), lo, hi)
+            .expect("the interval isolates positive sqrt(2)"),
+    ))
 }
 
 fn app(ts: &mut TermStore, name: &str, args: &[TermId], sort: Sort) -> TermId {
@@ -222,7 +230,7 @@ fn fp_to_real_handles_subnormal_sign_and_both_zeros_exactly() {
 }
 
 #[test]
-fn fp_to_real_nan_infinity_and_malformed_payloads_fail_closed() {
+fn fp_to_real_nonfinite_without_a_model_choice_and_malformed_payloads_fail_closed() {
     for (label, exponent, significand) in [
         ("positive-infinity", 31, 0),
         ("nan", 31, 512),
@@ -248,6 +256,244 @@ fn fp_to_real_nan_infinity_and_malformed_payloads_fail_closed() {
 }
 
 #[test]
+fn fp_to_real_nonfinite_uses_only_its_typed_fallback() {
+    for (label, significand) in [("positive-infinity", 0), ("nan", 512)] {
+        let mut ts = TermStore::new();
+        let x = ts.mk_var(label, Sort::FloatingPoint(5, 11));
+        let to_real = app(&mut ts, "fp.to_real", &[x], Sort::Real);
+        let selected = BigRational::new(int(7), int(3));
+        let expected = ts.mk_rational(selected.clone());
+        let assertion = app(&mut ts, "=", &[to_real, expected], Sort::Bool);
+        let model = UfStubModel::new()
+            .leaf(
+                x,
+                ModelValue::FloatingPoint {
+                    sign: false,
+                    exponent: 31,
+                    significand,
+                    exponent_bits: 5,
+                    significand_bits: 11,
+                },
+            )
+            .unconstrained(
+                to_real,
+                ProvenUnconstrainedKind::FpToRealNonFinite,
+                ModelValue::Real(selected),
+            );
+
+        assert_confirmed(&verdict(&ts, &model, &[assertion]));
+        assert_eq!(model.unconstrained_calls.get(), 1, "{label}");
+    }
+}
+
+#[test]
+fn finite_fp_to_real_never_consults_unconstrained_fallback() {
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("finite", Sort::FloatingPoint(5, 11));
+    let to_real = app(&mut ts, "fp.to_real", &[x], Sort::Real);
+    let five_halves = ts.mk_rational(BigRational::new(int(5), int(2)));
+    let assertion = app(&mut ts, "=", &[to_real, five_halves], Sort::Bool);
+    let model = UfStubModel::new()
+        .leaf(
+            x,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 16,
+                significand: 256,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .unconstrained(
+            to_real,
+            ProvenUnconstrainedKind::FpToRealNonFinite,
+            ModelValue::Real(BigRational::from_integer(int(99))),
+        );
+
+    assert_confirmed(&verdict(&ts, &model, &[assertion]));
+    assert_eq!(model.unconstrained_calls.get(), 0);
+}
+
+#[test]
+fn nonfinite_fp_to_real_rejects_wrong_sort_fallback() {
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("infinity", Sort::FloatingPoint(5, 11));
+    let to_real = app(&mut ts, "fp.to_real", &[x], Sort::Real);
+    let model = UfStubModel::new()
+        .leaf(
+            x,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 31,
+                significand: 0,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .unconstrained(
+            to_real,
+            ProvenUnconstrainedKind::FpToRealNonFinite,
+            ModelValue::Bool(true),
+        );
+
+    match evaluate_term(&ts, &model, to_real) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("must still be a real")),
+        other => panic!("wrong-sort fp.to_real fallback must fail closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn fp_to_real_rejects_ill_typed_or_mismatched_formats_before_fallback() {
+    let cases = [
+        ("integer operand", Sort::Int, 5, 11, Sort::Real),
+        (
+            "payload format mismatch",
+            Sort::FloatingPoint(5, 11),
+            8,
+            24,
+            Sort::Real,
+        ),
+        (
+            "non-real result",
+            Sort::FloatingPoint(5, 11),
+            5,
+            11,
+            Sort::Int,
+        ),
+    ];
+
+    for (label, operand_sort, payload_eb, payload_sb, result_sort) in cases {
+        let mut ts = TermStore::new();
+        let x = ts.mk_var(label, operand_sort);
+        let to_real = app(&mut ts, "fp.to_real", &[x], result_sort);
+        let model = UfStubModel::new()
+            .leaf(
+                x,
+                ModelValue::FloatingPoint {
+                    sign: false,
+                    exponent: (1u64 << payload_eb) - 1,
+                    significand: 0,
+                    exponent_bits: payload_eb,
+                    significand_bits: payload_sb,
+                },
+            )
+            .unconstrained(
+                to_real,
+                ProvenUnconstrainedKind::FpToRealNonFinite,
+                ModelValue::Real(BigRational::from_integer(int(7))),
+            );
+
+        assert!(
+            matches!(
+                evaluate_term(&ts, &model, to_real),
+                EvalOutcome::Unevaluable(_)
+            ),
+            "{label} must fail closed"
+        );
+        assert_eq!(
+            model.unconstrained_calls.get(),
+            0,
+            "{label} must not mint typed authority"
+        );
+    }
+}
+
+#[test]
+fn legacy_unconstrained_hook_applies_only_to_nonfinite_fp_to_real() {
+    let mut ts = TermStore::new();
+    let nan = ts.mk_var("nan", Sort::FloatingPoint(5, 11));
+    let to_real = app(&mut ts, "fp.to_real", &[nan], Sort::Real);
+    let one = ts.mk_rational(BigRational::from_integer(int(1)));
+    let zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let real_div = app(&mut ts, "/", &[one, zero], Sort::Real);
+    let model = LegacyUnconstrainedModel::new()
+        .leaf(
+            nan,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 31,
+                significand: 1,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .unconstrained(to_real, ModelValue::Real(BigRational::from_integer(int(7))))
+        .unconstrained(
+            real_div,
+            ModelValue::Real(BigRational::from_integer(int(9))),
+        );
+
+    assert!(matches!(
+        evaluate_term(&ts, &model, to_real),
+        EvalOutcome::Value(ModelValue::Real(value)) if value == BigRational::from_integer(int(7))
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 1);
+
+    // A legacy implementation opted into the historical fp.to_real case, not
+    // the later division-by-zero cases. The default typed hook must therefore
+    // leave this application unevaluable instead of consulting the old hook.
+    assert!(matches!(
+        evaluate_term(&ts, &model, real_div),
+        EvalOutcome::Unevaluable(_)
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 1);
+}
+
+#[test]
+fn distinct_nan_encodings_share_one_fp_to_real_graph_choice() {
+    let mut ts = TermStore::new();
+    let fp16 = Sort::FloatingPoint(5, 11);
+    let first_nan = ts.mk_var("first-nan", fp16.clone());
+    let second_nan = ts.mk_var("second-nan", fp16);
+    let first_to_real = app(&mut ts, "fp.to_real", &[first_nan], Sort::Real);
+    let second_to_real = app(&mut ts, "fp.to_real", &[second_nan], Sort::Real);
+    let seven = ts.mk_rational(BigRational::from_integer(int(7)));
+    let eight = ts.mk_rational(BigRational::from_integer(int(8)));
+    let first_definition = app(&mut ts, "=", &[first_to_real, seven], Sort::Bool);
+    let conflicting_definition = app(&mut ts, "=", &[second_to_real, eight], Sort::Bool);
+    let model = UfStubModel::new()
+        .leaf(
+            first_nan,
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 31,
+                significand: 1,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .leaf(
+            second_nan,
+            ModelValue::FloatingPoint {
+                sign: true,
+                exponent: 31,
+                significand: 512,
+                exponent_bits: 5,
+                significand_bits: 11,
+            },
+        )
+        .unconstrained(
+            first_to_real,
+            ProvenUnconstrainedKind::FpToRealNonFinite,
+            ModelValue::Real(BigRational::from_integer(int(7))),
+        )
+        .unconstrained(
+            second_to_real,
+            ProvenUnconstrainedKind::FpToRealNonFinite,
+            ModelValue::Real(BigRational::from_integer(int(8))),
+        );
+
+    // SMT-LIB has one NaN value per format. The two encodings are therefore
+    // equal graph arguments, so fp.to_real must make one consistent choice.
+    assert_violates(&verdict(
+        &ts,
+        &model,
+        &[first_definition, conflicting_definition],
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 1);
+}
+
+#[test]
 fn sat_euclidean_mod_and_div() {
     // SMT-LIB: (-7) = 3*(-3) + 2, so (mod -7 3) = 2 and (div -7 3) = -3.
     let mut ts = TermStore::new();
@@ -260,6 +506,350 @@ fn sat_euclidean_mod_and_div() {
     let em = app(&mut ts, "=", &[m, two], Sort::Bool);
     let ed = app(&mut ts, "=", &[d, neg3], Sort::Bool);
     assert_confirmed(&verdict(&ts, &StubModel::new(), &[em, ed]));
+}
+
+#[test]
+fn zero_divisors_use_the_exact_typed_fallbacks() {
+    let mut ts = TermStore::new();
+    let real_one = ts.mk_rational(BigRational::from_integer(int(1)));
+    let real_zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let int_one = ts.mk_int(int(1));
+    let int_zero = ts.mk_int(int(0));
+    let real_div = app(&mut ts, "/", &[real_one, real_zero], Sort::Real);
+    let int_div = app(&mut ts, "div", &[int_one, int_zero], Sort::Int);
+    let int_mod = app(&mut ts, "mod", &[int_one, int_zero], Sort::Int);
+    let real_choice = BigRational::new(int(7), int(2));
+    let real_expected = ts.mk_rational(real_choice.clone());
+    let int_div_expected = ts.mk_int(int(-4));
+    let int_mod_expected = ts.mk_int(int(9));
+    let real_eq = app(&mut ts, "=", &[real_div, real_expected], Sort::Bool);
+    let div_eq = app(&mut ts, "=", &[int_div, int_div_expected], Sort::Bool);
+    let mod_eq = app(&mut ts, "=", &[int_mod, int_mod_expected], Sort::Bool);
+    let model = UfStubModel::new()
+        .unconstrained(
+            real_div,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(real_choice),
+        )
+        .unconstrained(
+            int_div,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(-4)),
+        )
+        .unconstrained(
+            int_mod,
+            ProvenUnconstrainedKind::IntModByZero,
+            ModelValue::Int(int(9)),
+        );
+
+    assert_confirmed(&verdict(&ts, &model, &[real_eq, div_eq, mod_eq]));
+    assert_eq!(model.unconstrained_calls.get(), 3);
+}
+
+#[test]
+fn real_division_checks_the_zero_divisor_before_rationalizing_an_algebraic_numerator() {
+    let mut ts = TermStore::new();
+    let numerator = ts.mk_var("sqrt-two", Sort::Real);
+    let zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let division = app(&mut ts, "/", &[numerator, zero], Sort::Real);
+    let selected = BigRational::new(int(5), int(3));
+    let sqrt_two = algebraic::Algebraic::root_of(
+        algebraic::integer_poly(&[-2, 0, 1]),
+        BigRational::from_integer(int(1)),
+        BigRational::from_integer(int(2)),
+    )
+    .expect("sqrt(2) is a valid algebraic value");
+    let model = UfStubModel::new()
+        .leaf(numerator, ModelValue::Algebraic(Box::new(sqrt_two)))
+        .unconstrained(
+            division,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(selected.clone()),
+        );
+
+    assert!(matches!(
+        evaluate_term(&ts, &model, division),
+        EvalOutcome::Value(ModelValue::Real(value)) if value == selected
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 1);
+}
+
+#[test]
+fn committed_zero_division_value_precedes_typed_fallback() {
+    let mut ts = TermStore::new();
+    let one = ts.mk_int(int(1));
+    let zero = ts.mk_int(int(0));
+    let div = app(&mut ts, "div", &[one, zero], Sort::Int);
+    let committed = ts.mk_int(int(3));
+    let assertion = app(&mut ts, "=", &[div, committed], Sort::Bool);
+    let model = UfStubModel::new()
+        .uf(div, ModelValue::Int(int(3)))
+        .unconstrained(
+            div,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(99)),
+        );
+
+    assert_confirmed(&verdict(&ts, &model, &[assertion]));
+    assert_eq!(model.unconstrained_calls.get(), 0);
+}
+
+#[test]
+fn nonzero_real_div_div_and_mod_never_consult_unconstrained_fallback() {
+    let mut ts = TermStore::new();
+    let real_four = ts.mk_rational(BigRational::from_integer(int(4)));
+    let real_two = ts.mk_rational(BigRational::from_integer(int(2)));
+    let int_seven = ts.mk_int(int(7));
+    let int_three = ts.mk_int(int(3));
+    let real_div = app(&mut ts, "/", &[real_four, real_two], Sort::Real);
+    let int_div = app(&mut ts, "div", &[int_seven, int_three], Sort::Int);
+    let int_mod = app(&mut ts, "mod", &[int_seven, int_three], Sort::Int);
+    let real_expected = ts.mk_rational(BigRational::from_integer(int(2)));
+    let int_div_expected = ts.mk_int(int(2));
+    let int_mod_expected = ts.mk_int(int(1));
+    let real_assertion = app(&mut ts, "=", &[real_div, real_expected], Sort::Bool);
+    let div_assertion = app(&mut ts, "=", &[int_div, int_div_expected], Sort::Bool);
+    let mod_assertion = app(&mut ts, "=", &[int_mod, int_mod_expected], Sort::Bool);
+    let model = UfStubModel::new()
+        .unconstrained(
+            real_div,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(BigRational::from_integer(int(99))),
+        )
+        .unconstrained(
+            int_div,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(99)),
+        )
+        .unconstrained(
+            int_mod,
+            ProvenUnconstrainedKind::IntModByZero,
+            ModelValue::Int(int(99)),
+        );
+
+    assert_confirmed(&verdict(
+        &ts,
+        &model,
+        &[real_assertion, div_assertion, mod_assertion],
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 0);
+}
+
+#[test]
+fn malformed_division_signatures_never_mint_typed_authority() {
+    let mut ts = TermStore::new();
+    let real_zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let int_zero = ts.mk_int(int(0));
+    let int_one = ts.mk_int(int(1));
+
+    let unary_real_div = app(&mut ts, "/", &[real_zero], Sort::Real);
+    let real_div_with_int_operands = app(&mut ts, "/", &[int_one, int_zero], Sort::Real);
+    let int_div_with_real_operands = app(&mut ts, "div", &[real_zero, real_zero], Sort::Int);
+    let mod_with_real_result = app(&mut ts, "mod", &[int_one, int_zero], Sort::Real);
+    let model = UfStubModel::new()
+        .unconstrained(
+            unary_real_div,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(BigRational::from_integer(int(7))),
+        )
+        .unconstrained(
+            real_div_with_int_operands,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(BigRational::from_integer(int(7))),
+        )
+        .unconstrained(
+            int_div_with_real_operands,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(7)),
+        )
+        .unconstrained(
+            mod_with_real_result,
+            ProvenUnconstrainedKind::IntModByZero,
+            ModelValue::Int(int(7)),
+        );
+
+    for malformed in [
+        unary_real_div,
+        real_div_with_int_operands,
+        int_div_with_real_operands,
+        mod_with_real_result,
+    ] {
+        assert!(
+            matches!(
+                evaluate_term(&ts, &model, malformed),
+                EvalOutcome::Unevaluable(_)
+            ),
+            "malformed arithmetic application must fail closed"
+        );
+    }
+    assert_eq!(model.unconstrained_calls.get(), 0);
+}
+
+#[test]
+fn zero_division_rejects_wrong_sort_before_congruence_insertion() {
+    let mut ts = TermStore::new();
+    let a = ts.mk_var("a", Sort::Int);
+    let b = ts.mk_var("b", Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let div_a = app(&mut ts, "div", &[a, zero], Sort::Int);
+    let div_b = app(&mut ts, "div", &[b, zero], Sort::Int);
+    let model = UfStubModel::new()
+        .leaf(a, ModelValue::Int(int(1)))
+        .leaf(b, ModelValue::Int(int(1)))
+        .unconstrained(
+            div_a,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Bool(true),
+        )
+        .unconstrained(
+            div_b,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(7)),
+        );
+    let evaluator = Evaluator::new(&ts, &model);
+
+    match evaluator.evaluate(div_a) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("must still be a number")),
+        other => panic!("wrong-sort div fallback must fail closed, got {other:?}"),
+    }
+    assert!(matches!(
+        evaluator.evaluate(div_b),
+        EvalOutcome::Value(ModelValue::Int(value)) if value == int(7)
+    ));
+}
+
+#[test]
+fn congruent_zero_divisions_share_one_fallback_value() {
+    let mut ts = TermStore::new();
+    let a = ts.mk_var("a", Sort::Int);
+    let b = ts.mk_var("b", Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let div_a = app(&mut ts, "div", &[a, zero], Sort::Int);
+    let div_b = app(&mut ts, "div", &[b, zero], Sort::Int);
+    let seven = ts.mk_int(int(7));
+    let eight = ts.mk_int(int(8));
+    let first_definition = app(&mut ts, "=", &[div_a, seven], Sort::Bool);
+    let conflicting_definition = app(&mut ts, "=", &[div_b, eight], Sort::Bool);
+    let model = UfStubModel::new()
+        .leaf(a, ModelValue::Int(int(1)))
+        .leaf(b, ModelValue::Int(int(1)))
+        .unconstrained(
+            div_a,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(7)),
+        )
+        .unconstrained(
+            div_b,
+            ProvenUnconstrainedKind::IntDivByZero,
+            ModelValue::Int(int(8)),
+        );
+
+    // Evaluating the first definition installs div(1, 0) = 7 in the
+    // value-keyed graph.  The congruent second application must reuse that
+    // value instead of consulting its incompatible per-term fallback, making
+    // the second asserted definition false.
+    assert_violates(&verdict(
+        &ts,
+        &model,
+        &[first_definition, conflicting_definition],
+    ));
+    assert_eq!(model.unconstrained_calls.get(), 1);
+}
+
+#[test]
+fn equal_cross_extension_zero_division_keys_fail_closed() {
+    // Exact UNSAT shape: the polynomial and positivity assertions force both
+    // x and y to the one real value +sqrt(2).  Division by zero is total but
+    // unconstrained, so it may choose any value at sqrt(2), not TWO values at
+    // the same argument.  The two exact root objects deliberately use
+    // different isolating intervals. `value_eq` cannot compare those
+    // extensions, which must stop the gate rather than be mistaken for proof
+    // that x and y differ.
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("x", Sort::Real);
+    let y = ts.mk_var("y", Sort::Real);
+    let zero = ts.mk_rational(BigRational::from_integer(int(0)));
+    let two = ts.mk_rational(BigRational::from_integer(int(2)));
+    let seven = ts.mk_rational(BigRational::from_integer(int(7)));
+    let eight = ts.mk_rational(BigRational::from_integer(int(8)));
+    let x_squared = app(&mut ts, "*", &[x, x], Sort::Real);
+    let y_squared = app(&mut ts, "*", &[y, y], Sort::Real);
+    let x_is_root = app(&mut ts, "=", &[x_squared, two], Sort::Bool);
+    let y_is_root = app(&mut ts, "=", &[y_squared, two], Sort::Bool);
+    let x_positive = app(&mut ts, ">", &[x, zero], Sort::Bool);
+    let y_positive = app(&mut ts, ">", &[y, zero], Sort::Bool);
+    let div_x = app(&mut ts, "/", &[x, zero], Sort::Real);
+    let div_y = app(&mut ts, "/", &[y, zero], Sort::Real);
+    let first_definition = app(&mut ts, "=", &[div_x, seven], Sort::Bool);
+    let conflicting_definition = app(&mut ts, "=", &[div_y, eight], Sort::Bool);
+
+    let model = UfStubModel::new()
+        .leaf(
+            x,
+            sqrt_two_between(
+                BigRational::from_integer(int(1)),
+                BigRational::from_integer(int(2)),
+            ),
+        )
+        .leaf(
+            y,
+            sqrt_two_between(
+                BigRational::new(int(4), int(3)),
+                BigRational::new(int(3), int(2)),
+            ),
+        )
+        .unconstrained(
+            div_x,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(BigRational::from_integer(int(7))),
+        )
+        .unconstrained(
+            div_y,
+            ProvenUnconstrainedKind::RealDivByZero,
+            ModelValue::Real(BigRational::from_integer(int(8))),
+        );
+
+    match verdict(
+        &ts,
+        &model,
+        &[
+            x_is_root,
+            y_is_root,
+            x_positive,
+            y_positive,
+            first_definition,
+            conflicting_definition,
+        ],
+    ) {
+        GateVerdict::CannotConfirm { reason } => {
+            assert!(reason.contains("cannot decide congruence-key equality"));
+            assert!(reason.contains("algebraic equality across different extensions"));
+        }
+        other => panic!("equal algebraic /0 keys must fail closed, got {other:?}"),
+    }
+    assert_eq!(
+        model.unconstrained_calls.get(),
+        1,
+        "the ambiguous second key must fail before adopting another value"
+    );
+}
+
+#[test]
+fn generic_application_never_consults_unconstrained_fallback() {
+    let mut ts = TermStore::new();
+    let one = ts.mk_int(int(1));
+    let application = app(&mut ts, "f", &[one], Sort::Int);
+    let model = UfStubModel::new().unconstrained(
+        application,
+        ProvenUnconstrainedKind::IntDivByZero,
+        ModelValue::Int(int(7)),
+    );
+
+    match evaluate_term(&ts, &model, application) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("model commits no value")),
+        other => panic!("generic application must not use typed fallback, got {other:?}"),
+    }
+    assert_eq!(model.unconstrained_calls.get(), 0);
 }
 
 #[test]
@@ -958,6 +1548,42 @@ fn array_equality_extensional() {
 }
 
 #[test]
+fn bool_index_array_differing_defaults_do_not_prove_disequality() {
+    // Both arrays denote the constant-zero function over Bool: the left array's
+    // two stores cover the complete index domain, so its default `1` is
+    // unreachable. A value-only comparator cannot use the differing defaults
+    // as evidence for `(distinct left right)` without carrying the index sort.
+    let mut ts = TermStore::new();
+    let array_sort = Sort::array(Sort::Bool, Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let false_index = ts.mk_bool(false);
+    let true_index = ts.mk_bool(true);
+    let one_default = app(&mut ts, "const-array", &[one], array_sort.clone());
+    let with_false = app(
+        &mut ts,
+        "store",
+        &[one_default, false_index, zero],
+        array_sort.clone(),
+    );
+    let fully_covered = app(
+        &mut ts,
+        "store",
+        &[with_false, true_index, zero],
+        array_sort.clone(),
+    );
+    let zero_default = app(&mut ts, "const-array", &[zero], array_sort);
+    let disequality = app(
+        &mut ts,
+        "distinct",
+        &[fully_covered, zero_default],
+        Sort::Bool,
+    );
+
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[disequality]));
+}
+
+#[test]
 fn evaluate_term_exposes_outcome() {
     let mut ts = TermStore::new();
     let x = ts.mk_var("x", Sort::Int);
@@ -983,11 +1609,58 @@ fn evaluate_term_exposes_outcome() {
 // arguments to the same value while the model pins them to different results.
 // ===========================================================================
 
+/// A model implementing only the original one-argument unconstrained hook.
+///
+/// Its tests protect source compatibility and, more importantly, prove that
+/// the new typed default does not silently extend this legacy authority to
+/// division-by-zero applications.
+struct LegacyUnconstrainedModel {
+    leaves: HashMap<TermId, ModelValue>,
+    unconstrained_apps: HashMap<TermId, ModelValue>,
+    unconstrained_calls: Cell<usize>,
+}
+
+impl LegacyUnconstrainedModel {
+    fn new() -> Self {
+        Self {
+            leaves: HashMap::new(),
+            unconstrained_apps: HashMap::new(),
+            unconstrained_calls: Cell::new(0),
+        }
+    }
+
+    fn leaf(mut self, t: TermId, v: ModelValue) -> Self {
+        self.leaves.insert(t, v);
+        self
+    }
+
+    fn unconstrained(mut self, t: TermId, v: ModelValue) -> Self {
+        self.unconstrained_apps.insert(t, v);
+        self
+    }
+}
+
+impl ModelView for LegacyUnconstrainedModel {
+    fn leaf_value(&self, t: TermId) -> Option<ModelValue> {
+        self.leaves.get(&t).cloned()
+    }
+
+    fn unconstrained_app_value(&self, t: TermId) -> Option<ModelValue> {
+        self.unconstrained_calls
+            .set(self.unconstrained_calls.get() + 1);
+        self.unconstrained_apps.get(&t).cloned()
+    }
+}
+
 /// A stub model that also answers `uf_app_value` for whole application terms.
 struct UfStubModel {
     leaves: HashMap<TermId, ModelValue>,
     uf_apps: HashMap<TermId, ModelValue>,
+    unconstrained_apps: HashMap<TermId, (ProvenUnconstrainedKind, ModelValue)>,
+    unconstrained_calls: Cell<usize>,
     selects: HashMap<TermId, ModelValue>,
+    projections: HashMap<TermId, usize>,
+    projection_errors: HashMap<TermId, String>,
 }
 
 impl UfStubModel {
@@ -995,7 +1668,11 @@ impl UfStubModel {
         Self {
             leaves: HashMap::new(),
             uf_apps: HashMap::new(),
+            unconstrained_apps: HashMap::new(),
+            unconstrained_calls: Cell::new(0),
             selects: HashMap::new(),
+            projections: HashMap::new(),
+            projection_errors: HashMap::new(),
         }
     }
     fn leaf(mut self, t: TermId, v: ModelValue) -> Self {
@@ -1006,8 +1683,20 @@ impl UfStubModel {
         self.uf_apps.insert(t, v);
         self
     }
+    fn unconstrained(mut self, t: TermId, kind: ProvenUnconstrainedKind, v: ModelValue) -> Self {
+        self.unconstrained_apps.insert(t, (kind, v));
+        self
+    }
     fn sel(mut self, t: TermId, v: ModelValue) -> Self {
         self.selects.insert(t, v);
+        self
+    }
+    fn projection(mut self, t: TermId, selected: usize) -> Self {
+        self.projections.insert(t, selected);
+        self
+    }
+    fn projection_error(mut self, t: TermId, detail: &str) -> Self {
+        self.projection_errors.insert(t, detail.to_string());
         self
     }
 }
@@ -1016,8 +1705,25 @@ impl ModelView for UfStubModel {
     fn leaf_value(&self, t: TermId) -> Option<ModelValue> {
         self.leaves.get(&t).cloned()
     }
+    fn projection_argument(&self, t: TermId) -> Result<Option<usize>, ProjectionLookupError> {
+        if let Some(detail) = self.projection_errors.get(&t) {
+            return Err(ProjectionLookupError::inconsistent_model(detail.clone()));
+        }
+        Ok(self.projections.get(&t).copied())
+    }
     fn uf_app_value(&self, t: TermId) -> Option<ModelValue> {
         self.uf_apps.get(&t).cloned()
+    }
+    fn proven_unconstrained_app_value(
+        &self,
+        t: TermId,
+        kind: ProvenUnconstrainedKind,
+    ) -> Option<ModelValue> {
+        self.unconstrained_calls
+            .set(self.unconstrained_calls.get() + 1);
+        self.unconstrained_apps
+            .get(&t)
+            .and_then(|(expected, value)| (*expected == kind).then(|| value.clone()))
     }
     fn array_select_value(&self, t: TermId) -> Option<ModelValue> {
         self.selects.get(&t).cloned()
@@ -1084,6 +1790,277 @@ fn uf_congruent_applications_share_one_value() {
     // Congruent apps collapse to one value, so equality is TRUE (not a spurious
     // violation): `(= 1 1)`.
     assert_confirmed(&verdict(&ts, &m, &[eq]));
+}
+
+#[test]
+fn uf_array_keys_with_finite_domain_coverage_fail_closed() {
+    // The two array arguments are extensionally equal over Bool even though
+    // their stored defaults differ: the left stores cover both domain values.
+    // They therefore denote one UF graph key. Without index-sort evidence the
+    // key comparison must remain unresolved, never install two results and
+    // confirm the impossible conjunction `f(left) = 7 ∧ f(right) = 8`.
+    let mut ts = TermStore::new();
+    let array_sort = Sort::array(Sort::Bool, Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let false_index = ts.mk_bool(false);
+    let true_index = ts.mk_bool(true);
+    let one_default = app(&mut ts, "const-array", &[one], array_sort.clone());
+    let with_false = app(
+        &mut ts,
+        "store",
+        &[one_default, false_index, zero],
+        array_sort.clone(),
+    );
+    let fully_covered = app(
+        &mut ts,
+        "store",
+        &[with_false, true_index, zero],
+        array_sort.clone(),
+    );
+    let zero_default = app(&mut ts, "const-array", &[zero], array_sort);
+    let left_app = app(&mut ts, "f", &[fully_covered], Sort::Int);
+    let right_app = app(&mut ts, "f", &[zero_default], Sort::Int);
+    let seven = ts.mk_int(int(7));
+    let eight = ts.mk_int(int(8));
+    let left_definition = app(&mut ts, "=", &[left_app, seven], Sort::Bool);
+    let right_definition = app(&mut ts, "=", &[right_app, eight], Sort::Bool);
+    let model = UfStubModel::new()
+        .uf(left_app, ModelValue::Int(int(7)))
+        .uf(right_app, ModelValue::Int(int(8)));
+
+    assert_cannot(&verdict(&ts, &model, &[left_definition, right_definition]));
+}
+
+#[test]
+fn congruence_key_definite_difference_overrides_an_unresolved_component() {
+    // A multi-argument graph entry is a definite miss when ANY component is
+    // proven different, even if another component's equality is undecidable.
+    // The matcher must scan past the algebraic gap rather than failing closed
+    // too early and needlessly losing a valid, distinct function point.
+    let stored = vec![
+        sqrt_two_between(
+            BigRational::from_integer(int(1)),
+            BigRational::from_integer(int(2)),
+        ),
+        ModelValue::Int(int(1)),
+    ];
+    let candidate = vec![
+        sqrt_two_between(
+            BigRational::new(int(4), int(3)),
+            BigRational::new(int(3), int(2)),
+        ),
+        ModelValue::Int(int(2)),
+    ];
+
+    assert!(matches!(
+        eval::congruence_keys_equal(&stored, &candidate),
+        Ok(false)
+    ));
+}
+
+#[test]
+fn selector_graph_key_matcher_fails_closed_on_nested_algebraic_gap() {
+    // Selector fallback keys are committed datatype values. Two equal
+    // datatype values can carry equal algebraic fields represented in
+    // different extensions, so the recursive `value_eq` gap must propagate;
+    // it is not evidence that two selector arguments are distinct.
+    let stored = ModelValue::Datatype {
+        ctor: "WrongConstructor".to_string(),
+        args: vec![sqrt_two_between(
+            BigRational::from_integer(int(1)),
+            BigRational::from_integer(int(2)),
+        )],
+    };
+    let candidate = ModelValue::Datatype {
+        ctor: "WrongConstructor".to_string(),
+        args: vec![sqrt_two_between(
+            BigRational::new(int(4), int(3)),
+            BigRational::new(int(3), int(2)),
+        )],
+    };
+
+    match eval::congruence_keys_equal(
+        std::slice::from_ref(&stored),
+        std::slice::from_ref(&candidate),
+    ) {
+        Err(reason) => assert!(reason.contains("algebraic equality across different extensions")),
+        other => panic!("selector key equality gap must remain unresolved, got {other:?}"),
+    }
+}
+
+#[test]
+fn selector_graph_equal_cross_extension_arguments_fail_closed() {
+    // Make the selector argument itself unevaluable (its array index is
+    // unpinned), while supplying the model's committed value for that exact
+    // read. This reaches the selector-specific fallback graph. `get` is
+    // under-specified on constructor Bad, but it remains a single-valued
+    // function: two equal Bad(sqrt(2)) arguments cannot receive 7 and 8.
+    let mut ts = TermStore::new();
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "Choice",
+        vec![
+            DatatypeConstructor::new("Good", vec![DatatypeField::new("get", Sort::Int)]),
+            DatatypeConstructor::new("Bad", vec![DatatypeField::new("payload", Sort::Real)]),
+        ],
+    ));
+    let array_sort = Sort::array(Sort::Int, datatype.clone());
+    let array = ts.mk_var("choices", array_sort);
+    let left_index = ts.mk_var("left-index", Sort::Int); // deliberately unpinned
+    let right_index = ts.mk_var("right-index", Sort::Int); // deliberately unpinned
+    let left_argument = app(&mut ts, "select", &[array, left_index], datatype.clone());
+    let right_argument = app(&mut ts, "select", &[array, right_index], datatype);
+    let left_selector = app(&mut ts, "get", &[left_argument], Sort::Int);
+    let right_selector = app(&mut ts, "get", &[right_argument], Sort::Int);
+    let model = UfStubModel::new()
+        .sel(
+            left_argument,
+            ModelValue::Datatype {
+                ctor: "Bad".to_string(),
+                args: vec![sqrt_two_between(
+                    BigRational::from_integer(int(1)),
+                    BigRational::from_integer(int(2)),
+                )],
+            },
+        )
+        .sel(
+            right_argument,
+            ModelValue::Datatype {
+                ctor: "Bad".to_string(),
+                args: vec![sqrt_two_between(
+                    BigRational::new(int(4), int(3)),
+                    BigRational::new(int(3), int(2)),
+                )],
+            },
+        )
+        .uf(left_selector, ModelValue::Int(int(7)))
+        .uf(right_selector, ModelValue::Int(int(8)));
+    let evaluator = Evaluator::new(&ts, &model);
+
+    assert!(matches!(
+        evaluator.evaluate(left_selector),
+        EvalOutcome::Value(ModelValue::Int(value)) if value == int(7)
+    ));
+    assert!(
+        matches!(
+            evaluator.evaluate(right_selector),
+            EvalOutcome::Unevaluable(_)
+        ),
+        "an unresolved equality with the existing selector key must fail closed"
+    );
+}
+
+#[test]
+fn projection_reuses_outer_value_keyed_uf_graph() {
+    // `1` and `(bvadd 0 1)` are the same argument value, so both `g`
+    // applications denote one result even though the supplied per-term pins
+    // conflict. The projection must evaluate its selected nested application
+    // in the existing Evaluator: a fresh evaluator would forget the first
+    // `g(1) = #x10`, adopt `g(0+1) = #x20`, and wrongly confirm `distinct`.
+    let mut ts = TermStore::new();
+    let bv8 = Sort::bitvec(8);
+    let zero = ts.mk_bitvec(int(0), 8);
+    let one = ts.mk_bitvec(int(1), 8);
+    let dummy = ts.mk_bitvec(int(0xaa), 8);
+    let equivalent_one = app(&mut ts, "bvadd", &[zero, one], bv8.clone());
+    let g_direct = app(&mut ts, "g", &[one], bv8.clone());
+    let g_equivalent = app(&mut ts, "g", &[equivalent_one], bv8.clone());
+    let projected = app(&mut ts, "projection", &[dummy, g_equivalent], bv8.clone());
+    let distinct = app(&mut ts, "distinct", &[g_direct, projected], Sort::Bool);
+    let m = UfStubModel::new()
+        .uf(g_direct, ModelValue::bitvec(int(0x10), 8))
+        .uf(g_equivalent, ModelValue::bitvec(int(0x20), 8))
+        .projection(projected, 1);
+    assert_violates(&verdict(&ts, &m, &[distinct]));
+}
+
+#[test]
+fn projection_metadata_is_validated_before_beta_reduction() {
+    let mut ts = TermStore::new();
+    let one = ts.mk_int(int(1));
+    let out_of_bounds = app(&mut ts, "bad_index", &[one], Sort::Int);
+    let wrong_sort = app(&mut ts, "bad_sort", &[one], Sort::Bool);
+    let m = UfStubModel::new()
+        .uf(out_of_bounds, ModelValue::Int(int(9)))
+        .uf(wrong_sort, ModelValue::Bool(true))
+        .projection(out_of_bounds, 1)
+        .projection(wrong_sort, 0);
+
+    match evaluate_term(&ts, &m, out_of_bounds) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("application arity is 1")),
+        other => panic!("invalid projection index must fail closed, got {other:?}"),
+    }
+    match evaluate_term(&ts, &m, wrong_sort) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("does not match result sort")),
+        other => panic!("ill-sorted projection must fail closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn projection_lookup_error_precedes_per_application_uf_value() {
+    let mut ts = TermStore::new();
+    let one = ts.mk_int(int(1));
+    let application = app(&mut ts, "conflicting_projection", &[one], Sort::Int);
+    let model = UfStubModel::new()
+        .uf(application, ModelValue::Int(int(99)))
+        .projection_error(application, "installed and observed signatures differ");
+
+    match evaluate_term(&ts, &model, application) {
+        EvalOutcome::Unevaluable(reason) => {
+            assert!(reason.contains("inconsistent symbolic projection model"));
+            assert!(reason.contains("signatures differ"));
+        }
+        other => panic!("a projection conflict must not fall through to the UF pin, got {other:?}"),
+    }
+}
+
+#[test]
+fn projections_do_not_reset_the_evaluator_depth_budget() {
+    let mut ts = TermStore::new();
+    let bv8 = Sort::bitvec(8);
+    let dummy = ts.mk_bitvec(int(0), 8);
+    let mut nested = ts.mk_bitvec(int(1), 8);
+    let mut m = UfStubModel::new();
+    // Each layer contributes one projection edge and one ordinary interpreted
+    // edge. Resetting depth at projection boundaries would evaluate this whole
+    // chain; one continuous evaluator must stop once the shared bound is spent.
+    for _ in 0..(MAX_EVAL_DEPTH / 2 + 2) {
+        let inverted = app(&mut ts, "bvnot", &[nested], bv8.clone());
+        nested = app(&mut ts, "depth_projection", &[dummy, inverted], bv8.clone());
+        m = m.projection(nested, 1);
+    }
+    match evaluate_term(&ts, &m, nested) {
+        EvalOutcome::Unevaluable(reason) => assert!(reason.contains("recursion depth limit")),
+        other => panic!("projection edges must consume the shared depth budget, got {other:?}"),
+    }
+}
+
+#[test]
+fn projection_evaluator_call_depth_is_restored_between_evaluations() {
+    let mut ts = TermStore::new();
+    let selected = ts.mk_bool(true);
+    let dummy = ts.mk_bool(false);
+    let projected = app(
+        &mut ts,
+        "reused_shallow_projection",
+        &[dummy, selected],
+        Sort::Bool,
+    );
+    let model = UfStubModel::new().projection(projected, 1);
+    let evaluator = Evaluator::new(&ts, &model);
+
+    // This deliberately crosses the projection-specific active-call bound.
+    // Every top-level evaluation must restore the counter to zero; a leaked
+    // increment would make the 129th call fail closed despite being shallow.
+    for attempt in 0..256 {
+        assert!(
+            matches!(
+                evaluator.evaluate(projected),
+                EvalOutcome::Value(ModelValue::Bool(true))
+            ),
+            "shallow projection failed on top-level evaluation {attempt}"
+        );
+    }
 }
 
 #[test]
@@ -1197,6 +2174,51 @@ fn array_select_collapsed_indices_refute_strict_inequality() {
         .sel(sel_hi, ModelValue::Int(int(7)))
         .sel(sel_lo, ModelValue::Int(int(5)));
     assert_violates(&verdict(&ts, &m, &[gt]));
+}
+
+#[test]
+fn array_select_equal_cross_extension_indices_fail_closed() {
+    // These two exact algebraic index values both denote +sqrt(2), but their
+    // root objects use different isolating intervals. After the first read
+    // fixes A[sqrt(2)] = 5, an undecidable representation-level comparison at
+    // the second read cannot authorize a separate A[sqrt(2)] = 7 entry.
+    let mut ts = TermStore::new();
+    let asort = Sort::array(Sort::Real, Sort::Int);
+    let array = ts.mk_var("A", asort); // deliberately unreconstructable
+    let left_index = ts.mk_var("left-index", Sort::Real);
+    let right_index = ts.mk_var("right-index", Sort::Real);
+    let left_read = app(&mut ts, "select", &[array, left_index], Sort::Int);
+    let right_read = app(&mut ts, "select", &[array, right_index], Sort::Int);
+    let model = ArraySelectStubModel::new()
+        .leaf(
+            left_index,
+            sqrt_two_between(
+                BigRational::from_integer(int(1)),
+                BigRational::from_integer(int(2)),
+            ),
+        )
+        .leaf(
+            right_index,
+            sqrt_two_between(
+                BigRational::new(int(4), int(3)),
+                BigRational::new(int(3), int(2)),
+            ),
+        )
+        .sel(left_read, ModelValue::Int(int(5)))
+        .sel(right_read, ModelValue::Int(int(7)));
+    let evaluator = Evaluator::new(&ts, &model);
+
+    assert!(matches!(
+        evaluator.evaluate(left_read),
+        EvalOutcome::Value(ModelValue::Int(value)) if value == int(5)
+    ));
+    match evaluator.evaluate(right_read) {
+        EvalOutcome::Unevaluable(reason) => {
+            assert!(reason.contains("cannot decide congruence-key equality"));
+            assert!(reason.contains("algebraic equality across different extensions"));
+        }
+        other => panic!("ambiguous second array key must fail closed, got {other:?}"),
+    }
 }
 
 #[test]

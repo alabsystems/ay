@@ -24,12 +24,10 @@
 //! fails at the quantifier node itself (`eval.rs`: "quantifier is not evaluable
 //! by the gate"), so the model NEVER actually verifies the universal.
 //!
-//! Fix: under `--self-check` (fail-closed) a Deferred quantified conjunct is
-//! NOT confirmed, so the gate now degrades `sat` -> `unknown` (the self-check
-//! contract emits `sat` only when EVERY authored assertion is confirmed). This
-//! can only ADD unknowns to the fail-closed mode, never a wrong answer. DEFAULT
-//! mode is deliberately unchanged (keeps the completeness-favoring deferred-sat
-//! — default mode is documented not-sound and still answers `sat` here).
+//! Fix: a Deferred quantified conjunct is NOT confirmed in any mode, so the
+//! gate degrades `sat` -> `unknown` unless every authored quantified assertion
+//! is independently confirmed. Default and `--self-check` now share the same
+//! fail-closed soundness contract.
 //!
 //! The fixture is the verbatim `AR-fixpoint-5` benchmark (a single
 //! `(assert (forall … (=> premise conclusion)))` over twelve `(_ BitVec 2501)`

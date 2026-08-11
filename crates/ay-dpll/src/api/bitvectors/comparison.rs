@@ -29,8 +29,11 @@ impl Solver {
     /// [`bvult`]: Solver::bvult
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvult(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvult", a)?;
+        let b_id = self.resolve_term("bvult", b)?;
         self.expect_same_bitvec_width("bvult", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvult(a.0, b.0)))
+        let result = self.terms_mut().mk_bvult(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed less-than
@@ -54,8 +57,11 @@ impl Solver {
     /// [`bvslt`]: Solver::bvslt
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvslt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvslt", a)?;
+        let b_id = self.resolve_term("bvslt", b)?;
         self.expect_same_bitvec_width("bvslt", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvslt(a.0, b.0)))
+        let result = self.terms_mut().mk_bvslt(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector unsigned less-than-or-equal
@@ -79,8 +85,11 @@ impl Solver {
     /// [`bvule`]: Solver::bvule
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvule(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvule", a)?;
+        let b_id = self.resolve_term("bvule", b)?;
         self.expect_same_bitvec_width("bvule", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvule(a.0, b.0)))
+        let result = self.terms_mut().mk_bvule(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector unsigned greater-than
@@ -104,8 +113,11 @@ impl Solver {
     /// [`bvugt`]: Solver::bvugt
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvugt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvugt", a)?;
+        let b_id = self.resolve_term("bvugt", b)?;
         self.expect_same_bitvec_width("bvugt", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvugt(a.0, b.0)))
+        let result = self.terms_mut().mk_bvugt(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector unsigned greater-than-or-equal
@@ -129,8 +141,11 @@ impl Solver {
     /// [`bvuge`]: Solver::bvuge
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvuge(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvuge", a)?;
+        let b_id = self.resolve_term("bvuge", b)?;
         self.expect_same_bitvec_width("bvuge", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvuge(a.0, b.0)))
+        let result = self.terms_mut().mk_bvuge(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed less-than-or-equal
@@ -154,8 +169,11 @@ impl Solver {
     /// [`bvsle`]: Solver::bvsle
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsle(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsle", a)?;
+        let b_id = self.resolve_term("bvsle", b)?;
         self.expect_same_bitvec_width("bvsle", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsle(a.0, b.0)))
+        let result = self.terms_mut().mk_bvsle(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed greater-than
@@ -179,8 +197,11 @@ impl Solver {
     /// [`bvsgt`]: Solver::bvsgt
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsgt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsgt", a)?;
+        let b_id = self.resolve_term("bvsgt", b)?;
         self.expect_same_bitvec_width("bvsgt", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsgt(a.0, b.0)))
+        let result = self.terms_mut().mk_bvsgt(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector signed greater-than-or-equal
@@ -204,8 +225,11 @@ impl Solver {
     /// [`bvsge`]: Solver::bvsge
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsge(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsge", a)?;
+        let b_id = self.resolve_term("bvsge", b)?;
         self.expect_same_bitvec_width("bvsge", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsge(a.0, b.0)))
+        let result = self.terms_mut().mk_bvsge(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector comparison returning a 1-bit bitvector
@@ -233,7 +257,10 @@ impl Solver {
     /// [`bvcomp`]: Solver::bvcomp
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvcomp(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvcomp", a)?;
+        let b_id = self.resolve_term("bvcomp", b)?;
         self.expect_same_bitvec_width("bvcomp", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvcomp(a.0, b.0)))
+        let result = self.terms_mut().mk_bvcomp(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 }

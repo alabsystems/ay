@@ -6,6 +6,7 @@ use crate::expr::Expr;
 use crate::memory::MemoryModel;
 use crate::memory::OBJECT_ID_WIDTH;
 use crate::AYProgram;
+use crate::Sort;
 
 // ========================================================================
 // Stack Frame Tests (issue #8293)
@@ -121,6 +122,22 @@ fn test_no_stack_escape_check() {
     assert!(
         no_escape_heap.sort().is_bool(),
         "assert_no_stack_escape must return Bool"
+    );
+}
+
+#[test]
+fn test_no_stack_escape_accepts_a_symbolic_frame_id() {
+    let mem = MemoryModel::new();
+    let (_frame_ptr, concrete_frame, mem) = mem.push_frame();
+    let (alloca_ptr, mem) =
+        mem.stack_alloca(concrete_frame, Expr::bitvec_const(16u32, OBJECT_ID_WIDTH));
+
+    let symbolic_frame = Expr::var("frame", Sort::bv32());
+    let constraint = mem.assert_no_stack_escape(alloca_ptr, symbolic_frame);
+    assert!(constraint.sort().is_bool());
+    assert!(
+        constraint.to_string().contains("=>"),
+        "sub-allocation exclusions must be guarded by symbolic frame identity"
     );
 }
 

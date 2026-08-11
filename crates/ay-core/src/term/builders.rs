@@ -16,7 +16,10 @@ use num_traits::One;
 
 use crate::sort::Sort;
 
-use super::{Constant, Symbol, TermData, TermEntry, TermId, TermStore, GLOBAL_TERM_BYTES};
+use super::{
+    fresh_term_entry_stamp, Constant, Symbol, TermData, TermEntry, TermId, TermStore,
+    GLOBAL_TERM_BYTES,
+};
 
 impl TermStore {
     /// Internal: find or create a term
@@ -61,7 +64,11 @@ impl TermStore {
 
         // Create new term
         let id = TermId(self.terms.len() as u32);
-        self.terms.push(TermEntry { term, sort });
+        self.terms.push(TermEntry {
+            term,
+            sort,
+            stamp: fresh_term_entry_stamp(),
+        });
 
         // Track hash_cons bucket Vec capacity overhead (#8600 item 4).
         // When the bucket Vec grows, it allocates new heap memory. We
@@ -196,7 +203,6 @@ impl TermStore {
         self.intern(TermData::Const(Constant::String(value)), Sort::String)
     }
 
-    /// Create or get a variable by name
     /// The interned variable with this exact name, if one exists.
     ///
     /// Read-only counterpart to [`Self::mk_var`], which requires `&mut self`
@@ -204,13 +210,19 @@ impl TermStore {
     /// new binder — the model evaluator resolving a solver-internal name it did
     /// not author — need the lookup without the side effect.
     ///
-    /// Returns the first sort interned under the name; a name reused at two
-    /// sorts stores only the first here, exactly as `mk_var`'s cache does.
+    /// Returns the most recently interned binding for the name. Creating a
+    /// fresh same-name binding replaces this lookup entry while the older term
+    /// remains valid by its [`TermId`].
     #[must_use]
     pub fn find_var(&self, name: &str) -> Option<TermId> {
         self.names.get(name).map(|(id, _)| *id)
     }
 
+    /// Create or get a variable with the given name and sort.
+    ///
+    /// Variables are reused only when both their name and sort match. If the
+    /// same name was previously interned at another sort, this creates a
+    /// distinct term rather than returning a mis-sorted variable.
     pub fn mk_var(&mut self, name: impl Into<String>, sort: Sort) -> TermId {
         let name = name.into();
 

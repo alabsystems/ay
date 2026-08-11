@@ -325,11 +325,6 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
     Ok(Parsed {
         ay,
         ay_cli,
-        checkpoint,
-        resume,
-        sample,
-        seed,
-        progress,
         z3,
         json,
         timeout,
@@ -340,6 +335,11 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
         oracle,
         baseline,
         divisions,
+        checkpoint,
+        resume,
+        sample,
+        seed,
+        progress,
         positionals,
     })
 }

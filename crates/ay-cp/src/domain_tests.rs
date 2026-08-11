@@ -133,3 +133,53 @@ fn test_sparse_values_follow_current_bounds() {
     assert!(d.set_ub(150).unwrap());
     assert_eq!(d.values(), vec![100]);
 }
+
+#[test]
+fn fallible_constructors_reject_empty_and_unrepresentable_domains() {
+    assert_eq!(
+        Domain::try_new(2, 1).unwrap_err(),
+        DomainCreationError::EmptyBounds { lb: 2, ub: 1 }
+    );
+    assert_eq!(
+        Domain::try_from_values(&[]).unwrap_err(),
+        DomainCreationError::EmptyValues
+    );
+    assert!(matches!(
+        Domain::try_from_values(&[i64::MIN, i64::MAX]),
+        Err(DomainCreationError::SpanTooLarge { .. })
+    ));
+    assert!(matches!(
+        Domain::try_from_values(&[1, 1_000_000_000_000]),
+        Err(DomainCreationError::SparseSpanTooLarge { .. })
+    ));
+}
+
+#[test]
+fn removing_from_a_huge_dense_domain_tracks_a_bounded_exclusion() {
+    let mut domain = Domain::new(-1_000_000_000_000, 1_000_000_000_000);
+    assert!(domain.remove(0).unwrap());
+    assert!(!domain.contains(0));
+    assert!(domain.contains(-1));
+    assert!(domain.contains(1));
+    assert_eq!(domain.missing_values(), vec![0]);
+    assert_eq!(domain.size(), 2_000_000_000_000);
+}
+
+#[test]
+fn eager_enumeration_rejects_huge_dense_domains_before_allocation() {
+    let domain = Domain::new(0, 2_000_000);
+    assert_eq!(domain.size(), 2_000_001);
+    assert!(matches!(
+        domain.try_values(),
+        Err(DomainEnumerationError::TooManyValues {
+            size: 2_000_001,
+            max: MAX_MATERIALIZED_DOMAIN_VALUES,
+        })
+    ));
+
+    let panic = std::panic::catch_unwind(|| domain.values());
+    assert!(
+        panic.is_err(),
+        "compatibility API must fail before allocation"
+    );
+}

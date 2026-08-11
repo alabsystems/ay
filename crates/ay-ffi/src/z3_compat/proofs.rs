@@ -21,8 +21,9 @@
 //!
 //! In real Z3, `Z3_solver_get_proof` returns a `Z3_ast` whose
 //! `Z3_ast_to_string` yields the proof. AY's proof is an `ay_core::Proof`
-//! (a separate DAG), not a `Term`, and AY's `Z3_ast` is a 32-bit term index —
-//! there is no faithful way to encode a proof as an ordinary term handle.
+//! (a separate DAG), not a `Term`, and ordinary AY `Z3_ast` handles index the
+//! context's authenticated term-capability arena — there is no faithful way to
+//! encode a proof as an ordinary term handle.
 //!
 //! To preserve the Z3 surface while staying honest, [`Z3_solver_get_proof`]
 //! returns an opaque proof-AST handle tagged with the high bit

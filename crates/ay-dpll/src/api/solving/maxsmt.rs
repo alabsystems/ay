@@ -21,7 +21,6 @@
 //! overflowing instances return honest `Unknown`; the API never labels the
 //! executor's count/greedy fallback as an optimum.
 
-use ay_core::time::Instant;
 use ay_frontend::{Command, SoftAssertion};
 
 use crate::api::types::maxsmt::{MaxSmtResult, SoftConstraint};
@@ -62,9 +61,10 @@ impl Solver {
         weight: u64,
         group: Option<&str>,
     ) -> Result<usize, SolverError> {
+        let term_id = self.resolve_term("assert_soft", term)?;
         if let Some(message) = self
             .executor
-            .array_ext_witness_registration_error(&[term.0])
+            .array_ext_witness_registration_error(&[term_id])
         {
             return Err(SolverError::InvalidArgument {
                 operation: "assert_soft",
@@ -122,7 +122,7 @@ impl Solver {
             .context()
             .soft_constraints()
             .iter()
-            .map(|soft| Term(soft.term))
+            .map(|soft| self.wrap_term(soft.term))
             .collect()
     }
 
@@ -165,7 +165,7 @@ impl Solver {
         }
 
         if self.soft_constraints.is_empty() {
-            let result = self.check_sat();
+            let result = self.check_sat_internal_api();
             return Ok(if result.is_sat() {
                 MaxSmtResult::optimal(0, 0, Vec::new())
             } else if result.is_unsat() {
@@ -181,8 +181,8 @@ impl Solver {
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         self.reject_composite_bv_cnf_export("check_sat_max")?;
 
-        let deadline = self.timeout.map(|duration| Instant::now() + duration);
-        if self.preflight_check(deadline).is_some() {
+        let controls = self.native_publication_controls();
+        if self.preflight_check(controls).is_some() {
             return Ok(MaxSmtResult::unknown());
         }
 
@@ -220,7 +220,7 @@ impl Solver {
             .soft_constraints
             .iter()
             .map(|soft| SoftAssertion {
-                term: soft.term.0,
+                term: soft.term.id(),
                 weight: soft.weight,
                 id: soft.group.clone(),
             })
@@ -232,116 +232,179 @@ impl Solver {
         // including the executor-error path.
         let parsed_softs = self
             .executor
-            .context_mut()
+            .context_mut_internal()
             .replace_soft_constraints(native_softs);
-        self.install_solve_controls(deadline);
-        let execution = self.executor.execute(&Command::CheckSat);
-        self.executor.clear_solve_controls();
         #[cfg(test)]
-        if self.corrupt_native_soft_transaction {
-            self.corrupt_native_soft_transaction = false;
-            let mut installed = self
-                .executor
-                .context_mut()
-                .replace_soft_constraints(Vec::new());
-            if let Some(first) = installed.first_mut() {
-                first.weight = first.weight.wrapping_add(1);
+        let configured_term_memory_limit = self.term_memory_limit;
+        self.install_solve_controls(controls);
+        let execution = self.executor.execute(&Command::CheckSat);
+        let outcome = (|| -> Result<MaxSmtResult, SolverError> {
+            #[cfg(test)]
+            if self.interrupt_native_maxsmt_after_execution {
+                self.interrupt_native_maxsmt_after_execution = false;
+                self.interrupt();
             }
-            let displaced = self
-                .executor
-                .context_mut()
-                .replace_soft_constraints(installed);
-            debug_assert!(displaced.is_empty());
-        }
-        let installed_native_softs = self
-            .executor
-            .context_mut()
-            .replace_soft_constraints(parsed_softs);
-
-        // This is an authentication check, not a debug-only shape assertion:
-        // outcome indices are interpreted against the caller-owned native set.
-        // A reordered/substituted term at the same length would otherwise bind
-        // the executor's proof-shaped accounting to different constraints.
-        if installed_native_softs != expected_native_softs {
-            return Ok(self.reject_inconsistent_maxsmt(
-                "executor mutated or reordered the installed native soft-constraint set"
-                    .to_string(),
-            ));
-        }
-
-        if let Err(error) = execution {
-            self.record_executor_failure_unknown(&error);
-            return Err(error.into());
-        }
-
-        let result = self
-            .executor
-            .last_result()
-            .cloned()
-            .unwrap_or(SolveResult::Unknown);
-        if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(deadline);
-        }
-
-        if result.is_unsat() {
-            return Ok(MaxSmtResult::hard_unsatisfiable());
-        }
-        if !result.is_sat() {
-            return Ok(MaxSmtResult::unknown());
-        }
-
-        if !self.executor.was_model_validated() {
-            return Ok(self.reject_inconsistent_maxsmt(
-                "executor returned SAT from MaxSMT without an admitted model".to_string(),
-            ));
-        }
-
-        let Some((violated_weight, optimal, violated_softs)) = self.executor.last_maxsmt_outcome()
-        else {
-            return Ok(self.reject_inconsistent_maxsmt(
-                "executor returned SAT from MaxSMT without objective accounting".to_string(),
-            ));
-        };
-        let violated_softs = violated_softs.to_vec();
-
-        if !optimal {
-            // The executor may retain a feasible fallback witness for SMT-LIB
-            // reporting. The native result type has no Approximate status, so
-            // fail closed and expose neither that witness nor its upper bound.
-            self.executor.begin_public_solve(false);
-            self.executor
-                .replace_last_result_with_unknown(UnknownReason::Incomplete);
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            return Ok(MaxSmtResult::unknown());
-        }
-
-        // Treat accounting as proof-shaped data: independently check every
-        // index, reject duplicates, recompute the violated weight, and require
-        // exact partitioning of the caller's total weight before publication.
-        let mut seen = vec![false; self.soft_constraints.len()];
-        let recomputed_violated_weight = violated_softs.iter().try_fold(0u64, |sum, &index| {
-            let soft = self.soft_constraints.get(index)?;
-            if std::mem::replace(&mut seen[index], true) {
-                return None;
+            #[cfg(test)]
+            if self.exhaust_native_maxsmt_term_memory_after_execution {
+                self.exhaust_native_maxsmt_term_memory_after_execution = false;
+                self.term_memory_limit = Some(0);
             }
-            sum.checked_add(soft.weight)
-        });
-        if recomputed_violated_weight != Some(violated_weight) {
-            return Ok(self.reject_inconsistent_maxsmt(format!(
+            #[cfg(test)]
+            if self.corrupt_native_soft_transaction {
+                self.corrupt_native_soft_transaction = false;
+                let mut installed = self
+                    .executor
+                    .context_mut_internal()
+                    .replace_soft_constraints(Vec::new());
+                if let Some(first) = installed.first_mut() {
+                    first.weight = first.weight.wrapping_add(1);
+                }
+                let displaced = self
+                    .executor
+                    .context_mut_internal()
+                    .replace_soft_constraints(installed);
+                debug_assert!(displaced.is_empty());
+            }
+            let installed_native_softs = self
+                .executor
+                .context_mut_internal()
+                .replace_soft_constraints(parsed_softs);
+
+            // This is an authentication check, not a debug-only shape assertion:
+            // outcome indices are interpreted against the caller-owned native set.
+            // A reordered/substituted term at the same length would otherwise bind
+            // the executor's proof-shaped accounting to different constraints.
+            if installed_native_softs != expected_native_softs {
+                return Ok(self.reject_inconsistent_maxsmt(
+                    "executor mutated or reordered the installed native soft-constraint set"
+                        .to_string(),
+                ));
+            }
+
+            if let Err(error) = execution {
+                self.record_executor_failure_unknown(&error);
+                return Err(error.into());
+            }
+
+            let result = self
+                .executor
+                .last_result()
+                .cloned()
+                .unwrap_or(SolveResult::Unknown);
+            // The generic text boundary consumed the engine's one-shot SAT/UNSAT
+            // capability inside `execute`, but MaxSmtResult is a second, richer
+            // caller-visible publication: the authenticated objective accounting
+            // below is part of that same transaction. Keep the original controls
+            // live and revoke a definite engine result if a stop fired after text
+            // admission but before this native boundary.
+            let result = self.decline_maxsmt_definite_on_external_stop(result);
+            if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
+                self.classify_unknown_reason(controls);
+            }
+
+            if result.is_unsat() {
+                return Ok(MaxSmtResult::hard_unsatisfiable());
+            }
+            if !result.is_sat() {
+                return Ok(MaxSmtResult::unknown());
+            }
+
+            if !self.executor.was_model_validated() {
+                return Ok(self.reject_inconsistent_maxsmt(
+                    "executor returned SAT from MaxSMT without an admitted model".to_string(),
+                ));
+            }
+
+            let Some((violated_weight, optimal, violated_softs)) =
+                self.executor.last_maxsmt_outcome()
+            else {
+                return Ok(self.reject_inconsistent_maxsmt(
+                    "executor returned SAT from MaxSMT without objective accounting".to_string(),
+                ));
+            };
+            let violated_softs = violated_softs.to_vec();
+
+            if !optimal {
+                // The executor may retain a feasible fallback witness for SMT-LIB
+                // reporting. The native result type has no Approximate status, so
+                // fail closed and expose neither that witness nor its upper bound.
+                self.executor.begin_public_solve(false);
+                self.executor
+                    .replace_last_result_with_unknown(UnknownReason::Incomplete);
+                self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                return Ok(MaxSmtResult::unknown());
+            }
+
+            // Treat accounting as proof-shaped data: independently check every
+            // index, reject duplicates, recompute the violated weight, and require
+            // exact partitioning of the caller's total weight before publication.
+            let mut seen = vec![false; self.soft_constraints.len()];
+            let recomputed_violated_weight = violated_softs.iter().try_fold(0u64, |sum, &index| {
+                let soft = self.soft_constraints.get(index)?;
+                if std::mem::replace(&mut seen[index], true) {
+                    return None;
+                }
+                sum.checked_add(soft.weight)
+            });
+            if recomputed_violated_weight != Some(violated_weight) {
+                return Ok(self.reject_inconsistent_maxsmt(format!(
                 "executor MaxSMT accounting mismatch: reported violated weight {violated_weight}, recomputed {recomputed_violated_weight:?}"
             )));
-        }
-        let Some(satisfied_weight) = total_weight.checked_sub(violated_weight) else {
-            return Ok(self.reject_inconsistent_maxsmt(format!(
+            }
+            let Some(satisfied_weight) = total_weight.checked_sub(violated_weight) else {
+                return Ok(self.reject_inconsistent_maxsmt(format!(
                 "executor MaxSMT violated weight {violated_weight} exceeds total {total_weight}"
             )));
-        };
+            };
 
-        Ok(MaxSmtResult::optimal(
-            satisfied_weight,
-            violated_weight,
-            violated_softs,
-        ))
+            // Objective authentication above is proof-shaped post-solve work. Sample
+            // the still-installed interrupt/deadline/RSS/term-memory controls once
+            // more at its linearization point, immediately before exposing the
+            // accounting as an `Optimal` result.
+            if !self
+                .decline_maxsmt_definite_on_external_stop(SolveResult::Sat)
+                .is_sat()
+            {
+                return Ok(MaxSmtResult::unknown());
+            }
+
+            Ok(MaxSmtResult::optimal(
+                satisfied_weight,
+                violated_weight,
+                violated_softs,
+            ))
+        })();
+        self.restore_solve_controls(controls);
+        #[cfg(test)]
+        {
+            self.term_memory_limit = configured_term_memory_limit;
+        }
+        outcome
+    }
+
+    /// Apply every native solve control at the richer MaxSMT publication
+    /// boundary. `Executor` owns interrupt/deadline/process-memory origins;
+    /// per-instance term memory is a `Solver` concern and is checked here just
+    /// as it is in `finish_verified_result`.
+    fn decline_maxsmt_definite_on_external_stop(&mut self, result: SolveResult) -> SolveResult {
+        let result = if !result.is_unknown()
+            && self
+                .term_memory_limit
+                .is_some_and(|limit| self.terms().instance_memory_exceeded(limit))
+        {
+            self.executor
+                .publish_unknown_from_origin(crate::UnknownOrigin::MemoryBudget);
+            SolveResult::Unknown
+        } else {
+            result
+        };
+        let result = self
+            .executor
+            .decline_definite_publication_on_external_stop(result);
+        if result.is_unknown() {
+            self.last_unknown_reason = self.executor.unknown_reason();
+        }
+        result
     }
 
     /// Fail closed when executor accounting violates the native API contract.
@@ -359,5 +422,19 @@ impl Solver {
     #[cfg(test)]
     pub(crate) fn corrupt_native_soft_transaction_for_test(&mut self) {
         self.corrupt_native_soft_transaction = true;
+    }
+
+    /// Fire the native interrupt after the MaxSMT engine has returned but before
+    /// the wrapper authenticates and publishes its richer result.
+    #[cfg(test)]
+    pub(crate) fn interrupt_native_maxsmt_after_execution_for_test(&mut self) {
+        self.interrupt_native_maxsmt_after_execution = true;
+    }
+
+    /// Exhaust the instance-local term budget after the engine returns but
+    /// before native objective accounting is published.
+    #[cfg(test)]
+    pub(crate) fn exhaust_native_maxsmt_term_memory_after_execution_for_test(&mut self) {
+        self.exhaust_native_maxsmt_term_memory_after_execution = true;
     }
 }

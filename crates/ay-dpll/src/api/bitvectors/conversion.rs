@@ -51,8 +51,10 @@ impl Solver {
     /// [`bv2int`]: Solver::bv2int
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bv2int(&mut self, bv: Term) -> Result<Term, SolverError> {
+        let bv_id = self.resolve_term("bv2int", bv)?;
         self.expect_bitvec("bv2int", bv)?;
-        Ok(Term(self.terms_mut().mk_bv2int(bv.0, false)))
+        let result = self.terms_mut().mk_bv2int(bv_id, false);
+        Ok(self.wrap_term(result))
     }
 
     /// Try to convert bitvector to integer (signed interpretation).
@@ -66,8 +68,10 @@ impl Solver {
     /// [`bv2int_signed`]: Solver::bv2int_signed
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bv2int_signed(&mut self, bv: Term) -> Result<Term, SolverError> {
+        let bv_id = self.resolve_term("bv2int_signed", bv)?;
         self.expect_bitvec("bv2int_signed", bv)?;
-        Ok(Term(self.terms_mut().mk_bv2int(bv.0, true)))
+        let result = self.terms_mut().mk_bv2int(bv_id, true);
+        Ok(self.wrap_term(result))
     }
 
     /// Convert integer to bitvector of specified width
@@ -102,7 +106,9 @@ impl Solver {
     /// [`int2bv`]: Solver::int2bv
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_int2bv(&mut self, int_term: Term, width: u32) -> Result<Term, SolverError> {
+        let int_id = self.resolve_term("int2bv", int_term)?;
         self.expect_int("int2bv", int_term)?;
-        Ok(Term(self.terms_mut().mk_int2bv(width, int_term.0)))
+        let result = self.terms_mut().mk_int2bv(width, int_id);
+        Ok(self.wrap_term(result))
     }
 }

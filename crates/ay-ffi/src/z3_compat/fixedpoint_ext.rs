@@ -741,6 +741,8 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_num_levels(
 ) -> c_uint {
     // SAFETY: `pred`/`d`, when non-null, are live handles; `as_ref` null-checks.
     let pred_name = unsafe { pred.as_ref() }.map(|h| h.decl.name().to_string());
+    // SAFETY: as above, `d` is either null or a live fixedpoint handle and this
+    // shared read completes before the guarded context mutation below.
     let handle_state: Option<(bool, u64)> = unsafe { d.as_ref() }.map(|h| {
         let registered = pred_name
             .as_deref()

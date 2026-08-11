@@ -31,9 +31,8 @@ fn val_at_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn val_at_out_of_bounds_panics_in_debug() {
+fn val_at_out_of_bounds_panics() {
     let vals: Vec<i8> = vec![0, 1, -1];
     let _ = val_at(&vals, 3);
 }
@@ -46,9 +45,8 @@ fn word_at_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn word_at_out_of_bounds_panics_in_debug() {
+fn word_at_out_of_bounds_panics() {
     let words: Vec<u32> = vec![10, 20];
     let _ = word_at(&words, 2);
 }
@@ -61,9 +59,8 @@ fn entry_at_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn entry_at_out_of_bounds_panics_in_debug() {
+fn entry_at_out_of_bounds_panics() {
     let entries: Vec<u64> = vec![42];
     let _ = entry_at(&entries, 1);
 }
@@ -78,9 +75,8 @@ fn entry_set_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn entry_set_out_of_bounds_panics_in_debug() {
+fn entry_set_out_of_bounds_panics() {
     let mut entries: Vec<u64> = vec![0];
     entry_set(&mut entries, 1, 42);
 }
@@ -179,9 +175,8 @@ fn blocker_at_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn blocker_at_out_of_bounds_panics_in_debug() {
+fn blocker_at_out_of_bounds_panics() {
     let blockers: Vec<u32> = vec![10, 20];
     let _ = blocker_at(&blockers, 2);
 }
@@ -196,9 +191,8 @@ fn blocker_set_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn blocker_set_out_of_bounds_panics_in_debug() {
+fn blocker_set_out_of_bounds_panics() {
     let mut blockers: Vec<u32> = vec![0];
     blocker_set(&mut blockers, 1, 42);
 }
@@ -211,9 +205,8 @@ fn clause_ref_at_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn clause_ref_at_out_of_bounds_panics_in_debug() {
+fn clause_ref_at_out_of_bounds_panics() {
     let clause_refs: Vec<u64> = vec![100];
     let _ = clause_ref_at(&clause_refs, 1);
 }
@@ -228,9 +221,8 @@ fn clause_ref_set_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn clause_ref_set_out_of_bounds_panics_in_debug() {
+fn clause_ref_set_out_of_bounds_panics() {
     let mut clause_refs: Vec<u64> = vec![0];
     clause_ref_set(&mut clause_refs, 1, 42);
 }
@@ -246,9 +238,8 @@ fn val_set_in_bounds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "out of bounds")]
-fn val_set_out_of_bounds_panics_in_debug() {
+fn val_set_out_of_bounds_panics() {
     let mut vals: Vec<i8> = vec![0, 0];
     val_set(&mut vals, 2, 1);
 }

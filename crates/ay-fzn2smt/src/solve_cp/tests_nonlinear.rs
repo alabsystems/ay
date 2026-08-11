@@ -9,6 +9,63 @@ use ay_cp::engine::CpSolveResult;
 
 use super::tests::{parse_and_solve, solve_cp_output};
 
+#[test]
+fn oversized_nonlinear_big_m_is_a_typed_error() {
+    let fzn = "\
+        var -9223372036854775808..0: x;\n\
+        var 0..9223372036854775807: absolute;\n\
+        constraint int_abs(x, absolute);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let err = super::unsupported_constraints(&model)
+        .expect_err("an unrepresentable nonlinear Big-M coefficient must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::error::Fzn2smtError::LinearEncodingOverflow { .. }
+                | crate::error::Fzn2smtError::InvalidCpIntegerDomain { .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn oversized_reified_linear_encoding_is_a_typed_error() {
+    let fzn = "\
+        var -9223372036854775808..9223372036854775807: x;\n\
+        var -9223372036854775808..9223372036854775807: y;\n\
+        var bool: r;\n\
+        constraint int_le_reif(x, y, r);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let err = super::unsupported_constraints(&model)
+        .expect_err("an unrepresentable reified linear encoding must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::error::Fzn2smtError::LinearEncodingOverflow { .. }
+                | crate::error::Fzn2smtError::InvalidCpIntegerDomain { .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn wide_table_domain_is_rejected_without_overflow() {
+    let fzn = "\
+        var -9223372036854775808..9223372036854775807: x;\n\
+        var -9223372036854775808..9223372036854775807: q;\n\
+        constraint int_div(x, 2, q);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let error = super::unsupported_constraints(&model)
+        .expect_err("an unrepresentable CP domain must fail closed");
+    assert!(matches!(
+        error,
+        crate::error::Fzn2smtError::InvalidCpIntegerDomain { .. }
+    ));
+}
+
 // --- int_times tests ---
 
 #[test]

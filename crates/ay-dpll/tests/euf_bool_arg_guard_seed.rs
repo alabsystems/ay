@@ -60,12 +60,11 @@ fn bool_arg_guard_scratch_union_find_is_seeded_with_euf_classes() {
     std::env::set_var(REPAIR_ENV, "1");
 
     let path = common::workspace_path(BENCH);
-    if !path.is_file() {
-        panic!(
-            "regression asset missing: {} — it is committed in-tree and must not be deleted",
-            path.display()
-        );
-    }
+    assert!(
+        path.is_file(),
+        "regression asset missing: {} — it is committed in-tree and must not be deleted",
+        path.display()
+    );
     let smt = std::fs::read_to_string(&path).expect("read regression asset");
 
     let outputs = common::solve_vec(&smt);

@@ -9,10 +9,12 @@
 // the SMT-LIB translation layer entirely.
 
 use std::collections::BTreeMap as HashMap;
+use std::collections::HashSet;
 use std::io::{self, Write};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ay_cp::engine::CpSolveResult;
 use ay_cp::search::{SearchStrategy, ValueChoice};
@@ -20,8 +22,10 @@ use ay_cp::variable::IntVarId;
 use ay_cp::{CpSatEngine, Domain};
 use ay_flatzinc_parser::ast::*;
 
+use crate::checked_deadline;
 use crate::error::{Fzn2smtError, Result};
 
+mod constraint_arity;
 mod constraints;
 mod constraints_circuit;
 mod constraints_counting;
@@ -32,12 +36,14 @@ mod constraints_reif;
 mod constraints_set;
 mod constraints_table;
 mod detect_disjunctive;
+mod numeric;
 mod opt_loop;
 mod output;
 mod satisfaction_specialists;
 mod search_annotations;
 mod variables;
 
+use constraint_arity::validate_constraint_arity;
 use search_annotations::apply_search_annotations;
 
 #[derive(Clone, Copy)]
@@ -56,6 +62,119 @@ enum SolveCpStatus {
 struct SolveCpReport {
     status: SolveCpStatus,
     stdout: Vec<u8>,
+}
+
+struct PortfolioDeadlineTimer {
+    stopped: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PortfolioDeadlineTimer {
+    fn start(deadline: Instant, cancellation: Arc<AtomicBool>) -> io::Result<Self> {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let timer_stopped = Arc::clone(&stopped);
+        let handle = thread::Builder::new()
+            .name("ay-cp-portfolio-deadline".to_string())
+            .spawn(move || loop {
+                if timer_stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    cancellation.store(true, Ordering::Release);
+                    return;
+                }
+                thread::park_timeout(remaining);
+            })?;
+        Ok(Self {
+            stopped,
+            handle: Some(handle),
+        })
+    }
+
+    fn stop(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PortfolioDeadlineTimer {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+struct PortfolioThreads {
+    cancellation: Arc<AtomicBool>,
+    deadline_timer: Option<PortfolioDeadlineTimer>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl PortfolioThreads {
+    fn start(deadline: Option<Instant>, worker_capacity: usize) -> io::Result<Self> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let deadline_timer = deadline
+            .map(|deadline| PortfolioDeadlineTimer::start(deadline, Arc::clone(&cancellation)))
+            .transpose()?;
+        Ok(Self {
+            cancellation,
+            deadline_timer,
+            workers: Vec::with_capacity(worker_capacity),
+        })
+    }
+
+    /// Signal every worker, stop the deadline coordinator, and join all owned
+    /// threads. Returns whether any worker panicked.
+    fn cancel_and_join(&mut self) -> bool {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(timer) = self.deadline_timer.take() {
+            timer.stop();
+        }
+        let mut worker_panicked = false;
+        for handle in self.workers.drain(..) {
+            worker_panicked |= handle.join().is_err();
+        }
+        worker_panicked
+    }
+}
+
+impl Drop for PortfolioThreads {
+    fn drop(&mut self) {
+        let _ = self.cancel_and_join();
+    }
+}
+
+struct PortfolioWorkerActivity(Option<Arc<AtomicUsize>>);
+
+impl PortfolioWorkerActivity {
+    fn start(counter: Option<Arc<AtomicUsize>>) -> Self {
+        if let Some(counter) = &counter {
+            counter.fetch_add(1, Ordering::AcqRel);
+        }
+        Self(counter)
+    }
+}
+
+impl Drop for PortfolioWorkerActivity {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.0 {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PortfolioWorkerBehavior {
+    Normal,
+    #[cfg(test)]
+    WaitForCancellationAfterFirst,
 }
 
 const PORTFOLIO_WORKERS: [PortfolioWorkerConfig; 5] = [
@@ -123,44 +242,53 @@ pub fn cmd_solve_cp(
     parallel_workers: usize,
     prechecked_unsupported: Option<&[String]>,
 ) -> Result<()> {
+    let mut out = io::stdout().lock();
+    let mut err = io::stderr().lock();
+    cmd_solve_cp_with_writers(
+        model,
+        timeout_ms,
+        all_solutions,
+        parallel_workers,
+        prechecked_unsupported,
+        &mut out,
+        &mut err,
+    )
+}
+
+fn cmd_solve_cp_with_writers(
+    model: &FznModel,
+    timeout_ms: Option<u64>,
+    all_solutions: bool,
+    parallel_workers: usize,
+    prechecked_unsupported: Option<&[String]>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
     if !(1..=PORTFOLIO_WORKERS.len()).contains(&parallel_workers) {
         return Err(Fzn2smtError::InvalidWorkerCount {
             requested: parallel_workers,
             maximum: PORTFOLIO_WORKERS.len(),
         });
     }
-    // Reuse a caller-provided probe when the CLI already performed one.
+    // A caller-provided probe can reject early, but is never authoritative:
+    // every context built below rechecks its own `unsupported` list.
     if let Some(unsupported) = prechecked_unsupported {
-        if !unsupported.is_empty() {
-            let mut out = io::stdout().lock();
-            let mut err = io::stderr().lock();
-            for name in unsupported {
-                let _ = writeln!(err, "warning: unsupported constraint: {name}");
-            }
-            writeln!(out, "=====UNKNOWN=====")?;
+        if reject_unsupported_constraints(unsupported, out, err)? {
             return Ok(());
         }
     } else {
         let unsupported = unsupported_constraints(model)?;
-        if !unsupported.is_empty() {
-            let mut out = io::stdout().lock();
-            let mut err = io::stderr().lock();
-            for name in &unsupported {
-                let _ = writeln!(err, "warning: unsupported constraint: {name}");
-            }
-            writeln!(out, "=====UNKNOWN=====")?;
+        if reject_unsupported_constraints(&unsupported, out, err)? {
             return Ok(());
         }
     }
 
-    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-    let mut out = io::stdout().lock();
-    let mut err = io::stderr().lock();
+    let deadline = checked_deadline(timeout_ms)?;
 
     match &model.solve.kind {
         SolveKind::Satisfy => {
             if parallel_workers > 1 && !all_solutions {
-                solve_satisfaction_parallel(model, deadline, parallel_workers, &mut out)?;
+                solve_satisfaction_parallel(model, deadline, parallel_workers, out)?;
                 return Ok(());
             }
             if parallel_workers > 1 && all_solutions {
@@ -171,25 +299,33 @@ pub fn cmd_solve_cp(
             }
             let mut ctx = CpContext::new();
             ctx.build_model(model)?;
+            if reject_unsupported_constraints(&ctx.unsupported, out, err)? {
+                return Ok(());
+            }
             apply_search_annotations(&mut ctx, &model.solve.annotations);
             ctx.set_default_search_vars_if_missing();
             if satisfaction_specialists::try_emit_satisfaction_specialist(
                 &mut ctx,
                 model,
                 all_solutions,
-                &mut out,
+                out,
             )? {
                 return Ok(());
             }
-            // Pre-compile constraints before setting timeout so encoding
-            // overhead doesn't eat into the solve budget.
-            ctx.engine.pre_compile();
+            // Structurally matched specialists validate their complete output
+            // assignments without constructing the generic order encoding.
+            // All generic solver paths still capacity-check before requesting
+            // order literals.
+            if ctx.engine.try_pre_compile().is_err() {
+                writeln!(out, "=====UNKNOWN=====")?;
+                return Ok(());
+            }
             if let Some(dl) = deadline {
                 // Use set_deadline so the timer starts AFTER encoding,
                 // not during model building (#5683).
                 ctx.engine.set_deadline(dl);
             }
-            let _ = solve_satisfaction(&mut ctx, all_solutions, deadline, &mut out)?;
+            let _ = solve_satisfaction(&mut ctx, all_solutions, deadline, out)?;
         }
         SolveKind::Minimize(ref expr) | SolveKind::Maximize(ref expr) => {
             if parallel_workers > 1 {
@@ -199,7 +335,7 @@ pub fn cmd_solve_cp(
                 )?;
             }
             let minimize = matches!(model.solve.kind, SolveKind::Minimize(_));
-            opt_loop::solve_optimization(model, expr, minimize, deadline, &mut out, &mut err)?;
+            opt_loop::solve_optimization(model, expr, minimize, deadline, out, err)?;
         }
     }
 
@@ -210,6 +346,24 @@ pub fn unsupported_constraints(model: &FznModel) -> Result<Vec<String>> {
     let mut probe = CpContext::new();
     probe.build_model(model)?;
     Ok(probe.unsupported)
+}
+
+/// Emit the fail-closed MiniZinc result for a translated context containing
+/// unsupported constraints. Caller-provided probes are only an optimization;
+/// every freshly built context must be checked with this helper before solve.
+fn reject_unsupported_constraints(
+    unsupported: &[String],
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<bool> {
+    if unsupported.is_empty() {
+        return Ok(false);
+    }
+    for name in unsupported {
+        let _ = writeln!(err, "warning: unsupported constraint: {name}");
+    }
+    writeln!(out, "=====UNKNOWN=====")?;
+    Ok(true)
 }
 
 /// Solve a satisfaction model, optionally enumerating all solutions.
@@ -235,7 +389,7 @@ fn solve_satisfaction(
         match ctx.engine.solve() {
             CpSolveResult::Sat(assignment) => {
                 found_any = true;
-                let dzn = ctx.format_solution(&assignment);
+                let dzn = ctx.format_solution(&assignment)?;
                 write!(out, "{dzn}")?;
                 writeln!(out, "----------")?;
 
@@ -257,7 +411,7 @@ fn solve_satisfaction(
                             .map(|&(v, val)| (v, val))
                     })
                     .collect();
-                ctx.engine.block_assignment(&output_assignment);
+                ctx.engine.try_block_assignment(&output_assignment)?;
             }
             CpSolveResult::Unsat => {
                 if found_any {
@@ -294,28 +448,48 @@ fn run_satisfaction_worker(
     model: &FznModel,
     deadline: Option<Instant>,
     config: PortfolioWorkerConfig,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<SolveCpReport> {
     let mut ctx = CpContext::new();
+    // Portfolio winner cancellation and the coordinator deadline use one flag.
+    // Do not install a separate engine deadline below: that would let workers
+    // clear or replace each other's shared cancellation state.
+    ctx.engine.set_interrupt(Arc::clone(&cancellation));
     ctx.build_model(model)?;
-    apply_search_annotations(&mut ctx, &model.solve.annotations);
-    ctx.set_default_search_vars_if_missing();
     let mut stdout = Vec::new();
-    if satisfaction_specialists::try_emit_satisfaction_specialist(
-        &mut ctx,
-        model,
-        false,
-        &mut stdout,
-    )? {
+    if reject_unsupported_constraints(&ctx.unsupported, &mut stdout, &mut io::sink())? {
         return Ok(SolveCpReport {
-            status: SolveCpStatus::Sat,
+            status: SolveCpStatus::Unknown,
             stdout,
         });
     }
-    apply_portfolio_config(&mut ctx, config);
-    ctx.engine.pre_compile();
-    if let Some(dl) = deadline {
-        ctx.engine.set_deadline(dl);
+    if cancellation.load(Ordering::Acquire) {
+        writeln!(stdout, "=====UNKNOWN=====")?;
+        return Ok(SolveCpReport {
+            status: SolveCpStatus::Unknown,
+            stdout,
+        });
     }
+    apply_search_annotations(&mut ctx, &model.solve.annotations);
+    ctx.set_default_search_vars_if_missing();
+    if ctx.engine.try_pre_compile().is_err() {
+        writeln!(stdout, "=====UNKNOWN=====")?;
+        return Ok(SolveCpReport {
+            status: SolveCpStatus::Unknown,
+            stdout,
+        });
+    }
+    if cancellation.load(Ordering::Acquire) {
+        writeln!(stdout, "=====UNKNOWN=====")?;
+        return Ok(SolveCpReport {
+            status: SolveCpStatus::Unknown,
+            stdout,
+        });
+    }
+    // Specialists perform standalone searches that do not observe the engine
+    // interrupt. Keep them on the sequential path so every portfolio worker is
+    // cooperatively cancellable and can be joined before returning.
+    apply_portfolio_config(&mut ctx, config);
     let status = solve_satisfaction(&mut ctx, false, deadline, &mut stdout)?;
     Ok(SolveCpReport { status, stdout })
 }
@@ -326,18 +500,69 @@ fn solve_satisfaction_parallel(
     parallel_workers: usize,
     out: &mut impl Write,
 ) -> Result<()> {
+    solve_satisfaction_parallel_with_activity(
+        model,
+        deadline,
+        parallel_workers,
+        out,
+        None,
+        PortfolioWorkerBehavior::Normal,
+    )
+}
+
+fn solve_satisfaction_parallel_with_activity(
+    model: &FznModel,
+    deadline: Option<Instant>,
+    parallel_workers: usize,
+    out: &mut impl Write,
+    activity: Option<Arc<AtomicUsize>>,
+    behavior: PortfolioWorkerBehavior,
+) -> Result<()> {
     let worker_count = parallel_workers.min(PORTFOLIO_WORKERS.len());
     let (tx, rx) = mpsc::channel();
+    // This guard owns every thread from the first successful spawn onward.
+    // Any later spawn/I/O error drops it, which cancels and joins the partial
+    // portfolio instead of detaching already-started workers.
+    let mut threads = PortfolioThreads::start(deadline, worker_count)?;
+    let model = Arc::new(model.clone());
 
-    for &config in PORTFOLIO_WORKERS.iter().take(worker_count) {
+    for (worker_index, &config) in PORTFOLIO_WORKERS.iter().take(worker_count).enumerate() {
         let tx = tx.clone();
-        let model = model.clone();
-        thread::spawn(move || {
-            let _ = tx.send(run_satisfaction_worker(&model, deadline, config));
-        });
+        let model = Arc::clone(&model);
+        let cancellation = Arc::clone(&threads.cancellation);
+        let activity = activity.clone();
+        let handle = thread::Builder::new()
+            .name(format!("ay-cp-portfolio-{worker_index}"))
+            .spawn(move || {
+                let _activity = PortfolioWorkerActivity::start(activity);
+                #[cfg(test)]
+                let result = if matches!(
+                    behavior,
+                    PortfolioWorkerBehavior::WaitForCancellationAfterFirst
+                ) && worker_index > 0
+                {
+                    while !cancellation.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(SolveCpReport {
+                        status: SolveCpStatus::Unknown,
+                        stdout: b"=====UNKNOWN=====\n".to_vec(),
+                    })
+                } else {
+                    run_satisfaction_worker(&model, deadline, config, cancellation)
+                };
+                #[cfg(not(test))]
+                let result = {
+                    let _ = behavior;
+                    run_satisfaction_worker(&model, deadline, config, cancellation)
+                };
+                let _ = tx.send(result);
+            })?;
+        threads.workers.push(handle);
     }
     drop(tx);
 
+    let mut definitive: Option<SolveCpReport> = None;
     let mut first_unknown: Option<SolveCpReport> = None;
     let mut first_err: Option<Fzn2smtError> = None;
 
@@ -345,8 +570,9 @@ fn solve_satisfaction_parallel(
         match rx.recv() {
             Ok(Ok(report)) => match report.status {
                 SolveCpStatus::Sat | SolveCpStatus::Unsat => {
-                    out.write_all(&report.stdout)?;
-                    return Ok(());
+                    definitive = Some(report);
+                    threads.cancellation.store(true, Ordering::Release);
+                    break;
                 }
                 SolveCpStatus::Unknown => {
                     if first_unknown.is_none() {
@@ -363,16 +589,37 @@ fn solve_satisfaction_parallel(
         }
     }
 
-    if let Some(report) = first_unknown {
+    // No worker may outlive the portfolio call. Signal all losing engines,
+    // stop the coordinator timer, then join every worker before writing the
+    // selected result or propagating an error.
+    let worker_panicked = threads.cancel_and_join();
+
+    emit_portfolio_result(definitive, worker_panicked, first_err, first_unknown, out)
+}
+
+/// Select a portfolio outcome after all worker threads have been joined.
+/// A definitive solver verdict remains usable despite a losing lane failure;
+/// otherwise infrastructure failures must not be masked as ordinary UNKNOWN.
+fn emit_portfolio_result(
+    definitive: Option<SolveCpReport>,
+    worker_panicked: bool,
+    first_err: Option<Fzn2smtError>,
+    first_unknown: Option<SolveCpReport>,
+    out: &mut impl Write,
+) -> Result<()> {
+    if let Some(report) = definitive {
         out.write_all(&report.stdout)?;
-        return Ok(());
-    }
-
-    if let Some(err) = first_err {
+    } else if worker_panicked {
+        return Err(Fzn2smtError::Message(
+            "direct-CP portfolio worker panicked".to_string(),
+        ));
+    } else if let Some(err) = first_err {
         return Err(err);
+    } else if let Some(report) = first_unknown {
+        out.write_all(&report.stdout)?;
+    } else {
+        writeln!(out, "=====UNKNOWN=====")?;
     }
-
-    writeln!(out, "=====UNKNOWN=====")?;
     Ok(())
 }
 
@@ -383,6 +630,8 @@ pub(super) struct CpOutputVar {
     pub(super) is_array: bool,
     pub(super) array_range: Option<(i64, i64)>,
     pub(super) is_bool: bool,
+    /// Whether this output is a scalar or array of set variables.
+    pub(super) is_set: bool,
     /// For set outputs: names of set variables (looked up in set_var_map).
     pub(super) set_var_names: Vec<String>,
 }
@@ -406,7 +655,10 @@ pub(super) struct CpContext {
     pub(super) par_sets: HashMap<String, Expr>,
     /// Cached singleton variables for constants
     pub(super) const_vars: HashMap<i64, IntVarId>,
-    /// Variable domain bounds for Big-M reification encoding
+    /// Cached variable domain bounds for named FlatZinc variables.
+    ///
+    /// The CP engine remains authoritative because translators also create
+    /// auxiliary variables that need not be entered in this cache.
     pub(super) var_bounds: HashMap<IntVarId, (i64, i64)>,
     /// Output variables for DZN formatting
     pub(super) output_vars: Vec<CpOutputVar>,
@@ -605,19 +857,36 @@ impl CpContext {
         id
     }
 
-    /// Get bounds for a variable (for Big-M reification encoding).
+    /// Get authoritative bounds for a variable (for Big-M encoding).
+    ///
+    /// Auxiliary variables are often registered directly with the engine and
+    /// are intentionally absent from `var_bounds`; never invent fallback
+    /// bounds for a cache miss.
     pub(super) fn get_var_bounds(&self, var: IntVarId) -> (i64, i64) {
-        self.var_bounds
-            .get(&var)
-            .copied()
-            .unwrap_or((-1_000_000, 1_000_000))
+        let bounds = self.engine.var_bounds(var);
+        debug_assert!(
+            self.var_bounds
+                .get(&var)
+                .is_none_or(|cached| *cached == bounds),
+            "cached CP bounds disagree with the engine"
+        );
+        bounds
     }
 
     /// Collect all output variable IDs for blocking clause construction.
     fn output_var_ids(&self) -> Vec<IntVarId> {
         let mut ids = Vec::new();
+        let mut seen = HashSet::new();
         for ov in &self.output_vars {
-            ids.extend_from_slice(&ov.var_ids);
+            if ov.is_set {
+                for name in &ov.set_var_names {
+                    if let Some((_, indicators)) = self.set_var_map.get(name) {
+                        ids.extend(indicators.iter().copied().filter(|id| seen.insert(*id)));
+                    }
+                }
+            } else {
+                ids.extend(ov.var_ids.iter().copied().filter(|id| seen.insert(*id)));
+            }
         }
         ids
     }
@@ -630,11 +899,19 @@ impl CpContext {
         if self.engine.search_vars().is_empty() {
             let mut vars = Vec::new();
             let mut bool_vars = Vec::new();
+            let mut seen = HashSet::new();
             for ov in &self.output_vars {
-                if ov.is_bool {
-                    bool_vars.extend_from_slice(&ov.var_ids);
+                if ov.is_set {
+                    for name in &ov.set_var_names {
+                        if let Some((_, indicators)) = self.set_var_map.get(name) {
+                            bool_vars
+                                .extend(indicators.iter().copied().filter(|id| seen.insert(*id)));
+                        }
+                    }
+                } else if ov.is_bool {
+                    bool_vars.extend(ov.var_ids.iter().copied().filter(|id| seen.insert(*id)));
                 } else {
-                    vars.extend_from_slice(&ov.var_ids);
+                    vars.extend(ov.var_ids.iter().copied().filter(|id| seen.insert(*id)));
                 }
             }
             if vars.is_empty() {
@@ -654,7 +931,10 @@ impl CpContext {
 
     fn mark_unresolved_output_arrays_unsupported(&mut self) {
         if self.output_vars.iter().any(|output| {
-            output.is_array && output.var_ids.is_empty() && output.set_var_names.is_empty()
+            output.is_array
+                && !output.is_set
+                && output.var_ids.is_empty()
+                && output.array_range.map_or(true, |(lo, hi)| lo <= hi)
         }) {
             self.mark_unsupported("output_array");
         }

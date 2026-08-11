@@ -544,8 +544,8 @@ fn run_search(
 
     let edge_count: u64 = graph.adj.iter().map(|a| a.len() as u64).sum::<u64>().max(1);
     let verify_cost: u64 = formula_counts
-        .iter()
-        .map(|(k, _)| k.len() as u64)
+        .keys()
+        .map(|k| k.len() as u64)
         .sum::<u64>()
         .max(1);
     // Deterministic work ceiling for the whole search, in edge-visits. Sized so
@@ -774,7 +774,12 @@ mod tests {
             vec![lit(1, false), lit(2, true)],
         ];
         let counts = build_formula_counts(&clauses);
-        for g in &find_signed_automorphisms(&clauses, &counts, 10_000, 64) {
+        let generators = find_signed_automorphisms(&clauses, &counts, 10_000, 64);
+        assert!(
+            generators.is_empty(),
+            "an asymmetric formula must not produce signed generators: {generators:?}"
+        );
+        for g in &generators {
             assert!(crate::symmetry::literal_permutation_preserves_formula(
                 &counts, g
             ));

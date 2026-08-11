@@ -73,7 +73,7 @@
 //!   verdict is what would make the floor unbypassable rather than merely
 //!   observed. Until then this module is a checked convention, not a proof.
 
-use crate::model::{Col, ColKind, Model};
+use crate::model::Model;
 use crate::opts::SolveOpts;
 
 /// How strongly ONE claim is backed. **Total order**, weakest first.
@@ -271,11 +271,12 @@ pub(crate) fn may_close_outcome(
         .all(|&c| may_close(lane, c, model, opts))
 }
 
+#[cfg(test)]
 fn model_has_integrality(model: &Model) -> bool {
     (0..model.num_cols()).any(|j| {
         !matches!(
-            model.col_kind(Col(u32::try_from(j).unwrap_or(u32::MAX))),
-            ColKind::Continuous
+            model.col_kind(crate::model::Col(u32::try_from(j).unwrap_or(u32::MAX))),
+            crate::model::ColKind::Continuous
         )
     })
 }
@@ -476,8 +477,7 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 /// of the anchor, not of this cap, but it means any slice can land in a hole,
 /// and it is the strongest argument for eventually denominating first refusal
 /// in NODES rather than milliseconds.
-pub(crate) const ANCHOR_FIRST_REFUSAL_CAP: std::time::Duration =
-    std::time::Duration::from_millis(3000);
+pub(crate) const ANCHOR_FIRST_REFUSAL_CAP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The cap, after `AY_MILP_ANCHOR_FIRST_REFUSAL_MS`.
 ///
@@ -629,6 +629,7 @@ impl Drop for LaneFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Col;
 
     fn integral_model() -> Model {
         let mut m = Model::new();

@@ -44,7 +44,15 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
 use ay_core::{AletheRule, Proof, ProofId, Sort, Symbol, TermId};
 
+use super::proof_trust_surgery_provenance::SurgeryPlanningBudget;
 use super::Executor;
+
+#[path = "proof_euf_lemma_plan.rs"]
+mod plan;
+#[path = "proof_euf_lemma_surface.rs"]
+mod surface;
+#[path = "proof_euf_lemma_volume.rs"]
+mod volume;
 
 /// Justification for one needed equality `s = t` inside the recipe.
 #[derive(Clone, Copy, Debug)]
@@ -403,200 +411,6 @@ impl RecipeBuilder<'_> {
 }
 
 impl Executor {
-    /// Recognize an EUF congruence/substitution-chain trust lemma and plan
-    /// its certified derivation. `clause` is the trust step's clause; a
-    /// single or-term literal is unwrapped to the `OrUnit` target, anything
-    /// else is planned as a bare replacement. Fail-closed: `None` on any
-    /// unrecognized literal or non-entailed conclusion.
-    pub(super) fn plan_euf_lemma(&mut self, clause: &[TermId]) -> Option<EufLemmaPlan> {
-        let terms = &self.ctx.terms;
-        // Unwrap `(cl (or ...))`.
-        let (lits, or_term): (Vec<TermId>, Option<TermId>) = if clause.len() == 1 {
-            match terms.get(clause[0]) {
-                TermData::App(Symbol::Named(op), djs) if op == "or" && djs.len() >= 2 => {
-                    (djs.clone(), Some(clause[0]))
-                }
-                _ => (clause.to_vec(), None),
-            }
-        } else {
-            (clause.to_vec(), None)
-        };
-        if lits.len() < 2 {
-            return None;
-        }
-        // A bare replacement must reproduce the clause as a multiset built
-        // from distinct literals: reject duplicates outright.
-        if or_term.is_none() {
-            for (i, &l) in lits.iter().enumerate() {
-                if lits[i + 1..].contains(&l) {
-                    return None;
-                }
-            }
-        }
-        // Split literals.
-        let mut split = LemmaLits {
-            hyps: Vec::new(),
-            pos_eqs: Vec::new(),
-            neg_preds: Vec::new(),
-            pos_preds: Vec::new(),
-        };
-        for &lit in &lits {
-            match terms.get(lit) {
-                TermData::Not(inner) => {
-                    let inner = *inner;
-                    if let Some((a, b)) = decode_eq(terms, inner) {
-                        split.hyps.push((lit, a, b));
-                    } else if matches!(terms.get(inner), TermData::App(_, _)) {
-                        split.neg_preds.push((lit, inner));
-                    } else {
-                        return None;
-                    }
-                }
-                _ => {
-                    if let Some((a, b)) = decode_eq(terms, lit) {
-                        split.pos_eqs.push((lit, a, b));
-                    } else if matches!(terms.get(lit), TermData::App(_, _)) {
-                        split.pos_preds.push(lit);
-                    } else {
-                        return None;
-                    }
-                }
-            }
-        }
-        // Build the congruence closure over the hypothesis equalities.
-        let mut cc = CcForest::new();
-        for &(_, a, b) in &split.hyps {
-            cc.add_universe(terms, a);
-            cc.add_universe(terms, b);
-        }
-        for &(_, a, b) in &split.pos_eqs {
-            cc.add_universe(terms, a);
-            cc.add_universe(terms, b);
-        }
-        for &(_, atom) in &split.neg_preds {
-            if let TermData::App(_, args) = terms.get(atom) {
-                for a in args.clone() {
-                    cc.add_universe(terms, a);
-                }
-            }
-        }
-        for &atom in &split.pos_preds {
-            if let TermData::App(_, args) = terms.get(atom) {
-                for a in args.clone() {
-                    cc.add_universe(terms, a);
-                }
-            }
-        }
-        for &(lit, a, b) in &split.hyps {
-            cc.union(a, b, CcReason::Hyp(lit));
-            cc.close(terms);
-        }
-        // Find the entailed conclusion.
-        enum Found {
-            Eq(TermId, TermId, TermId),
-            Pred(TermId, TermId, TermId, TermId),
-        }
-        let mut found: Option<Found> = None;
-        for &(lit, l, r) in &split.pos_eqs {
-            if l == r || cc.find(l) == cc.find(r) {
-                found = Some(Found::Eq(lit, l, r));
-                break;
-            }
-        }
-        if found.is_none() {
-            'outer: for &(neg_lit, neg_atom) in &split.neg_preds {
-                let (ns, nargs) = match terms.get(neg_atom) {
-                    TermData::App(sym, args) => (sym.clone(), args.clone()),
-                    _ => continue,
-                };
-                for &pos_lit in &split.pos_preds {
-                    let (ps, pargs) = match terms.get(pos_lit) {
-                        TermData::App(sym, args) => (sym.clone(), args.clone()),
-                        _ => continue,
-                    };
-                    if ns != ps || nargs.len() != pargs.len() || nargs.is_empty() {
-                        continue;
-                    }
-                    if nargs
-                        .iter()
-                        .zip(pargs.iter())
-                        .all(|(&a, &b)| a == b || cc.find(a) == cc.find(b))
-                    {
-                        found = Some(Found::Pred(neg_lit, pos_lit, neg_atom, pos_lit));
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        let found = found?;
-        // Build the recipe.
-        let mut rb = RecipeBuilder {
-            terms: &mut self.ctx.terms,
-            cc: &cc,
-            derivs: Vec::new(),
-            memo: HashMap::default(),
-            used_hyps: Vec::new(),
-        };
-        let (concl, concl_lits) = match found {
-            Found::Eq(lit, l, r) => {
-                if l == r {
-                    (EufConcl::EqRefl { eq_term: lit }, vec![lit])
-                } else {
-                    let EufJust::Derived(top) = rb.derive(l, r, Some(lit))? else {
-                        return None;
-                    };
-                    (EufConcl::Eq { top }, vec![lit])
-                }
-            }
-            Found::Pred(neg_lit, pos_lit, neg_atom, pos_atom) => {
-                let nargs = match rb.terms.get(neg_atom) {
-                    TermData::App(_, args) => args.clone(),
-                    _ => return None,
-                };
-                let pargs = match rb.terms.get(pos_atom) {
-                    TermData::App(_, args) => args.clone(),
-                    _ => return None,
-                };
-                let mut prems = Vec::with_capacity(nargs.len());
-                for (&a, &b) in nargs.iter().zip(pargs.iter()) {
-                    prems.push(rb.derive(a, b, None)?);
-                }
-                (
-                    EufConcl::Pred {
-                        neg_lit,
-                        pos_lit,
-                        prems,
-                    },
-                    vec![neg_lit, pos_lit],
-                )
-            }
-        };
-        let RecipeBuilder {
-            derivs, used_hyps, ..
-        } = rb;
-        // Derived-literal set: used hypotheses + conclusion literal(s). All
-        // are literals of the lemma by construction.
-        let target = match or_term {
-            Some(term) => EufTarget::OrUnit { term },
-            None => {
-                let mut derived: Vec<TermId> = used_hyps.clone();
-                derived.extend(concl_lits.iter().copied());
-                debug_assert!(derived.iter().all(|l| lits.contains(l)));
-                let extras: Vec<TermId> = lits
-                    .iter()
-                    .copied()
-                    .filter(|l| !derived.contains(l))
-                    .collect();
-                EufTarget::Bare { extras }
-            }
-        };
-        Some(EufLemmaPlan {
-            derivs,
-            concl,
-            target,
-        })
-    }
-
     /// Cached `eq_reflexive` unit `(cl (= side side))`.
     fn euf_refl_unit(
         &mut self,
@@ -818,57 +632,26 @@ impl Executor {
     /// A remaining unsupported Generic leaf makes that final gate fail, so a
     /// partial promotion can never conceal another trust obligation.
     pub(super) fn promote_certified_generic_euf_leaves(&mut self, proof: &mut Proof) {
-        if proof
-            .steps
-            .iter()
-            .any(|step| matches!(step, ay_core::ProofStep::Anchor { .. }))
-        {
+        self.promote_certified_generic_euf_leaves_bounded(
+            proof,
+            volume::MAX_PROMOTION_VECTOR_ENTRIES,
+        );
+    }
+
+    fn promote_certified_generic_euf_leaves_bounded(
+        &mut self,
+        proof: &mut Proof,
+        output_limit: usize,
+    ) {
+        let Some(preflight) = volume::preflight_promotion(proof) else {
             return;
-        }
+        };
 
-        let original = proof.clone();
-        let n = original.steps.len();
-        let mut reachable = vec![false; n];
-        let mut stack = Vec::new();
-        for (idx, step) in original.steps.iter().enumerate() {
-            let derives_empty = match step {
-                ay_core::ProofStep::Resolution { clause, .. }
-                | ay_core::ProofStep::TheoryLemma { clause, .. }
-                | ay_core::ProofStep::Step { clause, .. } => clause.is_empty(),
-                _ => false,
-            };
-            if derives_empty {
-                reachable[idx] = true;
-                stack.push(idx);
-            }
-        }
-        while let Some(idx) = stack.pop() {
-            let mut mark = |premise: ProofId| {
-                let premise = premise.0 as usize;
-                if premise < n && !reachable[premise] {
-                    reachable[premise] = true;
-                    stack.push(premise);
-                }
-            };
-            match &original.steps[idx] {
-                ay_core::ProofStep::Resolution {
-                    clause1, clause2, ..
-                } => {
-                    mark(*clause1);
-                    mark(*clause2);
-                }
-                ay_core::ProofStep::Step { premises, .. } => {
-                    for &premise in premises {
-                        mark(premise);
-                    }
-                }
-                _ => {}
-            }
-        }
-
+        let n = proof.steps.len();
+        let mut planning = SurgeryPlanningBudget::new();
         let mut plans: Vec<Option<EufLemmaPlan>> = vec![None; n];
-        for (idx, step) in original.steps.iter().enumerate() {
-            if !reachable[idx] {
+        for (idx, step) in proof.steps.iter().enumerate() {
+            if !preflight.reachable[idx] {
                 continue;
             }
             // Two trust shapes carry certificate-free EUF leaves that
@@ -899,15 +682,26 @@ impl Executor {
                 } => clause,
                 _ => continue,
             };
-            plans[idx] = self.plan_euf_lemma(clause);
+            if !planning.spend_work(clause.len().saturating_add(1))
+                || !planning.spend_terms(&self.ctx.terms, clause)
+            {
+                return;
+            }
+            plans[idx] = self.plan_euf_lemma_with_budget(clause, &mut planning);
         }
         if plans.iter().all(Option::is_none) {
+            return;
+        }
+        if !self.generic_euf_promotion_surface_is_safe(proof, &plans) {
+            return;
+        }
+        if !volume::promotion_output_within(&preflight, &plans, output_limit) {
             return;
         }
 
         let mut rebuilt = Proof::new();
         let mut remap: Vec<ProofId> = Vec::with_capacity(n);
-        for (idx, step) in original.steps.iter().cloned().enumerate() {
+        for (idx, step) in proof.steps.iter().cloned().enumerate() {
             if let Some(plan) = &plans[idx] {
                 remap.push(self.emit_euf_lemma(&mut rebuilt, plan));
                 continue;
@@ -940,11 +734,11 @@ impl Executor {
             };
             remap.push(rebuilt.add_step(step));
         }
-        let mut remapped_named = original.named_steps.clone();
+        let mut remapped_named = proof.named_steps.clone();
         remapped_named.retain(|_, id| {
             let old_idx = id.0 as usize;
             if !matches!(
-                original.steps.get(old_idx),
+                proof.steps.get(old_idx),
                 Some(ay_core::ProofStep::Assume(_))
             ) {
                 return false;
@@ -1089,6 +883,69 @@ mod tests {
         exec.promote_certified_generic_euf_leaves(&mut proof);
         assert_eq!(format!("{:?}", proof.steps), before);
         assert!(ay_proof::check_proof_strict(&proof, &exec.ctx.terms).is_err());
+    }
+
+    #[test]
+    fn generic_euf_promotion_rejects_boolean_equality_surface_hypothesis() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let a = terms.mk_var("promotion_surface_a", Sort::Int);
+        let b = terms.mk_var("promotion_surface_b", Sort::Int);
+        let c = terms.mk_var("promotion_surface_c", Sort::Int);
+        let ab = terms.mk_eq(a, b);
+        let bc = terms.mk_eq(b, c);
+        let ac = terms.mk_eq(a, c);
+        let not_ab = terms.mk_not_raw(ab);
+        let not_bc = terms.mk_not_raw(bc);
+        let not_ac = terms.mk_not_raw(ac);
+
+        let mut proof = Proof::new();
+        let h_ab = proof.add_assume(ab, None);
+        let h_bc = proof.add_assume(bc, None);
+        let h_not_ac = proof.add_assume(not_ac, None);
+        let generic = proof.add_theory_lemma_with_kind(
+            "EUF",
+            vec![ac, not_ab, not_bc],
+            TheoryLemmaKind::Generic,
+        );
+        let r1 = proof.add_resolution(vec![ac, not_bc], ab, generic, h_ab);
+        let r2 = proof.add_resolution(vec![ac], bc, r1, h_bc);
+        proof.add_resolution(Vec::new(), ac, r2, h_not_ac);
+        exec.ctx.assertions.extend([ab, bc, not_ac]);
+
+        let before = format!("{:?}", proof.steps);
+        let mut active = HashMap::default();
+        active.insert(
+            not_ab,
+            "(= (= promotion_surface_a promotion_surface_b) false)".to_string(),
+        );
+        exec.last_proof_term_overrides = Some(active.clone());
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+
+        assert_eq!(format!("{:?}", proof.steps), before);
+        assert_eq!(exec.last_proof_term_overrides.as_ref(), Some(&active));
+        assert!(proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                ..
+            }
+        )));
+
+        // The same proof is otherwise promotable and passes the whole-proof
+        // strict gate. This control makes the surface-role rejection, rather
+        // than an unrelated native-check failure, decisive above.
+        exec.last_proof_term_overrides = None;
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+        assert!(proof.steps.iter().all(|step| !matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                ..
+            }
+        )));
+        ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+            .expect("canonical-surface EUF promotion must pass strict checking");
     }
 
     #[test]
@@ -1258,5 +1115,89 @@ mod tests {
             before,
             "a disconnected or-wrapped trust leaf must be left untouched"
         );
+    }
+
+    #[test]
+    fn generic_euf_promotion_declines_wide_proof_before_mutation() {
+        let mut exec = Executor::new();
+        let atom = exec
+            .ctx
+            .terms
+            .mk_var("generic_euf_preflight_atom", Sort::Bool);
+        let mut proof = Proof::new();
+        let assume = proof.add_assume(atom, None);
+        proof.add_rule_step(
+            AletheRule::Trust,
+            Vec::new(),
+            vec![assume; volume::MAX_PROMOTION_EDGES + 1],
+            Vec::new(),
+        );
+        let before_len = proof.steps.len();
+
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+
+        assert_eq!(proof.steps.len(), before_len);
+        assert!(matches!(proof.steps.first(), Some(ProofStep::Assume(t)) if *t == atom));
+        assert!(matches!(
+            proof.steps.last(),
+            Some(ProofStep::Step {
+                rule: AletheRule::Trust,
+                clause,
+                premises,
+                args,
+            }) if clause.is_empty()
+                && premises.len() == volume::MAX_PROMOTION_EDGES + 1
+                && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn repeated_generic_euf_leaves_decline_transactionally_at_output_limit() {
+        let mut exec = Executor::new();
+        let a = exec.ctx.terms.mk_var("promotion_repeat_a", Sort::Int);
+        let b = exec.ctx.terms.mk_var("promotion_repeat_b", Sort::Int);
+        let c = exec.ctx.terms.mk_var("promotion_repeat_c", Sort::Int);
+        let ab = exec.ctx.terms.mk_eq(a, b);
+        let bc = exec.ctx.terms.mk_eq(b, c);
+        let ac = exec.ctx.terms.mk_eq(a, c);
+        let not_ab = exec.ctx.terms.mk_not_raw(ab);
+        let not_bc = exec.ctx.terms.mk_not_raw(bc);
+        let clause = vec![ac, not_ab, not_bc];
+        let emitted = exec
+            .plan_euf_lemma(&clause)
+            .and_then(|plan| plan.emitted_literal_volume())
+            .expect("bounded transitivity recipe");
+
+        let mut proof = Proof::new();
+        let first = proof.add_step(ProofStep::TheoryLemma {
+            theory: "EUF".to_string(),
+            clause: clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::Generic,
+            lia: None,
+        });
+        let second = proof.add_step(ProofStep::TheoryLemma {
+            theory: "EUF".to_string(),
+            clause,
+            farkas: None,
+            kind: TheoryLemmaKind::Generic,
+            lia: None,
+        });
+        proof.add_rule_step(
+            AletheRule::Trust,
+            Vec::new(),
+            vec![first, second],
+            Vec::new(),
+        );
+        let input = volume::preflight_promotion(&proof)
+            .expect("small proof preflight")
+            .input_volume;
+        let before = format!("{:?}", proof.steps);
+
+        // There is room for exactly one recipe, but both occurrences would
+        // be emitted. The aggregate gate must decline before rebuilding.
+        exec.promote_certified_generic_euf_leaves_bounded(&mut proof, input + emitted);
+
+        assert_eq!(format!("{:?}", proof.steps), before);
     }
 }

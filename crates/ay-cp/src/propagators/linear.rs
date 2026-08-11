@@ -25,6 +25,152 @@ use crate::encoder::IntegerEncoder;
 use crate::propagator::{PropagationResult, Propagator, PropagatorPriority};
 use crate::trail::IntegerTrail;
 use crate::variable::IntVarId;
+use num_bigint::{BigInt, Sign};
+use num_traits::{ToPrimitive, Zero};
+
+/// An exact integer that keeps the common case allocation-free and promotes
+/// to arbitrary precision only if an `i128` accumulation overflows.
+#[derive(Debug, Clone)]
+pub(super) enum ExactInteger {
+    Small(i128),
+    Big(BigInt),
+}
+
+impl ExactInteger {
+    pub(super) fn zero() -> Self {
+        Self::Small(0)
+    }
+
+    pub(super) fn add_product(&mut self, coeff: i128, value: i64) {
+        let Some(product) = coeff.checked_mul(i128::from(value)) else {
+            let product = BigInt::from(coeff) * value;
+            match self {
+                Self::Small(sum) => *self = Self::Big(BigInt::from(*sum) + product),
+                Self::Big(sum) => *sum += product,
+            }
+            return;
+        };
+        match self {
+            Self::Small(sum) => {
+                if let Some(next) = sum.checked_add(product) {
+                    *sum = next;
+                } else {
+                    *self = Self::Big(BigInt::from(*sum) + product);
+                }
+            }
+            Self::Big(sum) => *sum += product,
+        }
+    }
+
+    pub(super) fn equals_i128(&self, rhs: i128) -> bool {
+        match self {
+            Self::Small(value) => *value == rhs,
+            Self::Big(value) => value == &BigInt::from(rhs),
+        }
+    }
+
+    fn greater_than_i128(&self, rhs: i128) -> bool {
+        match self {
+            Self::Small(value) => *value > rhs,
+            Self::Big(value) => value > &BigInt::from(rhs),
+        }
+    }
+
+    /// Compute `rhs - self + contribution` without losing precision.
+    fn slack(&self, rhs: i128, contribution: i128) -> Self {
+        match self {
+            Self::Small(sum) => rhs
+                .checked_sub(*sum)
+                .and_then(|value| value.checked_add(contribution))
+                .map_or_else(
+                    || Self::Big(BigInt::from(rhs) - sum + contribution),
+                    Self::Small,
+                ),
+            Self::Big(sum) => Self::Big(BigInt::from(rhs) - sum + contribution),
+        }
+    }
+
+    /// Compute `lhs - self` without losing precision.
+    pub(super) fn subtract_from(&self, lhs: i128) -> Self {
+        match self {
+            Self::Small(value) => lhs
+                .checked_sub(*value)
+                .map_or_else(|| Self::Big(BigInt::from(lhs) - value), Self::Small),
+            Self::Big(value) => Self::Big(BigInt::from(lhs) - value),
+        }
+    }
+
+    /// Return the exact quotient when divisible and representable as i64.
+    pub(super) fn exact_quotient_i64(&self, divisor: i128) -> Option<i64> {
+        if divisor == 0 {
+            return None;
+        }
+        match self {
+            Self::Small(value) => {
+                if value.checked_rem(divisor)? != 0 {
+                    return None;
+                }
+                value.checked_div(divisor)?.try_into().ok()
+            }
+            Self::Big(value) => {
+                let divisor = BigInt::from(divisor);
+                if (value % &divisor).is_zero() {
+                    (value / divisor).to_i64()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Divide a linear slack by its coefficient with the inequality's
+    /// required rounding, then clamp to the representable variable range.
+    fn linear_bound(&self, coeff: i128) -> i64 {
+        debug_assert_ne!(coeff, 0);
+        match self {
+            Self::Small(value) => value.checked_div_euclid(coeff).map_or_else(
+                || clamp_bigint_to_i64(rounded_linear_div(&BigInt::from(*value), coeff)),
+                clamp_i128_to_i64,
+            ),
+            Self::Big(value) => clamp_bigint_to_i64(rounded_linear_div(value, coeff)),
+        }
+    }
+}
+
+fn clamp_i128_to_i64(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn clamp_bigint_to_i64(value: BigInt) -> i64 {
+    value.to_i64().unwrap_or_else(|| match value.sign() {
+        Sign::Minus => i64::MIN,
+        Sign::NoSign | Sign::Plus => i64::MAX,
+    })
+}
+
+/// Apply the same directed rounding as `i128::div_euclid`, including for the
+/// exceptional mathematical quotient `i128::MIN / -1`.
+fn rounded_linear_div(value: &BigInt, coeff: i128) -> BigInt {
+    debug_assert_ne!(coeff, 0);
+    if coeff > 0 {
+        floor_div_positive(value, &BigInt::from(coeff))
+    } else {
+        -floor_div_positive(value, &-BigInt::from(coeff))
+    }
+}
+
+/// Floor division by a strictly positive divisor. `BigInt` division truncates
+/// toward zero, so negative non-integral quotients need one extra decrement.
+fn floor_div_positive(value: &BigInt, divisor: &BigInt) -> BigInt {
+    debug_assert!(matches!(divisor.sign(), Sign::Plus));
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    if value.sign() == Sign::Minus && !remainder.is_zero() {
+        quotient - 1
+    } else {
+        quotient
+    }
+}
 
 /// Linear inequality propagator: `sum(coeffs[i] * vars[i]) <= rhs`.
 ///
@@ -39,11 +185,11 @@ use crate::variable::IntVarId;
 #[derive(Debug)]
 pub struct LinearLe {
     /// Coefficients
-    coeffs: Vec<i64>,
+    coeffs: Vec<i128>,
     /// Variables
     vars: Vec<IntVarId>,
     /// Right-hand side
-    rhs: i64,
+    rhs: i128,
     /// Pre-allocated workspace: reason literals (one per variable).
     ws_reasons: Vec<Option<ay_sat::Literal>>,
 }
@@ -51,6 +197,15 @@ pub struct LinearLe {
 impl LinearLe {
     /// Create a new linear inequality propagator.
     pub fn new(coeffs: Vec<i64>, vars: Vec<IntVarId>, rhs: i64) -> Self {
+        Self::new_wide(
+            coeffs.into_iter().map(i128::from).collect(),
+            vars,
+            i128::from(rhs),
+        )
+    }
+
+    /// Construct a constraint after an exact sign reversal in i128.
+    pub(crate) fn new_wide(coeffs: Vec<i128>, vars: Vec<IntVarId>, rhs: i128) -> Self {
         assert_eq!(coeffs.len(), vars.len());
         let n = vars.len();
         Self {
@@ -64,14 +219,15 @@ impl LinearLe {
 
 impl LinearLe {
     /// Compute the minimum possible value of `sum(coeffs[i] * vars[i])`.
-    fn compute_sum_min(&self, trail: &IntegerTrail) -> i64 {
-        let mut sum_min: i64 = 0;
+    fn compute_sum_min(&self, trail: &IntegerTrail) -> ExactInteger {
+        let mut sum_min = ExactInteger::zero();
         for (&coeff, &var) in self.coeffs.iter().zip(&self.vars) {
-            if coeff > 0 {
-                sum_min = sum_min.saturating_add(coeff.saturating_mul(trail.lb(var)));
+            let value = if coeff > 0 {
+                trail.lb(var)
             } else {
-                sum_min = sum_min.saturating_add(coeff.saturating_mul(trail.ub(var)));
-            }
+                trail.ub(var)
+            };
+            sum_min.add_product(coeff, value);
         }
         sum_min
     }
@@ -141,7 +297,7 @@ impl LinearLe {
     fn derive_bound(
         &self,
         i: usize,
-        sum_min: i64,
+        sum_min: &ExactInteger,
         trail: &IntegerTrail,
         encoder: &IntegerEncoder,
     ) -> Option<Vec<ay_sat::Literal>> {
@@ -149,32 +305,22 @@ impl LinearLe {
         let coeff = self.coeffs[i];
 
         let my_contrib = if coeff > 0 {
-            coeff.saturating_mul(trail.lb(var))
+            coeff * i128::from(trail.lb(var))
         } else {
-            coeff.saturating_mul(trail.ub(var))
+            coeff * i128::from(trail.ub(var))
         };
 
-        let others_min = sum_min.saturating_sub(my_contrib);
-        let slack = self.rhs.saturating_sub(others_min);
+        let slack = sum_min.slack(self.rhs, my_contrib);
 
         if coeff > 0 {
-            let new_ub = if slack >= 0 {
-                slack / coeff
-            } else {
-                (slack - coeff + 1) / coeff
-            };
+            let new_ub = slack.linear_bound(coeff);
             if new_ub < trail.ub(var) {
                 if let Some(conclusion) = encoder.lookup_le(var, new_ub) {
                     return Some(Self::clause_from_reasons(&self.ws_reasons, i, conclusion));
                 }
             }
         } else {
-            let abs_coeff = -coeff;
-            let new_lb = if slack <= 0 {
-                (-slack + abs_coeff - 1) / abs_coeff
-            } else {
-                -(slack / abs_coeff)
-            };
+            let new_lb = slack.linear_bound(coeff);
             if new_lb > trail.lb(var) {
                 if let Some(conclusion) = encoder.lookup_ge(var, new_lb) {
                     return Some(Self::clause_from_reasons(&self.ws_reasons, i, conclusion));
@@ -205,7 +351,7 @@ impl Propagator for LinearLe {
             return PropagationResult::NoChange;
         }
 
-        if sum_min > self.rhs {
+        if sum_min.greater_than_i128(self.rhs) {
             // Conflict: all variables at their best bounds already exceed rhs.
             // Build conflict clause from all reason literals.
             let clause: Vec<_> = self
@@ -221,7 +367,7 @@ impl Propagator for LinearLe {
             if self.coeffs[i] == 0 {
                 continue;
             }
-            if let Some(clause) = self.derive_bound(i, sum_min, trail, encoder) {
+            if let Some(clause) = self.derive_bound(i, &sum_min, trail, encoder) {
                 clauses.push(clause);
             }
         }

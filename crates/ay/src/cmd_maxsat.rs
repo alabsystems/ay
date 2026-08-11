@@ -1615,6 +1615,18 @@ pub(crate) fn run(cmd: &MaxSatCommand) -> Result<i32> {
     }
 }
 
+fn checked_timeout_duration(seconds: f64) -> Result<Duration> {
+    Duration::try_from_secs_f64(seconds).map_err(|error| {
+        anyhow::anyhow!("--timeout is outside the supported duration range: {error}")
+    })
+}
+
+fn checked_timeout_deadline(start: Instant, duration: Duration) -> Result<Instant> {
+    start
+        .checked_add(duration)
+        .context("--timeout is too large for the platform clock")
+}
+
 /// Solve Z3's `-wcnf` input mode and emit its compact optimization transcript.
 ///
 /// This is deliberately separate from the MaxSAT-competition surface: the
@@ -1652,7 +1664,10 @@ pub(crate) fn run_z3_compat(
 
     let deadline = timeout_ms
         .filter(|milliseconds| *milliseconds > 0)
-        .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
+        .map(|milliseconds| {
+            checked_timeout_deadline(Instant::now(), Duration::from_millis(milliseconds))
+        })
+        .transpose()?;
     solver.set_deadline(deadline);
     let result = solver.solve();
     match result {
@@ -2051,13 +2066,15 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     if !args.timeout.is_finite() || args.timeout < 0.0 {
         bail!("--timeout must be finite and non-negative");
     }
+    let timeout = checked_timeout_duration(args.timeout)?;
     if args.milp {
-        return milp_solve(args);
+        return milp_solve(args, timeout);
     }
     // The timeout covers total wall time including parsing, matching how
     // competition timeouts (and `ay maxsat bench`) measure solvers.
-    let deadline =
-        (args.timeout > 0.0).then(|| Instant::now() + Duration::from_secs_f64(args.timeout));
+    let deadline = (args.timeout > 0.0)
+        .then(|| checked_timeout_deadline(Instant::now(), timeout))
+        .transpose()?;
 
     // MILP-race clause capture: collect while all size gates hold; on the
     // first violation drop the buffers and stop collecting (the OLL engine
@@ -2357,7 +2374,7 @@ fn print_assignment(num_vars: usize, model: &[bool]) {
 /// that let `o 3477` ship against a true optimum of 3366: verification that
 /// only runs in the bench harness does not run at competition. The emission
 /// below is audited like every other.
-fn milp_solve(args: &MaxSatSolveArgs) -> Result<i32> {
+fn milp_solve(args: &MaxSatSolveArgs, timeout: Duration) -> Result<i32> {
     use ay_milp::{BabSession, Outcome, SolveOpts};
     use num_traits::ToPrimitive;
 
@@ -2387,7 +2404,7 @@ fn milp_solve(args: &MaxSatSolveArgs) -> Result<i32> {
 
     let mut opts = SolveOpts::new();
     if args.timeout > 0.0 {
-        opts = opts.with_time_limit(Duration::from_secs_f64(args.timeout));
+        opts = opts.with_time_limit(timeout);
     }
     let mut sess = BabSession::new(m.clone(), &opts).context("ay-milp session init failed")?;
     let outcome = sess.check().context("ay-milp solve failed")?;
@@ -2576,6 +2593,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     if !args.timeout.is_finite() || args.timeout <= 0.0 {
         bail!("--timeout must be finite and positive for benchmarking");
     }
+    let timeout = checked_timeout_duration(args.timeout)?;
     if args.jobs == Some(0) {
         bail!("--jobs must be positive");
     }
@@ -2627,7 +2645,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
             args.proof_max_instance_mib,
             // A checker that needs longer than the solve did is itself a
             // finding; it lands in Unvalidated, never in green.
-            Duration::from_secs_f64(args.timeout.max(60.0)),
+            timeout.max(Duration::from_secs(60)),
         )
         .map_err(|why| anyhow::anyhow!("--proof-check: {why}"))?;
         safe_println!(
@@ -4365,6 +4383,26 @@ fn parse_i32(bytes: &[u8]) -> Result<i32> {
 mod tests {
     use super::*;
     use std::io::Read as _;
+
+    #[test]
+    fn timeout_duration_conversion_handles_endpoints_without_panicking() {
+        assert_eq!(
+            checked_timeout_duration(0.0).expect("zero timeout is representable"),
+            Duration::ZERO
+        );
+        assert!(checked_timeout_duration(f64::MAX).is_err());
+    }
+
+    #[test]
+    fn timeout_deadline_conversion_is_checked_at_clock_endpoint() {
+        let start = Instant::now();
+        let largest_millisecond_timeout = Duration::from_millis(u64::MAX);
+        assert_eq!(
+            checked_timeout_deadline(start, largest_millisecond_timeout).ok(),
+            start.checked_add(largest_millisecond_timeout)
+        );
+        assert!(checked_timeout_deadline(start, Duration::MAX).is_err());
+    }
 
     /// Collect a WCNF text into (num_vars, hard, soft) via the streaming
     /// parser.

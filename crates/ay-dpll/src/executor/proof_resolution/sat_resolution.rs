@@ -438,7 +438,6 @@ impl Executor {
             Some(t) => t,
             None => return false,
         };
-
         if !trace.has_empty_clause() {
             self.last_clause_trace = Some(trace);
             return false;

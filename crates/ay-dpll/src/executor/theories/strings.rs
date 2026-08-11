@@ -659,22 +659,7 @@ impl Executor {
             // folding. The formula is trivially satisfiable. Mark as validated
             // (not skip_model_eval) so finalize_sat_model_validation is not
             // called and the postcondition in check_sat is satisfied (#8456).
-            self.last_model = Some(super::super::model::Model {
-                sat_model: Vec::new(),
-                term_to_var: HashMap::default(),
-                bool_overrides: HashMap::default(),
-                euf_model: None,
-                array_model: None,
-                lra_model: None,
-                lia_model: None,
-                bv_model: None,
-                fp_model: None,
-                string_model: None,
-                seq_model: None,
-                completed_values: HashMap::default(),
-                dt_ground: HashMap::default(),
-                dt_pins: HashMap::default(),
-            });
+            self.last_model = Some(super::super::model::Model::empty());
             self.last_model_validated = true;
             return Ok(SolveResult::Sat);
         }

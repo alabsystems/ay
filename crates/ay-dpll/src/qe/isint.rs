@@ -38,13 +38,14 @@
 //!   `#[non_exhaustive]`/unrecognized node counts as an occurrence.
 //! * **Exact rationals only** ([`num_rational::BigRational`]); residues are
 //!   computed by exact floor.
-//! * **Independent self-check.** The built result is verified against direct
+//! * **Independent differential check.** The built result is tested against direct
 //!   witness evaluation on a battery of ground assignments to the other free
 //!   variables — the residue algebra (boolean substitution) is checked against
 //!   an is_int-aware evaluator that computes `is_int` by actually testing
 //!   integrality. Any disagreement, indefinite evaluation, or a
 //!   random-`x`-satisfies-but-result-false witness refuses the elimination.
 //! * Any refusal returns `None`; the caller keeps the original quantifier.
+//!   Passing the finite battery is not universal equivalence authority.
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
@@ -65,8 +66,8 @@ const SELF_CHECK_SAMPLES: usize = 96;
 const RANDOM_X_PROBES: usize = 8;
 
 /// Eliminate `∃x. matrix` when `x` (Real-sorted) occurs only inside
-/// `is_int(1·x + c)` atoms. Returns the quantifier-free equivalent (verified by
-/// the self-check) or `None` (out of fragment / unverified — fail-closed).
+/// `is_int(1·x + c)` atoms. Returns a quantifier-free candidate after the
+/// bounded differential check, or `None` when out of fragment / rejected.
 pub(crate) fn eliminate_exists_isint(
     terms: &mut TermStore,
     matrix: TermId,

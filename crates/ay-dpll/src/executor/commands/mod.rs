@@ -18,8 +18,10 @@ use ay_core::{quote_symbol, string_literal, Sort, TermId};
 use ay_frontend::{AuthoredAssertionRef, OptionValue};
 
 use crate::executor::model::EvalValue;
-use crate::executor_format::{format_bigint, format_rational, format_sort, format_symbol};
+use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
+use crate::executor_format::{format_bigint, format_rational, format_sort_surface, format_symbol};
 use crate::executor_types::{SolveResult, StatValue, UnknownReason};
+use crate::logic_detection::LogicCategory;
 
 use super::Executor;
 
@@ -252,15 +254,19 @@ impl Executor {
                 out.push_str(&format!(
                     "(declare-const {} {})\n",
                     quote_symbol(name),
-                    format_sort(&info.sort)
+                    format_sort_surface(&self.ctx, &info.sort)
                 ));
             } else {
-                let args: Vec<String> = info.arg_sorts.iter().map(format_sort).collect();
+                let args: Vec<String> = info
+                    .arg_sorts
+                    .iter()
+                    .map(|sort| format_sort_surface(&self.ctx, sort))
+                    .collect();
                 out.push_str(&format!(
                     "(declare-fun {} ({}) {})\n",
                     quote_symbol(name),
                     args.join(" "),
-                    format_sort(&info.sort)
+                    format_sort_surface(&self.ctx, &info.sort)
                 ));
             }
         }
@@ -304,12 +310,16 @@ impl Executor {
                 continue;
             }
             declared.insert(name.to_string());
-            let args: Vec<String> = info.arg_sorts.iter().map(format_sort).collect();
+            let args: Vec<String> = info
+                .arg_sorts
+                .iter()
+                .map(|sort| format_sort_surface(&self.ctx, sort))
+                .collect();
             out.push_str(&format!(
                 "(declare-fun {} ({}) {})\n",
                 quote_symbol(name),
                 args.join(" "),
-                format_sort(&info.sort)
+                format_sort_surface(&self.ctx, &info.sort)
             ));
         }
         let mut extra: Vec<String> = Vec::new();
@@ -349,10 +359,10 @@ impl Executor {
         use ay_core::term::Symbol;
         match self.ctx.terms.get(term_id) {
             TermData::App(Symbol::Named(name), args) => {
-                let surface_name = self.ctx.dt_surface_name(name).unwrap_or(name);
+                let surface_name = self.ctx.output_symbol_name(name);
                 if !declared.contains(surface_name) && !is_builtin_operator(name) {
                     declared.insert(surface_name.to_string());
-                    let res_sort = format_sort(self.ctx.terms.sort(term_id));
+                    let res_sort = format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id));
                     if args.is_empty() {
                         out.push(format!(
                             "(declare-const {} {})\n",
@@ -362,7 +372,7 @@ impl Executor {
                     } else {
                         let arg_sorts: Vec<String> = args
                             .iter()
-                            .map(|&a| format_sort(self.ctx.terms.sort(a)))
+                            .map(|&a| format_sort_surface(&self.ctx, self.ctx.terms.sort(a)))
                             .collect();
                         out.push(format!(
                             "(declare-fun {} ({}) {})\n",
@@ -439,7 +449,7 @@ impl Executor {
                     out.push(format!(
                         "(declare-const {} {})\n",
                         quote_symbol(name),
-                        format_sort(self.ctx.terms.sort(term_id))
+                        format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id))
                     ));
                 }
             }
@@ -581,7 +591,7 @@ impl Executor {
                     {
                         return format!(
                             "((as const {}) {})",
-                            format_sort(self.ctx.terms.sort(term_id)),
+                            format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id)),
                             self.format_term(*value)
                         );
                     }
@@ -596,7 +606,7 @@ impl Executor {
                             return format!(
                                 "(lambda (({} {})) {})",
                                 quote_symbol(vname),
-                                format_sort(self.ctx.terms.sort(*var)),
+                                format_sort_surface(&self.ctx, self.ctx.terms.sort(*var)),
                                 self.format_term(*body)
                             );
                         }
@@ -632,7 +642,13 @@ impl Executor {
             TermData::Forall(vars, body, _triggers) => {
                 let vars_str: Vec<String> = vars
                     .iter()
-                    .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_sort(sort)))
+                    .map(|(name, sort)| {
+                        format!(
+                            "({} {})",
+                            quote_symbol(name),
+                            format_sort_surface(&self.ctx, sort)
+                        )
+                    })
                     .collect();
                 format!(
                     "(forall ({}) {})",
@@ -643,7 +659,13 @@ impl Executor {
             TermData::Exists(vars, body, _triggers) => {
                 let vars_str: Vec<String> = vars
                     .iter()
-                    .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_sort(sort)))
+                    .map(|(name, sort)| {
+                        format!(
+                            "({} {})",
+                            quote_symbol(name),
+                            format_sort_surface(&self.ctx, sort)
+                        )
+                    })
                     .collect();
                 format!(
                     "(exists ({}) {})",
@@ -743,8 +765,9 @@ impl Executor {
         variables: &[TermId],
     ) -> crate::executor_types::Result<String> {
         // Preserve the post-check-sat state so a following get-value/get-model
-        // still observes the original model. The repeated check-sat-assuming
-        // calls below overwrite last_result/last_model/last_assumptions.
+        // still observes the original model. The checked internal probes below
+        // overwrite last_result/last_model/last_assumptions while certifying
+        // their exact temporary obligations.
         //
         // SOUNDNESS (#unsat-core-staleness): the core provenance fields
         // (`last_assumption_core`, `last_core_term_to_name`) MUST be part of
@@ -764,11 +787,15 @@ impl Executor {
         // be paired with the restored result/assumption scope from the public
         // query. `check_sat_assuming` clears or replaces every field below.
         let saved_proof = self.last_proof.take();
+        let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
+        let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
+        let saved_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
         let saved_lrat_certificate = self.last_lrat_certificate.take();
         let saved_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_proof_quality = self.last_proof_quality.take();
         let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_clause_trace = self.last_clause_trace.take();
+        let saved_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_var_to_term = self.last_var_to_term.take();
         let saved_trail_provenance = self.last_trail_provenance.take();
         let saved_clausification_proofs = self.last_clausification_proofs.take();
@@ -790,11 +817,15 @@ impl Executor {
         self.last_assumption_core = saved_assumption_core;
         self.last_core_term_to_name = saved_core_term_to_name;
         self.last_proof = saved_proof;
+        self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+        self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+        self.last_unsat_proof_reconstruction_suppressed = saved_proof_reconstruction_suppressed;
         self.last_lrat_certificate = saved_lrat_certificate;
         self.last_proof_term_overrides = saved_proof_term_overrides;
         self.last_proof_quality = saved_proof_quality;
         self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
         self.last_clause_trace = saved_clause_trace;
+        self.last_checked_sat_refutation = saved_checked_sat_refutation;
         self.last_var_to_term = saved_var_to_term;
         self.last_trail_provenance = saved_trail_provenance;
         self.last_clausification_proofs = saved_clausification_proofs;
@@ -813,16 +844,39 @@ impl Executor {
         assumptions: &[TermId],
         variables: &[TermId],
     ) -> crate::executor_types::Result<String> {
-        // Establish the base status: is `assertions /\ assumptions` satisfiable?
-        let base = self.check_sat_assuming(assumptions)?;
-        let status = match base {
-            SolveResult::Sat => "sat",
-            SolveResult::Unsat(_) => {
+        // Establish the base status from checked authority over the exact
+        // conjunction, not from a raw internal tri-state. Ground SAT requires
+        // the ordinary model-validation certificate; every accepted UNSAT
+        // requires a strict authored-root proof. Quantified SAT has no general
+        // finite certificate here and therefore remains `unknown`.
+        let mut base_roots = self.ctx.assertions.clone();
+        base_roots.extend_from_slice(assumptions);
+        let base = self.checked_ground_solve(base_roots.clone(), LogicCategory::Other, 2_000);
+        let checked_base = match base {
+            Some(CheckedGroundDecision::Sat(checked)) => {
+                checked.consume(self, &base_roots).then_some(true)
+            }
+            Some(CheckedGroundDecision::Unsat(checked)) => {
+                checked.consume(self, &base_roots).then_some(false)
+            }
+            None => None,
+        };
+        let status = match checked_base {
+            Some(true) => "sat",
+            Some(false) => {
                 // An unsatisfiable base entails everything, but Z3 reports an
                 // empty consequence list in this case.
                 return Ok("(unsat ())".to_string());
             }
-            SolveResult::Unknown => "unknown",
+            None => {
+                if self
+                    .checked_exact_unsat_solve(base_roots.clone(), 2_000)
+                    .is_some_and(|checked| checked.consume(self, &base_roots))
+                {
+                    return Ok("(unsat ())".to_string());
+                }
+                "unknown"
+            }
         };
 
         // Render the antecedent `(and <assumptions>)` once, reused per literal.
@@ -841,10 +895,13 @@ impl Executor {
             // UNSAT means `lit` is entailed; SAT/Unknown means it is not
             // (soundly) provable, so it is omitted.
             let neg = self.ctx.terms.mk_not(lit);
-            let mut combined: Vec<TermId> = assumptions.to_vec();
-            combined.push(neg);
-            let entailment = self.check_sat_assuming(&combined)?;
-            if matches!(entailment, SolveResult::Unsat(_)) {
+            let mut obligation = self.ctx.assertions.clone();
+            obligation.extend_from_slice(assumptions);
+            obligation.push(neg);
+            if self
+                .checked_exact_unsat_solve(obligation.clone(), 2_000)
+                .is_some_and(|checked| checked.consume(self, &obligation))
+            {
                 let lit_str = self.format_term(lit);
                 let rendered = match &antecedent {
                     Some(ante) => format!("(=> {ante} {lit_str})"),
@@ -868,8 +925,9 @@ impl Executor {
     ///   1. `A /\ C` is satisfiable, AND
     ///   2. `A /\ C => G`   (equivalently `A /\ C /\ not G` is unsatisfiable).
     ///
-    /// SOUNDNESS: every emitted abduct is *validated* with AY's own solver
-    /// before it is printed — both conditions above are checked by sub-solves.
+    /// SOUNDNESS: every emitted abduct is *certified* before it is printed —
+    /// satisfiability carries a validated-model token and entailment carries a
+    /// strict exact-root refutation token.
     /// If no candidate from the internal grammar validates, AY prints the
     /// SMT-LIB-standard `none` failure rather than an unsound abduct
     /// (fail-closed). Candidates are drawn from a fixed grammar over the atoms
@@ -883,9 +941,8 @@ impl Executor {
         name: &str,
         goal: TermId,
     ) -> crate::executor_types::Result<String> {
-        // Preserve post-check-sat state: the validating sub-solves below call
-        // check_sat_assuming repeatedly and would otherwise clobber the model a
-        // following get-value / get-model expects.
+        // Preserve post-check-sat state: the checked sub-solves below would
+        // otherwise clobber the model a following get-value / get-model expects.
         //
         // SOUNDNESS (#unsat-core-staleness): the core provenance fields are
         // part of the snapshot for the same reason as in `get_consequences`
@@ -898,11 +955,15 @@ impl Executor {
         let saved_assumption_core = self.last_assumption_core.clone();
         let saved_core_term_to_name = self.last_core_term_to_name.clone();
         let saved_proof = self.last_proof.take();
+        let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
+        let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
+        let saved_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
         let saved_lrat_certificate = self.last_lrat_certificate.take();
         let saved_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_proof_quality = self.last_proof_quality.take();
         let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_clause_trace = self.last_clause_trace.take();
+        let saved_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_var_to_term = self.last_var_to_term.take();
         let saved_trail_provenance = self.last_trail_provenance.take();
         let saved_clausification_proofs = self.last_clausification_proofs.take();
@@ -923,11 +984,15 @@ impl Executor {
         self.last_assumption_core = saved_assumption_core;
         self.last_core_term_to_name = saved_core_term_to_name;
         self.last_proof = saved_proof;
+        self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+        self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+        self.last_unsat_proof_reconstruction_suppressed = saved_proof_reconstruction_suppressed;
         self.last_lrat_certificate = saved_lrat_certificate;
         self.last_proof_term_overrides = saved_proof_term_overrides;
         self.last_proof_quality = saved_proof_quality;
         self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
         self.last_clause_trace = saved_clause_trace;
+        self.last_checked_sat_refutation = saved_checked_sat_refutation;
         self.last_var_to_term = saved_var_to_term;
         self.last_trail_provenance = saved_trail_provenance;
         self.last_clausification_proofs = saved_clausification_proofs;
@@ -970,21 +1035,33 @@ impl Executor {
                 continue;
             }
 
-            // Condition 1: A /\ C must be SATISFIABLE.
-            let sat_ac = self.check_sat_assuming(&[cand])?;
-            if !matches!(sat_ac, SolveResult::Sat) {
-                // Not SAT (unsat or unknown) — cannot soundly accept.
+            // Condition 1: A /\ C must be SATISFIABLE. This command currently
+            // accepts only a ground, model-certified witness; quantified SAT
+            // candidates fail closed until they have their own finite theorem.
+            let mut sat_obligation = self.ctx.assertions.clone();
+            sat_obligation.push(cand);
+            let sat_ac = self
+                .checked_ground_solve(sat_obligation.clone(), LogicCategory::Other, 2_000)
+                .is_some_and(|decision| match decision {
+                    CheckedGroundDecision::Sat(checked) => checked.consume(self, &sat_obligation),
+                    CheckedGroundDecision::Unsat(_) => false,
+                });
+            if !sat_ac {
                 continue;
             }
 
             // Condition 2: A /\ C /\ not G must be UNSATISFIABLE
             // (i.e. A /\ C => G).
-            let entail = self.check_sat_assuming(&[cand, not_goal])?;
-            if !matches!(entail, SolveResult::Unsat(_)) {
+            let mut entailment_obligation = self.ctx.assertions.clone();
+            entailment_obligation.extend([cand, not_goal]);
+            let entails = self
+                .checked_exact_unsat_solve(entailment_obligation.clone(), 2_000)
+                .is_some_and(|checked| checked.consume(self, &entailment_obligation));
+            if !entails {
                 continue;
             }
 
-            // Both conditions VALIDATED by AY's own solver — emit the abduct.
+            // Both conditions carry exact checked authority — emit the abduct.
             let body = self.format_term(cand);
             return Ok(format!(
                 "(define-fun {} () Bool {})",
@@ -1457,10 +1534,10 @@ impl Executor {
             format!(
                 "(as {} {})",
                 quote_symbol(surface_name),
-                format_sort(result_sort)
+                format_sort_surface(&self.ctx, result_sort)
             )
         } else {
-            quote_symbol(self.ctx.dt_surface_name(identity).unwrap_or(identity))
+            quote_symbol(self.ctx.output_symbol_name(identity))
         }
     }
 }

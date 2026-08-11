@@ -64,7 +64,7 @@ pub(crate) enum RootProbe {
     Probed {
         /// The model with forced fixings applied, re-cascaded through base
         /// presolve, and clique rows appended.
-        model: Model,
+        model: Box<Model>,
         /// Forced fixings admitted (binaries proven to one value).
         forced: usize,
         /// Clique rows emitted.
@@ -170,7 +170,7 @@ pub(crate) fn root_probe(model: &Model, deadline: Option<Instant>, cfg: ProbeCfg
     // fail-closes (it clones untouched). Match that: no probing there.
     if model.has_inexact_coeffs() {
         return RootProbe::Probed {
-            model: model.clone(),
+            model: Box::new(model.clone()),
             forced: 0,
             cliques: 0,
             probes: 0,
@@ -329,7 +329,7 @@ pub(crate) fn root_probe(model: &Model, deadline: Option<Instant>, cfg: ProbeCfg
     }
 
     RootProbe::Probed {
-        model: out,
+        model: Box::new(out),
         forced: forced.len(),
         cliques,
         probes,

@@ -206,8 +206,12 @@ impl ResultGateRequests {
     }
 }
 
-fn should_budget_synthesized_proof(synthesized_default: bool, gates: ResultGateRequests) -> bool {
-    synthesized_default && !gates.any()
+fn should_budget_synthesized_proof(
+    synthesized_default: bool,
+    has_artifact_path: bool,
+    gates: ResultGateRequests,
+) -> bool {
+    synthesized_default && !has_artifact_path && !gates.any()
 }
 
 fn may_use_ungated_solver_route(gates: ResultGateRequests) -> bool {
@@ -295,16 +299,22 @@ fn reject_decision_trace_for_route(route: &str) {
     std::process::exit(1);
 }
 
-/// Apply the best-effort reconstruction budget for a synthesized-default
-/// proof config (never for an explicit proof or mandatory result gate).
-fn apply_default_proof_budget(executor: &mut Executor, proof: &ProofConfig) {
+/// Enable proof production with an explicit typed policy: synthesized-default
+/// artifacts are best-effort and budgeted; every user/result-gate request is
+/// mandatory and unbudgeted.
+fn configure_proof_policy(executor: &mut Executor, proof: &ProofConfig) {
     // Every mandatory result gate needs the complete proof reconstruction it
     // requested. In particular, `--verify-firewall` synthesizes its proof
     // config by default; treating that config as best-effort could stop proof
     // reconstruction before the requested diagnostics run.
-    if should_budget_synthesized_proof(proof.synthesized_default, ResultGateRequests::current()) {
-        executor
-            .set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
+    if should_budget_synthesized_proof(
+        proof.synthesized_default,
+        proof.artifact_path.is_some(),
+        ResultGateRequests::current(),
+    ) {
+        executor.set_best_effort_produce_proofs(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET);
+    } else {
+        executor.set_produce_proofs(true);
     }
 }
 
@@ -3443,31 +3453,40 @@ fn print_synthesized_public_unknown(transcript: &mut SmtTranscriptState) -> bool
     true
 }
 
+/// Publish the CLI-visible result of the #8759 strict-proof terminal-trust
+/// gate: `unknown` on stdout plus the `(incomplete proof-trusted)`
+/// certification rejection on the transcript.
+///
+/// Shared by the two ways the gate can fire — the CLI flag observing a raw
+/// `unsat`, and the executor's own publication funnel having already withheld
+/// it — so the emitted contract is byte-identical either way.
+fn publish_strict_proof_trust_rejection(
+    transcript: &mut SmtTranscriptState,
+    cmd: &Command,
+) -> bool {
+    update_transcript_state_after_command(transcript, cmd);
+    transcript.reject_result_certification("(incomplete proof-trusted)");
+    invalidate_artifacts_for_rejected_result();
+    if let Err(error) = invalidate_decision_trace_for_public_mismatch(transcript) {
+        eprintln_smt_error(error);
+        return false;
+    }
+    print_synthesized_public_unknown(transcript)
+}
+
 /// Inspect the executor's last Alethe proof and return `true` when the
-/// terminal empty-clause derivation rides on an unverified `:rule trust`
-/// fallback (either `AletheRule::Trust` or a trust-emitting
-/// `TheoryLemmaKind`, e.g. `Generic`). See #8759.
+/// terminal empty-clause derivation is not trust-free. See #8759.
+///
+/// The predicate itself lives in the library, on
+/// `Executor::unsat_proof_terminal_trust_detected`, and that is the point: this
+/// function used to be its ONLY definition, so `--strict-proofs` was a
+/// driver-level downgrade and a consumer linking `ay-dpll` got no gate at all.
+/// The executor's public UNSAT funnel now enforces the same disjunction —
+/// terminal `trust`/`hole` step, provenance-unbacked `assume` leaf, or an
+/// uncheckable `Seq` reference — so the CLI and the library cannot disagree
+/// about the same proof.
 fn terminal_trust_detected(executor: &Executor) -> bool {
-    let trust_or_hole = executor
-        .last_proof()
-        .map(|p| ay_proof::terminal_trust_report(p).has_terminal_trust())
-        .unwrap_or(false);
-    // Leak-2: also downgrade when the terminal derivation rides on an `assume`
-    // NOT backed by the problem's provenance (a laundered free axiom). The
-    // provenance set is executor state (original assertions + quantifier
-    // expansions), so the check lives on the executor.
-    //
-    // TIER-0 leak: also downgrade when the proof references sequence-theory
-    // content (`Seq`-sorted terms). Such a proof can be clean (zero hole/trust,
-    // no foreign assume — e.g. a `seq.nth` term forced to two distinct integer
-    // constants collapses to a pure `la_generic`/`resolution` chain) yet is NOT
-    // independently checkable: carcara cannot parse the `Seq` sort, no
-    // firewall-Lean lemma covers sequences, and there is no DRAT lane. Shipping
-    // it bare under `--strict-proofs` would accept an uncheckable proof, a
-    // §0-class certification leak.
-    trust_or_hole
-        || executor.unsat_proof_terminal_foreign_assume()
-        || executor.unsat_proof_references_uncheckable_seq_theory()
+    executor.unsat_proof_terminal_trust_detected()
 }
 
 /// Disclose, on a published Alethe certificate, exactly which of AY's own
@@ -3942,11 +3961,12 @@ fn execute_and_print(
     // commands. The release profile is intentionally `panic = "unwind"` so this
     // containment works. Found by the diff_fuzz seq sort-interning crash (a valid
     // QF_SLIA input panicked `mk_eq expects same sort`, exiting the process 101).
-    let exec_result =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.execute(cmd))) {
-            Ok(r) => r,
-            Err(_panic) => return handle_executor_panic(executor, cmd, transcript),
-        };
+    let exec_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        executor.execute_authored(cmd)
+    })) {
+        Ok(r) => r,
+        Err(_panic) => return handle_executor_panic(executor, cmd, transcript),
+    };
     match exec_result {
         Ok(Some(output)) => {
             // Strict-proof mode: downgrade UNSAT to Unknown when the terminal
@@ -3956,14 +3976,22 @@ fn execute_and_print(
             if output == "unsat" && strict_proofs_enabled() && terminal_trust_detected(executor) {
                 let downgraded = executor.reject_last_unsat_as_unknown();
                 debug_assert!(downgraded, "strict-proof gate started from UNSAT");
-                update_transcript_state_after_command(transcript, cmd);
-                transcript.reject_result_certification("(incomplete proof-trusted)");
-                invalidate_artifacts_for_rejected_result();
-                if let Err(error) = invalidate_decision_trace_for_public_mismatch(transcript) {
-                    eprintln_smt_error(error);
-                    return false;
-                }
-                return print_synthesized_public_unknown(transcript);
+                debug_assert_eq!(
+                    executor.unknown_reason(),
+                    Some(UnknownReason::ProofTrusted),
+                    "the strict-proof gate must publish its own typed reason"
+                );
+                return publish_strict_proof_trust_rejection(transcript, cmd);
+            }
+            // The executor's own UNSAT funnel applies the same gate, so a
+            // script that turned strict proofs on with
+            // `(set-option :check-proofs-strict true)` — or any ay-dpll
+            // consumer — arrives here already downgraded. Publish the identical
+            // transcript certification rejection rather than letting the two
+            // spellings of "strict proofs" produce two different outputs.
+            if output == "unknown" && executor.unknown_reason() == Some(UnknownReason::ProofTrusted)
+            {
+                return publish_strict_proof_trust_rejection(transcript, cmd);
             }
             // Firewall result gate (`--verify-firewall`). Today's emitters prove
             // diagnostic LOCAL theory obligations only; even when every such
@@ -4515,6 +4543,7 @@ fn print_smt_stats(
         "model_validation.array_delegated",
         "model_validation.sat_fallback",
         "model_validation.total",
+        "model_validation.checked_projection_certificate",
         "lra_external_codegen_backend_substitute_compile_attempts",
         "lra_external_codegen_backend_substitute_compilations",
         "lra_external_codegen_backend_substitute_compile_failures",
@@ -4632,8 +4661,12 @@ mod tests {
     #[test]
     fn mandatory_result_gates_disable_best_effort_proof_budget_and_ungated_routes() {
         let none = ResultGateRequests::default();
-        assert!(should_budget_synthesized_proof(true, none));
-        assert!(!should_budget_synthesized_proof(false, none));
+        assert!(should_budget_synthesized_proof(true, false, none));
+        assert!(!should_budget_synthesized_proof(false, false, none));
+        assert!(
+            !should_budget_synthesized_proof(true, true, none),
+            "an explicit artifact path makes publication mandatory"
+        );
         assert!(may_use_ungated_solver_route(none));
 
         for gates in [
@@ -4658,7 +4691,7 @@ mod tests {
                 ..ResultGateRequests::default()
             },
         ] {
-            assert!(!should_budget_synthesized_proof(true, gates));
+            assert!(!should_budget_synthesized_proof(true, false, gates));
             assert!(!may_use_ungated_solver_route(gates));
         }
     }
@@ -7107,7 +7140,14 @@ fn write_alethe_proof(
                     error,
                     writer.inner().get_ref(),
                 )),
-                None => unreachable!("last_proof presence checked above"),
+                None => Err(alethe_error_after_invalidation(
+                    ay_proof::AletheStreamError::Print(
+                        ay_proof::AlethePrintError::UnavailableAuthenticatedSurface {
+                            reason: "proof export returned no artifact despite a retained proof",
+                        },
+                    ),
+                    writer.inner().get_ref(),
+                )),
             }
         }
         Err(error) => Err(ay_proof::AletheStreamError::Io(error)),
@@ -7952,8 +7992,7 @@ fn run_interactive_smt_stream(
             );
             std::process::exit(1);
         }
-        executor.set_produce_proofs(true);
-        apply_default_proof_budget(&mut executor, proof);
+        configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
         // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
         // competition mode), and no mandatory result/artifact gate needs the
@@ -8565,8 +8604,7 @@ fn run_smt_file_content(
             );
             std::process::exit(1);
         }
-        executor.set_produce_proofs(true);
-        apply_default_proof_budget(&mut executor, proof);
+        configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
         // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
         // competition mode), and no mandatory result/artifact gate needs the

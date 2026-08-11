@@ -83,7 +83,7 @@ pub mod variable;
 pub mod propagators;
 
 // Re-exports
-pub use domain::Domain;
+pub use domain::{Domain, DomainCreationError, DomainEnumerationError};
 pub use encoder::IntegerEncoder;
 pub use engine::CpSatEngine;
 pub use propagator::{Explanation, PropagationResult, Propagator};

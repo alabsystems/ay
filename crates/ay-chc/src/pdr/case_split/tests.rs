@@ -206,7 +206,7 @@ fn test_merge_case_split_safe_models_guards_by_split_var() {
     let case_ne = CaseConstraint::ne_all("m", &[1]);
     let safe_models = vec![(case_eq, model_eq), (case_ne, model_ne)];
 
-    let merged = PdrSolver::merge_case_split_safe_models(&safe_models, 1);
+    let merged = PdrSolver::merge_case_split_safe_models(&safe_models, pred_id, 1);
     let merged_interp = merged.get(&pred_id).expect("missing merged interpretation");
 
     let expected = ChcExpr::and_vec(vec![
@@ -224,9 +224,56 @@ fn test_merge_case_split_safe_models_guards_by_split_var() {
     assert_eq!(merged_interp.formula, expected);
 }
 
-// Removed: test_merge_case_split_safe_models_ors_when_split_idx_out_of_range
-// The or_vec fallback is unsound for case-split merging (#2065).
-// The debug_assert now catches this condition.
+#[test]
+fn test_merge_case_split_does_not_guard_unrelated_same_arity_predicate() {
+    let split_pred_id = PredicateId::new(0);
+    let other_pred_id = PredicateId::new(1);
+
+    let p_value = ChcVar::new("p_value", ChcSort::Int);
+    let p_mode = ChcVar::new("p_mode", ChcSort::Int);
+    let p_vars = vec![p_value.clone(), p_mode];
+
+    // Q deliberately has the same arity as P. Its second argument is ordinary
+    // data, not P's mode discriminator; the old index-only merge nevertheless
+    // used it as the case guard.
+    let q_value = ChcVar::new("q_value", ChcSort::Int);
+    let q_data = ChcVar::new("q_data", ChcSort::Int);
+    let q_vars = vec![q_value.clone(), q_data];
+
+    let p_eq = ChcExpr::eq(ChcExpr::var(p_value.clone()), ChcExpr::int(0));
+    let p_ne = ChcExpr::eq(ChcExpr::var(p_value), ChcExpr::int(1));
+    let q_eq = ChcExpr::eq(ChcExpr::var(q_value.clone()), ChcExpr::int(10));
+    let q_ne = ChcExpr::eq(ChcExpr::var(q_value), ChcExpr::int(20));
+
+    let mut model_eq = InvariantModel::new();
+    model_eq.set(
+        split_pred_id,
+        PredicateInterpretation::new(p_vars.clone(), p_eq),
+    );
+    model_eq.set(
+        other_pred_id,
+        PredicateInterpretation::new(q_vars.clone(), q_eq.clone()),
+    );
+
+    let mut model_ne = InvariantModel::new();
+    model_ne.set(split_pred_id, PredicateInterpretation::new(p_vars, p_ne));
+    model_ne.set(
+        other_pred_id,
+        PredicateInterpretation::new(q_vars.clone(), q_ne.clone()),
+    );
+
+    let safe_models = vec![
+        (CaseConstraint::eq("p_mode", 1), model_eq),
+        (CaseConstraint::ne_all("p_mode", &[1]), model_ne),
+    ];
+    let merged = PdrSolver::merge_case_split_safe_models(&safe_models, split_pred_id, 1);
+    let other = merged
+        .get(&other_pred_id)
+        .expect("missing unrelated predicate interpretation");
+
+    assert_eq!(other.vars, q_vars);
+    assert_eq!(other.formula, ChcExpr::or_vec(vec![q_eq, q_ne]));
+}
 
 fn test_config() -> PdrConfig {
     PdrConfig {
@@ -287,6 +334,13 @@ fn test_case_split_deadline_expired_helper_is_fail_closed() {
 
 #[test]
 fn test_case_split_branch_budget_uses_stage_slack_without_spending_reserves() {
+    let scaled_first = PdrSolver::case_split_branch_budget(Some(Duration::from_secs(16)), 1);
+    assert_eq!(
+        scaled_first,
+        Duration::from_millis(13_500),
+        "a scaled stage gives the first branch its slack without spending sibling/merge reserves"
+    );
+
     let first = PdrSolver::case_split_branch_budget(Some(Duration::from_secs(8)), 1);
     assert_eq!(
         first,
@@ -425,9 +479,3 @@ fn test_case_split_guards_merge_and_verify_after_deadline() {
         "case-split should not start strict verification after the deadline"
     );
 }
-
-// test_try_case_split_solve_returns_safe_when_all_cases_safe deleted:
-// try_case_split_solve returns None despite find_case_split_candidates
-// finding candidates. The case-split threshold/timeout logic rejects the
-// split at solve time. Pre-existing failure across all build profiles.
-// Re-add when case-split solve logic aligns with candidate detection.

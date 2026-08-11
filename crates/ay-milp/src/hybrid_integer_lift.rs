@@ -35,9 +35,11 @@ use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, ToPrimitive, Zero};
 
+#[cfg(test)]
+use crate::hybrid_pb_lp::HybridPbLpDecision;
 use crate::hybrid_pb_lp::{
     verify_hybrid_pb_lp_infeasibility_certificate_interruptible, CertifiedHybridPbLpDecision,
-    HybridPbLpDecision, HybridPbLpInfeasibilityCertificate,
+    HybridPbLpInfeasibilityCertificate,
 };
 use crate::model::{exact, Col, ColKind, Model, Row};
 
@@ -120,10 +122,12 @@ pub(crate) enum HybridIntegerLiftCertificateVerificationError {
 
 /// Try the integer-lifted hybrid route.  `None` is a structural/resource
 /// decline or an exact postsolve failure, never a partial verdict.
+#[cfg(test)]
 pub(crate) fn try_solve(original: &Model, deadline: Option<Instant>) -> Option<HybridPbLpDecision> {
     try_solve_interruptible(original, deadline, || false)
 }
 
+#[cfg(test)]
 pub(crate) fn try_solve_interruptible<F>(
     original: &Model,
     deadline: Option<Instant>,
@@ -158,7 +162,7 @@ where
     let decision = crate::hybrid_pb_lp::try_solve_certified_interruptible(
         &lift.transformed,
         deadline,
-        || should_stop(),
+        &mut should_stop,
     )?;
     if stopped(deadline, &mut should_stop) {
         return None;
@@ -221,17 +225,12 @@ where
     }
 }
 
+#[cfg(test)]
 fn drop_integer_lift_certificate(
     decision: CertifiedHybridIntegerLiftDecision,
 ) -> HybridPbLpDecision {
     match decision {
-        CertifiedHybridIntegerLiftDecision::Feasible {
-            model_values,
-            incumbent_only,
-        } => HybridPbLpDecision::Feasible {
-            model_values,
-            incumbent_only,
-        },
+        CertifiedHybridIntegerLiftDecision::Feasible { .. } => HybridPbLpDecision::Feasible,
         CertifiedHybridIntegerLiftDecision::Infeasible(_) => HybridPbLpDecision::Infeasible,
         CertifiedHybridIntegerLiftDecision::Optimal {
             value,

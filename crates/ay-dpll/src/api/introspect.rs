@@ -56,7 +56,8 @@ impl Solver {
     /// Panics if `term` was not created by this solver or is otherwise stale.
     #[must_use]
     pub fn format_term(&self, term: Term) -> String {
-        self.executor.format_term(term.0)
+        let id = self.require_term("format_term", term);
+        self.executor.format_term(id)
     }
 
     /// Format a term as SMT-LIB text, or `None` if `term` does not index a
@@ -69,10 +70,8 @@ impl Solver {
     /// string rather than unwind a panic across the C boundary.
     #[must_use]
     pub fn format_term_checked(&self, term: Term) -> Option<String> {
-        if term.0.index() >= self.terms().len() {
-            return None;
-        }
-        Some(self.executor.format_term(term.0))
+        let id = self.resolve_term("format_term_checked", term).ok()?;
+        Some(self.executor.format_term(id))
     }
 
     /// Serialize the current assertion stack as a self-contained SMT-LIB2
@@ -94,14 +93,15 @@ impl Solver {
     /// the executor's internal stack.
     #[must_use]
     pub fn assertions_sexpr(&self, assertions: &[Term]) -> String {
-        let ids: Vec<ay_core::TermId> = assertions.iter().map(|t| t.id()).collect();
+        let ids = self.require_terms("assertions_sexpr", assertions);
         self.executor.assertions_sexpr_for(&ids)
     }
 
     /// Get the kind of a term, including operator info for applications.
     #[must_use]
     pub fn term_kind(&self, term: Term) -> TermKind {
-        match self.terms().get(term.0) {
+        let id = self.require_term("term_kind", term);
+        match self.terms().get(id) {
             TermData::App(sym, args) => {
                 let name = match sym {
                     Symbol::Named(n) => n.clone(),
@@ -144,10 +144,11 @@ impl Solver {
     /// - `Var`, `Const` → `[]`
     #[must_use]
     pub fn term_children(&self, term: Term) -> Vec<Term> {
+        let id = self.require_term("term_children", term);
         self.terms()
-            .children(term.0)
+            .children(id)
             .into_iter()
-            .map(Term)
+            .map(|child| self.wrap_term(child))
             .collect()
     }
 
@@ -157,10 +158,11 @@ impl Solver {
     /// String, Datatype, Uninterpreted, etc.
     #[must_use]
     pub fn term_sort(&self, term: Term) -> Sort {
+        let id = self.require_term("term_sort", term);
         self.var_sorts
-            .get(&term.0)
+            .get(&id)
             .cloned()
-            .unwrap_or_else(|| self.terms().sort(term.0).clone())
+            .unwrap_or_else(|| self.terms().sort(id).clone())
     }
 
     /// Get the sort of a term.
@@ -177,7 +179,8 @@ impl Solver {
     /// Returns `None` if the term is not a quantifier.
     #[must_use]
     pub fn quantifier_bound_vars(&self, term: Term) -> Option<Vec<(String, Sort)>> {
-        match self.terms().get(term.0) {
+        let id = self.resolve_term("quantifier_bound_vars", term).ok()?;
+        match self.terms().get(id) {
             TermData::Forall(vars, _, _) | TermData::Exists(vars, _, _) => Some(vars.clone()),
             _ => None,
         }
@@ -190,11 +193,12 @@ impl Solver {
     /// The outer `Vec` contains alternative trigger sets (disjunction).
     #[must_use]
     pub fn quantifier_triggers(&self, term: Term) -> Option<Vec<Vec<Term>>> {
-        match self.terms().get(term.0) {
+        let id = self.resolve_term("quantifier_triggers", term).ok()?;
+        match self.terms().get(id) {
             TermData::Forall(_, _, triggers) | TermData::Exists(_, _, triggers) => Some(
                 triggers
                     .iter()
-                    .map(|ts| ts.iter().map(|&t| Term(t)).collect())
+                    .map(|ts| ts.iter().map(|&t| self.wrap_term(t)).collect())
                     .collect(),
             ),
             _ => None,
@@ -214,9 +218,11 @@ impl Solver {
     /// layer reports `Z3_SORT_ERROR` for mismatches before calling this).
     #[must_use]
     pub fn substitute(&mut self, term: Term, from: &[Term], to: &[Term]) -> Term {
-        let from_ids: Vec<_> = from.iter().map(|t| t.0).collect();
-        let to_ids: Vec<_> = to.iter().map(|t| t.0).collect();
-        Term(self.terms_mut().substitute(term.0, &from_ids, &to_ids))
+        let term_id = self.require_term("substitute", term);
+        let from_ids = self.require_terms("substitute", from);
+        let to_ids = self.require_terms("substitute", to);
+        let result = self.terms_mut().substitute(term_id, &from_ids, &to_ids);
+        self.wrap_term(result)
     }
 
     /// Return a simplified term that is logically equivalent to `term`.
@@ -235,6 +241,8 @@ impl Solver {
     /// FFI entry point.
     #[must_use]
     pub fn simplify(&mut self, term: Term) -> Term {
-        Term(self.terms_mut().simplify(term.0))
+        let id = self.require_term("simplify", term);
+        let result = self.terms_mut().simplify(id);
+        self.wrap_term(result)
     }
 }

@@ -11,7 +11,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::time::Instant;
 use ay_core::{TermData, TermId, TermStore};
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -19,11 +19,14 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use super::mbqi::CheckedDtSatAuthority;
+use super::quantified_sat::ProjectionSatAttempt;
 use super::quantifier_loop::unsupported_arith_mentions_ce_var;
 use super::theories::bv_cnf_dump;
 use super::theories::ArrayExtWitnessRootViolation;
-use super::Executor;
+use super::{AuthoredPlainHardQueryPermit, Executor};
 use crate::ematching::contains_quantifier;
+use crate::executor::exact_exists_bounds::ExactExistsDecision;
 use crate::executor_types::{Result, SolveResult, StatValue, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use crate::logic_detection::LogicCategory;
@@ -263,6 +266,9 @@ impl Executor {
             // "soundness-gate", not "theory-search": nothing was missing, a
             // computed verdict was refuted.
             UnknownReason::SelfCheckRejected => ("soundness-gate", "self-check-rejected"),
+            // Same class as the line above: a computed UNSAT was withheld by a
+            // gate, not lost to a missing capability.
+            UnknownReason::ProofTrusted => ("soundness-gate", "proof-trusted"),
             UnknownReason::Incomplete | UnknownReason::Unknown => ("theory-search", "unknown"),
         }
     }
@@ -298,6 +304,7 @@ impl Executor {
                 "the selected mixed collection/datatype fragment is unsupported".to_string()
             }
             UnknownReason::SelfCheckRejected => "AY COMPUTED A VERDICT AND ITS OWN FAIL-CLOSED CHECKER REFUTED IT -- this is a caught wrong answer, not a missing capability".to_string(),
+            UnknownReason::ProofTrusted => "AY COMPUTED AN UNSAT AND WITHHELD IT -- the terminal derivation chain is not trust-free, so no checker can confirm the refutation; this is a soundness gate firing, not a missing capability".to_string(),
             UnknownReason::SplitLimit => "theory split-loop budget was exhausted".to_string(),
             UnknownReason::ExpressionSplit => {
                 "an expression split was required but not available".to_string()
@@ -745,19 +752,43 @@ impl Executor {
         // wrong SAT (#quant-alt-WS). Safe in nested alternation re-entries because
         // solve_current_assertions_with_quantifier_support now clears the
         // defer_model_validation flag on entry.
-        self.simplify_vacuous_quantifiers();
-        // Deep QE pre-pass (#qe-prepass): equivalence-preserving quantifier
-        // elimination (Cooper for Int, Loos-Weispfenning for Real) with binder
+        // Vacuity elimination is semantically exact and is needed for SAT
+        // completeness (notably an outer arithmetic forall containing an inner
+        // forall whose binder disappeared after const-array folding).  Its
+        // current producer does not yet emit the derivation connecting a
+        // collapsed root to the authored quantifier, so keep the transformation
+        // for solving but mark only the UNSAT artifact lane incomplete when it
+        // actually changes the assertion vector. SAT still passes through its
+        // independent total-model certificate.
+        if self.produce_proofs_enabled() {
+            let before = self.ctx.assertions.clone();
+            self.simplify_vacuous_quantifiers();
+            if self.ctx.assertions != before {
+                self.quantified_proof_translation_incomplete = true;
+            }
+        } else {
+            self.simplify_vacuous_quantifiers();
+        }
+        // Deep QE pre-pass (#qe-prepass): candidate quantifier elimination
+        // (Cooper for Int, Loos-Weispfenning for Real) with binder
         // descent, ∀-duality, and capped ∃-over-∨ distribution. Adopts a
         // rewrite ONLY when the assertion becomes fully quantifier-free
         // (all-or-nothing); every refusal keeps the original TermId, so
         // out-of-fragment problems flow into the quantifier loop unchanged.
-        // Each individual elimination is gated by the engines' independent
-        // fail-closed equivalence self-checks. In-place and length-preserving
+        // Each individual elimination is screened by the engines' independent
+        // bounded differential checks. In-place and length-preserving
         // (`&mut [TermId]`), so the scope-frame `assertion_count` invariant
         // holds on every exit path, including the quantifier-loop restore
         // whose snapshot is taken after this point.
-        if has_quantified_assertions {
+        // The QE engines test candidate equivalence by bounded sampling; this
+        // neither proves all free-variable valuations nor emits an Alethe
+        // derivation from the authored
+        // quantified root to the replacement.  Mandatory UNSAT publication
+        // therefore cannot let a QE replacement become a free `Assume` in the
+        // proof.  Keep the original quantified formula whenever proof tracking
+        // is active; the downstream instantiation lanes can then derive their
+        // ground instances with `forall_inst`.
+        if has_quantified_assertions && !self.produce_proofs_enabled() {
             crate::executor::qe_prepass::deep_qe(
                 &mut self.ctx.terms,
                 &mut self.ctx.assertions,
@@ -777,7 +808,11 @@ impl Executor {
         // over-degrade a genuine SAT or touch a `∀x∃y.P` alternation (body has a
         // quantifier ⇒ excluded) or an array-extensionality universal (free array
         // symbol ⇒ excluded). Gated on the presence of quantified assertions.
-        if has_quantified_assertions {
+        // This semantic precheck proves falsity with a disposable model probe,
+        // but it does not yet translate the concrete witness into the outer
+        // proof.  In proof-authorized solves, let the ordinary instantiation
+        // pipeline derive the same witness from the authored `forall` instead.
+        if has_quantified_assertions && !self.is_producing_proofs() {
             let (precheck_category, _) = self.detect_logic_category(&self.ctx.assertions);
             if let Some(precheck) = self.closed_universal_validity_precheck(precheck_category) {
                 self.ctx.assertions = scope_tracked_assertions;
@@ -825,7 +860,7 @@ impl Executor {
         // restores state untouched and the normal solve proceeds with its own
         // verdict. Runs only when quantifiers are present (fast-declines otherwise).
         if has_quantified_assertions {
-            if let Some(sat) = self.dt_cert_resequence_probe() {
+            if let Some(evidence) = self.dt_cert_resequence_probe(solve_input_assertions) {
                 // The certificate is the sole grant authority — it re-verified the
                 // WHOLE snapshot (grounds + every forall route) against the single
                 // completed model M'. The candidate left in `last_model` only
@@ -840,7 +875,6 @@ impl Executor {
                 // `emit_sat_verdict` gate.
                 self.defer_model_validation = false;
                 self.last_model_validated = true;
-                self.dt_cert_grant_active = true;
                 self.last_unknown_reason = None;
                 self.ctx.assertions = scope_tracked_assertions;
                 if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
@@ -850,7 +884,13 @@ impl Executor {
                     self.incr_bv_state = incr_bv_state;
                     self.quantifier_manager = quantifier_manager;
                 }
-                return sat;
+                if !self.install_dt_sat_authority(evidence) {
+                    self.last_model = None;
+                    self.last_model_validated = false;
+                    self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
+                    return Ok(SolveResult::Unknown);
+                }
+                return Ok(SolveResult::Sat);
             }
             // The scoped DT certificate probe runs the same singleton-sort
             // closure as ordinary dispatch. If that closure hit a full resource
@@ -1151,7 +1191,7 @@ impl Executor {
 
     /// M4 DT-MBQI-Sat ground-core RE-SEQUENCING probe.
     ///
-    /// Returns `Some(Ok(Sat))` iff, with `AY_DT_CERT=on`, the snapshot is the
+    /// Returns checked SAT authority iff, with `AY_DT_CERT=on`, the snapshot is the
     /// DT-MBQI-sat shape (a top-level datatype-binder `forall` is present), its
     /// GROUND CORE (the quantifier-free assertions) is satisfiable, AND
     /// [`Executor::try_dt_model_sat_certificate`] certifies EVERY `forall`
@@ -1166,7 +1206,10 @@ impl Executor {
     /// the gate is unset (the env check is the first statement) or when no
     /// datatype-binder forall is present (fast decline). Fail-closed on every
     /// other path: state is restored and `None` returned.
-    fn dt_cert_resequence_probe(&mut self) -> Option<Result<SolveResult>> {
+    fn dt_cert_resequence_probe(
+        &mut self,
+        certification_roots: &[TermId],
+    ) -> Option<CheckedDtSatAuthority> {
         // Gate: byte-identical unless AY_DT_CERT=on.
         if !matches!(std::env::var("AY_DT_CERT").ok().as_deref(), Some("on")) {
             return None;
@@ -1274,9 +1317,15 @@ impl Executor {
             self.last_model = None;
             return None;
         }
-        // Certify the FULL snapshot against the completed candidate. The cert is
-        // the sole grant authority and re-verifies every assertion under M'.
-        let cert = self.try_dt_model_sat_certificate(&snapshot, category);
+        // Certify the exact pre-preprocessing query obligation against the
+        // completed candidate. `snapshot` is only the working window used to
+        // produce that candidate; preprocessing may have replaced or removed
+        // authored roots. Binding authority to `snapshot` would therefore
+        // either fail the publication gate or, worse, lend a certificate for a
+        // narrower formula to the original query. The certificate must
+        // positively re-check the same ordered roots that the independent gate
+        // will consume.
+        let cert = self.try_dt_model_sat_certificate(certification_roots, category);
         if dbg {
             eprintln!(
                 "c CERT/dt-mbqi-sat re-sequence: ground-core={} category={category:?} grant={}",
@@ -1284,20 +1333,17 @@ impl Executor {
                 cert.is_some()
             );
         }
-        if cert.is_some() {
-            // Make the certified foralls DEFER-eligible in the mandated
-            // quantified-model gate: strip the printed function-table
-            // interpretation of every arity>0 head occurring in a certified
-            // forall from the emitted candidate. The candidate only solves the
-            // ground core, so those tables' arbitrary defaults do not witness the
-            // universals; a blind nested re-check against them would spuriously
-            // refute a genuine model. The certificate already validated every
-            // forall against the completed M'. Per-application GROUND pins (which
-            // the strict / independent / authoritative gates read) are
-            // authoritative over the arg-keyed tables and survive, so ground
-            // validation is unaffected.
-            self.dt_cert_strip_forall_uf_tables(&snapshot);
-            return Some(Ok(SolveResult::Sat));
+        if let Some(evidence) = cert {
+            // Remove only stale raw EUF tables for heads occurring in the
+            // certified foralls.  The ground-core candidate's arbitrary raw
+            // defaults are not witnesses for those universals and must not
+            // override the completed model.  Conversely, an exact typed total
+            // interpretation installed by the certificate *is* the proved M′
+            // and must survive this cleanup for evaluation and model output.
+            // Per-application ground pins survive as well, so the strict and
+            // independent validation gates retain their committed evidence.
+            self.dt_cert_strip_forall_uf_tables(certification_roots);
+            return Some(evidence);
         }
         // Declined: restore verdict-shaping state and fall through to the normal
         // (possibly divergent) solve with its own conclusion.
@@ -1324,6 +1370,27 @@ impl Executor {
     /// (via `finalize_sat_model_validation`) but does not carry compile-time
     /// verification provenance. Part of #5787 (Phase 6).
     pub(crate) fn check_sat(&mut self) -> Result<SolveResult> {
+        self.check_sat_with_authority(None)
+    }
+
+    /// Run one caller-authored plain hard query with its linear query permit.
+    ///
+    /// The shared implementation keeps the permit alive until solve controls
+    /// and the per-call deadline are installed, immediately before any
+    /// preprocessing or solver mutation. Generic/internal callers can enter the
+    /// same implementation only through [`Self::check_sat`], which passes
+    /// `None` and cannot infer authority from call depth or assertion shape.
+    pub(in crate::executor) fn check_sat_with_authored_query(
+        &mut self,
+        permit: AuthoredPlainHardQueryPermit,
+    ) -> Result<SolveResult> {
+        self.check_sat_with_authority(Some(permit))
+    }
+
+    fn check_sat_with_authority(
+        &mut self,
+        authority: Option<AuthoredPlainHardQueryPermit>,
+    ) -> Result<SolveResult> {
         // Internal probes share this entry point, so retain their surrounding
         // state but never let an earlier certificate survive a new-solve error.
         self.last_sat_certificate = None;
@@ -1364,12 +1431,25 @@ impl Executor {
         self.validate_bv_cnf_export_roots(&dump_roots)?;
         let solve_started_at = Instant::now();
         let previous_deadline = self.install_timeout_deadline_for_call();
+        // This is the final read-only authority boundary before preprocessing
+        // and theory solving may rewrite assertions or extend the term store.
+        // A stale capability loses only the projection opportunity; the normal
+        // solver remains available and must still pass the SAT chokepoint.
+        let authority = authority.filter(|permit| permit.is_current(self));
+        #[cfg(test)]
+        {
+            self.last_authored_query_authority_seen = authority.is_some();
+        }
+        // An explicit CNF export describes the ordinary bit-blast transaction;
+        // the constructive quantified lane has no matching CNF artefact and
+        // therefore declines while an export is requested.
+        let projection_authority = (!bv_cnf_dump::requested()).then_some(authority).flatten();
         // Guard against small thread stacks: grow once here so inner theory
         // guards (NRA, model eval, proof checking) don't repeatedly mmap/munmap
         // their own segments. This fixes #6783 where repeated stacker growth
         // cycles caused extreme slowdown on 2 MiB threads in debug mode.
         let result = stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
-            self.check_sat_guarded()
+            self.check_sat_guarded(projection_authority)
         });
         self.restore_timeout_deadline_after_call(previous_deadline);
         self.record_z3_resource_statistics(solve_started_at);
@@ -1607,23 +1687,29 @@ impl Executor {
         .fold(0_u64, u64::saturating_add)
     }
 
-    /// Run check-sat with an additional cooperative interrupt callback (#622).
+    /// Run one complete solve/publication operation under a per-call callback.
     ///
-    /// The callback is polled by a lightweight watchdog and reflected into the
-    /// same interrupt flag used by `make_should_stop()`, so existing SAT/theory
-    /// interrupt checks observe it without special-case plumbing. The callback
-    /// should be cheap and non-blocking.
-    pub(crate) fn check_sat_interruptible<F>(&mut self, should_stop: F) -> Result<SolveResult>
+    /// The caller chooses the transaction boundary through `operation`. Native
+    /// `check_sat_interruptible` deliberately includes mandatory UNSAT
+    /// certification in that closure, so the callback's local interrupt flag
+    /// and watchdog cannot disappear between solving and publication.
+    pub(crate) fn with_interruptible_publication_controls<F, G>(
+        &mut self,
+        should_stop: F,
+        operation: G,
+    ) -> Result<SolveResult>
     where
         F: Fn() -> bool + Send + 'static,
+        G: FnOnce(&mut Self) -> Result<SolveResult>,
     {
         let previous_interrupt = self.solve_interrupt.clone();
         let previous_deadline = self.solve_deadline.get();
+        let mut callback = Some(should_stop);
         let local_interrupt = Arc::new(AtomicBool::new(
             previous_interrupt
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                || should_stop(),
+                || callback.as_ref().is_some_and(|should_stop| should_stop()),
         ));
         let done = Arc::new(AtomicBool::new(false));
 
@@ -1632,28 +1718,72 @@ impl Executor {
         // `local_interrupt` state above, and the default `Z3_solver_check` FFI
         // path (the only path the wasm build exercises) never installs one.
         #[cfg(not(target_arch = "wasm32"))]
-        if !local_interrupt.load(Ordering::Relaxed) {
+        let watchdog = if !local_interrupt.load(Ordering::Relaxed) {
             let poll_done = Arc::clone(&done);
             let poll_interrupt = Arc::clone(&local_interrupt);
             let poll_previous_interrupt = previous_interrupt.clone();
-            thread::spawn(move || {
-                while !poll_done.load(Ordering::Relaxed) {
+            let should_stop = callback
+                .take()
+                .expect("the callback moves to at most one watchdog");
+            Some(thread::spawn(move || {
+                loop {
                     if poll_previous_interrupt
                         .as_ref()
                         .is_some_and(|flag| flag.load(Ordering::Relaxed))
                         || should_stop()
                     {
                         poll_interrupt.store(true, Ordering::Relaxed);
-                        return;
+                        break;
+                    }
+                    // Poll first, then observe completion. Consequently a join
+                    // after setting `done` includes one last callback sample
+                    // from every watchdog loop that began before completion.
+                    if poll_done.load(Ordering::Relaxed) {
+                        break;
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
-            });
-        }
+                should_stop
+            }))
+        } else {
+            None
+        };
 
-        self.set_solve_controls(Some(local_interrupt), previous_deadline);
-        let result = self.check_sat();
+        self.set_solve_controls(Some(Arc::clone(&local_interrupt)), previous_deadline);
+        let result = operation(self);
+        // Linearize completion before the final admission check. Joining makes
+        // every callback poll that started before `done` visible in the local
+        // flag; a callback condition that changes only afterward belongs to the
+        // next query, not this already completed transaction.
         done.store(true, Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(watchdog) = watchdog {
+            match watchdog.join() {
+                Ok(should_stop) => callback = Some(should_stop),
+                Err(_) => {
+                    // A panicking cooperative callback cannot authorize a
+                    // definite result. Treat it as a fired interrupt.
+                    local_interrupt.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        // Sample once synchronously after the joined linearization point. This
+        // deterministically observes a stop condition flipped by `operation`
+        // immediately before it returned, even if the watchdog had just gone
+        // to sleep before `done` was stored.
+        if callback
+            .as_ref()
+            .is_some_and(|should_stop| catch_unwind(AssertUnwindSafe(should_stop)).unwrap_or(true))
+        {
+            local_interrupt.store(true, Ordering::Relaxed);
+        }
+        let result = match result {
+            Ok(proposed) => Ok(self.decline_definite_publication_on_external_stop(proposed)),
+            Err(error) => match self.finalize_external_stop_for_publication() {
+                Some(unknown) => Ok(unknown),
+                None => Err(error),
+            },
+        };
         self.set_solve_controls(previous_interrupt, previous_deadline);
         result
     }
@@ -2193,16 +2323,14 @@ impl Executor {
             return false;
         }
 
-        // 4. Re-solve the residue in isolation through the ORDINARY pipeline,
-        //    so it gets the full existing quantifier machinery (E-matching,
-        //    CEGQI, MBQI, the AUFLIRA lane). No parallel implementation: the
-        //    whole point is that the residue is a plain non-nested problem the
-        //    engine already handles.
+        // 4. Re-solve the exact residue on a disposable Context clone through
+        //    the ordinary public pipeline. A bare repeated UNSAT is not
+        //    authority: the clone must emit a strict authored-root proof
+        //    certificate, and the resulting non-cloneable token must still
+        //    match this outer query/source/root/term snapshot when consumed.
+        //    This is what prevents a repeatable wrong-UNSAT engine path from
+        //    laundering the distrusted full-problem verdict through the rescue.
         //
-        //    `check_sat_guarded` mutates far more state than a category solve,
-        //    so every field it can leave behind is snapshotted here and
-        //    restored unconditionally below. A leak would corrupt the OUTER
-        //    verdict, which is the one real risk this rescue carries.
         // SESSION budget gate: an incremental script has many check-sats, and
         // a residue that failed once will usually fail again. Without this the
         // aggregate is unbounded — measured at an 85x wall-clock blowup for
@@ -2211,101 +2339,23 @@ impl Executor {
         if self.residue_probe_failures >= RESIDUE_MAX_FAILURES {
             return false;
         }
-        self.in_nested_array_residue_probe = true;
-
-        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, residue);
-        let saved_theory_state = self.incr_theory_state.take();
-        let saved_bv_state = self.incr_bv_state.take();
-        let saved_model = self.last_model.take();
-        let saved_model_validated = self.last_model_validated;
-        let saved_validation_stats = self.last_validation_stats.take();
-        let saved_unknown_reason = self.last_unknown_reason;
-        let saved_result = self.last_result.take();
-        let saved_statistics = std::mem::take(&mut self.last_statistics);
-        let saved_proof = self.last_proof.take();
-        let saved_sat_certificate = self.last_sat_certificate.take();
-        let saved_defer = self.defer_model_validation;
-        let saved_skip_model_eval = self.skip_model_eval;
-        let saved_support_axioms = std::mem::take(&mut self.active_support_axioms);
-        let saved_quantifier_manager = self.quantifier_manager.take();
-        let saved_original_had_quantifiers = self.original_problem_had_quantifiers;
-        let saved_bv_drat_self_cert = self.last_bv_drat_self_cert;
-        let saved_phase = self.active_solve_phase.take();
-        let saved_cost_center = self.active_solve_cost_center.take();
-        let saved_deadline = self.solve_deadline.get();
-        let saved_backstop_installed = self.quantifier_deadline_backstop_installed;
-        self.defer_model_validation = false;
-        self.solve_deadline
-            .set(Self::residue_sub_deadline(saved_deadline).or(saved_deadline));
-        // Latch the quantified-solve wall-clock backstop CLOSED for the probe.
-        // It is a one-shot the outer call normally consumed already, but on a
-        // ground outer solve it would still be armed — and it multiplies the
-        // live deadline by 4, which is exactly the sub-deadline this probe just
-        // installed. The probe is optional extra work; it does not get an
-        // extension.
-        self.quantifier_deadline_backstop_installed = true;
-
-        // Same stack-growth guard the public entry uses: the residue runs the
-        // same deeply recursive pipeline (#6783).
-        //
-        // PANIC-SAFE. The restores below are plain statements, so an unwind out
-        // of `check_sat_guarded` would sail straight past every one of them and
-        // leave `ctx.assertions` PERMANENTLY set to the residue — every
-        // nested-array conjunct deleted. That is not hypothetical here:
-        // `panic = "unwind"` is deliberate (Cargo.toml), `run.rs` wraps every
-        // executed command in `catch_unwind`, prints `unknown`, and CONTINUES
-        // on the same executor, and `api/solving/panic_safe.rs` hands the
-        // caller a still-usable Solver. So a panic on the residue — a brand-new
-        // query shape — would silently weaken the problem and the NEXT
-        // check-sat could answer `sat` for an unsatisfiable input.
-        //
-        // Catch here, restore unconditionally, then re-raise: the same pattern
-        // `with_isolated_incremental_state` (theories/incremental_scope.rs)
-        // already uses for exactly these swaps.
-        let probe = catch_unwind(AssertUnwindSafe(|| {
-            stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
-                self.check_sat_guarded()
-            })
-        }));
-
-        self.solve_deadline.set(saved_deadline);
-        self.quantifier_deadline_backstop_installed = saved_backstop_installed;
-        self.ctx.assertions = saved_assertions;
-        self.incr_theory_state = saved_theory_state;
-        self.incr_bv_state = saved_bv_state;
-        self.last_model = saved_model;
-        self.last_model_validated = saved_model_validated;
-        self.last_validation_stats = saved_validation_stats;
-        self.last_unknown_reason = saved_unknown_reason;
-        self.last_result = saved_result;
-        self.last_statistics = saved_statistics;
-        self.last_proof = saved_proof;
-        self.last_sat_certificate = saved_sat_certificate;
-        self.defer_model_validation = saved_defer;
-        self.skip_model_eval = saved_skip_model_eval;
-        self.active_support_axioms = saved_support_axioms;
-        self.quantifier_manager = saved_quantifier_manager;
-        self.original_problem_had_quantifiers = saved_original_had_quantifiers;
-        self.last_bv_drat_self_cert = saved_bv_drat_self_cert;
-        self.active_solve_phase = saved_phase;
-        self.active_solve_cost_center = saved_cost_center;
-        // The caller already CONSUMED this marker (`mem::take`) before dispatching
-        // here, so its post-take value is `false`. The probe re-arms it whenever
-        // its own solve hits the store-flat reduction; clear it again so a
-        // residue's authorization can never leak into a later public query.
-        self.nested_array_row_reduction_unsat = false;
-        self.ho_seq_unfold_array_free_unsat = false;
-        self.in_nested_array_residue_probe = false;
-
-        // Every field is restored above; only now is it safe to re-raise.
-        let probe = match probe {
-            Ok(result) => result,
-            Err(payload) => resume_unwind(payload),
+        let outer_deadline = self.solve_deadline.get();
+        let Some(probe_deadline) = Self::residue_sub_deadline(outer_deadline).or(outer_deadline)
+        else {
+            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
+            return false;
         };
-
-        // Accept ONLY a definitive refutation. `Sat`, `Unknown`, an error, or a
-        // budget-exhausted probe all decline and fall through to the degrade.
-        let refuted = matches!(probe, Ok(ref solve_result) if solve_result.is_unsat());
+        let remaining = probe_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
+            return false;
+        }
+        let budget_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let refuted = self
+            .checked_exact_unsat_solve(residue.clone(), budget_ms)
+            .is_some_and(|checked| checked.consume(self, &residue));
         if !refuted {
             self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
         }
@@ -2364,7 +2414,10 @@ impl Executor {
     }
 
     /// Inner check-sat after stack guard. Separated to keep `check_sat` small.
-    fn check_sat_guarded(&mut self) -> Result<SolveResult> {
+    fn check_sat_guarded(
+        &mut self,
+        projection_authority: Option<AuthoredPlainHardQueryPermit>,
+    ) -> Result<SolveResult> {
         self.clear_active_solve_phase();
         // D1 lazy-extensionality shadow: reset the per-solve EAGER witness log
         // before any array axioms are emitted for this check-sat.
@@ -2388,17 +2441,12 @@ impl Executor {
             self.last_result = Some(SolveResult::Unknown);
             self.last_model = None;
             self.last_proof = None;
+            self.clear_finite_enum_proof_state();
             return Ok(SolveResult::Unknown);
         }
         self.last_model_validated = false;
         self.last_validation_stats = None;
-        self.dt_cert_grant_active = false;
-        self.finite_table_cert_grant_active = false;
-        self.const_interp_cert_grant_active = false;
-        self.mbqi_sat_cert_grant_active = false;
-        self.mbqi_sat_cert_pins.clear();
-        self.finite_table_cert_pending_witness = None;
-        self.const_interp_cert_witness.clear();
+        self.clear_quantified_sat_authority();
         self.model_validation_delegated_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
@@ -2462,6 +2510,91 @@ impl Executor {
         self.cegar_rounds_remaining = 32;
         self.cegar_pending_lemma = None;
         self.cegar_emitted_lemmas.clear();
+
+        // The constructive quantified path shares every public preflight and
+        // per-solve reset above and every internal-state reset below. Checking
+        // authority before these resets would let model/proof/substitution state
+        // from an earlier query leak into the emitted witness even though the
+        // source/query epoch itself was fresh.
+        if let Some(evidence) = self.try_authorize_current_query_exact_forall_uf_ground_unsat() {
+            // This theorem is established directly from the immutable authored
+            // roots before quantifier preprocessing can replace them.  Reset
+            // solve-local artifacts only after the sealed evidence exists;
+            // emission repeats its complete epoch/root/entry/snapshot audit.
+            if self.prepare_check_sat_internal_state() {
+                self.finalize_array_ext_shadow();
+                self.finalize_unknown_diagnostics();
+                return Ok(SolveResult::Unknown);
+            }
+            let result = self.emit_checked_exact_forall_uf_ground_unsat(evidence);
+            self.finalize_array_ext_shadow();
+            self.finalize_unknown_diagnostics();
+            return Ok(result);
+        }
+        if let Some(permit) = projection_authority {
+            if self.prepare_check_sat_internal_state() {
+                self.finalize_array_ext_shadow();
+                self.finalize_unknown_diagnostics();
+                return Ok(SolveResult::Unknown);
+            }
+            if let Some(evidence) = self.try_authorize_current_query_exact_forall_exists_unsat() {
+                let result = self.emit_checked_exact_forall_exists_unsat(evidence);
+                self.finalize_array_ext_shadow();
+                self.finalize_unknown_diagnostics();
+                return Ok(result);
+            }
+            let permit = match self.try_authorize_exact_exists_decision(permit) {
+                ExactExistsDecision::Sat(evidence) => {
+                    let result = self.emit_checked_exact_exists_sat(evidence)?;
+                    self.finalize_array_ext_shadow();
+                    self.finalize_unknown_diagnostics();
+                    return Ok(result);
+                }
+                ExactExistsDecision::Unsat(evidence) => {
+                    let result = self.emit_checked_exact_exists_unsat(evidence);
+                    self.finalize_array_ext_shadow();
+                    self.finalize_unknown_diagnostics();
+                    return Ok(result);
+                }
+                ExactExistsDecision::Declined(permit) => permit,
+            };
+            match self.try_authorize_projection_sat(permit) {
+                ProjectionSatAttempt::Checked(evidence) => {
+                    let result = self.emit_checked_projection_sat(*evidence)?;
+                    self.finalize_array_ext_shadow();
+                    self.finalize_unknown_diagnostics();
+                    return Ok(result);
+                }
+                ProjectionSatAttempt::Declined => {}
+                ProjectionSatAttempt::Stopped => {
+                    if self.should_abort_theory_loop() {
+                        self.finalize_array_ext_shadow();
+                        self.finalize_unknown_diagnostics();
+                        return Ok(SolveResult::Unknown);
+                    }
+                    // `Stopped` is reserved for the live external
+                    // deadline/interrupt/memory callback. If a future checker
+                    // uses it for a local cap, retain ordinary solving rather
+                    // than silently losing completeness.
+                }
+            }
+        } else if let Some(evidence) = self.try_authorize_current_query_exact_forall_exists_unsat()
+        {
+            // Generic text/API entrypoints do not own the linear constructive
+            // SAT permit, but their public UNSAT epoch still freezes an exact
+            // authored obligation. Reset solve-local state only after the
+            // independent source checker recognizes that obligation, then let
+            // emission recheck the evidence and complete scope.
+            if self.prepare_check_sat_internal_state() {
+                self.finalize_array_ext_shadow();
+                self.finalize_unknown_diagnostics();
+                return Ok(SolveResult::Unknown);
+            }
+            let result = self.emit_checked_exact_forall_exists_unsat(evidence);
+            self.finalize_array_ext_shadow();
+            self.finalize_unknown_diagnostics();
+            return Ok(result);
+        }
         let result = self.cegar_refine_solve()?;
         if result.is_unsat() && self.produce_proofs_enabled() && self.last_proof.is_none() {
             self.build_unsat_proof();
@@ -2495,9 +2628,10 @@ impl Executor {
                 );
             }
         }
-        // SINGLE SAT-EMISSION CHOKEPOINT (#sat-chokepoint): route the proposed
-        // verdict through `emit_sat_verdict`, the ONLY place a public `Sat` is
-        // minted. It defaults unconstrained constants, then runs the strict,
+
+        // ORDINARY SAT-EMISSION CHOKEPOINT (#sat-chokepoint): route the proposed
+        // search verdict through `emit_sat_verdict`. It defaults unconstrained
+        // constants, then runs the strict,
         // independent, and authoritative-failclosed gates in sequence and mints
         // the SatCertificate. Non-`Sat` verdicts pass through untouched. This is
         // the exact strict->independent sequence that previously lived inline
@@ -2691,6 +2825,7 @@ impl Executor {
                 self.last_unknown_reason = None;
             } else {
                 self.last_proof = None;
+                self.clear_finite_enum_proof_state();
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.record_model_validation_unknown_diagnostic(
                     "non-string sequence UNSAT not corroborated by a proof-producing re-solve",
@@ -2760,6 +2895,7 @@ impl Executor {
         debug_assert!(
             !self.last_result.as_ref().is_some_and(SolveResult::is_unsat)
                 || self.last_proof.is_some()
+                || self.last_unsat_proof_reconstruction_suppressed
                 || !self.produce_proofs_enabled(),
             "BUG: check_sat returned UNSAT without populating last_proof (proofs enabled)"
         );
@@ -2827,6 +2963,24 @@ impl Executor {
         self.solve_deadline.set(deadline);
     }
 
+    /// Return the currently installed absolute solve deadline.
+    ///
+    /// This crate-private view lets the native API preserve an enclosing
+    /// executor control while it installs one combined solve/publication
+    /// envelope. Relative SMT-LIB `:timeout` configuration remains available
+    /// separately through [`Self::timeout`].
+    pub(crate) fn current_solve_deadline(&self) -> Option<Instant> {
+        self.solve_deadline.get()
+    }
+
+    /// Select whether quantified solving may relax the installed deadline.
+    pub(in crate::executor) fn set_quantifier_deadline_policy(
+        &mut self,
+        policy: super::QuantifierDeadlinePolicy,
+    ) {
+        self.quantifier_deadline_policy = policy;
+    }
+
     /// Set a relative timeout for subsequent executor solve commands.
     ///
     /// The timeout is converted into a fresh deadline at each `check-sat` or
@@ -2852,6 +3006,7 @@ impl Executor {
     }
 
     /// Clear solve controls after a check-sat call completes.
+    #[cfg(test)]
     pub(crate) fn clear_solve_controls(&mut self) {
         self.solve_interrupt = None;
         self.solve_deadline.set(None);
@@ -2868,6 +3023,24 @@ impl Executor {
     fn timeout_deadline_from_now(&self) -> Option<Instant> {
         let now = Instant::now();
         self.timeout.and_then(|timeout| now.checked_add(timeout))
+    }
+
+    /// Install one absolute deadline for a complete public decision command.
+    ///
+    /// The ordinary solve entry temporarily relaxes quantified deadlines into
+    /// a hang-protection backstop, then restores this exact value. Keeping the
+    /// nominal deadline live at the command layer ensures post-solve UNSAT
+    /// certification uses the caller's remaining time and never starts a fresh
+    /// relative-timeout window.
+    pub(super) fn install_command_publication_deadline(&mut self) -> Option<Instant> {
+        let previous_deadline = self.solve_deadline.get();
+        if self.timeout.is_some() {
+            self.solve_deadline.set(Self::earliest_deadline(
+                previous_deadline,
+                self.timeout_deadline_from_now(),
+            ));
+        }
+        previous_deadline
     }
 
     pub(super) fn install_timeout_deadline_for_call(&mut self) -> Option<Instant> {
@@ -2894,7 +3067,9 @@ impl Executor {
         // without a timeout precisely because they want a proof, so this is the
         // executor-side twin of the ay-chc solve_init default — every solve path
         // is covered. Far above any legitimate solve time; only kills a true spin.
-        if self.solve_deadline.get().is_none() {
+        if self.solve_deadline.get().is_none()
+            && self.quantifier_deadline_policy != super::QuantifierDeadlinePolicy::Exact
+        {
             const DEFAULT_SAFETY_DEADLINE: Duration = Duration::from_mins(5);
             self.solve_deadline
                 .set(Instant::now().checked_add(DEFAULT_SAFETY_DEADLINE));
@@ -2994,7 +3169,9 @@ impl Executor {
         /// simply too hard, and the fail-closed Unknown is the right result.
         const QUANTIFIED_BACKSTOP_MAX_EXTRA: Duration = Duration::from_mins(3);
 
-        if self.quantifier_deadline_backstop_installed {
+        if self.quantifier_deadline_policy == super::QuantifierDeadlinePolicy::Exact
+            || self.quantifier_deadline_backstop_installed
+        {
             return;
         }
         self.quantifier_deadline_backstop_installed = true;
@@ -3176,22 +3353,25 @@ impl Executor {
     // Internal check-sat (logic routing)
     // ========================================================================
 
-    /// Internal check-sat that also stores the model
-    pub(super) fn check_sat_internal(&mut self) -> Result<SolveResult> {
+    /// Clear all per-solve internal state before either the ordinary search or
+    /// the independently checked constructive projection lane runs.
+    ///
+    /// Returns `true` when a live external stop condition already requires an
+    /// immediate `Unknown`.
+    pub(in crate::executor) fn prepare_check_sat_internal_state(&mut self) -> bool {
         // Clear previous state. Defer last_model clear until after process_quantifiers()
         // which reads last_model.euf_model for congruence-aware E-matching (Phase B1b #3325).
         self.last_assumptions = None;
         self.last_assumption_core = None;
-        // The BV-MBQI entailment certificate authorises a Sat that would
-        // otherwise fail closed, so it must never survive from a previous
-        // `check_sat`: a stale `true` would wave through an unrelated Sat at the
-        // post-restore gate.
-        self.bv_quantifier_full_domain_proof = false;
         self.last_core_term_to_name = None;
         self.last_proof = None;
+        self.clear_finite_enum_proof_state();
+        self.last_unsat_proof_reconstruction_suppressed = false;
+        self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
@@ -3238,12 +3418,11 @@ impl Executor {
         self.defer_counterexample_minimization = false;
         self.last_model_validated = false;
         self.last_validation_stats = None;
-        self.dt_cert_grant_active = false;
-        self.finite_table_cert_grant_active = false;
-        self.const_interp_cert_grant_active = false;
-        self.mbqi_sat_cert_grant_active = false;
-        self.mbqi_sat_cert_pins.clear();
-        self.const_interp_cert_witness.clear();
+        // Quantified result authority is solve-local. Internal retries enter
+        // here too, so revoke the parked model and pins as well as every grant;
+        // otherwise a new default-row grant can consume an earlier attempt's
+        // finite-table witness.
+        self.clear_quantified_sat_authority();
         self.model_validation_delegated_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
@@ -3260,7 +3439,7 @@ impl Executor {
         self.proof_check_result = None;
 
         if self.should_abort_theory_loop() {
-            return Ok(SolveResult::Unknown);
+            return true;
         }
 
         // Sync proof tracker with :produce-proofs option
@@ -3274,6 +3453,15 @@ impl Executor {
         // Reset proof content for new solving session (keep scope tracking
         // for incremental push/pop balance) (#5992)
         self.proof_tracker.reset_session();
+
+        false
+    }
+
+    /// Internal check-sat that also stores the model.
+    pub(super) fn check_sat_internal(&mut self) -> Result<SolveResult> {
+        if self.prepare_check_sat_internal_state() {
+            return Ok(SolveResult::Unknown);
+        }
 
         // Scanned BEFORE the empty-hard-assertion shortcut below: an objective
         // or a soft constraint is part of the public problem even when nothing
@@ -3333,50 +3521,37 @@ impl Executor {
         // original assertions, which every preprocessing pass in the helper
         // must (and does) preserve model-for-model.
         let scope_tracked_assertions = self.ctx.assertions.clone();
-        // (#selfcert-authored) This snapshot — taken BEFORE the first in-place
-        // preprocessing pass — is exactly the set of assertions the USER
-        // authored for this check-sat. Publish it for the fail-closed
-        // `--self-check` SAT gate, which must certify the emitted model against
-        // the user's formula rather than against the solver's internal,
-        // proof-mode assertion window. Save/restore so a nested `check_sat_internal`
-        // (retry or probe solve) restores the outer window on the way out and can
-        // never lend its narrower snapshot to the outer verdict. Only paid for
-        // under `--self-check`; otherwise the field stays `None` (fails closed).
-        // ALWAYS publish the authored snapshot, not only under `--self-check`.
+        // The mandatory independent model gate must always see this exact
+        // AUTHORED window, including in default mode. Falling back to the
+        // post-preprocessing `ctx.assertions` let an eliminated assertion vanish
+        // from validation entirely: a wrong SAT was reported as
+        // `confirmed-sat` after the gate evaluated zero roots. Keep this
+        // authority in its own slot so installing it does not also opt default
+        // mode into self-check-only completion/model-construction behavior.
         //
-        // The comment above says the field "stays `None` (fails closed)" in
-        // default mode. It does NOT fail closed. `independent_gate_query_roots`
-        // (model/independent_gate.rs:55) reads this field IF SET and otherwise
-        // falls back to `self.ctx.assertions` — the POST-PREPROCESSING window —
-        // so in default mode an assertion that preprocessing eliminated never
-        // reaches the model gate at all. That is fail-OPEN: the gate certifies a
-        // model against a formula the user did not write.
-        //
-        // Measured consequence, and the reason this is not hypothetical: the
-        // wrong SAT fixed in the two preceding commits published
-        // `:model_check_gate.result "confirmed-sat"` with `AY_G3_GATE_DUMP`
-        // reporting `n_false=0 n_uneval=0` — the gate evaluated ZERO assertions —
-        // and a published model of literally `(model )`. The gate's own verdict
-        // function is sound (empty roots and unevaluable each yield
-        // `CannotConfirm`); it was being handed the wrong roots.
-        //
-        // Cost is one extra `Vec<TermId>` clone per check-sat: the snapshot is
-        // already taken on the line above for `scope_tracked_assertions`.
-        //
-        // COMPLETENESS COST, stated rather than hidden: the gate must now confirm
-        // the AUTHORED form, which it may evaluate less well than the
-        // preprocessed one. Any such case degrades `Sat` -> `Unknown`, never the
-        // reverse — the gate cannot make a verdict unsound, only decline to
-        // certify it. An uncertified `sat` is exactly what shipped a wrong answer
-        // today, so that is the correct direction to fail.
-        //
-        // Save/restore is unchanged, so a nested probe or retry solve still
-        // cannot lend its narrower window to the outer verdict.
-        let saved_authored = self
-            .self_check_authored_assertions
+        // The gate may evaluate an authored form less completely than its
+        // preprocessed equivalent. That can only degrade `Sat` to `Unknown`; it
+        // cannot manufacture a wrong answer. Nested probe/retry solves replace
+        // this slot temporarily and restore the outer roots on return.
+        let saved_independent_gate_authored = self
+            .independent_gate_authored_assertions
             .replace(scope_tracked_assertions.clone());
+
+        // (#selfcert-authored) The fail-closed `--self-check` SAT gate, its
+        // model-completion support, and strict proof checking retain their
+        // existing conditional snapshot. Default mode intentionally leaves this
+        // slot empty; the always-on independent gate uses the separate slot
+        // above. Save/restore prevents a nested solve from lending a narrower
+        // self-check premise window to the outer verdict.
+        let saved_self_check_authored = if self.self_check {
+            self.self_check_authored_assertions
+                .replace(scope_tracked_assertions.clone())
+        } else {
+            self.self_check_authored_assertions.take()
+        };
         let result = self.check_sat_internal_preprocess_and_solve(&scope_tracked_assertions);
-        self.self_check_authored_assertions = saved_authored;
+        self.self_check_authored_assertions = saved_self_check_authored;
+        self.independent_gate_authored_assertions = saved_independent_gate_authored;
         self.ctx.assertions = scope_tracked_assertions;
         result
     }
@@ -3634,6 +3809,7 @@ impl Executor {
                     if let Some(core) = self.try_enum_pigeonhole_named_core(&term_to_name) {
                         self.last_model = None;
                         self.last_proof = None;
+                        self.clear_finite_enum_proof_state();
                         self.last_assumptions = None;
                         self.last_unknown_reason = None;
                         self.last_assumption_core = Some(core);
@@ -3655,6 +3831,7 @@ impl Executor {
                     if let Some(core) = self.try_int_domain_pigeonhole_named_core(&term_to_name) {
                         self.last_model = None;
                         self.last_proof = None;
+                        self.clear_finite_enum_proof_state();
                         self.last_assumptions = None;
                         self.last_unknown_reason = None;
                         self.last_assumption_core = Some(core);
@@ -3702,7 +3879,8 @@ impl Executor {
                         std::mem::replace(&mut self.ctx.assertions, unnamed_assertions);
 
                     self.last_model = None;
-                    let result = self.check_sat_assuming(&named_assumptions);
+                    let result =
+                        self.check_sat_assuming_deferred_to_plain_check_sat(&named_assumptions);
                     // Certificate gate while the base is still stripped: a
                     // harvested proper-subset core must re-prove UNSAT on its
                     // own or it is discarded (#unsat-core-miscount).
@@ -3719,8 +3897,10 @@ impl Executor {
                     let (result, rescue_elapsed) = match result {
                         Ok(SolveResult::Unknown) => {
                             let rescue_started = Instant::now();
-                            let rescued =
-                                self.rescue_named_core_redirect_unknown(&named_assumptions);
+                            let rescued = self.rescue_named_core_redirect_unknown(
+                                &named_assumptions,
+                                super::check_sat_assuming::AssumptionSatPublication::DeferToPlainCheckSat,
+                            );
                             (rescued, Some(rescue_started.elapsed()))
                         }
                         other => (other, None),
@@ -3788,6 +3968,18 @@ impl Executor {
                 SolveResult::Sat => {
                     debug_assert!(
                         self.last_model.is_some()
+                            || (self.finite_table_cert_grant_active
+                                && self
+                                    .finite_table_cert_witness_state
+                                    .as_ref()
+                                    .is_some_and(|state| state
+                                        .is_pending_current_for(self, &self.ctx.assertions,)))
+                            || (self.const_interp_cert_grant_active
+                                && self
+                                    .const_interp_cert_witness_state
+                                    .as_ref()
+                                    .is_some_and(|state| state
+                                        .is_pending_current_for(self, &self.ctx.assertions,)))
                             || self.ctx.assertions.is_empty()
                             || self
                                 .ctx
@@ -3799,7 +3991,9 @@ impl Executor {
                 }
                 SolveResult::Unsat(_) => {
                     debug_assert!(
-                        self.last_proof.is_some() || !self.produce_proofs_enabled(),
+                        self.last_proof.is_some()
+                            || self.last_unsat_proof_reconstruction_suppressed
+                            || !self.produce_proofs_enabled(),
                         "BUG: check_sat_internal returned UNSAT without proof \
                          (produce-proofs is enabled)"
                     );
@@ -4846,7 +5040,7 @@ mod quantifier_determinism_tests {
     //! workflow w6ur8ni5u): the quantified-solve wall-clock backstop and the
     //! truthful attribution of externally-caused Unknown stops.
 
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -4915,6 +5109,129 @@ mod quantifier_determinism_tests {
         exec2.set_deadline(None);
         exec2.install_quantifier_deadline_backstop();
         assert_eq!(exec2.solve_deadline.get(), None);
+    }
+
+    #[test]
+    fn control_lifetime_exact_quantifier_deadline_policy_forbids_backstop_extension() {
+        let mut exec = Executor::new();
+        let nominal = Instant::now() + Duration::from_secs(10);
+        exec.set_deadline(Some(nominal));
+        exec.set_quantifier_deadline_policy(super::super::QuantifierDeadlinePolicy::Exact);
+        exec.install_quantifier_deadline_backstop();
+        assert_eq!(exec.solve_deadline.get(), Some(nominal));
+        assert!(
+            !exec.quantifier_deadline_backstop_installed,
+            "an exact caller deadline must never be marked or relaxed as a backstop"
+        );
+    }
+
+    #[test]
+    fn control_lifetime_exact_policy_preserves_absent_deadline() {
+        let mut exec = Executor::new();
+        exec.set_deadline(None);
+        exec.set_quantifier_deadline_policy(super::super::QuantifierDeadlinePolicy::Exact);
+
+        let previous = exec.install_timeout_deadline_for_call();
+
+        assert_eq!(previous, None);
+        assert_eq!(exec.solve_deadline.get(), None);
+    }
+
+    #[test]
+    fn control_lifetime_interruptible_publication_keeps_watchdog_and_restores_controls() {
+        let mut exec = Executor::new();
+        let outer_interrupt = Arc::new(AtomicBool::new(false));
+        let outer_deadline = Instant::now() + Duration::from_mins(1);
+        exec.set_solve_controls(Some(Arc::clone(&outer_interrupt)), Some(outer_deadline));
+        let callback_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_polls_for_watchdog = Arc::clone(&callback_polls);
+
+        let result = exec
+            .with_interruptible_publication_controls(
+                move || callback_polls_for_watchdog.fetch_add(1, Ordering::Relaxed) > 0,
+                |active| {
+                    let wait_until = Instant::now() + Duration::from_secs(1);
+                    while !active
+                        .solve_interrupt
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                        && Instant::now() < wait_until
+                    {
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        active
+                            .solve_interrupt
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed)),
+                        "the callback watchdog must remain live throughout the publication operation"
+                    );
+                    assert_eq!(active.solve_deadline.get(), Some(outer_deadline));
+                    Ok(SolveResult::Unknown)
+                },
+            )
+            .expect("control transaction must complete");
+        assert_eq!(result, SolveResult::Unknown);
+
+        let restored = exec
+            .solve_interrupt
+            .as_ref()
+            .expect("the outer interrupt must be restored");
+        assert!(Arc::ptr_eq(restored, &outer_interrupt));
+        assert!(!restored.load(Ordering::Relaxed));
+        assert_eq!(exec.solve_deadline.get(), Some(outer_deadline));
+        assert!(callback_polls.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn control_lifetime_interruptible_transaction_revokes_late_sat() {
+        let mut exec = Executor::new();
+        let stop_condition = Arc::new(AtomicBool::new(false));
+        let stop_condition_for_callback = Arc::clone(&stop_condition);
+        let admitted = exec
+            .with_interruptible_publication_controls(
+                move || stop_condition_for_callback.load(Ordering::Relaxed),
+                |active| {
+                    let proposed = active.emit_sat_verdict(SolveResult::Sat, &[]);
+                    stop_condition.store(true, Ordering::Relaxed);
+                    proposed
+                },
+            )
+            .expect("trivial SAT emission must complete");
+
+        assert_eq!(admitted, SolveResult::Unknown);
+        assert_eq!(exec.unknown_reason(), Some(UnknownReason::Interrupted));
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::InterruptFlag));
+        assert!(exec.last_sat_certificate.is_none());
+        assert!(exec.last_unsat_certificate.is_none());
+        assert!(exec.last_model.is_none());
+        assert!(exec.solve_interrupt.is_none());
+    }
+
+    #[test]
+    fn control_lifetime_interruptible_final_stop_dominates_executor_error() {
+        let mut exec = Executor::new();
+        let stop_condition = Arc::new(AtomicBool::new(false));
+        let stop_condition_for_callback = Arc::clone(&stop_condition);
+        let admitted = exec
+            .with_interruptible_publication_controls(
+                move || stop_condition_for_callback.load(Ordering::Relaxed),
+                |_active| {
+                    stop_condition.store(true, Ordering::Relaxed);
+                    Err(crate::ExecutorError::UnsupportedLogic(
+                        "forced callback/error race".to_string(),
+                    ))
+                },
+            )
+            .expect("the final caller stop must dominate a concurrent executor error");
+
+        assert_eq!(admitted, SolveResult::Unknown);
+        assert_eq!(exec.unknown_reason(), Some(UnknownReason::Interrupted));
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::InterruptFlag));
+        assert!(exec.last_sat_certificate.is_none());
+        assert!(exec.last_unsat_certificate.is_none());
+        assert!(exec.last_model.is_none());
+        assert!(exec.solve_interrupt.is_none());
     }
 
     #[test]
@@ -5043,6 +5360,64 @@ mod quantifier_determinism_tests {
         .expect("test input must parse");
         exec.execute_all(&commands)
             .expect("setup commands must run");
+    }
+
+    #[test]
+    fn control_lifetime_command_publication_preserves_one_nominal_deadline() {
+        let mut exec = Executor::new();
+        load_quantified_mix(&mut exec);
+        exec.set_timeout(Some(Duration::from_secs(10)));
+
+        let before_command = exec.install_command_publication_deadline();
+        assert_eq!(before_command, None);
+        let nominal = exec
+            .solve_deadline
+            .get()
+            .expect("the command scope must install its absolute deadline");
+
+        // The nested solve may temporarily relax a quantified deadline, but
+        // must restore the exact command value before publication begins.
+        let before_solve = exec.install_timeout_deadline_for_call();
+        assert_eq!(before_solve, Some(nominal));
+        assert!(
+            exec.solve_deadline
+                .get()
+                .is_some_and(|deadline| deadline > nominal),
+            "the fixture must exercise quantified deadline relaxation"
+        );
+        exec.restore_timeout_deadline_after_call(before_solve);
+        assert_eq!(
+            exec.solve_deadline.get(),
+            Some(nominal),
+            "certification must inherit the original absolute deadline, not a renewed timeout"
+        );
+
+        exec.restore_timeout_deadline_after_call(before_command);
+        assert_eq!(
+            exec.solve_deadline.get(),
+            None,
+            "the complete command scope must restore its predecessor"
+        );
+    }
+
+    #[test]
+    fn control_lifetime_command_publication_restores_deadline_after_elaboration_error() {
+        let mut exec = Executor::new();
+        exec.set_timeout(Some(Duration::from_secs(10)));
+        let command = ay_frontend::parse("(check-sat-assuming (undeclared_symbol))")
+            .expect("the malformed query is syntactically valid")
+            .pop()
+            .expect("one command must parse");
+
+        assert!(
+            exec.execute_authored(&command).is_err(),
+            "an undeclared assumption must fail elaboration"
+        );
+        assert_eq!(
+            exec.solve_deadline.get(),
+            None,
+            "an error path must not leak the command publication deadline"
+        );
     }
 
     #[test]

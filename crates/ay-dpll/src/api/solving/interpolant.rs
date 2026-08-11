@@ -84,15 +84,22 @@ impl Solver {
         b_terms: &[Term],
         strength: InterpolantStrength,
     ) -> Option<InterpolantResult> {
+        let a_term_ids: HashSet<TermId> = self
+            .resolve_terms("get_interpolant", a_terms)
+            .ok()?
+            .into_iter()
+            .collect();
+        let b_term_ids: HashSet<TermId> = self
+            .resolve_terms("get_interpolant", b_terms)
+            .ok()?
+            .into_iter()
+            .collect();
+
         // Clone the proof to release the immutable borrow on self.
         let proof = self.last_proof()?.clone();
         if proof.steps.is_empty() {
             return None;
         }
-
-        // Collect A and B assertion TermIds.
-        let a_term_ids: HashSet<TermId> = a_terms.iter().map(|t| t.0).collect();
-        let b_term_ids: HashSet<TermId> = b_terms.iter().map(|t| t.0).collect();
 
         // Collect variables for A and B to determine shared variables.
         let mut a_vars = HashSet::default();
@@ -147,7 +154,7 @@ impl Solver {
                 .unwrap_or_else(|| "<unknown>".to_string())
         );
 
-        Some(InterpolantResult::new(Term(result_tid), strength))
+        Some(InterpolantResult::new(self.wrap_term(result_tid), strength))
     }
 
     /// Compute path interpolants for a sequence of formula partitions.
@@ -199,6 +206,13 @@ impl Solver {
             return None;
         }
 
+        // Authenticate every caller-owned partition before proof inspection or
+        // interpolant construction mutates the term store.
+        for partition in partitions {
+            self.resolve_terms("get_path_interpolants", partition)
+                .ok()?;
+        }
+
         // Clone the proof to release the immutable borrow on self.
         let proof = self.last_proof()?.clone();
         if proof.steps.is_empty() {
@@ -222,8 +236,8 @@ impl Solver {
                 .collect();
 
             // Collect A and B assertion TermIds.
-            let a_term_ids: HashSet<TermId> = a_terms.iter().map(|t| t.0).collect();
-            let b_term_ids: HashSet<TermId> = b_terms.iter().map(|t| t.0).collect();
+            let a_term_ids: HashSet<TermId> = a_terms.iter().map(|term| term.id()).collect();
+            let b_term_ids: HashSet<TermId> = b_terms.iter().map(|term| term.id()).collect();
 
             // Collect variables for A and B to determine shared variables.
             let mut a_vars = HashSet::default();
@@ -273,7 +287,7 @@ impl Solver {
                     .unwrap_or_else(|| "<unknown>".to_string())
             );
 
-            interpolants.push(Term(result_tid));
+            interpolants.push(self.wrap_term(result_tid));
         }
 
         Some(PathInterpolantResult::new(interpolants, strength))
@@ -1727,8 +1741,8 @@ mod tests {
         HashSet<TermId>,
     ) {
         let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
-        let q = solver.declare_const("q", Sort::Bool).0;
-        let r = solver.declare_const("r", Sort::Bool).0;
+        let q = solver.declare_const("q", Sort::Bool).id();
+        let r = solver.declare_const("r", Sort::Bool).id();
         let not_q = solver.terms_mut().mk_not_raw(q);
         let not_r = solver.terms_mut().mk_not_raw(r);
         let b1 = solver.terms_mut().mk_or(vec![not_q, r]);
@@ -1797,7 +1811,7 @@ mod tests {
             )
             .expect("McMillan traversal must produce an interpolant");
 
-        let i_text = solver.format_term(Term(itp));
+        let i_text = solver.format_term(solver.wrap_term(itp));
         assert_eq!(i_text, "q", "hand-computed McMillan interpolant is q");
         assert_eq!(script_verdict(&shared_pivot_check_a(&i_text)), "unsat");
         assert_eq!(script_verdict(&shared_pivot_check_b(&i_text)), "unsat");
@@ -1832,7 +1846,7 @@ mod tests {
             )
             .expect("Pudlak traversal must produce an interpolant");
 
-        let i_text = solver.format_term(Term(itp));
+        let i_text = solver.format_term(solver.wrap_term(itp));
         assert_eq!(script_verdict(&shared_pivot_check_a(&i_text)), "unsat");
         assert_eq!(script_verdict(&shared_pivot_check_b(&i_text)), "unsat");
     }
@@ -1852,8 +1866,8 @@ mod tests {
     #[test]
     fn test_labeling_mcmillan_prime_shared_pivot_verified() {
         let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
-        let q = solver.declare_const("q", Sort::Bool).0;
-        let r = solver.declare_const("r", Sort::Bool).0;
+        let q = solver.declare_const("q", Sort::Bool).id();
+        let r = solver.declare_const("r", Sort::Bool).id();
         let not_q = solver.terms_mut().mk_not_raw(q);
         let not_r = solver.terms_mut().mk_not_raw(r);
         let a1 = solver.terms_mut().mk_or(vec![q, r]);
@@ -1887,7 +1901,7 @@ mod tests {
             )
             .expect("McMillan' traversal must produce an interpolant");
 
-        let i_text = solver.format_term(Term(itp));
+        let i_text = solver.format_term(solver.wrap_term(itp));
         let decls = "(declare-const q Bool)\n(declare-const r Bool)\n";
         let check_a = format!(
             "{decls}(assert (or q r))\n(assert (not r))\n(assert (not {i_text}))\n(check-sat)\n"
@@ -1911,8 +1925,8 @@ mod tests {
     #[test]
     fn test_path_interpolant_result_accessors() {
         // Unit test for PathInterpolantResult methods.
-        let t1 = Term(TermId(0));
-        let t2 = Term(TermId(1));
+        let t1 = Term::from_raw(0);
+        let t2 = Term::from_raw(1);
         let pr = PathInterpolantResult::new(vec![t1, t2], InterpolantStrength::Weakest);
         assert_eq!(pr.len(), 2);
         assert!(!pr.is_empty());

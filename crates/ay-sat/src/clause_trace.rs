@@ -158,6 +158,13 @@ pub struct ClauseTrace {
     proof_work_exhausted: bool,
     /// Why level-0 minimize-chain hints were dropped (introspection).
     hint_omissions: HintOmissionCounters,
+    /// Authoritative SAT variable namespace captured by the owning solver at
+    /// the exact extraction boundary.
+    ///
+    /// Live/manual traces carry `None`. The field is private and every public
+    /// proof-content mutator clears it, so downstream proof composition cannot
+    /// pair a mutated trace with stale namespace authority.
+    solver_num_vars: Option<usize>,
 }
 
 impl Default for ClauseTrace {
@@ -177,6 +184,7 @@ impl ClauseTrace {
             is_truncated: false,
             proof_work_exhausted: false,
             hint_omissions: HintOmissionCounters::default(),
+            solver_num_vars: None,
         }
     }
 
@@ -190,6 +198,7 @@ impl ClauseTrace {
             is_truncated: false,
             proof_work_exhausted: false,
             hint_omissions: HintOmissionCounters::default(),
+            solver_num_vars: None,
         }
     }
 
@@ -199,6 +208,16 @@ impl ClauseTrace {
         // plus heap allocations for clause and hints vectors.
         const ENTRY_OVERHEAD: usize = 64;
         ENTRY_OVERHEAD + clause_len * size_of::<Literal>() + hints_len * size_of::<u64>()
+    }
+
+    /// Allocated slots in the outer entry vector.
+    ///
+    /// The bounded independent-replay path combines this with every entry's
+    /// public clause/hint capacity.  `used_bytes()` is intentionally only the
+    /// trace writer's len-based admission estimate, so it cannot serve as an
+    /// exact retained-capacity census for certificate validation.
+    pub(crate) fn entries_capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     /// Record the outcome of a level-0 minimize-chain hint lookup.
@@ -250,6 +269,7 @@ impl ClauseTrace {
         is_original: bool,
         resolution_hints: Vec<u64>,
     ) {
+        self.solver_num_vars = None;
         let entry_bytes = Self::estimate_entry_bytes(clause.len(), resolution_hints.len());
 
         if clause.is_empty() {
@@ -288,6 +308,7 @@ impl ClauseTrace {
     /// in release builds when the ID is missing, so proof-DAG edge drops are
     /// never completely silent.
     pub fn set_resolution_hints(&mut self, id: u64, resolution_hints: Vec<u64>) -> bool {
+        self.solver_num_vars = None;
         // Search from the end: the target clause was almost always just appended,
         // making the common case O(1) instead of O(n). Over C total conflicts,
         // this turns the aggregate cost from O(C^2) to O(C).
@@ -313,6 +334,7 @@ impl ClauseTrace {
 
     /// Record that the empty clause was derived.
     pub fn mark_empty(&mut self) {
+        self.solver_num_vars = None;
         self.has_empty = true;
     }
 
@@ -331,6 +353,7 @@ impl ClauseTrace {
     /// The trace can no longer be reconstructed into a complete certificate;
     /// consumers must fail closed (no certificate, honest warning).
     pub fn mark_proof_work_exhausted(&mut self) {
+        self.solver_num_vars = None;
         self.proof_work_exhausted = true;
     }
 
@@ -343,6 +366,7 @@ impl ClauseTrace {
     /// exhaustion). The `proof_work_exhausted` / `has_empty` markers are
     /// kept so consumers still see the honest degrade signal.
     pub fn clear_entries(&mut self) {
+        self.solver_num_vars = None;
         self.entries = Vec::new();
         self.used_bytes = 0;
     }
@@ -375,6 +399,23 @@ impl ClauseTrace {
     /// Get learned clauses only.
     pub fn learned_clauses(&self) -> impl Iterator<Item = &ClauseTraceEntry> {
         self.entries.iter().filter(|e| !e.is_original)
+    }
+
+    /// Exact SAT variable namespace captured by the solver that produced this
+    /// immutable trace snapshot.
+    ///
+    /// `None` means the trace is live, manually constructed, or was mutated
+    /// after extraction and therefore cannot authorize proof publication.
+    #[must_use]
+    pub fn solver_num_vars(&self) -> Option<usize> {
+        self.solver_num_vars
+    }
+
+    /// Bind a freshly extracted immutable snapshot to its owning solver's
+    /// exact variable namespace. Only solver extraction code may mint this
+    /// provenance.
+    pub(crate) fn stamp_solver_num_vars(&mut self, solver_num_vars: usize) {
+        self.solver_num_vars = Some(solver_num_vars);
     }
 }
 

@@ -765,7 +765,7 @@ fn square_roots_are_correctly_rounded_by_definition() {
             lo
         } else if mid_sq < q {
             hi
-        } else if lo.significand % 2 == 0 {
+        } else if lo.significand.is_multiple_of(2) {
             lo
         } else {
             hi

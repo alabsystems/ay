@@ -23,21 +23,15 @@
 //! [`QeResult::NotSupported`](crate::qe::QeResult::NotSupported)), so the pass
 //! keeps the original quantified node verbatim.
 //!
-//! # Soundness (HARD requirement)
+//! # Publication boundary
 //!
-//! This pass is **equivalence-preserving**:
-//!
-//! * On a node it eliminates, the replacement is guaranteed logically
-//!   equivalent to `∃x.φ` by Cooper's own independent equivalence self-check
-//!   ([`crate::qe::cooper::selfcheck`]) — `eliminate_exists` returns `Eliminated`
-//!   ONLY after that check passes, and `NotSupported` otherwise (fail-closed).
-//!   Replacing a subterm with a logically-equivalent subterm preserves the
-//!   meaning of the whole assertion.
-//! * On every other node it is the identity.
-//!
-//! Because each rewritten subterm denotes the same boolean as the original, the
-//! transformed goal has exactly the same models as the input goal: the pass
-//! never drops, weakens, or strengthens an assertion.
+//! Cooper implements an equivalence-preserving algorithm and its candidate is
+//! screened by an independent finite differential battery. The battery is not
+//! a proof over every valuation of the remaining free variables. Consequently
+//! this pass is a candidate producer, not public verdict authority: decision
+//! paths must either retain the exact quantified roots or compose a changed
+//! root with a separate symbolic equivalence certificate. On every refused node
+//! the pass remains the byte-for-byte identity.
 //!
 //! # Capture safety
 //!
@@ -229,8 +223,9 @@ fn try_eliminate_exists(
     };
 
     match eliminate_exists(terms, body, var) {
-        // Equivalence already verified by Cooper's self-check before returning
-        // `Eliminated`, so swapping this subterm for `qf` preserves meaning.
+        // The candidate passed Cooper's bounded differential check. Public
+        // decision code must still retain the source or provide independent
+        // symbolic equivalence authority before adopting this changed root.
         QeResult::Eliminated(qf) => {
             // Capture-safety gate (defence in depth): never emit a result that
             // still references the eliminated variable — a freed binder is

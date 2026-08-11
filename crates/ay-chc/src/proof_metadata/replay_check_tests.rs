@@ -504,8 +504,8 @@ fn checked_replay_rejects_model_that_does_not_discharge_safety() {
     assert!(
         error
             .to_string()
-            .contains("did not produce a native strict-Alethe UNSAT certificate"),
-        "failure should name the non-discharging strict-Alethe obligation: {error}"
+            .contains("did not produce a native strict UNSAT certificate"),
+        "failure should name the non-discharging strict obligation: {error}"
     );
 
     let metadata =

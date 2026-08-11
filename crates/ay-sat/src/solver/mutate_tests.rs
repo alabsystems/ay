@@ -1163,6 +1163,31 @@ fn test_replace_clause_checked_propagates_to_clause_trace() {
 }
 
 #[test]
+fn solver_namespace_is_bundled_at_clause_trace_extraction() {
+    let mut solver = Solver::new(3);
+    solver.enable_clause_trace();
+
+    let snapshot = solver
+        .snapshot_clause_trace()
+        .expect("enabled trace has a snapshot");
+    assert_eq!(snapshot.solver_num_vars(), Some(solver.total_num_vars()));
+    assert_eq!(
+        solver
+            .clause_trace()
+            .expect("live trace remains installed")
+            .solver_num_vars(),
+        None,
+        "only extracted immutable snapshots carry namespace authority"
+    );
+
+    let expected = solver.total_num_vars();
+    let taken = solver
+        .take_clause_trace()
+        .expect("enabled trace can be taken");
+    assert_eq!(taken.solver_num_vars(), Some(expected));
+}
+
+#[test]
 fn test_replace_clause_checked_vivify_lrat_standalone_validation() {
     let lrat_check = require_workspace_lrat_checker();
 

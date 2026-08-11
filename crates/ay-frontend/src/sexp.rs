@@ -370,7 +370,10 @@ impl<'a> SExprParser<'a> {
                 Some(Err(())) => return Err(self.error_at_current("Invalid token in list")),
                 Some(Ok(Token::RParen)) => {
                     self.advance(); // consume ')'
-                    let completed = SExpr::List(stack.pop().expect("stack non-empty"));
+                    let Some(elements) = stack.pop() else {
+                        return Err(self.error_at_current("Internal parser stack underflow"));
+                    };
+                    let completed = SExpr::List(elements);
                     match stack.last_mut() {
                         Some(parent) => parent.push(completed),
                         None => return Ok(completed), // outermost list complete
@@ -387,7 +390,10 @@ impl<'a> SExprParser<'a> {
                 }
                 _ => {
                     let atom = self.parse_atom()?;
-                    stack.last_mut().expect("stack non-empty").push(atom);
+                    let Some(current_list) = stack.last_mut() else {
+                        return Err(self.error_at_current("Internal parser stack underflow"));
+                    };
+                    current_list.push(atom);
                 }
             }
         }

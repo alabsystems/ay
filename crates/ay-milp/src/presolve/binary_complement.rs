@@ -162,10 +162,6 @@ fn binary_relation(model: &Model, row_index: usize) -> Option<(usize, usize, boo
     None
 }
 
-fn shifted_bound(bound: Option<BigRational>, constant: &BigRational) -> Option<BigRational> {
-    bound.map(|value| value - constant)
-}
-
 /// Collapse connected components of binary equivalence/complement equations.
 ///
 /// Returns `None` when the model does not contain such a component, when its
@@ -303,8 +299,12 @@ pub(crate) fn substitute_binary_complements(
             }
         }
         folded.retain(|_, coefficient| !coefficient.is_zero());
-        let new_lb = shifted_bound(model.row_lb_exact(row_index, lb), &constant);
-        let new_ub = shifted_bound(model.row_ub_exact(row_index, ub), &constant);
+        let new_lb = model
+            .row_lb_exact(row_index, lb)
+            .map(|value| value - &constant);
+        let new_ub = model
+            .row_ub_exact(row_index, ub)
+            .map(|value| value - &constant);
         // A constant row that became 0 within its range is redundant.  An
         // impossible constant row is retained empty so the reduced exact lane
         // can produce ordinary caller-liftable infeasibility evidence.

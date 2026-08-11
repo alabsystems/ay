@@ -3,6 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::executor::Executor;
+use ay_frontend::parse;
 use num_bigint::BigInt;
 
 fn setup_term_store() -> TermStore {
@@ -181,6 +183,145 @@ fn test_eliminate_div_by_zero_returns_unconstrained_fresh_var() {
 }
 
 #[test]
+fn test_literal_zero_divisor_aux_cannot_alias_single_underscore_user_symbol() {
+    let mut terms = setup_term_store();
+    let x = terms.mk_fresh_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+
+    // A single-underscore name is legal user input. It matched AY's former
+    // witness spelling exactly, so hash-consing could make `(div x 0)` reuse
+    // the user variable and silently strengthen the formula.
+    let user = terms.mk_var(format!("_ay_zerodiv_div_{}", x.index()), Sort::Int);
+    let div_expr = terms.mk_intdiv(x, zero);
+    let result = eliminate_int_mod_div_by_constant(&mut terms, &[div_expr]);
+
+    let witness = result.rewritten[0];
+    assert_ne!(
+        witness, user,
+        "an internal witness must not alias user input"
+    );
+    let TermData::Var(name, _) = terms.get(witness) else {
+        panic!("expected an integer witness variable");
+    };
+    assert!(name.starts_with("__ay_zerodiv_div_"));
+}
+
+#[test]
+fn test_symbolic_divisor_aux_cannot_alias_single_underscore_user_symbol() {
+    let mut terms = setup_term_store();
+    let x = terms.mk_fresh_var("x", Sort::Int);
+    let y = terms.mk_fresh_var("y", Sort::Int);
+
+    // The symbolic-divisor witness used to occupy this user-declarable name.
+    // Pre-intern it to reproduce the collision that the reserved prefix avoids.
+    let user = terms.mk_var(
+        format!("_ay_symdiv_q_{}_{}", x.index(), y.index()),
+        Sort::Int,
+    );
+    let div_expr = terms.mk_intdiv(x, y);
+    let result = eliminate_int_mod_div(&mut terms, &[div_expr]);
+
+    let witness = result.rewritten[0];
+    assert_ne!(
+        witness, user,
+        "an internal witness must not alias user input"
+    );
+    let TermData::Var(name, _) = terms.get(witness) else {
+        panic!("expected an integer witness variable");
+    };
+    assert!(name.starts_with("__ay_symdiv_q_"));
+}
+
+#[test]
+fn test_frontend_single_underscore_literal_witness_name_cannot_capture_internal_aux() {
+    let mut exec = Executor::new();
+    let declarations = parse("(set-logic QF_NIA)(declare-const x Int)")
+        .expect("initial declarations should parse");
+    assert!(exec
+        .execute_all(&declarations)
+        .expect("initial declarations should execute")
+        .is_empty());
+    let x = exec
+        .ctx
+        .symbol_info("x")
+        .and_then(|info| info.term)
+        .expect("x should have a core term identity");
+    let user_name = format!("_ay_zerodiv_div_{}", x.index());
+
+    // The old single-underscore spelling remains legal user input, but it can
+    // no longer constrain the reserved witness for `(div x 0)`.
+    let commands = parse(&format!(
+        "(declare-const {user_name} Int)\
+         (assert (= {user_name} 0))\
+         (assert (> (div x 0) 0))\
+         (check-sat)"
+    ))
+    .expect("the former internal spelling should remain valid SMT-LIB");
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("single-underscore declaration should execute");
+
+    assert!(exec.ctx.symbol_info(&user_name).is_some());
+    assert_eq!(outputs, vec!["sat"]);
+}
+
+#[test]
+fn test_frontend_single_underscore_symbolic_witness_name_cannot_capture_internal_aux() {
+    let mut exec = Executor::new();
+    let declarations = parse(
+        "(set-logic QF_NIA)\
+         (declare-const x Int)\
+         (declare-const y Int)",
+    )
+    .expect("initial declarations should parse");
+    assert!(exec
+        .execute_all(&declarations)
+        .expect("initial declarations should execute")
+        .is_empty());
+    let x = exec
+        .ctx
+        .symbol_info("x")
+        .and_then(|info| info.term)
+        .expect("x should have a core term identity");
+    let y = exec
+        .ctx
+        .symbol_info("y")
+        .and_then(|info| info.term)
+        .expect("y should have a core term identity");
+    let user_name = format!("_ay_symdiv_q_{}_{}", x.index(), y.index());
+
+    // Pinning the former symbolic-quotient spelling must not pin the actual
+    // under-specified `(div x y)` result when `y = 0`.
+    let commands = parse(&format!(
+        "(declare-const {user_name} Int)\
+         (assert (= {user_name} 0))\
+         (assert (= y 0))\
+         (assert (= (div x y) 9))\
+         (check-sat)"
+    ))
+    .expect("the former internal spelling should remain valid SMT-LIB");
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("single-underscore declaration should execute");
+
+    assert!(exec.ctx.symbol_info(&user_name).is_some());
+    assert_eq!(outputs, vec!["sat"]);
+}
+
+#[test]
+fn test_frontend_rejects_reserved_div_witness_names() {
+    for name in ["__ay_zerodiv_div_0", "__ay_symdiv_q_0_1"] {
+        let commands = parse(&format!("(declare-const {name} Int)"))
+            .expect("reserved name should still be syntactically valid");
+        let mut exec = Executor::new();
+        assert!(
+            exec.execute_all(&commands).is_err(),
+            "frontend accepted reserved solver name {name}"
+        );
+    }
+}
+
+#[test]
 fn test_zero_vs_symbolic_divisor_cross_congruence_emitted() {
     // `(div x 0)` (literal-zero divisor) and `(div (* x x) x)` (symbolic divisor)
     // both denote `div(0,0)` when `x = 0`, so they must be congruent. The two
@@ -200,7 +341,7 @@ fn test_zero_vs_symbolic_divisor_cross_congruence_emitted() {
     let result = eliminate_int_mod_div(&mut terms, &[div_x0, div_xx_x]);
     assert!(result.introduced_unconstrained_div_mod);
 
-    // Identify the literal-zero-divisor var (name `_ay_zerodiv_div_*`) and the
+    // Identify the literal-zero-divisor var (name `__ay_zerodiv_div_*`) and the
     // symbolic-divisor result var. The cross-class congruence emitter must have
     // added a constraint that transitively mentions BOTH of them (the linking
     // implication `(=> (and (= d x) (= y 0)) (= v r))`). Neither the zero-divisor
@@ -210,7 +351,7 @@ fn test_zero_vs_symbolic_divisor_cross_congruence_emitted() {
     for idx in 0..terms.len() {
         let t = TermId::new(idx as u32);
         if let TermData::Var(name, _) = terms.get(t) {
-            if name.starts_with("_ay_zerodiv_div_") {
+            if name.starts_with("__ay_zerodiv_div_") {
                 zero_var = Some(t);
             }
         }

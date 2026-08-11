@@ -1807,6 +1807,7 @@ fn classify_file_outcome(
     z3: &ProcessRun,
     queries: &[QueryRun],
 ) -> FileOutcome {
+    let expected_query_count = file.queries.len();
     if ay.memout || z3.memout {
         FileOutcome::Memout
     } else if ay.timed_out || z3.timed_out {
@@ -1817,8 +1818,8 @@ fn classify_file_outcome(
         FileOutcome::Crash
     } else if !ay.is_complete()
         || !z3.is_complete()
-        || ay.verdicts.len() != file.queries.len()
-        || z3.verdicts.len() != file.queries.len()
+        || ay.verdicts.len() != expected_query_count
+        || z3.verdicts.len() != expected_query_count
         || queries
             .iter()
             .any(|query| query.outcome != QueryOutcome::Pass)
@@ -1919,8 +1920,9 @@ fn validate_run_results(
         return Err("official corpus result artifact or file count binding drift".to_string());
     }
     for (result, file) in results.files.iter().zip(&manifest.files) {
+        let expected_input_sha256 = file.sha256.as_str();
         if result.path != file.path
-            || result.input_sha256 != file.sha256
+            || result.input_sha256.as_str() != expected_input_sha256
             || result.query_count != file.queries.len()
             || result.queries.len() != file.queries.len()
         {

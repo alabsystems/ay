@@ -281,11 +281,16 @@ class TwoClubCampaignSyntaxTest(unittest.TestCase):
 
     def test_marked_ab_schedule_is_typed_and_part_of_the_identity(self):
         self.assertIn(
-            "branch_schedule=first_below_floor_half+"
+            "BRANCH_SCHEDULE=first_below_floor_half+"
             "marked_at_or_above_floor_half",
             self.source,
         )
-        self.assertIn('local branch_rule=first', self.source)
+        self.assertIn("branch_schedule=$BRANCH_SCHEDULE", self.source)
+        self.assertIn("BRANCH_SCHEDULE=first_on_all_workers", self.source)
+        self.assertIn("BRANCH_SCHEDULE=marked_on_all_workers", self.source)
+        self.assertIn("BRANCH_SCHEDULE=viol_on_all_workers", self.source)
+        self.assertIn('local branch_rule=$BRANCH_MODE', self.source)
+        self.assertIn('branch_rule=first', self.source)
         self.assertIn('branch_rule=marked', self.source)
         self.assertIn('--branch "$branch_rule"', self.source)
         self.assertIn("'--branch first|viol|marked'", self.source)

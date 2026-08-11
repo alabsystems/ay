@@ -14,6 +14,7 @@
 
 use super::*;
 use ay_core::{ProofId, Sort, Symbol, TermStore};
+use num_bigint::BigInt;
 
 fn str_const(terms: &mut TermStore, s: &str) -> TermId {
     terms.mk_string(s.to_string())
@@ -272,6 +273,91 @@ fn ground_string_operations_evaluate() {
     );
     let eq_sub = terms.mk_app(Symbol::named("="), [sub, ell], Sort::Bool);
     assert!(recognize_string_ground_eval(&terms, &[eq_sub]));
+}
+
+#[test]
+fn replace_all_debits_aggregate_chars_before_output_allocation() {
+    let mut terms = TermStore::new();
+    let subject = str_const(&mut terms, "aaaaaaaa");
+    let needle = str_const(&mut terms, "a");
+    let replacement = str_const(&mut terms, "bbbbbbbb");
+    let replace_all = terms.mk_app(
+        Symbol::named("str.replace_all"),
+        [subject, needle, replacement],
+        Sort::String,
+    );
+
+    let mut eval = GroundEval::new(&terms);
+    // Decoding, memoizing, and scratch-cloning the three inputs costs 51
+    // chars. The 64-char result would exceed this deliberately small aggregate
+    // limit and must fail before `Vec::with_capacity(64)`.
+    eval.string_chars_remaining = 100;
+    assert!(eval.eval(replace_all).is_none());
+}
+
+#[test]
+fn cached_string_value_clone_debits_aggregate_chars() {
+    let mut terms = TermStore::new();
+    let value = str_const(&mut terms, "12345678");
+    let mut eval = GroundEval::new(&terms);
+    // Initial decoding plus the retained memo clone consumes 16 chars. Only
+    // seven remain, so returning another cached eight-char clone must fail.
+    eval.string_chars_remaining = 23;
+    assert!(eval.eval(value).is_some());
+    assert!(eval.eval(value).is_none());
+}
+
+#[test]
+fn substring_near_miss_exhausts_metered_comparison_work() {
+    let terms = TermStore::new();
+    let mut eval = GroundEval::new(&terms);
+    eval.budget = 100;
+    let haystack = vec!['a'; 64];
+    let mut needle = vec!['a'; 32];
+    needle[31] = 'b';
+
+    assert_eq!(eval.find_sub(&haystack, &needle, 0), None);
+}
+
+#[test]
+fn large_integer_multiplication_exhausts_numeric_work_before_compute() {
+    let mut terms = TermStore::new();
+    let operand = (BigInt::from(1_u8) << 2047_usize) + BigInt::from(1_u8);
+    let left = terms.mk_int(operand.clone());
+    let right = terms.mk_int(operand);
+    let product = terms.mk_app(Symbol::named("*"), [left, right], Sort::Int);
+    let mut eval = GroundEval::new(&terms);
+
+    // Both operands and their 4096-bit result bound are individually legal,
+    // but the checked 2048*2048 multiplication cost exceeds the shared 4M
+    // numeric budget and must fail before BigInt multiplication executes.
+    assert!(eval.eval(product).is_none());
+}
+
+#[test]
+fn oversized_decimal_parse_fails_before_bigint_allocation() {
+    let mut terms = TermStore::new();
+    let digits = str_const(&mut terms, &"9".repeat(MAX_NUMERIC_DECIMAL_DIGITS + 1));
+    let to_int = terms.mk_app(Symbol::named("str.to_int"), [digits], Sort::Int);
+    let mut eval = GroundEval::new(&terms);
+
+    assert!(eval.eval(to_int).is_none());
+}
+
+#[test]
+fn regex_split_transitions_consume_work_on_memo_hits() {
+    let mut terms = TermStore::new();
+    let first = terms.mk_app(Symbol::named("re.none"), [], Sort::RegLan);
+    let second = terms.mk_app(Symbol::named("re.none"), [], Sort::RegLan);
+    let concat = terms.mk_app(Symbol::named("re.++"), [first, second], Sort::RegLan);
+    let mut eval = GroundEval::new(&terms);
+    for split in 0..=32 {
+        eval.re_memo.insert((first, 0, split), false);
+    }
+    // The state miss consumes the first unit. Even though every child probe is
+    // a memo hit, the first split transition must consume another and fail.
+    eval.budget = 1;
+    assert_eq!(eval.re_concat(concat, &[first, second], 0, 0, 32), None);
 }
 
 #[test]

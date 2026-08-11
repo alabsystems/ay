@@ -29,6 +29,7 @@ script does not exist until its index entry does
 | firewall-selfcert-check | audit.smt | `scripts/firewall-selfcert-check.sh` | bash | active | - | End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones. |
 | lra-bmc-validate | audit.smt | `scripts/lra_bmc_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .bmc files. |
 | lra-ind-validate | audit.smt | `scripts/lra_ind_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .ind files. |
+| ufbv-fixpoint-audit | audit.smt | `scripts/ufbv_fixpoint_audit.py` | python | active | - | Guarded two-lane production and self-check audit of the exact 121-file quantified UFBV fixpoint family. |
 | z3py-cascade-check | audit.z3 | `scripts/verify_z3py_cascade.py` | python | active | - | Stock-z3py cascade verification against AY's libz3-compatible dylib. |
 
 ## bench

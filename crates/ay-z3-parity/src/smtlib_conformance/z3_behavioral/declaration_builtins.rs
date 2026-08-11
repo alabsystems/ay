@@ -179,6 +179,7 @@ const DECLARATION_SEMANTIC_PREDICATES: [(&str, &str); 126] = [
     ("~", "(= (~ 3) (- 3))"),
 ];
 
+#[cfg(test)]
 const ARITHMETIC_PLUGIN_OWNERS: [&str; 19] = [
     "*",
     "+",
@@ -201,6 +202,7 @@ const ARITHMETIC_PLUGIN_OWNERS: [&str; 19] = [
     "~",
 ];
 
+#[cfg(test)]
 const ARRAY_PLUGIN_OWNERS: [&str; 6] = [
     "Set",
     "complement",
@@ -210,8 +212,10 @@ const ARRAY_PLUGIN_OWNERS: [&str; 6] = [
     "union",
 ];
 
+#[cfg(test)]
 const PB_PLUGIN_OWNERS: [&str; 5] = ["at-least", "at-most", "pbeq", "pbge", "pble"];
 
+#[cfg(test)]
 const CHAR_PLUGIN_OWNERS: [&str; 5] = [
     "Char",
     "char.<=",
@@ -220,6 +224,7 @@ const CHAR_PLUGIN_OWNERS: [&str; 5] = [
     "char.to_int",
 ];
 
+#[cfg(test)]
 const FPA_PLUGIN_OWNERS: [&str; 20] = [
     "+oo",
     "+zero",

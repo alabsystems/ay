@@ -1343,6 +1343,20 @@ impl AdaptivePortfolio {
         desired.min(remaining.saturating_sub(COOPERATIVE_GRACE_RESERVE))
     }
 
+    /// Budget the constant-argument case-split stage from the time that is
+    /// actually left, while reserving roughly one third for later engines.
+    pub(crate) fn multi_pred_case_split_budget(remaining: Option<Duration>) -> Duration {
+        const MIN_CASE_SPLIT_BUDGET: Duration = Duration::from_secs(8);
+        const MAX_CASE_SPLIT_BUDGET: Duration = Duration::from_secs(16);
+
+        let Some(remaining) = remaining else {
+            return MIN_CASE_SPLIT_BUDGET;
+        };
+        let desired = (remaining / 4).clamp(MIN_CASE_SPLIT_BUDGET, MAX_CASE_SPLIT_BUDGET);
+        let downstream_reserve = remaining / 3;
+        desired.min(remaining.saturating_sub(downstream_reserve))
+    }
+
     pub(crate) fn multi_pred_probe_timeout(&self, deadline: Option<Instant>) -> Duration {
         match self.remaining_budget(deadline) {
             Some(remaining) => remaining.min(Duration::from_secs(5)),
@@ -1454,25 +1468,19 @@ impl AdaptivePortfolio {
         if self.config.verbose {
             safe_eprintln!("Adaptive: Trying case-split preprocessing (Stage 0)");
         }
-        let case_split_budget = self
-            .remaining_budget(deadline)
-            .unwrap_or(Duration::from_secs(8))
-            .min(Duration::from_secs(8));
+        let case_split_budget = Self::multi_pred_case_split_budget(self.remaining_budget(deadline));
         let mut case_split_config = Self::multi_pred_pdr_config(PdrConfig {
             max_iterations: 1000,
             max_obligations: 500_000,
             max_frames: 100,
             verbose: self.config.verbose,
             max_escalation_level: if features.uses_datatypes { 0 } else { 3 },
-            // Cap case-split so the portfolio still gets the bulk of the budget.
-            // Case-split either finds a simple decomposition quickly or not at all;
-            // spending more time here steals from TPA/PDKIND which need the budget
-            // to converge on harder multi-predicate problems (#4751).
-            // 8s budget: branches are individually capped at 4s (case_split/mod.rs)
-            // and the dillig12_m branches now solve in ~3.2s (E=1) + ~1.2s
-            // (E!=1); the remaining time covers merged-model verification which
-            // needs SMT checks on complex guarded formulas (e.g., dillig12_m's
-            // quadratic invariant).
+            // Scale case-split from the budget that actually remains, capped at
+            // 16s and with roughly one third preserved for TPA/PDKIND and later
+            // retries. The branch allocator additionally reserves 2s per future
+            // branch and 500ms for merged-model verification. Thus the historical
+            // 8s stage receives 5.5s + 2s + 0.5s, while a 16s stage gives the
+            // harder first dillig12_m branch 13.5s without starving the portfolio.
             solve_timeout: Some(case_split_budget),
             ..PdrConfig::default()
         })
@@ -2033,7 +2041,23 @@ impl AdaptivePortfolio {
         pdr2: PdrConfig,
         features: &ProblemFeatures,
     ) -> PortfolioConfig {
-        let mut engines = vec![EngineConfig::Pdr(pdr1), EngineConfig::Pdr(pdr2)];
+        // Keep the capped prefix heterogeneous. `AdaptiveConfig::test_default`
+        // retains only three engines, so placing both PDR variants first used
+        // two slots on the same algorithm and dropped TPA -- the documented
+        // mode-dispatch lane for dillig12_m. Production still receives every
+        // engine below; this ordering only makes a bounded roster spend its
+        // scarce slots on complementary algorithms.
+        let mut engines = vec![EngineConfig::Pdr(pdr1)];
+
+        // TPA closes mode-dispatch arithmetic cases (e.g., dillig12_m) that
+        // often stall in PDR/TRL due heavy implication checks.
+        engines.push(EngineConfig::Tpa(TpaConfig {
+            base: ChcEngineConfig {
+                verbose: self.config.verbose,
+                ..ChcEngineConfig::default()
+            },
+            ..TpaConfig::default()
+        }));
 
         // #7930: Skip Kind for DT problems. Kind with SingleLoop encoding
         // produces huge flattened formulas for DT+BV problems (13+ predicates
@@ -2050,16 +2074,12 @@ impl AdaptivePortfolio {
             }));
         }
 
+        // Preserve the spacer-mode PDR variant for uncapped production runs.
+        // For datatype problems, where Kind is deliberately ineligible, this
+        // remains the third capped engine after PDR and TPA.
+        engines.push(EngineConfig::Pdr(pdr2));
+
         engines.extend([
-            // TPA closes mode-dispatch arithmetic cases (e.g., dillig12_m) that
-            // often stall in PDR/TRL due heavy implication checks.
-            EngineConfig::Tpa(TpaConfig {
-                base: ChcEngineConfig {
-                    verbose: self.config.verbose,
-                    ..ChcEngineConfig::default()
-                },
-                ..TpaConfig::default()
-            }),
             // PDKind via SingleLoop encoding: combines PDR frames with
             // k-induction. Golem's pdkind solves benchmarks like s_multipl_24
             // that pure PDR and Kind cannot handle individually.

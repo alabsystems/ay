@@ -29,8 +29,11 @@ impl Solver {
     /// [`bvadd`]: Solver::bvadd
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvadd(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvadd", a)?;
+        let b_id = self.resolve_term("bvadd", b)?;
         self.expect_same_bitvec_width("bvadd", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvadd(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvadd(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector subtraction
@@ -54,8 +57,11 @@ impl Solver {
     /// [`bvsub`]: Solver::bvsub
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsub(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsub", a)?;
+        let b_id = self.resolve_term("bvsub", b)?;
         self.expect_same_bitvec_width("bvsub", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsub(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvsub(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector multiplication
@@ -79,7 +85,10 @@ impl Solver {
     /// [`bvmul`]: Solver::bvmul
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvmul(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvmul", a)?;
+        let b_id = self.resolve_term("bvmul", b)?;
         self.expect_same_bitvec_width("bvmul", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvmul(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvmul(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 }

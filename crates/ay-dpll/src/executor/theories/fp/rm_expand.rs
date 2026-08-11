@@ -209,10 +209,12 @@ impl Executor {
         // degrade (and `--strict-proofs` / self-check refuse the uncertified
         // verdict) instead of emitting a bogus certificate.
         self.last_proof = None;
+        self.clear_finite_enum_proof_state();
         self.last_lrat_certificate = None;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;

@@ -34,9 +34,9 @@ pub unsafe extern "C" fn Z3_del_config(c: Z3_config) {
     if c.is_null() {
         return;
     }
-    // SAFETY: The pointer was produced by a matching `Box::into_raw` in the corresponding
-    // `Z3_mk_*`/cache-add path and stored in the context's handle cache. We own it exclusively
-    // here because the Z3 C API is single-threaded per context.
+    // SAFETY: `c` is non-null and was returned by `Box::into_raw` in
+    // `Z3_mk_config`; the caller transfers exclusive ownership and this
+    // function consumes that allocation exactly once.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let _ = Box::from_raw(c);
     }));
@@ -64,6 +64,8 @@ pub unsafe extern "C" fn Z3_set_param_value(
     }) else {
         return;
     };
+    // SAFETY: `c` was null-checked above and points to a live `Z3Config` that
+    // the single-threaded C API gives this call exclusive access to.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let cfg = &mut *c;
         cfg.params.push((key, value));
@@ -111,6 +113,7 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             ffi_sort_symbols: std::collections::HashMap::new(),
             ffi_used_decl_names: std::collections::HashSet::new(),
             next_ffi_fresh_id: 0,
+            term_asts: std::cell::RefCell::default(),
             ast_sorts: Vec::new(),
             finite_set_sorts: std::collections::HashMap::new(),
             finite_set_sorts_by_basis: std::collections::HashMap::new(),
@@ -164,6 +167,7 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             rec_declared_names: std::collections::HashSet::new(),
             rec_def_axiom_index: std::collections::HashMap::new(),
             range_bounded: std::collections::HashSet::new(),
+            bounded_array_ext_lemmas: std::collections::HashMap::new(),
             array_ext_cache: std::collections::HashMap::new(),
             char_to_bv_cache: std::collections::HashMap::new(),
             special_relation_cache: std::collections::HashMap::new(),

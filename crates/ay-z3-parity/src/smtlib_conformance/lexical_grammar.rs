@@ -139,8 +139,7 @@ impl ProcessExpectation {
                 "{obligation}; one `(error \"line 2 column 3: ...\")`, then {RECOVERY_MARKER:?}; stderr=\"\"; exit=1"
             ),
             Self::Response(kind) => format!(
-                "{obligation}; live output satisfies closed {:?} response recognizer; stderr=\"\"; exit=0",
-                kind
+                "{obligation}; live output satisfies closed {kind:?} response recognizer; stderr=\"\"; exit=0"
             ),
         }
     }
@@ -425,7 +424,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("lexical-grammar timeout must be between 1ns and 3600 seconds".to_string());
     }
     let prepared = prepare_campaign(productions)?;
@@ -491,8 +490,7 @@ fn prepare_campaign(productions: &[LanguageGrammarProduction]) -> Result<Prepare
         .collect::<Vec<_>>();
     if actual != PRODUCTION_NAMES {
         return Err(format!(
-            "authenticated grammar production order drift: expected {:?}, got {actual:?}",
-            PRODUCTION_NAMES
+            "authenticated grammar production order drift: expected {PRODUCTION_NAMES:?}, got {actual:?}"
         ));
     }
 
@@ -527,8 +525,7 @@ fn prepare_campaign(productions: &[LanguageGrammarProduction]) -> Result<Prepare
                 id: negative_id.clone(),
                 input_sha256: sha256_bytes(&grounded_bytes(production, &negative_id, invalid)),
                 expected: format!(
-                    "closed {:?} response recognizer rejects malformed response bytes",
-                    kind
+                    "closed {kind:?} response recognizer rejects malformed response bytes"
                 ),
                 observed: format!("malformed_response_rejected={rejected}"),
                 stdout: None,

@@ -20,9 +20,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_and(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("and", a)?;
+        let b_id = self.resolve_term("and", b)?;
         self.expect_bool("and", a)?;
         self.expect_bool("and", b)?;
-        Ok(Term(self.terms_mut().mk_and(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_and(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a logical AND of multiple terms.
@@ -39,11 +42,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if any argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_and_many(&mut self, terms: &[Term]) -> Result<Term, SolverError> {
+        let ids = terms
+            .iter()
+            .copied()
+            .map(|term| self.resolve_term("and_many", term))
+            .collect::<Result<Vec<_>, _>>()?;
         for t in terms {
             self.expect_bool("and_many", *t)?;
         }
-        let ids: Vec<_> = terms.iter().map(|t| t.0).collect();
-        Ok(Term(self.terms_mut().mk_and(ids)))
+        let result = self.terms_mut().mk_and(ids);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a logical OR of two terms.
@@ -60,9 +68,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_or(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("or", a)?;
+        let b_id = self.resolve_term("or", b)?;
         self.expect_bool("or", a)?;
         self.expect_bool("or", b)?;
-        Ok(Term(self.terms_mut().mk_or(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_or(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a logical OR of multiple terms.
@@ -79,11 +90,16 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if any argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_or_many(&mut self, terms: &[Term]) -> Result<Term, SolverError> {
+        let ids = terms
+            .iter()
+            .copied()
+            .map(|term| self.resolve_term("or_many", term))
+            .collect::<Result<Vec<_>, _>>()?;
         for t in terms {
             self.expect_bool("or_many", *t)?;
         }
-        let ids: Vec<_> = terms.iter().map(|t| t.0).collect();
-        Ok(Term(self.terms_mut().mk_or(ids)))
+        let result = self.terms_mut().mk_or(ids);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an exclusive OR (a xor b).
@@ -123,9 +139,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_xor(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("xor", a)?;
+        let b_id = self.resolve_term("xor", b)?;
         self.expect_bool("xor", a)?;
         self.expect_bool("xor", b)?;
-        Ok(Term(self.terms_mut().mk_xor(a.0, b.0)))
+        let result = self.terms_mut().mk_xor(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a logical NOT.
@@ -142,8 +161,10 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_not(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("not", a)?;
         self.expect_bool("not", a)?;
-        Ok(Term(self.terms_mut().mk_not(a.0)))
+        let result = self.terms_mut().mk_not(a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an implication (a => b).
@@ -160,9 +181,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_implies(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("implies", a)?;
+        let b_id = self.resolve_term("implies", b)?;
         self.expect_bool("implies", a)?;
         self.expect_bool("implies", b)?;
-        Ok(Term(self.terms_mut().mk_implies(a.0, b.0)))
+        let result = self.terms_mut().mk_implies(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a biconditional / logical equivalence (a <=> b).
@@ -182,9 +206,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_iff(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("iff", a)?;
+        let b_id = self.resolve_term("iff", b)?;
         self.expect_bool("iff", a)?;
         self.expect_bool("iff", b)?;
-        Ok(Term(self.terms_mut().mk_eq(a.0, b.0)))
+        let result = self.terms_mut().mk_eq(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an if-then-else (ite cond then_val else_val).
@@ -209,10 +236,12 @@ impl Solver {
         then_val: Term,
         else_val: Term,
     ) -> Result<Term, SolverError> {
+        let cond_id = self.resolve_term("ite", cond)?;
+        let then_id = self.resolve_term("ite", then_val)?;
+        let else_id = self.resolve_term("ite", else_val)?;
         self.expect_bool("ite", cond)?;
         self.expect_same_sort("ite", then_val, else_val)?;
-        Ok(Term(
-            self.terms_mut().mk_ite(cond.0, then_val.0, else_val.0),
-        ))
+        let result = self.terms_mut().mk_ite(cond_id, then_id, else_id);
+        Ok(self.wrap_term(result))
     }
 }

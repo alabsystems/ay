@@ -438,6 +438,43 @@ fn command_stream_recovers_from_stray_close_paren() {
         .count();
     assert_eq!(check_sats, 2, "both check-sats must survive: {items:?}");
     assert!(errors >= 1, "stray paren must produce an error: {items:?}");
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            CommandStreamItem::Command(command)
+                if matches!(command.as_ref(), Command::DeclareConst(name, _) if name == "y")
+        )),
+        "the command immediately after the stray token must not be discarded: {items:?}"
+    );
+}
+
+#[test]
+fn command_stream_preserves_command_after_invalid_top_level_token() {
+    let items = drain_stream("#q(check-sat)");
+    assert_eq!(
+        items.len(),
+        2,
+        "one error and one command expected: {items:?}"
+    );
+    assert!(matches!(items[0], CommandStreamItem::Error(_)));
+    assert!(stream_item_is_check_sat(&items[1]));
+}
+
+#[test]
+fn command_stream_resync_honors_escaped_bar_in_quoted_symbol() {
+    // The invalid token makes S-expression parsing stop before the quoted
+    // symbol. Recovery still has to skip the entire malformed command. The
+    // escaped bar is not the symbol terminator, and the `)` / `(` inside the
+    // symbol are not structural parentheses.
+    let input = r"(assert #q |name\|) with ( parens|)(check-sat)";
+    let items = drain_stream(input);
+    assert_eq!(
+        items.len(),
+        2,
+        "one error and one command expected: {items:?}"
+    );
+    assert!(matches!(items[0], CommandStreamItem::Error(_)));
+    assert!(stream_item_is_check_sat(&items[1]));
 }
 
 #[test]

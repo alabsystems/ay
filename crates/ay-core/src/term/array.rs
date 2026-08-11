@@ -872,15 +872,14 @@ impl TermStore {
         if let Some((func_name, arrays)) = self.get_array_map(array) {
             let func_name = func_name.to_string();
             let arrays = arrays.to_vec();
-            let elem_sort = match self.sort(array) {
-                Sort::Array(arr) => arr.element_sort.clone(),
-                _ => unreachable!("get_array_map returned a non-array term"),
-            };
-            let defaults = arrays
-                .into_iter()
-                .map(|arg| self.mk_array_default(arg))
-                .collect::<Vec<_>>();
-            return self.mk_app(Symbol::named(func_name), defaults, elem_sort);
+            if let Sort::Array(arr) = self.sort(array) {
+                let elem_sort = arr.element_sort.clone();
+                let defaults = arrays
+                    .into_iter()
+                    .map(|arg| self.mk_array_default(arg))
+                    .collect::<Vec<_>>();
+                return self.mk_app(Symbol::named(func_name), defaults, elem_sort);
+            }
         }
 
         // Z3 5.0.0 folds a binder-INDEPENDENT lambda to its constant body, but

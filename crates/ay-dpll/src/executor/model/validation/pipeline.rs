@@ -949,6 +949,9 @@ impl Executor {
         if self.last_model.is_none() {
             return;
         }
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
+        }
         let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
         let TermData::Not(inner) = self.ctx.terms.get(rejected) else {
             return;
@@ -1244,6 +1247,8 @@ impl Executor {
                     if dbg {
                         eprintln!("[neg-dual] completion installed (pattern {tried})");
                     }
+                    self.last_model_validated = false;
+                    self.revoke_cegqi_uf_recompletion_authority();
                     return;
                 }
             }
@@ -1301,6 +1306,9 @@ impl Executor {
         // `AY_NO_CROSS_BASE_COMPLETION` kill switch is removed.)
         if self.last_model.is_none() {
             return;
+        }
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
         }
         let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
         // Definition map (#qfax-sf-defchase): sf variants flatten chains
@@ -1801,6 +1809,8 @@ impl Executor {
                     }
                 }
                 success = true;
+                self.last_model_validated = false;
+                self.revoke_cegqi_uf_recompletion_authority();
                 if dbg {
                     eprintln!("[cross-base] completion installed");
                     // Ground-vs-symbolic diff: evaluate select(chain, iv) for
@@ -2441,6 +2451,9 @@ impl Executor {
         protected: &ay_core::kani_compat::DetHashSet<TermId>,
     ) -> usize {
         use ay_core::term::TermData;
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
+        }
         let wdefs = self.build_array_defs();
         // Phase 1 (immutable): group Int reads by resolved root cell.
         let groups: Vec<(
@@ -2634,6 +2647,9 @@ impl Executor {
         vs: &crate::preprocess::VariableSubstitution,
         protected: &ay_core::kani_compat::DetHashSet<TermId>,
     ) -> usize {
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
+        }
         // Phase 1: re-derive LIA values from the repaired leaves.
         let changed: Vec<(TermId, num_bigint::BigInt)> = {
             let Some(model) = self.last_model.as_mut() else {
@@ -2775,11 +2791,14 @@ impl Executor {
     /// Only bare Bool variables (and one leading `not`) qualify.  Opposite
     /// asserted polarities are left untouched so a contradictory Boolean
     /// skeleton cannot be hidden by choosing one side.
-    fn repair_asserted_bool_leaf_polarities(&mut self) {
+    pub(in crate::executor) fn repair_asserted_bool_leaf_polarities(&mut self) {
         use ay_core::term::TermData;
 
         if !matches!(self.last_result, Some(SolveResult::Sat)) || self.last_model.is_none() {
             return;
+        }
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
         }
 
         let mut required: ay_core::kani_compat::DetHashMap<TermId, bool> =
@@ -2840,6 +2859,8 @@ impl Executor {
             }
         }
         if changed {
+            model.revoke_cegqi_uf_recompletion();
+            self.cegqi_uf_recompletion_grant = None;
             crate::executor::model::eval_memo_clear();
             self.last_model_validated = false;
         }
@@ -2856,6 +2877,9 @@ impl Executor {
                 );
             }
             return;
+        }
+        if let Some(model) = self.last_model.as_mut() {
+            model.revoke_all_quantified_model_seals();
         }
         // Single-shot PER MODEL (a sentinel in the model itself): re-running
         // after intervening completion passes mixes repair rounds, but a
@@ -2898,10 +2922,10 @@ impl Executor {
             }
         };
         // This primitive is also called by apply_strict_model_gate for a model
-        // that may already carry completed validation evidence. Once we know a
-        // repair round will run, invalidate that evidence BEFORE touching the
-        // witness. This covers both a missing marker and a stale marker carried
-        // by a reused EUF view; every caller must revalidate the repaired model.
+        // that may already carry completed validation evidence. The marker is
+        // bookkeeping only, so installing or refreshing it must not invalidate
+        // semantic evidence. Each actual repair below invalidates the model at
+        // its mutation point, or is counted by the common epilogue.
         if self
             .last_model
             .as_ref()
@@ -2910,7 +2934,6 @@ impl Executor {
         {
             return;
         }
-        self.last_model_validated = false;
         if stale_marker {
             if let Some(model) = self.last_model.as_mut() {
                 if let Some(euf) = model.euf_model.as_mut() {
@@ -3556,6 +3579,10 @@ impl Executor {
                     }
                 }
                 let max_attempts = 1 + pairs.len().min(20);
+                // The bounded search mutates a trial assignment in place. If
+                // no separating cell exists, the attempt establishes nothing
+                // and must leave the predecessor model byte-for-byte intact.
+                let trial_predecessor = self.last_model.clone();
                 let mut witness: Option<String> = None;
                 for attempt in 0..max_attempts {
                     // Assign fresh distinct values to every index var.
@@ -3682,7 +3709,11 @@ impl Executor {
                         );
                     }
                 }
-                let Some(w_atom) = witness else { continue };
+                let Some(w_atom) = witness else {
+                    self.last_model = trial_predecessor;
+                    crate::executor::model::eval_memo_clear();
+                    continue;
+                };
                 // Drop STALE derived-chain interps (#qfax-sf-stale-chain-interp).
                 // The install above re-keys the BASE interpretation and the
                 // index valuation, but the extraction-era entries for the
@@ -3772,13 +3803,11 @@ impl Executor {
         // defs) and update its value; gates re-validate everything after.
         if total_applied > 0 || total_shifted > 0 {
             let mut updates: Vec<(TermId, String)> = Vec::new();
+            if let Some((model, am)) = self
+                .last_model
+                .as_ref()
+                .and_then(|model| model.array_model.as_ref().map(|arrays| (model, arrays)))
             {
-                let Some(model) = self.last_model.as_ref() else {
-                    return;
-                };
-                let Some(am) = model.array_model.as_ref() else {
-                    return;
-                };
                 for (&v, &d) in wdefs.iter() {
                     let TermData::App(ds, da) = self.ctx.terms.get(d) else {
                         continue;
@@ -3863,6 +3892,10 @@ impl Executor {
         // itself on failed candidate trials, so this is a no-op on every
         // healthy model.
         let resynced = self.reconcile_int_model_after_repair(&shifted_vars);
+        if total_applied > 0 || total_shifted > 0 || resynced > 0 {
+            self.last_model_validated = false;
+            self.revoke_cegqi_uf_recompletion_authority();
+        }
         if std::env::var_os("AY_DEBUG_READ_PIN").is_some()
             && (total_applied > 0 || total_shifted > 0 || resynced > 0)
         {
@@ -4161,6 +4194,17 @@ impl Executor {
             return SolveResult::Unknown;
         }
         result
+    }
+
+    /// Read-only strict check for an affine quantified-certificate model.
+    ///
+    /// The ordinary strict entry may repair its candidate before deciding.
+    /// Certificate publication instead runs only this raw read-only oracle on
+    /// the producer's exact theorem model. A model that needs repair therefore
+    /// fails closed rather than silently changing the witness after its
+    /// quantified theorem was proved.
+    pub(in crate::executor) fn exact_certificate_model_passes_strict_read_only(&self) -> bool {
+        self.verify_model_strict().is_none()
     }
 
     /// Find a top-level asserted array disequality — `(not (= A B))` over

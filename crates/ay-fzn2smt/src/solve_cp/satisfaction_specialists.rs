@@ -25,7 +25,7 @@ pub(super) fn try_emit_satisfaction_specialist(
     }
 
     if let Some(assignment) = nqueens_assignment(ctx, model) {
-        let dzn = ctx.format_solution(&assignment);
+        let dzn = ctx.format_solution(&assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         writeln!(out, "==========")?;
@@ -33,7 +33,7 @@ pub(super) fn try_emit_satisfaction_specialist(
     }
 
     if let Some(assignment) = black_hole_assignment(ctx, model) {
-        let dzn = ctx.format_solution(&assignment);
+        let dzn = ctx.format_solution(&assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         writeln!(out, "==========")?;
@@ -41,7 +41,7 @@ pub(super) fn try_emit_satisfaction_specialist(
     }
 
     if let Some(assignment) = latin_square_one_hot_assignment(ctx, model) {
-        let dzn = ctx.format_solution(&assignment);
+        let dzn = ctx.format_solution(&assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         writeln!(out, "==========")?;
@@ -49,7 +49,7 @@ pub(super) fn try_emit_satisfaction_specialist(
     }
 
     if let Some(assignment) = costas_assignment(ctx, model) {
-        let dzn = ctx.format_solution(&assignment);
+        let dzn = ctx.format_solution(&assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         writeln!(out, "==========")?;
@@ -57,7 +57,7 @@ pub(super) fn try_emit_satisfaction_specialist(
     }
 
     if let Some(assignment) = steiner_triple_assignment(ctx, model) {
-        let dzn = ctx.format_solution(&assignment);
+        let dzn = ctx.format_solution(&assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         writeln!(out, "==========")?;

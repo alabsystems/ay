@@ -116,16 +116,15 @@ impl Context {
             | "multiset.comprehension"
             | "multiset.sum"
             | "multiset.choose" => {
-                if arg_ids.is_empty() {
-                    return Err(ElaborateError::InvalidConstant(format!(
-                        "{name} requires at least 1 argument"
-                    )));
-                }
                 // Use the last argument's sort as the result sort when it is a
                 // multiset carrier (`map`/`filter` carry a function/predicate in
                 // arg 0); otherwise the first argument's sort. The executor
                 // fail-closes regardless, so this only needs to type-check.
-                let last = *arg_ids.last().expect("non-empty checked above");
+                let Some(&last) = arg_ids.last() else {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "{name} requires at least 1 argument"
+                    )));
+                };
                 let result_sort = if self.terms.sort(last).is_array() {
                     self.terms.sort(last).clone()
                 } else {

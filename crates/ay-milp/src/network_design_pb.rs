@@ -1411,7 +1411,7 @@ fn build_hoffman_cut(
             for &(controller, ref capacity) in &flow.vub.capacity_terms {
                 add_term(&mut terms, controller, capacity.clone());
             }
-        } else if !matches!(sign, -1 | 0 | 1) {
+        } else if !matches!(sign, -1..=1) {
             return Err(NetworkDesignCompletionError::InvalidProjection);
         }
     }

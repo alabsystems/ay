@@ -41,57 +41,12 @@ pub(super) struct InlineResult {
 }
 
 impl ClauseInliner {
-    /// Apply definitions to inline predicates in a clause.
+    /// Apply definitions to inline predicates in a clause while recording a
+    /// [`CompositionStep`] for every predicate, so the invalidity
+    /// back-translator can reconstruct the collapsed derivation chain
+    /// (#chc25-deriv-expansion).
     ///
-    /// This function recursively inlines all predicates that are in the defs map,
-    /// including predicates introduced by other inlined definitions.
-    pub(super) fn apply_defs(
-        &self,
-        clause: &HornClause,
-        defs: &FxHashMap<PredicateId, HornClause>,
-    ) -> HornClause {
-        let mut pending_preds = clause.body.predicates.clone();
-        let mut final_preds: Vec<(PredicateId, Vec<ChcExpr>)> = Vec::new();
-        let mut constraints: Vec<ChcExpr> = clause.body.constraint.iter().cloned().collect();
-
-        // Recursively inline predicates until no more can be inlined
-        while let Some((pred_id, args)) = pending_preds.pop() {
-            if let Some(def_clause) = defs.get(&pred_id) {
-                // Inline this predicate - its body predicates go back into pending
-                let inlined = self.inline_clause(def_clause, &args);
-                pending_preds.extend(inlined.body_preds);
-                if let Some(c) = inlined.constraint {
-                    constraints.push(c);
-                }
-            } else {
-                // Keep this predicate as-is
-                final_preds.push((pred_id, args));
-            }
-        }
-
-        let final_constraint = if constraints.is_empty() {
-            None
-        } else {
-            Some(
-                constraints
-                    .into_iter()
-                    .reduce(ChcExpr::and)
-                    .expect("constraints is non-empty after is_empty check"),
-            )
-        };
-
-        HornClause::new(
-            ClauseBody::new(final_preds, final_constraint),
-            clause.head.clone(),
-        )
-    }
-
-    /// Like [`Self::apply_defs`], but also records a [`CompositionStep`] for
-    /// every predicate it inlines, so the invalidity back-translator can
-    /// reconstruct the collapsed derivation chain (#chc25-deriv-expansion).
-    ///
-    /// The returned clause is byte-for-byte identical to `apply_defs` — the
-    /// recording is a pure side-observation and never affects inlining output.
+    /// Recording is a pure side-observation and never affects inlining output.
     /// Each step captures the predicate's CALL ARGUMENTS as they appear in the
     /// (progressively freshened) composite variable space; reading their model
     /// values from the composite derivation entry yields that predicate's
@@ -127,16 +82,7 @@ impl ClauseInliner {
             }
         }
 
-        let final_constraint = if constraints.is_empty() {
-            None
-        } else {
-            Some(
-                constraints
-                    .into_iter()
-                    .reduce(ChcExpr::and)
-                    .expect("constraints is non-empty after is_empty check"),
-            )
-        };
+        let final_constraint = constraints.into_iter().reduce(ChcExpr::and);
 
         (
             HornClause::new(

@@ -85,8 +85,12 @@ pub(crate) const CHC_REPLAY_CHECKER_IDENTITY_SCHEMA: &str = "ay.chc-replay-check
 /// Schema tag for checked replay command result rows.
 pub(crate) const CHC_REPLAY_CHECK_RESULT_SCHEMA: &str = "ay.chc-replay-check-result/v1";
 
-/// Schema tag for the per-obligation native strict-Alethe certificate recorded
-/// alongside an UNSAT replay obligation.
+/// Stable schema tag for a native strict certificate plus bound Alethe
+/// diagnostic recorded alongside an UNSAT replay obligation.
+///
+/// The string retains its historical `strict-alethe` spelling for wire
+/// compatibility; the `verdict` authenticates the native bundle, not an
+/// external checker verdict for the Alethe text.
 pub(crate) const CHC_OBLIGATION_STRICT_CERT_SCHEMA: &str =
     "ay.chc-obligation-strict-alethe-cert/v1";
 
@@ -987,12 +991,13 @@ impl ChcReplayCheckResult {
     }
 }
 
-/// A native strict-Alethe certificate recorded for one UNSAT replay obligation.
+/// A native strict certificate recorded for one UNSAT replay obligation.
 ///
 /// This is the SELF-CONTAINED, no-z3 evidence that an UNSAT replay obligation
-/// was discharged by a REAL native-Alethe-verified proof rather than merely a
-/// trusted re-run verdict. `alethe_sha256` binds the rendered Alethe proof
-/// text; `bundle_sha256` binds the serialized offline-recheckable proof bundle
+/// was discharged by a real AY-native-verified proof rather than merely a
+/// trusted re-run verdict. `alethe_sha256` binds the rendered Alethe diagnostic
+/// text, which may be honestly holey; it is not an external-checker verdict.
+/// `bundle_sha256` binds the serialized offline-recheckable proof bundle
 /// (the exact bytes `ay_dpll::api::re_check_bundle_strict` re-validates with no
 /// solver run). `verdict` is the in-process strict verdict — always
 /// `"verified"` for a recorded cert, because an obligation whose strict verdict
@@ -1004,12 +1009,12 @@ pub struct ChcObligationStrictCert {
     pub alethe_sha256: String,
     /// SHA-256 over the serialized offline-recheckable proof bundle.
     pub bundle_sha256: String,
-    /// Strict Alethe verdict — `"verified"` for any recorded (admitted) cert.
+    /// AY-native strict verdict — `"verified"` for any recorded cert.
     pub verdict: String,
 }
 
 impl ChcObligationStrictCert {
-    /// Build a strict-Alethe certificate record from the bound digests.
+    /// Build a native strict-certificate record from the bound digests.
     pub(crate) fn new(
         alethe_sha256: impl Into<String>,
         bundle_sha256: impl Into<String>,
@@ -1108,8 +1113,8 @@ pub struct ChcCheckedReplayObligation {
     pub checker_command: String,
     /// Checked replay result for this obligation.
     pub result: ChcReplayCheckResult,
-    /// Native strict-Alethe certificate for this obligation, when it was an
-    /// UNSAT obligation discharged by a REAL native-Alethe-verified proof.
+    /// Native strict certificate for this obligation, when it was an UNSAT
+    /// obligation discharged by a real AY-native-verified proof.
     /// `None` for `sat` (trace-validity) obligations, which have no UNSAT
     /// proof, and for any obligation admitted before this evidence existed.
     pub strict_cert: Option<ChcObligationStrictCert>,
@@ -1134,12 +1139,14 @@ impl ChcCheckedReplayObligation {
         }
     }
 
-    /// Attach a native strict-Alethe certificate to this obligation row.
+    /// Attach a native strict certificate to this obligation row.
     ///
     /// Used for UNSAT obligations discharged via
     /// `smtlib_strict_unsat_cert_via_executor`: the recorded cert is the
-    /// self-contained (no-z3) evidence that the obligation was verified by a
-    /// REAL native-Alethe proof, not merely a trusted re-run verdict.
+    /// self-contained (no-z3) evidence that the obligation was verified by an
+    /// AY-native proof, not merely a trusted re-run verdict. The separately
+    /// hashed Alethe text is diagnostic and can disclose unsupported wire rules
+    /// as `hole`.
     #[must_use]
     pub(crate) fn with_strict_cert(mut self, cert: ChcObligationStrictCert) -> Self {
         self.strict_cert = Some(cert);

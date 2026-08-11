@@ -88,6 +88,38 @@
 /// through, or it would re-exec forever.
 pub const ARMED_ENV: &str = "AY_GOVERN_ARMED";
 
+/// The pid of the ROOT `ay` process — the one a caller actually spawned.
+///
+/// [`arm`] re-execs this image under `taskpolicy` so the jetsam memlimit binds
+/// the real binary (see the module docs). A caller that spawned `ay` and wants
+/// to bind provenance to "the process I started" therefore CANNOT use
+/// `std::process::id()` from inside the solver: by the time anything runs, the
+/// image has been through `execv(taskpolicy)` and `taskpolicy`'s own exec of
+/// the real binary, and the observed pid need not be the one the caller holds.
+///
+/// This is not hypothetical: external-codegen binds its exported BV CNF to the pid it
+/// spawned, and measured the CNF reporting a DIFFERENT pid than the one it
+/// launched — which made that binding permanently unsatisfiable.
+///
+/// `arm` records the root pid here BEFORE the exec chain. The environment
+/// survives `execv`, and the re-exec'd image returns early from `arm` (it is
+/// already armed), so the value is written exactly once, by the process the
+/// caller spawned.
+pub const ROOT_PID_ENV: &str = "AY_ROOT_PID";
+
+/// The pid of the root `ay` process — the one a caller spawned.
+///
+/// Falls back to the live pid when the marker is absent (no `arm`, a platform
+/// where `arm` is a no-op, or a direct library embedding), which is exactly the
+/// case where the live pid IS the root pid.
+#[must_use]
+pub fn root_pid() -> u32 {
+    std::env::var(ROOT_PID_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or_else(std::process::id)
+}
+
 /// Per-process footprint budget override, in MiB. Falls back to
 /// `GOVERN_DEFAULT_MB`, then to physical RAM / 16.
 pub const BUDGET_ENV: &str = "GOVERN_AY_MB";
@@ -99,6 +131,7 @@ pub const SHARED_BUDGET_ENV: &str = "GOVERN_DEFAULT_MB";
 /// `RLIMIT_AS` is set to this multiple of the footprint budget above the floor,
 /// so it backstops a single enormous `mmap` and fork/exec descendants without
 /// racing L1's accurate footprint cap.
+#[cfg(target_os = "macos")]
 const AS_SLACK: u64 = 2;
 
 /// Minimum address-space headroom above the startup floor, in MiB.
@@ -132,6 +165,7 @@ const AS_SLACK: u64 = 2;
 /// costs nothing physical — and against an arena allocator L2 cannot catch a
 /// footprint runaway anyway (footprint grows inside already-mapped VA), which
 /// is exactly why it must not be sized as though it could.
+#[cfg(target_os = "macos")]
 const MIN_AS_HEADROOM_MB: u64 = 65_536;
 
 /// Denominator for the default budget. Deliberately a small fraction of RAM:
@@ -139,7 +173,19 @@ const MIN_AS_HEADROOM_MB: u64 = 65_536;
 /// must still leave the OS its headroom.
 const DEFAULT_BUDGET_DIVISOR: usize = 16;
 
+#[cfg(target_os = "macos")]
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+
+/// Darwin major version of macOS 14 (Sonoma), the first release whose
+/// `taskpolicy` accepts `-m <MB>`. Used ONLY to skip the probe in
+/// [`imp::l1_installable`] — never to conclude the flag is missing.
+#[cfg(target_os = "macos")]
+const DARWIN_SONOMA: u32 = 23;
+
+/// Program the `taskpolicy` probe runs. Needs only to exist and exit 0, so
+/// that a non-zero status isolates `taskpolicy`'s own rejection of `-m`.
+#[cfg(target_os = "macos")]
+const PROBE_PROGRAM: &str = "/usr/bin/true";
 
 /// Exit code used when the bound cannot be established.
 ///
@@ -192,9 +238,14 @@ pub fn active_budget_bytes() -> Option<usize> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{budget_mb, ARMED_ENV, AS_SLACK, EXIT_UNGOVERNED, MIN_AS_HEADROOM_MB, TASKPOLICY};
+    use super::{
+        budget_mb, ARMED_ENV, AS_SLACK, DARWIN_SONOMA, EXIT_UNGOVERNED, MIN_AS_HEADROOM_MB,
+        PROBE_PROGRAM, ROOT_PID_ENV, TASKPOLICY,
+    };
     use std::ffi::{CString, OsString};
+    use std::mem::{size_of, zeroed};
     use std::os::unix::ffi::OsStringExt;
+    use std::process::{Command, Stdio};
 
     /// This process's current address space, which IS the smallest settable
     /// `RLIMIT_AS`. Read directly rather than searched for: `govern-exec`
@@ -205,12 +256,13 @@ mod imp {
     /// Returns `None` when unavailable, in which case the caller skips L2
     /// rather than guessing a floor and breaking `setrlimit` outright.
     fn as_floor() -> Option<u64> {
-        // SAFETY: `proc_pidinfo` writes at most `size_of::<proc_taskinfo>()`
-        // bytes into `ti`, which is an owned, exclusively-borrowed stack local
-        // of exactly that type. The return value is checked against the
-        // expected byte count before any field is read.
-        let mut ti = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
-        let size = std::mem::size_of::<libc::proc_taskinfo>();
+        // SAFETY: `proc_taskinfo` is a C record of integer counters with no
+        // invalid bit patterns; zero is a valid initialization for every field.
+        let mut ti = unsafe { zeroed::<libc::proc_taskinfo>() };
+        let size = size_of::<libc::proc_taskinfo>();
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes into `ti`, which is
+        // an owned, exclusively borrowed local of exactly that type. The return
+        // value is checked against the expected byte count before fields are read.
         let n = unsafe {
             libc::proc_pidinfo(
                 libc::getpid(),
@@ -237,6 +289,65 @@ mod imp {
     fn self_path() -> Option<CString> {
         let exe = std::env::current_exe().ok()?;
         CString::new(OsString::from(exe).into_vec()).ok()
+    }
+
+    /// This kernel's Darwin major version, e.g. `22` for `22.6.0`.
+    ///
+    /// `uname` rather than a `sysctl` name lookup or a spawned `sw_vers`: one
+    /// syscall, no string table, no process.
+    fn darwin_major() -> Option<u32> {
+        // SAFETY: `uname` writes into an owned, zeroed, exclusively-borrowed
+        // `utsname`. The return value is checked before any field is read.
+        let mut u = unsafe { zeroed::<libc::utsname>() };
+        if unsafe { libc::uname(&raw mut u) } != 0 {
+            return None;
+        }
+        // `release` is a NUL-terminated C string in a fixed-size array.
+        let release: Vec<u8> = u
+            .release
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        std::str::from_utf8(&release)
+            .ok()?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// Can L1 — the `taskpolicy -m <MB>` jetsam footprint cap — actually be
+    /// installed on this system?
+    ///
+    /// This has to be answered BEFORE the `execv` below, because that `execv`
+    /// **succeeds** on a system whose `taskpolicy` lacks `-m`: the binary is
+    /// present, it simply rejects the argument. By then this process has been
+    /// replaced, so there is no `fail_closed` left to reach — the caller just
+    /// sees `taskpolicy`'s usage text where `ay`'s output should be, and an
+    /// exit code attributed to nothing. Every invocation on such a host dies
+    /// that way, with no diagnostic naming `ay` at all.
+    ///
+    /// Answered by RUNNING `taskpolicy`, not by consulting a version table:
+    /// the question is whether this exact binary takes the flag. The Darwin
+    /// check is a fast path only — it can skip the probe, never fail it — so a
+    /// stale table costs at most one spawn and can never silently drop the
+    /// guard. That matters because the probe costs ~3.3 ms against the ~4.4 ms
+    /// reference solve that already ruled out the bisecting `as_floor`
+    /// alternative above; on a supported host it must not be paid at all.
+    fn l1_installable(budget: u64) -> bool {
+        if darwin_major().is_some_and(|major| major >= DARWIN_SONOMA) {
+            return true;
+        }
+        Command::new(TASKPOLICY)
+            .arg("-m")
+            .arg(budget.to_string())
+            .arg(PROBE_PROGRAM)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// Apply L2, then re-exec this image under `taskpolicy` to apply L1.
@@ -275,6 +386,20 @@ mod imp {
             );
         }
 
+        // Ask before the point of no return. `execv` cannot report that
+        // `taskpolicy` rejected `-m`, because by then we are gone.
+        if !l1_installable(budget) {
+            fail_closed(&format!(
+                "{TASKPOLICY} does not accept `-m <MB>` on this system, so L1 -- \
+                 the jetsam footprint cap -- cannot be installed (`-m` is a macOS \
+                 14+ flag; this kernel is Darwin {}). L2 (RLIMIT_AS) is NOT a \
+                 substitute: it bounds ADDRESS SPACE, and the runaway this guard \
+                 exists to stop grows the FOOTPRINT inside already-mapped arena \
+                 pages, which never crosses it",
+                darwin_major().map_or_else(|| "unknown".to_owned(), |m| m.to_string())
+            ));
+        }
+
         let Some(exe) = self_path() else {
             fail_closed("could not resolve this executable's own path");
         };
@@ -283,6 +408,13 @@ mod imp {
         // SAFETY: single-threaded here -- arm() is the first statement of main,
         // before any thread is spawned -- so there is no concurrent getenv.
         unsafe { std::env::set_var(ARMED_ENV, "1") };
+
+        // Record the ROOT pid before the exec chain, for callers that bind
+        // provenance to the process they spawned. This is the last point at
+        // which `std::process::id()` is still that pid: below, `execv` hands
+        // off to `taskpolicy`, which execs the real image. See `ROOT_PID_ENV`.
+        // SAFETY: as above -- still single-threaded, no concurrent getenv.
+        unsafe { std::env::set_var(ROOT_PID_ENV, std::process::id().to_string()) };
 
         // L1 LAST: taskpolicy must be the IMMEDIATE exec'ing parent of the real
         // image, because any subsequent execve destroys the memlimit. Nothing
@@ -331,6 +463,46 @@ mod imp {
              355.7 GB on a 128 GB box)."
         );
         std::process::exit(EXIT_UNGOVERNED);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{darwin_major, l1_installable, Command, Stdio, PROBE_PROGRAM, TASKPOLICY};
+
+        /// The Darwin fast path exists only to SKIP the probe, so it must never
+        /// disagree with it. If this fires on some host, `DARWIN_SONOMA` is
+        /// wrong there — and a wrong table either refuses a machine that could
+        /// be governed, or (worse) skips the probe on one that cannot.
+        #[test]
+        fn darwin_fast_path_agrees_with_the_taskpolicy_probe() {
+            let authority = Command::new(TASKPOLICY)
+                .arg("-m")
+                .arg("64")
+                .arg(PROBE_PROGRAM)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+
+            assert_eq!(
+                l1_installable(64),
+                authority,
+                "the Darwin {} fast path disagrees with actually running \
+                 `{TASKPOLICY} -m`; DARWIN_SONOMA is wrong for this host",
+                darwin_major().map_or_else(|| "?".to_owned(), |m| m.to_string())
+            );
+        }
+
+        /// A `None` here silently sends every host down the probe path.
+        #[test]
+        fn darwin_major_is_readable() {
+            assert!(
+                darwin_major().is_some_and(|major| major >= 8),
+                "uname gave no usable Darwin major version: {:?}",
+                darwin_major()
+            );
+        }
     }
 }
 

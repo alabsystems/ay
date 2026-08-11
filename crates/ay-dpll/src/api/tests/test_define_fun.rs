@@ -6,6 +6,8 @@
 
 use num_bigint::BigInt;
 
+use ay_core::term::TermData;
+
 use crate::api::*;
 
 fn has_validated_sat_model(solver: &mut Solver, label: &str) -> bool {
@@ -15,6 +17,28 @@ fn has_validated_sat_model(solver: &mut Solver, label: &str) -> bool {
         "{label}: expected SAT or Unknown, got {result:?}"
     );
     result.is_sat() && result.was_model_validated()
+}
+
+fn assert_private_native_constant_identity(solver: &Solver, surface: &str, term: Term) {
+    let context = solver.executor.context();
+    let core_name = match context.terms.get(term.id()) {
+        TermData::Var(name, _) => name,
+        other => panic!("native constant must be a Var, got {other:?}"),
+    };
+    let info = context
+        .symbol_info(surface)
+        .expect("native constant symbol metadata");
+    assert_ne!(core_name, surface);
+    assert_eq!(info.internal_name.as_deref(), Some(core_name.as_str()));
+    assert_eq!(context.symbol_identity_name(surface, info), core_name);
+    assert_eq!(
+        context.effective_declaration_kind(info.declaration_id()),
+        Some(ay_frontend::DeclarationKind::Uninterpreted)
+    );
+    assert!(
+        context.symbol_info_by_identity(surface).is_none(),
+        "the canonical theory identity must have no native constant owner"
+    );
 }
 
 /// Basic define-fun: sum(a, b) = a + b, verify inline expansion.
@@ -309,6 +333,26 @@ fn forged_same_name_handle_cannot_select_definition_with_wrong_signature() {
 }
 
 #[test]
+fn forged_same_name_handle_cannot_select_definition_with_exact_signature() {
+    let mut solver = Solver::try_new(Logic::QfUflia).unwrap();
+    solver
+        .try_define_fun("f", &[("x", Sort::Int)], Sort::Int, |_solver, params| {
+            Ok(params[0])
+        })
+        .unwrap();
+
+    let forged = FuncDecl::new("f".to_string(), vec![Sort::Int], Sort::Int);
+    let value = solver.int_const(1);
+    assert!(matches!(
+        solver.try_apply(&forged, &[value]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn forged_undeclared_function_handle_cannot_create_an_application() {
     let mut solver = Solver::try_new(Logic::QfUf).unwrap();
     let forged = FuncDecl::new("missing".to_string(), vec![Sort::Int], Sort::Int);
@@ -377,6 +421,95 @@ fn repeated_native_constant_declaration_is_idempotent() {
 }
 
 #[test]
+fn ordinary_native_map_target_constant_has_private_core_and_public_keys() {
+    let mut solver = Solver::try_new(Logic::QfLia).unwrap();
+    solver.try_push().unwrap();
+    let constant = solver.try_declare_const("div", Sort::Int).unwrap();
+    solver.try_pop().unwrap();
+
+    assert_private_native_constant_identity(&solver, "div", constant);
+    assert!(
+        solver.executor.context().symbol_info("div").is_some(),
+        "native declarations remain global across assertion-scope pop"
+    );
+
+    let seven = solver.int_const(7);
+    let equality = solver.try_eq(constant, seven).unwrap();
+    solver.try_assert_term(equality).unwrap();
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_sat());
+    let model = solver
+        .try_get_model_for_consumer()
+        .expect("validated native constant model");
+    assert_eq!(model.model().int_val_i64("div"), Some(7));
+
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let declaration = artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == constant.id() && declaration.name == "div")
+        .expect("public declaration with private core identity");
+    assert!(declaration.core_name.starts_with("__ay_overload_"));
+    assert!(matches!(
+        solver.terms().get(constant.id()),
+        TermData::Var(core_name, _) if core_name == &declaration.core_name
+    ));
+    assert!(artifact
+        .declarations
+        .iter()
+        .all(|declaration| !declaration.name.starts_with("__ay_overload_")));
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("public native constant replay key remains valid");
+    assert!(replay.result.result().is_sat());
+    let replay_from_json = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("private-core native constant JSON replay remains valid");
+    assert!(replay_from_json.result.result().is_sat());
+}
+
+#[test]
+fn fresh_identity_native_map_target_constant_has_private_core_and_identity_keys() {
+    let mut solver = Solver::try_new(Logic::QfLia).unwrap();
+    let constant = solver
+        .try_declare_const_with_fresh_identity("adapter-display-div", "mod", Sort::Int)
+        .unwrap();
+
+    assert_private_native_constant_identity(&solver, "mod", constant);
+    let nine = solver.int_const(9);
+    let equality = solver.try_eq(constant, nine).unwrap();
+    solver.try_assert_term(equality).unwrap();
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_sat());
+    let model = solver
+        .try_get_model_for_consumer()
+        .expect("validated fresh-identity model");
+    assert_eq!(model.model().int_val_i64("mod"), Some(9));
+
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let declaration = artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == constant.id() && declaration.name == "mod")
+        .expect("identity-name declaration with private core identity");
+    assert!(declaration.core_name.starts_with("__ay_overload_"));
+    assert!(matches!(
+        solver.terms().get(constant.id()),
+        TermData::Var(core_name, _) if core_name == &declaration.core_name
+    ));
+    assert!(artifact
+        .declarations
+        .iter()
+        .all(|declaration| declaration.name != "adapter-display-div"));
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("documented identity-name replay key remains valid");
+    assert!(replay.result.result().is_sat());
+    let replay_from_json = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("fresh identity-name private-core JSON replay remains valid");
+    assert!(replay_from_json.result.result().is_sat());
+}
+
+#[test]
 fn repeated_native_constant_uses_its_exact_identity_after_function_alias() {
     let mut solver = Solver::try_new(Logic::All).unwrap();
     let constant = solver.declare_const("surface", Sort::Int);
@@ -413,6 +546,173 @@ fn native_function_alias_rejects_forged_declaration_handles() {
             ..
         })
     ));
+
+    let exact_signature = FuncDecl::new(declared.name().to_string(), vec![Sort::Int], Sort::Int);
+    let one = solver.int_const(1);
+    assert!(matches!(
+        solver.try_apply(&exact_signature, &[one]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+    assert!(matches!(
+        solver.try_register_native_function_alias("surface", &exact_signature),
+        Err(SolverError::InvalidArgument {
+            operation: "register_native_function_alias",
+            ..
+        })
+    ));
+    assert!(matches!(
+        solver.try_register_native_public_function_alias(
+            "surface",
+            &exact_signature,
+            vec![ay_frontend::PublicSort::Core(Sort::Int)],
+            ay_frontend::PublicSort::Core(Sort::Int),
+        ),
+        Err(SolverError::InvalidArgument {
+            operation: "register_native_public_function_alias",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn native_function_handles_reject_same_signature_reincarnations_after_reset() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let stale = solver
+        .try_declare_fun("f", &[Sort::Int], Sort::Int)
+        .unwrap();
+
+    solver.try_reset().unwrap();
+    let current = solver
+        .try_declare_fun("f", &[Sort::Int], Sort::Int)
+        .unwrap();
+    let one = solver.int_const(1);
+
+    assert!(matches!(
+        solver.try_apply(&stale, &[one]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+    assert!(solver.try_apply(&current, &[one]).is_ok());
+}
+
+#[test]
+fn native_function_handles_are_bound_to_their_frontend_context() {
+    let mut source = Solver::try_new(Logic::All).unwrap();
+    let source_function = source
+        .try_declare_fun("f", &[Sort::Int], Sort::Int)
+        .unwrap();
+    let mut target = Solver::try_new(Logic::All).unwrap();
+    let target_function = target
+        .try_declare_fun("f", &[Sort::Int], Sort::Int)
+        .unwrap();
+    let one = target.int_const(1);
+
+    assert!(matches!(
+        target.try_apply(&source_function, &[one]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+    assert!(target.try_apply(&target_function, &[one]).is_ok());
+}
+
+#[test]
+fn native_definition_handles_reject_same_signature_reincarnations_after_reset() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let stale = solver
+        .try_define_fun("f", &[("x", Sort::Int)], Sort::Int, |_solver, params| {
+            Ok(params[0])
+        })
+        .unwrap();
+
+    solver.try_reset().unwrap();
+    let current = solver
+        .try_define_fun("f", &[("x", Sort::Int)], Sort::Int, |_solver, params| {
+            Ok(params[0])
+        })
+        .unwrap();
+    let one = solver.int_const(1);
+
+    assert!(matches!(
+        solver.try_apply(&stale, &[one]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+    assert_eq!(solver.try_apply(&current, &[one]).unwrap(), one);
+}
+
+#[test]
+fn builtin_colliding_core_name_reuse_cannot_capture_a_stale_handle() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let stale_rem = solver
+        .try_declare_fun("rem", &[Sort::Int, Sort::Int], Sort::Int)
+        .unwrap();
+    let stale_core_name = stale_rem.core_name().to_string();
+
+    solver.try_reset().unwrap();
+    let current_div = solver
+        .try_declare_fun("div", &[Sort::Int, Sort::Int], Sort::Int)
+        .unwrap();
+    assert_eq!(
+        stale_core_name,
+        current_div.core_name(),
+        "reset must exercise the private-core-name reuse that used to capture stale handles"
+    );
+
+    assert!(matches!(
+        solver.try_register_native_function_alias("captured", &stale_rem),
+        Err(SolverError::InvalidArgument {
+            operation: "register_native_function_alias",
+            ..
+        })
+    ));
+    assert!(matches!(
+        solver.try_register_native_public_function_alias(
+            "captured_public",
+            &stale_rem,
+            vec![
+                ay_frontend::PublicSort::Core(Sort::Int),
+                ay_frontend::PublicSort::Core(Sort::Int),
+            ],
+            ay_frontend::PublicSort::Core(Sort::Int),
+        ),
+        Err(SolverError::InvalidArgument {
+            operation: "register_native_public_function_alias",
+            ..
+        })
+    ));
+
+    let one = solver.int_const(1);
+    let current_application = solver
+        .try_apply(&current_div, &[one, one])
+        .expect("current declaration remains applicable");
+    assert!(matches!(
+        solver.try_apply(&stale_rem, &[one, one]),
+        Err(SolverError::InvalidArgument {
+            operation: "apply",
+            ..
+        })
+    ));
+
+    let replacement = solver.int_const(7);
+    assert_eq!(
+        solver.substitute_funs(current_application, &[stale_rem], &[replacement]),
+        current_application,
+        "stale identity must not rewrite a reincarnated core symbol"
+    );
+    assert_eq!(
+        solver.substitute_funs(current_application, &[current_div], &[replacement]),
+        replacement,
+        "the exact current declaration remains eligible for substitution"
+    );
 }
 
 #[test]
@@ -643,7 +943,10 @@ fn native_definitional_forall_adopts_exact_macro_and_prints_model() {
 
     solver.try_assert_term(axiom).unwrap();
     assert!(solver.defined_funs["native_positive"].assertion_derived);
-    assert_eq!(solver.assertions(), vec![Term(solver.terms().true_term())]);
+    assert_eq!(
+        solver.assertions(),
+        vec![solver.wrap_term(solver.terms().true_term())]
+    );
 
     // Later applications use the exact body rather than a disconnected UF.
     let one = solver.int_const(1);

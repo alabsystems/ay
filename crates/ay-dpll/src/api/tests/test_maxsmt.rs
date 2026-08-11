@@ -4,6 +4,8 @@
 
 //! Tests for the MaxSMT API (#8300).
 
+use std::time::Duration;
+
 use crate::api::{BitVecSort, Logic, MaxSmtStatus, Solver, Sort};
 
 /// Basic: three soft LIA constraints, verify maximum satisfaction.
@@ -201,6 +203,10 @@ fn test_maxsmt_hard_unsat() {
     let result = solver.check_sat_max().unwrap();
     assert_eq!(result.status, MaxSmtStatus::HardUnsatisfiable);
     assert_eq!(result.satisfied_weight, 0);
+    assert!(
+        solver.executor.last_command_unsat_was_strictly_verified(),
+        "hard MaxSMT UNSAT must be certified against the restored current hard-query source"
+    );
 }
 
 /// Trivial: all softs satisfiable.
@@ -553,6 +559,9 @@ fn test_maxsmt_executor_error_revokes_model() {
     );
     assert!(solver.model_for_consumer().is_some());
 
+    solver
+        .parse_smtlib2("(set-option :timeout 60000) (set-option :max-memory 2048)")
+        .unwrap();
     solver.set_option(":ay-maxsmt-engine", "invalid");
     let assertions_before = solver.assertions();
     let scopes_before = solver.num_scopes();
@@ -569,6 +578,13 @@ fn test_maxsmt_executor_error_revokes_model() {
         solver.unknown_reason(),
         Some(crate::UnknownReason::InternalError)
     );
+    assert_eq!(solver.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(
+        solver.executor.memory_limit(),
+        Some(2_048 * 1024 * 1024),
+        "error cleanup must restore the parsed executor ceiling"
+    );
+    assert_eq!(solver.executor.current_solve_deadline(), None);
 }
 
 /// `check_sat_max` is the API-soft entrypoint. Parsed-only softs must not be
@@ -652,6 +668,96 @@ fn test_maxsmt_native_soft_transaction_corruption_is_rejected() {
     assert!(solver.model().is_none());
     assert!(solver.model_for_consumer().is_none());
     assert_eq!(solver.num_soft_constraints(), 1);
+}
+
+/// A native MaxSMT result is richer than the internal text verdict: objective
+/// accounting and the restored soft-owner transaction are authenticated after
+/// the executor returns. An interrupt in that window must revoke both an
+/// apparent optimum and an apparent hard-UNSAT result before either reaches the
+/// caller.
+#[test]
+fn test_maxsmt_late_interrupt_revokes_all_definite_native_results() {
+    const PARSED_MEMORY_BYTES: usize = 2_048 * 1024 * 1024;
+    let mut optimal = Solver::try_new(Logic::QfUf).unwrap();
+    optimal
+        .parse_smtlib2("(set-option :timeout 60000) (set-option :max-memory 2048)")
+        .unwrap();
+    let a = optimal.declare_const("a", Sort::Bool);
+    optimal.assert_soft(a, 1, None).unwrap();
+    optimal.interrupt_native_maxsmt_after_execution_for_test();
+
+    let optimal_result = optimal.check_sat_max().unwrap();
+    assert!(optimal_result.is_unknown());
+    assert_eq!(
+        optimal.unknown_reason(),
+        Some(crate::UnknownReason::Interrupted)
+    );
+    assert_eq!(
+        optimal.executor.unknown_origin(),
+        Some(crate::UnknownOrigin::InterruptFlag)
+    );
+    assert!(optimal.model_for_consumer().is_none());
+    assert!(optimal.executor.last_maxsmt_outcome().is_none());
+    assert_eq!(optimal.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(
+        optimal.executor.memory_limit(),
+        Some(PARSED_MEMORY_BYTES),
+        "late-result cleanup must restore the parsed executor ceiling"
+    );
+    assert_eq!(optimal.executor.current_solve_deadline(), None);
+    optimal.clear_interrupt();
+
+    let mut hard_unsat = Solver::try_new(Logic::QfUf).unwrap();
+    let b = hard_unsat.declare_const("b", Sort::Bool);
+    hard_unsat.try_assert_term(b).unwrap();
+    let not_b = hard_unsat.try_not(b).unwrap();
+    hard_unsat.try_assert_term(not_b).unwrap();
+    hard_unsat.assert_soft(b, 1, None).unwrap();
+    hard_unsat.interrupt_native_maxsmt_after_execution_for_test();
+
+    let hard_unsat_result = hard_unsat.check_sat_max().unwrap();
+    assert!(hard_unsat_result.is_unknown());
+    assert_eq!(
+        hard_unsat.unknown_reason(),
+        Some(crate::UnknownReason::Interrupted)
+    );
+    assert_eq!(
+        hard_unsat.executor.unknown_origin(),
+        Some(crate::UnknownOrigin::InterruptFlag)
+    );
+    assert!(hard_unsat.executor.last_result_is_unknown());
+    assert!(hard_unsat.last_proof().is_none());
+    hard_unsat.clear_interrupt();
+}
+
+/// Per-instance term memory is owned by `Solver`, not `Executor`, so the richer
+/// MaxSMT publication boundary must repeat the native verified-result check
+/// after the engine returns and before exposing objective totals.
+#[test]
+fn test_maxsmt_late_term_memory_exhaustion_revokes_optimum() {
+    let mut solver = Solver::try_new(Logic::QfUf).unwrap();
+    let a = solver.declare_const("a", Sort::Bool);
+    solver.assert_soft(a, 1, None).unwrap();
+    assert_eq!(solver.term_memory_limit(), None);
+    solver.exhaust_native_maxsmt_term_memory_after_execution_for_test();
+
+    let result = solver.check_sat_max().unwrap();
+    assert!(result.is_unknown());
+    assert_eq!(
+        solver.unknown_reason(),
+        Some(crate::UnknownReason::MemoryLimit)
+    );
+    assert_eq!(
+        solver.executor.unknown_origin(),
+        Some(crate::UnknownOrigin::MemoryBudget)
+    );
+    assert!(solver.model_for_consumer().is_none());
+    assert!(solver.executor.last_maxsmt_outcome().is_none());
+    assert_eq!(
+        solver.term_memory_limit(),
+        None,
+        "the test publication hook must restore the caller's configured budget"
+    );
 }
 
 /// The native result has no "approximate" state, so instances outside the

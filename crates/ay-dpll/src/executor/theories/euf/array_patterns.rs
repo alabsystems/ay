@@ -1424,6 +1424,9 @@ impl Executor {
     /// was found and `false` was asserted) so the caller can conclude UNSAT
     /// without dispatching the (now trivially unsatisfiable) ground solve.
     pub(in crate::executor) fn add_finite_enum_pigeonhole_conflict(&mut self) -> bool {
+        // A failed scan must never leave a clique from a prior attempt eligible
+        // for proof reconstruction.
+        self.clear_finite_enum_proof_state();
         // sort-key -> cardinality k + disequality edges with source-assertion
         // provenance (the provenance also feeds the named unsat-core fast
         // path, see `pigeonhole_core`).
@@ -1483,6 +1486,28 @@ impl Executor {
             if !verified {
                 continue;
             }
+            // Record the ARGUMENT before asserting the conclusion
+            // (#dt-enum-pigeonhole). Pushing bare `false` makes the verdict
+            // plumbing work but throws the reasoning away: `[false]` is not a
+            // tautology and carries no premises, so strict certification must
+            // reject it and every discharge lane fails. Keeping the clique lets
+            // the proof layer emit a checkable lemma instead.
+            let members: Vec<TermId> = clique.iter().copied().take(k + 1).collect();
+            let mut edge_sources: HashMap<(TermId, TermId), TermId> = HashMap::default();
+            for (i, &a) in members.iter().enumerate() {
+                for &b in &members[i + 1..] {
+                    let key = if a.0 < b.0 { (a, b) } else { (b, a) };
+                    if let Some(&src) = info.edges.get(&(a, b)).or_else(|| info.edges.get(&(b, a)))
+                    {
+                        edge_sources.insert(key, src);
+                    }
+                }
+            }
+            self.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+                k,
+                members,
+                edge_sources,
+            });
             let false_term = self.ctx.terms.false_term();
             self.push_array_axiom_assertion_site(false_term, "finite_enum_pigeonhole");
             // One asserted `false` already makes the whole problem UNSAT; no

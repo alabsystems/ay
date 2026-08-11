@@ -54,8 +54,10 @@ impl Solver {
     /// [`select`]: Solver::select
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_select(&mut self, array: Term, index: Term) -> Result<Term, SolverError> {
-        let array_sort = self.terms().sort(array.0).clone();
-        let index_sort = self.terms().sort(index.0).clone();
+        let array_id = self.resolve_term("select", array)?;
+        let index_id = self.resolve_term("select", index)?;
+        let array_sort = self.terms().sort(array_id).clone();
+        let index_sort = self.terms().sort(index_id).clone();
 
         match &array_sort {
             Sort::Array(arr) => {
@@ -66,7 +68,8 @@ impl Solver {
                         got: vec![index_sort],
                     });
                 }
-                Ok(Term(self.terms_mut().mk_select(array.0, index.0)))
+                let result = self.terms_mut().mk_select(array_id, index_id);
+                Ok(self.wrap_term(result))
             }
             _ => Err(SolverError::SortMismatch {
                 operation: "select",
@@ -95,9 +98,12 @@ impl Solver {
         index: Term,
         value: Term,
     ) -> Result<Term, SolverError> {
-        let array_sort = self.terms().sort(array.0).clone();
-        let index_sort = self.terms().sort(index.0).clone();
-        let value_sort = self.terms().sort(value.0).clone();
+        let array_id = self.resolve_term("store", array)?;
+        let index_id = self.resolve_term("store", index)?;
+        let value_id = self.resolve_term("store", value)?;
+        let array_sort = self.terms().sort(array_id).clone();
+        let index_sort = self.terms().sort(index_id).clone();
+        let value_sort = self.terms().sort(value_id).clone();
 
         match &array_sort {
             Sort::Array(arr) => {
@@ -115,7 +121,8 @@ impl Solver {
                         got: vec![value_sort],
                     });
                 }
-                Ok(Term(self.terms_mut().mk_store(array.0, index.0, value.0)))
+                let result = self.terms_mut().mk_store(array_id, index_id, value_id);
+                Ok(self.wrap_term(result))
             }
             _ => Err(SolverError::SortMismatch {
                 operation: "store",
@@ -135,9 +142,9 @@ impl Solver {
     /// [`const_array`]: Solver::const_array
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_const_array(&mut self, index_sort: Sort, value: Term) -> Result<Term, SolverError> {
-        Ok(Term(
-            self.terms_mut()
-                .mk_const_array(index_sort.as_term_sort(), value.0),
-        ))
+        let value_id = self.resolve_term("const_array", value)?;
+        let index_sort = self.lower_live_sort(&index_sort);
+        let result = self.terms_mut().mk_const_array(index_sort, value_id);
+        Ok(self.wrap_term(result))
     }
 }

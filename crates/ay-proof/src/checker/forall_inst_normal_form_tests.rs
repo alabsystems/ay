@@ -2,34 +2,13 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `forall_inst` must accept the instance the EMITTER actually builds.
+//! `forall_inst` accepts only an exact, raw structural substitution.
 //!
-//! The obligation is `instance = body[vars := args]`, and the checker recomputes
-//! that function itself. But "the substitution" is not one term — it is one term
-//! per set of simplifications applied while rebuilding, and the emitter and the
-//! checker apply DIFFERENT sets:
-//!
-//! | node    | emitter (`ematching::mk_app_simplified`) | checker (`TermStore::rebuild_app`) |
-//! |---------|------------------------------------------|------------------------------------|
-//! | `(= a b)` | `mk_eq_coerce` — folds `(= 5 5)` to `true` | `mk_eq_coerce` — same             |
-//! | `(or ...)`| NO case; falls to the generic branch     | `mk_or` — folds `(or true X)` to `true` |
-//!
-//! So for a body containing `(or (= pushed x) (contains s x))` instantiated with
-//! `pushed := 5, x := 5`, the emitter produces `(or true (contains s 5))` and the
-//! checker's rebuild produces `true`. Both are correct instances; they are not
-//! the same term, and the id comparison rejected the proof — publishing a correct
-//! `unsat` as `unknown`.
-//!
-//! This is the real, dumped divergence from
-//! `auflia_verification_consumer_9185_reducers` (captured with `AY_DEBUG_FORALL_INST`), not a
-//! constructed one.
-//!
-//! The fix normalizes BOTH sides with the SAME function, `TermStore::simplify`,
-//! whose contract is that every rewrite it applies is semantics-preserving. That
-//! keeps the check independent — the checker still recomputes the substitution
-//! from the step's own binder list and arguments, and an instance that is not the
-//! substitution under either normal form is still rejected, as the rejecting
-//! tests below require.
+//! Certificate producers must preserve the quantified body's syntax while
+//! replacing binder occurrences. A separately simplified or canonicalized term
+//! may be equivalent, but accepting it here would require a second proof rule for
+//! that rewrite and would obscure binder identity. In particular, the checker
+//! must not recover variables by name and run a capture-unsafe substitution.
 
 use crate::checker::*;
 use ay_core::{AletheRule, ProofId, ProofStep, Sort, Symbol, TermId, TermStore};
@@ -89,9 +68,10 @@ fn source_forall(terms: &mut TermStore) -> TermId {
     )
 }
 
-/// The dumped case: `pushed_2` and `x_3` both instantiate to `5`.
+/// A legacy canonicalizing emitter partially folded this instance. The exact
+/// producer must instead emit a raw substitution, so this form is rejected.
 #[test]
-fn forall_inst_accepts_the_emitters_partially_folded_instance() {
+fn forall_inst_rejects_a_partially_folded_instance() {
     let mut terms = TermStore::new();
     let quantified = source_forall(&mut terms);
     let not_forall = terms.mk_not(quantified);
@@ -120,10 +100,9 @@ fn forall_inst_accepts_the_emitters_partially_folded_instance() {
     let instance = terms.mk_eq_coerce(lhs, or_unfolded);
 
     let conclusion = terms.mk_or(vec![not_forall, instance]);
-    validate(&terms, vec![conclusion], vec![s, five, five]).expect(
-        "forall_inst must accept the instance the emitter actually builds: the \
-         checker's rebuild folds (or true X) to true, the emitter's does not, \
-         and both are the same instance",
+    validate(&terms, vec![conclusion], vec![s, five, five]).expect_err(
+        "forall_inst must reject a canonicalized term that is not the raw \
+         simultaneous substitution",
     );
 }
 

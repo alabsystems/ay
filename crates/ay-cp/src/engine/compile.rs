@@ -26,6 +26,23 @@ use super::{CpSatEngine, LazyNeq, LAZY_NEQ_DOMAIN_THRESHOLD};
 /// Bounds propagation alone is sufficient; pairwise encoding is O(n²d).
 const ALLDIFF_PAIRWISE_THRESHOLD: usize = 20;
 
+/// Inclusive x-value interval for which `x - offset` lies in y's domain.
+fn pairwise_neq_x_overlap(
+    lb_x: i64,
+    ub_x: i64,
+    lb_y: i64,
+    ub_y: i64,
+    offset: i64,
+) -> Option<(i64, i64)> {
+    let lo = i128::from(lb_x).max(i128::from(lb_y) + i128::from(offset));
+    let hi = i128::from(ub_x).min(i128::from(ub_y) + i128::from(offset));
+    if lo > hi {
+        return None;
+    }
+    // Intersecting with x's i64 domain keeps both endpoints representable.
+    Some((lo as i64, hi as i64))
+}
+
 impl CpSatEngine {
     /// Compile pending constraints into SAT clauses and propagators.
     ///
@@ -77,7 +94,11 @@ impl CpSatEngine {
                     if use_ac {
                         let mut all_values = Vec::new();
                         for &v in vars {
-                            all_values.extend(self.trail.values(v));
+                            all_values.extend(
+                                self.trail
+                                    .try_values(v)
+                                    .expect("order-encoding preflight bounds domain enumeration"),
+                            );
                         }
                         all_values.sort_unstable();
                         all_values.dedup();
@@ -95,14 +116,14 @@ impl CpSatEngine {
                     let prop_le = LinearLe::new(coeffs.clone(), vars.clone(), *rhs);
                     self.dirty.push(true);
                     self.propagators.push(Box::new(prop_le));
-                    let neg_coeffs: Vec<i64> = coeffs.iter().map(|c| -c).collect();
-                    let prop_ge = LinearLe::new(neg_coeffs, vars.clone(), -*rhs);
+                    let neg_coeffs: Vec<i128> = coeffs.iter().map(|&c| -i128::from(c)).collect();
+                    let prop_ge = LinearLe::new_wide(neg_coeffs, vars.clone(), -i128::from(*rhs));
                     self.dirty.push(true);
                     self.propagators.push(Box::new(prop_ge));
                 }
                 Constraint::LinearGe { coeffs, vars, rhs } => {
-                    let neg_coeffs: Vec<i64> = coeffs.iter().map(|c| -c).collect();
-                    let prop = LinearLe::new(neg_coeffs, vars.clone(), -*rhs);
+                    let neg_coeffs: Vec<i128> = coeffs.iter().map(|&c| -i128::from(c)).collect();
+                    let prop = LinearLe::new_wide(neg_coeffs, vars.clone(), -i128::from(*rhs));
                     self.dirty.push(true);
                     self.propagators.push(Box::new(prop));
                 }
@@ -138,8 +159,9 @@ impl CpSatEngine {
                 Constraint::PairwiseNeq { x, y, offset } => {
                     let (lb_x, ub_x) = self.encoder.var_bounds(*x);
                     let (lb_y, ub_y) = self.encoder.var_bounds(*y);
-                    let overlap = (ub_x - offset).min(ub_y) - (lb_x - offset).max(lb_y) + 1;
-                    if overlap > LAZY_NEQ_DOMAIN_THRESHOLD {
+                    let overlap = pairwise_neq_x_overlap(lb_x, ub_x, lb_y, ub_y, *offset)
+                        .map_or(0, |(lo, hi)| i128::from(hi) - i128::from(lo) + 1);
+                    if overlap > i128::from(LAZY_NEQ_DOMAIN_THRESHOLD) {
                         self.lazy_neqs.push(LazyNeq {
                             x: *x,
                             y: *y,
@@ -288,20 +310,21 @@ impl CpSatEngine {
     /// producing PairwiseNeq with offset = i-j. If n variables form a complete
     /// clique under a consistent shift assignment, that's `alldiff(q[k] + shift[k])`.
     pub(super) fn detect_shifted_alldifferent(&mut self) {
-        let mut edge_set: HashMap<(IntVarId, IntVarId), HashSet<i64>> = HashMap::new();
-        let mut var_edges: HashMap<IntVarId, Vec<(IntVarId, i64)>> = HashMap::new();
+        let mut edge_set: HashMap<(IntVarId, IntVarId), HashSet<i128>> = HashMap::new();
+        let mut var_edges: HashMap<IntVarId, Vec<(IntVarId, i128)>> = HashMap::new();
 
         for c in &self.constraints {
             if let Constraint::PairwiseNeq { x, y, offset } = c {
                 if *offset == 0 {
                     continue;
                 }
-                var_edges.entry(*x).or_default().push((*y, *offset));
-                var_edges.entry(*y).or_default().push((*x, -*offset));
+                let offset = i128::from(*offset);
+                var_edges.entry(*x).or_default().push((*y, offset));
+                var_edges.entry(*y).or_default().push((*x, -offset));
                 let (lo, hi, canon) = if *x < *y {
-                    (*x, *y, *offset)
+                    (*x, *y, offset)
                 } else {
-                    (*y, *x, -*offset)
+                    (*y, *x, -offset)
                 };
                 edge_set.entry((lo, hi)).or_default().insert(canon);
             }
@@ -311,7 +334,7 @@ impl CpSatEngine {
             return;
         }
 
-        let has_edge = |a: IntVarId, b: IntVarId, offset: i64| -> bool {
+        let has_edge = |a: IntVarId, b: IntVarId, offset: i128| -> bool {
             let (lo, hi, canon) = if a < b {
                 (a, b, offset)
             } else {
@@ -323,7 +346,7 @@ impl CpSatEngine {
         };
 
         let mut shifted_groups: Vec<(Vec<IntVarId>, Vec<i64>)> = Vec::new();
-        let mut consumed: HashSet<(IntVarId, IntVarId, i64)> = HashSet::new();
+        let mut consumed: HashSet<(IntVarId, IntVarId, i128)> = HashSet::new();
 
         let all_vars: Vec<IntVarId> = var_edges.keys().copied().collect();
         for &seed in &all_vars {
@@ -335,7 +358,7 @@ impl CpSatEngine {
                 if consumed.contains(&(seed, first_nbr, first_offset)) {
                     continue;
                 }
-                let mut group: HashMap<IntVarId, i64> = HashMap::new();
+                let mut group: HashMap<IntVarId, i128> = HashMap::new();
                 group.insert(seed, 0);
                 group.insert(first_nbr, -first_offset);
 
@@ -356,7 +379,7 @@ impl CpSatEngine {
                     continue;
                 }
 
-                let members: Vec<(IntVarId, i64)> = group.iter().map(|(&v, &s)| (v, s)).collect();
+                let members: Vec<(IntVarId, i128)> = group.iter().map(|(&v, &s)| (v, s)).collect();
                 let mut is_clique = true;
                 'verify: for i in 0..members.len() {
                     for j in (i + 1)..members.len() {
@@ -370,6 +393,23 @@ impl CpSatEngine {
                     continue;
                 }
 
+                let vars: Vec<IntVarId> = members.iter().map(|&(v, _)| v).collect();
+                // Negate shifts: the group assigns shift[v] such that the
+                // PairwiseNeq offset between vi and vj equals si - sj, i.e.,
+                // vi - vj != si - sj. The propagator enforces
+                // alldiff(v[k] + s'[k]), meaning vi + s'i != vj + s'j, i.e.,
+                // vi - vj != s'j - s'i = -(s'i - s'j). Setting s' = -s gives
+                // vi - vj != si - sj, matching the original constraints.
+                let Some(shifts) = members
+                    .iter()
+                    .map(|&(_, shift)| i64::try_from(-shift).ok())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    // Pattern reconstruction is an optimization. If a derived
+                    // shift cannot be represented, retain the original exact
+                    // PairwiseNeq constraints instead.
+                    continue;
+                };
                 for i in 0..members.len() {
                     for j in (i + 1)..members.len() {
                         let (vi, si) = members[i];
@@ -378,15 +418,6 @@ impl CpSatEngine {
                         consumed.insert((vj, vi, sj - si));
                     }
                 }
-
-                let vars: Vec<IntVarId> = members.iter().map(|&(v, _)| v).collect();
-                // Negate shifts: the group assigns shift[v] such that the
-                // PairwiseNeq offset between vi and vj equals si - sj, i.e.,
-                // vi - vj != si - sj. The propagator enforces
-                // alldiff(v[k] + s'[k]), meaning vi + s'i != vj + s'j, i.e.,
-                // vi - vj != s'j - s'i = -(s'i - s'j). Setting s' = -s gives
-                // vi - vj != si - sj, matching the original constraints.
-                let shifts: Vec<i64> = members.iter().map(|&(_, s)| -s).collect();
                 shifted_groups.push((vars, shifts));
             }
         }
@@ -398,7 +429,7 @@ impl CpSatEngine {
         let mut remove_set: HashSet<usize> = HashSet::new();
         for (i, c) in self.constraints.iter().enumerate() {
             if let Constraint::PairwiseNeq { x, y, offset } = c {
-                if *offset != 0 && consumed.contains(&(*x, *y, *offset)) {
+                if *offset != 0 && consumed.contains(&(*x, *y, i128::from(*offset))) {
                     remove_set.insert(i);
                 }
             }
@@ -438,30 +469,36 @@ impl CpSatEngine {
     fn encode_pairwise_neq(&mut self, x: IntVarId, y: IntVarId, offset: i64) {
         let (lb_x, ub_x) = self.encoder.var_bounds(x);
         let (lb_y, ub_y) = self.encoder.var_bounds(y);
+        let Some((overlap_lb, overlap_ub)) = pairwise_neq_x_overlap(lb_x, ub_x, lb_y, ub_y, offset)
+        else {
+            return;
+        };
 
-        for vx in lb_x..=ub_x {
-            let vy = vx - offset;
-            if vy >= lb_y && vy <= ub_y {
-                // ¬(x=vx ∧ y=vy) = ¬[x≥vx] ∨ [x≥vx+1] ∨ ¬[y≥vy] ∨ [y≥vy+1]
-                let mut clause = Vec::with_capacity(4);
-                clause.push(
-                    self.encoder
-                        .get_or_create_ge(&mut self.sat, x, vx)
-                        .negated(),
-                );
-                if let Some(next_vx) = vx.checked_add(1) {
-                    clause.push(self.encoder.get_or_create_ge(&mut self.sat, x, next_vx));
-                }
-                clause.push(
-                    self.encoder
-                        .get_or_create_ge(&mut self.sat, y, vy)
-                        .negated(),
-                );
-                if let Some(next_vy) = vy.checked_add(1) {
-                    clause.push(self.encoder.get_or_create_ge(&mut self.sat, y, next_vy));
-                }
-                self.sat.add_clause(clause);
+        // Iterate only values that can match a y value. Besides bounding eager
+        // work by the overlap classification above, this keeps `vx - offset`
+        // representable even at i64 endpoints.
+        for vx in overlap_lb..=overlap_ub {
+            let vy = i64::try_from(i128::from(vx) - i128::from(offset))
+                .expect("overlap with y domain keeps shifted value representable");
+            // ¬(x=vx ∧ y=vy) = ¬[x≥vx] ∨ [x≥vx+1] ∨ ¬[y≥vy] ∨ [y≥vy+1]
+            let mut clause = Vec::with_capacity(4);
+            clause.push(
+                self.encoder
+                    .get_or_create_ge(&mut self.sat, x, vx)
+                    .negated(),
+            );
+            if let Some(next_vx) = vx.checked_add(1) {
+                clause.push(self.encoder.get_or_create_ge(&mut self.sat, x, next_vx));
             }
+            clause.push(
+                self.encoder
+                    .get_or_create_ge(&mut self.sat, y, vy)
+                    .negated(),
+            );
+            if let Some(next_vy) = vy.checked_add(1) {
+                clause.push(self.encoder.get_or_create_ge(&mut self.sat, y, next_vy));
+            }
+            self.sat.add_clause(clause);
         }
     }
 
@@ -484,7 +521,11 @@ impl CpSatEngine {
         // Compute union of all variable domains.
         let mut all_values: Vec<i64> = Vec::new();
         for &v in vars {
-            all_values.extend(self.trail.values(v));
+            all_values.extend(
+                self.trail
+                    .try_values(v)
+                    .expect("order-encoding preflight bounds domain enumeration"),
+            );
         }
         all_values.sort_unstable();
         all_values.dedup();
@@ -501,7 +542,7 @@ impl CpSatEngine {
             let mut clause = Vec::with_capacity(vars.len());
             for &var in vars {
                 let (lb, ub) = self.encoder.var_bounds(var);
-                if v > ub + 1 {
+                if v > ub {
                     // Variable can never be >= v; skip.
                     continue;
                 }
@@ -526,7 +567,7 @@ impl CpSatEngine {
             let mut clause = Vec::with_capacity(vars.len());
             for &var in vars {
                 let (lb, ub) = self.encoder.var_bounds(var);
-                if v < lb - 1 {
+                if v < lb {
                     // Variable is always > v; skip.
                     continue;
                 }

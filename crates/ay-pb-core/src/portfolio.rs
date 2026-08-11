@@ -3081,7 +3081,7 @@ fn auto_worker_count() -> usize {
         return nbcore;
     }
     std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
+        .map(NonZeroUsize::get)
         .unwrap_or(PARALLEL_DEFAULT_WORKERS)
 }
 

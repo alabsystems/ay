@@ -501,7 +501,7 @@ macro_rules! pipeline_build_unsat_proof_with_pop {
         $self.last_model = None;
         if $proof_enabled {
             $negations.sync_pending(&mut $self.ctx.terms);
-            let _bup_clause_trace = $solver.clause_trace().cloned();
+            let _bup_clause_trace = $solver.snapshot_clause_trace();
             let (_bup_cp, _bup_tp) = {
                 if let Some(ref _bup_trace) = _bup_clause_trace {
                     let _bup_oc = _bup_trace.original_clauses().count();

@@ -146,9 +146,8 @@ pub(super) fn dt_canonical_string(mv: &ModelValue) -> String {
         // Injective over the triple that determines the value: which root of
         // which polynomial, and which element of that extension.
         ModelValue::Algebraic(a) => {
-            let poly = |cs: &[num_rational::BigRational]| {
-                cs.iter().map(format_rational).collect::<Vec<_>>().join(",")
-            };
+            let poly =
+                |cs: &[BigRational]| cs.iter().map(format_rational).collect::<Vec<_>>().join(",");
             let (lo, hi) = a.interval();
             format!(
                 "(root-obj [{}] ({} {}) [{}])",
@@ -217,7 +216,7 @@ fn mv_to_eval(mv: &ModelValue) -> EvalValue {
 /// Convert a committed scalar [`EvalValue`] into a [`ModelValue`] guided by
 /// the term's sort. `None` when the value cannot be represented faithfully
 /// (fail closed — the field/class is then left unconstructed).
-fn eval_to_mv(ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
+pub(super) fn eval_to_mv(ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
     match (ev, sort) {
         (EvalValue::Bool(b), Sort::Bool) => Some(ModelValue::Bool(*b)),
         (EvalValue::Rational(r), Sort::Int) if r.is_integer() => {

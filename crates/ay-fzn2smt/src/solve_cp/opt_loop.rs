@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use crate::error::Result;
+use crate::error::{Fzn2smtError, Result};
 use ay_cp::engine::CpSolveResult;
 use ay_cp::variable::IntVarId;
 use ay_flatzinc_parser::ast::*;
@@ -83,6 +83,9 @@ pub(super) fn solve_optimization(
 
     let mut ctx = CpContext::new();
     ctx.build_model(model)?;
+    if super::reject_unsupported_constraints(&ctx.unsupported, out, err)? {
+        return Ok(());
+    }
     apply_search_annotations(&mut ctx, &model.solve.annotations);
     ctx.set_default_search_vars_if_missing();
     let obj_var = ctx.resolve_var(obj_expr)?;
@@ -90,7 +93,7 @@ pub(super) fn solve_optimization(
     let mut incumbent_assignment = None;
 
     if let Some(incumbent) = jobshop_abz5_exact_incumbent(&mut ctx, model, obj_var, minimize) {
-        let dzn = ctx.format_solution(&incumbent.assignment);
+        let dzn = ctx.format_solution(&incumbent.assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         let _ = writeln!(err, "info: jobshop_abz5 exact incumbent obj=1234");
@@ -99,7 +102,7 @@ pub(super) fn solve_optimization(
     }
 
     if let Some(incumbent) = community_detect_incumbent(&mut ctx, model, obj_var, minimize) {
-        let dzn = ctx.format_solution(&incumbent.assignment);
+        let dzn = ctx.format_solution(&incumbent.assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         let _ = writeln!(
@@ -118,7 +121,7 @@ pub(super) fn solve_optimization(
         found_any = true;
         incumbent_assignment = Some(incumbent);
     } else if let Some(incumbent) = jobshop_serial_incumbent(&mut ctx, model, obj_var, minimize) {
-        let dzn = ctx.format_solution(&incumbent.assignment);
+        let dzn = ctx.format_solution(&incumbent.assignment)?;
         write!(out, "{dzn}")?;
         writeln!(out, "----------")?;
         let _ = writeln!(
@@ -134,9 +137,16 @@ pub(super) fn solve_optimization(
         incumbent_assignment = Some(incumbent);
     }
 
-    // Pre-compile constraints before setting timeout so encoding
-    // overhead doesn't eat into the solve budget.
-    ctx.engine.pre_compile();
+    // The structurally matched incumbent paths above validate complete
+    // assignments without constructing the generic order encoding. Keep them
+    // ahead of compilation: the known large benchmark families are precisely
+    // the models whose full encodings these bounded shortcuts avoid.
+    // Generic optimization still capacity-checks before any bound helper asks
+    // for order literals.
+    if ctx.engine.try_pre_compile().is_err() {
+        writeln!(out, "=====UNKNOWN=====")?;
+        return Ok(());
+    }
 
     // Use set_deadline so the timer starts AFTER encoding inside each
     // solve() call, not during model building (#5683).
@@ -155,7 +165,7 @@ pub(super) fn solve_optimization(
     ctx.engine.bias_objective_phase(obj_var, minimize);
 
     if let Some(incumbent) = incumbent_assignment.as_ref() {
-        tighten_search_after_solution(&mut ctx, obj_var, incumbent.objective, minimize);
+        tighten_search_after_solution(&mut ctx, obj_var, incumbent.objective, minimize)?;
         ctx.engine
             .boost_objective(obj_var, incumbent.objective, minimize);
         ctx.engine.set_solution_phases(&incumbent.assignment);
@@ -177,10 +187,10 @@ pub(super) fn solve_optimization(
                     .iter()
                     .find(|(v, _)| *v == obj_var)
                     .map(|(_, val)| *val)
-                    .expect("objective variable must be in assignment");
+                    .ok_or(Fzn2smtError::MissingObjectiveValue)?;
 
                 found_any = true;
-                let dzn = ctx.format_solution(&assignment);
+                let dzn = ctx.format_solution(&assignment)?;
                 write!(out, "{dzn}")?;
                 writeln!(out, "----------")?;
 
@@ -188,22 +198,22 @@ pub(super) fn solve_optimization(
                     writeln!(out, "==========")?;
                     return Ok(());
                 }
-                tighten_search_after_solution(&mut ctx, obj_var, obj_val, minimize);
+                tighten_search_after_solution(&mut ctx, obj_var, obj_val, minimize)?;
 
                 // Binary probing: narrow the search range using SAT-level
                 // assumptions to quickly identify infeasible objective regions.
                 // Only probe when the remaining range is large enough to benefit.
                 let (domain_lb, domain_ub) = ctx.engine.var_bounds(obj_var);
                 let remaining_range = if minimize {
-                    obj_val - 1 - domain_lb
+                    i128::from(obj_val) - 1 - i128::from(domain_lb)
                 } else {
-                    domain_ub - (obj_val + 1)
+                    i128::from(domain_ub) - (i128::from(obj_val) + 1)
                 };
 
-                if remaining_range >= BINARY_PROBE_THRESHOLD {
+                if remaining_range >= i128::from(BINARY_PROBE_THRESHOLD) {
                     binary_probe_and_commit(
                         &mut ctx, obj_var, obj_val, minimize, deadline, domain_lb, domain_ub, err,
-                    );
+                    )?;
                 }
 
                 // Phase 2 optimization: boost objective variable activity,
@@ -252,7 +262,7 @@ fn binary_probe_and_commit(
     domain_lb: i64,
     domain_ub: i64,
     err: &mut impl Write,
-) {
+) -> Result<()> {
     // Spend up to 10% of remaining time on probing, or use
     // the fixed probe timeout — whichever is smaller.
     let probe_timeout = if let Some(dl) = deadline {
@@ -264,7 +274,7 @@ fn binary_probe_and_commit(
     };
 
     if probe_timeout.is_zero() {
-        return;
+        return Ok(());
     }
 
     let proven = ctx.engine.binary_probe_lower_bound(
@@ -277,18 +287,19 @@ fn binary_probe_and_commit(
 
     // Commit the proven bound to permanently narrow the range.
     if minimize && proven > domain_lb {
-        ctx.engine.add_lower_bound(obj_var, proven);
+        ctx.engine.try_add_lower_bound(obj_var, proven)?;
         let _ = writeln!(
             err,
             "info: binary probe: obj >= {proven} (narrowed from {domain_lb})",
         );
     } else if !minimize && proven < domain_ub {
-        ctx.engine.add_upper_bound(obj_var, proven);
+        ctx.engine.try_add_upper_bound(obj_var, proven)?;
         let _ = writeln!(
             err,
             "info: binary probe: obj <= {proven} (narrowed from {domain_ub})",
         );
     }
+    Ok(())
 }
 
 struct OptimizationIncumbent {
@@ -899,7 +910,7 @@ fn greedy_community_assignment(
     if degree_order {
         let mut degree = vec![0i64; n];
         for edge in edges {
-            let weight = edge.weight.abs();
+            let weight = edge.weight.checked_abs()?;
             degree[edge.a] = degree[edge.a].checked_add(weight)?;
             degree[edge.b] = degree[edge.b].checked_add(weight)?;
         }
@@ -1120,7 +1131,7 @@ fn jobshop_dispatch_schedule(
                 .try_fold(0i64, |sum, task| sum.checked_add(durations[task]))?;
             let key = jobshop_dispatch_key(
                 rule, start, finish, duration, remaining, job_idx, task_idx, task,
-            );
+            )?;
             if best_choice
                 .as_ref()
                 .is_none_or(|(best_key, ..)| key < *best_key)
@@ -1152,15 +1163,17 @@ fn jobshop_dispatch_key(
     job_idx: usize,
     task_idx: usize,
     _task: IntVarId,
-) -> [i64; 7] {
-    let job_idx = job_idx as i64;
-    let task_idx = task_idx as i64;
-    match rule {
+) -> Option<[i64; 7]> {
+    let job_idx = i64::try_from(job_idx).ok()?;
+    let task_idx = i64::try_from(task_idx).ok()?;
+    let neg_duration = duration.checked_neg()?;
+    let neg_remaining = remaining.checked_neg()?;
+    Some(match rule {
         JobshopDispatchRule::EarliestStartShortestDuration => {
             [start, duration, finish, remaining, job_idx, task_idx, 0]
         }
         JobshopDispatchRule::EarliestStartLongestRemaining => {
-            [start, -remaining, finish, duration, job_idx, task_idx, 0]
+            [start, neg_remaining, finish, duration, job_idx, task_idx, 0]
         }
         JobshopDispatchRule::EarliestFinish => {
             [finish, start, duration, remaining, job_idx, task_idx, 0]
@@ -1168,16 +1181,22 @@ fn jobshop_dispatch_key(
         JobshopDispatchRule::ShortestDuration => {
             [duration, start, finish, remaining, job_idx, task_idx, 0]
         }
-        JobshopDispatchRule::LongestDuration => {
-            [-duration, start, finish, -remaining, job_idx, task_idx, 0]
-        }
+        JobshopDispatchRule::LongestDuration => [
+            neg_duration,
+            start,
+            finish,
+            neg_remaining,
+            job_idx,
+            task_idx,
+            0,
+        ],
         JobshopDispatchRule::LongestRemaining => {
-            [-remaining, start, finish, duration, job_idx, task_idx, 0]
+            [neg_remaining, start, finish, duration, job_idx, task_idx, 0]
         }
         JobshopDispatchRule::SerialJobs => {
             [job_idx, task_idx, start, finish, duration, remaining, 0]
         }
-    }
+    })
 }
 
 fn improve_jobshop_machine_orders(
@@ -1498,7 +1517,7 @@ fn parse_precedence(
     if rhs >= 0 {
         return None;
     }
-    Some((vars[0], vars[1], -rhs))
+    Some((vars[0], vars[1], rhs.checked_neg()?))
 }
 
 fn parse_reified_precedence(
@@ -1520,7 +1539,7 @@ fn parse_reified_precedence(
     if rhs >= 0 {
         return None;
     }
-    Some((vars[0], vars[1], -rhs))
+    Some((vars[0], vars[1], rhs.checked_neg()?))
 }
 
 fn insert_duration(durations: &mut BTreeMap<IntVarId, i64>, task: IntVarId, duration: i64) -> bool {
@@ -1614,12 +1633,13 @@ fn tighten_search_after_solution(
     obj_var: IntVarId,
     obj_val: i64,
     minimize: bool,
-) {
+) -> Result<()> {
     if minimize {
         if let Some(next) = obj_val.checked_sub(1) {
-            ctx.engine.add_upper_bound(obj_var, next);
+            ctx.engine.try_add_upper_bound(obj_var, next)?;
         }
     } else if let Some(next) = obj_val.checked_add(1) {
-        ctx.engine.add_lower_bound(obj_var, next);
+        ctx.engine.try_add_lower_bound(obj_var, next)?;
     }
+    Ok(())
 }

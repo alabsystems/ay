@@ -980,7 +980,7 @@ pub(crate) fn capture_split_unsat_proof(
     if !proof_enabled {
         return None;
     }
-    let clause_trace = solver.clause_trace().cloned();
+    let clause_trace = solver.snapshot_clause_trace();
     if let Some(ref trace) = clause_trace {
         let original_count = trace.original_clauses().count();
         if local_clausification_proofs.len() < original_count {

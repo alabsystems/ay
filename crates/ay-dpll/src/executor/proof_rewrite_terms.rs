@@ -36,11 +36,41 @@ impl Executor {
                 ProofStep::Assume(term) => {
                     *term = Self::rewrite_term(terms, *term, rewrites, &mut cache);
                 }
-                ProofStep::TheoryLemma { clause, .. } => {
+                ProofStep::TheoryLemma {
+                    clause,
+                    farkas,
+                    lia,
+                    ..
+                } => {
                     for lit in clause.iter_mut() {
                         *lit = Self::rewrite_term(terms, *lit, rewrites, &mut cache);
                     }
+                    let rewritten_with_duplicates = clause.clone();
                     Self::dedup_clause(clause);
+                    if let Some(original) = farkas.take() {
+                        *farkas = original
+                            .rebind_by_literal(&rewritten_with_duplicates, clause)
+                            .filter(|rebound| {
+                                super::proof_farkas_validation::certificate_valid_for_blocking_clause(
+                                    terms, clause, rebound,
+                                )
+                            });
+                    }
+                    if let Some(ay_core::LiaAnnotation::CuttingPlane(cutting_plane)) = lia.as_mut()
+                    {
+                        let rebound = cutting_plane
+                            .farkas
+                            .rebind_by_literal(&rewritten_with_duplicates, clause)
+                            .filter(|rebound| {
+                                super::proof_farkas_validation::certificate_valid_for_blocking_clause(
+                                    terms, clause, rebound,
+                                )
+                            });
+                        match rebound {
+                            Some(rebound) => cutting_plane.farkas = rebound,
+                            None => *lia = None,
+                        }
+                    }
                 }
                 ProofStep::Step { clause, args, .. } => {
                     for lit in clause.iter_mut() {

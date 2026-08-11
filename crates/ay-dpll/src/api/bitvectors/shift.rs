@@ -29,8 +29,11 @@ impl Solver {
     /// [`bvshl`]: Solver::bvshl
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvshl(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvshl", a)?;
+        let b_id = self.resolve_term("bvshl", b)?;
         self.expect_same_bitvec_width("bvshl", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvshl(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvshl(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector logical shift right
@@ -54,8 +57,11 @@ impl Solver {
     /// [`bvlshr`]: Solver::bvlshr
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvlshr(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvlshr", a)?;
+        let b_id = self.resolve_term("bvlshr", b)?;
         self.expect_same_bitvec_width("bvlshr", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvlshr(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvlshr(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector arithmetic shift right
@@ -79,7 +85,10 @@ impl Solver {
     /// [`bvashr`]: Solver::bvashr
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvashr(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvashr", a)?;
+        let b_id = self.resolve_term("bvashr", b)?;
         self.expect_same_bitvec_width("bvashr", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvashr(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvashr(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 }

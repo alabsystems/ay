@@ -23,7 +23,7 @@
 //!
 //! The blocking clause negates these reasons and adds the conclusion
 //! `x_k != forbidden`:
-//!   `¬[x_1>=v_1] ∨ [x_1>=v_1+1] ∨ ... ∨ ¬[x_k>=f] ∨ [x_k>=f+1]`
+//!   `¬[x_1>=v_1] ∨ ¬[x_1<=v_1] ∨ ... ∨ ¬[x_k>=f] ∨ ¬[x_k<=f]`
 //!
 //! # Reference
 //!
@@ -32,6 +32,7 @@
 
 use crate::encoder::IntegerEncoder;
 use crate::propagator::{PropagationResult, Propagator, PropagatorPriority};
+use crate::propagators::linear::ExactInteger;
 use crate::trail::IntegerTrail;
 use crate::variable::IntVarId;
 
@@ -62,14 +63,13 @@ impl Propagator for LinearNotEqual {
     fn propagate(&mut self, trail: &IntegerTrail, encoder: &IntegerEncoder) -> PropagationResult {
         let n = self.vars.len();
         let mut num_fixed: usize = 0;
-        let mut partial_sum: i64 = 0;
+        let mut partial_sum = ExactInteger::zero();
         let mut unfixed_idx: usize = 0;
 
         for i in 0..n {
             if trail.is_fixed(self.vars[i]) {
                 num_fixed += 1;
-                partial_sum = partial_sum
-                    .saturating_add(self.coeffs[i].saturating_mul(trail.lb(self.vars[i])));
+                partial_sum.add_product(i128::from(self.coeffs[i]), trail.lb(self.vars[i]));
             } else {
                 unfixed_idx = i;
             }
@@ -82,7 +82,7 @@ impl Propagator for LinearNotEqual {
 
         if num_fixed == n {
             // All fixed: check if constraint is violated
-            if partial_sum == self.rhs {
+            if partial_sum.equals_i128(i128::from(self.rhs)) {
                 // Conflict: build clause from all fixed-var reasons
                 let clause = self.build_conflict_clause(trail, encoder);
                 return match clause {
@@ -97,7 +97,7 @@ impl Propagator for LinearNotEqual {
         let c_k = self.coeffs[unfixed_idx];
         if c_k == 0 {
             // Zero coefficient: this variable is irrelevant
-            if partial_sum == self.rhs {
+            if partial_sum.equals_i128(i128::from(self.rhs)) {
                 // Conflict regardless of x_k's value
                 let clause = self.build_conflict_clause_excluding(trail, encoder, unfixed_idx);
                 return match clause {
@@ -108,15 +108,13 @@ impl Propagator for LinearNotEqual {
             return PropagationResult::NoChange;
         }
 
-        let remainder = self.rhs.saturating_sub(partial_sum);
+        let remainder = partial_sum.subtract_from(i128::from(self.rhs));
 
-        // Check divisibility: if remainder not divisible by c_k,
-        // the forbidden value is non-integer → constraint always satisfied
-        if remainder % c_k != 0 {
+        // If the remainder is not divisible by c_k, or the quotient is outside
+        // i64, the forbidden value cannot occur in an integer variable domain.
+        let Some(forbidden) = remainder.exact_quotient_i64(i128::from(c_k)) else {
             return PropagationResult::NoChange;
-        }
-
-        let forbidden = remainder / c_k;
+        };
         let var_k = self.vars[unfixed_idx];
 
         // Check if forbidden is in domain
@@ -156,23 +154,23 @@ impl LinearNotEqual {
             }
             let v_i = trail.lb(self.vars[i]);
             let ge_vi = encoder.lookup_ge(self.vars[i], v_i)?;
-            let ge_vi1 = encoder.lookup_ge(self.vars[i], v_i + 1)?;
+            let le_vi = encoder.lookup_le(self.vars[i], v_i)?;
             clause.push(ge_vi.negated());
-            clause.push(ge_vi1);
+            clause.push(le_vi.negated());
         }
 
-        // Conclusion: x_k != forbidden → ¬[x_k>=f] ∨ [x_k>=f+1]
+        // Conclusion: x_k != forbidden → ¬[x_k>=f] ∨ ¬[x_k<=f].
         let var_k = self.vars[unfixed_idx];
         let ge_f = encoder.lookup_ge(var_k, forbidden)?;
-        let ge_f1 = encoder.lookup_ge(var_k, forbidden + 1)?;
+        let le_f = encoder.lookup_le(var_k, forbidden)?;
         clause.push(ge_f.negated());
-        clause.push(ge_f1);
+        clause.push(le_f.negated());
 
         Some(clause)
     }
 
     /// Build a conflict clause when all variables are fixed and sum == rhs.
-    /// Each fixed var x_i=v_i contributes: ¬[x_i>=v_i] ∨ [x_i>=v_i+1]
+    /// Each fixed var x_i=v_i contributes: ¬[x_i>=v_i] ∨ ¬[x_i<=v_i].
     fn build_conflict_clause(
         &self,
         trail: &IntegerTrail,
@@ -183,9 +181,9 @@ impl LinearNotEqual {
         for i in 0..n {
             let v_i = trail.lb(self.vars[i]);
             let ge_vi = encoder.lookup_ge(self.vars[i], v_i)?;
-            let ge_vi1 = encoder.lookup_ge(self.vars[i], v_i + 1)?;
+            let le_vi = encoder.lookup_le(self.vars[i], v_i)?;
             clause.push(ge_vi.negated());
-            clause.push(ge_vi1);
+            clause.push(le_vi.negated());
         }
         Some(clause)
     }
@@ -205,9 +203,9 @@ impl LinearNotEqual {
             }
             let v_i = trail.lb(self.vars[i]);
             let ge_vi = encoder.lookup_ge(self.vars[i], v_i)?;
-            let ge_vi1 = encoder.lookup_ge(self.vars[i], v_i + 1)?;
+            let le_vi = encoder.lookup_le(self.vars[i], v_i)?;
             clause.push(ge_vi.negated());
-            clause.push(ge_vi1);
+            clause.push(le_vi.negated());
         }
         Some(clause)
     }

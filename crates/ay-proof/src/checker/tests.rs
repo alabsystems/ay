@@ -1645,4 +1645,5 @@ mod hole_deferral_tests;
 mod ite_negation_shape_tests;
 mod lra_farkas_coverage_tests;
 mod or_coverage_tests;
+mod resolution_negation_depth_tests;
 mod theory_forgery_tests;

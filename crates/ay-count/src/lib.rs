@@ -5,9 +5,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! # ay-count — exact model counting for the Model Counting Competition
-//!
 //! A competition-grade exact counter covering every MC-2026 track:
-//!
 //! | track | type | value domain |
 //! |-------|------|--------------|
 //! | 1 / 1F | `mc` | arbitrary-precision naturals |
@@ -15,65 +13,35 @@
 //! | 3 | `pmc` | arbitrary-precision naturals |
 //! | 4 | `wmc`/`pmc`/`pwmc` | rationals |
 //! | 5B | `amc-complex` | complex rationals |
-//!
 //! The engine is an exhaustive DPLL with dynamic component decomposition and
 //! component caching (sharpSAT/GANAK architecture), generic over the value
 //! semiring; projected instances existentially check projection-free
 //! components with the `ay-sat` CDCL solver. All arithmetic is exact.
-//!
 //! ## Fail-closed contract
-//!
 //! Any condition the counter cannot handle exactly (oracle `Unknown`,
 //! malformed input) surfaces as an error or an `UNKNOWN` outcome — never a
 //! best-effort count. A returned count is always exact.
 
 pub mod cache;
 pub mod engine;
+mod options;
 pub mod output;
 pub mod parse;
 pub mod prep;
 pub mod prep_eg;
 pub mod td;
+mod threaded;
 pub mod value;
 pub mod xor;
+
+pub use options::{SolveOptions, SolveOptionsError};
+pub use threaded::solve_instance_big_stack;
 
 use engine::{CountAbort, Engine, EngineConfig};
 use num_rational::BigRational;
 use output::{ExactValue, SolveOutcome};
 use parse::{Instance, ProblemType};
 use value::{GaussInt, WeightTable};
-
-/// Options for a solve run.
-pub struct SolveOptions {
-    /// Component-cache budget in bytes.
-    pub cache_budget_bytes: usize,
-    /// Attach engine statistics to the outcome.
-    pub stats: bool,
-    /// Tree-decomposition time budget in seconds (0 disables TD scoring).
-    pub td_budget_secs: f64,
-    /// Phase-1 budget: solve WITHOUT TD scores for this long first; only on
-    /// expiry compute the tree decomposition and re-solve (easy instances
-    /// never pay the TD cost). 0 = single-phase.
-    pub phase1_secs: f64,
-    /// TD score weight (`decow`; competition value 100).
-    pub decow: f64,
-    /// Explicit FlowCutter binary path (else `AY_FLOWCUTTER` env / exe dir /
-    /// PATH).
-    pub flow_cutter: Option<std::path::PathBuf>,
-}
-
-impl Default for SolveOptions {
-    fn default() -> Self {
-        Self {
-            cache_budget_bytes: EngineConfig::default().cache_budget_bytes,
-            stats: false,
-            td_budget_secs: 0.0,
-            phase1_secs: 10.0,
-            decow: 100.0,
-            flow_cutter: None,
-        }
-    }
-}
 
 /// Scale per-literal rational weights to integer numerators over per-var
 /// denominators; returns the scaled table and the global denominator
@@ -136,6 +104,8 @@ fn count_with_phases<W: value::CountValue>(
     options: &SolveOptions,
     warnings: &mut Vec<String>,
 ) -> (Engine<W>, Result<W, CountAbort>) {
+    let phase1_budget = std::time::Duration::try_from_secs_f64(options.phase1_secs).ok();
+    let td_budget = std::time::Duration::try_from_secs_f64(options.td_budget_secs).ok();
     // TD-first for small primal graphs: FlowCutter converges in ~a second
     // there and the guided branching is worth orders of magnitude, so
     // skipping phase 1 is strictly better (loss analysis: 100-2300x decision
@@ -152,7 +122,11 @@ fn count_with_phases<W: value::CountValue>(
     if std::env::var_os("AY_COUNT_DEBUG").is_some() {
         eprintln!("c o [debug] scheduling: approx_edges={approx_edges} td_first={td_first}");
     }
-    let two_phase = options.td_budget_secs > 0.0 && options.phase1_secs > 0.0 && !td_first;
+    let phase1_deadline = phase1_budget
+        .filter(|budget| !budget.is_zero())
+        .and_then(|budget| std::time::Instant::now().checked_add(budget));
+    let two_phase =
+        td_budget.is_some_and(|budget| !budget.is_zero()) && phase1_deadline.is_some() && !td_first;
     if two_phase {
         let mut phase1: Engine<W> = Engine::new(
             num_vars,
@@ -161,10 +135,7 @@ fn count_with_phases<W: value::CountValue>(
             show,
             EngineConfig {
                 cache_budget_bytes: options.cache_budget_bytes,
-                deadline: Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs_f64(options.phase1_secs),
-                ),
+                deadline: phase1_deadline,
             },
         );
         match phase1.count() {
@@ -176,8 +147,10 @@ fn count_with_phases<W: value::CountValue>(
                 if std::env::var_os("AY_COUNT_DEBUG").is_some() {
                     eprintln!(
                         "c o [debug] phase1 expired after {}s (decisions={} conflicts={} cache_stores={})",
-                        options.phase1_secs, phase1.stats.decisions,
-                        phase1.stats.conflicts, phase1.stats.cache_stores
+                        options.phase1_secs,
+                        phase1.stats.decisions,
+                        phase1.stats.conflicts,
+                        phase1.stats.cache_stores
                     );
                 }
             }
@@ -185,16 +158,10 @@ fn count_with_phases<W: value::CountValue>(
         }
     }
     // Phase 2 (or single-phase): optional TD scores, no deadline.
-    let td_scores = if options.td_budget_secs > 0.0 {
+    let td_scores = if let Some(td_budget) = td_budget.filter(|budget| !budget.is_zero()) {
         match td::find_flow_cutter(options.flow_cutter.as_deref()) {
             Some(fc) => {
-                let scores = td::td_scores(
-                    num_vars,
-                    clauses,
-                    std::time::Duration::from_secs_f64(options.td_budget_secs),
-                    options.decow,
-                    &fc,
-                );
+                let scores = td::td_scores(num_vars, clauses, td_budget, options.decow, &fc);
                 match &scores {
                     Some(s) => {
                         warnings.push("TD scores active".to_string());
@@ -245,6 +212,16 @@ fn count_with_phases<W: value::CountValue>(
 /// [`solve_instance_big_stack`]).
 pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutcome {
     let mut warnings = instance.warnings.clone();
+    if let Err(error) = options.validate() {
+        warnings.push(error.to_string());
+        return SolveOutcome {
+            ptype: instance.ptype,
+            satisfiable: None,
+            value: None,
+            warnings,
+            stats: None,
+        };
+    }
     // Count-safe preprocessing (equivalence-preserving: same models over the
     // same variables, so sound for every track).
     let weighted = matches!(
@@ -497,230 +474,6 @@ fn unknown_outcome(
     }
 }
 
-/// Solve on a dedicated thread with a large stack (the counting recursion is
-/// as deep as the variable count in the worst case).
-pub fn solve_instance_big_stack(instance: Instance, options: SolveOptions) -> SolveOutcome {
-    const STACK_BYTES: usize = 1 << 30;
-    std::thread::Builder::new()
-        .name("ay-count".into())
-        .stack_size(STACK_BYTES)
-        .spawn(move || solve_instance(&instance, &options))
-        .expect("spawn counting thread")
-        .join()
-        .expect("counting thread panicked")
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn solve_text(text: &str) -> SolveOutcome {
-        let instance = parse::parse_instance(text).expect("parses");
-        solve_instance(&instance, &SolveOptions::default())
-    }
-
-    #[test]
-    fn end_to_end_spec_example_1() {
-        let text = "p cnf 6 4\nc t mc\n-1 -2\n0\n2 3 -4 0\n4 5 0\n4 6 0\n";
-        let outcome = solve_text(text);
-        assert_eq!(outcome.satisfiable, Some(true));
-        assert_eq!(
-            outcome.value,
-            Some(ExactValue::Nat(num_bigint::BigUint::from(22u32)))
-        );
-        let rendered = output::render(&outcome);
-        assert!(rendered.contains("c s exact arb int 22"));
-    }
-
-    #[test]
-    fn end_to_end_spec_example_2_weighted() {
-        let text = "p cnf 6 4\nc t wmc\n\
-            c p weight 1 0.4 0\nc p weight 2 0.5 0\nc p weight 3 0.4 0\n\
-            c p weight 4 0.3 0\nc p weight 5 0.5 0\nc p weight 6 0.7 0\n\
-            -1 -2 0\n2 3 -4 0\n4 5 0\n4 6 0\n";
-        let outcome = solve_text(text);
-        // Complements default to 1-w with warnings. Cross-check against an
-        // independent brute-force computation (the spec's own example text
-        // is inconsistent between 0.345 and 0.346, so compute the truth).
-        assert_eq!(outcome.satisfiable, Some(true));
-        let clauses = vec![vec![-1, -2], vec![2, 3, -4], vec![4, 5], vec![4, 6]];
-        let expected = brute_force_weighted(
-            6,
-            &clauses,
-            &[
-                ("0.4", "0.6"),
-                ("0.5", "0.5"),
-                ("0.4", "0.6"),
-                ("0.3", "0.7"),
-                ("0.5", "0.5"),
-                ("0.7", "0.3"),
-            ],
-        );
-        match &outcome.value {
-            Some(ExactValue::Rat(r)) => {
-                assert_eq!(*r, expected, "weighted count mismatch: {r}");
-            }
-            other => panic!("expected rational, got {other:?}"),
-        }
-    }
-
-    /// Brute-force real weighted count; weights[(v-1)] = (w(v), w(-v)).
-    fn brute_force_weighted(
-        num_vars: usize,
-        clauses: &[Vec<i32>],
-        weights: &[(&str, &str)],
-    ) -> BigRational {
-        use num_traits::{One, Zero};
-        let w: Vec<(BigRational, BigRational)> = weights
-            .iter()
-            .map(|(p, n)| {
-                (
-                    parse::parse_rational(p).unwrap(),
-                    parse::parse_rational(n).unwrap(),
-                )
-            })
-            .collect();
-        let mut total = BigRational::zero();
-        for m in 0..(1u64 << num_vars) {
-            let sat = clauses.iter().all(|cl| {
-                cl.iter().any(|&l| {
-                    let v = l.unsigned_abs() as usize - 1;
-                    let bit = (m >> v) & 1 == 1;
-                    if l > 0 {
-                        bit
-                    } else {
-                        !bit
-                    }
-                })
-            });
-            if !sat {
-                continue;
-            }
-            let mut prod = BigRational::one();
-            for v in 0..num_vars {
-                let bit = (m >> v) & 1 == 1;
-                prod *= if bit { &w[v].0 } else { &w[v].1 };
-            }
-            total += prod;
-        }
-        total
-    }
-
-    #[test]
-    fn end_to_end_spec_example_4_projected() {
-        let text = "p cnf 6 4 2\nc t pmc\nc p show 1 2 0\n-1 -2 0\n2 3 -4 0\n4 5 0\n4 6 0\n";
-        let outcome = solve_text(text);
-        assert_eq!(outcome.satisfiable, Some(true));
-        assert_eq!(
-            outcome.value,
-            Some(ExactValue::Nat(num_bigint::BigUint::from(3u32)))
-        );
-    }
-
-    #[test]
-    fn end_to_end_spec_example_5_complex() {
-        let text = "p cnf 3 2\nc t amc-complex\n\
-            c p weight 1 0.4+0.2i 0\nc p weight -1 0.6+0.6i 0\n\
-            c p weight 2 0.5+0.5i 0\nc p weight -2 0.5+0.5i 0\n\
-            c p weight 3 0.3+0.7i 0\nc p weight -3 0.7+0.3i 0\n\
-            1 -2 0\n-1 3 0\n";
-        let outcome = solve_text(text);
-        assert_eq!(outcome.satisfiable, Some(true));
-        // Spec example: result 0.55 - 1.1i... the spec prints
-        // `c s exact double float 0.55-1.1i`. Verify against an independent
-        // brute-force complex computation.
-        let (re, im) = brute_force_complex(
-            3,
-            &[vec![1, -2], vec![-1, 3]],
-            &[
-                ("0.4", "0.2"),
-                ("0.6", "0.6"),
-                ("0.5", "0.5"),
-                ("0.5", "0.5"),
-                ("0.3", "0.7"),
-                ("0.7", "0.3"),
-            ],
-        );
-        match &outcome.value {
-            Some(ExactValue::Complex(gre, gim)) => {
-                assert_eq!(*gre, re);
-                assert_eq!(*gim, im);
-            }
-            other => panic!("expected complex, got {other:?}"),
-        }
-    }
-
-    /// Brute-force complex weighted count for tests. Weight list is
-    /// [(re,im) for lit codes 1,-1,2,-2,...] as decimal strings.
-    fn brute_force_complex(
-        num_vars: usize,
-        clauses: &[Vec<i32>],
-        weights: &[(&str, &str)],
-    ) -> (BigRational, BigRational) {
-        use num_traits::{One, Zero};
-        let w: Vec<(BigRational, BigRational)> = weights
-            .iter()
-            .map(|(re, im)| {
-                (
-                    parse::parse_rational(re).unwrap(),
-                    parse::parse_rational(im).unwrap(),
-                )
-            })
-            .collect();
-        let mut total_re = BigRational::zero();
-        let mut total_im = BigRational::zero();
-        for m in 0..(1u64 << num_vars) {
-            let sat = clauses.iter().all(|cl| {
-                cl.iter().any(|&l| {
-                    let v = l.unsigned_abs() as usize - 1;
-                    let bit = (m >> v) & 1 == 1;
-                    if l > 0 {
-                        bit
-                    } else {
-                        !bit
-                    }
-                })
-            });
-            if !sat {
-                continue;
-            }
-            let mut prod_re = BigRational::one();
-            let mut prod_im = BigRational::zero();
-            for v in 0..num_vars {
-                let bit = (m >> v) & 1 == 1;
-                let (wre, wim) = &w[v * 2 + usize::from(!bit)];
-                let new_re = &prod_re * wre - &prod_im * wim;
-                let new_im = &prod_re * wim + &prod_im * wre;
-                prod_re = new_re;
-                prod_im = new_im;
-            }
-            total_re += prod_re;
-            total_im += prod_im;
-        }
-        (total_re, total_im)
-    }
-
-    #[test]
-    fn unsat_instance_reports_unsatisfiable() {
-        let text = "p cnf 1 2\nc t mc\n1 0\n-1 0\n";
-        let outcome = solve_text(text);
-        assert_eq!(outcome.satisfiable, Some(false));
-        assert_eq!(
-            outcome.value,
-            Some(ExactValue::Nat(num_bigint::BigUint::from(0u32)))
-        );
-    }
-
-    #[test]
-    fn pmc_with_no_show_line_is_sat_decision() {
-        // Spec: "if no variables are stated the problem is simply to decide
-        // satisfiability" — count over the empty projection is 1 if SAT.
-        let text = "p cnf 2 1\nc t pmc\nc p show 0\n1 2 0\n";
-        let outcome = solve_text(text);
-        assert_eq!(outcome.satisfiable, Some(true));
-        assert_eq!(
-            outcome.value,
-            Some(ExactValue::Nat(num_bigint::BigUint::from(1u32)))
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

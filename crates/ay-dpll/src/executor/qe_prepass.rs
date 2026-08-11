@@ -9,7 +9,7 @@
 //! presence of quantified assertions. Where the `qe-light` tactic pass
 //! ([`crate::preprocess::qe_light`]) only replaces top-fragment
 //! single-variable existentials, this pass descends INTO binders and layers
-//! four logical identities over the same soundness-gated elimination engines:
+//! four logical identities over the same candidate elimination engines:
 //!
 //! 1. **Binder currying** — `∃y,z.φ ≡ ∃y.(∃z.φ)`: bound variables are peeled
 //!    one at a time, last-to-first (dually for `∀`).
@@ -26,8 +26,10 @@
 //! [`Sort::Int`] goes to Cooper ([`crate::qe::eliminate_exists`]) and
 //! [`Sort::Real`] to Loos-Weispfenning virtual substitution
 //! ([`crate::qe::eliminate_exists_real`]); anything else is refused. Both
-//! engines only return `Eliminated` after their independent per-elimination
-//! equivalence self-check passes (fail-closed).
+//! engines only return `Eliminated` after an independent bounded differential
+//! check passes. That finite check is a candidate screen, not universal
+//! equivalence authority; public proof-producing solves therefore keep the
+//! exact quantified source unless a separate symbolic certificate is present.
 //!
 //! # Soundness discipline (HARD requirements)
 //!

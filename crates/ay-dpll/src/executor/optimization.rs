@@ -13,7 +13,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::term::{Symbol, TermData};
+use ay_core::term::{Symbol, TermData, TermEntryStamp};
 use ay_core::{Sort, TermId, TheorySolver};
 use ay_frontend::ObjectiveDirection;
 use ay_lra::{LraSolver, OptimizationResult, OptimizationSense};
@@ -23,9 +23,11 @@ use num_traits::{One, Signed, Zero};
 
 use super::check_sat::contains_symbolic_integer_power;
 use super::model::{EvalValue, Model};
-use super::Executor;
+use super::quantifier_loop::result_mapping::CheckedGroundDecision;
+use super::{Executor, QueryAuthorityEpoch};
 use crate::ematching::contains_quantifier;
 use crate::executor_types::{ExecutorError, Result, SolveResult, UnknownOrigin, UnknownReason};
+use crate::logic_detection::LogicCategory;
 
 /// Upper bound on the TOTAL soft weight the core-guided OLL engine will accept
 /// before falling back to the binary-search baseline.
@@ -40,6 +42,11 @@ use crate::executor_types::{ExecutorError, Result, SolveResult, UnknownOrigin, U
 /// relative to typical small `(assert-soft ...)` weights yet bounds the copy
 /// count to a few thousand auxiliary Booleans.
 pub(crate) const MAXSMT_EXACT_MAX_TOTAL_WEIGHT: u64 = 4096;
+
+/// Per-probe ceiling for disposable optimization authority checks. The checked
+/// solver also inherits the enclosing solve's earlier deadline and resource
+/// controls, so this never extends a public optimization query's budget.
+const OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS: u64 = 2_000;
 
 /// Multi-objective priority requested via `(set-option :opt.priority ...)`.
 ///
@@ -112,6 +119,90 @@ pub(crate) struct ParetoState {
     pub(crate) last_point: Option<Vec<BigRational>>,
 }
 
+/// Opaque obligation extension produced by the exact Pareto-front blocker
+/// construction that is subsequently probed for infeasibility.
+///
+/// Its fields are private to this module, so no other executor component can
+/// widen an UNSAT proof scope with an arbitrary term (especially `false`). The
+/// token also binds the blockers to the active public query, source scope,
+/// authored hard roots, and objective inventory.
+pub(crate) struct ParetoFrontExhaustionExtension {
+    query_epoch: QueryAuthorityEpoch,
+    source_context_stamp: ay_frontend::SourceContextStamp,
+    hard_roots: Box<[TermId]>,
+    hard_root_entries: Box<[TermEntryStamp]>,
+    objectives: Box<[ay_frontend::Objective]>,
+    objective_entries: Box<[TermEntryStamp]>,
+    blocking: Box<[TermId]>,
+    blocking_entries: Box<[TermEntryStamp]>,
+}
+
+impl ParetoFrontExhaustionExtension {
+    fn entries_are_current(
+        executor: &Executor,
+        terms: &[TermId],
+        entries: &[TermEntryStamp],
+    ) -> bool {
+        entries.len() == terms.len()
+            && entries.iter().copied().map(Some).eq(terms
+                .iter()
+                .map(|&term| executor.ctx.terms.entry_stamp(term)))
+    }
+
+    fn objective_entries_are_current(&self, executor: &Executor) -> bool {
+        self.objective_entries.len() == self.objectives.len()
+            && self.objective_entries.iter().copied().map(Some).eq(self
+                .objectives
+                .iter()
+                .map(|objective| executor.ctx.terms.entry_stamp(objective.term)))
+    }
+
+    pub(in crate::executor) fn is_current(&self, executor: &Executor) -> bool {
+        self.query_epoch
+            .is_same_epoch(&executor.query_authority_epoch)
+            && self.source_context_stamp == executor.ctx.source_context_stamp()
+            && self.hard_roots.as_ref() == executor.ctx.assertions.as_slice()
+            && Self::entries_are_current(executor, &self.hard_roots, &self.hard_root_entries)
+            && self.objectives.as_ref() == executor.ctx.objectives()
+            && self.objective_entries_are_current(executor)
+            && Self::entries_are_current(executor, &self.blocking, &self.blocking_entries)
+    }
+
+    pub(in crate::executor) fn into_current_binding(
+        self,
+        executor: &Executor,
+    ) -> Option<ParetoFrontExhaustionBinding> {
+        self.is_current(executor)
+            .then_some(ParetoFrontExhaustionBinding {
+                hard_roots: self.hard_roots,
+                hard_root_entries: self.hard_root_entries,
+                objectives: self.objectives,
+                objective_entries: self.objective_entries,
+                blocking: self.blocking,
+                blocking_entries: self.blocking_entries,
+            })
+    }
+
+    fn blocking(&self) -> &[TermId] {
+        &self.blocking
+    }
+}
+
+/// Exact, already-current Pareto blocker payload transferred into the public
+/// UNSAT query epoch.
+///
+/// Keeping term-entry identities beside every numeric [`TermId`] prevents the
+/// UNSAT authority layer from refreshing a blocker, objective, or authored root
+/// after speculative rollback reused its slot.
+pub(in crate::executor) struct ParetoFrontExhaustionBinding {
+    pub(in crate::executor) hard_roots: Box<[TermId]>,
+    pub(in crate::executor) hard_root_entries: Box<[TermEntryStamp]>,
+    pub(in crate::executor) objectives: Box<[ay_frontend::Objective]>,
+    pub(in crate::executor) objective_entries: Box<[TermEntryStamp]>,
+    pub(in crate::executor) blocking: Box<[TermId]>,
+    pub(in crate::executor) blocking_entries: Box<[TermEntryStamp]>,
+}
+
 /// Outcome of one Pareto feasibility probe (see [`Executor::pareto_probe`]).
 ///
 /// Only the verdict matters to the caller: the seed probe just needs to know
@@ -125,6 +216,18 @@ enum ParetoProbe {
     /// Infeasible under the probe's assumptions.
     Unsat,
     /// The probe was inconclusive.
+    Unknown,
+}
+
+/// Result of an exact, disposable optimization feasibility check.
+///
+/// Unlike [`SolveResult`], this type is constructed only after the checked
+/// token has been consumed against the identical ordered assertion vector.
+/// No model crosses the isolation boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckedOptimizationDecision {
+    Sat,
+    Unsat,
     Unknown,
 }
 
@@ -164,6 +267,108 @@ enum SimplexOpt {
 }
 
 impl Executor {
+    /// Exact ordered roots for one optimization sub-obligation.
+    ///
+    /// `ctx.assertions` already contains every active hard root plus any
+    /// transient lex/Pareto/MaxSMT extension. Assumptions are appended in their
+    /// solver order so the disposable proof is about precisely the conjunction
+    /// whose feasibility controls the optimization state transition.
+    fn optimization_probe_roots(&self, assumptions: &[TermId]) -> Vec<TermId> {
+        let mut roots = self.ctx.assertions.clone();
+        roots.extend_from_slice(assumptions);
+        roots
+    }
+
+    /// Decide one exact optimization obligation without importing a model or a
+    /// raw nested-solver verdict.
+    ///
+    /// Ground obligations use the checked two-sided decision API. Quantified
+    /// obligations have no checked SAT transport here; they may contribute only
+    /// a strict-proof UNSAT token, otherwise the optimization probe is Unknown.
+    fn checked_optimization_decision(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> CheckedOptimizationDecision {
+        let roots = self.optimization_probe_roots(assumptions);
+        self.checked_optimization_roots_decision(&roots)
+    }
+
+    fn checked_optimization_roots_decision(
+        &mut self,
+        roots: &[TermId],
+    ) -> CheckedOptimizationDecision {
+        if roots
+            .iter()
+            .any(|&root| contains_quantifier(&self.ctx.terms, root))
+        {
+            return match self
+                .checked_exact_unsat_solve(roots.to_vec(), OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS)
+            {
+                Some(checked) => {
+                    if checked.consume(self, roots) {
+                        CheckedOptimizationDecision::Unsat
+                    } else {
+                        CheckedOptimizationDecision::Unknown
+                    }
+                }
+                _ => CheckedOptimizationDecision::Unknown,
+            };
+        }
+
+        match self.checked_ground_solve(
+            roots.to_vec(),
+            LogicCategory::Other,
+            OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS,
+        ) {
+            Some(CheckedGroundDecision::Sat(checked)) => {
+                if checked.consume(self, roots) {
+                    CheckedOptimizationDecision::Sat
+                } else {
+                    CheckedOptimizationDecision::Unknown
+                }
+            }
+            Some(CheckedGroundDecision::Unsat(checked)) => {
+                if checked.consume(self, roots) {
+                    CheckedOptimizationDecision::Unsat
+                } else {
+                    CheckedOptimizationDecision::Unknown
+                }
+            }
+            _ => CheckedOptimizationDecision::Unknown,
+        }
+    }
+
+    /// Strictly recheck a proposed optimization UNSAT over the exact active
+    /// hard/extension roots and assumptions. This is the only authority used to
+    /// move a search bound, accept an OLL core, or terminate an improvement loop
+    /// when the SAT side still needs the enclosing executor's model.
+    fn checked_optimization_unsat(&mut self, assumptions: &[TermId]) -> bool {
+        let roots = self.optimization_probe_roots(assumptions);
+        self.checked_optimization_roots_unsat(&roots)
+    }
+
+    /// Strict-UNSAT twin for a caller that already captured its full ordered
+    /// root window before a raw same-context model probe could rewrite working
+    /// assertions.
+    fn checked_optimization_roots_unsat(&mut self, roots: &[TermId]) -> bool {
+        self.checked_exact_unsat_solve(roots.to_vec(), OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS)
+            .is_some_and(|checked| checked.consume(self, roots))
+    }
+
+    /// Same-Context probe for search steps whose SAT arm still needs the raw
+    /// validated model. SAT transport remains deliberately local to the
+    /// existing caller; an UNSAT result crosses this helper only after a strict
+    /// checked re-solve of the pre-probe H + extension + assumptions roots.
+    fn optimization_model_probe(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
+        let exact_roots = self.optimization_probe_roots(assumptions);
+        let result = self.check_sat_assuming(assumptions)?;
+        if result.is_unsat() && !self.checked_optimization_roots_unsat(&exact_roots) {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(SolveResult::Unknown);
+        }
+        Ok(result)
+    }
+
     /// Solve a MaxSMT problem from `(assert-soft ...)` soft constraints.
     ///
     /// SOUNDNESS: a soft constraint is NOT a hard constraint. This
@@ -324,6 +529,13 @@ impl Executor {
         // established over the user's genuine hard constraints. This keeps
         // `(get-proof)` / proof verification working for hard-unsat MaxSMT inputs.
         if captured_result.is_unsat() {
+            // Internal relaxation/counter declarations deliberately advance the
+            // frontend source-context revision. They have all been removed above,
+            // but a monotonic stamp must never be rewound: restart exact public
+            // UNSAT authority on the now-restored hard roots instead. The outer
+            // command will certify this fresh hard-only proof before publication.
+            self.begin_public_solve(false);
+            self.bind_unsat_query_assumptions(&[]);
             let hard_result = self.check_sat();
             if hard_result.is_err() {
                 self.invalidate_last_check_result();
@@ -596,13 +808,13 @@ impl Executor {
         let relax_vars = self.maxsmt_build_relaxation(&soft_terms);
 
         // Base feasibility (all relaxations free): is the hard formula SAT?
-        let (base, _) = self.maxsmt_scoped_check_sat(|_| {})?;
+        let base = self.maxsmt_scoped_checked_decision(|_| {});
         match base {
-            SolveResult::Sat => {}
-            SolveResult::Unsat(reason) => {
-                return Ok((SolveResult::Unsat(reason), None, 0, true, Vec::new()));
+            CheckedOptimizationDecision::Sat => {}
+            CheckedOptimizationDecision::Unsat => {
+                return Ok((SolveResult::unsat(), None, 0, true, Vec::new()));
             }
-            SolveResult::Unknown => {
+            CheckedOptimizationDecision::Unknown => {
                 return Ok((SolveResult::Unknown, None, 0, false, Vec::new()));
             }
         }
@@ -624,13 +836,13 @@ impl Executor {
                 let mid = lo + (hi - lo) / 2;
                 let relax = relax_vars.clone();
                 let weights = soft_weights.clone();
-                let (probe, _) = self.maxsmt_scoped_check_sat(move |exec| {
+                let probe = self.maxsmt_scoped_checked_decision(move |exec| {
                     exec.maxsmt_assert_weighted_at_most_w(&relax, &weights, mid);
-                })?;
+                });
                 match probe {
-                    SolveResult::Sat => hi = mid,
-                    SolveResult::Unsat(_) => lo = mid + 1,
-                    SolveResult::Unknown => {
+                    CheckedOptimizationDecision::Sat => hi = mid,
+                    CheckedOptimizationDecision::Unsat => lo = mid + 1,
+                    CheckedOptimizationDecision::Unknown => {
                         // Inconclusive probe (resource limit): report the base
                         // model's TRUE violated weight as an approximate
                         // (non-optimal) upper bound. Reporting `total_weight`
@@ -706,12 +918,13 @@ impl Executor {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let relax = relax_vars.clone();
-            let (probe, _) =
-                self.maxsmt_scoped_check_sat(|exec| exec.maxsmt_assert_at_most_k(&relax, mid))?;
+            let probe = self.maxsmt_scoped_checked_decision(|exec| {
+                exec.maxsmt_assert_at_most_k(&relax, mid);
+            });
             match probe {
-                SolveResult::Sat => hi = mid,
-                SolveResult::Unsat(_) => lo = mid + 1,
-                SolveResult::Unknown => {
+                CheckedOptimizationDecision::Sat => hi = mid,
+                CheckedOptimizationDecision::Unsat => lo = mid + 1,
+                CheckedOptimizationDecision::Unknown => {
                     // Inconclusive cardinality probe (resource limit): report
                     // the base model's true violated weight, marked approximate.
                     let (_, model) = self.maxsmt_scoped_check_sat(|_| {})?;
@@ -741,7 +954,7 @@ impl Executor {
             for &i in sorted_by_weight.iter().rev() {
                 let relax = relax_vars.clone();
                 let committed = committed_not_relax.clone();
-                let (probe, _) = self.maxsmt_scoped_check_sat(move |exec| {
+                let probe = self.maxsmt_scoped_checked_decision(move |exec| {
                     exec.maxsmt_assert_at_most_k(&relax, opt_k);
                     for &c in &committed {
                         let nr = exec.ctx.terms.mk_not(relax[c]);
@@ -749,8 +962,8 @@ impl Executor {
                     }
                     let nr = exec.ctx.terms.mk_not(relax[i]);
                     exec.maxsmt_assert(nr);
-                })?;
-                if probe.is_sat() {
+                });
+                if probe == CheckedOptimizationDecision::Sat {
                     committed_not_relax.push(i);
                 }
             }
@@ -916,19 +1129,13 @@ impl Executor {
         let relax_vars = self.maxsmt_build_relaxation(&soft_terms);
 
         // (2) Base feasibility (all relaxations free): is the hard formula SAT?
-        let (base, _) = self.maxsmt_scoped_check_sat(|_| {})?;
+        let base = self.maxsmt_scoped_checked_decision(|_| {});
         match base {
-            SolveResult::Sat => {}
-            SolveResult::Unsat(reason) => {
-                return Ok(Some((
-                    SolveResult::Unsat(reason),
-                    None,
-                    0,
-                    true,
-                    Vec::new(),
-                )));
+            CheckedOptimizationDecision::Sat => {}
+            CheckedOptimizationDecision::Unsat => {
+                return Ok(Some((SolveResult::unsat(), None, 0, true, Vec::new())));
             }
-            SolveResult::Unknown => return Ok(None),
+            CheckedOptimizationDecision::Unknown => return Ok(None),
         }
 
         // (3) Weighted disjoint-core lower bound. `residual[i]` is soft `i`'s
@@ -960,9 +1167,17 @@ impl Executor {
                 break;
             }
 
+            let exact_base_roots = self.ctx.assertions.clone();
+            let mut exact_round_roots = exact_base_roots.clone();
+            exact_round_roots.extend_from_slice(&assumptions);
             let probe = self.check_sat_assuming(&assumptions)?;
             match probe {
                 SolveResult::Sat => {
+                    if self.checked_optimization_roots_decision(&exact_round_roots)
+                        != CheckedOptimizationDecision::Sat
+                    {
+                        return Ok(None);
+                    }
                     // Every soft with positive residual can be satisfied
                     // simultaneously; the disjoint cores already found give the
                     // final lower bound.
@@ -1002,6 +1217,17 @@ impl Executor {
                     // bound, so we fall back rather than risk a wrong optimum. (A
                     // singleton core is fine: it forces that one soft relaxed.)
                     if core_indices.is_empty() {
+                        return Ok(None);
+                    }
+
+                    // The failed-assumption harvest is only a candidate core.
+                    // Membership proves where its literals came from, not that
+                    // this proper subset is itself inconsistent with H + R.
+                    // Re-prove that exact conjunction before it can raise the
+                    // weighted lower bound.
+                    let mut exact_core_roots = exact_base_roots;
+                    exact_core_roots.extend_from_slice(&core);
+                    if !self.checked_optimization_roots_unsat(&exact_core_roots) {
                         return Ok(None);
                     }
 
@@ -1098,6 +1324,19 @@ impl Executor {
         }
     }
 
+    /// Decide a model-free MaxSMT feasibility obligation over the exact
+    /// temporary assertion extension.
+    fn maxsmt_scoped_checked_decision<F>(&mut self, add_clauses: F) -> CheckedOptimizationDecision
+    where
+        F: FnOnce(&mut Self),
+    {
+        let snapshot = self.ctx.assertions.len();
+        add_clauses(self);
+        let decision = self.checked_optimization_decision(&[]);
+        self.ctx.truncate_assertions(snapshot);
+        decision
+    }
+
     /// Run a MaxSMT probe over a temporary extension of the assertion stack.
     ///
     /// `add_clauses` appends the probe's temporary assertions (cardinality /
@@ -1115,6 +1354,10 @@ impl Executor {
     {
         let snapshot = self.ctx.assertions.len();
         add_clauses(self);
+        // Capture before the raw same-context solve: preprocessing may replace
+        // its working assertion window, while the bound transition must be
+        // justified by the exact H + R + encoder roots built above.
+        let exact_roots = self.ctx.assertions.clone();
 
         let saved_incr_mode = self.incremental_mode;
         let saved_incr_theory = self.incr_theory_state.take();
@@ -1126,8 +1369,22 @@ impl Executor {
         self.incr_theory_state = saved_incr_theory;
         self.incr_bv_state = saved_incr_bv;
 
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.ctx.truncate_assertions(snapshot);
+                return Err(error);
+            }
+        };
+        let result = if result.is_unsat() && !self.checked_optimization_roots_unsat(&exact_roots) {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            SolveResult::Unknown
+        } else {
+            result
+        };
+
         self.ctx.truncate_assertions(snapshot);
-        Ok((result?, model))
+        Ok((result, model))
     }
 
     /// Total weight of soft constraints violated in `model`.
@@ -1816,12 +2073,9 @@ impl Executor {
         // (1) SEED: a feasible point not dominated-or-equal by any emitted point.
         // Blocking literal per emitted point `e`: "strictly better than e on >= 1
         // objective" — the negation of "e dominates-or-equals this solution".
-        let mut block: Vec<TermId> = Vec::with_capacity(state.emitted.len());
-        for point in &state.emitted {
-            block.push(self.mk_not_dominated_or_equal_by(objectives, point)?);
-        }
-
-        let seed = self.pareto_probe(&block)?;
+        let exhaustion =
+            self.build_pareto_front_exhaustion_extension(objectives, &state.emitted)?;
+        let seed = self.pareto_probe(exhaustion.blocking())?;
         match seed {
             ParetoProbe::Sat => {}
             ParetoProbe::Unknown => {
@@ -1845,7 +2099,9 @@ impl Executor {
                 // correct refutation for assuming a term the authored
                 // assertions do not contain. Declared BEFORE `state` is reset,
                 // since `block` was built from the emitted points.
-                self.declare_pareto_front_exhaustion_extension(&block);
+                if !self.declare_pareto_front_exhaustion_extension(exhaustion) {
+                    return Ok(self.optimization_inconclusive());
+                }
                 self.pareto_state = Some(ParetoState {
                     emitted: Vec::new(),
                     last_point: last,
@@ -1860,6 +2116,8 @@ impl Executor {
                 return Ok(SolveResult::unsat());
             }
         }
+
+        let block = exhaustion.blocking().to_vec();
 
         // (2) PUSH TO PARETO-OPTIMALITY by LEXICOGRAPHIC optimization subject to
         // the seed-blocking constraints. A lex-optimal point (maximize obj0, then
@@ -1976,15 +2234,73 @@ impl Executor {
         self.finalize_optimization(&finite_values, true)
     }
 
-    /// Run one Pareto feasibility probe under `assumptions`, returning only the
-    /// verdict. (`check_sat_assuming` populates `self.last_model` on SAT, which the
-    /// caller reads when it needs the witness.)
+    /// Run one Pareto feasibility probe under `assumptions`, returning only a
+    /// verdict corroborated by a disposable exact-scope token. The raw solve is
+    /// retained because a SAT seed supplies the same-Context candidate model to
+    /// the lex push, while terminal front exhaustion needs its proof state for
+    /// the outer Pareto-extension publication funnel. Its bare tri-state is
+    /// never sufficient to change the enumeration state.
     fn pareto_probe(&mut self, assumptions: &[TermId]) -> Result<ParetoProbe> {
-        match self.check_sat_assuming(assumptions)? {
-            SolveResult::Sat => Ok(ParetoProbe::Sat),
-            SolveResult::Unsat(_) => Ok(ParetoProbe::Unsat),
-            SolveResult::Unknown => Ok(ParetoProbe::Unknown),
+        let exact_roots = self.optimization_probe_roots(assumptions);
+        let raw = self.check_sat_assuming(assumptions)?;
+        let checked = self.checked_optimization_roots_decision(&exact_roots);
+        match (raw, checked) {
+            (SolveResult::Sat, CheckedOptimizationDecision::Sat) => Ok(ParetoProbe::Sat),
+            (SolveResult::Unsat(_), CheckedOptimizationDecision::Unsat) => Ok(ParetoProbe::Unsat),
+            _ => Ok(ParetoProbe::Unknown),
         }
+    }
+
+    /// Build the exact blocker vector used by the next-front feasibility probe
+    /// and seal it to the current public optimization query.
+    fn build_pareto_front_exhaustion_extension(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        emitted: &[Vec<BigRational>],
+    ) -> Result<ParetoFrontExhaustionExtension> {
+        let mut blocking = Vec::with_capacity(emitted.len());
+        for point in emitted {
+            blocking.push(self.mk_not_dominated_or_equal_by(objectives, point)?);
+        }
+        let hard_root_entries = self
+            .ctx
+            .assertions
+            .iter()
+            .map(|&root| self.ctx.terms.entry_stamp(root))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecutorError::UnsupportedOptimization(
+                    "Pareto exhaustion roots contain a stale term entry".to_string(),
+                )
+            })?;
+        let objective_entries = objectives
+            .iter()
+            .map(|objective| self.ctx.terms.entry_stamp(objective.term))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecutorError::UnsupportedOptimization(
+                    "Pareto exhaustion objectives contain a stale term entry".to_string(),
+                )
+            })?;
+        let blocking_entries = blocking
+            .iter()
+            .map(|&term| self.ctx.terms.entry_stamp(term))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecutorError::UnsupportedOptimization(
+                    "Pareto exhaustion blockers contain a stale term entry".to_string(),
+                )
+            })?;
+        Ok(ParetoFrontExhaustionExtension {
+            query_epoch: self.query_authority_epoch.clone(),
+            source_context_stamp: self.ctx.source_context_stamp(),
+            hard_roots: self.ctx.assertions.clone().into_boxed_slice(),
+            hard_root_entries: hard_root_entries.into_boxed_slice(),
+            objectives: objectives.into(),
+            objective_entries: objective_entries.into_boxed_slice(),
+            blocking: blocking.into_boxed_slice(),
+            blocking_entries: blocking_entries.into_boxed_slice(),
+        })
     }
 
     /// Evaluate an objective term to its scalar value as a `BigRational`,
@@ -2139,22 +2455,7 @@ impl Executor {
         let obj_sort = self.ctx.terms.sort(obj.term).clone();
 
         // Current model for this objective's initial value (warm start).
-        let best_model = self.last_model.clone().unwrap_or_else(|| Model {
-            sat_model: Vec::new(),
-            term_to_var: HashMap::default(),
-            bool_overrides: HashMap::default(),
-            euf_model: None,
-            array_model: None,
-            lra_model: None,
-            lia_model: None,
-            bv_model: None,
-            fp_model: None,
-            string_model: None,
-            seq_model: None,
-            completed_values: HashMap::default(),
-            dt_ground: HashMap::default(),
-            dt_pins: HashMap::default(),
-        });
+        let best_model = self.last_model.clone().unwrap_or_else(Model::empty);
 
         let optimized = match obj_sort {
             Sort::Int => {
@@ -2372,7 +2673,7 @@ impl Executor {
             // Bias the midpoint UP so a SAT probe makes progress (ceil).
             let mid = (&lo + &hi + BigInt::one()) / BigInt::from(2);
             let bound = self.mk_bv_uge(objective, &mid, width);
-            match self.check_sat_assuming(&[bound])? {
+            match self.optimization_model_probe(&[bound])? {
                 SolveResult::Sat => {
                     let model = self.bv_probe_model()?;
                     let value = self.eval_bv_probe(&model, objective)?;
@@ -2384,9 +2685,7 @@ impl Executor {
                     best_value = value.clone();
                     lo = value;
                 }
-                SolveResult::Unsat(_) => {
-                    hi = &mid - BigInt::one();
-                }
+                SolveResult::Unsat(_) => hi = &mid - BigInt::one(),
                 SolveResult::Unknown => {
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     return Ok(None);
@@ -2422,7 +2721,7 @@ impl Executor {
             // Bias the midpoint DOWN so a SAT probe makes progress (floor).
             let mid = (&lo + &hi) / BigInt::from(2);
             let bound = self.mk_bv_ule(objective, &mid, width);
-            match self.check_sat_assuming(&[bound])? {
+            match self.optimization_model_probe(&[bound])? {
                 SolveResult::Sat => {
                     let model = self.bv_probe_model()?;
                     let value = self.eval_bv_probe(&model, objective)?;
@@ -2434,9 +2733,7 @@ impl Executor {
                     best_value = value.clone();
                     hi = value;
                 }
-                SolveResult::Unsat(_) => {
-                    lo = &mid + BigInt::one();
-                }
+                SolveResult::Unsat(_) => lo = &mid + BigInt::one(),
                 SolveResult::Unknown => {
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     return Ok(None);
@@ -2472,10 +2769,10 @@ impl Executor {
         loop {
             let le = self.mk_bv_ule(objective, &candidate, width);
             let ge = self.mk_bv_uge(objective, &candidate, width);
-            match self.check_sat_assuming(&[le, ge])? {
-                SolveResult::Sat => return Ok(Some(candidate)),
-                SolveResult::Unknown => return Ok(None),
-                SolveResult::Unsat(_) => match direction {
+            match self.checked_optimization_decision(&[le, ge]) {
+                CheckedOptimizationDecision::Sat => return Ok(Some(candidate)),
+                CheckedOptimizationDecision::Unknown => return Ok(None),
+                CheckedOptimizationDecision::Unsat => match direction {
                     ObjectiveDirection::Maximize => {
                         if candidate == BigInt::from(0) {
                             return Ok(None); // exhausted (no feasible value)
@@ -2764,6 +3061,10 @@ impl Executor {
                     delta <<= 1;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[ge]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     hi = Some(candidate);
                     break;
                 }
@@ -2793,6 +3094,10 @@ impl Executor {
                     lo = value;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[ge]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     hi = mid;
                 }
                 SolveResult::Unknown => {
@@ -2846,6 +3151,10 @@ impl Executor {
                     delta <<= 1;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[le]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     lo = Some(candidate);
                     break;
                 }
@@ -2875,6 +3184,10 @@ impl Executor {
                     hi = value;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[le]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     lo = mid;
                 }
                 SolveResult::Unknown => {
@@ -3156,7 +3469,7 @@ impl Executor {
                         let publish = if needs_maximality_twin {
                             value == optimal && {
                                 let gt = self.mk_real_gt(objective, &optimal);
-                                matches!(self.check_sat_assuming(&[gt])?, SolveResult::Unsat(_))
+                                self.checked_optimization_unsat(&[gt])
                             }
                         } else {
                             true
@@ -3194,10 +3507,12 @@ impl Executor {
                 // distrust the simplex and fall through to the iterative
                 // fallback, which only decides on a full-solver UNSAT.
                 let ge = self.mk_real_ge(objective, &value);
-                if matches!(self.check_sat_assuming(&[ge])?, SolveResult::Unsat(_)) {
+                if self.checked_optimization_unsat(&[ge]) {
                     let near = &value - BigRational::one();
                     let gt_near = self.mk_real_gt(objective, &near);
-                    if matches!(self.check_sat_assuming(&[gt_near])?, SolveResult::Sat) {
+                    if self.checked_optimization_decision(&[gt_near])
+                        == CheckedOptimizationDecision::Sat
+                    {
                         self.infinitesimal_objectives
                             .insert(objective_index, (value, eps_coeff));
                         // The returned scalar is a placeholder exactly like the
@@ -3246,6 +3561,10 @@ impl Executor {
                     best_value = value;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[gt]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     return Ok(Some((best_model, best_value)));
                 }
                 SolveResult::Unknown => return Ok(None),
@@ -3293,7 +3612,7 @@ impl Executor {
                         let publish = if needs_maximality_twin {
                             value == optimal && {
                                 let lt = self.mk_real_lt(objective, &optimal);
-                                matches!(self.check_sat_assuming(&[lt])?, SolveResult::Unsat(_))
+                                self.checked_optimization_unsat(&[lt])
                             }
                         } else {
                             true
@@ -3322,10 +3641,12 @@ impl Executor {
                 // UNSAT (refutation) and `obj < value + 1` must be SAT
                 // (δ-closeness, bounding any underestimate below 1).
                 let le = self.mk_real_le(objective, &value);
-                if matches!(self.check_sat_assuming(&[le])?, SolveResult::Unsat(_)) {
+                if self.checked_optimization_unsat(&[le]) {
                     let near = &value + BigRational::one();
                     let lt_near = self.mk_real_lt(objective, &near);
-                    if matches!(self.check_sat_assuming(&[lt_near])?, SolveResult::Sat) {
+                    if self.checked_optimization_decision(&[lt_near])
+                        == CheckedOptimizationDecision::Sat
+                    {
                         self.infinitesimal_objectives
                             .insert(objective_index, (value, eps_coeff));
                         // Placeholder scalar; consumers read the map (see the
@@ -3369,6 +3690,10 @@ impl Executor {
                     best_value = value;
                 }
                 SolveResult::Unsat(_) => {
+                    if !self.checked_optimization_unsat(&[lt]) {
+                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                        return Ok(None);
+                    }
                     return Ok(Some((best_model, best_value)));
                 }
                 SolveResult::Unknown => return Ok(None),
@@ -3625,6 +3950,233 @@ impl Executor {
 #[cfg(test)]
 mod admission_state_tests {
     use super::*;
+
+    fn pareto_stamp_executor() -> (Executor, Vec<ay_frontend::Objective>) {
+        let mut exec = Executor::new();
+        let hard_root = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_stamp_hard_root", Sort::Bool);
+        let objective_term = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_stamp_objective", Sort::Int);
+        exec.ctx.assertions = vec![hard_root];
+        exec.ctx.add_objective(ay_frontend::Objective {
+            direction: ObjectiveDirection::Maximize,
+            term: objective_term,
+        });
+        exec.begin_public_solve(false);
+        exec.bind_unsat_query_assumptions(&[]);
+        let objectives = exec.ctx.objectives().to_vec();
+        (exec, objectives)
+    }
+
+    #[test]
+    fn pareto_extension_survives_append_only_term_growth() {
+        let (mut exec, objectives) = pareto_stamp_executor();
+        let extension = exec
+            .build_pareto_front_exhaustion_extension(
+                &objectives,
+                &[vec![BigRational::from_integer(BigInt::from(0))]],
+            )
+            .expect("live Pareto blocker package");
+        assert!(extension.is_current(&exec));
+
+        let _suffix = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_stamp_unrelated_suffix", Sort::Bool);
+        assert!(
+            extension.is_current(&exec),
+            "append-only growth preserves every captured entry identity"
+        );
+    }
+
+    #[test]
+    fn pareto_extension_rejects_rollback_reuse_of_numeric_slots() {
+        let mut exec = Executor::new();
+        let checkpoint = exec.ctx.terms.rollback_checkpoint();
+        let hard_root = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_rolled_hard_root", Sort::Bool);
+        let objective_term = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_rolled_objective", Sort::Int);
+        exec.ctx.assertions = vec![hard_root];
+        exec.ctx.add_objective(ay_frontend::Objective {
+            direction: ObjectiveDirection::Maximize,
+            term: objective_term,
+        });
+        exec.begin_public_solve(false);
+        exec.bind_unsat_query_assumptions(&[]);
+        let objectives = exec.ctx.objectives().to_vec();
+        let extension = exec
+            .build_pareto_front_exhaustion_extension(
+                &objectives,
+                &[vec![BigRational::from_integer(BigInt::from(0))]],
+            )
+            .expect("live Pareto blocker package");
+        let max_slot = extension
+            .blocking()
+            .iter()
+            .copied()
+            .chain([hard_root, objective_term])
+            .map(|term| term.index())
+            .max()
+            .expect("the package contains terms");
+
+        exec.ctx.terms.rollback_to(checkpoint);
+        while exec.ctx.terms.len() <= max_slot {
+            let replacement_index = exec.ctx.terms.len();
+            let _replacement = exec.ctx.terms.mk_fresh_var(
+                &format!("pareto_replacement_{replacement_index}"),
+                Sort::Bool,
+            );
+        }
+        assert!(exec.ctx.terms.entry_stamp(hard_root).is_some());
+        assert!(exec.ctx.terms.entry_stamp(objective_term).is_some());
+        assert!(extension.blocking().iter().all(|&term| exec
+            .ctx
+            .terms
+            .entry_stamp(term)
+            .is_some()));
+        assert!(
+            !extension.is_current(&exec),
+            "repopulating identical numeric slots cannot refresh Pareto authority"
+        );
+    }
+
+    #[test]
+    fn pareto_extension_authenticates_objective_entry_independently() {
+        let mut exec = Executor::new();
+        let hard_root = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_objective_stamp_hard_root", Sort::Bool);
+        exec.ctx.assertions = vec![hard_root];
+        let checkpoint = exec.ctx.terms.rollback_checkpoint();
+        let objective_term = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_objective_stamp_term", Sort::Int);
+        exec.ctx.add_objective(ay_frontend::Objective {
+            direction: ObjectiveDirection::Maximize,
+            term: objective_term,
+        });
+        exec.begin_public_solve(false);
+        exec.bind_unsat_query_assumptions(&[]);
+        let objectives = exec.ctx.objectives().to_vec();
+        let mut extension = exec
+            .build_pareto_front_exhaustion_extension(
+                &objectives,
+                &[vec![BigRational::from_integer(BigInt::from(0))]],
+            )
+            .expect("live Pareto blocker package");
+        let max_slot = extension
+            .blocking()
+            .iter()
+            .copied()
+            .chain([objective_term])
+            .map(|term| term.index())
+            .max()
+            .expect("the package contains an objective and blocker");
+
+        exec.ctx.terms.rollback_to(checkpoint);
+        while exec.ctx.terms.len() <= max_slot {
+            let replacement_index = exec.ctx.terms.len();
+            let _replacement = exec.ctx.terms.mk_fresh_var(
+                &format!("pareto_objective_replacement_{replacement_index}"),
+                Sort::Bool,
+            );
+        }
+        // Refresh the blocker stamps deliberately so the objective stamp is
+        // the only failing identity check in this low-level attack canary.
+        extension.blocking_entries = extension
+            .blocking
+            .iter()
+            .map(|&term| {
+                exec.ctx
+                    .terms
+                    .entry_stamp(term)
+                    .expect("replacement blocker slot is live")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        assert!(ParetoFrontExhaustionExtension::entries_are_current(
+            &exec,
+            &extension.blocking,
+            &extension.blocking_entries,
+        ));
+        assert!(
+            !extension.is_current(&exec),
+            "a replacement objective cannot inherit the old Pareto construction authority"
+        );
+    }
+
+    #[test]
+    fn transferred_pareto_blocker_stamps_reject_later_slot_reuse() {
+        let (mut exec, objectives) = pareto_stamp_executor();
+        let checkpoint = exec.ctx.terms.rollback_checkpoint();
+        let extension = exec
+            .build_pareto_front_exhaustion_extension(
+                &objectives,
+                &[vec![BigRational::from_integer(BigInt::from(0))]],
+            )
+            .expect("live Pareto blocker package");
+        let blocking = extension.blocking().to_vec();
+        assert!(exec.declare_pareto_front_exhaustion_extension(extension));
+
+        let _suffix = exec
+            .ctx
+            .terms
+            .mk_fresh_var("pareto_declared_unrelated_suffix", Sort::Bool);
+        assert_eq!(exec.declared_obligation_extension(), blocking);
+
+        let max_slot = blocking
+            .iter()
+            .map(|term| term.index())
+            .max()
+            .expect("one emitted point creates one blocker");
+        exec.ctx.terms.rollback_to(checkpoint);
+        while exec.ctx.terms.len() <= max_slot {
+            let replacement_index = exec.ctx.terms.len();
+            let _replacement = exec.ctx.terms.mk_fresh_var(
+                &format!("pareto_declared_replacement_{replacement_index}"),
+                Sort::Bool,
+            );
+        }
+        assert!(
+            exec.declared_obligation_extension().is_empty(),
+            "the UNSAT epoch must retain the blocker birth identities"
+        );
+    }
+
+    #[test]
+    fn raw_unsat_cannot_authorize_a_satisfiable_optimization_bound() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_UF)\n\
+             (declare-const p Bool)\n\
+             (assert p)",
+        )
+        .expect("setup script parses");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("setup commands execute");
+        let p = exec.ctx.assertions[0];
+
+        // Model a forged/provisional nested verdict: the bare enum says UNSAT,
+        // but H + p is satisfiable and therefore cannot move an optimization
+        // bound through the checked authority gate.
+        let raw = SolveResult::unsat();
+        assert!(raw.is_unsat());
+        assert!(!exec.checked_optimization_unsat(&[p]));
+
+        // The identical gate does accept a genuine exact contradiction.
+        let not_p = exec.ctx.terms.mk_not(p);
+        assert!(exec.checked_optimization_unsat(&[not_p]));
+    }
 
     #[test]
     fn inconclusive_optimization_revokes_partial_witness_and_objectives() {

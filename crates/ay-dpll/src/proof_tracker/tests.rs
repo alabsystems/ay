@@ -10,6 +10,7 @@ use crate::theory_inference::{
 use ay_core::TheoryLit;
 use ay_core::{ProofStep, Sort, TermStore, TheoryConflict};
 use num_bigint::BigInt;
+use num_rational::BigRational;
 
 fn assert_internal_id_invariants(tracker: &ProofTracker) {
     let len = u32::try_from(tracker.proof.steps.len())
@@ -521,6 +522,86 @@ fn test_normalized_forall_instance_uses_strict_farkas_rewrites() {
 }
 
 #[test]
+fn exact_forall_instance_survives_ground_constant_folding() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("exact_forall_x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let body = terms.mk_lt(zero, x);
+    let forall = terms.mk_forall(vec![("exact_forall_x".to_string(), Sort::Int)], body);
+    let exact = terms.mk_app(Symbol::named("<"), [zero, zero], Sort::Bool);
+    let simplified = terms.mk_lt(zero, zero);
+    assert_ne!(
+        exact, simplified,
+        "the regression requires a folded instance"
+    );
+
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker
+        .add_forall_instantiated_assertion(&mut terms, forall, &[zero], exact)
+        .expect("the exact structural instance must be derivable");
+    let proof = tracker.take_proof();
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Resolution { clause, .. } if clause.is_empty()
+        )),
+        "an independently false arithmetic instance must close before ground folding"
+    );
+    let quality =
+        ay_proof::check_proof_strict_with_context(&proof, &terms, None, None, Some(&[forall]))
+            .expect("exact forall_inst plus checked Farkas complement must pass strict checking");
+    assert!(quality.is_complete());
+    assert_eq!(quality.trust_count, 0);
+
+    let mut rejected = ProofTracker::new();
+    rejected.enable();
+    assert!(
+        rejected
+            .add_forall_instantiated_assertion(&mut terms, forall, &[zero], simplified)
+            .is_none(),
+        "the simplified constant must never be emitted as forall_inst"
+    );
+    assert_eq!(rejected.num_steps(), 0);
+}
+
+#[test]
+fn exact_forall_instance_closes_with_checked_ground_evaluate() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("exact_eval_x", Sort::Real);
+    let zero = terms.mk_int(BigInt::from(0));
+    let to_int_x = terms.mk_app(Symbol::named("to_int"), [x], Sort::Int);
+    let body = terms.mk_app(Symbol::named("="), [to_int_x, zero], Sort::Bool);
+    let forall = terms.mk_forall(vec![("exact_eval_x".to_string(), Sort::Real)], body);
+    let three_halves = terms.mk_rational(BigRational::new(BigInt::from(3), BigInt::from(2)));
+    let grounded_to_int = terms.mk_app(Symbol::named("to_int"), [three_halves], Sort::Int);
+    let exact = terms.mk_app(Symbol::named("="), [grounded_to_int, zero], Sort::Bool);
+
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker
+        .add_forall_instantiated_assertion(&mut terms, forall, &[three_halves], exact)
+        .expect("the exact to_int instance must be derivable");
+    let proof = tracker.take_proof();
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::Evaluate,
+            ..
+        }
+    )));
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::Resolution { clause, .. } if clause.is_empty()
+    )));
+    let quality =
+        ay_proof::check_proof_strict_with_context(&proof, &terms, None, None, Some(&[forall]))
+            .expect("forall_inst plus ground evaluate chain must pass strict checking");
+    assert!(quality.is_complete());
+    assert_eq!(quality.trust_count, 0);
+}
+
+#[test]
 fn test_theory_lemma() {
     let mut tracker = ProofTracker::new();
     tracker.enable();
@@ -821,7 +902,7 @@ fn test_push_pop_removes_scoped_lemmas() {
 }
 
 #[test]
-fn test_push_pop_cleans_ids_for_all_insertion_paths() {
+fn test_push_pop_rollback_cleans_ids_for_all_insertion_paths() {
     let mut tracker = ProofTracker::new();
     tracker.enable();
     tracker.set_theory("LIA");
@@ -864,6 +945,157 @@ fn test_push_pop_cleans_ids_for_all_insertion_paths() {
     );
 
     assert_eq!(tracker.num_steps(), 5);
+    assert_internal_id_invariants(&tracker);
+}
+
+#[test]
+fn test_checkpoint_rollback_restores_entire_proof_ledger() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("LIA");
+
+    tracker.push();
+    let (outer_assumption, outer_lemma) = add_outer_entries(&mut tracker);
+    let checkpoint = tracker.rollback_checkpoint();
+
+    tracker
+        .add_assumption(TermId(2), Some("discarded_assumption".to_string()))
+        .expect("proof tracking enabled");
+    tracker.push();
+    tracker
+        .add_theory_lemma(vec![TermId(20), TermId(21)])
+        .expect("proof tracking enabled");
+    tracker.set_theory("BV");
+    tracker.disable();
+    assert_eq!(tracker.scope_stack.len(), 2);
+    assert_eq!(tracker.num_steps(), 4);
+
+    assert!(tracker.rollback_to(checkpoint));
+
+    assert_eq!(tracker.num_steps(), 2);
+    assert_eq!(tracker.scope_stack.len(), 1);
+    assert!(tracker.is_enabled());
+    assert_eq!(tracker.theory_name, "LIA");
+    assert!(!tracker
+        .proof
+        .named_steps
+        .contains_key("discarded_assumption"));
+    assert_internal_id_invariants(&tracker);
+    assert_outer_entries_dedup(&mut tracker, outer_assumption, outer_lemma);
+
+    let replacement = tracker
+        .add_assumption(TermId(2), Some("replacement".to_string()))
+        .expect("proof tracking enabled");
+    assert_eq!(replacement, ProofId(2));
+
+    assert!(
+        tracker.pop(),
+        "the scope present at checkpoint must survive"
+    );
+    assert_eq!(tracker.num_steps(), 0);
+    assert!(!tracker.pop(), "speculative nested scope must be discarded");
+    assert_internal_id_invariants(&tracker);
+}
+
+#[test]
+fn test_checkpoint_rollback_rejects_replacement_ledger_id_aliases() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("LIA");
+    tracker
+        .add_assumption(TermId(1), Some("entry".to_string()))
+        .expect("proof tracking enabled");
+    let checkpoint = tracker.rollback_checkpoint();
+
+    let moved = tracker.take_proof();
+    assert_eq!(moved.steps.len(), 1);
+    tracker
+        .add_assumption(TermId(2), Some("replacement_ledger".to_string()))
+        .expect("proof tracking enabled");
+    tracker.set_theory("BV");
+    tracker.disable();
+    assert_eq!(tracker.num_steps(), 1, "ProofId(0) was reused");
+
+    assert!(!tracker.rollback_to(checkpoint));
+
+    assert_eq!(tracker.num_steps(), 0);
+    assert!(tracker.is_enabled());
+    assert_eq!(tracker.theory_name, "LIA");
+    assert!(tracker.assumption_map.is_empty());
+    assert!(tracker.lemma_map.is_empty());
+    assert!(tracker.proof.named_steps.is_empty());
+    assert_internal_id_invariants(&tracker);
+}
+
+#[test]
+fn test_checkpoint_rollback_snapshot_can_be_reused_without_proof_id_aliasing() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker
+        .add_assumption(TermId(1), Some("entry".to_string()))
+        .expect("proof tracking enabled");
+    let checkpoint = tracker.rollback_checkpoint();
+    tracker
+        .add_assumption(TermId(2), Some("discarded".to_string()))
+        .expect("proof tracking enabled");
+
+    assert!(tracker.rollback_to(checkpoint.clone()));
+    let reused = tracker
+        .add_assumption(TermId(3), Some("reused_id".to_string()))
+        .expect("proof tracking enabled");
+    assert_eq!(reused, ProofId(1));
+
+    assert!(tracker.rollback_to(checkpoint));
+    assert_eq!(tracker.num_steps(), 1);
+    assert!(tracker.proof.named_steps.contains_key("entry"));
+    assert!(!tracker.proof.named_steps.contains_key("reused_id"));
+    assert_internal_id_invariants(&tracker);
+}
+
+#[test]
+fn test_checkpoint_rollback_removes_new_map_alias_to_old_step() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("EUF");
+    let term = TermId(40);
+    let lemma = tracker
+        .add_theory_lemma(vec![term])
+        .expect("proof tracking enabled");
+    let checkpoint = tracker.rollback_checkpoint();
+
+    let alias = tracker
+        .add_assumption(term, Some("post_checkpoint_alias".to_string()))
+        .expect("certified singleton is reusable");
+    assert_eq!(alias, lemma);
+    assert_eq!(tracker.num_steps(), 1, "alias adds no proof step");
+    assert!(tracker.assumption_map.contains_key(&term));
+
+    assert!(tracker.rollback_to(checkpoint));
+    assert_eq!(tracker.num_steps(), 1);
+    assert!(!tracker.assumption_map.contains_key(&term));
+    assert_internal_id_invariants(&tracker);
+}
+
+#[test]
+fn test_scope_rollback_pop_removes_new_map_alias_to_old_step() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("EUF");
+    let term = TermId(41);
+    tracker
+        .add_theory_lemma(vec![term])
+        .expect("proof tracking enabled");
+    tracker.push();
+
+    tracker
+        .add_assumption(term, Some("scoped_alias".to_string()))
+        .expect("certified singleton is reusable");
+    assert!(tracker.assumption_map.contains_key(&term));
+    assert_eq!(tracker.num_steps(), 1);
+
+    assert!(tracker.pop());
+    assert_eq!(tracker.num_steps(), 1);
+    assert!(!tracker.assumption_map.contains_key(&term));
     assert_internal_id_invariants(&tracker);
 }
 

@@ -349,7 +349,7 @@ impl Profile {
     /// (`bab.rs:10943`), so without inheritance a consumer's per-solve
     /// configuration would silently stop applying inside every sub-search it
     /// spawns — the one place a "per-`SolveOpts`" promise is easiest to break.
-    pub(crate) fn overlay(mut self, other: Profile) -> Self {
+    pub(crate) fn overlay(mut self, other: &Profile) -> Self {
         for k in Knob::ALL {
             if let Some(v) = other.get(k) {
                 self.entries[k.slot()] = Some(v);
@@ -481,6 +481,7 @@ impl Shape {
     }
 
     /// Fraction of columns that must take integer values.
+    #[cfg(test)]
     pub(crate) fn integrality_fraction(&self) -> f64 {
         if self.cols == 0 {
             return 0.0;
@@ -489,6 +490,7 @@ impl Shape {
     }
 
     /// Matrix density in `[0, 1]`.
+    #[cfg(test)]
     pub(crate) fn density(&self) -> f64 {
         let cells = self.rows.saturating_mul(self.cols);
         if cells == 0 {
@@ -498,6 +500,7 @@ impl Shape {
     }
 
     /// Every integral column is binary and there are no continuous columns.
+    #[cfg(test)]
     pub(crate) fn is_pure_binary(&self) -> bool {
         self.general_ints == 0 && self.continuous == 0 && self.binaries > 0
     }
@@ -625,6 +628,9 @@ pub(crate) fn activate(model: &Model) -> Active {
 
 /// Make an explicit *policy* profile active. Exists for tests and for the
 /// measurement harness, which needs to install a profile it did not derive.
+// Profiles are Copy snapshots; taking ownership prevents an active frame from
+// observing later caller mutation and is cheaper than heap indirection here.
+#[allow(clippy::large_types_passed_by_value)]
 pub(crate) fn activate_profile(profile: Profile) -> Active {
     push(Frame {
         caller: caller_layer(),
@@ -647,13 +653,15 @@ pub(crate) fn activate_profile(profile: Profile) -> Active {
 ///   model's shape; applying it to a sub-model it was never derived for is a
 ///   silent misconfiguration, and `Profile::EMPTY` is the honest answer until
 ///   the sub-solve selects its own.
+#[allow(clippy::large_types_passed_by_value)]
 pub(crate) fn activate_caller(profile: Profile) -> Active {
     push(Frame {
-        caller: caller_layer().overlay(profile),
+        caller: caller_layer().overlay(&profile),
         policy: Profile::EMPTY,
     })
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn push(frame: Frame) -> Active {
     let depth = ACTIVE.with(|a| {
         let mut stack = a.borrow_mut();

@@ -13,12 +13,14 @@
 
 pub mod branching;
 mod builtins;
+mod builtins_arithmetic;
 mod builtins_extra;
 pub mod error;
 mod globals;
 mod globals_count;
 mod globals_extra;
 mod globals_regular;
+mod logic;
 pub mod output;
 mod resolve;
 pub mod search;

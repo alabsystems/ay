@@ -31,11 +31,17 @@
 //! so they preserve the property.
 //!
 //! Because of that, a solver that applies a tactic before solving returns the
-//! SAME SAT/UNSAT verdict as solving the original goal. When a tactic *splits*
-//! into several subgoals, the single-goal solver path solves the ORIGINAL goal,
-//! which is equisatisfiable to their disjunction. A tactic that honestly fails
-//! returns `Unknown` and retires every preceding solve artefact; it never reuses
-//! a stale verdict or model.
+//! SAME SAT/UNSAT verdict as solving the original goal. Public decision queries
+//! additionally require an exact-source proof: until a tactic equivalence
+//! certificate exists, [`TacticSolver`] executes the tactic against a detached
+//! clone of the source term store and root vector, discards every speculative
+//! term it builds, and solves the untouched source assertions. It never
+//! substitutes a merely changed root vector for the exact authored query or
+//! lets scratch terms enter later whole-store scans. When a tactic *splits* into
+//! several subgoals, the single-goal solver path likewise solves the ORIGINAL
+//! goal, which is equisatisfiable to their disjunction. A tactic that honestly
+//! fails returns `Unknown` and retires every preceding solve artefact; it never
+//! reuses a stale verdict or model.
 //!
 //! A few tactics are **equisatisfiable but not model-preserving**:
 //! [`Tactic::TseitinCnf`] (fresh Boolean definition variables),
@@ -61,6 +67,7 @@ use crate::preprocess::{
     BitBlast, Der, DistributeForall, FlattenAnd, Nnf, PreprocessingPass, PropagateIneqs,
     PropagateValues, QeLight, ReduceArgs, TseitinCnf, VariableSubstitution,
 };
+use crate::UnknownReason;
 
 /// A single goal produced by a tactic: a set of assertion formulas plus the
 /// Z3-style *depth* (number of primitive tactic applications) reached to
@@ -948,13 +955,14 @@ fn ctx_check_unsat(
         .chain(after.iter())
         .chain(std::iter::once(&target))
     {
-        if sub.try_assert_term(Term(t)).is_err() {
+        let term = sub.wrap_term(t);
+        if sub.try_assert_term(term).is_err() {
             // Could not build the sub-goal faithfully -> do not simplify.
             let _ = sub.try_pop();
             return SubCheck::NotProven;
         }
     }
-    let unsat = sub.check_sat().is_unsat();
+    let unsat = sub.check_sat_internal_api().is_unsat();
     // A failed pop would corrupt subsequent checks; if it fails, signal not-proven
     // (the caller falls back to keeping assertions, which is always sound).
     if sub.try_pop().is_err() {
@@ -1933,9 +1941,12 @@ fn walk(
 ///
 /// Build terms and assert them through [`solver_mut`](Self::solver_mut) (or the
 /// convenience [`assert_term`](Self::assert_term)). When you call
-/// [`check_sat`](Self::check_sat), the configured tactic transforms the
-/// assertions first; because every tactic is model-preserving as a disjunction,
-/// the verdict and model are identical to solving the untransformed goal.
+/// [`check_sat`](Self::check_sat), the configured tactic is executed first.
+/// Public exact-source queries run it on a detached clone of the term store and
+/// assertion-root vector, then solve the untouched source roots until the
+/// transformed roots have a checked equivalence certificate. This preserves
+/// exact proof authority without turning a successful, changed tactic into
+/// `Unknown`; an honest tactic failure still returns `Unknown`.
 pub struct TacticSolver {
     inner: Solver,
     tactic: Tactic,
@@ -1988,17 +1999,31 @@ impl TacticSolver {
         self.inner.assertions()
     }
 
-    /// Apply the tactic to the goal, then check satisfiability.
+    /// Execute the tactic, then check satisfiability.
     ///
-    /// The verdict (and any extracted model) is identical to what
-    /// [`Solver::check_sat`] would return on the untransformed goal, because the
-    /// tactic transformation is model-preserving as a disjunction.
+    /// For a public exact-source query, the tactic runs against a detached clone
+    /// of the source goal and term store. Its validation happens, but neither an
+    /// unproved changed root vector nor any speculative term-store effects are
+    /// committed. The untouched exact source assertions are solved instead. A
+    /// future equivalence-certificate path may authorize solving transformed
+    /// roots; structural equality or a tactic/shape whitelist never does.
     pub fn check_sat(&mut self) -> VerifiedSolveResult {
         // Applying the tactic is itself fallible work in this PUBLIC decision
         // query. Retire the previous model/certificate before it starts, rather
         // than relying on Solver::check_sat (which is never reached on failure).
         self.inner.clear_last_solve_state(true, false);
-        if let Err(e) = self.inner.apply_tactic(&self.tactic) {
+        let source_assertions = self.inner.executor.context().assertions.clone();
+        let source_requires_strict = self
+            .inner
+            .executor
+            .active_unsat_query_requires_strict_proof();
+        let tactic_result = if source_requires_strict {
+            self.inner
+                .validate_tactic_on_detached_goal(&self.tactic, &source_assertions)
+        } else {
+            self.inner.apply_tactic(&self.tactic)
+        };
+        if let Err(e) = tactic_result {
             // A transformation failure must never fabricate a verdict; surface
             // it as Unknown rather than silently solving a possibly-wrong goal.
             self.inner
@@ -2006,18 +2031,73 @@ impl TacticSolver {
             self.inner.set_internal_error_unknown(&e.to_string());
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
+        if source_requires_strict && self.inner.executor.context().assertions != source_assertions {
+            self.inner
+                .record_native_replay_event(NativeReplayEventKind::CheckSat);
+            self.inner.set_internal_error_unknown(
+                "detached strict-source tactic execution changed the authored assertion roots",
+            );
+            return self.inner.finish_verified_result(SolveResult::Unknown);
+        }
+        // This is the caller-visible authored decision, not a solver-internal
+        // probe. Enter through the authored wrapper so quantified SAT can use
+        // the exact source/declaration capability minted there. This begins the
+        // final solve epoch after detached validation; the earlier epoch exists
+        // solely to revoke stale artefacts before fallible tactic execution.
         self.inner.check_sat()
     }
 
-    /// Apply the tactic, then check satisfiability under temporary assumptions.
+    /// Execute the tactic, then check satisfiability under temporary assumptions.
+    ///
+    /// The strict-source behavior is the same as [`Self::check_sat`]: the tactic
+    /// receives a detached copy of the term store and permanent assertion roots,
+    /// while the exact caller-supplied assumptions remain bound to the source
+    /// query.
     pub fn check_sat_assuming(&mut self, assumptions: &[Term]) -> VerifiedSolveResult {
-        self.inner.clear_last_solve_state(false, false);
-        if let Err(e) = self.inner.apply_tactic(&self.tactic) {
+        // Retire the prior query before even validating caller handles. A stale
+        // or foreign assumption is itself a failed public decision attempt and
+        // must not leave the preceding assumption map or artefacts observable.
+        self.inner.clear_last_solve_state(true, false);
+        let assumption_ids = match self
+            .inner
+            .resolve_terms("tactic_check_sat_assuming", assumptions)
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.inner.last_executor_error = Some(error.to_string());
+                return self.inner.preflight_unknown(UnknownReason::Incomplete);
+            }
+        };
+        let source_assertions = self.inner.executor.context().assertions.clone();
+        self.inner
+            .executor
+            .bind_unsat_query_assumptions(&assumption_ids);
+        let source_requires_strict = self
+            .inner
+            .executor
+            .active_unsat_query_requires_strict_proof();
+        let tactic_result = if source_requires_strict {
+            self.inner
+                .validate_tactic_on_detached_goal(&self.tactic, &source_assertions)
+        } else {
+            self.inner.apply_tactic(&self.tactic)
+        };
+        if let Err(e) = tactic_result {
             self.inner
                 .record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
-                    assumptions: assumptions.iter().map(|term| term.0).collect(),
+                    assumptions: assumption_ids.clone(),
                 });
             self.inner.set_internal_error_unknown(&e.to_string());
+            return self.inner.finish_verified_result(SolveResult::Unknown);
+        }
+        if source_requires_strict && self.inner.executor.context().assertions != source_assertions {
+            self.inner
+                .record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
+                    assumptions: assumption_ids,
+                });
+            self.inner.set_internal_error_unknown(
+                "detached strict-source tactic execution changed the authored assertion roots",
+            );
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
         self.inner.check_sat_assuming(assumptions)
@@ -2025,6 +2105,32 @@ impl TacticSolver {
 }
 
 impl Solver {
+    /// Execute `tactic` against a fully detached copy of the term universe and
+    /// `source_assertions`.
+    ///
+    /// The clone preserves every source [`TermId`] while isolating fresh names,
+    /// metadata, caches, memory accounting, and appended terms. Both the changed
+    /// roots and all speculative term-store effects are discarded because
+    /// transformation success, structural equality, and tactic identity are not
+    /// equivalence certificates. Honest failure is preserved.
+    fn validate_tactic_on_detached_goal(
+        &mut self,
+        tactic: &Tactic,
+        source_assertions: &[TermId],
+    ) -> Result<(), SolverError> {
+        if tactic.may_invoke_solver() {
+            self.reject_composite_bv_cnf_export(
+                "validate_tactic_on_detached_goal(ctx-solver-simplify)",
+            )?;
+        }
+        let mut detached_terms = self.terms().clone();
+        let mut detached_goal = source_assertions.to_vec();
+        tactic
+            .apply_or_fail(&mut detached_terms, &mut detached_goal)
+            .map_err(|failure| SolverError::TacticFailed(failure.message))?;
+        Ok(())
+    }
+
     /// Apply `tactic` to this solver's goal in place.
     ///
     /// Snapshots the current assertions, runs the tactic's transformation in the
@@ -2063,7 +2169,8 @@ impl Solver {
 
         self.try_reset_assertions()?;
         for id in goal {
-            self.try_assert_term(Term(id))?;
+            let term = self.wrap_term(id);
+            self.try_assert_term(term)?;
         }
         Ok(())
     }
@@ -2090,15 +2197,15 @@ impl Solver {
         tactic: &Tactic,
         goal: &mut Vec<Term>,
     ) -> Result<bool, SolverError> {
+        let mut ids = self.resolve_terms("apply_tactic_to_goal", goal)?;
         if tactic.may_invoke_solver() {
             self.reject_composite_bv_cnf_export("apply_tactic_to_goal(ctx-solver-simplify)")?;
         }
-        let mut ids: Vec<TermId> = goal.iter().map(|t| t.0).collect();
         let changed = tactic
             .apply_or_fail(self.terms_mut(), &mut ids)
             .map_err(|f| SolverError::TacticFailed(f.message))?;
         if changed {
-            *goal = ids.into_iter().map(Term).collect();
+            *goal = ids.into_iter().map(|id| self.wrap_term(id)).collect();
         }
         Ok(changed)
     }
@@ -2127,16 +2234,24 @@ impl Solver {
         tactic: &Tactic,
         goal: &[Term],
     ) -> Result<Vec<(Vec<Term>, usize)>, SolverError> {
+        let ids = self.resolve_terms("apply_tactic_subgoals", goal)?;
         if tactic.may_invoke_solver() {
             self.reject_composite_bv_cnf_export("apply_tactic_subgoals(ctx-solver-simplify)")?;
         }
-        let ids: Vec<TermId> = goal.iter().map(|t| t.0).collect();
         let subgoals = tactic
             .apply_subgoals(self.terms_mut(), Goal::root(ids))
             .map_err(|f| SolverError::TacticFailed(f.message))?;
         Ok(subgoals
             .into_iter()
-            .map(|g| (g.formulas.into_iter().map(Term).collect(), g.depth))
+            .map(|g| {
+                (
+                    g.formulas
+                        .into_iter()
+                        .map(|id| self.wrap_term(id))
+                        .collect(),
+                    g.depth,
+                )
+            })
             .collect())
     }
 
@@ -2152,7 +2267,7 @@ impl Solver {
     /// return exactly what libz3 returns. Boolean probes return `1.0`/`0.0`.
     #[must_use]
     pub fn apply_probe(&self, probe: &Probe, goal: &[Term], depth: usize) -> f64 {
-        let ids: Vec<TermId> = goal.iter().map(|t| t.0).collect();
+        let ids = self.require_terms("apply_probe", goal);
         eval_probe_num(probe, self.terms(), &ids, depth)
     }
 
@@ -2168,6 +2283,7 @@ impl Solver {
     /// result denotes the same formulas over this solver's store.
     #[must_use]
     pub fn translate_terms_from(&mut self, source: &Solver, formulas: &[Term]) -> Vec<Term> {
+        let source_ids = source.require_terms("translate_terms_from", formulas);
         // Propagate the `to_real`-shadowed latch for the same reason as the
         // `is_int` latch below. `graft_term` rebuilds applications directly and
         // therefore does not revisit declaration-time shadow detection. Losing
@@ -2192,11 +2308,11 @@ impl Solver {
         }
         let src = source.terms();
         let mut memo: std::collections::HashMap<TermId, TermId> = std::collections::HashMap::new();
-        let out: Vec<Term> = formulas
-            .iter()
-            .map(|t| Term(graft_term(src, self.terms_mut(), t.0, &mut memo)))
+        let out: Vec<TermId> = source_ids
+            .into_iter()
+            .map(|id| graft_term(src, self.terms_mut(), id, &mut memo))
             .collect();
-        out
+        out.into_iter().map(|id| self.wrap_term(id)).collect()
     }
 
     /// Record an internal error and mark the next/last result as Unknown.
@@ -2209,9 +2325,9 @@ impl Solver {
         // tactic-probe artefact before publishing Unknown diagnostics.
         self.executor.begin_public_solve(false);
         self.executor
-            .replace_last_result_with_unknown(crate::UnknownReason::InternalError);
+            .replace_last_result_with_unknown(UnknownReason::InternalError);
         self.last_assumptions = None;
-        self.last_unknown_reason = Some(crate::UnknownReason::InternalError);
+        self.last_unknown_reason = Some(UnknownReason::InternalError);
         self.last_executor_error = Some(detail.to_string());
     }
 }

@@ -510,6 +510,7 @@ fn incremental_solver_ay_pipe_responds() {
     use std::io::{BufReader, BufWriter, Write};
     use std::process::Stdio;
 
+    let _ay_guard = common::ay_process_guard();
     let mut child = common::ay_command()
         .arg("-in")
         .stdin(Stdio::piped())

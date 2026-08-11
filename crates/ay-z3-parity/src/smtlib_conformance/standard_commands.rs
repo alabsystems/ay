@@ -62,8 +62,7 @@ impl CaseSpec {
                 marker,
                 unsupported,
             } => format!(
-                "stdout-fragments={:?};verdict={:?};marker={:?};unsupported={unsupported}",
-                fragments, verdict, marker
+                "stdout-fragments={fragments:?};verdict={verdict:?};marker={marker:?};unsupported={unsupported}"
             ),
             StdoutExpectation::Rejected => {
                 "one-error-response-followed-by-recovery-marker".to_string()
@@ -353,7 +352,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("standard-commands timeout must be between 1ns and 3600 seconds".to_string());
     }
     let subject = contract
@@ -1133,14 +1132,10 @@ fn row_from_output(spec: &CaseSpec, output: GuardedTranscriptOutput) -> Validato
     let stdout_utf8 = String::from_utf8(output.stdout);
     let stderr_utf8 = String::from_utf8(output.stderr);
     let streams_valid = stdout_utf8.is_ok() && stderr_utf8.is_ok();
-    let stdout = stdout_utf8.map_or_else(
-        |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        |value| value,
-    );
-    let stderr = stderr_utf8.map_or_else(
-        |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        |value| value,
-    );
+    let stdout =
+        stdout_utf8.unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    let stderr =
+        stderr_utf8.unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
     let process = ProcessObservation {
         stdin_complete: output.stdin_complete,
         timed_out: output.timed_out,

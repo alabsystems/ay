@@ -289,3 +289,30 @@ fn test_mbqi_model_value_injection_mixed_sorts() {
     // With x=a, n=0: P(a) => 0>0 = true => false = false → counterexample.
     assert_eq!(outputs, vec!["unsat"]);
 }
+
+/// A function returning the binder sort occurs only under a forall. The EPR
+/// finite-universe certificate must scan the original quantified snapshot,
+/// not just the stripped MBQI ground window, or it can miss `g(a)` and certify
+/// the singleton `{a}` as complete.
+#[test]
+#[timeout(60_000)]
+fn test_finite_uninterpreted_certificate_sees_quantified_domain_generator() {
+    let smt = r#"
+        (set-logic UF)
+        (declare-sort U 0)
+        (declare-const a U)
+        (declare-fun q (U) Bool)
+        (declare-fun p (U) Bool)
+        (declare-fun g (U) U)
+        (assert (q a))
+        (assert (forall ((x U)) (p x)))
+        (assert (forall ((x U)) (not (p (g x)))))
+        (check-sat)
+    "#;
+    let outputs = crate::common::solve_vec(smt);
+    assert_ne!(
+        outputs,
+        vec!["sat"],
+        "domain generator makes the formula UNSAT"
+    );
+}

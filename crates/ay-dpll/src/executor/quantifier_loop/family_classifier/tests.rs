@@ -8,7 +8,6 @@
 //! classified `forall` term ids are the raw parsed ones), then drives the shadow
 //! classifier directly.
 
-use super::super::model_completion::is_quantifier_consumer_seq_model_completion_quantifier;
 use super::FamilyClass;
 use crate::Executor;
 use ay_frontend::parse;
@@ -157,9 +156,8 @@ fn mono_vocabulary_coupling_is_not_bridge_cycle() {
 // Other — every certificate-path shape MUST classify Other.
 // ---------------------------------------------------------------------------
 
-/// A quantifier_consumer `(Seq Int)` model-completion axiom (`0 <= seq_len s`) is a certificate
-/// shape: it is recognized by [`is_quantifier_consumer_seq_model_completion_quantifier`] AND
-/// classifies Other (never SelfChaining / BridgeCycle).
+/// A quantifier_consumer `(Seq Int)` prelude axiom (`0 <= seq_len s`) classifies Other
+/// (never SelfChaining / BridgeCycle).
 #[test]
 fn quantifier_consumer_seq_prelude_axiom_is_other() {
     let src = r#"
@@ -168,16 +166,6 @@ fn quantifier_consumer_seq_prelude_axiom_is_other() {
         (assert (forall ((s (Seq Int))) (! (<= 0 (seq_len s)) :pattern ((seq_len s)))))
     "#;
     assert_eq!(class_counts(src), (0, 0, 1));
-
-    // Cross-check: it genuinely IS a quantifier_consumer model-completion certificate shape, so
-    // the "certificate shapes classify Other" pin is over a real certificate.
-    let exec = build(src);
-    let foralls = exec.collect_classifiable_foralls();
-    assert_eq!(foralls.len(), 1);
-    assert!(
-        is_quantifier_consumer_seq_model_completion_quantifier(&exec.ctx.terms, foralls[0]),
-        "fixture must be a recognized quantifier_consumer seq model-completion axiom"
-    );
 }
 
 /// A uf-completion pointwise/constant definition (`forall x. f(x) = 0`) is a

@@ -9,11 +9,11 @@
 
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::term::TermData;
-use ay_core::{quote_symbol, string_literal, Sort, TermId};
+use ay_core::{quote_symbol, string_literal, Sort, Symbol, TermId};
 
 use crate::executor_format::{
-    format_bigint, format_bitvec, format_default_value, format_model_atom, format_rational,
-    format_real, format_sort,
+    format_bigint, format_bitvec, format_default_value_surface, format_model_atom_surface,
+    format_real, format_sort_surface,
 };
 use crate::executor_types::SolveResult;
 
@@ -21,251 +21,6 @@ use super::Executor;
 use super::{debug_model, EvalValue, Model};
 
 impl Executor {
-    /// Generate objective output for get-objectives command.
-    pub(crate) fn get_objectives(&self) -> String {
-        // MaxSMT path: when the last solve came from `(assert-soft ...)`, the
-        // soft-cost objective was materialized and popped inside a scope, so it
-        // is no longer in `ctx.objectives()`. Report the minimized total
-        // violated weight recorded by the MaxSMT solve.
-        if self.ctx.objectives().is_empty() {
-            if let Some(cost) = self.last_soft_cost {
-                // `:approximate` marks a feasible-but-unproven bound
-                // (resource-limited or weight-incomplete search); consumers
-                // must not treat it as the optimum.
-                if !self.last_soft_cost_optimal {
-                    return format!("(objectives\n (__ay_soft_cost {cost} :approximate)\n)\n");
-                }
-                return format!("(objectives\n (__ay_soft_cost {cost})\n)\n");
-            }
-            // z3 parity: with no objectives and no soft cost, `(get-objectives)`
-            // prints an empty objectives list (exit 0), even before any
-            // `(check-sat)` — it does not error here.
-            return "(objectives\n)\n".to_string();
-        }
-
-        // PARETO terminal-`unsat` path: Z3 keeps reporting the LAST emitted Pareto
-        // point's objectives after the front is exhausted (the terminal
-        // `(check-sat)` returns `unsat`, but `(get-objectives)` still shows the
-        // last point). `finite_objective_values` was cleared by the unsat path, so we
-        // render directly from the persisted `pareto_state.last_point`.
-        if matches!(self.last_result, Some(SolveResult::Unsat(_))) {
-            if let Some(state) = &self.pareto_state {
-                if let Some(point) = &state.last_point {
-                    let objs = self.ctx.objectives();
-                    if objs.len() == point.len() {
-                        let mut out = String::from("(objectives\n");
-                        for (obj, val) in objs.iter().zip(point.iter()) {
-                            let term_str = self.format_term(obj.term);
-                            let value_str =
-                                if matches!(self.ctx.terms.sort(obj.term), Sort::BitVec(_)) {
-                                    val.numer().to_string()
-                                } else {
-                                    self.format_objective_rational(val, obj.term)
-                                };
-                            out.push_str(&format!(" ({term_str} {value_str})\n"));
-                        }
-                        out.push_str(")\n");
-                        return out;
-                    }
-                }
-            }
-        }
-
-        if !matches!(self.last_result, Some(SolveResult::Sat)) {
-            return "(error \"objectives are not available\")".to_string();
-        }
-
-        let mut out = String::from("(objectives\n");
-        for (objective_index, obj) in self.ctx.objectives().iter().enumerate() {
-            if self.unavailable_objectives.contains(&objective_index) {
-                // A lex predecessor with no attainable optimum — unbounded
-                // (`oo`) or unattained (infinitesimal, #opt-epsilon) — leaves
-                // no scalar to optimize under. z3 prints an interval for the
-                // predecessor and a demonstrably FALSE scalar for the suffix
-                // (measured 4.15.4: `(y (- 1))` where max y = 5); AY refuses
-                // to fabricate one. Documented deviation.
-                return format!(
-                    "(error \"objective {objective_index} is unavailable after a lexicographic predecessor with no attainable optimum\")"
-                );
-            }
-            let term_str = self.format_term(obj.term);
-            // An objective with no finite optimum is reported as infinity per
-            // SMT-LIB OMT conventions (matches z3): `oo` for an unbounded
-            // maximize, `(- oo)` for an unbounded minimize. Reporting the
-            // arbitrary finite value from the iterative fallback would be wrong.
-            let value_str = match self.unbounded_objectives.get(&objective_index) {
-                Some(ay_frontend::ObjectiveDirection::Maximize) => "oo".to_string(),
-                Some(ay_frontend::ObjectiveDirection::Minimize) => "(* (- 1) oo)".to_string(),
-                None => {
-                    // A BitVector objective is reported by Z3 as a DECIMAL
-                    // numeral in `(get-objectives)` (e.g. `(x 7)`), NOT the
-                    // `#x7` bitvector literal that `format_eval_value` would emit
-                    // (the bitvector literal is only used by `(get-value)`). The
-                    // optimum is the unsigned value, stored as a whole rational,
-                    // so we render its numerator (the integer) directly.
-                    let is_bv = matches!(self.ctx.terms.sort(obj.term), Sort::BitVec(_));
-                    if let Some((value, eps_coeff)) =
-                        self.infinitesimal_objectives.get(&objective_index)
-                    {
-                        // Unattained optimum (#opt-epsilon): render the z3
-                        // epsilon grammar. Checked BEFORE the finite map,
-                        // matching `objective_optimum`'s resolution order.
-                        self.format_epsilon_objective(value, eps_coeff, obj.term)
-                    } else if let Some(recorded) =
-                        self.finite_objective_values.get(&objective_index)
-                    {
-                        // Every finite outcome is explicitly recorded only after
-                        // an optimizing query is admitted. Lex/Pareto values are
-                        // bound to the final model; BOX values are independently
-                        // authenticated and intentionally model-free.
-                        if is_bv {
-                            recorded.numer().to_string()
-                        } else {
-                            self.format_objective_rational(recorded, obj.term)
-                        }
-                    } else {
-                        return format!(
-                            "(error \"objective {objective_index} has no admitted optimization outcome\")"
-                        );
-                    }
-                }
-            };
-            out.push_str(&format!(" ({term_str} {value_str})\n"));
-        }
-        out.push_str(")\n");
-        out
-    }
-
-    /// Format a recorded BOX objective optimum (a `BigRational`) exactly as
-    /// the lex path formats an objective value: sort-aware at the stdout
-    /// boundary (#real-fmt) — a Real objective prints `2.0` / `(/ 7.0 2.0)`,
-    /// an Int one a bare integer. Routed through
-    /// [`Self::try_format_eval_value_user`] so box and lex objective output
-    /// (and the certificate `bound`/`entails` strings) use one shared
-    /// formatter (no divergence).
-    fn format_objective_rational(
-        &self,
-        value: &num_rational::BigRational,
-        term_id: TermId,
-    ) -> String {
-        self.try_format_eval_value_user(&EvalValue::Rational(value.clone()), term_id)
-            .expect("a rational value always formats")
-    }
-
-    /// Render an UNATTAINED Real optimum `value + eps_coeff·ε` in z3 4.15.4's
-    /// exact `(get-objectives)` epsilon grammar (#opt-epsilon, all shapes
-    /// measured and pinned byte-exact in the opt-epsilon battery):
-    ///
-    /// * minimize (k > 0): k=1 elides the coefficient (`(+ (/ 3.0 2.0)
-    ///   epsilon)`; v=0 → bare `epsilon`); k≠1 → `(* 2.0 epsilon)` /
-    ///   `(+ v (* k epsilon))`.
-    /// * maximize (k < 0): the coefficient is never elided:
-    ///   `(* (- 1.0) epsilon)`; v≠0 → `(+ v (* (- |k|) epsilon))`.
-    ///
-    /// `eps_coeff` is nonzero by construction (a zero ε-part is exactly an
-    /// attained `Optimal` and never lands in `infinitesimal_objectives`).
-    fn format_epsilon_objective(
-        &self,
-        value: &num_rational::BigRational,
-        eps_coeff: &num_rational::BigRational,
-        term_id: TermId,
-    ) -> String {
-        use num_traits::{One, Signed, Zero};
-        let value_str = self.format_objective_rational(value, term_id);
-        if eps_coeff.is_positive() {
-            if eps_coeff.is_one() {
-                if value.is_zero() {
-                    "epsilon".to_string()
-                } else {
-                    format!("(+ {value_str} epsilon)")
-                }
-            } else {
-                let k_str = self.format_objective_rational(eps_coeff, term_id);
-                if value.is_zero() {
-                    format!("(* {k_str} epsilon)")
-                } else {
-                    format!("(+ {value_str} (* {k_str} epsilon))")
-                }
-            }
-        } else {
-            let k_abs = -eps_coeff.clone();
-            let k_str = self.format_objective_rational(&k_abs, term_id);
-            let inner = format!("(* (- {k_str}) epsilon)");
-            if value.is_zero() {
-                inner
-            } else {
-                format!("(+ {value_str} {inner})")
-            }
-        }
-    }
-
-    /// Generate output for the `(get-objective-certificates)` command
-    /// (#lra-opt-cert, AY extension).
-    ///
-    /// For each objective whose last optimizing `(check-sat)` produced a dual
-    /// (Farkas) optimality certificate, prints
-    ///
-    /// ```text
-    /// (objective-certificates
-    ///  ((objective <term>)
-    ///   (sense minimize|maximize)
-    ///   (bound <value>)
-    ///   (entails (>=|<= <term> <value>))
-    ///   (strict true|false)
-    ///   (farkas
-    ///    (<coeff> <literal>)
-    ///    ...))
-    /// )
-    /// ```
-    ///
-    /// where each `<literal>` is the asserted atom (wrapped in `(not ...)`
-    /// when it was asserted false) and `<coeff>` its positive Farkas
-    /// multiplier: summing `coeff * literal` (each literal oriented as a
-    /// `>= 0` fact) yields exactly the `entails` inequality, checkable without
-    /// trusting AY.
-    pub(crate) fn get_objective_certificates(&self) -> String {
-        if self.ctx.objectives().is_empty() {
-            return "(error \"no objectives\")".to_string();
-        }
-        let mut certified = 0usize;
-        let mut out = String::from("(objective-certificates\n");
-        for (objective_index, obj) in self.ctx.objectives().iter().enumerate() {
-            let Some(cert) = self.objective_certificates.get(&objective_index) else {
-                continue;
-            };
-            certified += 1;
-            let term_str = self.format_term(obj.term);
-            // Same formatter as `(get-objectives)` so the two never diverge.
-            let bound_str = self.format_objective_rational(&cert.bound, obj.term);
-            let (sense_str, rel) = match cert.sense {
-                ay_lra::OptimizationSense::Minimize => ("minimize", ">="),
-                ay_lra::OptimizationSense::Maximize => ("maximize", "<="),
-            };
-            out.push_str(&format!(
-                " ((objective {term_str})\n  (sense {sense_str})\n  (bound {bound_str})\n  (entails ({rel} {term_str} {bound_str}))\n  (strict {strict})\n  (farkas\n",
-                strict = cert.strict
-            ));
-            for atom in &cert.atoms {
-                let atom_str = self.format_term(atom.atom);
-                let literal_str = if atom.value {
-                    atom_str
-                } else {
-                    format!("(not {atom_str})")
-                };
-                out.push_str(&format!(
-                    "   ({} {literal_str})\n",
-                    format_rational(&atom.coeff)
-                ));
-            }
-            out.push_str("  ))\n");
-        }
-        out.push_str(")\n");
-        if certified == 0 {
-            return "(error \"no objective certificates available\")".to_string();
-        }
-        out
-    }
-
     /// Generate model output for get-model command.
     pub(crate) fn model(&self) -> String {
         if !self.produce_models_enabled() {
@@ -325,7 +80,124 @@ impl Executor {
 
         for (name, info) in self.ctx.symbol_iter() {
             // Skip DT-internal symbols (constructors, testers, selectors) (#5412).
-            if self.is_dt_internal_symbol(name) {
+            if self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info)) {
+                continue;
+            }
+
+            // Skip SOLVER-INTERNAL symbol registrations (fresh single-ctor
+            // elimination field constants): not user-declared, so a validator
+            // treats their definitions as garbage — the pinned 2025 Dolmen
+            // silently stops reading the model at the first one, orphaning
+            // every later user symbol (#mv-internal-symbol-suppression). The
+            // flag is cleared on user (re)declaration, so no user-DECLARED
+            // symbol is ever suppressed.
+            if self.ctx.is_internal_symbol(name) {
+                continue;
+            }
+
+            // A checked projection is the exact total interpretation of this
+            // declaration, not a finite sample. Emit its lambda body directly
+            // and do not consult or complete an ordinary EUF table for the
+            // same head. The internal identity plus full signature prevents an
+            // overloaded surface name from selecting the wrong definition.
+            let identity = self.ctx.symbol_identity_name(name, info);
+            let symbol = Symbol::named(identity);
+            match model.projection_ufs.projected_argument_for_signature(
+                &symbol,
+                &info.arg_sorts,
+                &info.sort,
+            ) {
+                Ok(Some(projected_argument)) => {
+                    // A semantic projection token does not prove that this
+                    // head is still a free UF in the CURRENT source context.
+                    // In particular, an adopted definitional macro keeps its
+                    // declaration in `symbol_iter`, so projection-first output
+                    // would otherwise silently replace its authored body.
+                    // Fail closed at the final output boundary. This negative
+                    // check is defense in depth only; steering still requires
+                    // positive, stable declaration-kind provenance.
+                    let source_is_defined = self.ctx.is_defined_fun(name);
+                    let source_is_adopted = self.ctx.adopted_macro_interp(name).is_some();
+                    if source_is_defined || source_is_adopted {
+                        tracing::error!(
+                            surface_name = %name,
+                            identity = %identity,
+                            is_defined_fun = source_is_defined,
+                            is_adopted_macro = source_is_adopted,
+                            "refusing to format a projection model over a defined source head"
+                        );
+                        return "(error \"checked projection model conflicts with current source binding\")"
+                            .to_string();
+                    }
+                    match self.format_projection_function(
+                        name,
+                        &info.arg_sorts,
+                        &info.sort,
+                        projected_argument,
+                    ) {
+                        Ok(definition) => definitions.push(definition),
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "refusing to format a malformed checked projection model"
+                            );
+                            return "(error \"malformed checked projection model\")".to_string();
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        surface_name = %name,
+                        identity = %identity,
+                        "refusing to read a checked projection model at a conflicting declaration signature"
+                    );
+                    return "(error \"checked projection model conflicts with current declaration signature\")"
+                        .to_string();
+                }
+            }
+
+            // A quantified SAT certificate may install an exact typed table
+            // with an explicit else value.  Emit that interpretation directly
+            // before consulting the lossy raw EUF table (whose legacy format
+            // encodes the else branch as its last row and cannot faithfully
+            // represent a carrier-free datatype domain).
+            if let Some(total) = model.certified_total_ufs.by_symbol.get(identity) {
+                let argument_sorts_match = total.arg_sorts == info.arg_sorts;
+                let result_sort_matches = total.result_sort == info.sort;
+                let signature_matches = argument_sorts_match && result_sort_matches;
+                if self.ctx.is_defined_fun(name)
+                    || self.ctx.adopted_macro_interp(name).is_some()
+                    || !signature_matches
+                {
+                    tracing::error!(
+                        surface_name = %name,
+                        identity = %identity,
+                        "refusing to format a certified total UF at a conflicting source declaration"
+                    );
+                    return "(error \"certified total UF conflicts with current source declaration\")"
+                        .to_string();
+                }
+                match self.format_certified_total_function(
+                    name,
+                    &total.arg_sorts,
+                    &total.result_sort,
+                    &total.rendered_rows,
+                    &total.rendered_default,
+                ) {
+                    Ok(definition) => definitions.push(definition),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            surface_name = %name,
+                            identity = %identity,
+                            "refusing to format a malformed certified total UF"
+                        );
+                        return "(error \"malformed certified total UF model\")".to_string();
+                    }
+                }
                 continue;
             }
 
@@ -350,22 +222,77 @@ impl Executor {
             // supplied the entire model, so it can never displace a theory
             // model built by a real solve.
             if let Some(entry) = self
-                .const_interp_cert_witness_entries()
+                .const_interp_cert_witness_entries(model)
                 .iter()
-                .find(|e| e.name == *name)
+                .find(|entry| entry.name() == Some(name.as_str()))
             {
                 let params_str = entry
-                    .params
+                    .parameter_sorts()
                     .iter()
-                    .map(|(n, s)| format!("({} {})", quote_symbol(n), format_sort(s)))
+                    .enumerate()
+                    .map(|(index, sort)| {
+                        let parameter = format!("x!{index}");
+                        format!(
+                            "({} {})",
+                            quote_symbol(&parameter),
+                            format_sort_surface(&self.ctx, sort)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 definitions.push(format!(
                     "  (define-fun {} ({}) {}\n    {})",
                     quote_symbol(name),
                     params_str,
-                    format_sort(&info.sort),
-                    self.format_term(entry.value)
+                    format_sort_surface(&self.ctx, &info.sort),
+                    self.format_term(entry.value())
+                ));
+                continue;
+            }
+
+            // Canonical interpretations for declarations proved absent from a
+            // quantified theorem live outside `EufModel`, so installing them
+            // cannot change strict-gate `euf_backed` classification. Recheck
+            // the exact declaration binding/signature at this final output
+            // boundary and print the same constant body evaluation returns.
+            let identity_symbol = Symbol::named(identity);
+            if let Some(entry) = model
+                .formula_neutral_function_default_entries()
+                .iter()
+                .find(|entry| entry.symbol() == &identity_symbol)
+            {
+                if !entry.is_current(&self.ctx)
+                    || entry.parameter_sorts() != info.arg_sorts
+                    || entry.result_sort() != &info.sort
+                    || self.unconstrained_default_value(&info.sort).as_ref() != Some(entry.value())
+                {
+                    tracing::error!(
+                        surface_name = %name,
+                        identity = %identity,
+                        "refusing to format a stale formula-neutral function default"
+                    );
+                    return "(error \"formula-neutral function default conflicts with current declaration\")"
+                        .to_string();
+                }
+                let params_str = entry
+                    .parameter_sorts()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, sort)| {
+                        format!(
+                            "({} {})",
+                            quote_symbol(&format!("x!{index}")),
+                            format_sort_surface(&self.ctx, sort)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                definitions.push(format!(
+                    "  (define-fun {} ({}) {}\n    {})",
+                    quote_symbol(name),
+                    params_str,
+                    format_sort_surface(&self.ctx, &info.sort),
+                    format_default_value_surface(&self.ctx, &info.sort)
                 ));
                 continue;
             }
@@ -379,7 +306,13 @@ impl Executor {
             if let Some((params, body)) = self.ctx.adopted_macro_interp(name) {
                 let params_str = params
                     .iter()
-                    .map(|(n, s)| format!("({} {})", quote_symbol(n), format_sort(s)))
+                    .map(|(n, s)| {
+                        format!(
+                            "({} {})",
+                            quote_symbol(n),
+                            format_sort_surface(&self.ctx, s)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 let body = *body;
@@ -387,7 +320,7 @@ impl Executor {
                     "  (define-fun {} ({}) {}\n    {})",
                     quote_symbol(name),
                     params_str,
-                    format_sort(&info.sort),
+                    format_sort_surface(&self.ctx, &info.sort),
                     self.format_term(body)
                 ));
                 continue;
@@ -400,17 +333,6 @@ impl Executor {
             // macro-expanded at elaboration) — any table found here could only
             // be a completion default, i.e. a WRONG body (#mv-defined-fun-emit).
             if self.ctx.is_defined_fun(name) {
-                continue;
-            }
-
-            // Skip SOLVER-INTERNAL symbol registrations (fresh single-ctor
-            // elimination field constants): not user-declared, so a validator
-            // treats their definitions as garbage — the pinned 2025 Dolmen
-            // silently stops reading the model at the first one, orphaning
-            // every later user symbol (#mv-internal-symbol-suppression). The
-            // flag is cleared on user (re)declaration, so no user-DECLARED
-            // symbol is ever suppressed.
-            if self.ctx.is_internal_symbol(name) {
                 continue;
             }
 
@@ -440,7 +362,7 @@ impl Executor {
                                 return format!(
                                     "(error \"model value for function {} is not available: {e}\")",
                                     quote_symbol(name)
-                                )
+                                );
                             }
                         };
                         // Resolve @?N placeholders in function table values (#5452).
@@ -491,7 +413,7 @@ impl Executor {
                                 return format!(
                                     "(error \"model value for function {} is not available: {e}\")",
                                     quote_symbol(name)
-                                )
+                                );
                             }
                         }
                     }
@@ -594,7 +516,7 @@ impl Executor {
             // For constants (no arguments), need term_id.
             if let Some(term_id) = info.term {
                 // For constants (no arguments), look up value.
-                let sort_str = format_sort(&info.sort);
+                let sort_str = format_sort_surface(&self.ctx, &info.sort);
 
                 // Handle array-sorted symbols specially. Render a `store`-chain
                 // that satisfies the asserted `(select a i) = v` constraints
@@ -698,7 +620,7 @@ impl Executor {
                 ) {
                     if let Some(ref euf_model) = model.euf_model {
                         if let Some(elem) = euf_model.term_values.get(&term_id) {
-                            let elem = format_model_atom(&info.sort, elem);
+                            let elem = format_model_atom_surface(&self.ctx, &info.sort, elem);
                             definitions
                                 .push(format!("  (define-fun {quoted_name} () {sort_str} {elem})"));
                             continue;
@@ -854,7 +776,7 @@ impl Executor {
                         Err(e) => {
                             return format!(
                                 "(error \"model value for {quoted_name} is not available: {e}\")"
-                            )
+                            );
                         }
                     }
                     continue;
@@ -927,13 +849,12 @@ impl Executor {
                     }
                     if let Some(value) = resolved {
                         if !matches!(value, EvalValue::Unknown) {
-                            let value_str = match self.try_format_eval_value_user(&value, term_id)
-                            {
+                            let value_str = match self.try_format_eval_value_user(&value, term_id) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     return format!(
                                         "(error \"model value for {quoted_name} is not available: {e}\")"
-                                    )
+                                    );
                                 }
                             };
                             definitions.push(format!(
@@ -983,7 +904,7 @@ impl Executor {
                         Err(e) => {
                             return format!(
                                 "(error \"model value for {quoted_name} is not available: {e}\")"
-                            )
+                            );
                         }
                     },
                 };
@@ -1066,6 +987,22 @@ impl Executor {
         model: &Model,
         term_id: TermId,
     ) -> Result<String, String> {
+        // Route projection applications to the selected argument through this
+        // same per-term formatting core. This keeps `(get-value)` identical to
+        // the evaluator and also handles non-scalar sorts (arrays, datatypes,
+        // sequences) using the selected argument's established renderer. An
+        // unavailable selected value remains unavailable; no finite-table or
+        // asserted-equality fallback may replace the total projection. Peeling
+        // is iterative and bounded so a deeply nested native query cannot grow
+        // the Rust stack through this formatting path.
+        let term_id = match model
+            .projection_ufs
+            .peel_application_chain(&self.ctx.terms, term_id)
+        {
+            Ok(Some(projected_term)) => projected_term,
+            Ok(None) => term_id,
+            Err(error) => return Err(error.to_string()),
+        };
         let sort = self.ctx.terms.sort(term_id);
         if matches!(sort, Sort::Array(_)) {
             // Render a `store`-chain that satisfies the asserted
@@ -1193,7 +1130,7 @@ impl Executor {
             Some((_, else_value)) => self.resolve_table_value(else_value, result_sort, model),
             // Empty table: the same unconstrained-function body `(get-model)`
             // prints.
-            None => Ok(format_default_value(result_sort)),
+            None => Ok(format_default_value_surface(&self.ctx, result_sort)),
         })
     }
 

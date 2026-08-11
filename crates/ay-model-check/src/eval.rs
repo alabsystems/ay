@@ -9,7 +9,7 @@
 //! surfaces as [`EvalOutcome::Unevaluable`]). Nothing here panics or unwraps on
 //! malformed/under-specified input — every such case returns `Err`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use ay_core::term::{Constant, Symbol, TermData};
@@ -21,7 +21,7 @@ use num_traits::{Signed, Zero};
 
 use crate::{
     array_select, bitvec, seq, value_eq, ArrayValue, EvalOutcome, ModelValue, ModelView,
-    MAX_EVAL_DEPTH,
+    ProvenUnconstrainedKind, MAX_EVAL_DEPTH,
 };
 
 /// One entry of the per-evaluator uninterpreted-function graph: a function
@@ -35,6 +35,57 @@ type UfGraphEntry = (String, Vec<ModelValue>, ModelValue);
 /// [`Evaluator::eval_select_via_model`].
 type SelectGraphEntry = (TermId, ModelValue, ModelValue);
 
+/// Compare two value-key tuples for a congruence-graph lookup.
+///
+/// `value_eq` is deliberately three-valued: in particular, exact algebraic
+/// values from different extensions can be semantically equal even when this
+/// checker cannot decide that equality.  A graph lookup may skip an entry only
+/// after at least one component is PROVABLY different.  Treating an
+/// incomparable component as `false` would permit a second result for a key
+/// that may be equal to the first, violating function single-valuedness and
+/// potentially confirming a wrong model.
+///
+/// Keep scanning after an incomparable component because a later
+/// `Ok(false)` still proves the tuples distinct.  If no component separates
+/// them, the unresolved comparison propagates and the gate fails closed before
+/// installing another mapping.
+pub(crate) fn congruence_keys_equal(
+    stored: &[ModelValue],
+    candidate: &[ModelValue],
+) -> Result<bool, String> {
+    if stored.len() != candidate.len() {
+        return Ok(false);
+    }
+
+    let mut unresolved = None;
+    for (left, right) in stored.iter().zip(candidate) {
+        match value_eq(left, right) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(reason) => {
+                if unresolved.is_none() {
+                    unresolved = Some(reason);
+                }
+            }
+        }
+    }
+
+    match unresolved {
+        Some(reason) => Err(format!("cannot decide congruence-key equality: {reason}")),
+        None => Ok(true),
+    }
+}
+
+/// Native evaluator-call depth at which projection dispatch fails closed.
+///
+/// Projection applications are peeled iteratively, but ordinary terms between
+/// projections still recurse through [`Evaluator::eval`]. Keep a conservative
+/// backstop below the native-stack exhaustion point seen on libtest's small
+/// worker stacks. This does not lower [`MAX_EVAL_DEPTH`] for projection-free
+/// evaluation, and consecutive projections consume only the shared logical
+/// depth budget because they do not add native evaluator frames.
+const MAX_PROJECTION_EVAL_CALL_DEPTH: usize = 128;
+
 /// Restores the local lambda-binding stack on every exit, including unwinding.
 ///
 /// The evaluator is intentionally reusable across all assertions in one gate
@@ -42,6 +93,18 @@ type SelectGraphEntry = (TermId, ModelValue, ModelValue);
 struct LocalBindingGuard<'a> {
     bindings: &'a RefCell<Vec<(TermId, ModelValue)>>,
     restore_len: usize,
+}
+
+/// Restores the active native evaluator-call count on every exit.
+struct EvalCallDepthGuard<'a> {
+    active_calls: &'a Cell<usize>,
+}
+
+impl Drop for EvalCallDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.active_calls
+            .set(self.active_calls.get().saturating_sub(1));
+    }
 }
 
 impl Drop for LocalBindingGuard<'_> {
@@ -114,6 +177,10 @@ pub struct Evaluator<'a> {
     /// environment. Binder-independent terms remain valid model observations
     /// inside an unrelated lambda body.
     local_bindings: RefCell<Vec<(TermId, ModelValue)>>,
+    /// Number of currently active [`Self::eval`] calls. Projection dispatch
+    /// uses this only as a native-stack safety backstop; SMT term depth remains
+    /// governed by [`MAX_EVAL_DEPTH`].
+    active_eval_calls: Cell<usize>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -127,6 +194,7 @@ impl<'a> Evaluator<'a> {
             select_graph: RefCell::new(Vec::new()),
             local_bindings: RefCell::new(Vec::new()),
             memo: RefCell::new(ay_core::kani_compat::DetHashMap::default()),
+            active_eval_calls: Cell::new(0),
         }
     }
 
@@ -146,7 +214,61 @@ impl<'a> Evaluator<'a> {
     /// exact-behavior-preservation argument): a hit is taken only when the
     /// stored success depth is at least the current depth, and only `Ok`
     /// results are stored.
-    fn eval(&self, term: TermId, depth: usize) -> Result<ModelValue, String> {
+    fn eval(&self, mut term: TermId, mut depth: usize) -> Result<ModelValue, String> {
+        // This increment is paired one-for-one with `EvalCallDepthGuard::drop`.
+        let active_calls = self
+            .active_eval_calls
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| "evaluator call depth overflow".to_string())?;
+        self.active_eval_calls.set(active_calls);
+        let _call_depth_guard = EvalCallDepthGuard {
+            active_calls: &self.active_eval_calls,
+        };
+
+        // A checked projection is a total symbolic interpretation. Peel it in
+        // this SAME evaluator so the selected argument observes the current
+        // UF/select graphs, memo, logical depth budget, and lambda bindings.
+        // Iteration avoids adding one native Rust frame per projection while
+        // retaining one depth edge per beta reduction. Projection lookup must
+        // precede the TermId-keyed memo so symbolic definitions cannot be
+        // shadowed by a per-application value.
+        loop {
+            if depth > MAX_EVAL_DEPTH {
+                return Err(format!("recursion depth limit {MAX_EVAL_DEPTH} exceeded"));
+            }
+            let TermData::App(_, args) = self.terms.get(term) else {
+                break;
+            };
+            let Some(projected_argument) = self
+                .model
+                .projection_argument(term)
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
+            if active_calls > MAX_PROJECTION_EVAL_CALL_DEPTH {
+                return Err(format!(
+                    "projection recursion depth limit {MAX_PROJECTION_EVAL_CALL_DEPTH} exceeded"
+                ));
+            }
+            let selected = args.get(projected_argument).copied().ok_or_else(|| {
+                format!(
+                    "projection selects argument {projected_argument}, but application arity is {}",
+                    args.len()
+                )
+            })?;
+            let selected_sort = self.terms.sort(selected);
+            let result_sort = self.terms.sort(term);
+            if selected_sort != result_sort {
+                return Err(format!(
+                    "projection selected argument sort {selected_sort:?} does not match result sort {result_sort:?}"
+                ));
+            }
+            term = selected;
+            depth += 1;
+        }
+
         // Constants are cheaper to recompute than to cache (their evaluation
         // is one clone either way). A term depending on an active lambda
         // binding can denote a different value in each beta environment, so a
@@ -464,7 +586,9 @@ impl<'a> Evaluator<'a> {
             // interpretation (fail closed if it cannot be built).
             _ => match self.eval_datatype(term, name, args, depth) {
                 Ok(v) => Ok(v),
-                Err(dt_err) => self.eval_uninterpreted_app(term, name, args, depth, dt_err, false),
+                Err(dt_err) => {
+                    self.eval_uninterpreted_app(term, name, args, depth, dt_err, None, |_| Ok(()))
+                }
             },
         }
     }
@@ -473,23 +597,19 @@ impl<'a> Evaluator<'a> {
     /// SMT-LIB leaves UNCONSTRAINED on these particular inputs, then CHECK the
     /// residue the standard does constrain.
     ///
-    /// SMT-LIB fixes no value for `fp.min`/`fp.max` of `+0` and `-0`, for
-    /// `fp.to_real` of a NaN or an infinity, for the NaN encoding
-    /// `fp.to_ieee_bv` returns, nor for `/`, `div` and `mod` by zero. On those
-    /// inputs the operator IS an uninterpreted function and is treated as one:
-    /// the gate adopts the model's value and its `uf_graph` still forces equal
-    /// arguments to the same result. Failing closed here instead would refuse
-    /// to confirm a witness the standard plainly admits — `(assert (< 0 (div 1
-    /// 0)))` is `sat` — while adopting UNCHECKED would let a broken solver
-    /// answer through.
+    /// SMT-LIB restricts, but does not uniquely determine, `fp.min`/`fp.max` of
+    /// `+0` and `-0` and the NaN encoding `fp.to_ieee_bv` returns. On those
+    /// inputs the gate may read only a normal, committed application value and
+    /// then validates the remaining restriction. Fully unconstrained results
+    /// (`fp.to_real` of a non-finite operand and arithmetic division by zero)
+    /// use the separate typed [`Self::adopt_proven_unconstrained`] path.
     ///
     /// `residue` is what is left to check once the free part is granted: an
     /// adopted `fp.min` of the two zeros must still be a ZERO of that format,
-    /// an adopted `fp.to_ieee_bv` of NaN must still be a NaN ENCODING, an
-    /// adopted `(div a 0)` must still be an INTEGER. That is what keeps this
-    /// path from laundering an evaluator bug into a confirmed `sat`. A residue
-    /// failure is an `Err`, i.e. `CannotConfirm` — fail closed, as everywhere
-    /// else here.
+    /// and an adopted `fp.to_ieee_bv` of NaN must still be a NaN ENCODING.
+    /// That is what keeps this path from laundering an evaluator bug into a
+    /// confirmed `sat`. A residue failure is an `Err`, i.e. `CannotConfirm` —
+    /// fail closed, as everywhere else here.
     fn adopt_underspecified(
         &self,
         term: TermId,
@@ -497,16 +617,41 @@ impl<'a> Evaluator<'a> {
         args: &[TermId],
         depth: usize,
         reason: String,
-        residue: impl FnOnce(&ModelValue) -> Result<(), String>,
+        residue: impl Fn(&ModelValue) -> Result<(), String>,
     ) -> Result<ModelValue, String> {
-        // `false`, NOT `unconstrained`: this helper exists for results the
-        // standard RESTRICTS rather than frees (a NaN keeps a required
-        // encoding even though its sign and payload are unspecified), so only
-        // the model's own committed value is admissible and `residue` audits
-        // it below.
-        let adopted = self.eval_uninterpreted_app(term, name, args, depth, reason, false)?;
-        residue(&adopted)?;
-        Ok(adopted)
+        // `None`, NOT a typed unconstrained reason: this helper exists for
+        // results the standard RESTRICTS rather than frees (a NaN keeps a
+        // required encoding even though its sign and payload are
+        // unspecified), so only the model's own committed value is
+        // admissible. The residue is checked before a new graph entry is
+        // installed, so an ill-sorted/bogus pin cannot pollute congruent uses.
+        self.eval_uninterpreted_app(term, name, args, depth, reason, None, residue)
+    }
+
+    /// Adopt a value only after an exact evaluator branch has proved that the
+    /// operation is unconstrained on the independently evaluated inputs.
+    ///
+    /// The ordinary committed value has priority. Only when it is absent may
+    /// the model supply a definition-selected value through the typed fallback.
+    /// `residue` validates the result sort before the value enters `uf_graph`.
+    fn adopt_proven_unconstrained(
+        &self,
+        term: TermId,
+        name: &str,
+        args: &[TermId],
+        depth: usize,
+        kind: ProvenUnconstrainedKind,
+        residue: impl Fn(&ModelValue) -> Result<(), String>,
+    ) -> Result<ModelValue, String> {
+        self.eval_uninterpreted_app(
+            term,
+            name,
+            args,
+            depth,
+            format!("SMT-LIB leaves {name} unconstrained for these inputs"),
+            Some(kind),
+            residue,
+        )
     }
 
     /// `(/ a 0)`, `(div a 0)` and `(mod a 0)`: unspecified but TOTAL.
@@ -529,26 +674,45 @@ impl<'a> Evaluator<'a> {
         name: &str,
         args: &[TermId],
         depth: usize,
+        kind: ProvenUnconstrainedKind,
     ) -> Result<ModelValue, String> {
-        self.adopt_underspecified(
-            term,
-            name,
-            args,
-            depth,
-            format!("SMT-LIB leaves {name} by zero unconstrained"),
-            |adopted| {
-                let well_sorted = match name {
-                    "div" | "mod" => matches!(adopted, ModelValue::Int(_)),
-                    "/" => matches!(adopted, ModelValue::Real(_) | ModelValue::Int(_)),
-                    _ => false,
-                };
-                if well_sorted {
-                    Ok(())
-                } else {
-                    Err(format!("{name} by zero must still be a number"))
+        let (expected_name, expected_sort, operand_sort) = match kind {
+            ProvenUnconstrainedKind::RealDivByZero => ("/", Sort::Real, Sort::Real),
+            ProvenUnconstrainedKind::IntDivByZero => ("div", Sort::Int, Sort::Int),
+            ProvenUnconstrainedKind::IntModByZero => ("mod", Sort::Int, Sort::Int),
+            ProvenUnconstrainedKind::FpToRealNonFinite => {
+                return Err(
+                    "non-arithmetic unconstrained reason at division-by-zero site".to_string(),
+                )
+            }
+        };
+        if name != expected_name
+            || self.terms.sort(term) != &expected_sort
+            || args.len() != 2
+            || args
+                .iter()
+                .any(|&argument| self.terms.sort(argument) != &operand_sort)
+        {
+            return Err(format!(
+                "typed unconstrained reason does not match `{name}` signature"
+            ));
+        }
+        self.adopt_proven_unconstrained(term, name, args, depth, kind, |adopted| {
+            let well_sorted = match kind {
+                ProvenUnconstrainedKind::RealDivByZero => {
+                    matches!(adopted, ModelValue::Real(_) | ModelValue::Algebraic(_))
                 }
-            },
-        )
+                ProvenUnconstrainedKind::IntDivByZero | ProvenUnconstrainedKind::IntModByZero => {
+                    matches!(adopted, ModelValue::Int(_))
+                }
+                ProvenUnconstrainedKind::FpToRealNonFinite => false,
+            };
+            if well_sorted {
+                Ok(())
+            } else {
+                Err(format!("{name} by zero must still be a number"))
+            }
+        })
     }
 
     /// Resolve a `RoundingMode`-sorted operand to one of the five modes.
@@ -668,10 +832,12 @@ impl<'a> Evaluator<'a> {
     ///
     /// No host float participates in this conversion.  Finite values are
     /// reconstructed as `significand * 2^exponent` using `BigInt` /
-    /// `BigRational`; malformed payloads, unsupported field widths, NaN,
-    /// infinity, and impractically large exact shifts are rejected rather than
-    /// guessed.  The shift bound is only a resource guard: crossing it changes
-    /// a possible confirmation into `CannotConfirm`, never the reverse.
+    /// `BigRational`; malformed payloads, unsupported field widths, and
+    /// impractically large exact shifts are rejected rather than guessed. NaN
+    /// and infinity take the separately typed unconstrained-result path after
+    /// their exact IEEE encoding has been proved. The shift bound is only a
+    /// resource guard: crossing it changes a possible confirmation into
+    /// `CannotConfirm`, never the reverse.
     ///
     /// The decoding is kept here, rather than delegated to [`crate::fp`],
     /// because it accepts a WIDER format envelope than the arithmetic there
@@ -685,6 +851,14 @@ impl<'a> Evaluator<'a> {
         depth: usize,
     ) -> Result<ModelValue, String> {
         let [arg] = exactly(args)?;
+        if self.terms.sort(term) != &Sort::Real {
+            return Err("fp.to_real result sort is not Real".to_string());
+        }
+        let Sort::FloatingPoint(expected_exponent_bits, expected_significand_bits) =
+            self.terms.sort(arg)
+        else {
+            return Err("fp.to_real operand sort is not FloatingPoint".to_string());
+        };
         let ModelValue::FloatingPoint {
             sign,
             exponent,
@@ -695,6 +869,11 @@ impl<'a> Evaluator<'a> {
         else {
             return Err("fp.to_real expects a floating-point value".to_string());
         };
+        if exponent_bits != *expected_exponent_bits
+            || significand_bits != *expected_significand_bits
+        {
+            return Err("fp.to_real model payload format disagrees with operand sort".to_string());
+        }
 
         // AY's concrete FP model uses u64 fields.  Keep the independent gate's
         // accepted envelope identical to that representation and validate the
@@ -711,21 +890,19 @@ impl<'a> Evaluator<'a> {
         if exponent == max_exponent {
             // Unconstrained by SMT-LIB rather than uncomputable: `fp.to_real`
             // of a NaN or an infinity may be ANY real, so this adopts the
-            // model's own choice instead of refusing (see
-            // [`Self::adopt_underspecified`] and `crate::fp::UNDERSPECIFIED`).
-            // The only residue the theory leaves to check is that the adopted
-            // value is a number at all.
-            return self.adopt_underspecified(
+            // model's committed choice, or (only if no commitment exists) the
+            // definition-selected fallback. Reaching this exact all-ones
+            // exponent branch is what mints the typed evidence; malformed
+            // fields were rejected above. The only residue is the Real result
+            // sort, checked before the value enters the congruence graph.
+            return self.adopt_proven_unconstrained(
                 term,
                 "fp.to_real",
                 args,
                 depth,
-                crate::fp::UNDERSPECIFIED.to_string(),
+                ProvenUnconstrainedKind::FpToRealNonFinite,
                 |adopted| {
-                    if matches!(
-                        adopted,
-                        ModelValue::Real(_) | ModelValue::Int(_) | ModelValue::Algebraic(_)
-                    ) {
+                    if matches!(adopted, ModelValue::Real(_) | ModelValue::Algebraic(_)) {
                         Ok(())
                     } else {
                         Err("fp.to_real of NaN or infinity must still be a real".to_string())
@@ -787,12 +964,17 @@ impl<'a> Evaluator<'a> {
     /// If the model does not pin the application, the result is `Unevaluable`
     /// (`dt_err` is surfaced) — fail closed, never assumed.
     ///
-    /// `unconstrained` says the CALLER has established that SMT-LIB fixes no
-    /// value whatsoever for this application, so an asserted definition is the
-    /// only thing that can pin it and reading one is legitimate
-    /// ([`ModelView::unconstrained_app_value`]). It is `false` everywhere the
-    /// gate is itself responsible for computing the value; see that method for
-    /// why the difference is a soundness boundary rather than a preference.
+    /// `proven_unconstrained` is present only when the exact calling branch has
+    /// positively proved one of [`ProvenUnconstrainedKind`]'s input conditions.
+    /// It authorizes a fallback to
+    /// [`ModelView::proven_unconstrained_app_value`] *only if* the ordinary
+    /// committed value is absent. Generic applications and partially
+    /// unspecified results pass `None`.
+    ///
+    /// `residue` validates the value's remaining theory obligations (at least
+    /// its result sort) before a fresh graph entry is installed. It is also
+    /// rechecked on graph hits, keeping this primitive fail-closed even if a
+    /// future caller supplies a stricter residue for the same value key.
     fn eval_uninterpreted_app(
         &self,
         term: TermId,
@@ -800,7 +982,8 @@ impl<'a> Evaluator<'a> {
         args: &[TermId],
         depth: usize,
         dt_err: String,
-        unconstrained: bool,
+        proven_unconstrained: Option<ProvenUnconstrainedKind>,
+        residue: impl Fn(&ModelValue) -> Result<(), String>,
     ) -> Result<ModelValue, String> {
         // Evaluate the arguments ourselves. If any argument is unevaluable, the
         // application is unevaluable (fail closed).
@@ -810,13 +993,8 @@ impl<'a> Evaluator<'a> {
         {
             let graph = self.uf_graph.borrow();
             for (f, keys, val) in graph.iter() {
-                if f == name
-                    && keys.len() == arg_vals.len()
-                    && keys
-                        .iter()
-                        .zip(arg_vals.iter())
-                        .all(|(a, b)| value_eq(a, b).unwrap_or(false))
-                {
+                if f == name && congruence_keys_equal(keys, &arg_vals)? {
+                    residue(val)?;
                     return Ok(val.clone());
                 }
             }
@@ -844,13 +1022,30 @@ impl<'a> Evaluator<'a> {
         // the evaluator vs. complete the model — and the misattribution sends a
         // reader to the wrong one. Keep `dt_err` in the text so the datatype
         // path is still diagnosable when that is genuinely the cause.
-        let val = self.model.uf_app_value(term).ok_or_else(|| {
-            format!(
+        let val = if let Some(committed) = self.model.uf_app_value(term) {
+            // A normal model commitment always wins. The typed fallback exists
+            // solely for otherwise-uncommitted theory applications.
+            committed
+        } else if let Some(kind) = proven_unconstrained {
+            self.model
+                .proven_unconstrained_app_value(term, kind)
+                .ok_or_else(|| {
+                    format!(
+                        "model supplies no value for proven-unconstrained \
+                         application `{name}` ({kind:?}; {dt_err})"
+                    )
+                })?
+        } else {
+            return Err(format!(
                 "model commits no value for this application of `{name}` \
                  (gate cannot confirm without one; datatype dispatch also \
                  declined: {dt_err})"
-            )
-        })?;
+            ));
+        };
+        // Validate before insertion. In particular, a malicious or malformed
+        // fallback cannot seed the value-keyed graph with a wrong-sort value
+        // that a congruent sibling would later inherit.
+        residue(&val)?;
         self.uf_graph
             .borrow_mut()
             .push((name.to_string(), arg_vals, val.clone()));
@@ -1044,34 +1239,56 @@ impl<'a> Evaluator<'a> {
                 wrap_numeric(acc, sort)
             }
             "/" => {
-                if vals.is_empty() {
-                    return Err("/ needs at least one argument".to_string());
+                let [numerator, denominator] = vals.as_slice() else {
+                    return Err("/ expects exactly two canonical operands".to_string());
+                };
+                let denominator = as_rational(denominator)?;
+                if denominator.is_zero() {
+                    // SMT-LIB leaves `(/ x 0)` unconstrained — it is an
+                    // uninterpreted function on that input, not something
+                    // to compute. This exact-zero branch alone mints the
+                    // typed reason; adopt the model's choice, checked.
+                    return self.division_by_zero(
+                        term,
+                        name,
+                        args,
+                        depth,
+                        ProvenUnconstrainedKind::RealDivByZero,
+                    );
                 }
-                let mut acc = as_rational(&vals[0])?;
-                for v in &vals[1..] {
-                    let d = as_rational(v)?;
-                    if d.is_zero() {
-                        // SMT-LIB leaves `(/ x 0)` unconstrained — it is an
-                        // uninterpreted function on that input, not something
-                        // to compute. Adopt the model's choice, checked.
-                        return self.division_by_zero(term, name, args, depth);
-                    }
-                    acc /= d;
-                }
+                let numerator = as_rational(numerator)?;
                 // Result sort of `/` is Real.
-                Ok(ModelValue::Real(acc))
+                Ok(ModelValue::Real(numerator / denominator))
             }
             "div" => {
-                let (a, b) = (as_integer(&vals[0])?, as_integer(arg_v(&vals, 1)?)?);
+                let [a, b] = vals.as_slice() else {
+                    return Err("div expects exactly two operands".to_string());
+                };
+                let (a, b) = (as_integer(a)?, as_integer(b)?);
                 let Some((q, _)) = euclid(&a, &b) else {
-                    return self.division_by_zero(term, name, args, depth);
+                    return self.division_by_zero(
+                        term,
+                        name,
+                        args,
+                        depth,
+                        ProvenUnconstrainedKind::IntDivByZero,
+                    );
                 };
                 Ok(ModelValue::Int(q))
             }
             "mod" => {
-                let (a, b) = (as_integer(&vals[0])?, as_integer(arg_v(&vals, 1)?)?);
+                let [a, b] = vals.as_slice() else {
+                    return Err("mod expects exactly two operands".to_string());
+                };
+                let (a, b) = (as_integer(a)?, as_integer(b)?);
                 let Some((_, r)) = euclid(&a, &b) else {
-                    return self.division_by_zero(term, name, args, depth);
+                    return self.division_by_zero(
+                        term,
+                        name,
+                        args,
+                        depth,
+                        ProvenUnconstrainedKind::IntModByZero,
+                    );
                 };
                 Ok(ModelValue::Int(r))
             }
@@ -1500,7 +1717,12 @@ impl<'a> Evaluator<'a> {
         if !self.term_depends_on_local_binding(array_term) {
             let graph = self.select_graph.borrow();
             for (at, key_idx, val) in graph.iter() {
-                if *at == array_term && value_eq(key_idx, idx).unwrap_or(false) {
+                if *at == array_term
+                    && congruence_keys_equal(
+                        std::slice::from_ref(key_idx),
+                        std::slice::from_ref(idx),
+                    )?
+                {
                     return Ok(val.clone());
                 }
             }
@@ -1821,7 +2043,7 @@ impl<'a> Evaluator<'a> {
         if let Some(key) = &arg_key {
             let graph = self.uf_graph.borrow();
             for (f, keys, val) in graph.iter() {
-                if f == name && keys.len() == 1 && value_eq(&keys[0], key).unwrap_or(false) {
+                if f == name && congruence_keys_equal(keys, std::slice::from_ref(key))? {
                     return Ok(val.clone());
                 }
             }
@@ -1886,7 +2108,7 @@ fn fp_special_constant(name: &str, indices: &[u32]) -> Option<ModelValue> {
     // `exponent` and `significand` are `u64`: an all-ones exponent needs
     // `eb <= 64`, and the stored fraction field is `sb - 1` bits wide. A quiet
     // NaN additionally needs a fraction bit to set, hence `sb >= 2`.
-    if eb == 0 || eb > 64 || sb < 2 || sb > 65 {
+    if eb == 0 || eb > 64 || !(2..=65).contains(&sb) {
         return None;
     }
     let all_ones = if eb == 64 { u64::MAX } else { (1u64 << eb) - 1 };
@@ -1919,7 +2141,7 @@ fn fp_special_constant(name: &str, indices: &[u32]) -> Option<ModelValue> {
 /// than something to coerce, so it falls through and fails closed.
 fn fp_from_ieee_bits(indices: &[u32], value: &ModelValue) -> Option<ModelValue> {
     let [eb, sb] = <[u32; 2]>::try_from(indices).ok()?;
-    if eb == 0 || eb > 64 || sb < 2 || sb > 65 {
+    if eb == 0 || eb > 64 || !(2..=65).contains(&sb) {
         return None;
     }
     let ModelValue::BitVec { width, value } = value else {
@@ -2009,10 +2231,6 @@ fn element_domain_size(sort: &Sort) -> crate::sets::DomainSize {
 /// Destructure exactly `N` arguments, or fail closed.
 fn exactly<const N: usize>(args: &[TermId]) -> Result<[TermId; N], String> {
     <[TermId; N]>::try_from(args).map_err(|_| format!("expected {N} arguments, got {}", args.len()))
-}
-
-fn arg_v(vals: &[ModelValue], i: usize) -> Result<&ModelValue, String> {
-    vals.get(i).ok_or_else(|| "missing argument".to_string())
 }
 
 /// Evaluate a comparison chain where at least one operand is algebraic.

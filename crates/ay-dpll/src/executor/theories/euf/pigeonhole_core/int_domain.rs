@@ -287,7 +287,7 @@ impl Executor {
                 return None;
             }
             let k = candidate.len();
-            in_candidate.iter_mut().for_each(|b| *b = false);
+            in_candidate.fill(false);
             for &id in candidate {
                 in_candidate[id as usize] = true;
             }

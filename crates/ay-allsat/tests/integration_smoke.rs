@@ -14,7 +14,7 @@ fn projection_collapses_models_with_same_projected_assignment() {
     solver.add_clause(vec![2, -2]);
 
     // Full assignments differ on x2, so two models exist.
-    assert_eq!(solver.count(), 2);
+    assert_eq!(solver.count().unwrap(), 2);
 
     // Projecting onto x1 collapses both models into one projected assignment.
     let projected = solver.enumerate_with_config(AllSatConfig {

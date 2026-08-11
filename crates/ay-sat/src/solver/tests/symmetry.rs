@@ -4,20 +4,25 @@
 
 use super::*;
 
-#[test]
-fn test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair() {
-    let mut solver = Solver::new(3);
-    solver.cold.symmetry_enabled = true; // #8190: symmetry defaults off
-
+fn add_swap_pair_formula(solver: &mut Solver) -> (Variable, Variable, Variable) {
     let x0 = Variable(0);
     let x1 = Variable(1);
     let z = Variable(2);
 
     // x0 and x1 are interchangeable in this formula.
-    assert!(solver.add_clause(vec![Literal::positive(x0), Literal::positive(z),]));
-    assert!(solver.add_clause(vec![Literal::positive(x1), Literal::positive(z),]));
-    assert!(solver.add_clause(vec![Literal::negative(x0), Literal::negative(z),]));
-    assert!(solver.add_clause(vec![Literal::negative(x1), Literal::negative(z),]));
+    assert!(solver.add_clause(vec![Literal::positive(x0), Literal::positive(z)]));
+    assert!(solver.add_clause(vec![Literal::positive(x1), Literal::positive(z)]));
+    assert!(solver.add_clause(vec![Literal::negative(x0), Literal::negative(z)]));
+    assert!(solver.add_clause(vec![Literal::negative(x1), Literal::negative(z)]));
+    (x0, x1, z)
+}
+
+#[test]
+fn test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair() {
+    let mut solver = Solver::new(3);
+    solver.cold.symmetry_enabled = true; // #8190: symmetry defaults off
+
+    let (x0, x1, _z) = add_swap_pair_formula(&mut solver);
 
     let before = solver.arena.active_clause_count();
     let (unsat, changed) = solver.preprocess_symmetry();
@@ -26,7 +31,7 @@ fn test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair() {
     assert_eq!(
         solver.arena.active_clause_count(),
         before + 1,
-        "expected one binary SBP clause",
+        "expected one ordinary binary SBP clause",
     );
 
     let expected = vec![Literal::positive(x0), Literal::negative(x1)];
@@ -44,6 +49,114 @@ fn test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair() {
     assert!(found, "expected symmetry SBP clause {expected:?} in arena");
     assert_eq!(solver.cold.symmetry_stats.pairs_detected, 1);
     assert_eq!(solver.cold.symmetry_stats.sb_clauses_added, 1);
+    assert!(
+        !solver
+            .cold
+            .symmetry_stats
+            .routes
+            .iter()
+            .any(|(route, _)| *route == "signed"),
+        "a non-one-shot solver must not attempt signed symmetry"
+    );
+}
+
+#[test]
+fn signed_symmetry_runs_only_for_an_explicit_one_shot_solver() {
+    let mut solver = Solver::new(3);
+    solver.set_symmetry_oneshot(true);
+    let (_x0, _x1, _z) = add_swap_pair_formula(&mut solver);
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+
+    if std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some() {
+        // The opt-in route runs before the ordinary detector. This formula has
+        // two verified signed generators; their SBPs can be binary or unit.
+        assert!(changed);
+        assert_eq!(solver.arena.active_clause_count(), before + 2);
+        assert!(solver
+            .cold
+            .symmetry_stats
+            .routes
+            .iter()
+            .any(|(route, outcome)| route == &"signed" && outcome == "added 2 clauses"));
+        assert_eq!(solver.cold.symmetry_stats.pairs_detected, 2);
+        assert_eq!(solver.cold.symmetry_stats.sb_clauses_added, 2);
+        assert_eq!(solver.cold.symmetry_stats.last_skipped_reason, None);
+    } else {
+        assert!(!solver
+            .cold
+            .symmetry_stats
+            .routes
+            .iter()
+            .any(|(route, _)| *route == "signed"));
+    }
+}
+
+#[test]
+fn signed_symmetry_env_cannot_remove_models_from_an_assumption_solver() {
+    let mut solver = Solver::new(3);
+    let (x0, _x1, _z) = add_swap_pair_formula(&mut solver);
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(!changed, "a non-one-shot solver must not emit signed SBPs");
+    assert_eq!(solver.arena.active_clause_count(), before);
+    assert!(!solver
+        .cold
+        .symmetry_stats
+        .routes
+        .iter()
+        .any(|(route, _)| *route == "signed"));
+
+    let result = solver
+        .solve_with_assumptions(&[Literal::negative(x0)])
+        .into_inner();
+    assert!(
+        matches!(&result, AssumeResult::Sat(model) if !model[x0.id() as usize]),
+        "the model selected by the assumption must remain SAT, got {result:?}"
+    );
+}
+
+#[test]
+fn signed_symmetry_search_telemetry_survives_later_route_outcomes() {
+    let mut solver = Solver::new(3);
+    solver.set_symmetry_oneshot(true);
+    solver.cold.symmetry_enabled = true;
+    assert!(solver.add_clause(vec![Literal::positive(Variable(0))]));
+    assert!(solver.add_clause(vec![
+        Literal::positive(Variable(0)),
+        Literal::positive(Variable(1)),
+    ]));
+    assert!(solver.add_clause(vec![
+        Literal::negative(Variable(1)),
+        Literal::positive(Variable(2)),
+    ]));
+
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(!changed);
+    assert_eq!(
+        solver.cold.symmetry_stats.last_skipped_reason,
+        Some(crate::symmetry::SymmetrySkipReason::NoPairs)
+    );
+    if std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some() {
+        assert!(solver
+            .cold
+            .symmetry_stats
+            .routes
+            .iter()
+            .any(|(route, outcome)| route == &"signed" && outcome == "ran, found nothing"));
+    } else {
+        assert!(!solver
+            .cold
+            .symmetry_stats
+            .routes
+            .iter()
+            .any(|(route, _)| *route == "signed"));
+    }
 }
 
 #[test]

@@ -100,7 +100,7 @@ impl PinnedSolver {
         let mut destination = destination_options.open(&execution_path)?;
         let mut hasher = Sha256::new();
         let mut size_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let read = source.read(&mut buffer).with_bench_context(|| {
                 format!("copying pinned solver binary {}", source_path.display())
@@ -317,7 +317,7 @@ impl SolverProvenance {
         }
         let mut hasher = Sha256::new();
         let mut size_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let read = file
                 .read(&mut buffer)

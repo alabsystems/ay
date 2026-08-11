@@ -28,7 +28,9 @@ pub(crate) use super::*;
 mod array_completion;
 mod array_witness_soundness;
 mod cert_default_row_key;
+mod certificate_pins;
 mod cross_base_witness_defchase;
+mod div_witness_index;
 mod dt_element_canon_gate;
 mod dt_recursive_model_faithfulness;
 mod eval_term_bitvec_array;
@@ -41,7 +43,9 @@ mod eval_term_misc;
 mod eval_term_theory_validation;
 mod eval_term_validation_regressions;
 mod free_dt_array_residual_gate;
+mod ite_fixup;
 mod no_fabricated_output;
+mod projection_uf;
 mod seq_array_uf_def;
 mod uflia_uninterp_eq;
 
@@ -51,6 +55,8 @@ mod uflia_uninterp_eq;
 
 pub(super) fn empty_model() -> Model {
     Model {
+        quantified_confirmation_seal: Default::default(),
+        quantified_grant_model_seal: Default::default(),
         sat_model: vec![],
         term_to_var: HashMap::default(),
         bool_overrides: HashMap::default(),
@@ -62,6 +68,10 @@ pub(super) fn empty_model() -> Model {
         fp_model: None,
         string_model: None,
         seq_model: None,
+        projection_ufs: ProjectionUfModel::default(),
+        certified_total_ufs: CertifiedTotalUfModel::default(),
+        certified_const_interps: CertifiedConstInterpModel::default(),
+        formula_neutral_function_defaults: FormulaNeutralFunctionDefaults::default(),
         completed_values: HashMap::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),
@@ -95,6 +105,8 @@ pub(super) fn model_with_sat_assignments(assignments: &[(TermId, bool)]) -> Mode
     }
 
     Model {
+        quantified_confirmation_seal: Default::default(),
+        quantified_grant_model_seal: Default::default(),
         sat_model,
         term_to_var,
         bool_overrides: HashMap::default(),
@@ -106,6 +118,10 @@ pub(super) fn model_with_sat_assignments(assignments: &[(TermId, bool)]) -> Mode
         fp_model: None,
         string_model: None,
         seq_model: None,
+        projection_ufs: ProjectionUfModel::default(),
+        certified_total_ufs: CertifiedTotalUfModel::default(),
+        certified_const_interps: CertifiedConstInterpModel::default(),
+        formula_neutral_function_defaults: FormulaNeutralFunctionDefaults::default(),
         completed_values: HashMap::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),

@@ -89,11 +89,9 @@ pub(crate) const HYBRID_PB_LP_INFEASIBILITY_CERTIFICATE_FORMAT: &str =
 const MAX_HYBRID_CERTIFICATE_JSON_BYTES: u64 = 64 << 20;
 
 /// A conclusive result from the exact hybrid reduction.
+#[cfg(test)]
 pub(crate) enum HybridPbLpDecision {
-    Feasible {
-        model_values: Vec<BigRational>,
-        incumbent_only: bool,
-    },
+    Feasible,
     Infeasible,
     Optimal {
         value: BigRational,
@@ -103,10 +101,8 @@ pub(crate) enum HybridPbLpDecision {
 
 /// A hybrid result that retains proof data for an infeasible verdict.
 ///
-/// This is deliberately separate from [`HybridPbLpDecision`].  Existing
-/// heuristic callers may keep using that result, while a proof-requiring
-/// caller must opt into this type and cannot accidentally discard the hybrid
-/// cut ledger or the final PB refutation.
+/// Proof-requiring callers use this type so they cannot accidentally discard
+/// the hybrid cut ledger or the final PB refutation.
 pub(crate) enum CertifiedHybridPbLpDecision {
     Feasible {
         model_values: Vec<BigRational>,
@@ -249,10 +245,12 @@ pub(crate) enum HybridPbLpCertificateVerificationError {
 
 /// Try the hybrid route.  `None` is a structural decline, timeout, resource
 /// stop, unsupported PB integer range, or a result that failed an exact check.
+#[cfg(test)]
 pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<HybridPbLpDecision> {
     try_solve_interruptible(model, deadline, || false)
 }
 
+#[cfg(test)]
 pub(crate) fn try_solve_interruptible<F>(
     model: &Model,
     deadline: Option<Instant>,
@@ -439,15 +437,10 @@ where
     None
 }
 
+#[cfg(test)]
 fn drop_hybrid_certificate(decision: CertifiedHybridPbLpDecision) -> HybridPbLpDecision {
     match decision {
-        CertifiedHybridPbLpDecision::Feasible {
-            model_values,
-            incumbent_only,
-        } => HybridPbLpDecision::Feasible {
-            model_values,
-            incumbent_only,
-        },
+        CertifiedHybridPbLpDecision::Feasible { .. } => HybridPbLpDecision::Feasible,
         CertifiedHybridPbLpDecision::Infeasible(_) => HybridPbLpDecision::Infeasible,
         CertifiedHybridPbLpDecision::Optimal {
             value,

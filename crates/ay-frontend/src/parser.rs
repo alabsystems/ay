@@ -148,7 +148,8 @@ impl<'a> CommandStream<'a> {
         // a one-token lookahead, so before parsing `consumed_offset` is the
         // start of that token). Used to attribute errors to the offending
         // token rather than to whatever the consumer guesses.
-        let token_start = self.cursor + parser.consumed_offset();
+        let command_start = parser.consumed_offset();
+        let token_start = self.cursor + command_start;
 
         match parser.parse_sexp() {
             Ok(sexp) => {
@@ -189,14 +190,19 @@ impl<'a> CommandStream<'a> {
                     err.position = Some(abs);
                     err.line = Some(line_col(self.input, abs).0);
                 }
-                // A malformed S-expression leaves the lexer in an indeterminate
-                // position. Resync to the next plausible top-level command
-                // boundary by scanning for the next balanced `(...)` group in
-                // the remaining input. If none exists, consume the rest so the
-                // stream terminates.
-                let next = next_command_boundary(remaining);
+                // Distinguish an error *inside* a parenthesized command from a
+                // stray top-level token. For a malformed command we discard its
+                // balanced group. For a stray token (`)`, an invalid lexer
+                // token, etc.) we stop at the next command's opening `(` and do
+                // not consume that otherwise-valid command.
+                let command_input = remaining.get(command_start..).unwrap_or_default();
+                let next = if command_input.starts_with('(') {
+                    end_of_parenthesized_command(command_input)
+                } else {
+                    next_command_start(command_input)
+                };
                 match next {
-                    Some(offset) => self.cursor += offset,
+                    Some(offset) => self.cursor += command_start + offset,
                     None => self.cursor = self.input.len(),
                 }
                 Some(CommandStreamItem::Error(err))
@@ -278,30 +284,13 @@ impl Iterator for CommandStream<'_> {
 /// literals, and `;` comments) and return the offset just after it. When the
 /// parens never balance (truncated input), there is no further command, so we
 /// return `None` and the caller drops the rest of the input.
-fn next_command_boundary(remaining: &str) -> Option<usize> {
+fn end_of_parenthesized_command(remaining: &str) -> Option<usize> {
     let bytes = remaining.as_bytes();
-    let mut i = 0usize;
-    // Skip to the first '(' that begins the (malformed) command.
-    while i < bytes.len() && bytes[i] != b'(' {
-        // Respect comments and strings even before the first paren so a stray
-        // ')' inside them does not derail the scan.
-        match bytes[i] {
-            b';' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                i = skip_string_literal(bytes, i);
-            }
-            _ => i += 1,
-        }
-    }
-    if i >= bytes.len() {
+    if bytes.first() != Some(&b'(') {
         return None;
     }
 
+    let mut i = 0usize;
     let mut depth = 0usize;
     while i < bytes.len() {
         match bytes[i] {
@@ -317,11 +306,12 @@ fn next_command_boundary(remaining: &str) -> Option<usize> {
                 continue;
             }
             b'|' => {
-                // Quoted symbol: skip to the closing '|'.
+                // Quoted symbol: skip escaped `\|` / `\\` as well as any
+                // other Z3-compatible backslash escape. Parentheses and bars
+                // inside the symbol are data, never command boundaries.
                 i += 1;
-                while i < bytes.len() && bytes[i] != b'|' {
-                    i += 1;
-                }
+                i = skip_quoted_symbol(bytes, i);
+                continue;
             }
             b'(' => depth += 1,
             b')' => {
@@ -339,6 +329,38 @@ fn next_command_boundary(remaining: &str) -> Option<usize> {
     None
 }
 
+/// Find the next unquoted, uncommented `(` without consuming it.
+///
+/// Used after a stray top-level token. Returning the opening parenthesis (not
+/// the end of its group) is what preserves the following valid command.
+fn next_command_start(remaining: &str) -> Option<usize> {
+    let bytes = remaining.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => return Some(i),
+            b';' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                i = skip_string_literal(bytes, i);
+                continue;
+            }
+            b'|' => {
+                i += 1;
+                i = skip_quoted_symbol(bytes, i);
+                continue;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Advance `i` past the body of a string literal (the opening `"` already
 /// consumed). Handles SMT-LIB's doubled-quote (`""`) escape.
 fn skip_string_literal(bytes: &[u8], mut i: usize) -> usize {
@@ -352,6 +374,25 @@ fn skip_string_literal(bytes: &[u8], mut i: usize) -> usize {
             return i + 1;
         }
         i += 1;
+    }
+    i
+}
+
+/// Advance past a quoted symbol body (the opening `|` was already consumed).
+/// A backslash quotes the following character in Z3's compatible extension,
+/// so an escaped `|` cannot terminate the symbol.
+fn skip_quoted_symbol(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'|' => return i + 1,
+            _ => i += 1,
+        }
     }
     i
 }

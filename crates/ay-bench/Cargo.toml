@@ -29,3 +29,6 @@ ay-sys.workspace = true
 
 [dev-dependencies]
 ay-test-support.workspace = true
+
+[lints]
+workspace = true

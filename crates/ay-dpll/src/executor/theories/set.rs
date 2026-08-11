@@ -1009,12 +1009,11 @@ impl Executor {
         let zero = self.ctx.terms.mk_int(BigInt::zero());
         let one = self.ctx.terms.mk_int(BigInt::from(1));
         let mut contributions: Vec<TermId> = Vec::with_capacity(elems.len());
-        for i in 0..elems.len() {
-            let elem = elems[i];
+        for (i, &elem) in elems.iter().enumerate() {
             // Guard: `elem` is in the set AND is not a repeat of an earlier probe.
             let mut guard = vec![self.ctx.terms.mk_select(set_arg, elem)];
-            for j in 0..i {
-                let same = self.ctx.terms.mk_eq(elem, elems[j]);
+            for &previous in &elems[..i] {
+                let same = self.ctx.terms.mk_eq(elem, previous);
                 let distinct = self.ctx.terms.mk_not(same);
                 guard.push(distinct);
             }

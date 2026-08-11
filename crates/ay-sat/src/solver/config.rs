@@ -477,6 +477,7 @@ impl Solver {
         self.cold.symmetry_oneshot = oneshot;
     }
 
+    /// Enable the official SAT Competition Main conflict-analysis pruning policy.
     pub fn set_sat_comp_main_conflict_pruning(&mut self, enabled: bool) {
         self.cold.sat_comp_main_conflict_pruning = enabled;
     }
@@ -1410,8 +1411,6 @@ impl Solver {
                 .map(|clause| clause.capacity() * size_of::<Literal>())
                 .sum::<usize>();
 
-        let original_ledger = self.cold.original_ledger.heap_bytes();
-
         let inprocessing = packed_bool_vec_bytes(self.subsume_dirty.capacity())
             + packed_bool_vec_bytes(self.dirty_watches.capacity())
             + self.dirty_watch_list.capacity() * size_of::<u32>()
@@ -1440,7 +1439,7 @@ impl Solver {
             trail,
             support,
             clause_ids,
-            original_ledger,
+            original_ledger: self.cold.original_ledger.heap_bytes(),
             inprocessing,
             reconstruction,
         }

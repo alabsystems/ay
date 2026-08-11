@@ -405,9 +405,7 @@ impl EufSolver<'_> {
         } else {
             std::mem::take(&mut self.pending_ite)
         };
-        let n_ite = sweep.len();
-        for ite_i in 0..n_ite {
-            let idx = sweep[ite_i];
+        for idx in sweep {
             let term_id = TermId(idx);
             // #euf-ite-sweep: this loop runs on EVERY rebuild over EVERY ITE
             // term — profiled at 1,471,446,450 iterations producing 300,988

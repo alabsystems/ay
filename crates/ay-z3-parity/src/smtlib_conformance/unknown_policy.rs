@@ -138,7 +138,7 @@ struct ExpectedOrigin {
     fixture: &'static str,
 }
 
-const EXPECTED_ORIGINS: [ExpectedOrigin; 18] = [
+const EXPECTED_ORIGINS: [ExpectedOrigin; 19] = [
     ExpectedOrigin {
         origin: UnknownOrigin::SolveDeadline,
         origin_code: "solve_deadline",
@@ -338,6 +338,18 @@ const EXPECTED_ORIGINS: [ExpectedOrigin; 18] = [
         production_chokepoint: "executor/lifecycle.rs::finalize_unknown_publication",
         trigger_kind: "authoritative-origin-publication-fault-injection",
         fixture: "fault.untagged-solver-unknown.authoritative-publication",
+    },
+    ExpectedOrigin {
+        origin: UnknownOrigin::TerminalTrust,
+        origin_code: "terminal_trust",
+        reason: UnknownReason::ProofTrusted,
+        reason_code: "proof_trusted",
+        reason_name: "Strict proofs WITHHELD a trust-bearing UNSAT",
+        reason_smtlib: "(incomplete proof-trusted)",
+        production_chokepoint:
+            "executor/unsat_cert.rs::decline_trust_bearing_unsat_under_strict_proofs",
+        trigger_kind: "natural-public-query",
+        fixture: "natural.check-sat.strict-proof-terminal-trust",
     },
 ];
 
@@ -549,7 +561,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("unknown-policy timeout must be between 1ns and 3600 seconds".to_string());
     }
     let subject = contract
@@ -929,8 +941,8 @@ mod tests {
     }
 
     #[test]
-    fn independent_oracle_is_closed_unique_and_has_three_natural_fixtures() {
-        assert_eq!(EXPECTED_ORIGINS.len(), 18);
+    fn independent_oracle_is_closed_unique_and_has_four_natural_fixtures() {
+        assert_eq!(EXPECTED_ORIGINS.len(), 19);
         assert_eq!(
             EXPECTED_ORIGINS
                 .iter()
@@ -952,7 +964,7 @@ mod tests {
                 .iter()
                 .filter(|expected| expected.trigger_kind == "natural-public-query")
                 .count(),
-            3
+            4
         );
         for expected in EXPECTED_ORIGINS {
             assert_eq!(expected.origin.code(), expected.origin_code);

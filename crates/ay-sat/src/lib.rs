@@ -109,6 +109,7 @@ pub(crate) mod clause;
 pub(crate) mod clause_arena;
 pub(crate) mod clause_provenance;
 pub(crate) mod clause_trace;
+mod clause_trace_resolution;
 pub(crate) mod component;
 pub(crate) mod condition;
 pub(crate) mod conflict;
@@ -328,6 +329,12 @@ impl Default for InprocessingFeatureProfile {
 pub use adaptive::adjust_features_for_instance;
 pub use clause_provenance::{ClauseProvenance, CoreProvenanceSummary};
 pub use clause_trace::{ClauseTrace, ClauseTraceEntry, HintOmission, HintOmissionStats};
+pub use clause_trace_resolution::{
+    validate_clause_trace_resolution, validate_clause_trace_resolution_interruptible,
+    validate_clause_trace_resolution_with_unit_premises_interruptible, ClauseTraceOriginalMapping,
+    ClauseTraceResolutionError, ValidatedClauseTraceResolution,
+    ValidatedPremisedClauseTraceResolution,
+};
 pub use cube_and_conquer::CubeAndConquerSolver;
 pub use decision_trace::{
     decision_trace_suppressed_after_public_mismatch, finish_reserved_decision_trace,

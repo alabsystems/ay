@@ -384,6 +384,7 @@ pub(crate) fn extract_euf_chain(
     clause: &[TermId],
     terms: &TermStore,
     is_congruence: bool,
+    wrap_term: &impl Fn(TermId) -> Term,
 ) -> Vec<CongruenceStep> {
     let mut chain = Vec::with_capacity(clause.len());
 
@@ -395,8 +396,8 @@ pub(crate) fn extract_euf_chain(
                 if let TermData::App(Symbol::Named(name), args) = terms.get(*inner) {
                     if name == "=" && args.len() == 2 {
                         chain.push(CongruenceStep {
-                            left: Term(args[0]),
-                            right: Term(args[1]),
+                            left: wrap_term(args[0]),
+                            right: wrap_term(args[1]),
                             reason: CongruenceReason::Direct,
                         });
                     }
@@ -410,8 +411,8 @@ pub(crate) fn extract_euf_chain(
                     CongruenceReason::Direct
                 };
                 chain.push(CongruenceStep {
-                    left: Term(args[0]),
-                    right: Term(args[1]),
+                    left: wrap_term(args[0]),
+                    right: wrap_term(args[1]),
                     reason,
                 });
             }
@@ -436,6 +437,7 @@ pub(crate) fn attribution_from_lemma(
     theory_name: &str,
     clause: &[TermId],
     terms: &TermStore,
+    wrap_term: &impl Fn(TermId) -> Term,
 ) -> TheoryAttribution {
     match kind {
         TheoryLemmaKind::LraFarkas => {
@@ -459,11 +461,11 @@ pub(crate) fn attribution_from_lemma(
             }
         }
         TheoryLemmaKind::EufTransitive => TheoryAttribution::EufTransitive {
-            chain: extract_euf_chain(clause, terms, false),
+            chain: extract_euf_chain(clause, terms, false, wrap_term),
         },
         TheoryLemmaKind::EufCongruent | TheoryLemmaKind::EufCongruentPred => {
             TheoryAttribution::EufCongruent {
-                chain: extract_euf_chain(clause, terms, true),
+                chain: extract_euf_chain(clause, terms, true, wrap_term),
             }
         }
         TheoryLemmaKind::BvBitBlast | TheoryLemmaKind::BvBitBlastGate { .. } => {

@@ -8,15 +8,14 @@
 //! The `TermStore` manages term creation and ensures structural sharing
 //! through hash-consing.
 
-use crate::kani_compat::KaniHashMap;
+use crate::kani_compat::{KaniHashMap, KaniHashSet};
 use crate::sort::Sort;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 mod arith_div_cmp;
@@ -33,8 +32,10 @@ mod expand_select_store;
 mod ite_lifting;
 mod preprocess;
 mod subst;
+mod value;
 
 pub use compact::{RemapTable, Remappable};
+pub use value::{Constant, RationalWrapper, SkolemChoice, Symbol, TermData, TermId};
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,34 @@ mod tests;
 /// slightly underestimates due to Vec capacity rounding, but is close enough
 /// for OOM detection.
 static GLOBAL_TERM_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-wide source of non-reused term-entry identities.
+///
+/// A `TermId` is only a slot index and speculative rollback can later reuse a
+/// discarded suffix slot.  Native API handles therefore authenticate both the
+/// slot and this birth stamp.  Keeping the source outside `TermStore` is
+/// deliberate: cloning and later restoring a speculative store snapshot cannot
+/// rewind it and accidentally resurrect a stale handle.
+static NEXT_TERM_ENTRY_STAMP: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque birth identity of one exact entry in a [`TermStore`].
+///
+/// The stamp is copied when a store is cloned, so prefix entries retain their
+/// logical identity across an exact rollback snapshot. Freshly interned entries
+/// always receive a process-wide non-reused stamp, including when their numeric
+/// [`TermId`] slot was previously occupied by a discarded speculative term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TermEntryStamp(u64);
+
+#[allow(clippy::panic)]
+fn fresh_term_entry_stamp() -> TermEntryStamp {
+    let stamp = NEXT_TERM_ENTRY_STAMP
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("term entry identity space exhausted"));
+    TermEntryStamp(stamp)
+}
 
 /// Global counter for the number of active portfolio engines.
 ///
@@ -89,225 +118,17 @@ static GLOBAL_TERM_MEMORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_TERM_MEM
 /// every DPLL(T) iteration (#8600).
 const TRUE_MEMORY_RECOMPUTE_DELTA: usize = 64 * 1024;
 
-/// A term identifier (index into the term store)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[must_use = "TermId must be used (discarding it usually indicates a bug)"]
-pub struct TermId(pub u32);
-
-impl TermId {
-    /// Sentinel value used by the LRA simplex solver for bounds that have no
-    /// SAT-level atom reason (e.g., Gomory/HNF cuts, model-seed probing).
-    /// Must never collide with a real interned term ID.
-    pub const SENTINEL: Self = Self(u32::MAX);
-
-    /// Create a new TermId
-    pub fn new(id: u32) -> Self {
-        Self(id)
-    }
-
-    /// Returns true if this is the sentinel (no real atom reason).
-    pub fn is_sentinel(self) -> bool {
-        self.0 == u32::MAX
-    }
-
-    /// Get the raw index
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl fmt::Display for TermId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "t{}", self.0)
-    }
-}
-
-/// What a Skolem CONSTANT minted for a single-binder quantifier denotes: the
-/// Hilbert choice term `(choice ((binder sort)) body)`.
-///
-/// Skolemization replaces `∃x. B` by `B[x := sk]`. Read as "sk is some fresh
-/// constant" that is only equisatisfiable, and an external proof checker is
-/// right to reject it: nothing licenses a fresh constant satisfying `B`. Read
-/// as "sk is `εx. B`" it is an EQUIVALENCE — `∃x. B ⟺ B[x := εx. B]` is the
-/// epsilon axiom — which is why Alethe's `sko_ex`/`sko_forall` rules are stated
-/// over `choice` terms. The same holds for the negative universal case
-/// (`¬∀x. B ≡ ∃x. ¬B`), where `body` is the already-negated body.
-///
-/// `body` is captured at the substitution site with every OUTER Skolem already
-/// substituted in, so a witness minted later can mention one minted earlier and
-/// the pair is renderable in mint (i.e. `TermId`) order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkolemChoice {
-    /// Bound variable of the source quantifier (the `choice` binder).
-    pub binder: String,
-    /// Sort of the bound variable — also the witness's own sort.
-    pub sort: Sort,
-    /// `choice` body: the quantifier body this witness was chosen to satisfy,
-    /// still mentioning `binder` free.
-    pub body: TermId,
-}
+/// Cap on `TermStore::strict_bv_semantics_ok`. Past it the store stops
+/// memoizing completed strict BV validations and the checker re-runs them, so
+/// the bound costs time, never correctness.
+const MAX_STRICT_BV_SEMANTICS_MEMO: usize = 4096;
 
 /// Internal term representation with pre-computed hash
 #[derive(Debug, Clone)]
 struct TermEntry {
     term: TermData,
     sort: Sort,
-}
-
-/// The actual term data
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum TermData {
-    /// A constant value
-    Const(Constant),
-    /// A variable with name and unique ID
-    Var(String, u32),
-    /// Function application: function symbol + arguments
-    App(Symbol, Vec<TermId>),
-    /// Let binding (after expansion this should not appear)
-    Let(Vec<(String, TermId)>, TermId),
-    /// Negation (special case for efficient handling)
-    Not(TermId),
-    /// If-then-else
-    Ite(TermId, TermId, TermId),
-    /// Universal quantifier: forall ((x1 S1) (x2 S2) ...) body
-    ///
-    /// Triggers are multi-patterns:
-    /// - Outer Vec = alternative trigger sets (disjunction)
-    /// - Inner Vec = multi-trigger patterns (conjunction; currently flattened by E-matching)
-    Forall(Vec<(String, Sort)>, TermId, Vec<Vec<TermId>>),
-    /// Existential quantifier: exists ((x1 S1) (x2 S2) ...) body
-    ///
-    /// Triggers are multi-patterns:
-    /// - Outer Vec = alternative trigger sets (disjunction)
-    /// - Inner Vec = multi-trigger patterns (conjunction; currently flattened by E-matching)
-    Exists(Vec<(String, Sort)>, TermId, Vec<Vec<TermId>>),
-}
-
-impl Hash for TermData {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Self::Const(c) => c.hash(state),
-            Self::Var(name, id) => {
-                name.hash(state);
-                id.hash(state);
-            }
-            Self::App(sym, args) => {
-                sym.hash(state);
-                args.hash(state);
-            }
-            Self::Let(bindings, body) => {
-                bindings.hash(state);
-                body.hash(state);
-            }
-            Self::Not(t) => t.hash(state),
-            Self::Ite(c, t, e) => {
-                c.hash(state);
-                t.hash(state);
-                e.hash(state);
-            }
-            Self::Forall(vars, body, triggers) | Self::Exists(vars, body, triggers) => {
-                for (name, sort) in vars {
-                    name.hash(state);
-                    sort.hash(state);
-                }
-                body.hash(state);
-                triggers.hash(state);
-            }
-        }
-    }
-}
-
-/// Function/predicate symbol
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Symbol {
-    /// Named function (user-defined or built-in)
-    Named(String),
-    /// Indexed function like (_ extract 7 4)
-    Indexed(String, Vec<u32>),
-}
-
-impl Symbol {
-    /// Create a named symbol
-    pub fn named(name: impl Into<String>) -> Self {
-        Self::Named(name.into())
-    }
-
-    /// Create an indexed symbol
-    pub fn indexed(name: impl Into<String>, indices: Vec<u32>) -> Self {
-        Self::Indexed(name.into(), indices)
-    }
-
-    /// Get the name of the symbol
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Named(n) | Self::Indexed(n, _) => n,
-        }
-    }
-}
-
-impl fmt::Display for Symbol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Named(n) => write!(f, "{n}"),
-            Self::Indexed(n, indices) => {
-                write!(f, "(_ {n}")?;
-                for idx in indices {
-                    write!(f, " {idx}")?;
-                }
-                write!(f, ")")
-            }
-        }
-    }
-}
-
-/// Constant values
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Constant {
-    /// Boolean constant
-    Bool(bool),
-    /// Integer constant (arbitrary precision)
-    Int(BigInt),
-    /// Rational constant
-    Rational(RationalWrapper),
-    /// Bitvector constant with value and width
-    BitVec {
-        /// The numeric value of the bitvector
-        value: BigInt,
-        /// The bit width of the bitvector
-        width: u32,
-    },
-    /// String constant
-    String(String),
-}
-
-/// Wrapper for BigRational to implement Eq and Hash
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RationalWrapper(pub BigRational);
-
-impl PartialEq for RationalWrapper {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for RationalWrapper {}
-
-impl Hash for RationalWrapper {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash the normalized form
-        self.0.numer().hash(state);
-        self.0.denom().hash(state);
-    }
-}
-
-impl From<BigRational> for RationalWrapper {
-    fn from(r: BigRational) -> Self {
-        Self(r)
-    }
+    stamp: TermEntryStamp,
 }
 
 /// Hash-consing term store
@@ -393,7 +214,7 @@ pub struct TermStore {
     /// can only lose proofs, never a wrong-UNSAT); stable across push/pop (the
     /// ordinary push/pop is append-only; the isolated speculative rollback
     /// lane prunes this set together with its discarded term suffix).
-    no_mbqi: crate::kani_compat::KaniHashSet<TermId>,
+    no_mbqi: KaniHashSet<TermId>,
     /// Names of Skolem symbols minted by existential Skolemization — both the
     /// Skolem *constants* (`mk_fresh_var("sk!x", ..)`) and the Skolem *function*
     /// symbols (`mk_internal_symbol("sk_x")` → `__ay_sk_x!N`). Registered at the
@@ -404,7 +225,7 @@ pub struct TermStore {
     /// must recover the pre-Skolemization body exactly or fail closed. The set
     /// is append-only for the TermStore lifetime (push/pop and repeated
     /// `process_quantifiers` runs only ever ADD freshly-named symbols).
-    skolem_symbols: crate::kani_compat::KaniHashSet<String>,
+    skolem_symbols: KaniHashSet<String>,
     /// Hilbert-choice provenance of a Skolem CONSTANT, keyed by its witness
     /// `TermId`. See [`SkolemChoice`]. Recorded at the single creation site
     /// (`skolemize_quantifier_body`) so the value is what the substitution
@@ -454,8 +275,27 @@ pub struct TermStore {
     /// `RollbackIdentity::clone` deliberately mints a fresh identity, so a
     /// checkpoint from a cloned store cannot truncate this store.
     rollback_identity: RollbackIdentity,
-    /// Invalidates every older checkpoint after one rollback is consumed.
+    /// Invalidates every older checkpoint and structural snapshot after a
+    /// rollback or compaction can make a previously used length alias a new
+    /// term universe.
     rollback_generation: u64,
+    /// Clauses whose strict `bv_bitblast` SEMANTIC decision procedure has
+    /// already run to completion — and PASSED — against this store.
+    ///
+    /// A memo of work already done, never a substitute for it. An entry is
+    /// written only by the strict checker, only after the full decision
+    /// procedure (exhaustive bounded evaluation, or the bounded bit-blast +
+    /// LRAT proof producer and its replay) ACCEPTED that exact clause, and it
+    /// is read only to skip repeating that identical decision. Failures are
+    /// deliberately never recorded: the proof-producing checker is
+    /// deadline-bounded, so a failure is a fact about one attempt, not about
+    /// the clause.
+    ///
+    /// Keyed by `TermId`, hence cleared by every operation that can change what
+    /// a `TermId` means — `rollback_to` and `mark_and_compact` are the only two
+    /// (every other mutation of `self.terms` appends), and both clear it.
+    /// `Clone` and `from_entries` start empty.
+    strict_bv_semantics_ok: std::cell::RefCell<KaniHashSet<Vec<TermId>>>,
 }
 
 impl Clone for TermStore {
@@ -492,6 +332,9 @@ impl Clone for TermStore {
             quantifier_no_patterns: self.quantifier_no_patterns.clone(),
             rollback_identity: self.rollback_identity.clone(),
             rollback_generation: self.rollback_generation,
+            // A memo of completed checker work, not store content. Starting a
+            // clone empty is always correct: it only costs a re-validation.
+            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
         };
 
         // A cloned store owns a second physical allocation and its Drop
@@ -532,6 +375,60 @@ pub struct TermStoreRollbackCheckpoint {
     identity: Arc<()>,
     generation: u64,
     len: usize,
+}
+
+/// Opaque identity of one exact structural [`TermStore`] snapshot.
+///
+/// This is intended for read-only derived indexes.  It compares equal only
+/// while the same physical store has the same structural generation and
+/// length: cloning/replacing a store mints a fresh identity, appending changes
+/// the length, and rollback or compaction advances the generation. Existing
+/// term entries are immutable, so equality is sufficient evidence that a
+/// structural index over `0..len` still describes this store exactly.
+#[derive(Clone)]
+pub struct TermStoreSnapshotStamp {
+    identity: Arc<()>,
+    generation: u64,
+    len: usize,
+}
+
+impl PartialEq for TermStoreSnapshotStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.len == other.len
+            && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl Eq for TermStoreSnapshotStamp {}
+
+impl TermStoreSnapshotStamp {
+    /// Whether this snapshot remains an immutable prefix of `store` after only
+    /// append-only growth.
+    ///
+    /// Unlike equality, this deliberately permits `store` to contain terms
+    /// appended after the snapshot. It still requires the same physical term
+    /// universe and structural generation, so cloning/replacing the store,
+    /// rolling back any suffix, or compacting it retires the stamp. Since term
+    /// entries are immutable, those conditions plus `store.len() >= self.len`
+    /// guarantee that every `TermId` below the captured boundary still names
+    /// the same entry.
+    #[must_use]
+    pub fn is_append_only_prefix_of(&self, store: &TermStore) -> bool {
+        self.generation == store.rollback_generation
+            && self.len <= store.terms.len()
+            && Arc::ptr_eq(&self.identity, &store.rollback_identity.0)
+    }
+}
+
+impl fmt::Debug for TermStoreSnapshotStamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TermStoreSnapshotStamp")
+            .field("identity", &"<opaque>")
+            .field("generation", &self.generation)
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 impl Drop for TermStore {
@@ -606,8 +503,8 @@ impl TermStore {
             bucket_capacity_bytes: 0,
             true_memory_cache: std::cell::Cell::new(0),
             true_memory_cache_at: std::cell::Cell::new(0),
-            no_mbqi: crate::kani_compat::KaniHashSet::default(),
-            skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            no_mbqi: KaniHashSet::default(),
+            skolem_symbols: KaniHashSet::default(),
             skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
@@ -616,6 +513,7 @@ impl TermStore {
             quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
+            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
         };
         // Pre-create true and false
         store.true_term = Some(store.mk_bool(true));
@@ -656,8 +554,8 @@ impl TermStore {
             bucket_capacity_bytes: 0,
             true_memory_cache: std::cell::Cell::new(0),
             true_memory_cache_at: std::cell::Cell::new(0),
-            no_mbqi: crate::kani_compat::KaniHashSet::default(),
-            skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            no_mbqi: KaniHashSet::default(),
+            skolem_symbols: KaniHashSet::default(),
             skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
@@ -666,6 +564,7 @@ impl TermStore {
             quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
+            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
         }
     }
 
@@ -745,7 +644,6 @@ impl TermStore {
     }
 
     /// Return the exact `:no-pattern` terms attached to a quantifier.
-    #[must_use]
     pub fn quantifier_no_patterns(&self, id: TermId) -> &[TermId] {
         self.quantifier_no_patterns
             .get(&id)
@@ -899,6 +797,29 @@ impl TermStore {
         self.terms.is_empty()
     }
 
+    /// Capture the identity of the current immutable structural snapshot.
+    ///
+    /// Read-only caches may reuse data only while this stamp remains equal.
+    /// Any append, rollback, compaction, clone, or wholesale store replacement
+    /// makes a previously captured stamp compare unequal.
+    #[must_use]
+    pub fn snapshot_stamp(&self) -> TermStoreSnapshotStamp {
+        TermStoreSnapshotStamp {
+            identity: Arc::clone(&self.rollback_identity.0),
+            generation: self.rollback_generation,
+            len: self.terms.len(),
+        }
+    }
+
+    /// Retire every structural snapshot and affine rollback checkpoint minted
+    /// before a destructive arena rewrite.
+    pub(super) fn advance_structural_generation(&mut self) {
+        self.rollback_generation = self
+            .rollback_generation
+            .checked_add(1)
+            .expect("term store structural generation exhausted");
+    }
+
     /// Capture the current suffix boundary for one later speculative rollback.
     ///
     /// The returned checkpoint is bound to this exact store instance and its
@@ -957,13 +878,14 @@ impl TermStore {
             checkpoint.len <= self.terms.len(),
             "term rollback checkpoint lies beyond the current store"
         );
-        self.rollback_generation = self
-            .rollback_generation
-            .checked_add(1)
-            .expect("term rollback generation exhausted");
+        self.advance_structural_generation();
         let len = checkpoint.len;
         let keep = |id: &TermId| (id.0 as usize) < len;
         self.terms.truncate(len);
+        // Every memoized checker verdict is keyed by `TermId`; the suffix this
+        // truncation reclaims can be re-minted as entirely different terms, so
+        // the memo must not survive it.
+        self.strict_bv_semantics_ok.get_mut().clear();
         for bucket in self.hash_cons.values_mut() {
             bucket.retain(|id| keep(id));
         }
@@ -1175,6 +1097,33 @@ impl TermStore {
             .expect("TermStore: false_term accessed before initialization")
     }
 
+    /// Whether `clause` is recorded as having PASSED the strict `bv_bitblast`
+    /// semantic decision procedure against this store.
+    ///
+    /// `true` means that procedure has already run TO COMPLETION on this exact
+    /// clause in this exact store and accepted it; see
+    /// `strict_bv_semantics_ok`. There is deliberately no way to record — or to
+    /// observe — a failure, so this can never be used to skip a check that has
+    /// not actually passed.
+    #[must_use]
+    pub fn strict_bv_semantics_validated(&self, clause: &[TermId]) -> bool {
+        self.strict_bv_semantics_ok.borrow().contains(clause)
+    }
+
+    /// Record that the strict `bv_bitblast` semantic decision procedure ran to
+    /// completion on `clause` and ACCEPTED it.
+    ///
+    /// Callers must only call this immediately after such a success.
+    pub fn record_strict_bv_semantics_validated(&self, clause: &[TermId]) {
+        let mut memo = self.strict_bv_semantics_ok.borrow_mut();
+        // Bounded so an untrusted proof cannot grow the memo without limit.
+        // Once full we simply stop memoizing and re-validate, as before.
+        if memo.len() >= MAX_STRICT_BV_SEMANTICS_MEMO {
+            return;
+        }
+        memo.insert(clause.to_vec());
+    }
+
     /// Interning position of the preallocated `false` constant.
     ///
     /// [`TermStore::new`] interns `true` and then `false` into an empty store
@@ -1230,6 +1179,15 @@ impl TermStore {
         &self.terms[id.index()].sort
     }
 
+    /// Return the opaque birth stamp for a live term slot.
+    ///
+    /// Unlike [`Self::get`] and [`Self::sort`], this lookup is bounds checked so
+    /// an untrusted native handle can be authenticated before any indexing.
+    #[must_use]
+    pub fn entry_stamp(&self, id: TermId) -> Option<TermEntryStamp> {
+        self.terms.get(id.index()).map(|entry| entry.stamp)
+    }
+
     /// The current variable counter (number of unique variable ids minted).
     #[must_use]
     pub fn var_counter(&self) -> u32 {
@@ -1267,7 +1225,11 @@ impl TermStore {
     ) -> Self {
         let terms = entries
             .into_iter()
-            .map(|(term, sort)| TermEntry { term, sort })
+            .map(|(term, sort)| TermEntry {
+                term,
+                sort,
+                stamp: fresh_term_entry_stamp(),
+            })
             .collect();
         Self {
             terms,
@@ -1286,8 +1248,8 @@ impl TermStore {
             // Empty: this checker-only store never interns, so the not-memo cache
             // stays empty (the strict checker only reads terms by index).
             not_cache: KaniHashMap::default(),
-            no_mbqi: crate::kani_compat::KaniHashSet::default(),
-            skolem_symbols: crate::kani_compat::KaniHashSet::default(),
+            no_mbqi: KaniHashSet::default(),
+            skolem_symbols: KaniHashSet::default(),
             skolem_choice: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
@@ -1296,6 +1258,7 @@ impl TermStore {
             quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
+            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
         }
     }
 

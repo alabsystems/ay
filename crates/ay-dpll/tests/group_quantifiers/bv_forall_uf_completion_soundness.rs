@@ -83,6 +83,24 @@ fn test_forall_two_bv1_var_equality_not_sat() {
     assert_not_sat(smt, "forall two BV1 var equality");
 }
 
+/// Datatype binders surface as uninterpreted sorts in this stage of the
+/// pipeline, so a syntactic UF-completion check must not treat them as freely
+/// collapsible. The trigger has a real ground match at `R`; nevertheless the
+/// universal is false at the distinct constructor `S`.
+#[test]
+#[timeout(20000)]
+fn test_matched_enum_forall_is_not_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-datatype E ((R) (S)))
+        (declare-fun f (E) Bool)
+        (assert (f R))
+        (assert (forall ((c E)) (! (= c R) :pattern ((f c)))))
+        (check-sat)
+    "#;
+    assert_not_sat(smt, "matched enum forall over two constructors");
+}
+
 /// A single BV8 binder (domain 256) is small enough to decide via finite-domain
 /// expansion. It must remain `unsat` (decided), not regress to Unknown.
 #[test]

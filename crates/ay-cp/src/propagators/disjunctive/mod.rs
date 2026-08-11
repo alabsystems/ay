@@ -32,9 +32,9 @@ pub struct Disjunctive {
     /// Theta-Lambda tree workspace.
     tree: ThetaLambdaTree,
     /// Workspace: (task_idx, lct) sorted by decreasing LCT.
-    ws_by_lct: Vec<(usize, i64)>,
+    ws_by_lct: Vec<(usize, i128)>,
     /// Workspace: (task_idx, est) sorted by increasing EST.
-    ws_by_est: Vec<(usize, i64)>,
+    ws_by_est: Vec<(usize, i128)>,
 }
 
 impl Disjunctive {
@@ -69,7 +69,7 @@ impl Disjunctive {
         // Sort tasks by EST to build tree ordering
         self.ws_by_est.clear();
         for i in 0..n {
-            let est = trail.lb(self.starts[i]);
+            let est = i128::from(trail.lb(self.starts[i]));
             self.ws_by_est.push((i, est));
         }
         self.ws_by_est.sort_unstable_by_key(|&(_, est)| est);
@@ -79,14 +79,15 @@ impl Disjunctive {
 
         // Add all tasks to Theta
         for &(i, est) in &self.ws_by_est {
-            let ect = est + self.durations[i];
-            self.tree.add_to_theta(i, ect, self.durations[i]);
+            let duration = i128::from(self.durations[i]);
+            let ect = est + duration;
+            self.tree.add_to_theta(i, ect, duration);
         }
 
         // Sort tasks by decreasing LCT
         self.ws_by_lct.clear();
         for i in 0..n {
-            let lct = trail.ub(self.starts[i]) + self.durations[i];
+            let lct = i128::from(trail.ub(self.starts[i])) + i128::from(self.durations[i]);
             self.ws_by_lct.push((i, lct));
         }
         self.ws_by_lct
@@ -104,19 +105,23 @@ impl Disjunctive {
             }
 
             // Move j from Theta to Lambda
-            let est_j = trail.lb(self.starts[j]);
-            let ect_j = est_j + self.durations[j];
+            let est_j = i128::from(trail.lb(self.starts[j]));
+            let duration_j = i128::from(self.durations[j]);
+            let ect_j = est_j + duration_j;
             self.tree.remove_from_theta(j);
-            self.tree.add_to_lambda(j, ect_j, self.durations[j]);
+            self.tree.add_to_lambda(j, ect_j, duration_j);
 
             // Edge-finding: while some Lambda task must come after all Theta tasks
             while self.tree.ect_bar() > lct_j {
                 if let Some(i) = self.tree.responsible_ect_bar() {
                     let new_lb = self.tree.ect();
-                    let current_lb = trail.lb(self.starts[i]);
+                    let current_lb = i128::from(trail.lb(self.starts[i]));
 
                     if new_lb > current_lb {
                         // Propagate: lb(s_i) >= ect(Theta)
+                        let Ok(new_lb) = i64::try_from(new_lb) else {
+                            return self.build_overload_conflict(trail, encoder);
+                        };
                         if let Some(clause) = self.build_lb_clause(trail, encoder, i, new_lb) {
                             clauses.push(clause);
                         }
@@ -152,8 +157,8 @@ impl Disjunctive {
         // ect' = est' + dur = -(ub + dur) + dur = -ub
         self.ws_by_est.clear();
         for i in 0..n {
-            let ub = trail.ub(self.starts[i]);
-            let est_mirror = -(ub + self.durations[i]);
+            let ub = i128::from(trail.ub(self.starts[i]));
+            let est_mirror = -(ub + i128::from(self.durations[i]));
             self.ws_by_est.push((i, est_mirror));
         }
         self.ws_by_est.sort_unstable_by_key(|&(_, est)| est);
@@ -163,14 +168,15 @@ impl Disjunctive {
 
         // Add all tasks to Theta in mirrored coordinates
         for &(i, est_mirror) in &self.ws_by_est {
-            let ect_mirror = est_mirror + self.durations[i]; // = -ub
-            self.tree.add_to_theta(i, ect_mirror, self.durations[i]);
+            let duration = i128::from(self.durations[i]);
+            let ect_mirror = est_mirror + duration; // = -ub
+            self.tree.add_to_theta(i, ect_mirror, duration);
         }
 
         // Sort by decreasing mirrored LCT (lct' = -lb, so decreasing lct' = increasing lb)
         self.ws_by_lct.clear();
         for i in 0..n {
-            let lb = trail.lb(self.starts[i]);
+            let lb = i128::from(trail.lb(self.starts[i]));
             let lct_mirror = -lb;
             self.ws_by_lct.push((i, lct_mirror));
         }
@@ -186,20 +192,24 @@ impl Disjunctive {
                 return self.build_overload_conflict_upper(trail, encoder);
             }
 
-            let ub_j = trail.ub(self.starts[j]);
-            let ect_j_mirror = -(ub_j + self.durations[j]) + self.durations[j]; // = -ub_j
+            let ub_j = i128::from(trail.ub(self.starts[j]));
+            let duration_j = i128::from(self.durations[j]);
+            let ect_j_mirror = -(ub_j + duration_j) + duration_j; // = -ub_j
             self.tree.remove_from_theta(j);
-            self.tree.add_to_lambda(j, ect_j_mirror, self.durations[j]);
+            self.tree.add_to_lambda(j, ect_j_mirror, duration_j);
 
             while self.tree.ect_bar() > lct_j_mirror {
                 if let Some(i) = self.tree.responsible_ect_bar() {
                     // In mirrored coords: new_lb_mirror = ect(Theta)
                     // Convert back: new_ub_original = -(new_lb_mirror) - duration_i
                     let new_lb_mirror = self.tree.ect();
-                    let new_ub = -new_lb_mirror - self.durations[i];
-                    let current_ub = trail.ub(self.starts[i]);
+                    let new_ub = -new_lb_mirror - i128::from(self.durations[i]);
+                    let current_ub = i128::from(trail.ub(self.starts[i]));
 
                     if new_ub < current_ub {
+                        let Ok(new_ub) = i64::try_from(new_ub) else {
+                            return self.build_overload_conflict_upper(trail, encoder);
+                        };
                         if let Some(clause) = self.build_ub_clause(trail, encoder, i, new_ub) {
                             clauses.push(clause);
                         }

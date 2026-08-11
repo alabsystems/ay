@@ -21,17 +21,20 @@ fn validate_bitvector_width(operation: &'static str, width: u32) -> Result<(), S
 impl Solver {
     /// Create a boolean constant
     pub fn bool_const(&mut self, value: bool) -> Term {
-        Term(self.terms_mut().mk_bool(value))
+        let result = self.terms_mut().mk_bool(value);
+        self.wrap_term(result)
     }
 
     /// Create an integer constant
     pub fn int_const(&mut self, value: i64) -> Term {
-        Term(self.terms_mut().mk_int(BigInt::from(value)))
+        let result = self.terms_mut().mk_int(BigInt::from(value));
+        self.wrap_term(result)
     }
 
     /// Create an integer constant from an arbitrary-precision value.
     pub fn int_const_bigint(&mut self, value: &BigInt) -> Term {
-        Term(self.terms_mut().mk_int(value.clone()))
+        let result = self.terms_mut().mk_int(value.clone());
+        self.wrap_term(result)
     }
 
     /// Create a real constant from a floating-point value.
@@ -61,7 +64,8 @@ impl Solver {
                 BigInt::from(1_000_000_000_000_000i64),
             )
         });
-        Ok(Term(self.terms_mut().mk_rational(r)))
+        let result = self.terms_mut().mk_rational(r);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a real constant from a rational (numerator/denominator).
@@ -87,7 +91,8 @@ impl Solver {
             });
         }
         let r = BigRational::new(BigInt::from(numer), BigInt::from(denom));
-        Ok(Term(self.terms_mut().mk_rational(r)))
+        let result = self.terms_mut().mk_rational(r);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a real constant from arbitrary-precision rational numerator/denominator.
@@ -119,14 +124,16 @@ impl Solver {
             });
         }
         let r = BigRational::new(numer.clone(), denom.clone());
-        Ok(Term(self.terms_mut().mk_rational(r)))
+        let result = self.terms_mut().mk_rational(r);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a real constant from a BigRational value.
     ///
     /// Use this when you already have a BigRational.
     pub fn rational_const_ratio(&mut self, value: &BigRational) -> Term {
-        Term(self.terms_mut().mk_rational(value.clone()))
+        let result = self.terms_mut().mk_rational(value.clone());
+        self.wrap_term(result)
     }
 
     /// Create a bitvector constant.
@@ -147,7 +154,8 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bv_const(&mut self, value: i64, width: u32) -> Result<Term, SolverError> {
         validate_bitvector_width("bv_const", width)?;
-        Ok(Term(self.terms_mut().mk_bitvec(BigInt::from(value), width)))
+        let result = self.terms_mut().mk_bitvec(BigInt::from(value), width);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector constant from an unsigned 64-bit value.
@@ -172,7 +180,8 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bv_const_u64(&mut self, value: u64, width: u32) -> Result<Term, SolverError> {
         validate_bitvector_width("bv_const_u64", width)?;
-        Ok(Term(self.terms_mut().mk_bitvec(BigInt::from(value), width)))
+        let result = self.terms_mut().mk_bitvec(BigInt::from(value), width);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector constant from an arbitrary-precision value.
@@ -211,6 +220,7 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bv_const_bigint(&mut self, value: &BigInt, width: u32) -> Result<Term, SolverError> {
         validate_bitvector_width("bv_const_bigint", width)?;
-        Ok(Term(self.terms_mut().mk_bitvec(value.clone(), width)))
+        let result = self.terms_mut().mk_bitvec(value.clone(), width);
+        Ok(self.wrap_term(result))
     }
 }

@@ -8444,10 +8444,8 @@ pub(crate) fn emit_fp_dot_error_bound_firewall_lean_from_parsed(
                 return None;
             }
             shape = Some(found);
-        } else if let Some(mag) = fpdot_magnitude_assertion(assertion, defined) {
-            magnitudes.push(mag);
         } else {
-            return None;
+            magnitudes.push(fpdot_magnitude_assertion(assertion, defined)?);
         }
     }
     let shape = shape?;

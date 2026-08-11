@@ -74,18 +74,23 @@ pub struct ShiftedAllDifferentBounds {
     vars: Vec<IntVarId>,
     shifts: Vec<i64>,
     // Per-variable workspace (shifted-space bounds)
-    ws_lb: Vec<i64>,      // shifted lb
-    ws_ub_excl: Vec<i64>, // shifted ub + 1 (half-open)
+    ws_lb: Vec<i128>,      // shifted lb
+    ws_ub_excl: Vec<i128>, // shifted ub + 1 (half-open)
     ws_minrank: Vec<usize>,
     ws_maxrank: Vec<usize>,
     ws_minsorted: Vec<usize>,
     ws_maxsorted: Vec<usize>,
     // Per-bounds workspace (capacity: 2*n + 2)
-    ws_bounds: Vec<i64>,
+    ws_bounds: Vec<i128>,
     ws_t: Vec<usize>,
-    ws_d: Vec<i64>,
+    ws_d: Vec<i128>,
     ws_h: Vec<usize>,
     nb_bounds: usize,
+}
+
+enum ShiftedHallExplanation {
+    Propagation(Vec<Literal>),
+    Conflict(Vec<Literal>),
 }
 
 impl ShiftedAllDifferentBounds {
@@ -119,9 +124,9 @@ impl ShiftedAllDifferentBounds {
         let n = self.vars.len();
         for i in 0..n {
             let var = self.vars[i];
-            let shift = self.shifts[i];
-            self.ws_lb[i] = trail.lb(var) + shift;
-            self.ws_ub_excl[i] = trail.ub(var) + shift + 1;
+            let shift = i128::from(self.shifts[i]);
+            self.ws_lb[i] = i128::from(trail.lb(var)) + shift;
+            self.ws_ub_excl[i] = i128::from(trail.ub(var)) + shift + 1;
         }
         for i in 0..n {
             self.ws_minsorted[i] = i;
@@ -236,8 +241,13 @@ impl ShiftedAllDifferentBounds {
                 let current_slb = self.ws_lb[var_idx];
 
                 if hall_max > current_slb {
-                    if let Some(clause) = self.explain_lower_prop(var_idx, hall_max, encoder) {
-                        clauses.push(clause);
+                    if let Some(explanation) = self.explain_lower_prop(var_idx, hall_max, encoder) {
+                        match explanation {
+                            ShiftedHallExplanation::Propagation(clause) => clauses.push(clause),
+                            ShiftedHallExplanation::Conflict(clause) => {
+                                return PropagationResult::Conflict(clause);
+                            }
+                        }
                     }
                 }
 
@@ -304,8 +314,13 @@ impl ShiftedAllDifferentBounds {
                 let current_sub_excl = self.ws_ub_excl[var_idx];
 
                 if hall_min < current_sub_excl {
-                    if let Some(clause) = self.explain_upper_prop(var_idx, hall_min, encoder) {
-                        clauses.push(clause);
+                    if let Some(explanation) = self.explain_upper_prop(var_idx, hall_min, encoder) {
+                        match explanation {
+                            ShiftedHallExplanation::Propagation(clause) => clauses.push(clause),
+                            ShiftedHallExplanation::Conflict(clause) => {
+                                return PropagationResult::Conflict(clause);
+                            }
+                        }
                     }
                 }
 
@@ -331,9 +346,9 @@ impl ShiftedAllDifferentBounds {
     fn explain_conflict(&self, encoder: &IntegerEncoder) -> Option<Vec<Literal>> {
         let mut reasons = Vec::new();
         for (i, &var) in self.vars.iter().enumerate() {
-            let shift = self.shifts[i];
-            let orig_lb = self.ws_lb[i] - shift;
-            let orig_ub = self.ws_ub_excl[i] - 1 - shift;
+            let shift = i128::from(self.shifts[i]);
+            let orig_lb = i64::try_from(self.ws_lb[i] - shift).ok()?;
+            let orig_ub = i64::try_from(self.ws_ub_excl[i] - 1 - shift).ok()?;
             reasons.push(encoder.lookup_ge(var, orig_lb)?);
             reasons.push(encoder.lookup_le(var, orig_ub)?);
         }
@@ -345,29 +360,38 @@ impl ShiftedAllDifferentBounds {
     fn explain_lower_prop(
         &self,
         var_idx: usize,
-        hall_max: i64, // shifted space
+        hall_max: i128, // shifted space
         encoder: &IntegerEncoder,
-    ) -> Option<Vec<Literal>> {
+    ) -> Option<ShiftedHallExplanation> {
         let var = self.vars[var_idx];
-        let shift = self.shifts[var_idx];
+        let shift = i128::from(self.shifts[var_idx]);
         // Conclusion: original lb >= hall_max - shift
         let new_orig_lb = hall_max - shift;
-        let conclusion = encoder.lookup_ge(var, new_orig_lb)?;
         let mut reasons = Vec::new();
         for (i, &v) in self.vars.iter().enumerate() {
             if i == var_idx {
                 continue;
             }
             if self.ws_ub_excl[i] <= hall_max {
-                let s = self.shifts[i];
-                reasons.push(encoder.lookup_ge(v, self.ws_lb[i] - s)?);
-                reasons.push(encoder.lookup_le(v, self.ws_ub_excl[i] - 1 - s)?);
+                let s = i128::from(self.shifts[i]);
+                let lb = i64::try_from(self.ws_lb[i] - s).ok()?;
+                let ub = i64::try_from(self.ws_ub_excl[i] - 1 - s).ok()?;
+                reasons.push(encoder.lookup_ge(v, lb)?);
+                reasons.push(encoder.lookup_le(v, ub)?);
             }
         }
         // Outsider's current lb (original space)
-        let orig_lb = self.ws_lb[var_idx] - shift;
+        let orig_lb = i64::try_from(self.ws_lb[var_idx] - shift).ok()?;
         reasons.push(encoder.lookup_ge(var, orig_lb)?);
-        Some(Explanation::new(reasons).into_clause(conclusion))
+        let explanation = Explanation::new(reasons);
+        match i64::try_from(new_orig_lb) {
+            Ok(new_lb) => Some(ShiftedHallExplanation::Propagation(
+                explanation.into_clause(encoder.lookup_ge(var, new_lb)?),
+            )),
+            Err(_) => Some(ShiftedHallExplanation::Conflict(
+                explanation.into_conflict_clause(),
+            )),
+        }
     }
 
     /// Explanation for ub reduction in shifted space. Hall set: variables with
@@ -375,29 +399,38 @@ impl ShiftedAllDifferentBounds {
     fn explain_upper_prop(
         &self,
         var_idx: usize,
-        hall_min: i64, // shifted space
+        hall_min: i128, // shifted space
         encoder: &IntegerEncoder,
-    ) -> Option<Vec<Literal>> {
+    ) -> Option<ShiftedHallExplanation> {
         let var = self.vars[var_idx];
-        let shift = self.shifts[var_idx];
+        let shift = i128::from(self.shifts[var_idx]);
         // Conclusion: original ub <= hall_min - 1 - shift
         let new_orig_ub = hall_min - 1 - shift;
-        let conclusion = encoder.lookup_le(var, new_orig_ub)?;
         let mut reasons = Vec::new();
         for (i, &v) in self.vars.iter().enumerate() {
             if i == var_idx {
                 continue;
             }
             if self.ws_lb[i] >= hall_min {
-                let s = self.shifts[i];
-                reasons.push(encoder.lookup_ge(v, self.ws_lb[i] - s)?);
-                reasons.push(encoder.lookup_le(v, self.ws_ub_excl[i] - 1 - s)?);
+                let s = i128::from(self.shifts[i]);
+                let lb = i64::try_from(self.ws_lb[i] - s).ok()?;
+                let ub = i64::try_from(self.ws_ub_excl[i] - 1 - s).ok()?;
+                reasons.push(encoder.lookup_ge(v, lb)?);
+                reasons.push(encoder.lookup_le(v, ub)?);
             }
         }
         // Outsider's current ub (original space)
-        let orig_ub = self.ws_ub_excl[var_idx] - 1 - shift;
+        let orig_ub = i64::try_from(self.ws_ub_excl[var_idx] - 1 - shift).ok()?;
         reasons.push(encoder.lookup_le(var, orig_ub)?);
-        Some(Explanation::new(reasons).into_clause(conclusion))
+        let explanation = Explanation::new(reasons);
+        match i64::try_from(new_orig_ub) {
+            Ok(new_ub) => Some(ShiftedHallExplanation::Propagation(
+                explanation.into_clause(encoder.lookup_le(var, new_ub)?),
+            )),
+            Err(_) => Some(ShiftedHallExplanation::Conflict(
+                explanation.into_conflict_clause(),
+            )),
+        }
     }
 }
 

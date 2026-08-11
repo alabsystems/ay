@@ -55,7 +55,7 @@ impl Context {
             || current_logic_has_theory_sort(self.logic.as_deref(), name)
             || self.sort_defs.contains_key(name)
             || self.parametric_sort_defs.contains_key(name)
-            || self.datatypes.contains_key(name)
+            || self.live_datatype_carriers.contains(name)
             || self.parametric_datatypes.contains_key(name)
             || self.sort_parameters.contains(name)
         {
@@ -552,8 +552,8 @@ impl Context {
             .polymorphic_assertions
             .iter()
             .any(|assertion| !assertion.parameters.is_empty());
-        if (needs_sort_universe && !universe_complete)
-            || (needs_sort_universe && !self.instantiate_polymorphic_declarations_for(&sorts)?)
+        if (needs_sort_universe
+            && (!universe_complete || !self.instantiate_polymorphic_declarations_for(&sorts)?))
             || self.polymorphic_assertions.iter().any(|assertion| {
                 schematic_instance_count(sorts.len(), assertion.parameters.len()).is_none()
             })
@@ -894,7 +894,10 @@ impl Context {
             complete = false;
         }
 
-        let parsed = sorts.iter().filter_map(core_sort_to_parsed).collect();
+        let parsed = sorts
+            .iter()
+            .filter_map(|sort| self.surface_sort(sort))
+            .collect();
         (parsed, complete)
     }
 }
@@ -1251,44 +1254,6 @@ fn clone_qualified_identifier(identifier: &QualifiedIdentifier) -> QualifiedIden
         QualifiedIdentifier::Indexed(name, indices) => {
             QualifiedIdentifier::Indexed(name.clone(), indices.clone())
         }
-    }
-}
-
-fn core_sort_to_parsed(sort: &Sort) -> Option<ParsedSort> {
-    match sort {
-        Sort::Bool => Some(ParsedSort::Simple("Bool".to_string())),
-        Sort::Int => Some(ParsedSort::Simple("Int".to_string())),
-        Sort::Real => Some(ParsedSort::Simple("Real".to_string())),
-        Sort::String => Some(ParsedSort::Simple("String".to_string())),
-        Sort::RegLan => Some(ParsedSort::Simple("RegLan".to_string())),
-        Sort::BitVec(bit_vector) => Some(ParsedSort::Indexed(
-            "BitVec".to_string(),
-            vec![Index::Numeral(bit_vector.width.to_string())],
-        )),
-        Sort::Array(array) => Some(ParsedSort::Parameterized(
-            "Array".to_string(),
-            vec![
-                core_sort_to_parsed(&array.index_sort)?,
-                core_sort_to_parsed(&array.element_sort)?,
-            ],
-        )),
-        Sort::Seq(element) => Some(ParsedSort::Parameterized(
-            "Seq".to_string(),
-            vec![core_sort_to_parsed(element)?],
-        )),
-        Sort::FloatingPoint(exponent, significand) => Some(ParsedSort::Indexed(
-            "FloatingPoint".to_string(),
-            vec![
-                Index::Numeral(exponent.to_string()),
-                Index::Numeral(significand.to_string()),
-            ],
-        )),
-        Sort::Uninterpreted(name) | Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => {
-            Some(ParsedSort::Simple(name.clone()))
-        }
-        Sort::Datatype(datatype) => Some(ParsedSort::Simple(datatype.name.clone())),
-        Sort::Char => Some(ParsedSort::Simple("Char".to_string())),
-        _ => None,
     }
 }
 

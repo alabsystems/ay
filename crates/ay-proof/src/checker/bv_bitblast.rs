@@ -28,8 +28,8 @@
 //! terms, SAT negations, and unsurfaceable refutations are all rejected.
 
 use ay_core::{
-    time::Instant, BvGateType, Constant, Proof, ProofId, ProofStep, Sort, Symbol, TermData, TermId,
-    TermStore, TheoryLemmaKind,
+    term::TermStoreSnapshotStamp, time::Instant, BvGateType, Constant, Proof, ProofId, ProofStep,
+    Sort, Symbol, TermData, TermId, TermStore, TheoryLemmaKind,
 };
 use ay_sat::ResolutionProofLimits;
 use num_traits::ToPrimitive;
@@ -40,7 +40,7 @@ use super::ProofCheckError;
 use crate::{
     bv_blast_export::BvBlastValidateLimits,
     bv_blast_solver::{export_bv_blast_proof_expr_with_limits, BvExprProofLimits},
-    BvExpr,
+    BvExpr, BvExprExportError,
 };
 
 /// Recognize whether `clause` is a strict-checkable (ungated) bit-blast lemma —
@@ -75,17 +75,26 @@ pub fn bv_bitblast_requires_proof_producer(terms: &TermStore, clause: &[TermId])
         return false;
     }
     match collect_bounded_vars(terms, clause) {
-        Some(vars) => vars.iter().map(|var| var.bits).sum::<u32>() > MAX_BOUNDED_ASSIGNMENT_BITS,
+        Some(vars) => vars
+            .iter()
+            .try_fold(0_u32, |total, var| total.checked_add(var.bits))
+            .is_none_or(|total| total > MAX_BOUNDED_ASSIGNMENT_BITS),
         None => true,
     }
 }
 
 /// Reject a strict proof whose tagged BV lemmas can multiply the bounded
 /// proof-producing fallback beyond the whole-proof resource budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProofProducingBvAggregateCharge {
+    pub(crate) work: usize,
+    pub(crate) bytes: usize,
+}
+
 pub(crate) fn validate_proof_producing_bv_budget(
     proof: &Proof,
     terms: &TermStore,
-) -> Result<(), ProofCheckError> {
+) -> Result<ProofProducingBvAggregateCharge, ProofCheckError> {
     let mut count = 0_usize;
     for (index, step) in proof.steps.iter().enumerate() {
         let ProofStep::TheoryLemma { clause, kind, .. } = step else {
@@ -98,19 +107,27 @@ pub(crate) fn validate_proof_producing_bv_budget(
         {
             continue;
         }
-        count += 1;
+        count = count.checked_add(1).ok_or(ProofCheckError::ResourceLimit)?;
         if count > MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF {
             return Err(ProofCheckError::InvalidTheoryLemma {
                 step: ProofId(index as u32),
                 reason: format!(
-                    "proof contains more than {} lemmas requiring the bounded \
-                     proof-producing BV checker",
-                    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF
+                    "proof contains more than {MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF} lemmas \
+                     requiring the bounded proof-producing BV checker"
                 ),
             });
         }
     }
-    Ok(())
+    let work_per_lemma = usize::try_from(PROOF_PRODUCING_AGGREGATE_WORK_PER_LEMMA)
+        .map_err(|_| ProofCheckError::ResourceLimit)?;
+    Ok(ProofProducingBvAggregateCharge {
+        work: count
+            .checked_mul(work_per_lemma)
+            .ok_or(ProofCheckError::ResourceLimit)?,
+        bytes: count
+            .checked_mul(PROOF_PRODUCING_AGGREGATE_BYTES_PER_LEMMA)
+            .ok_or(ProofCheckError::ResourceLimit)?,
+    })
 }
 
 /// Recognize the deliberately narrow `evaluate` fragment used to certify a
@@ -440,16 +457,66 @@ pub(crate) fn validate_bv_bitblast(
         }
     }
 
+    validate_bv_bitblast_semantics(terms, step_id, clause)
+}
+
+/// The SEMANTIC half of `bv_bitblast` validation — exhaustive bounded
+/// evaluation, falling back to the bounded bit-blast + LRAT proof producer and
+/// its replay — memoized per `(store, clause)`.
+///
+/// PERF. Proof finalization runs `check_proof_strict*` as an atomic revert gate
+/// after each of ~30 individual surgery passes, so ONE promoted `BvBitBlast`
+/// lemma is re-decided many times per solve, on an unchanged clause in an
+/// unchanged store. MEASURED at b0a836719b over the 28 `shl_is_mul_by_pow2`
+/// queries: 226 entries into this decision procedure for 28 distinct decisions
+/// — every query decides exactly ONE clause, 20 of them 12 times over — and
+/// 41.3 s of the 53.2 s spent here is re-decision of a clause already accepted.
+///
+/// Nothing is checked less:
+/// * the structural schema checks in [`validate_bv_bitblast`] (Boolean sorts,
+///   BV content, gate-annotation agreement) run on EVERY call and are never
+///   memoized — which is also why the memo key needs no gate annotation;
+/// * only a COMPLETED, ACCEPTING decision is recorded, keyed by the exact
+///   clause it was computed for. An acceptance from either checker is the
+///   store-and-clause-determined semantic fact "this clause holds under every
+///   assignment", so repeating it cannot change the answer;
+/// * failures are never recorded — the proof-producing checker is
+///   deadline-bounded, so a failure is a fact about one attempt rather than
+///   about the clause, and a rejected lemma is re-decided every time exactly as
+///   before;
+/// * `TermStore` clears the memo on both operations that can change what a
+///   `TermId` means (`rollback_to`, `mark_and_compact`), the only two writers
+///   of its term arena after construction — every other mutation appends;
+/// * the whole-proof [`MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF`] budget is a
+///   structural count over the proof's steps, so it is unaffected.
+fn validate_bv_bitblast_semantics(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if terms.strict_bv_semantics_validated(clause) {
+        return Ok(());
+    }
     match validate_bounded_clause_semantics(terms, step_id, clause) {
-        Ok(()) => Ok(()),
-        Err(bounded_error) => validate_proof_producing_clause_semantics(terms, step_id, clause)
-            .map_err(|proof_error| ProofCheckError::InvalidTheoryLemma {
-                step: step_id,
-                reason: format!(
-                    "bv_bitblast semantic checks failed: bounded checker: {bounded_error}; \
+        Ok(()) => {
+            terms.record_strict_bv_semantics_validated(clause);
+            Ok(())
+        }
+        Err(bounded_error) => {
+            match validate_proof_producing_clause_semantics(terms, step_id, clause) {
+                Ok(()) => {
+                    terms.record_strict_bv_semantics_validated(clause);
+                    Ok(())
+                }
+                Err(proof_error) => Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!(
+                        "bv_bitblast semantic checks failed: bounded checker: {bounded_error}; \
                      proof-producing checker: {proof_error}"
-                ),
-            }),
+                    ),
+                }),
+            }
+        }
     }
 }
 
@@ -488,31 +555,33 @@ fn required_op_name(gate_type: BvGateType) -> Option<&'static str> {
 /// Return true if any literal in the clause contains (directly or nested) a
 /// bitvector constant, bitvector variable, or bitvector-producing term.
 fn clause_mentions_bv(terms: &TermStore, clause: &[TermId]) -> bool {
-    clause
-        .iter()
-        .any(|&lit| term_mentions_bv(terms, lit, &mut Vec::new()))
-}
-
-fn term_mentions_bv(terms: &TermStore, term: TermId, stack: &mut Vec<TermId>) -> bool {
-    // Guard against pathological cyclic/very deep walks. Hash-consing makes
-    // cycles impossible in practice but we bound depth defensively.
-    if stack.len() > 512 {
-        return false;
-    }
-    stack.push(term);
-    let result = if matches!(terms.sort(term), Sort::BitVec(_)) {
-        true
-    } else {
-        match terms.get(term) {
-            TermData::App(_, args) => args.iter().any(|&a| term_mentions_bv(terms, a, stack)),
-            TermData::Not(inner) | TermData::Ite(_, inner, _) => {
-                term_mentions_bv(terms, *inner, stack)
-            }
-            _ => false,
+    let mut visited = HashSet::new();
+    let mut pending = clause.to_vec();
+    while let Some(term) = pending.pop() {
+        if !visited.insert(term) {
+            continue;
         }
-    };
-    stack.pop();
-    result
+        if matches!(terms.sort(term), Sort::BitVec(_)) {
+            return true;
+        }
+        match terms.get(term) {
+            TermData::App(_, args) => pending.extend(args.iter().copied()),
+            TermData::Let(bindings, body) => {
+                pending.extend(bindings.iter().map(|(_, value)| *value));
+                pending.push(*body);
+            }
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(condition, then_branch, else_branch) => {
+                pending.extend([*condition, *then_branch, *else_branch]);
+            }
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                pending.push(*body);
+                pending.extend(triggers.iter().flatten().copied());
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Return true if any literal in the clause contains an application matching
@@ -641,6 +710,149 @@ const MAX_PROOF_PRODUCING_GATE_WORK: usize = 100_000;
 const MAX_PROOF_PRODUCING_RESOLUTION_STEPS: usize = 250_000;
 const PROOF_PRODUCING_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Source-bound evidence that one exact ordered Bool/BV query is
+/// unsatisfiable.
+///
+/// The constructor is private.  Evidence is issued only after the query has
+/// been lowered from the live [`TermStore`], bit-blasted into provenance-bearing
+/// CNF, refuted by the SAT engine, and independently replayed as a
+/// [`crate::BvBlastProof`].  The opaque term-store stamp prevents a proof about
+/// one arena snapshot from being retargeted after append, rollback, compaction,
+/// clone, or wholesale replacement.
+#[derive(Debug)]
+pub struct AuthenticatedBoolBvUnsatQuery {
+    term_snapshot: TermStoreSnapshotStamp,
+    roots: Box<[TermId]>,
+}
+
+impl AuthenticatedBoolBvUnsatQuery {
+    /// Whether this evidence still denotes the same immutable term snapshot
+    /// and exact ordered query roots.
+    #[must_use]
+    pub fn is_current_for(&self, terms: &TermStore, roots: &[TermId]) -> bool {
+        self.term_snapshot == terms.snapshot_stamp() && self.roots.as_ref() == roots
+    }
+
+    /// Whether the immutable term snapshot authenticated by this evidence is
+    /// still current.  Callers that seal the exact roots in a separate affine
+    /// query-scope capability may use this narrower check at final consumption.
+    #[must_use]
+    pub fn term_snapshot_is_current(&self, terms: &TermStore) -> bool {
+        self.term_snapshot == terms.snapshot_stamp()
+    }
+}
+
+/// Fail-closed reason why a source Bool/BV query could not be authenticated as
+/// UNSAT.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BoolBvUnsatAuthenticationError {
+    /// The empty conjunction is satisfiable and cannot have an UNSAT proof.
+    #[error("the Bool/BV query has no roots")]
+    EmptyQuery,
+    /// A supplied root does not name a term in the live store.
+    #[error("query root {root} is outside the live term store")]
+    InvalidRoot {
+        /// The first invalid source root.
+        root: TermId,
+    },
+    /// The query uses a sort or operator outside the checked Bool/BV fragment.
+    #[error("query is outside the proof-producing Bool/BV fragment: {reason}")]
+    UnsupportedFragment {
+        /// Stable diagnostic from source lowering.
+        reason: String,
+    },
+    /// The independently bit-blasted query is satisfiable, so no UNSAT
+    /// capability may be minted.
+    #[error("the independently bit-blasted Bool/BV query is satisfiable")]
+    Satisfiable,
+    /// Bounded proof production failed or exhausted its explicit envelope.
+    #[error("Bool/BV refutation production failed: {reason}")]
+    Refutation {
+        /// Proof-production or bounded-resource diagnostic.
+        reason: String,
+    },
+    /// The surfaced gate/resolution proof failed independent replay.
+    #[error("Bool/BV refutation replay failed: {reason}")]
+    Replay {
+        /// Independent replay diagnostic.
+        reason: String,
+    },
+}
+
+impl BoolBvUnsatAuthenticationError {
+    /// Whether a different, independently checked theory-specific lane may be
+    /// attempted because this checker simply does not implement the query's
+    /// source fragment.
+    #[must_use]
+    pub fn is_unsupported_fragment(&self) -> bool {
+        matches!(self, Self::UnsupportedFragment { .. })
+    }
+}
+
+/// Authenticate that the conjunction of `roots` is UNSAT in the supported
+/// quantifier-free Bool/BV fragment.
+///
+/// This is deliberately independent of the production solver's bit-blast CNF:
+/// it lowers the exact source roots again, constructs provenance-bearing gate
+/// clauses, obtains a pure-RUP refutation, and replays every gate and resolution
+/// step before returning an opaque capability.  `caller_deadline`, when
+/// present, is clamped with this checker's fixed three-second ceiling.
+pub fn authenticate_bool_bv_unsat_query(
+    terms: &TermStore,
+    roots: &[TermId],
+    caller_deadline: Option<Instant>,
+) -> Result<AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError> {
+    if roots.is_empty() {
+        return Err(BoolBvUnsatAuthenticationError::EmptyQuery);
+    }
+    if let Some(&root) = roots.iter().find(|root| root.index() >= terms.len()) {
+        return Err(BoolBvUnsatAuthenticationError::InvalidRoot { root });
+    }
+
+    let term_snapshot = terms.snapshot_stamp();
+    let mut lowerer = ProofProducingLowerer::new(terms);
+    let mut conjunction = BvExpr::const_val(1, 1);
+    for &root in roots {
+        let lowered = lowerer
+            .lower_bool(root)
+            .map_err(|reason| BoolBvUnsatAuthenticationError::UnsupportedFragment { reason })?;
+        conjunction = BvExpr::and(conjunction, lowered);
+    }
+
+    let false_expr = BvExpr::const_val(0, 1);
+    let limits = proof_producing_limits(caller_deadline);
+    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
+        .map_err(|error| match error {
+            BvExprExportError::NoRefutation => BoolBvUnsatAuthenticationError::Satisfiable,
+            other => BoolBvUnsatAuthenticationError::Refutation {
+                reason: other.to_string(),
+            },
+        })?;
+    let replay_limits = proof_replay_limits(&limits);
+    proof
+        .validate_with_limits(&replay_limits)
+        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
+            reason: error.to_string(),
+        })?;
+
+    Ok(AuthenticatedBoolBvUnsatQuery {
+        term_snapshot,
+        roots: roots.into(),
+    })
+}
+
+/// Work debited from the caller-owned strict-authentication envelope for each
+/// lemma that can enter the private proof-producing BV fallback. This is the
+/// fallback replay validator's published maximum, rather than a token charge
+/// based only on the outer proof-step count.
+const PROOF_PRODUCING_AGGREGATE_WORK_PER_LEMMA: u64 = 50_000_000;
+
+/// Bytes debited from the caller-owned strict-authentication envelope for each
+/// lemma that can enter the private proof-producing BV fallback. This matches
+/// the replay validator's maximum allocation budget.
+const PROOF_PRODUCING_AGGREGATE_BYTES_PER_LEMMA: usize = 128 * 1024 * 1024;
+
 #[derive(Clone)]
 enum ProofProducingExpr {
     Bool(BvExpr),
@@ -718,10 +930,18 @@ fn validate_proof_producing_clause_semantics(
         disjunction = BvExpr::or(disjunction, literal);
     }
     let truth = BvExpr::const_val(1, 1);
-    let limits = proof_producing_limits();
+    let limits = proof_producing_limits(None);
     let proof = export_bv_blast_proof_expr_with_limits(&disjunction, &truth, &limits)
         .map_err(|error| format!("negated clause did not yield a refutation: {error}"))?;
-    let replay_limits = BvBlastValidateLimits {
+    let replay_limits = proof_replay_limits(&limits);
+    proof
+        .validate_with_limits(&replay_limits)
+        .map_err(|error| format!("surfaced bit-blast refutation failed replay: {error}"))?;
+    Ok(())
+}
+
+fn proof_replay_limits(limits: &BvExprProofLimits) -> BvBlastValidateLimits {
+    BvBlastValidateLimits {
         deadline: limits
             .resolution
             .validation
@@ -735,40 +955,39 @@ fn validate_proof_producing_clause_semantics(
         max_resolution_steps: limits.max_resolution_steps,
         max_derived_literals: limits.resolution.max_derived_literals,
         max_work: limits.resolution.validation.max_work,
-    };
-    proof
-        .validate_with_limits(&replay_limits)
-        .map_err(|error| format!("surfaced bit-blast refutation failed replay: {error}"))?;
-    Ok(())
+    }
 }
 
-fn proof_producing_limits() -> BvExprProofLimits {
-    let deadline = Instant::now() + PROOF_PRODUCING_DEADLINE;
-    let mut resolution = ResolutionProofLimits::default();
-    resolution.deadline = Some(deadline);
-    resolution.max_num_vars = 150_000;
-    resolution.max_input_clauses = 700_000;
-    resolution.max_input_literals = 3_000_000;
-    resolution.max_input_clause_literals = 64;
-    resolution.max_input_bytes = 64 * 1024 * 1024;
-    resolution.max_conflicts = Some(250_000);
-    resolution.max_decisions = Some(2_000_000);
-    resolution.solver_clause_db_reduction_threshold_bytes = 64 * 1024 * 1024;
-    resolution.max_proof_output_bytes = 64 * 1024 * 1024;
-    resolution.max_derived_steps = MAX_PROOF_PRODUCING_RESOLUTION_STEPS;
-    resolution.max_derived_literals = 2_000_000;
-    resolution.max_hints = 4_000_000;
-    resolution.max_pending_deletions = 250_000;
-    resolution.max_codec_bytes = 192 * 1024 * 1024;
-    resolution.max_backward_reconstruction_bytes = 64 * 1024 * 1024;
+fn proof_producing_limits(caller_deadline: Option<Instant>) -> BvExprProofLimits {
+    let local_deadline = Instant::now() + PROOF_PRODUCING_DEADLINE;
+    let deadline = caller_deadline.map_or(local_deadline, |outer| outer.min(local_deadline));
+    let mut resolution = ResolutionProofLimits {
+        deadline: Some(deadline),
+        max_num_vars: 150_000,
+        max_input_clauses: 700_000,
+        max_input_literals: 3_000_000,
+        max_input_clause_literals: 64,
+        max_input_bytes: 64 * 1024 * 1024,
+        max_conflicts: Some(250_000),
+        max_decisions: Some(2_000_000),
+        solver_clause_db_reduction_threshold_bytes: 64 * 1024 * 1024,
+        max_proof_output_bytes: 64 * 1024 * 1024,
+        max_derived_steps: MAX_PROOF_PRODUCING_RESOLUTION_STEPS,
+        max_derived_literals: 2_000_000,
+        max_hints: 4_000_000,
+        max_pending_deletions: 250_000,
+        max_codec_bytes: 192 * 1024 * 1024,
+        max_backward_reconstruction_bytes: 64 * 1024 * 1024,
+        ..ResolutionProofLimits::default()
+    };
     resolution.validation.deadline = Some(deadline);
     resolution.validation.max_original_clauses = resolution.max_input_clauses;
     resolution.validation.max_original_literals = resolution.max_input_literals;
     resolution.validation.max_derived_steps = resolution.max_derived_steps;
     resolution.validation.max_derived_literals = resolution.max_derived_literals;
     resolution.validation.max_hints = resolution.max_hints;
-    resolution.validation.max_work = 50_000_000;
-    resolution.validation.max_bytes = 128 * 1024 * 1024;
+    resolution.validation.max_work = PROOF_PRODUCING_AGGREGATE_WORK_PER_LEMMA;
+    resolution.validation.max_bytes = PROOF_PRODUCING_AGGREGATE_BYTES_PER_LEMMA;
     BvExprProofLimits {
         max_expr_nodes: MAX_PROOF_PRODUCING_EXPR_NODES,
         max_expr_depth: MAX_PROOF_PRODUCING_EXPR_DEPTH,
@@ -856,10 +1075,7 @@ impl<'a> ProofProducingLowerer<'a> {
     }
 
     fn charge_constructed_expr_nodes(&mut self, nodes: usize) -> Result<(), String> {
-        let actual = self
-            .constructed_expr_nodes
-            .checked_add(nodes)
-            .unwrap_or(usize::MAX);
+        let actual = self.constructed_expr_nodes.saturating_add(nodes);
         if actual > MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES {
             return Err(format!(
                 "lowered BvExpr construction exceeds {MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES} nodes"
@@ -879,8 +1095,14 @@ impl<'a> ProofProducingLowerer<'a> {
             TermData::Var(_, _) => BvExpr::leaf(&format!("proof_bool_{}", term.index()), 1),
             TermData::Not(inner) => BvExpr::not(self.lower_bool(inner)?),
             TermData::App(symbol, args) => self.lower_bool_app(&symbol, &args)?,
-            TermData::Ite(..) => {
-                return Err("Bool ite is outside the proof-producing fragment".to_string())
+            TermData::Ite(condition, then_term, else_term) => {
+                let condition = self.lower_bool(condition)?;
+                let then_expr = self.lower_bool(then_term)?;
+                let else_expr = self.lower_bool(else_term)?;
+                BvExpr::or(
+                    BvExpr::and(condition.clone(), then_expr),
+                    BvExpr::and(BvExpr::not(condition), else_expr),
+                )
             }
             other => return Err(format!("unsupported Bool node {other:?}")),
         };
@@ -905,6 +1127,14 @@ impl<'a> ProofProducingLowerer<'a> {
                 Ok(out)
             }
             "not" if args.len() == 1 => Ok(BvExpr::not(self.lower_bool(args[0])?)),
+            "=>" | "implies" if args.len() == 2 => Ok(BvExpr::or(
+                BvExpr::not(self.lower_bool(args[0])?),
+                self.lower_bool(args[1])?,
+            )),
+            "xor" if args.len() == 2 => Ok(BvExpr::xor(
+                self.lower_bool(args[0])?,
+                self.lower_bool(args[1])?,
+            )),
             "=" if args.len() == 2 => match self.terms.sort(args[0]) {
                 Sort::Bool => Ok(BvExpr::eq(
                     self.lower_bool(args[0])?,
@@ -918,16 +1148,21 @@ impl<'a> ProofProducingLowerer<'a> {
                 }
                 sort => Err(format!("equality over unsupported sort {sort:?}")),
             },
-            "bvult" | "bvule" | "bvugt" | "bvuge" if args.len() == 2 => {
+            "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
+                if args.len() == 2 =>
+            {
                 let (lhs, lhs_width) = self.lower_bv(args[0])?;
                 let (rhs, rhs_width) = self.lower_bv(args[1])?;
                 Self::require_same_width(name, lhs_width, rhs_width)?;
-                let ult = |a: BvExpr, b: BvExpr| BvExpr::not(BvExpr::carry_out_sub(a, b));
                 Ok(match name {
-                    "bvult" => ult(lhs, rhs),
-                    "bvule" => BvExpr::not(ult(rhs, lhs)),
-                    "bvugt" => ult(rhs, lhs),
-                    "bvuge" => BvExpr::not(ult(lhs, rhs)),
+                    "bvult" => Self::unsigned_lt(lhs, rhs),
+                    "bvule" => BvExpr::not(Self::unsigned_lt(rhs, lhs)),
+                    "bvugt" => Self::unsigned_lt(rhs, lhs),
+                    "bvuge" => BvExpr::not(Self::unsigned_lt(lhs, rhs)),
+                    "bvslt" => Self::signed_lt(lhs, rhs, lhs_width),
+                    "bvsle" => BvExpr::not(Self::signed_lt(rhs, lhs, lhs_width)),
+                    "bvsgt" => Self::signed_lt(rhs, lhs, lhs_width),
+                    "bvsge" => BvExpr::not(Self::signed_lt(lhs, rhs, lhs_width)),
                     _ => unreachable!("guarded comparison"),
                 })
             }
@@ -953,8 +1188,19 @@ impl<'a> ProofProducingLowerer<'a> {
                 expected_width,
             ),
             TermData::App(symbol, args) => self.lower_bv_app(&symbol, &args)?,
-            TermData::Ite(..) => {
-                return Err("BitVec ite is outside the proof-producing fragment".to_string())
+            TermData::Ite(condition, then_term, else_term) => {
+                let condition = self.lower_bool(condition)?;
+                let (then_expr, then_width) = self.lower_bv(then_term)?;
+                let (else_expr, else_width) = self.lower_bv(else_term)?;
+                Self::require_same_width("ite", then_width, else_width)?;
+                let mask = BvExpr::sign_ext(condition, then_width - 1);
+                (
+                    BvExpr::or(
+                        BvExpr::and(mask.clone(), then_expr),
+                        BvExpr::and(BvExpr::not(mask), else_expr),
+                    ),
+                    then_width,
+                )
             }
             other => return Err(format!("unsupported BitVec node {other:?}")),
         };
@@ -1061,6 +1307,90 @@ impl<'a> ProofProducingLowerer<'a> {
             Err(format!("`{name}` width mismatch: {lhs} vs {rhs}"))
         }
     }
+
+    fn unsigned_lt(lhs: BvExpr, rhs: BvExpr) -> BvExpr {
+        BvExpr::not(BvExpr::carry_out_sub(lhs, rhs))
+    }
+
+    /// Two's-complement order is unsigned order after flipping the sign bit.
+    /// This uses only checked XOR and subtraction-carry gates already present
+    /// in the clean bit-blast kernel.
+    fn signed_lt(lhs: BvExpr, rhs: BvExpr, width: u32) -> BvExpr {
+        let sign_mask = BvExpr::const_val(1_u128 << (width - 1), width);
+        Self::unsigned_lt(
+            BvExpr::xor(lhs, sign_mask.clone()),
+            BvExpr::xor(rhs, sign_mask),
+        )
+    }
+}
+
+#[cfg(test)]
+mod authenticated_query_tests {
+    use ay_core::{Sort, Symbol, TermStore};
+    use num_bigint::BigInt;
+
+    use super::{authenticate_bool_bv_unsat_query, BoolBvUnsatAuthenticationError};
+
+    fn signed_add_safety_query(
+        terms: &mut TermStore,
+        lhs_value: u32,
+        rhs_value: u32,
+    ) -> Vec<ay_core::TermId> {
+        const WIDTH: u32 = 4;
+        let lhs = terms.mk_var("auth_bv_lhs", Sort::bitvec(WIDTH));
+        let rhs = terms.mk_var("auth_bv_rhs", Sort::bitvec(WIDTH));
+        let lhs_literal = terms.mk_bitvec(BigInt::from(lhs_value), WIDTH);
+        let rhs_literal = terms.mk_bitvec(BigInt::from(rhs_value), WIDTH);
+        let lhs_eq = terms.mk_app(Symbol::named("="), [lhs, lhs_literal], Sort::Bool);
+        let rhs_eq = terms.mk_app(Symbol::named("="), [rhs, rhs_literal], Sort::Bool);
+
+        let zero = terms.mk_bitvec(BigInt::from(0_u8), WIDTH);
+        let sum = terms.mk_app(Symbol::named("bvadd"), [lhs, rhs], Sort::bitvec(WIDTH));
+        let lhs_positive = terms.mk_app(Symbol::named("bvsgt"), [lhs, zero], Sort::Bool);
+        let rhs_positive = terms.mk_app(Symbol::named("bvsgt"), [rhs, zero], Sort::Bool);
+        let both_positive = terms.mk_and(vec![lhs_positive, rhs_positive]);
+        let sum_positive = terms.mk_app(Symbol::named("bvsgt"), [sum, zero], Sort::Bool);
+        let no_positive_overflow = terms.mk_implies(both_positive, sum_positive);
+        vec![lhs_eq, rhs_eq, no_positive_overflow]
+    }
+
+    #[test]
+    fn source_bound_query_authenticates_signed_overflow_and_retires_on_change() {
+        let mut terms = TermStore::new();
+        // 7 + 1 wraps to -8 in signed four-bit arithmetic.
+        let roots = signed_add_safety_query(&mut terms, 7, 1);
+        let evidence = authenticate_bool_bv_unsat_query(&terms, &roots, None)
+            .expect("the source-level signed-overflow contradiction must be proved");
+        assert!(evidence.is_current_for(&terms, &roots));
+
+        let mut reordered = roots.clone();
+        reordered.swap(0, 1);
+        assert!(!evidence.is_current_for(&terms, &reordered));
+
+        let _late_term = terms.mk_var("auth_bv_late", Sort::Bool);
+        assert!(!evidence.term_snapshot_is_current(&terms));
+        assert!(!evidence.is_current_for(&terms, &roots));
+    }
+
+    #[test]
+    fn source_bound_query_refuses_satisfiable_signed_addition() {
+        let mut terms = TermStore::new();
+        let roots = signed_add_safety_query(&mut terms, 1, 1);
+        let error = authenticate_bool_bv_unsat_query(&terms, &roots, None)
+            .expect_err("a safe concrete addition is satisfiable");
+        assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
+    }
+
+    #[test]
+    fn source_bound_query_refuses_unsupported_theory_roots() {
+        let mut terms = TermStore::new();
+        let integer = terms.mk_var("auth_integer", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let root = terms.mk_app(Symbol::named("="), [integer, zero], Sort::Bool);
+        let error = authenticate_bool_bv_unsat_query(&terms, &[root], None)
+            .expect_err("integer equality is outside the Bool/BV proof fragment");
+        assert!(error.is_unsupported_fragment());
+    }
 }
 
 fn validate_bounded_clause_semantics(
@@ -1077,7 +1407,13 @@ fn validate_bounded_clause_semantics(
                 .to_string(),
         });
     };
-    let total_bits: u32 = vars.iter().map(|v| v.bits).sum();
+    let total_bits = vars
+        .iter()
+        .try_fold(0_u32, |total, var| total.checked_add(var.bits))
+        .ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "bv_bitblast bounded-variable width sum overflows u32".to_string(),
+        })?;
     if total_bits > MAX_BOUNDED_ASSIGNMENT_BITS {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
@@ -1121,8 +1457,9 @@ fn validate_bounded_clause_semantics(
 
 fn collect_bounded_vars(terms: &TermStore, clause: &[TermId]) -> Option<Vec<EvalVar>> {
     let mut vars = Vec::new();
+    let mut visited = HashSet::new();
     for &lit in clause {
-        collect_bounded_vars_term(terms, lit, &mut vars, &mut Vec::new())?;
+        collect_bounded_vars_term(terms, lit, &mut vars, &mut visited, &mut Vec::new())?;
     }
     Some(vars)
 }
@@ -1131,6 +1468,7 @@ fn collect_bounded_vars_term(
     terms: &TermStore,
     term: TermId,
     vars: &mut Vec<EvalVar>,
+    visited: &mut HashSet<TermId>,
     stack: &mut Vec<TermId>,
 ) -> Option<()> {
     if stack.len() > 512 {
@@ -1141,6 +1479,9 @@ fn collect_bounded_vars_term(
         Sort::BitVec(bv) if bv.width > MAX_EVALUATED_BV_WIDTH
     ) {
         return None;
+    }
+    if !visited.insert(term) {
+        return Some(());
     }
     stack.push(term);
     let result = match terms.get(term) {
@@ -1157,22 +1498,23 @@ fn collect_bounded_vars_term(
                 }
                 _ => return None,
             };
-            if !vars.iter().any(|var| var.term == term) {
-                vars.push(EvalVar { term, kind, bits });
-            }
+            // The shared `visited` set already guarantees one push per TermId;
+            // a second linear search here would make classification quadratic
+            // in the number of distinct variables.
+            vars.push(EvalVar { term, kind, bits });
             Some(())
         }
         TermData::App(sym, args) if supports_bounded_app(sym.name()) => {
             for &arg in args {
-                collect_bounded_vars_term(terms, arg, vars, stack)?;
+                collect_bounded_vars_term(terms, arg, vars, visited, stack)?;
             }
             Some(())
         }
-        TermData::Not(inner) => collect_bounded_vars_term(terms, *inner, vars, stack),
+        TermData::Not(inner) => collect_bounded_vars_term(terms, *inner, vars, visited, stack),
         TermData::Ite(c, t, e) => {
-            collect_bounded_vars_term(terms, *c, vars, stack)?;
-            collect_bounded_vars_term(terms, *t, vars, stack)?;
-            collect_bounded_vars_term(terms, *e, vars, stack)
+            collect_bounded_vars_term(terms, *c, vars, visited, stack)?;
+            collect_bounded_vars_term(terms, *t, vars, visited, stack)?;
+            collect_bounded_vars_term(terms, *e, vars, visited, stack)
         }
         _ => None,
     };

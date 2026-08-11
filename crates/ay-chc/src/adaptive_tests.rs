@@ -4334,6 +4334,34 @@ fn test_multi_pred_linear_portfolio_uses_single_pdkind_engine() {
 }
 
 #[test]
+fn test_multi_pred_linear_capped_roster_preserves_engine_diversity() {
+    let problem = create_multi_predicate_safe();
+    let features = ProblemClassifier::classify(&problem);
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let config = adaptive.multi_pred_linear_portfolio_config(
+        PdrConfig::default(),
+        PdrConfig::portfolio_variant_with_splits(),
+        &features,
+    );
+
+    let capped_names: Vec<_> = config
+        .engines
+        .iter()
+        .take(adaptive.config.max_engines.expect("test config has a cap"))
+        .map(EngineConfig::name)
+        .collect();
+    assert_eq!(
+        capped_names,
+        ["PDR", "TPA", "Kind"],
+        "the three-engine test roster must retain complementary MultiPredLinear lanes"
+    );
+    assert!(
+        matches!(config.engines.get(3), Some(EngineConfig::Pdr(_))),
+        "the spacer PDR variant must remain available to uncapped production runs"
+    );
+}
+
+#[test]
 fn test_multi_pred_linear_direct_kind_uses_full_verification_evidence_source_regression() {
     let src = include_str!("adaptive_multi_pred.rs");
     let fn_start = src
@@ -5017,6 +5045,39 @@ fn test_multi_pred_portfolio_timeout_clamps_small_remaining_budget() {
         Duration::from_secs(2),
         "the nested portfolio's two-second cancellation grace must fit inside the global deadline"
     );
+}
+
+#[test]
+fn test_multi_pred_case_split_budget_scales_from_actual_remaining_time() {
+    assert_eq!(
+        AdaptivePortfolio::multi_pred_case_split_budget(None),
+        Duration::from_secs(8),
+        "an unbounded adaptive solve retains the established case-split budget"
+    );
+
+    let cases = [
+        (Duration::ZERO, Duration::ZERO),
+        (Duration::from_nanos(1), Duration::from_nanos(1)),
+        (Duration::from_nanos(3), Duration::from_nanos(2)),
+        (Duration::from_secs(6), Duration::from_secs(4)),
+        (Duration::from_secs(12), Duration::from_secs(8)),
+        (Duration::from_secs(20), Duration::from_secs(8)),
+        (Duration::from_secs(40), Duration::from_secs(10)),
+        (Duration::from_secs(65), Duration::from_secs(16)),
+        (Duration::from_secs(120), Duration::from_secs(16)),
+    ];
+    for (remaining, expected) in cases {
+        let budget = AdaptivePortfolio::multi_pred_case_split_budget(Some(remaining));
+        assert_eq!(budget, expected, "unexpected budget for {remaining:?}");
+        assert!(
+            budget <= remaining.saturating_sub(remaining / 3),
+            "case-split must preserve its downstream share for {remaining:?}"
+        );
+        assert!(
+            budget <= Duration::from_secs(16),
+            "case-split must retain its hard stage cap"
+        );
+    }
 }
 
 #[test]

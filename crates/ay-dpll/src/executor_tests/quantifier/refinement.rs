@@ -428,6 +428,54 @@ fn test_forall_exists_square_conjunct_affine_probe_sat() {
     assert_eq!(outputs, vec!["sat"]);
 }
 
+/// NEGATIVE MUTANT for the raw-Unknown quantified-CE SAT completion above.
+/// Changing `-3` to `3` makes the sentence FALSE: at `x = 2`, the equality
+/// forces `y = 0`, contradicting `y*y > 3`.  The shape, NIA routing, affine
+/// witness equality, and quantifier prefix are otherwise identical to the
+/// positive fixture, so a route that treated the preceding CEGQI `Unknown` or
+/// the synthesized term itself as authority would answer wrong-SAT here.  The
+/// checked counterexample obligation remains satisfiable and must decline.
+#[test]
+fn test_forall_exists_square_conjunct_affine_probe_mutant_never_sat() {
+    let input = r#"
+        (set-logic NIA)
+        (assert (forall ((x Int)) (exists ((y Int)) (and (> (* y y) 3) (= y (+ x -2))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs,
+        vec!["sat"],
+        "the checked SAT completion must reject the falsifying threshold mutant"
+    );
+}
+
+/// UNWITNESSABLE NIA control for the same routing site.  The square conjunct
+/// keeps the temporary CE window in the nonlinear family, while `y <= x` and
+/// `y >= x+1` make the existential body impossible for every `x`.  No
+/// synthesized witness can turn a satisfiable negated obligation into theorem
+/// authority; the public answer may be UNSAT or conservatively Unknown, never
+/// SAT.
+#[test]
+fn test_forall_exists_square_conjunct_unwitnessable_never_sat() {
+    let input = r#"
+        (set-logic NIA)
+        (assert (forall ((x Int)) (exists ((y Int))
+            (and (> (* y y) -3) (<= y x) (>= y (+ x 1))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs,
+        vec!["sat"],
+        "an unwitnessable existential must never pass the checked SAT completion"
+    );
+}
+
 /// NEGATIVE CONTROL for the UNSAT leg: `forall x. exists y. y*y >= x` is VALID
 /// (y := |x| works for every x), so it must NEVER answer unsat: every
 /// standalone instance `sk(c)*sk(c) >= c` is satisfiable, so no ground-witness

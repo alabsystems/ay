@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 //! # ay-model-check — an independent, fail-closed model-check gate
 //!
 //! This crate is a **second, independent** SMT-LIB evaluator whose only job is
@@ -21,7 +23,8 @@
 //!   recursion-depth overflow — yields [`EvalOutcome::Unevaluable`], which maps
 //!   to [`GateVerdict::CannotConfirm`]. It is **never** assumed `true`.
 //! * The evaluator is total and panic-free: every partial/ill-typed/under-
-//!   specified case returns `Unevaluable` instead of unwrapping or panicking.
+//!   specified case without an exact typed proof and a checked model choice
+//!   returns `Unevaluable` instead of unwrapping or panicking.
 //!
 //! Therefore partial coverage is *sound* (it only produces more
 //! `CannotConfirm`); a wrong `ConfirmedSat` is catastrophic and is what this
@@ -45,6 +48,7 @@ pub mod dt_axiom;
 mod eval;
 pub mod fp;
 pub mod ieee;
+mod projection;
 mod regex;
 mod residual;
 mod seq;
@@ -56,6 +60,11 @@ mod tests;
 
 pub use dt_axiom::{is_datatype_tautology, is_datatype_tautology_with};
 pub use eval::Evaluator;
+pub use projection::{
+    check_projection_implication, check_projection_implication_with_stop,
+    CheckedProjectionImplication, CheckedProjectionUf, ProjectionCertificateRejection,
+    ProjectionImplicationCandidate, ProjectionUfCandidate,
+};
 
 /// Maximum compositional recursion depth before the evaluator fails closed.
 ///
@@ -96,8 +105,9 @@ pub enum ModelValue {
     /// `significand_bits - 1` stored fraction bits.  The representation keeps
     /// positive and negative zero distinct, as SMT-LIB structural equality
     /// requires.  NaN and infinity are represented exactly but operations
-    /// whose SMT-LIB result is unspecified (notably `fp.to_real`) reject them
-    /// fail-closed.
+    /// whose SMT-LIB result is unspecified (notably `fp.to_real`) are admitted
+    /// only through the evaluator's typed, input-proven unconstrained-result
+    /// path.
     FloatingPoint {
         /// Sign bit (`true` means negative).
         sign: bool,
@@ -128,7 +138,7 @@ pub enum ModelValue {
     /// irrational witness reaches the gate as an unpinned leaf and the verdict
     /// fails closed. See [`crate::algebraic`] for the exact arithmetic and its
     /// soundness argument.
-    Algebraic(Box<crate::algebraic::Algebraic>),
+    Algebraic(Box<algebraic::Algebraic>),
     /// A datatype value: the constructor name and its field values in order.
     Datatype {
         /// Constructor name.
@@ -170,14 +180,17 @@ impl ModelValue {
 /// Exact structural value equality, with the few well-typed numeric coercions
 /// SMT-LIB allows.
 ///
-/// Returns `Ok(true)`/`Ok(false)` when the two values are comparable, and
-/// `Err(reason)` (i.e. *unevaluable*) when they are of genuinely incomparable
-/// shapes — which, for well-typed assertions, cannot happen, so failing closed
-/// here can never produce a wrong `false` for a real equality.
+/// Returns `Ok(true)`/`Ok(false)` only when equality is decided, and
+/// `Err(reason)` (i.e. *unevaluable*) when the available value representation
+/// lacks enough evidence. That includes genuinely incomparable shapes and the
+/// finite-domain array case below; failing closed can never produce a wrong
+/// `false` for a real equality.
 ///
-/// Arrays are compared by their interpreted function (normalized: defaults must
-/// match and every overridden index must agree), so this is exact for the
-/// `(default, finite-store)` representation rather than syntactic.
+/// Arrays are compared extensionally at every explicit store key. Equal
+/// explicit reads plus equal defaults prove equality. Differing defaults remain
+/// undecided because `ArrayValue` carries no index-sort/cardinality evidence:
+/// over a finite domain the stores may cover every index, making both defaults
+/// unreachable.
 pub(crate) fn value_eq(a: &ModelValue, b: &ModelValue) -> Result<bool, String> {
     use ModelValue as V;
     match (a, b) {
@@ -266,15 +279,15 @@ pub(crate) fn array_select(arr: &ArrayValue, idx: &ModelValue) -> Result<ModelVa
 }
 
 /// Extensional equality of two array values over the `(default, finite-store)`
-/// representation. Two arrays are equal iff their defaults are equal and they
-/// agree at every overridden index (everywhere else they both return their —
-/// equal — default).
+/// representation.
+///
+/// A differing read at an explicit store key proves the arrays unequal. Equal
+/// explicit reads plus equal defaults prove them equal. Differing defaults do
+/// *not* by themselves prove inequality: over a finite index sort (notably
+/// `Bool` and bit-vectors), the explicit stores may cover the whole domain, in
+/// which case the defaults are unreachable. [`ArrayValue`] deliberately carries
+/// no index-sort/cardinality evidence, so that last case must fail closed.
 fn array_eq(a: &ArrayValue, b: &ArrayValue) -> Result<bool, String> {
-    if !value_eq(&a.default, &b.default)? {
-        // Defaults differ ⇒ they differ at the (infinitely many) indices that
-        // neither store overrides.
-        return Ok(false);
-    }
     for (k, _) in a.store.iter().chain(b.store.iter()) {
         let va = array_select(a, k)?;
         let vb = array_select(b, k)?;
@@ -282,7 +295,14 @@ fn array_eq(a: &ArrayValue, b: &ArrayValue) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    Ok(true)
+    if value_eq(&a.default, &b.default)? {
+        Ok(true)
+    } else {
+        Err(
+            "array equality with differing defaults needs index-domain coverage evidence"
+                .to_string(),
+        )
+    }
 }
 
 // Re-export of a tiny helper used across modules.
@@ -293,6 +313,32 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 // ===========================================================================
 // The model view the gate reads
 // ===========================================================================
+
+/// The exact theory case for which the evaluator has proved that an
+/// application's result is unconstrained.
+///
+/// This is evidence about the *input*, not permission supplied by a model. The
+/// independent evaluator constructs a variant only after it has evaluated the
+/// relevant operands and positively established the defining condition (a
+/// non-finite IEEE value or an exact zero divisor). A [`ModelView`] receives
+/// the reason only so it can recover an asserted/model-completion choice for
+/// that otherwise uncommitted application. The evaluator still validates the
+/// returned value's result sort before using it.
+///
+/// Generic applications, finite `fp.to_real`, and nonzero division never reach
+/// [`ModelView::proven_unconstrained_app_value`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProvenUnconstrainedKind {
+    /// `fp.to_real` applied to a NaN or either infinity.
+    FpToRealNonFinite,
+    /// Real division `/` with an exactly zero divisor.
+    RealDivByZero,
+    /// Integer `div` with an exactly zero divisor.
+    IntDivByZero,
+    /// Integer `mod` with an exactly zero divisor.
+    IntModByZero,
+}
 
 /// Read-only access to a model, as seen by the gate.
 ///
@@ -311,6 +357,24 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 pub trait ModelView {
     /// The model's value for a leaf term, or `None` if unpinned.
     fn leaf_value(&self, t: TermId) -> Option<ModelValue>;
+
+    /// The selected argument index when application `t` has an independently
+    /// checked exact projection interpretation.
+    ///
+    /// The evaluator validates that `t` is an application, the index is in
+    /// bounds, and the selected argument's sort is exactly the application's
+    /// result sort. It then evaluates that argument in the *current* evaluator
+    /// frame. This preserves the value-keyed UF graph, memo, recursion budget,
+    /// and active lambda bindings; an implementation must not evaluate or pin
+    /// the application itself. Returning `Ok(None)` means no exact projection
+    /// is available. `Err` means model state claims a projection for the
+    /// application's symbol but cannot apply it coherently (for example, its
+    /// signature differs); the evaluator fails closed instead of consulting a
+    /// lower-priority per-application UF value. The default keeps existing
+    /// model views fail-closed.
+    fn projection_argument(&self, _t: TermId) -> Result<Option<usize>, ProjectionLookupError> {
+        Ok(None)
+    }
 
     /// Resolve a datatype declared under a bare `Sort::Uninterpreted(name)`.
     ///
@@ -351,34 +415,67 @@ pub trait ModelView {
         None
     }
 
-    /// The value an asserted definition fixes for the application `t`, asked
-    /// ONLY at a point where SMT-LIB constrains the result to NOTHING AT ALL.
+    /// The value an asserted definition fixes for a non-finite `fp.to_real`
+    /// application `t`.
     ///
-    /// Today that is exactly `fp.to_real` of a NaN or an infinity: the theory
-    /// declares the result unspecified, so EVERY real is a legal interpretation
-    /// and `(= (fp.to_real x) 5.0)` is satisfiable (z3 answers `sat`). No model
-    /// commits a value for such an application — there is nothing to commit —
-    /// so [`uf_app_value`](ModelView::uf_app_value) returns `None` and the gate
-    /// would fail closed on a witness the standard plainly admits.
+    /// This is the original public hook retained for source compatibility.
+    /// New implementations that need to distinguish all independently proven
+    /// unconstrained cases should implement
+    /// [`proven_unconstrained_app_value`](Self::proven_unconstrained_app_value)
+    /// instead. The default typed hook delegates here ONLY for
+    /// [`ProvenUnconstrainedKind::FpToRealNonFinite`], preserving this method's
+    /// historical meaning without granting legacy implementations authority
+    /// over division by zero.
+    ///
+    /// WHY THIS IS SOUND. An implementor may answer this from the assertion
+    /// itself, which [`uf_app_value`](Self::uf_app_value) must never do for a
+    /// theory head. The evaluator calls this method only through the typed hook
+    /// after independently proving that the operand is NaN or infinity.
+    ///
+    /// Default: `None` — fail closed, exactly as before.
+    fn unconstrained_app_value(&self, _t: TermId) -> Option<ModelValue> {
+        None
+    }
+
+    /// The value an asserted definition fixes for the application `t`, asked
+    /// ONLY after the evaluator proves the typed unconstrained-input condition.
+    ///
+    /// The admitted cases are enumerated by [`ProvenUnconstrainedKind`]:
+    /// non-finite `fp.to_real`, Real division by zero, and integer `div`/`mod`
+    /// by zero. In each case the theory permits every value of the result sort.
+    /// A solver may therefore have no ordinary per-application commitment even
+    /// though an asserted definition selects a legal value.
     ///
     /// WHY THIS IS A SEPARATE METHOD, AND WHY IT IS SOUND.  An implementor may
     /// answer this from the ASSERTION ITSELF, which `uf_app_value` must never
     /// do for a theory head: for an operation the gate computes, "no value"
     /// means the gate's own evaluator failed, and adopting the assertion's
     /// claim would turn that evaluator bug into a confirmed wrong `sat`. The
-    /// caller therefore reaches this method only after its FP evaluator has
-    /// POSITIVELY established, from the operand's independently evaluated IEEE
-    /// fields, that the operand is a NaN or an infinity — never from a failure.
+    /// caller therefore reaches this method only after its evaluator has
+    /// POSITIVELY established the condition represented by `kind` from exact,
+    /// independently evaluated operands — never from an evaluation failure.
     /// Adoption then cannot admit a forbidden model, because choosing the
-    /// interpretation that satisfies the definition is itself a legal
-    /// interpretation, every other assertion is still checked against that
-    /// choice, and the gate's value-keyed `uf_graph` still forces all
-    /// applications with equal argument values (all NaN payloads denote the ONE
-    /// NaN element — see `fp::same_element`) to the SAME result.
+    /// interpretation that satisfies the definition is itself legal, every
+    /// other assertion is still checked against that choice, and the gate's
+    /// value-keyed `uf_graph` still forces equal argument values to one result.
+    /// A committed [`uf_app_value`](ModelView::uf_app_value) always takes
+    /// precedence; this fallback is consulted only when that lookup returns
+    /// `None`.
     ///
-    /// Default: `None` — fail closed, exactly as before.
-    fn unconstrained_app_value(&self, _t: TermId) -> Option<ModelValue> {
-        None
+    /// By default, the pre-existing non-finite-`fp.to_real` hook remains
+    /// effective. Division-by-zero kinds deliberately do not delegate to it:
+    /// an implementation written before those cases existed never opted into
+    /// supplying their values.
+    fn proven_unconstrained_app_value(
+        &self,
+        t: TermId,
+        kind: ProvenUnconstrainedKind,
+    ) -> Option<ModelValue> {
+        if kind == ProvenUnconstrainedKind::FpToRealNonFinite {
+            self.unconstrained_app_value(t)
+        } else {
+            None
+        }
     }
 
     /// The model's committed value for the array-`select` application term `t`
@@ -412,6 +509,45 @@ pub trait ModelView {
         None
     }
 }
+
+/// A model view claimed a symbolic projection but could not read it
+/// coherently.
+///
+/// This is deliberately distinct from `Ok(None)`: absence permits ordinary UF
+/// evaluation, while an inconsistent projection must stop evaluation before a
+/// finite table or per-application pin can shadow the symbolic interpretation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProjectionLookupError {
+    /// The installed projection interpretation conflicts with the application
+    /// being evaluated.
+    InconsistentModel {
+        /// Stable human-readable detail for fail-closed diagnostics.
+        detail: String,
+    },
+}
+
+impl ProjectionLookupError {
+    /// Construct an inconsistent-model lookup error.
+    #[must_use]
+    pub fn inconsistent_model(detail: impl Into<String>) -> Self {
+        Self::InconsistentModel {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectionLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InconsistentModel { detail } => {
+                write!(f, "inconsistent symbolic projection model: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectionLookupError {}
 
 // ===========================================================================
 // Evaluation outcome and gate verdict

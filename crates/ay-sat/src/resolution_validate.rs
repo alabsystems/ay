@@ -186,6 +186,9 @@ pub enum ResolutionValidationError {
     /// The absolute validation deadline expired.
     #[error("resolution replay deadline exceeded")]
     DeadlineExceeded,
+    /// The caller's cooperative cancellation predicate fired.
+    #[error("resolution replay cancelled")]
+    Cancelled,
     /// Overflow occurred while accounting proof or scratch size.
     #[error("resolution replay accounting overflow for {resource:?}")]
     AccountingOverflow {
@@ -202,23 +205,42 @@ pub enum ResolutionValidationError {
 
 struct WorkMeter<'a> {
     limits: &'a ResolutionValidationLimits,
+    should_stop: &'a mut dyn FnMut() -> bool,
     work: u64,
 }
 
 impl<'a> WorkMeter<'a> {
-    fn new(limits: &'a ResolutionValidationLimits) -> Result<Self, ResolutionValidationError> {
-        let meter = Self { limits, work: 0 };
-        meter.check_deadline()?;
+    fn new(
+        limits: &'a ResolutionValidationLimits,
+        initial_work: u64,
+        should_stop: &'a mut dyn FnMut() -> bool,
+    ) -> Result<Self, ResolutionValidationError> {
+        let mut meter = Self {
+            limits,
+            should_stop,
+            work: initial_work,
+        };
+        if initial_work > limits.max_work {
+            return Err(ResolutionValidationError::LimitExceeded {
+                resource: ResolutionValidationResource::Work,
+                limit: u128::from(limits.max_work),
+                actual: u128::from(initial_work),
+            });
+        }
+        meter.check_controls()?;
         Ok(meter)
     }
 
-    fn check_deadline(&self) -> Result<(), ResolutionValidationError> {
+    fn check_controls(&mut self) -> Result<(), ResolutionValidationError> {
         if self
             .limits
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             return Err(ResolutionValidationError::DeadlineExceeded);
+        }
+        if (self.should_stop)() {
+            return Err(ResolutionValidationError::Cancelled);
         }
         Ok(())
     }
@@ -240,9 +262,21 @@ impl<'a> WorkMeter<'a> {
         }
         // Clock reads are amortized across deterministic replay work.
         if old / 1024 != self.work / 1024 {
-            self.check_deadline()?;
+            self.check_controls()?;
         }
         Ok(())
+    }
+
+    fn charge_usize(&mut self, amount: usize) -> Result<(), ResolutionValidationError> {
+        let amount =
+            u64::try_from(amount).map_err(|_| ResolutionValidationError::AccountingOverflow {
+                resource: ResolutionValidationResource::Work,
+            })?;
+        self.charge(amount)
+    }
+
+    fn consumed_work(&self) -> u64 {
+        self.work
     }
 }
 
@@ -363,10 +397,35 @@ impl ResolutionDag {
         &self,
         limits: &ResolutionValidationLimits,
     ) -> Result<(), ResolutionValidationError> {
-        let mut meter = WorkMeter::new(limits)?;
+        let mut never_stop = || false;
+        self.validate_with_limits_interruptible(limits, &[], 0, 0, &mut never_stop)
+            .map(|_| ())
+    }
+
+    /// Replay under `limits`, accounting bytes retained and deterministic work
+    /// already consumed by the caller, and polling its cooperative
+    /// cancellation predicate.
+    ///
+    /// This is crate-private because the additional retained-byte allowance is
+    /// part of trace conversion's peak-memory accounting, not a general public
+    /// way to reinterpret [`ResolutionValidationLimits::max_bytes`].
+    pub(crate) fn validate_with_limits_interruptible(
+        &self,
+        limits: &ResolutionValidationLimits,
+        fixed_unit_premises: &[Literal],
+        additional_retained_bytes: usize,
+        initial_work: u64,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<u64, ResolutionValidationError> {
+        let mut meter = WorkMeter::new(limits, initial_work, should_stop)?;
+        let original_clause_count = checked_add(
+            self.original_clauses.len(),
+            fixed_unit_premises.len(),
+            ResolutionValidationResource::OriginalClauses,
+        )?;
         enforce(
             ResolutionValidationResource::OriginalClauses,
-            self.original_clauses.len(),
+            original_clause_count,
             limits.max_original_clauses,
         )?;
         enforce(
@@ -375,7 +434,11 @@ impl ResolutionDag {
             limits.max_derived_steps,
         )?;
 
-        let mut certificate_bytes = size_of::<ResolutionDag>();
+        let mut certificate_bytes = checked_add(
+            size_of::<ResolutionDag>(),
+            additional_retained_bytes,
+            ResolutionValidationResource::Bytes,
+        )?;
         certificate_bytes = checked_add(
             certificate_bytes,
             checked_mul(
@@ -399,7 +462,7 @@ impl ResolutionDag {
         for (index, (_, clause)) in self.original_clauses.iter().enumerate() {
             meter.charge(1)?;
             if index % 1024 == 0 {
-                meter.check_deadline()?;
+                meter.check_controls()?;
             }
             original_literals = checked_add(
                 original_literals,
@@ -416,6 +479,11 @@ impl ResolutionDag {
                 ResolutionValidationResource::Bytes,
             )?;
         }
+        original_literals = checked_add(
+            original_literals,
+            fixed_unit_premises.len(),
+            ResolutionValidationResource::OriginalLiterals,
+        )?;
         enforce(
             ResolutionValidationResource::OriginalLiterals,
             original_literals,
@@ -427,7 +495,7 @@ impl ResolutionDag {
         for (index, step) in self.derived.iter().enumerate() {
             meter.charge(1)?;
             if index % 1024 == 0 {
-                meter.check_deadline()?;
+                meter.check_controls()?;
             }
             derived_literals = checked_add(
                 derived_literals,
@@ -473,9 +541,15 @@ impl ResolutionDag {
         // Conservatively preflight scratch before allocating it. HashMap's
         // implementation controls its actual bucket count, so it is checked
         // again from the resulting capacity below.
+        let reserved_db_bucket_bound =
+            checked_mul(db_entries, 2, ResolutionValidationResource::Bytes)?;
         let mut estimated_bytes = checked_add(
             certificate_bytes,
-            checked_mul(db_entries, 64, ResolutionValidationResource::Bytes)?,
+            checked_mul(
+                reserved_db_bucket_bound,
+                64,
+                ResolutionValidationResource::Bytes,
+            )?,
             ResolutionValidationResource::Bytes,
         )?;
         estimated_bytes = checked_add(
@@ -496,29 +570,48 @@ impl ResolutionDag {
             estimated_bytes,
             limits.max_bytes,
         )?;
-        meter.check_deadline()?;
+        meter.check_controls()?;
 
         let mut db: HashMap<u64, &[Literal]> = HashMap::new();
+        // Reserving and initializing replay tables is deterministic work too.
+        // Debit it before each allocation so a huge otherwise-unused SAT
+        // namespace cannot bypass `max_work` with a tiny proof DAG.
+        meter.charge_usize(reserved_db_bucket_bound)?;
+        meter.check_controls()?;
         db.try_reserve(db_entries)
             .map_err(|_| ResolutionValidationError::AllocationFailed {
                 resource: ResolutionValidationResource::ClauseDatabase,
             })?;
-        meter.check_deadline()?;
+        meter.check_controls()?;
         let mut assign: Vec<Option<bool>> = Vec::new();
+        meter.charge_usize(self.num_vars)?;
+        meter.check_controls()?;
         assign.try_reserve_exact(self.num_vars).map_err(|_| {
             ResolutionValidationError::AllocationFailed {
                 resource: ResolutionValidationResource::AssignmentScratch,
             }
         })?;
-        assign.resize(self.num_vars, None);
-        meter.check_deadline()?;
+        const INITIALIZATION_CHUNK: usize = 1024;
+        while assign.len() < self.num_vars {
+            let chunk = (self.num_vars - assign.len()).min(INITIALIZATION_CHUNK);
+            let next_len = assign.len().checked_add(chunk).ok_or(
+                ResolutionValidationError::AccountingOverflow {
+                    resource: ResolutionValidationResource::Work,
+                },
+            )?;
+            meter.charge_usize(chunk)?;
+            assign.resize(next_len, None);
+            meter.check_controls()?;
+        }
         let mut trail: Vec<usize> = Vec::new();
+        meter.charge_usize(self.num_vars)?;
+        meter.check_controls()?;
         trail.try_reserve_exact(self.num_vars).map_err(|_| {
             ResolutionValidationError::AllocationFailed {
                 resource: ResolutionValidationResource::AssignmentScratch,
             }
         })?;
-        meter.check_deadline()?;
+        meter.check_controls()?;
 
         let actual_scratch_bytes = checked_add(
             checked_mul(db.capacity(), 64, ResolutionValidationResource::Bytes)?,
@@ -568,6 +661,38 @@ impl ResolutionDag {
             db.insert(*id, lits.as_slice());
         }
 
+        // `check-sat-assuming` premises are decisions in the producing solver,
+        // not permanent clauses in its retained trace.  A premised replay fixes
+        // those exact unit literals once and preserves them across every RUP
+        // step.  This is equivalent to making each unit available before every
+        // explicit hint, without materializing O(premises * steps) duplicate
+        // hint IDs.  Opposite units make the premise set itself inconsistent,
+        // in which case every derived clause follows, but the structural checks
+        // below (monotone IDs and terminal empty clause) still run.
+        let mut fixed_premises_conflict = false;
+        for &literal in fixed_unit_premises {
+            meter.charge(1)?;
+            let var = literal.variable().index();
+            if var >= self.num_vars {
+                return Err(ResolutionDagValidateError::VarOutOfRange {
+                    clause: 0,
+                    var,
+                    num_vars: self.num_vars,
+                }
+                .into());
+            }
+            let value = literal.is_positive();
+            match assign[var] {
+                None => {
+                    assign[var] = Some(value);
+                    trail.push(var);
+                }
+                Some(existing) if existing == value => {}
+                Some(_) => fixed_premises_conflict = true,
+            }
+        }
+        let fixed_trail_len = trail.len();
+
         let mut last_id = u64::try_from(self.original_clauses.len()).map_err(|_| {
             ResolutionValidationError::AccountingOverflow {
                 resource: ResolutionValidationResource::OriginalClauses,
@@ -584,12 +709,16 @@ impl ResolutionDag {
             }
             check_lits(self.num_vars, step.id, &step.clause, &mut meter)?;
 
-            let result = replay_rup(step, &db, &mut assign, &mut trail, &mut meter);
-            for &var in &trail {
+            let result = if fixed_premises_conflict {
+                Ok(())
+            } else {
+                replay_rup(step, &db, &mut assign, &mut trail, &mut meter)
+            };
+            for &var in &trail[fixed_trail_len..] {
                 meter.charge(1)?;
                 assign[var] = None;
             }
-            trail.clear();
+            trail.truncate(fixed_trail_len);
             result?;
 
             db.insert(step.id, step.clause.as_slice());
@@ -612,7 +741,8 @@ impl ResolutionDag {
             }
             .into());
         }
-        meter.check_deadline()
+        meter.check_controls()?;
+        Ok(meter.consumed_work())
     }
 }
 
@@ -796,6 +926,7 @@ fn scan_hint(
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+    use crate::literal::Variable;
 
     // Deliberately exhaustive: adding a bounded-resource variant to the
     // historical error enum must fail this compile guard.
@@ -816,6 +947,33 @@ mod compatibility_tests {
     #[test]
     fn legacy_error_remains_exhaustive() {
         exhaust_legacy_error(ResolutionDagValidateError::NoSteps);
+    }
+
+    #[test]
+    fn bounded_replay_charges_large_variable_namespace_initialization() {
+        let positive = Literal::positive(Variable::new(0));
+        let negative = Literal::negative(Variable::new(0));
+        let dag = ResolutionDag {
+            num_vars: 4_096,
+            original_clauses: vec![(1, vec![positive]), (2, vec![negative])],
+            derived: vec![RupStep {
+                id: 3,
+                clause: Vec::new(),
+                rup_hints: vec![1, 2],
+            }],
+            empty_clause_id: 3,
+        };
+        let mut limits = ResolutionValidationLimits::unbounded();
+        limits.max_work = 100;
+
+        assert!(matches!(
+            dag.validate_with_limits(&limits),
+            Err(ResolutionValidationError::LimitExceeded {
+                resource: ResolutionValidationResource::Work,
+                limit: 100,
+                ..
+            })
+        ));
     }
 
     #[cfg(feature = "unsat-cert")]

@@ -14,6 +14,10 @@ use crate::executor::{SatCertificate, UnsatCertificate};
 /// Always present on `SolveResult::Unsat`. Like the SAT certificate, proof
 /// materialization is lazy: no reconstruction work occurs until the consumer
 /// explicitly requests it via [`sat_certificate()`](Self::sat_certificate).
+/// Some independently checked semantic UNSAT lanes have no LRAT derivation;
+/// those carry the existing explicitly-incomplete empty payload, while
+/// [`VerifiedSolveResult`] separately records the exact certification kind and
+/// never reports strict-proof verification for them.
 ///
 /// # Zero-cost path
 ///
@@ -180,22 +184,25 @@ impl From<SatResult> for SolveResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConsumerAcceptanceError {
-    /// SAT was reported, but model validation did not run.
-    #[error("sat result rejected at consumer boundary: model validation did not run")]
+    /// SAT was reported without a complete sealed model-evidence lane.
+    #[error("sat result rejected at consumer boundary: model evidence was not admitted")]
     SatModelNotValidated,
 }
 
-/// A `SolveResult` that has been validated by the executor.
+/// A `SolveResult` admitted by one of the executor's sealed evidence lanes.
 ///
-/// For `Sat` results, this records whether model validation passed
-/// (via `finalize_sat_model_validation`). Consumers must inspect
+/// For `Sat` results, this records either that ordinary final model validation
+/// passed or that the independently checked quantified-projection lane proved
+/// and installed its exact total model. Consumers must inspect
 /// [`was_model_validated()`](Self::was_model_validated) or call
 /// [`accept_for_consumer()`](Self::accept_for_consumer) before treating a SAT
 /// model as trusted. For `Unsat` results, a private one-shot certificate proves
-/// the strict checker accepted the refutation against the exact authored query
-/// epoch. The shared native result boundary publishes registered `Unknown` and
-/// revokes executor artifacts before wrapping any definite verdict whose exact
-/// capability is missing.
+/// either that the strict checker accepted the refutation against the exact
+/// authored query epoch or that the separately classified exact semantic
+/// theorem discharged its narrow integer-existential fragment. The shared
+/// native result boundary publishes registered `Unknown` and revokes executor
+/// artifacts before wrapping any definite verdict whose exact capability is
+/// missing.
 ///
 /// The private inner fields prevent construction outside ay-dpll.
 /// Within the crate, every native solve route crosses the same
@@ -225,6 +232,15 @@ pub struct VerifiedSolveResult {
     /// Records that the one-shot `UnsatCertificate` was consumed at this
     /// boundary. The capability itself is never exposed or cloned.
     unsat_emission_witness: bool,
+    /// Records the strict checker claim separately for diagnostics. This bit
+    /// can be set only by consuming the strict exact-query token.
+    unsat_strictly_verified: bool,
+    /// Records an independently checked SAT-refutation or fully discharged
+    /// trust-family proof separately from literal strict-checker acceptance.
+    unsat_independently_verified: bool,
+    /// Records the narrow exact semantic theorem lane separately from strict
+    /// proof checking. This is never inferred from an empty proof payload.
+    unsat_exact_semantically_verified: bool,
 }
 
 impl VerifiedSolveResult {
@@ -236,20 +252,37 @@ impl VerifiedSolveResult {
             model_validated: true,
             sat_emission_witness: true,
             unsat_emission_witness: false,
+            unsat_strictly_verified: false,
+            unsat_independently_verified: false,
+            unsat_exact_semantically_verified: false,
         }
     }
 
-    /// Construct the public UNSAT wrapper by consuming the exact one-shot token
-    /// minted after strict proof validation for the authored query epoch.
+    /// Construct a certified public UNSAT wrapper by consuming its exact-query
+    /// one-shot token. The token keeps literal strict-proof acceptance,
+    /// independently checked refutations, and the narrow semantic theorem
+    /// mutually exclusive.
     pub(crate) fn certified_unsat(
         result: SmtProofCertificate,
-        _certificate: UnsatCertificate,
+        certificate: UnsatCertificate,
     ) -> Self {
+        let unsat_strictly_verified = certificate.strict_proof_verified();
+        let unsat_independently_verified = certificate.independently_verified();
+        let unsat_exact_semantically_verified = certificate.exact_semantic_verified();
+        debug_assert_eq!(
+            usize::from(unsat_strictly_verified)
+                + usize::from(unsat_independently_verified)
+                + usize::from(unsat_exact_semantically_verified),
+            1
+        );
         Self {
             result: SolveResult::Unsat(result),
             model_validated: false,
             sat_emission_witness: false,
             unsat_emission_witness: true,
+            unsat_strictly_verified,
+            unsat_independently_verified,
+            unsat_exact_semantically_verified,
         }
     }
 
@@ -261,6 +294,9 @@ impl VerifiedSolveResult {
             model_validated: false,
             sat_emission_witness: false,
             unsat_emission_witness: false,
+            unsat_strictly_verified: false,
+            unsat_independently_verified: false,
+            unsat_exact_semantically_verified: false,
         }
     }
 
@@ -275,8 +311,8 @@ impl VerifiedSolveResult {
     ///
     /// This constructor is deliberately absent from normal library builds: a
     /// public caller-chosen `model_validated` bit would let downstream code
-    /// fabricate a trusted-looking SAT result without the private
-    /// [`SatCertificate`] capability minted by `emit_sat_verdict`.
+    /// fabricate a trusted-looking SAT result without a private
+    /// [`SatCertificate`] capability minted by a complete emission lane.
     #[cfg(test)]
     pub(crate) fn for_testing(result: SolveResult, model_validated: bool) -> Self {
         Self {
@@ -284,14 +320,19 @@ impl VerifiedSolveResult {
             model_validated,
             sat_emission_witness: false,
             unsat_emission_witness: false,
+            unsat_strictly_verified: false,
+            unsat_independently_verified: false,
+            unsat_exact_semantically_verified: false,
         }
     }
 
-    /// Whether completed model-validation evidence exists for this result.
+    /// Whether complete sealed SAT-witness evidence exists for this result.
     ///
     /// For a SAT query with no assertions/assumptions this is explicit vacuous
     /// evidence, recorded only after the final output-visible unconstrained
-    /// model has been completed; non-vacuous SAT requires the validation gates.
+    /// model has been completed. Other SAT results require either the ordinary
+    /// validation gates, the checked total-projection evidence lane, or the
+    /// exact-exists semantic theorem lane.
     #[inline]
     pub fn was_model_validated(&self) -> bool {
         self.model_validated
@@ -300,10 +341,10 @@ impl VerifiedSolveResult {
     /// Whether this result crossed the #sat-chokepoint with its one-shot
     /// emission witness present.
     ///
-    /// `true` iff construction consumed the unforgeable `SatCertificate`
-    /// minted by the single `emit_sat_verdict` funnel (strict + independent +
-    /// authoritative-failclosed gates). The token is not retained or cloned;
-    /// only its presence at the boundary is recorded. The test-only
+    /// `true` iff construction consumed an unforgeable [`SatCertificate`]
+    /// minted either by the ordinary validation funnel or by the independently
+    /// checked quantified-projection funnel. The token is not retained or
+    /// cloned; only its presence at the boundary is recorded. The test-only
     /// [`for_testing`](Self::for_testing) bypass records `false`.
     #[inline]
     #[must_use]
@@ -311,12 +352,38 @@ impl VerifiedSolveResult {
         self.sat_emission_witness
     }
 
-    /// Whether this UNSAT result crossed the mandatory strict-proof
-    /// certification boundary with its exact-query one-shot capability.
+    /// Whether this UNSAT result crossed the exact-query publication boundary
+    /// with a sealed one-shot certification capability.
     #[inline]
     #[must_use]
     pub fn has_unsat_emission_witness(&self) -> bool {
         self.unsat_emission_witness
+    }
+
+    /// Whether this UNSAT result carries a refutation accepted by the strict
+    /// proof checker for the exact authored query epoch.
+    #[inline]
+    #[must_use]
+    pub fn was_unsat_strictly_verified(&self) -> bool {
+        self.unsat_strictly_verified
+    }
+
+    /// Whether this UNSAT result was established by an independently checked
+    /// SAT-level refutation or by complete discharge of the proof's trust-family
+    /// steps, after the ordinary strict checker declined that proof.
+    #[inline]
+    #[must_use]
+    pub fn was_unsat_independently_verified(&self) -> bool {
+        self.unsat_independently_verified
+    }
+
+    /// Whether this UNSAT result was established by the narrow, independently
+    /// checked exact integer-existential theorem rather than by the ordinary
+    /// strict proof checker.
+    #[inline]
+    #[must_use]
+    pub fn was_unsat_exact_semantically_verified(&self) -> bool {
+        self.unsat_exact_semantically_verified
     }
 
     /// Get the underlying solve result.
@@ -419,6 +486,9 @@ mod tests {
         assert!(result.is_unknown());
         assert!(!result.was_model_validated());
         assert!(!result.has_unsat_emission_witness());
+        assert!(!result.was_unsat_strictly_verified());
+        assert!(!result.was_unsat_independently_verified());
+        assert!(!result.was_unsat_exact_semantically_verified());
         assert_eq!(result.accept_for_consumer(), Ok(&SolveResult::Unknown));
     }
 }

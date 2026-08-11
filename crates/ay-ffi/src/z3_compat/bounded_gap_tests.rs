@@ -13,6 +13,7 @@
 //! marked; libz3-4.16-cross-checked values are quoted from the probe runs.
 
 use super::super::*;
+use ay_dpll::api::Sort;
 use std::ffi::CStr;
 use std::ptr;
 
@@ -250,6 +251,500 @@ fn array_ext_soundness_and_caching() {
         let i = Z3_mk_const(c, sym(c, c"exti"), int);
         assert_eq!(Z3_mk_array_ext(c, i, i), 0);
         assert_eq!(Z3_get_error_code(c), Z3_SORT_ERROR);
+        Z3_del_context(c);
+    }
+}
+
+// ============================================================================
+// Bounded-carrier arrays — public extensionality, and the exact limits of it.
+// ============================================================================
+
+/// `Char` and finite-domain sorts lower to an unbounded `Int` in the core term
+/// store, so `(Array Char Bool)` becomes `(Array Int Bool)` and gains indices
+/// (`-1`, `196608`, …) that no public formula can name. Quantifier construction
+/// relativizes `forall ch:Char` to `[0, 196607]`, so without the extensionality
+/// lemma the engine can satisfy "agrees at every public index AND is a different
+/// core array" by differing at `-1`.
+///
+/// Oracle, measured against the pinned z3 5.0.0 (`Z3 5.0.0.0`):
+///
+/// ```text
+/// ForAll([ch], Select(a, ch) == Select(b, ch)), a != b   => unsat   (Char)
+/// ForAll([d],  Select(x, d)  == Select(y, d)),  x != y   => unsat   (D3)
+/// ForAll([ch], Select(a, ch) == Select(b, ch)), a[0] != b[0] => unsat
+/// a != b                                                 => sat
+/// Select(a, CharVal(0)) == Select(b, CharVal(0)), a != b => sat
+/// ```
+#[test]
+fn bounded_array_extensionality_is_exact_for_free_carrier_arrays() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let integer = Z3_mk_int_sort(c);
+
+        // z3 5.0.0: unsat. The Int-lowered engine has extra indices, so this is
+        // the direct outside-carrier disequality attack.
+        let char_sort = Z3_mk_char_sort(c);
+        let char_array = Z3_mk_array_sort(c, char_sort, boolean);
+        let a = Z3_mk_const(c, sym(c, c"char_array_a"), char_array);
+        let b = Z3_mk_const(c, sym(c, c"char_array_b"), char_array);
+        let ch = Z3_mk_const(c, sym(c, c"char_array_index"), char_sort);
+        let reads_equal = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, b, ch));
+        let all_reads_equal =
+            Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), reads_equal);
+        assert_ne!(all_reads_equal, 0);
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, all_reads_equal);
+        Z3_solver_assert(c, solver, Z3_mk_not(c, Z3_mk_eq(c, a, b)));
+        assert_eq!(
+            Z3_solver_check(c, solver),
+            Z3_L_FALSE,
+            "Char arrays cannot differ only at an Int value outside Char's carrier"
+        );
+
+        // NON-VACUITY: the lemma must reach ONLY goals that assert the
+        // extensionality formula. A sibling handle that drops the agreement
+        // hypothesis has to stay SAT (z3 5.0.0 on `a != b` alone: sat).
+        let open = Z3_mk_solver(c);
+        Z3_solver_assert(c, open, Z3_mk_not(c, Z3_mk_eq(c, a, b)));
+        assert_eq!(
+            Z3_solver_check(c, open),
+            Z3_L_TRUE,
+            "the extensionality lemma must not leak into a goal that lacks its hypothesis"
+        );
+
+        // NON-VACUITY: agreement at a SINGLE public index is far too weak to
+        // entail equality; the lemma must not fire for it (z3 5.0.0: sat).
+        let zero_char = Z3_mk_char(c, 0);
+        assert_ne!(zero_char, 0);
+        let one_point = Z3_mk_solver(c);
+        Z3_solver_assert(
+            c,
+            one_point,
+            Z3_mk_eq(
+                c,
+                Z3_mk_select(c, a, zero_char),
+                Z3_mk_select(c, b, zero_char),
+            ),
+        );
+        Z3_solver_assert(c, one_point, Z3_mk_not(c, Z3_mk_eq(c, a, b)));
+        assert_eq!(
+            Z3_solver_check(c, one_point),
+            Z3_L_TRUE,
+            "agreement at one index must not entail array equality"
+        );
+
+        // NON-VACUITY (the other direction): pointwise agreement really does
+        // reach the public indices — disagreeing at one is unsat (z3 5.0.0).
+        let point_conflict = Z3_mk_solver(c);
+        Z3_solver_assert(c, point_conflict, all_reads_equal);
+        Z3_solver_assert(
+            c,
+            point_conflict,
+            Z3_mk_not(
+                c,
+                Z3_mk_eq(
+                    c,
+                    Z3_mk_select(c, a, zero_char),
+                    Z3_mk_select(c, b, zero_char),
+                ),
+            ),
+        );
+        assert_eq!(
+            Z3_solver_check(c, point_conflict),
+            Z3_L_FALSE,
+            "pointwise agreement must refute disagreement at a public index"
+        );
+
+        // Public sort checks happen before the core's Char -> Int erasure.
+        // Z3 rejects an Int index for an Array(Char, ...); AY must do likewise.
+        let int_zero = Z3_mk_int(c, 0, integer);
+        assert_eq!(Z3_mk_select(c, a, int_zero), 0);
+        assert_eq!(Z3_get_error_code(c), Z3_SORT_ERROR);
+        let value = Z3_mk_true(c);
+        assert_eq!(Z3_mk_store(c, a, int_zero, value), 0);
+        assert_eq!(Z3_get_error_code(c), Z3_SORT_ERROR);
+
+        // Same attack over a named finite domain (z3 5.0.0 on the quantified
+        // form: unsat).
+        let fd = Z3_mk_finite_domain_sort(c, sym(c, c"ArrayD3"), 3);
+        let fd_array = Z3_mk_array_sort(c, fd, boolean);
+        let x = Z3_mk_const(c, sym(c, c"fd_array_x"), fd_array);
+        let y = Z3_mk_const(c, sym(c, c"fd_array_y"), fd_array);
+        let d = Z3_mk_const(c, sym(c, c"fd_array_index"), fd);
+        let fd_reads_equal = Z3_mk_eq(c, Z3_mk_select(c, x, d), Z3_mk_select(c, y, d));
+        let fd_all_reads_equal =
+            Z3_mk_forall_const(c, 0, 1, &raw const d, 0, ptr::null(), fd_reads_equal);
+        let solver2 = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver2, fd_all_reads_equal);
+        Z3_solver_assert(c, solver2, Z3_mk_not(c, Z3_mk_eq(c, x, y)));
+        assert_eq!(
+            Z3_solver_check(c, solver2),
+            Z3_L_FALSE,
+            "finite-domain arrays cannot differ only outside the named carrier"
+        );
+
+        Z3_del_context(c);
+    }
+}
+
+/// SOUNDNESS REGRESSION — the defect that sank the first attempt at this
+/// closure. The canonical-extension proof needs every array term of the sort to
+/// BE a canonical extension. `Z3_mk_const_array` pins every core index
+/// including the off-carrier ones, and `store` inherits its base's off-carrier
+/// values, so for
+///
+/// ```text
+/// D1 = (_ FiniteDomain "probeD1" 1)             carrier = {0}
+/// a = const(D1, true)                           off-carrier: true
+/// b = store(const(D1, false), 0, true)          off-carrier: false
+/// forall d:D1. a[d] = b[d]                      holds: both read true at 0
+/// ```
+///
+/// the goal is SATISFIABLE by construction while core `a = b` is FALSE. A
+/// bridge that guards only the SORT shape injects `a = b` and refutes it.
+///
+/// Oracle (z3 5.0.0): the whole goal is `unknown`; the same two definitions
+/// WITHOUT the quantifier are `sat`. AY must never answer `Z3_L_FALSE`.
+#[test]
+fn bounded_array_extensionality_refuses_off_carrier_pinned_terms() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let d1 = Z3_mk_finite_domain_sort(c, sym(c, c"probeD1"), 1);
+        assert_ne!(d1, ptr::null_mut());
+        let d1_array = Z3_mk_array_sort(c, d1, boolean);
+        let a = Z3_mk_const(c, sym(c, c"pinned_a"), d1_array);
+        let b = Z3_mk_const(c, sym(c, c"pinned_b"), d1_array);
+        let zero = Z3_mk_numeral(c, c"0".as_ptr(), d1);
+        assert_ne!(zero, 0);
+
+        let all_true = Z3_mk_const_array(c, d1, Z3_mk_true(c));
+        let all_false = Z3_mk_const_array(c, d1, Z3_mk_false(c));
+        assert_ne!(all_true, 0);
+        assert_ne!(all_false, 0);
+        let stored_true = Z3_mk_store(c, all_false, zero, Z3_mk_true(c));
+        assert_ne!(stored_true, 0);
+
+        let d = Z3_mk_const(c, sym(c, c"pinned_index"), d1);
+        let reads_equal = Z3_mk_eq(c, Z3_mk_select(c, a, d), Z3_mk_select(c, b, d));
+        let all_reads_equal =
+            Z3_mk_forall_const(c, 0, 1, &raw const d, 0, ptr::null(), reads_equal);
+        assert_ne!(all_reads_equal, 0);
+
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, a, all_true));
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, b, stored_true));
+        Z3_solver_assert(c, solver, all_reads_equal);
+        assert_ne!(
+            Z3_solver_check(c, solver),
+            Z3_L_FALSE,
+            "a goal whose arrays are pinned off-carrier is satisfiable — the \
+             extensionality lemma must not be injected into it (z3 5.0.0: unknown)"
+        );
+
+        // CONTROL: the same two definitions without the quantifier are `sat` in
+        // z3 5.0.0, and must stay sat here.
+        let control = Z3_mk_solver(c);
+        Z3_solver_assert(c, control, Z3_mk_eq(c, a, all_true));
+        Z3_solver_assert(c, control, Z3_mk_eq(c, b, stored_true));
+        assert_eq!(
+            Z3_solver_check(c, control),
+            Z3_L_TRUE,
+            "the two definitions alone are satisfiable"
+        );
+
+        Z3_del_context(c);
+    }
+}
+
+/// SOUNDNESS REGRESSION — binder capture. For
+/// `forall ch:Char. select(a, ch) = select(store(b, f(ch), true), ch)` a bridge
+/// that reads the operands off the body without an occurs check records
+/// `a = store(b, f(ch), true)` with `ch` ESCAPING as a free constant, which is
+/// a different (and unentailed) claim about `f`'s value at an arbitrary point.
+/// Nothing may be registered for it.
+///
+/// Oracle (z3 5.0.0): the goal alone is `sat`.
+#[test]
+fn bounded_array_extensionality_refuses_binder_capture() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let char_sort = Z3_mk_char_sort(c);
+        let char_array = Z3_mk_array_sort(c, char_sort, boolean);
+        let a = Z3_mk_const(c, sym(c, c"capture_a"), char_array);
+        let b = Z3_mk_const(c, sym(c, c"capture_b"), char_array);
+        let ch = Z3_mk_const(c, sym(c, c"capture_index"), char_sort);
+
+        let domain = [char_sort];
+        let f = Z3_mk_func_decl(c, sym(c, c"capture_f"), 1, domain.as_ptr(), char_sort);
+        assert_ne!(f, ptr::null_mut());
+        let args = [ch];
+        let f_ch = Z3_mk_app(c, f, 1, args.as_ptr());
+        assert_ne!(f_ch, 0);
+
+        let written = Z3_mk_store(c, b, f_ch, Z3_mk_true(c));
+        assert_ne!(written, 0);
+        let body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, written, ch));
+        let quantifier = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), body);
+        assert_ne!(quantifier, 0);
+        let quantifier_term = checked_ast_to_term(&*c, quantifier).expect("quantifier term");
+        assert_eq!(
+            (*c).bounded_array_ext_lemmas.get(&quantifier_term),
+            None,
+            "an operand that is not a free constant (and would capture the \
+             binder) must register no lemma"
+        );
+
+        // And the goal itself must not be refuted (z3 5.0.0: sat).
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, quantifier);
+        assert_ne!(
+            Z3_solver_check(c, solver),
+            Z3_L_FALSE,
+            "the capture goal is satisfiable in z3 5.0.0"
+        );
+
+        Z3_del_context(c);
+    }
+}
+
+/// The lemma's conclusion is exactly ONE core equality, registered under exactly
+/// the quantifier the caller built, and only for the recognized shape: two FREE
+/// array constants read at the binder. A mutant that fires on an unrelated body,
+/// on an already-exact `Int` index, or on an interpreted array operand is caught
+/// here by name.
+#[test]
+fn bounded_array_ext_lemma_registers_exactly_the_array_equality() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let integer = Z3_mk_int_sort(c);
+        let char_sort = Z3_mk_char_sort(c);
+
+        // An UNBOUNDED index sort is already extensionally exact in the core,
+        // so the lemma is unnecessary and must not be registered.
+        let int_array = Z3_mk_array_sort(c, integer, boolean);
+        let p = Z3_mk_const(c, sym(c, c"int_array_p"), int_array);
+        let q = Z3_mk_const(c, sym(c, c"int_array_q"), int_array);
+        let i = Z3_mk_const(c, sym(c, c"int_array_index"), integer);
+        let int_body = Z3_mk_eq(c, Z3_mk_select(c, p, i), Z3_mk_select(c, q, i));
+        let int_forall = Z3_mk_forall_const(c, 0, 1, &raw const i, 0, ptr::null(), int_body);
+        assert_ne!(int_forall, 0);
+        assert!(
+            (*c).bounded_array_ext_lemmas.is_empty(),
+            "an Int-indexed array needs no carrier lemma"
+        );
+
+        // A Char index over two free constants is the real case: exactly `a = b`.
+        let char_array = Z3_mk_array_sort(c, char_sort, boolean);
+        let a = Z3_mk_const(c, sym(c, c"bridge_a"), char_array);
+        let b = Z3_mk_const(c, sym(c, c"bridge_b"), char_array);
+        let a_term = checked_ast_to_term(&*c, a).expect("array const term");
+        let b_term = checked_ast_to_term(&*c, b).expect("array const term");
+
+        let ch = Z3_mk_const(c, sym(c, c"bridge_index"), char_sort);
+        let body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, b, ch));
+        let quantifier = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), body);
+        let quantifier_term = checked_ast_to_term(&*c, quantifier).expect("quantifier term");
+        let expected = (*c).solver.eq(a_term, b_term);
+        let lemma = (*c)
+            .bounded_array_ext_lemmas
+            .get(&quantifier_term)
+            .expect("the recognized shape registers a lemma");
+        assert_eq!(lemma.equality, expected);
+        assert_eq!(lemma.left, a_term);
+        assert_eq!(lemma.right, b_term);
+        assert_eq!(lemma.carrier_hi, AY_MAX_CHAR);
+        assert_eq!((*c).bounded_array_ext_lemmas.len(), 1);
+
+        // A body that is NOT pointwise agreement of two reads AT the bound
+        // variable must register nothing.
+        let other = Z3_mk_const(c, sym(c, c"bridge_other"), char_sort);
+        let unrelated_body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, b, other));
+        let unrelated = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), unrelated_body);
+        let unrelated_term = checked_ast_to_term(&*c, unrelated).expect("quantifier term");
+        assert_eq!((*c).bounded_array_ext_lemmas.get(&unrelated_term), None);
+
+        // An INTERPRETED array operand pins off-carrier values, so no lemma —
+        // this is the guard the first attempt lacked (see the D1 regression).
+        let all_true = Z3_mk_const_array(c, char_sort, Z3_mk_true(c));
+        assert_ne!(all_true, 0);
+        let const_body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, all_true, ch));
+        let const_forall = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), const_body);
+        let const_term = checked_ast_to_term(&*c, const_forall).expect("quantifier term");
+        assert_eq!(
+            (*c).bounded_array_ext_lemmas.get(&const_term),
+            None,
+            "a const-array operand pins every core index"
+        );
+
+        let stored = Z3_mk_store(c, b, Z3_mk_char(c, 0), Z3_mk_true(c));
+        assert_ne!(stored, 0);
+        let store_body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, stored, ch));
+        let store_forall = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), store_body);
+        let store_term = checked_ast_to_term(&*c, store_forall).expect("quantifier term");
+        assert_eq!(
+            (*c).bounded_array_ext_lemmas.get(&store_term),
+            None,
+            "a store operand inherits its base's off-carrier values"
+        );
+
+        Z3_del_context(c);
+    }
+}
+
+/// SOUNDNESS GUARD. The lemma rests on a canonical extension that exists only
+/// when the index sort is DIRECTLY bounded and the element sort carries no
+/// further bounded lowering of its own. A mutant that drops
+/// `bounded_array_sort_supported` is caught here.
+#[test]
+fn bounded_array_ext_lemma_refuses_unencodable_element_sorts() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let char_sort = Z3_mk_char_sort(c);
+
+        let char_array = Z3_mk_array_sort(c, char_sort, boolean);
+        assert!(bounded_array_sort_supported(&Sort::array(
+            Sort::Char,
+            Sort::Bool
+        )));
+        // Indexing BY an Array(Char, Bool) is the unencodable shape.
+        let higher_order = Z3_mk_array_sort(c, char_array, boolean);
+        assert_ne!(higher_order, ptr::null_mut());
+        let unencodable_element = Sort::array(Sort::array(Sort::Char, Sort::Bool), Sort::Bool);
+        assert!(!bounded_array_sort_supported(&unencodable_element));
+        // ... and it stays unencodable when it is the ELEMENT of a Char-indexed
+        // array, which is exactly the shape whose binder IS bounded and would
+        // therefore reach the lemma without the recursive guard.
+        let outer = Z3_mk_array_sort(c, char_sort, higher_order);
+        assert_ne!(outer, ptr::null_mut());
+        assert!(!bounded_array_sort_supported(&Sort::array(
+            Sort::Char,
+            unencodable_element
+        )));
+        // A non-array sort has no carrier lemma at all.
+        assert!(!bounded_array_sort_supported(&Sort::Bool));
+
+        let u = Z3_mk_const(c, sym(c, c"unencodable_u"), outer);
+        let v = Z3_mk_const(c, sym(c, c"unencodable_v"), outer);
+        let ch = Z3_mk_const(c, sym(c, c"unencodable_index"), char_sort);
+        let body = Z3_mk_eq(c, Z3_mk_select(c, u, ch), Z3_mk_select(c, v, ch));
+        assert_ne!(body, 0);
+        let quantifier = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), body);
+        let quantifier_term = checked_ast_to_term(&*c, quantifier).expect("quantifier term");
+        assert_eq!(
+            (*c).bounded_array_ext_lemmas.get(&quantifier_term),
+            None,
+            "no canonical representative exists, so no equality may be claimed"
+        );
+
+        Z3_del_context(c);
+    }
+}
+
+/// SOUNDNESS. `Z3_mk_array_ext` mints its witness at the PUBLIC index sort, so
+/// for a bounded carrier the witness carries the `0 <= k <= hi` invariant while
+/// its axiom `a != b => a[k] != b[k]` speaks about CORE disequality. On arrays
+/// that are pinned off-carrier (`const-array`, `store`) those two are not the
+/// same relation, and the pair must not refute a goal the oracle satisfies.
+///
+/// Oracle (z3 5.0.0, `Ext(a,b)` built through the same C entry point): `sat`,
+/// with model `a = K(D1, True)`, `b = Store(K(D1, False), 0, True)`,
+/// `Ext = [else -> 0]`.
+#[test]
+fn array_ext_witness_must_not_refute_a_satisfiable_bounded_carrier_goal() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let d1 = Z3_mk_finite_domain_sort(c, sym(c, c"probeExtD1"), 1);
+        let d1_array = Z3_mk_array_sort(c, d1, boolean);
+        let a = Z3_mk_const(c, sym(c, c"ext_probe_a"), d1_array);
+        let b = Z3_mk_const(c, sym(c, c"ext_probe_b"), d1_array);
+        let zero = Z3_mk_numeral(c, c"0".as_ptr(), d1);
+        let all_true = Z3_mk_const_array(c, d1, Z3_mk_true(c));
+        let all_false = Z3_mk_const_array(c, d1, Z3_mk_false(c));
+        let stored_true = Z3_mk_store(c, all_false, zero, Z3_mk_true(c));
+        let ext = Z3_mk_array_ext(c, a, b);
+        assert_ne!(ext, 0);
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, a, all_true));
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, b, stored_true));
+        Z3_solver_assert(c, solver, Z3_mk_not(c, Z3_mk_eq(c, a, b)));
+        // Make the witness reachable so its axiom is asserted.
+        Z3_solver_assert(
+            c,
+            solver,
+            Z3_mk_eq(c, Z3_mk_select(c, a, ext), Z3_mk_select(c, a, ext)),
+        );
+        assert_ne!(
+            Z3_solver_check(c, solver),
+            Z3_L_FALSE,
+            "PROBE RESULT: array_ext's bounded witness refutes a z3-sat goal"
+        );
+        Z3_del_context(c);
+    }
+}
+
+/// The check-time canonicity scan is what keeps a REGISTERED lemma from firing
+/// into a goal it does not cover: the same two free arrays, the same
+/// quantifier, but a third array in the goal that is pinned off-carrier by a
+/// `const-array`. The lemma stays silent and the verdict is honest.
+///
+/// (z3 5.0.0 answers `unsat` on this goal; AY answers `unknown` — a DELIBERATE
+/// fail-closed narrowing, never a wrong verdict.)
+#[test]
+fn bounded_array_ext_lemma_is_withheld_when_the_goal_pins_off_carrier_values() {
+    unsafe {
+        let c = ctx();
+        let boolean = Z3_mk_bool_sort(c);
+        let char_sort = Z3_mk_char_sort(c);
+        let char_array = Z3_mk_array_sort(c, char_sort, boolean);
+        let a = Z3_mk_const(c, sym(c, c"scan_a"), char_array);
+        let b = Z3_mk_const(c, sym(c, c"scan_b"), char_array);
+        let e = Z3_mk_const(c, sym(c, c"scan_e"), char_array);
+        let ch = Z3_mk_const(c, sym(c, c"scan_index"), char_sort);
+        let body = Z3_mk_eq(c, Z3_mk_select(c, a, ch), Z3_mk_select(c, b, ch));
+        let quantifier = Z3_mk_forall_const(c, 0, 1, &raw const ch, 0, ptr::null(), body);
+        let quantifier_term = checked_ast_to_term(&*c, quantifier).expect("quantifier term");
+        assert!(
+            (*c).bounded_array_ext_lemmas.contains_key(&quantifier_term),
+            "the lemma IS registered — the scan is what withholds it"
+        );
+
+        let all_true = Z3_mk_const_array(c, char_sort, Z3_mk_true(c));
+        assert_ne!(all_true, 0);
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, quantifier);
+        Z3_solver_assert(c, solver, Z3_mk_not(c, Z3_mk_eq(c, a, b)));
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, e, all_true));
+        assert_ne!(
+            Z3_solver_check(c, solver),
+            Z3_L_TRUE,
+            "a released SAT here would contradict the oracle (z3 5.0.0: unsat)"
+        );
+
+        // The scan's own verdict, asserted directly so a mutant that widens it
+        // is caught even if the engine's answer happens not to move.
+        let lemma = (*c)
+            .bounded_array_ext_lemmas
+            .get(&quantifier_term)
+            .expect("registered above")
+            .clone();
+        let const_array_term = checked_ast_to_term(&*c, all_true).expect("const array term");
+        assert!(
+            !goal_admits_canonical_extension(&*c, &lemma, &[const_array_term]),
+            "a const-array of the lowered sort must fail the canonicity scan"
+        );
+        let a_term = checked_ast_to_term(&*c, a).expect("array const term");
+        let b_term = checked_ast_to_term(&*c, b).expect("array const term");
+        assert!(
+            goal_admits_canonical_extension(&*c, &lemma, &[a_term, b_term]),
+            "two free array constants must pass it"
+        );
+
         Z3_del_context(c);
     }
 }

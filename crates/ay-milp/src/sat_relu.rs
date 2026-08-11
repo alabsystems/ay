@@ -782,6 +782,7 @@ pub fn verify_infeasibility_certificate(
         Err(
             ResolutionValidationError::LimitExceeded { .. }
             | ResolutionValidationError::DeadlineExceeded
+            | ResolutionValidationError::Cancelled
             | ResolutionValidationError::AccountingOverflow { .. }
             | ResolutionValidationError::AllocationFailed { .. },
         ) => return Err(SatReluInfeasibilityVerificationError::ResourceLimit),
@@ -798,6 +799,7 @@ pub fn verify_infeasibility_certificate(
 /// a model-level artifact. Certificate-requiring callers use [`prepare`] plus
 /// [`SatReluPlan::try_solve_with_proof`] instead. A SAT result crosses either
 /// boundary only after reconstruction and an exact check against `model`.
+#[cfg(test)]
 pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<SatReluDecision> {
     prepare(model, deadline)?.solve(model, deadline)
 }
@@ -991,7 +993,7 @@ fn cheap_shape_gate(model: &Model) -> bool {
         || cols.len() > MAX_PLAN_MODEL_COLS
         || model.rows.len() < 16
         || model.rows.len() > MAX_PLAN_MODEL_ROWS
-        || (model.rows.len() - 4) % 4 != 0
+        || !(model.rows.len() - 4).is_multiple_of(4)
     {
         return false;
     }
@@ -1475,13 +1477,10 @@ fn detect(
         if !is_equality(model, i, row) {
             return None;
         }
-        let Some(&(z_column, z_coefficient)) = row
+        let &(z_column, z_coefficient) = row
             .coeffs
             .iter()
-            .find(|&&(column, _)| column as usize == n + i)
-        else {
-            return None;
-        };
+            .find(|&&(column, _)| column as usize == n + i)?;
         let scale = bounded_rational(-row_coefficient_exact(model, i, z_column, z_coefficient)?)?;
         if scale <= Rational::zero() {
             return None;

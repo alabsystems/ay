@@ -636,13 +636,14 @@ pub(crate) fn bareiss_det<R: ExactRing>(matrix: &[Vec<R>]) -> Option<R> {
             sign_negative = !sign_negative;
         }
         let pivot_val = m[k][k].clone();
-        for i in k + 1..n {
-            let mik = m[i][k].clone();
-            for j in k + 1..n {
-                let num = m[i][j].mul(&pivot_val).sub(&mik.mul(&m[k][j]));
-                m[i][j] = num.exact_div(&prev)?;
+        let pivot_row = m[k].clone();
+        for row in m.iter_mut().skip(k + 1) {
+            let mik = row[k].clone();
+            for (j, entry) in row.iter_mut().enumerate().skip(k + 1) {
+                let num = entry.mul(&pivot_val).sub(&mik.mul(&pivot_row[j]));
+                *entry = num.exact_div(&prev)?;
             }
-            m[i][k] = R::zero();
+            row[k] = R::zero();
         }
         prev = pivot_val;
     }

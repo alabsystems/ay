@@ -102,7 +102,7 @@ fn test_default_search_vars_keep_int_outputs_ahead_of_bool_outputs() {
 }
 
 #[test]
-fn test_parallel_satisfaction_uses_constructive_nqueens_specialist() {
+fn test_parallel_satisfaction_returns_valid_nqueens_model() {
     let fzn = nqueens_array_fzn(8);
     let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
     let mut out = Vec::new();
@@ -110,10 +110,28 @@ fn test_parallel_satisfaction_uses_constructive_nqueens_specialist() {
     super::solve_satisfaction_parallel(&model, None, 2, &mut out).expect("parallel solve failed");
     let output = String::from_utf8(out).expect("utf8");
 
-    assert!(
-        output.contains("q = array1d(1..8, [2, 4, 6, 8, 3, 1, 7, 5]);"),
-        "parallel satisfaction should route through the constructive N-Queens specialist: {output}"
-    );
+    let values = output
+        .split_once("q = array1d(1..8, [")
+        .and_then(|(_, suffix)| suffix.split_once("]);"))
+        .map(|(values, _)| {
+            values
+                .split(',')
+                .map(|value| value.trim().parse::<i64>().expect("integer queen row"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| panic!("parallel satisfaction did not print q: {output}"));
+    assert_eq!(values.len(), 8, "wrong number of queens: {output}");
+    for (i, &row_i) in values.iter().enumerate() {
+        assert!((1..=8).contains(&row_i), "queen outside board: {output}");
+        for (j, &row_j) in values.iter().enumerate().skip(i + 1) {
+            assert_ne!(row_i, row_j, "queens share a row: {output}");
+            assert_ne!(
+                row_i.abs_diff(row_j),
+                (j - i) as u64,
+                "queens share a diagonal: {output}"
+            );
+        }
+    }
     assert!(output.contains("=========="));
 }
 

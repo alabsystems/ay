@@ -51,6 +51,7 @@ impl TermIndex {
     /// Ground terms are those containing no bound variables. Declared constants
     /// (from `declare-const` or nullary `declare-fun`) ARE ground - only variables
     /// bound by enclosing quantifiers are non-ground.
+    #[cfg(any(test, feature = "ematching-differential"))]
     pub(super) fn new(terms: &TermStore, assertions: &[TermId]) -> Self {
         let mut reachable = Vec::new();
         let mut reachable_seen: HashSet<u32> = HashSet::default();

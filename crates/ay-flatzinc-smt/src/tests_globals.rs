@@ -98,6 +98,17 @@ fn test_count_eq_with_var_value() {
     assert!(r.smtlib.contains("(ite (= x_2 v) 1 0)"));
 }
 
+#[test]
+fn test_alldifferent_int_alias() {
+    let r = translate_fzn(
+        "var 1..2: x;\n\
+         var 1..2: y;\n\
+         constraint alldifferent_int([x, y]);\n\
+         solve satisfy;\n",
+    );
+    assert!(r.smtlib.contains("(assert (not (= x y)))"));
+}
+
 // --- Global: circuit ---
 
 #[test]
@@ -140,6 +151,39 @@ fn test_circuit_adds_successor_range_guards_for_unbounded_vars() {
     assert!(r.smtlib.contains("(assert (and (>= s1 1) (<= s1 3)))"));
     assert!(r.smtlib.contains("(assert (and (>= s2 1) (<= s2 3)))"));
     assert!(r.smtlib.contains("(assert (and (>= s3 1) (<= s3 3)))"));
+}
+
+#[test]
+fn test_circuit_uses_zero_based_named_array_indices() {
+    let r = translate_fzn(
+        "array [0..2] of var int: succ;\n\
+         constraint fzn_circuit(succ);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r
+        .smtlib
+        .contains("(assert (and (>= succ_0 0) (<= succ_0 2)))"));
+    assert!(r.smtlib.contains("(assert (not (= succ_0 0)))"));
+    assert!(r.smtlib.contains("(assert (not (= succ_2 2)))"));
+    assert!(r
+        .smtlib
+        .contains("(assert (=> (= succ_0 1) (>= _circ0_2 (+ 1 1))))"));
+}
+
+#[test]
+fn test_circuit_singleton_is_its_self_loop() {
+    let r = translate_fzn(
+        "array [7..7] of var int: succ;\n\
+         constraint fzn_circuit(succ);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r
+        .smtlib
+        .contains("(assert (and (>= succ_7 7) (<= succ_7 7)))"));
+    assert!(r.smtlib.contains("(assert (= succ_7 7))"));
+    assert!(!r.smtlib.contains("(assert (not (= succ_7 7)))"));
 }
 
 // --- Global: cumulative ---
@@ -233,6 +277,59 @@ fn test_inverse_adds_index_range_guards_for_unbounded_vars() {
     assert!(r.smtlib.contains("(assert (and (>= f2 1) (<= f2 2)))"));
     assert!(r.smtlib.contains("(assert (and (>= g1 1) (<= g1 2)))"));
     assert!(r.smtlib.contains("(assert (and (>= g2 1) (<= g2 2)))"));
+}
+
+#[test]
+fn test_inverse_uses_each_named_arrays_declared_index_set() {
+    let r = translate_fzn(
+        "array [0..1] of var int: f;\n\
+         array [4..5] of var int: g;\n\
+         constraint fzn_inverse(f, g);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r.smtlib.contains("(assert (and (>= f_0 4) (<= f_0 5)))"));
+    assert!(r.smtlib.contains("(assert (and (>= g_4 0) (<= g_4 1)))"));
+    assert!(r.smtlib.contains("(assert (=> (= f_0 4) (= g_4 0)))"));
+    assert!(r.smtlib.contains("(assert (=> (= g_5 1) (= f_1 5)))"));
+}
+
+#[test]
+fn test_inverse_rejects_different_array_cardinalities() {
+    let err = translate_fzn_err(
+        "array [0..1] of var int: f;\n\
+         array [4..6] of var int: g;\n\
+         constraint fzn_inverse(f, g);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(
+        matches!(err, TranslateError::UnsupportedType(ref message)
+            if message.contains("inverse: array cardinality mismatch")),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_global_dispatch_rejects_missing_and_extra_arguments() {
+    let cases = [
+        ("fzn_circuit()", 1, 0),
+        ("fzn_circuit([], [])", 1, 2),
+        ("all_different_int()", 1, 0),
+        ("all_different_int([], [])", 1, 2),
+    ];
+
+    for (constraint, expected, got) in cases {
+        let err = translate_fzn_err(&format!("constraint {constraint};\nsolve satisfy;\n"));
+        assert!(
+            matches!(err, TranslateError::WrongArgCount {
+                expected: actual_expected,
+                got: actual_got,
+                ..
+            } if actual_expected == expected && actual_got == got),
+            "unexpected error for {constraint}: {err}"
+        );
+    }
 }
 
 // --- Global: diffn ---

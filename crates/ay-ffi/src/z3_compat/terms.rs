@@ -300,8 +300,7 @@ pub unsafe extern "C" fn Z3_mk_app(
     // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
     // `.decl`/`.dt_op` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
-    let decl = unsafe { (*d).decl.clone() };
-    let dt_op = unsafe { (*d).dt_op.clone() };
+    let (decl, dt_op) = unsafe { ((*d).decl.clone(), (*d).dt_op.clone()) };
     let arg_asts: Vec<_> = (0..num_args as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `args` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
@@ -547,7 +546,7 @@ fn instantiate_poly_decl(
             decl.range()
         ));
     };
-    let inst = ay_dpll::api::FuncDecl::new(name.to_string(), arg_sorts, range);
+    let inst = decl.with_instantiated_signature(arg_sorts, range);
     ctx.poly_decl_instances.insert(key, inst.clone());
     Ok(inst)
 }
@@ -1098,8 +1097,12 @@ pub unsafe extern "C" fn Z3_mk_pble(
         return 0;
     }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
-    let terms = unsafe { read_ast_args(num_args, args) };
-    let cs = unsafe { read_int_coeffs(num_args, coeffs) };
+    let (terms, cs) = unsafe {
+        (
+            read_ast_args(num_args, args),
+            read_int_coeffs(num_args, coeffs),
+        )
+    };
     if terms.len() != cs.len() {
         return 0;
     }
@@ -1135,8 +1138,12 @@ pub unsafe extern "C" fn Z3_mk_pbge(
         return 0;
     }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
-    let terms = unsafe { read_ast_args(num_args, args) };
-    let cs = unsafe { read_int_coeffs(num_args, coeffs) };
+    let (terms, cs) = unsafe {
+        (
+            read_ast_args(num_args, args),
+            read_int_coeffs(num_args, coeffs),
+        )
+    };
     if terms.len() != cs.len() {
         return 0;
     }
@@ -1172,8 +1179,12 @@ pub unsafe extern "C" fn Z3_mk_pbeq(
         return 0;
     }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
-    let terms = unsafe { read_ast_args(num_args, args) };
-    let cs = unsafe { read_int_coeffs(num_args, coeffs) };
+    let (terms, cs) = unsafe {
+        (
+            read_ast_args(num_args, args),
+            read_int_coeffs(num_args, coeffs),
+        )
+    };
     if terms.len() != cs.len() {
         return 0;
     }
@@ -1283,8 +1294,12 @@ pub unsafe extern "C" fn Z3_substitute(
     // SAFETY: The caller's `# Safety` contract guarantees `from`/`to` each point
     // to at least `num_exprs` elements. Both were null-checked above, so
     // `from.add(i)`/`to.add(i)` stay within the caller's allocation.
-    let from_asts: Vec<_> = (0..n).map(|i| unsafe { *from.add(i) }).collect();
-    let to_asts: Vec<_> = (0..n).map(|i| unsafe { *to.add(i) }).collect();
+    let (from_asts, to_asts): (Vec<_>, Vec<_>) = unsafe {
+        (
+            (0..n).map(|i| *from.add(i)).collect(),
+            (0..n).map(|i| *to.add(i)).collect(),
+        )
+    };
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).

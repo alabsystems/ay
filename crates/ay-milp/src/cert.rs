@@ -388,6 +388,7 @@ impl OptimalityCertificate {
     /// must never be reachable as a `tree_cert::TreeNode`, because that type's
     /// `Ok(())` MEANS "the model has no feasible point". Keeping this function
     /// out of `TreeNode` is the fix, and is why no variant was added there.
+    #[cfg(test)]
     pub(crate) fn verify_bound_leaf(
         multipliers: &[Multiplier],
         model: &Model,
@@ -1152,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_leaf_accepts_a_bound_strictly_STRONGER_than_z_star() {
+    fn a_bound_leaf_accepts_a_bound_strictly_stronger_than_z_star() {
         // A standalone OptimalityCertificate checks its bound for EQUALITY. A
         // leaf only has to DOMINATE z*, so proving more than required must pass.
         let (model, mult) = forgery_model();

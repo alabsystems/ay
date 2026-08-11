@@ -84,6 +84,7 @@ impl Solver {
         &mut self,
         assumptions: &[Term],
     ) -> Result<VerifiedSolveResult, SolverError> {
+        self.resolve_terms("check_sat_assuming", assumptions)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.check_sat_assuming(assumptions)
         }))
@@ -137,6 +138,7 @@ impl Solver {
         &mut self,
         assumptions: &[Term],
     ) -> Result<AssumptionSolveDetails, SolverError> {
+        self.resolve_terms("check_sat_assuming_with_details", assumptions)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.check_sat_assuming_with_details(assumptions)
         }))

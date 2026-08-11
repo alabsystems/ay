@@ -36,7 +36,8 @@ impl Solver {
 
     /// Check that a term has a Seq sort, returning the element sort.
     fn expect_seq(&self, operation: &'static str, t: Term) -> Result<Sort, SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let id = self.resolve_term(operation, t)?;
+        let sort = self.terms().sort(id).clone();
         match sort {
             Sort::Seq(elem) => Ok(*elem),
             other => Err(SolverError::SortMismatch {
@@ -84,10 +85,10 @@ impl Solver {
     #[must_use = "this creates a term that is usually needed for assertions"]
     pub fn seq_empty(&mut self, element_sort: Sort) -> Term {
         let seq_sort = Sort::seq(element_sort);
-        Term(
-            self.terms_mut()
-                .mk_app(Symbol::named("seq.empty"), vec![], seq_sort),
-        )
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("seq.empty"), vec![], seq_sort);
+        self.wrap_term(result)
     }
 
     /// Create a unit sequence (`seq.unit`) containing a single element.
@@ -102,13 +103,13 @@ impl Solver {
     /// Try to create a unit sequence (`seq.unit`).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_unit(&mut self, elem: Term) -> Result<Term, SolverError> {
-        let elem_sort = self.terms().sort(elem.0).clone();
+        let elem_id = self.resolve_term("seq.unit", elem)?;
+        let elem_sort = self.terms().sort(elem_id).clone();
         let seq_sort = Sort::seq(elem_sort);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("seq.unit"),
-            vec![elem.0],
-            seq_sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("seq.unit"), vec![elem_id], seq_sort);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -130,13 +131,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if arguments are not matching Seq sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_concat(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("seq.++", a)?;
+        let b_id = self.resolve_term("seq.++", b)?;
         let elem = self.expect_same_seq("seq.++", a, b)?;
         let seq_sort = Sort::seq(elem);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("seq.++"),
-            vec![a.0, b.0],
-            seq_sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("seq.++"), vec![a_id, b_id], seq_sort);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -158,12 +160,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not a Seq sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_len(&mut self, s: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.len", s)?;
         self.expect_seq("seq.len", s)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("seq.len"),
-            vec![s.0],
-            Sort::Int,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("seq.len"), vec![s_id], Sort::Int);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -185,13 +187,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if sorts are wrong.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_nth(&mut self, s: Term, idx: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.nth", s)?;
+        let idx_id = self.resolve_term("seq.nth", idx)?;
         let elem = self.expect_seq("seq.nth", s)?;
         self.expect_int("seq.nth", idx)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("seq.nth"),
-            vec![s.0, idx.0],
-            elem,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("seq.nth"), vec![s_id, idx_id], elem);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -221,15 +224,19 @@ impl Solver {
         offset: Term,
         len: Term,
     ) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.extract", s)?;
+        let offset_id = self.resolve_term("seq.extract", offset)?;
+        let len_id = self.resolve_term("seq.extract", len)?;
         let elem = self.expect_seq("seq.extract", s)?;
         self.expect_int("seq.extract", offset)?;
         self.expect_int("seq.extract", len)?;
         let seq_sort = Sort::seq(elem);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("seq.extract"),
-            vec![s.0, offset.0, len.0],
+            vec![s_id, offset_id, len_id],
             seq_sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -252,12 +259,13 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if arguments are not matching Seq sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_contains(&mut self, s: Term, t: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.contains", s)?;
+        let t_id = self.resolve_term("seq.contains", t)?;
         self.expect_same_seq("seq.contains", s, t)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("seq.contains"),
-            vec![s.0, t.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("seq.contains"), vec![s_id, t_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a sequence prefix test (`seq.prefixof`), returning Bool.
@@ -276,12 +284,15 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if arguments are not matching Seq sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_prefixof(&mut self, prefix: Term, s: Term) -> Result<Term, SolverError> {
+        let prefix_id = self.resolve_term("seq.prefixof", prefix)?;
+        let s_id = self.resolve_term("seq.prefixof", s)?;
         self.expect_same_seq("seq.prefixof", prefix, s)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("seq.prefixof"),
-            vec![prefix.0, s.0],
+            vec![prefix_id, s_id],
             Sort::Bool,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Create a sequence suffix test (`seq.suffixof`), returning Bool.
@@ -300,12 +311,15 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if arguments are not matching Seq sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_suffixof(&mut self, suffix: Term, s: Term) -> Result<Term, SolverError> {
+        let suffix_id = self.resolve_term("seq.suffixof", suffix)?;
+        let s_id = self.resolve_term("seq.suffixof", s)?;
         self.expect_same_seq("seq.suffixof", suffix, s)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("seq.suffixof"),
-            vec![suffix.0, s.0],
+            vec![suffix_id, s_id],
             Sort::Bool,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -331,13 +345,17 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if sorts are wrong.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_indexof(&mut self, s: Term, t: Term, start: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.indexof", s)?;
+        let t_id = self.resolve_term("seq.indexof", t)?;
+        let start_id = self.resolve_term("seq.indexof", start)?;
         self.expect_same_seq("seq.indexof", s, t)?;
         self.expect_int("seq.indexof", start)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("seq.indexof"),
-            vec![s.0, t.0, start.0],
+            vec![s_id, t_id, start_id],
             Sort::Int,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================
@@ -362,6 +380,9 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the arguments are not matching Seq sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_seq_replace(&mut self, s: Term, from: Term, to: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("seq.replace", s)?;
+        let from_id = self.resolve_term("seq.replace", from)?;
+        let to_id = self.resolve_term("seq.replace", to)?;
         let elem = self.expect_same_seq("seq.replace", s, from)?;
         let to_elem = self.expect_seq("seq.replace", to)?;
         if elem != to_elem {
@@ -372,10 +393,11 @@ impl Solver {
             });
         }
         let seq_sort = Sort::seq(elem);
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::named("seq.replace"),
-            vec![s.0, from.0, to.0],
+            vec![s_id, from_id, to_id],
             seq_sort,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 }

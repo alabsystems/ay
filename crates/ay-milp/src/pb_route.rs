@@ -143,7 +143,7 @@ const BLOCK_SYMMETRY_CANDIDATE_VERIFICATION_CAP: Duration = Duration::from_milli
 /// representation, not merely a speculative MILP reduction.  Give that exact
 /// engine enough wall to prove a nontrivial optimum while retaining at least a
 /// third of every finite caller deadline for native branch-and-bound.
-const DENSE_BOOLEAN_PORTFOLIO_TRIAL_CAP: Duration = Duration::from_secs(120);
+const DENSE_BOOLEAN_PORTFOLIO_TRIAL_CAP: Duration = Duration::from_mins(2);
 const DENSE_BOOLEAN_MIN_VARS: u32 = 48;
 const DENSE_BOOLEAN_MAX_VARS: u32 = 128;
 const DENSE_BOOLEAN_MIN_ROWS: usize = 24;
@@ -1191,6 +1191,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
 /// decision assignment needs no portfolio race.  All exact translation,
 /// result sanitization, lifted-point checking, and model-objective checking are
 /// shared with [`try_solve_portfolio_trial`].
+#[cfg(test)]
 pub(crate) fn try_solve_portfolio_trial_with_workers(
     model: &Model,
     trial_deadline: Instant,
@@ -1277,9 +1278,7 @@ where
     let start = Instant::now();
     let solution = match (objective.as_ref(), workers) {
         (Some(objective), Some(workers)) => {
-            let Some(shared) = instance.as_parallel() else {
-                return None;
-            };
+            let shared = instance.as_parallel()?;
             let mut ignore_improvement = |_: i128, _: &[bool]| {};
             solve_optimization_portfolio_parallel_with_workers(
                 shared,
@@ -1555,6 +1554,7 @@ pub(crate) fn verify_multi_row_infeasibility_certificate_with_deadline(
 /// is exactly `pb <= p - 1`, with no epsilon or coefficient-gcd assumption.
 /// The returned decision DAG proves that face empty; the primal point attaining
 /// the claimed value remains a separate witness obligation.
+#[cfg(test)]
 pub(crate) fn try_prove_objective_bound(
     model: &Model,
     claimed_model_value: &BigRational,
@@ -1605,6 +1605,7 @@ fn generate_objective_bound_certificate(
 /// Rebuild the exact objective projection and replay a strict-better-face
 /// refutation.  Neither the artifact's embedded PB rows nor solver state define
 /// the optimization claim.
+#[cfg(test)]
 pub(crate) fn verify_objective_bound(
     model: &Model,
     claimed_model_value: &BigRational,
@@ -2099,7 +2100,7 @@ mod tests {
 
         assert!(try_solve_specialized(&model, None).is_none());
 
-        let trial_deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let trial_deadline = Instant::now() + Duration::from_secs(5);
         let generic = try_solve_generic_trial(&model, trial_deadline)
             .expect("explicit generic PB trial should decide this tiny instance");
         let PbRouteDecision::Feasible {
@@ -2125,7 +2126,7 @@ mod tests {
         model.add_row(1.0, f64::INFINITY, &[(y, 1.0)]);
         model.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let decision = try_prove_multi_row_infeasibility(&model, deadline)
             .expect("bounded multi-row proof route");
         let PbRouteDecision::CertifiedMultiRowInfeasible { certificate } = decision else {
@@ -2167,7 +2168,7 @@ mod tests {
         model.add_row(f64::NEG_INFINITY, 1.0, &[(x, 2.0), (y, 1.0)]);
         model.set_objective(&[(x, 3.0), (y, 1.0)], Sense::Minimize);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let decision =
             try_solve_portfolio_trial(&model, deadline).expect("bounded PB portfolio result");
         let PbRouteDecision::Optimal {
@@ -2194,7 +2195,7 @@ mod tests {
         model.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
         model.set_objective(&[(x, 5.0), (y, 2.0), (z, 1.0)], Sense::Minimize);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let workers = NonZeroUsize::new(2).expect("nonzero worker budget");
         let decision = try_solve_portfolio_trial_with_workers(&model, deadline, workers)
             .expect("typed parallel PB portfolio result");
@@ -2309,7 +2310,7 @@ mod tests {
         let mut model = Model::new();
         let x = model.add_binary_col();
         model.add_row(1.0, f64::INFINITY, &[(x, 1.0)]);
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         assert!(try_solve_portfolio_trial_interruptible(&model, deadline, || true).is_none());
     }
 

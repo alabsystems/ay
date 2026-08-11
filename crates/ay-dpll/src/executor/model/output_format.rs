@@ -16,8 +16,8 @@ use ay_core::{quote_symbol, string_literal, Sort, TermId};
 use num_bigint::BigInt;
 
 use crate::executor_format::{
-    format_bigint, format_bitvec, format_default_value, format_model_atom, format_rational,
-    format_real, format_sort,
+    format_bigint, format_bitvec, format_default_value_surface, format_model_atom_surface,
+    format_rational, format_real, format_sort_surface,
 };
 
 use super::Executor;
@@ -118,6 +118,51 @@ fn format_newest_first_store_chain(mut base: String, stores: &[(String, String)]
 }
 
 impl Executor {
+    /// Format an exact total projection as an SMT-LIB `define-fun`.
+    pub(super) fn format_projection_function(
+        &self,
+        name: &str,
+        argument_sorts: &[Sort],
+        result_sort: &Sort,
+        projected_argument: usize,
+    ) -> Result<String, String> {
+        let Some(projected_sort) = argument_sorts.get(projected_argument) else {
+            return Err(format!(
+                "selected argument {projected_argument} is outside arity {}",
+                argument_sorts.len()
+            ));
+        };
+        if projected_sort != result_sort {
+            return Err(format!(
+                "selected argument {projected_argument} has sort {}, not result sort {}",
+                format_sort_surface(&self.ctx, projected_sort),
+                format_sort_surface(&self.ctx, result_sort)
+            ));
+        }
+        let parameter_names: Vec<String> = (0..argument_sorts.len())
+            .map(|index| format!("__ay_projection_arg_{index}"))
+            .collect();
+        let parameters = parameter_names
+            .iter()
+            .zip(argument_sorts)
+            .map(|(parameter, sort)| {
+                format!(
+                    "({} {})",
+                    quote_symbol(parameter),
+                    format_sort_surface(&self.ctx, sort)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!(
+            "  (define-fun {} ({}) {}\n    {})",
+            quote_symbol(name),
+            parameters,
+            format_sort_surface(&self.ctx, result_sort),
+            quote_symbol(&parameter_names[projected_argument]),
+        ))
+    }
+
     /// Replace opaque EUF cells in Seq-typed function-table positions with
     /// placeholders for the aligned source application's actual terms. The
     /// ordinary placeholder resolver can then read the concrete sequence
@@ -225,11 +270,11 @@ impl Executor {
         let params: Vec<String> = arg_sorts
             .iter()
             .enumerate()
-            .map(|(i, s)| format!("(x{} {})", i, format_sort(s)))
+            .map(|(i, s)| format!("(x{} {})", i, format_sort_surface(&self.ctx, s)))
             .collect();
 
         let params_str = params.join(" ");
-        let result_sort_str = format_sort(result_sort);
+        let result_sort_str = format_sort_surface(&self.ctx, result_sort);
 
         // Resolve @?N placeholders in table entries (#5452).
         let mut resolved_table: Vec<(Vec<String>, String)> = Vec::with_capacity(table.len());
@@ -308,7 +353,7 @@ impl Executor {
             // it with the canonical constant body (legitimate model
             // completion of an unconstrained function, not a fabricated value
             // for a missing one).
-            format_default_value(result_sort)
+            format_default_value_surface(&self.ctx, result_sort)
         } else {
             self.format_function_body(arg_sorts, result_sort, &resolved_table)
         };
@@ -318,6 +363,78 @@ impl Executor {
             quote_symbol(name),
             params_str,
             result_sort_str,
+            body
+        ))
+    }
+
+    /// Format an exact certificate-constructed total function whose default
+    /// is stored explicitly rather than encoded as the last raw EUF row.
+    ///
+    /// `rows` and `default` were type-checked and rendered atomically when the
+    /// typed interpretation was installed.  Preserve every exception row and
+    /// use the proved default directly; choosing one row as an implicit else
+    /// would publish a different function on unlisted points.
+    pub(super) fn format_certified_total_function(
+        &self,
+        name: &str,
+        arg_sorts: &[Sort],
+        result_sort: &Sort,
+        rows: &[(Vec<String>, String)],
+        default: &str,
+    ) -> Result<String, String> {
+        let params: Vec<String> = arg_sorts
+            .iter()
+            .enumerate()
+            .map(|(i, sort)| format!("(x{} {})", i, format_sort_surface(&self.ctx, sort)))
+            .collect();
+        let mut seen: HashMap<Vec<String>, String> = HashMap::new();
+        let mut deduped: Vec<(Vec<String>, String)> = Vec::with_capacity(rows.len());
+        for (args, value) in rows {
+            if args.len() != arg_sorts.len() {
+                return Err(format!(
+                    "certified total function {} has row arity {}, expected {}",
+                    quote_symbol(name),
+                    args.len(),
+                    arg_sorts.len()
+                ));
+            }
+            match seen.get(args) {
+                Some(previous) if previous == value => continue,
+                Some(previous) => {
+                    return Err(format!(
+                        "inconsistent certified total function {} at ({}) resolves to both {} and {}",
+                        quote_symbol(name),
+                        args.join(" "),
+                        previous,
+                        value
+                    ));
+                }
+                None => {
+                    seen.insert(args.clone(), value.clone());
+                    deduped.push((args.clone(), value.clone()));
+                }
+            }
+        }
+
+        let mut body = default.to_string();
+        for (args, value) in deduped.iter().rev() {
+            let conditions: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| format!("(= x{i} {arg})"))
+                .collect();
+            let condition = if conditions.len() == 1 {
+                conditions[0].clone()
+            } else {
+                format!("(and {})", conditions.join(" "))
+            };
+            body = format!("(ite {condition} {value} {body})");
+        }
+        Ok(format!(
+            "  (define-fun {} ({}) {}\n    {})",
+            quote_symbol(name),
+            params.join(" "),
+            format_sort_surface(&self.ctx, result_sort),
             body
         ))
     }
@@ -360,7 +477,7 @@ impl Executor {
                         .ok_or_else(|| {
                             format!(
                                 "no complete array model value for function-table entry of sort {}",
-                                format_sort(sort)
+                                format_sort_surface(&self.ctx, sort)
                             )
                         });
                 }
@@ -379,7 +496,7 @@ impl Executor {
                 }
                 return Err(format!(
                     "no model value for function-table entry of sort {}",
-                    format_sort(sort)
+                    format_sort_surface(&self.ctx, sort)
                 ));
             }
         }
@@ -393,7 +510,7 @@ impl Executor {
             // sort-ascribe it exactly like every other printed occurrence
             // (#mv-abstract-value-ascription). Scalar sorts pass through
             // unchanged.
-            return Ok(format_model_atom(sort, raw));
+            return Ok(format_model_atom_surface(&self.ctx, sort, raw));
         }
         Ok(raw.to_string())
     }
@@ -445,7 +562,9 @@ impl Executor {
             }
             match self.ctx.terms.get(u) {
                 TermData::Var(n, _) => {
-                    if self.ctx.symbol_info_by_identity(n).is_none() {
+                    if self.ctx.symbol_info_by_identity(n).is_none()
+                        && self.ctx.exact_datatype_member_info(n).is_none()
+                    {
                         return true;
                     }
                 }
@@ -534,7 +653,7 @@ impl Executor {
         if table.is_empty() {
             // Unreachable in practice (the caller special-cases the empty
             // table); kept total with the same unconstrained-function body.
-            return format_default_value(result_sort);
+            return format_default_value_surface(&self.ctx, result_sort);
         }
 
         // Use last entry as the default (else branch).
@@ -574,7 +693,7 @@ impl Executor {
         sort: &Sort,
         interp: &ay_arrays::ArrayInterpretation,
     ) -> Option<String> {
-        let sort_str = format_sort(sort);
+        let sort_str = format_sort_surface(&self.ctx, sort);
 
         // A partial interpretation has no honest total SMT value.  Completion
         // must commit an else value to `ArrayModel` before output; inventing one
@@ -628,7 +747,7 @@ impl Executor {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        Some(format_model_atom(sort, &bare))
+        Some(format_model_atom_surface(&self.ctx, sort, &bare))
     }
 
     /// Upsert `(idx, val)` into an ordered store list: overwrite an existing
@@ -1287,7 +1406,7 @@ impl Executor {
         let Sort::Array(arr_sort) = sort else {
             return None;
         };
-        let sort_str = format_sort(sort);
+        let sort_str = format_sort_surface(&self.ctx, sort);
         let (default, stores) = self.array_witness_interp_inner(
             model,
             array_term,
@@ -1456,7 +1575,7 @@ impl Executor {
                         let default_str = self.try_format_eval_value(&default_val, args[0]).ok()?;
                         Some(format!(
                             "((as const {}) {})",
-                            format_sort(sort),
+                            format_sort_surface(&self.ctx, sort),
                             default_str
                         ))
                     }
@@ -1490,7 +1609,7 @@ impl Executor {
                         "opaque internal equality-class value {elem} is not a concrete sequence"
                     ));
                 }
-                Ok(format_model_atom(sort, elem))
+                Ok(format_model_atom_surface(&self.ctx, sort, elem))
             }
             EvalValue::Rational(r) => {
                 if r.is_integer() {
@@ -1513,7 +1632,7 @@ impl Executor {
                 Some(ay_nra::RealScalar::Algebraic(n)) => Ok(n.alpha().to_smtlib()),
                 None => Err(format!(
                     "no defining polynomial for algebraic model value of sort {}",
-                    format_sort(self.ctx.terms.sort(term_id))
+                    format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id))
                 )),
             },
             EvalValue::BitVec { value, width } => {
@@ -1537,7 +1656,7 @@ impl Executor {
             }
             EvalValue::Unknown => Err(format!(
                 "no model value available for term of sort {}",
-                format_sort(self.ctx.terms.sort(term_id))
+                format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id))
             )),
         }
     }
@@ -1603,7 +1722,7 @@ impl Executor {
     /// caller then keeps its existing behavior — including the explicit
     /// unavailable marker — so a real gap is surfaced, not papered over
     /// (#no-fabricated-model-values).
-    pub(super) fn format_gate_model_value(
+    pub(in crate::executor) fn format_gate_model_value(
         &self,
         value: &ay_model_check::ModelValue,
         sort: &Sort,
@@ -1665,7 +1784,7 @@ impl Executor {
                 if tok.starts_with('@') || tok.contains('!') {
                     return None;
                 }
-                Some(format_model_atom(sort, tok))
+                Some(format_model_atom_surface(&self.ctx, sort, tok))
             }
             MV::Seq(elems) => {
                 let elem_sort = sort.seq_element()?;
@@ -1677,7 +1796,10 @@ impl Executor {
                     vals.push(self.format_gate_model_value(e, elem_sort)?);
                 }
                 if vals.is_empty() {
-                    return Some(format!("(as seq.empty {})", format_sort(sort)));
+                    return Some(format!(
+                        "(as seq.empty {})",
+                        format_sort_surface(&self.ctx, sort)
+                    ));
                 }
                 let mut acc = format!("(seq.unit {})", vals[0]);
                 for v in &vals[1..] {
@@ -1692,7 +1814,11 @@ impl Executor {
                 let idx_sort = &arr.index_sort;
                 let elem_sort = &arr.element_sort;
                 let default = self.format_gate_model_value(&av.default, elem_sort)?;
-                let mut out = format!("((as const {}) {})", format_sort(sort), default);
+                let mut out = format!(
+                    "((as const {}) {})",
+                    format_sort_surface(&self.ctx, sort),
+                    default
+                );
                 for (idx, val) in &av.store {
                     let idx_str = self.format_gate_model_value(idx, idx_sort)?;
                     let val_str = self.format_gate_model_value(val, elem_sort)?;
@@ -1734,7 +1860,10 @@ impl Executor {
     pub(super) fn format_seq_value(&self, elems: &[EvalValue], elem_sort: &Sort) -> String {
         if elems.is_empty() {
             let seq_sort = Sort::Seq(Box::new(elem_sort.clone()));
-            return format!("(as seq.empty {})", format_sort(&seq_sort));
+            return format!(
+                "(as seq.empty {})",
+                format_sort_surface(&self.ctx, &seq_sort)
+            );
         }
         let mut acc = format!(
             "(seq.unit {})",
@@ -1766,7 +1895,7 @@ impl Executor {
             EvalValue::BitVec { value, width } => format_bitvec(value, *width),
             EvalValue::Fp(fp_val) => fp_val.to_smtlib(),
             EvalValue::String(s) => string_literal(s),
-            EvalValue::Element(elem) => format_model_atom(elem_sort, elem),
+            EvalValue::Element(elem) => format_model_atom_surface(&self.ctx, elem_sort, elem),
             EvalValue::Seq(inner) => {
                 let inner_sort = elem_sort
                     .seq_element()
@@ -1780,12 +1909,14 @@ impl Executor {
             // internal invariant violations, surfaced as the explicit
             // unparseable marker, never a fabricated element default
             // (#no-fabricated-model-values).
-            EvalValue::Algebraic(_) => {
-                value_unavailable_marker(&format!("seq-elem {}", format_sort(elem_sort)))
-            }
-            EvalValue::Unknown => {
-                value_unavailable_marker(&format!("seq-elem {}", format_sort(elem_sort)))
-            }
+            EvalValue::Algebraic(_) => value_unavailable_marker(&format!(
+                "seq-elem {}",
+                format_sort_surface(&self.ctx, elem_sort)
+            )),
+            EvalValue::Unknown => value_unavailable_marker(&format!(
+                "seq-elem {}",
+                format_sort_surface(&self.ctx, elem_sort)
+            )),
         }
     }
 
@@ -2000,6 +2131,8 @@ mod sequence_table_provenance_tests {
         // no authority to reinterpret either opaque class as a concrete Seq.
         exec.last_result = Some(SolveResult::Sat);
         exec.last_model = Some(Model {
+            quantified_confirmation_seal: Default::default(),
+            quantified_grant_model_seal: Default::default(),
             sat_model: Vec::new(),
             term_to_var: DetHashMap::default(),
             bool_overrides: DetHashMap::default(),
@@ -2011,6 +2144,10 @@ mod sequence_table_provenance_tests {
             fp_model: None,
             string_model: None,
             seq_model: None,
+            projection_ufs: Default::default(),
+            certified_total_ufs: Default::default(),
+            certified_const_interps: Default::default(),
+            formula_neutral_function_defaults: Default::default(),
             completed_values: DetHashMap::default(),
             dt_ground: DetHashMap::default(),
             dt_pins: DetHashMap::default(),

@@ -14,9 +14,12 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep};
 
+mod checked_sat_refutation;
 pub(crate) mod congruence;
 pub(crate) mod empty_clause;
 mod sat_resolution;
+
+pub(in crate::executor) use checked_sat_refutation::CheckedSatRefutation;
 
 /// Remove trailing ThResolution/Resolution steps from the proof.
 /// The chain is always appended at the end by the derive-empty-clause
@@ -66,6 +69,24 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
         return;
     };
 
+    let _ = prune_to_empty_clause_derivation_at(proof, target_idx);
+}
+
+/// Keep only the dependency cone of one exact empty-clause step.
+///
+/// The caller supplies the root so proof publication can compare multiple
+/// independently derived contradictions instead of unconditionally selecting
+/// the last one. Returns `false` without changing `proof` when the target is not
+/// an empty clause or a premise cannot be remapped.
+pub(crate) fn prune_to_empty_clause_derivation_at(proof: &mut Proof, target_idx: usize) -> bool {
+    if !matches!(
+        proof.steps.get(target_idx),
+        Some(ProofStep::Resolution { clause, .. } | ProofStep::Step { clause, .. })
+            if clause.is_empty()
+    ) {
+        return false;
+    }
+
     let mut keep = vec![false; proof.steps.len()];
     let mut stack = vec![target_idx];
     while let Some(idx) = stack.pop() {
@@ -99,7 +120,7 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
         proof
             .named_steps
             .retain(|_, id| matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(_))));
-        return;
+        return true;
     }
 
     let mut remap: HashMap<u32, u32> = HashMap::default();
@@ -129,7 +150,7 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
             total = proof.steps.len(),
             "proof pruning aborted: premises reference pruned steps"
         );
-        return;
+        return false;
     }
 
     for step in &mut new_steps {
@@ -175,4 +196,5 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
 
     proof.steps = new_steps;
     proof.named_steps = new_named_steps;
+    true
 }

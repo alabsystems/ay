@@ -81,16 +81,16 @@ pub struct Cumulative {
     /// Pre-allocated workspace for active-task flags during overload check.
     ws_active_tasks: Vec<bool>,
     /// Pre-allocated workspace for profile step function.
-    ws_profile_steps: Vec<(i64, i64)>,
+    ws_profile_steps: Vec<(i128, i128)>,
 }
 
 /// An event in the resource profile sweep.
 #[derive(Debug, Clone, Copy)]
 struct ProfileEvent {
     /// Time point
-    time: i64,
+    time: i128,
     /// Change in resource usage (+demand at start, -demand at end)
-    delta: i64,
+    delta: i128,
     /// Index of the task causing this event
     task: usize,
 }
@@ -102,16 +102,16 @@ struct ProfileEvent {
 pub(super) struct ProfileStepFunction {
     /// Sorted by time. `steps[i] = (time_i, load_i)` means at `time >= time_i`
     /// (until the next entry), the total compulsory load is `load_i`.
-    steps: Vec<(i64, i64)>,
+    steps: Vec<(i128, i128)>,
 }
 
 impl ProfileStepFunction {
     /// Build a step-function profile from sweep events into a workspace Vec.
     /// Reuses the workspace's capacity to avoid per-call allocation.
-    fn from_events_ws(events: &[ProfileEvent], ws: &mut Vec<(i64, i64)>) -> Self {
+    fn from_events_ws(events: &[ProfileEvent], ws: &mut Vec<(i128, i128)>) -> Self {
         ws.clear();
         if !events.is_empty() {
-            let mut current_load: i64 = 0;
+            let mut current_load = 0i128;
             let mut i = 0;
             while i < events.len() {
                 let t = events[i].time;
@@ -129,12 +129,12 @@ impl ProfileStepFunction {
     }
 
     /// Return the steps Vec back to the workspace for reuse.
-    fn return_steps_ws(self, ws: &mut Vec<(i64, i64)>) {
+    fn return_steps_ws(self, ws: &mut Vec<(i128, i128)>) {
         *ws = self.steps;
     }
 
     /// Query the load at time point `t`. O(log n) via binary search.
-    fn load_at(&self, t: i64) -> i64 {
+    fn load_at(&self, t: i128) -> i128 {
         if self.steps.is_empty() {
             return 0;
         }
@@ -155,12 +155,12 @@ impl ProfileStepFunction {
     /// profile in the range `[cp_start, cp_end)`.
     fn find_conflict_in_range(
         &self,
-        start: i64,
-        end: i64,
-        demand: i64,
-        capacity: i64,
-        exclude_cp: Option<(i64, i64, i64)>,
-    ) -> Option<i64> {
+        start: i128,
+        end: i128,
+        demand: i128,
+        capacity: i128,
+        exclude_cp: Option<(i128, i128, i128)>,
+    ) -> Option<i128> {
         if self.steps.is_empty() {
             return None;
         }
@@ -210,7 +210,7 @@ impl ProfileStepFunction {
     }
 
     /// Load at time `t` adjusted for an excluded task's compulsory part.
-    fn adjusted_load(&self, t: i64, exclude_cp: Option<(i64, i64, i64)>) -> i64 {
+    fn adjusted_load(&self, t: i128, exclude_cp: Option<(i128, i128, i128)>) -> i128 {
         let base = self.load_at(t);
         if let Some((cp_start, cp_end, dem)) = exclude_cp {
             if cp_start <= t && t < cp_end {
@@ -275,7 +275,7 @@ impl Cumulative {
     /// with `lb(dur)` is always valid.
     ///
     /// Returns `Some((lst, ect))` if the compulsory part is non-empty.
-    fn compulsory_part(&self, i: usize, trail: &IntegerTrail) -> Option<(i64, i64)> {
+    fn compulsory_part(&self, i: usize, trail: &IntegerTrail) -> Option<(i128, i128)> {
         let dur_lb = trail.lb(self.durations[i]);
         let dem_lb = trail.lb(self.demands[i]);
 
@@ -283,8 +283,8 @@ impl Cumulative {
             return None;
         }
 
-        let lst = trail.ub(self.starts[i]); // latest start time
-        let ect = trail.lb(self.starts[i]) + dur_lb; // earliest completion time
+        let lst = i128::from(trail.ub(self.starts[i])); // latest start time
+        let ect = i128::from(trail.lb(self.starts[i])) + i128::from(dur_lb);
 
         if lst < ect {
             Some((lst, ect))
@@ -309,7 +309,7 @@ impl Cumulative {
 
         for i in 0..self.starts.len() {
             if let Some((lst, ect)) = self.compulsory_part(i, trail) {
-                let dem = self.demand_lb(i, trail);
+                let dem = i128::from(self.demand_lb(i, trail));
                 self.ws_events.push(ProfileEvent {
                     time: lst,
                     delta: dem,

@@ -476,20 +476,8 @@ fn flip_op_for_negation(op: Op) -> Op {
 /// arithmetic one. The SAT layer is empty: pure-DL instances have no Boolean
 /// structure, and unassigned arithmetic vars default to 0 in `evaluate_var`.
 fn empty_model_with(lia: Option<ay_lia::LiaModel>, lra: Option<ay_lra::LraModel>) -> Model {
-    Model {
-        sat_model: Vec::new(),
-        term_to_var: HashMap::default(),
-        bool_overrides: HashMap::default(),
-        euf_model: None,
-        array_model: None,
-        lra_model: lra,
-        lia_model: lia,
-        bv_model: None,
-        fp_model: None,
-        string_model: None,
-        seq_model: None,
-        completed_values: HashMap::default(),
-        dt_ground: HashMap::default(),
-        dt_pins: HashMap::default(),
-    }
+    let mut model = Model::empty();
+    model.lia_model = lia;
+    model.lra_model = lra;
+    model
 }

@@ -17,10 +17,16 @@ mod boolean;
 mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
+mod bv_lia_query;
 pub(crate) use bv_bitblast::validate_proof_producing_bv_budget;
 pub use bv_bitblast::{
-    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
-    recognize_bv_ground_evaluate, MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+    authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
+    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+};
+pub use bv_lia_query::{
+    authenticate_bv_lia_unsat_query, AuthenticatedBvLiaUnsatQuery, BvLiaUnsatAuthenticationError,
 };
 mod clausification;
 mod datatype_axiom;
@@ -45,15 +51,24 @@ mod rounding_mode;
 #[path = "set_axiom.rs"]
 mod set_axiom;
 pub use rounding_mode::recognize_rounding_mode_domain;
-pub use set_axiom::EmptySetRegistry;
+pub(crate) use set_axiom::EmptySetRegistry;
 pub use string_ground::recognize_string_ground_eval;
+pub(crate) use string_ground::{
+    STRING_CHAR_ALLOCATION_LIMIT, STRING_EVAL_WORK_LIMIT, STRING_NUMERIC_BIT_ALLOCATION_LIMIT,
+    STRING_NUMERIC_WORK_LIMIT,
+};
 mod fp_bounded;
 pub use fp_bounded::{
     recognize_fp_classification, recognize_fp_classification_op, recognize_fp_rounding_mode_domain,
 };
 mod fp_forward_error;
 pub use fp_forward_error::recognize_fp_forward_error;
+mod fp_ground;
+pub use fp_ground::recognize_fp_ground_eval;
+pub(crate) use fp_ground::FP_GROUND_WORK_LIMIT;
 mod fp_to_bv;
+mod ground_evaluate;
+pub use ground_evaluate::recognize_ground_evaluate;
 mod lia;
 mod lra_farkas;
 pub(crate) mod quantifier;
@@ -70,13 +85,18 @@ use ay_core::{
 use thiserror::Error;
 
 use euf::{validate_euf_congruent, validate_euf_congruent_pred, validate_euf_transitive};
-use euf_step_rules::{validate_cong, validate_refl, validate_symm, validate_trans};
+pub(crate) use euf_step_rules::validate_symm;
+use euf_step_rules::{validate_cong, validate_refl, validate_trans};
 use resolution::{is_valid_binary_resolution, is_valid_rup_step, validate_resolution_rule};
 
 /// Validation failure returned by [`check_proof`].
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProofCheckError {
+    /// A caller-owned aggregate proof-validation resource envelope was
+    /// exhausted or cancelled.
+    #[error("proof validation resource envelope exhausted")]
+    ResourceLimit,
     /// The proof has no steps.
     #[error("proof is empty")]
     EmptyProof,
@@ -319,8 +339,8 @@ pub fn check_proof_collecting_trust_with_context(
     };
     // Same provenance discipline: built once from the PROBLEM, `None` without
     // it so `SetCardEmptyByAssertion` fails closed.
-    let empty_sets = problem_assertions
-        .map(|assertions| set_axiom::EmptySetRegistry::collect(terms, assertions));
+    let empty_sets =
+        problem_assertions.map(|assertions| EmptySetRegistry::collect(terms, assertions));
 
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
     let mut collected: Vec<(ProofId, Vec<TermId>)> = Vec::new();
@@ -457,7 +477,7 @@ pub(crate) fn validate_step_with_datatypes(
     ext_diff: Option<&ExtDiffRegistry>,
     // Problem-derived registry of sets asserted empty; `None` keeps
     // `SetCardEmptyByAssertion` fail-closed.
-    empty_sets: Option<&set_axiom::EmptySetRegistry>,
+    empty_sets: Option<&EmptySetRegistry>,
     // Deferred-trust recovery (see [`validate_step`]): when `Some`, a strict
     // `Trust` step is collected for independent discharge instead of rejected.
     mut trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
@@ -600,7 +620,7 @@ fn validate_theory_lemma(
     // Problem-derived registry of sets asserted empty. `None` keeps
     // `TheoryLemmaKind::SetCardEmptyByAssertion` fail-closed, exactly as a
     // `None` `ext_diff` does for array extensionality.
-    empty_sets: Option<&set_axiom::EmptySetRegistry>,
+    empty_sets: Option<&EmptySetRegistry>,
     // When `Some` AND a strict trust-kind (`Generic`) theory lemma is encountered,
     // the lemma is DEFERRED (its clause collected for independent re-discharge)
     // instead of rejected — the theory-lemma analogue of the `Step{rule:Trust}`
@@ -677,6 +697,16 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::FpRoundingModeDomain => {
                 fp_bounded::validate_fp_rounding_mode_domain(terms, step_id, clause)?;
+            }
+            // Exact IEEE-754 evaluation (`fp_ground`): the clause is TRUE under
+            // every assignment of whatever variables survive its own ground
+            // bindings, decided by an INDEPENDENT correctly-rounded
+            // integer/rational kernel — not by `f64`, and not by the solver's
+            // evaluator. This is a full semantic validation rather than a
+            // schema check; unsupported operators, unbounded variable domains
+            // and budget exhaustion all fail closed.
+            TheoryLemmaKind::FpGroundEval => {
+                fp_ground::validate_fp_ground_eval(terms, step_id, clause)?;
             }
             TheoryLemmaKind::RoundingModeDomain => {
                 rounding_mode::validate_rounding_mode_domain(terms, step_id, clause)?;
@@ -815,6 +845,27 @@ fn validate_theory_lemma(
                     });
                 }
             },
+            // Finite-enum pigeonhole. Same fail-closed contract as the sibling
+            // above: without the datatype registry the checker cannot establish
+            // the constructor count or the nullarity the argument rests on, so
+            // the kind is rejected rather than assumed.
+            TheoryLemmaKind::DatatypeEnumPigeonhole => match dt_decls {
+                Some(decls) => {
+                    datatype_axiom::validate_datatype_enum_pigeonhole(
+                        terms,
+                        step_id,
+                        clause,
+                        decls,
+                        ctor_selectors,
+                    )?;
+                }
+                None => {
+                    return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
+                        step: step_id,
+                        kind,
+                    });
+                }
+            },
             // Datatype selector projection (#trust-count→0).
             //
             // `(= (sel_i (C a_0 .. a_n)) a_i)` — reading field `i` of a
@@ -938,14 +989,9 @@ fn validate_generic_step(
         // Alethe resolution is N-ARY (#dt-premise-binding). Arity 2 keeps the
         // binary check verbatim; other arities fold the chain, which is what
         // lets emitters replace an O(n^2)-text binary triangle with one step.
-        AletheRule::Resolution | AletheRule::ThResolution => validate_resolution_rule(
-            terms,
-            step_id,
-            rule,
-            clause,
-            &premise_clauses,
-            args.first().copied(),
-        )?,
+        AletheRule::Resolution | AletheRule::ThResolution => {
+            validate_resolution_rule(terms, step_id, rule, clause, &premise_clauses, args)?
+        }
         AletheRule::Drup => {
             if !is_valid_rup_step(terms, clause, derived_clauses) {
                 return Err(ProofCheckError::InvalidDrup { step: step_id });
@@ -1096,7 +1142,26 @@ fn validate_generic_step(
             euf::validate_distinct_elim(terms, step_id, clause)?;
         }
         AletheRule::Evaluate if strict => {
-            bv_bitblast::validate_bv_ground_evaluate(terms, step_id, clause, premises.len(), args)?;
+            if ground_evaluate::validate_ground_evaluate(
+                terms,
+                step_id,
+                clause,
+                premises.len(),
+                args,
+            )
+            .is_err()
+            {
+                // `evaluate` also has a deliberately separate closed-BV
+                // concat fragment.  Both validators are independent and
+                // fail-closed; admission by either exact semantics is enough.
+                bv_bitblast::validate_bv_ground_evaluate(
+                    terms,
+                    step_id,
+                    clause,
+                    premises.len(),
+                    args,
+                )?;
+            }
         }
         AletheRule::LaDisequality if strict => {
             lia::validate_la_disequality(terms, step_id, clause, premises.len(), args)?;

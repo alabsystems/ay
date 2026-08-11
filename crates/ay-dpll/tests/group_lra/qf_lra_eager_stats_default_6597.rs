@@ -107,16 +107,18 @@ fn test_default_qf_lra_unsat_exports_eager_stats_6597() {
     let input = r#"
         (set-logic QF_LRA)
         (declare-const x Real)
+        (declare-const y Real)
         (assert (>= x 1.0))
-        (assert (<= x 0.0))
+        (assert (>= y 1.0))
+        (assert (<= (+ x y) 1.0))
         (check-sat)
     "#;
 
     let (exec, outputs) = run_script(input);
     assert_eq!(outputs, vec!["unsat"]);
 
-    // Even on a trivially UNSAT problem, the eager extension should have been
-    // invoked at least once to discover the conflict.
+    // This infeasibility requires the multi-variable simplex/eager path rather
+    // than being eliminated as a contradictory direct bound before DPLL.
     let propagate_calls = int_stat(&exec, "dpll.eager.propagate_calls");
     assert!(
         propagate_calls > 0,

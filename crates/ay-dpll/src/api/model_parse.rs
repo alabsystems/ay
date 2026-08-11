@@ -23,8 +23,7 @@ fn parse_define_fun(line: &str) -> Option<(String, String, String)> {
     let name = parts.next()?.to_string();
     let rest = parts.next()?;
 
-    // Find where sort ends and value begins
-    // Sort can be: Int, Real, Bool, (_ BitVec N)
+    // Find the value after an Int, Real, Bool, or `(_ BitVec N)` sort.
     let (sort, value) = if rest.starts_with("(_ ") {
         // Indexed sort like (_ BitVec 32)
         let sort_end = rest.find(')')? + 1;
@@ -519,7 +518,8 @@ pub(super) fn parse_get_value_output(
         }
 
         let value_sexp = &items[1];
-        let sort = term_store.sort(term.0);
+        // The caller authenticates the term slice; use its validated numeric ID.
+        let sort = term_store.sort(term.id());
         values.push(parse_value_sexp(value_sexp, sort));
     }
 

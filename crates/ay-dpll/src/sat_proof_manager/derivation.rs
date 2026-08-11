@@ -536,7 +536,7 @@ impl SatProofManager<'_> {
     /// to a premiseless `trust`, and the collapse shape is no longer recognizable
     /// — every specialized rebuild silently declines and the refutation publishes
     /// as an unattributed `hole` (or is rejected outright as a trust step).
-    fn canonicalize_tautology_clause(
+    pub(super) fn canonicalize_tautology_clause(
         terms: &mut TermStore,
         rule: &AletheRule,
         source: TermId,

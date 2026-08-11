@@ -465,7 +465,7 @@ fn test_int_to_real() {
     let mut solver = Solver::new(Logic::QfLira);
     let i = solver.int_const(42);
     let r = solver.int_to_real(i);
-    assert_eq!(solver.terms().sort(r.0), &Sort::Real);
+    assert_eq!(solver.terms().sort(r.id()), &Sort::Real);
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn test_real_to_int() {
     let mut solver = Solver::new(Logic::QfLira);
     let r = solver.real_const(3.7);
     let i = solver.real_to_int(r);
-    assert_eq!(solver.terms().sort(i.0), &Sort::Int);
+    assert_eq!(solver.terms().sort(i.id()), &Sort::Int);
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn test_is_int() {
     let mut solver = Solver::new(Logic::QfLira);
     let r = solver.real_const(3.0);
     let b = solver.is_int(r);
-    assert_eq!(solver.terms().sort(b.0), &Sort::Bool);
+    assert_eq!(solver.terms().sort(b.id()), &Sort::Bool);
 }
 
 #[test]
@@ -1886,8 +1886,10 @@ fn test_funcdecl_display() {
     // 0-arity function (constant)
     let f0 = FuncDecl {
         name: "c".to_string(),
+        core_name: "c".to_string(),
         domain: vec![],
         range: Sort::Int,
+        identity: None,
     };
     assert_eq!(format!("{f0}"), "c : Int");
 
@@ -3087,9 +3089,8 @@ fn native_bv_boundary_scans_unused_quantifier_binder_sort() {
 
 #[test]
 fn native_bv_boundary_scans_optimization_objective_dag() {
-    // Objective solving bypasses `check_sat_guarded`, and `int2bv` historically
-    // accepted an arbitrary native width. The objective DAG needs the same
-    // preflight before finite-domain binary search computes 2^width.
+    // Objective solving bypasses `check_sat_guarded`; preflight its DAG before
+    // finite-domain binary search computes 2^width.
     let mut solver = Solver::new(Logic::All);
     let x = solver.int_var("objective_source");
     let oversized = solver.int2bv(x, FIRST_UNSUPPORTED_NATIVE_BV_WIDTH);
@@ -3100,9 +3101,8 @@ fn native_bv_boundary_scans_optimization_objective_dag() {
 
 #[test]
 fn native_bv_boundary_scans_maxsmt_soft_dag_before_scaffolding() {
-    // Native soft terms are installed only for `check_sat_max`; preflight them
-    // before relaxation/cardinality scaffolding rather than waiting for a later
-    // feasibility probe to rediscover the unsupported width.
+    // Preflight native soft terms before relaxation/cardinality scaffolding,
+    // rather than rediscovering the unsupported width during feasibility.
     let mut solver = Solver::new(Logic::All);
     let x = solver.int_var("soft_source_x");
     let y = solver.int_var("soft_source_y");

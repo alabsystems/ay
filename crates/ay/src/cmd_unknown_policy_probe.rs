@@ -435,6 +435,29 @@ fn exercise_natural_origin(executor: &mut Executor, origin: UnknownOrigin) -> Re
                 bail!("interrupt origin did not produce Unknown");
             }
         }
+        UnknownOrigin::TerminalTrust => {
+            // The #8759 strict-proof gate has a deterministic natural
+            // producer, so it is exercised rather than fault-injected. AY
+            // refutes this problem cleanly — no `trust`/`hole` step, every
+            // `assume` provenance-backed — but the refutation is stated over a
+            // `Seq` sort no external checker can parse, so under strict proofs
+            // the certified UNSAT is withheld.
+            let script = "(set-option :produce-proofs true)\n\
+                          (set-option :check-proofs-strict true)\n\
+                          (set-logic ALL)\n\
+                          (declare-const s (Seq Int))\n\
+                          (assert (= (seq.len s) 1))\n\
+                          (assert (= (seq.len s) 2))\n\
+                          (check-sat)\n";
+            let commands = ay_frontend::parse(script)
+                .context("parsing the strict-proof terminal-trust fixture")?;
+            let outputs = executor
+                .execute_all(&commands)
+                .context("triggering strict-proof terminal-trust Unknown origin")?;
+            if outputs.last().map(String::as_str) != Some("unknown") {
+                bail!("strict-proof terminal-trust origin did not produce Unknown");
+            }
+        }
         _ => bail!(
             "origin={} has no natural conformance fixture",
             origin.code()
@@ -447,7 +470,8 @@ fn trigger_kind(origin: UnknownOrigin) -> &'static str {
     match origin {
         UnknownOrigin::SolveDeadline
         | UnknownOrigin::MemoryBudget
-        | UnknownOrigin::InterruptFlag => "natural-public-query",
+        | UnknownOrigin::InterruptFlag
+        | UnknownOrigin::TerminalTrust => "natural-public-query",
         _ => "authoritative-origin-publication-fault-injection",
     }
 }
@@ -494,6 +518,7 @@ fn origin_fixture(origin: UnknownOrigin) -> &'static str {
         UnknownOrigin::UntaggedSolverUnknown => {
             "fault.untagged-solver-unknown.authoritative-publication"
         }
+        UnknownOrigin::TerminalTrust => "natural.check-sat.strict-proof-terminal-trust",
     }
 }
 

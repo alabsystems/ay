@@ -17,6 +17,7 @@ use ay_cp::propagator::Constraint;
 use ay_cp::variable::IntVarId;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::linear_encoding_overflow;
 use super::{CpContext, MAX_MATERIALIZED_VALUES};
 
 #[derive(Clone, Copy)]
@@ -586,7 +587,7 @@ impl CpContext {
                 one
             } else {
                 let equal = self.new_aux_bool();
-                self.add_reif_eq(&[1, -1], &[b1, b2], 0, equal);
+                self.add_reif_eq(&[1, -1], &[b1, b2], 0, equal, operation)?;
                 equal
             };
             let equal_branch = self.add_bool_conjunction(&[(equal, true), (lex_next, true)]);
@@ -785,7 +786,8 @@ impl CpContext {
                 constraint: "array_set_element".into(),
             });
         }
-        let n = const_sets.len() as i64;
+        let n = i64::try_from(const_sets.len())
+            .map_err(|_| linear_encoding_overflow("array_set_element"))?;
         let index_0 = self.engine.new_int_var(ay_cp::Domain::new(0, n - 1), None);
         self.engine.add_constraint(Constraint::LinearEq {
             coeffs: vec![1, -1],
@@ -802,7 +804,8 @@ impl CpContext {
                 self.engine.add_constraint(Constraint::LinearNotEqual {
                     coeffs: vec![1],
                     vars: vec![index_0],
-                    rhs: offset as i64,
+                    rhs: i64::try_from(offset)
+                        .map_err(|_| linear_encoding_overflow("array_set_element"))?,
                 });
             }
         }
@@ -852,7 +855,8 @@ impl CpContext {
                 .map(|(set_lo, indicators)| (*set_lo, indicators.as_slice())),
         );
         let elems = combined_set_values(&domains, "array_set_element")?;
-        let n = array_sets.len() as i64;
+        let n = i64::try_from(array_sets.len())
+            .map_err(|_| linear_encoding_overflow("array_set_element"))?;
         let zero = self.get_const_var(0);
         let index_0 = self.engine.new_int_var(ay_cp::Domain::new(0, n - 1), None);
         self.engine.add_constraint(Constraint::LinearEq {

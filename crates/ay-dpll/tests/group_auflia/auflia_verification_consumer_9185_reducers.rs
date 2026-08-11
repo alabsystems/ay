@@ -65,8 +65,8 @@ fn symbolic_address_frame_independence_native_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn slice_index_has_value_usize_reducer_is_sat() {
-    expect_sat(
+fn slice_index_has_value_usize_fails_closed_without_total_model() {
+    expect_unknown(
         include_str!("../fixtures/verification_consumer_9185/slice_index_has_value_usize_sat.smt2"),
         "ay#9185 slice_index has_value_usize reducer",
     );
@@ -74,8 +74,8 @@ fn slice_index_has_value_usize_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn slice_index_in_bounds_usize_reducer_is_sat() {
-    expect_sat(
+fn slice_index_in_bounds_usize_fails_closed_without_total_model() {
+    expect_unknown(
         include_str!("../fixtures/verification_consumer_9185/slice_index_in_bounds_usize_sat.smt2"),
         "ay#9185 slice_index in_bounds_usize reducer",
     );
@@ -83,8 +83,8 @@ fn slice_index_in_bounds_usize_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn slice_index_in_bounds_range_inclusive_reducer_is_sat() {
-    expect_sat(
+fn slice_index_in_bounds_range_inclusive_fails_closed_without_total_model() {
+    expect_unknown(
         include_str!(
             "../fixtures/verification_consumer_9185/slice_index_in_bounds_range_inclusive_sat.smt2"
         ),
@@ -94,8 +94,8 @@ fn slice_index_in_bounds_range_inclusive_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn option_constructor_membership_axiom_reducer_is_sat() {
-    expect_sat(
+fn option_constructor_membership_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun logic_Some (Int) Int)
@@ -129,8 +129,8 @@ fn option_constructor_membership_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn option_none_some_disjointness_axiom_reducer_is_sat() {
-    expect_sat(
+fn option_none_some_disjointness_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun logic_None () Int)
@@ -181,8 +181,8 @@ fn option_none_some_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_symbolic_mod_bucket_index_reducer_is_sat() {
-    expect_sat(
+fn hashmap_symbolic_mod_bucket_index_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -442,8 +442,10 @@ fn seq_elem_list_injectivity_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_invariant_bounded_good_bucket_axiom_reducer_is_sat() {
-    expect_sat(
+fn hashmap_invariant_bounded_good_bucket_axiom_is_soundly_unknown_without_model_certificate() {
+    // This is satisfiable (for example, seq_len_proxy = 0 makes every guard
+    // vacuous), but AY has not constructed and rechecked a total interpretation.
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -475,8 +477,8 @@ fn hashmap_invariant_bounded_good_bucket_axiom_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_ix_symbolic_mod_definition_axiom_reducer_is_sat() {
-    expect_sat(
+fn hashmap_bucket_ix_symbolic_mod_definition_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -496,8 +498,8 @@ fn hashmap_bucket_ix_symbolic_mod_definition_axiom_reducer_is_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_ix_zero_divisor_seq_definition_axiom_reducer_is_sat() {
-    expect_sat(
+fn hashmap_bucket_ix_zero_divisor_seq_definition_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic ALL)
 (declare-sort MyHashMap 0)
@@ -546,8 +548,8 @@ fn hashmap_bucket_ix_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_concat_len_definition_axiom_reducer_is_sat() {
-    expect_sat(
+fn seq_concat_len_definition_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_concat ((Seq Int) (Seq Int)) (Seq Int))
@@ -587,8 +589,10 @@ fn seq_concat_len_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_concat_len_and_bucket_ix_definitions_are_sat() {
-    expect_sat(
+fn seq_concat_len_and_bucket_ix_definitions_are_soundly_unknown_without_joint_model() {
+    // Each axiom family is satisfiable, but the mixed bundle has no jointly
+    // materialized and rechecked model. Per-axiom syntax is not SAT authority.
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -614,8 +618,8 @@ fn seq_concat_len_and_bucket_ix_definitions_are_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_contains_push_back_definition_axiom_reducer_is_sat() {
-    expect_sat(
+fn seq_contains_push_back_definition_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_push_back ((Seq Int) Int) (Seq Int))
@@ -652,8 +656,8 @@ fn seq_contains_push_back_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_empty_contains_axiom_reducer_is_sat() {
-    expect_sat(
+fn seq_empty_contains_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_empty () (Seq Int))
@@ -687,8 +691,29 @@ fn seq_empty_contains_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_len_nonnegative_axiom_reducer_is_sat() {
-    expect_sat(
+fn unrelated_quantifier_consumer_trigger_never_certifies_seq_empty_contains_sat() {
+    expect_not_sat(
+        r#"
+(set-logic ALL)
+(declare-fun seq_contains ((Seq Int) Int) Bool)
+(declare-const seq_empty (Seq Int))
+(declare-const other (Seq Int))
+(assert (distinct seq_empty other))
+(assert (forall ((x Int))
+    (! (not (seq_contains seq_empty x))
+       :pattern ((seq_contains other x)))))
+(assert (not (seq_contains other 0)))
+(assert (seq_contains seq_empty 1))
+(check-sat)
+"#,
+        "unrelated seq_contains trigger must not certify a contradictory universal",
+    );
+}
+
+#[test]
+#[timeout(30_000)]
+fn seq_len_nonnegative_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_len ((Seq Int)) Int)
@@ -721,8 +746,8 @@ fn seq_len_nonnegative_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_select_bridge_axiom_reducer_is_sat() {
-    expect_sat(
+fn seq_select_bridge_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_array ((Seq Int)) (Array Int Int))
@@ -762,8 +787,8 @@ fn seq_select_bridge_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_get_in_bounds_axiom_reducer_is_sat() {
-    expect_sat(
+fn seq_get_in_bounds_axiom_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_get ((Seq Int) Int) Int)
@@ -856,8 +881,8 @@ fn seq_index_restore_ground_bridge_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_index_restore_with_verification_consumer_quantifiers_and_symbolic_mod_is_sat() {
-    expect_sat(
+fn seq_index_restore_with_verification_consumer_quantifiers_and_symbolic_mod_fails_closed() {
+    expect_unknown(
         r#"
 (set-logic ALL)
 (declare-datatype List ((nil) (cons (hd Int) (tl List))))
@@ -946,8 +971,10 @@ fn verification_consumer_bucket_mod_ground_completion_rejects_concrete_contradic
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_invariant_nested_definition_reducer_is_sat() {
-    expect_sat(
+fn hashmap_invariant_nested_definition_is_soundly_unknown_without_model_certificate() {
+    // This is satisfiable (choose seq_len_proxy = 0 and the invariant false),
+    // but the nested quantified RHS has no constructive total-model certificate.
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -1036,8 +1063,8 @@ fn ematching_exists_does_not_mask_ground_unsat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_guarded_frame_clause_reducer_is_sat() {
-    expect_sat(
+fn hashmap_bucket_guarded_frame_clause_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -1097,8 +1124,8 @@ fn hashmap_bucket_guarded_frame_clause_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_range_guarded_frame_clause_reducer_is_sat() {
-    expect_sat(
+fn hashmap_bucket_range_guarded_frame_clause_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -1308,8 +1335,8 @@ fn positive_symbolic_mod_bounds_discharge_resize_frame_split_with_list_carriers(
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_logic_no_double_binding_invariant_reducer_is_sat() {
-    expect_sat(
+fn hashmap_logic_no_double_binding_invariant_fails_closed_without_total_model() {
+    expect_unknown(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)

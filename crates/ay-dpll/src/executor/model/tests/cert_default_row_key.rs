@@ -85,14 +85,20 @@ const NONZERO_POINT_ASSERTIONS: &str = "\
 ";
 
 /// Run a script whose last two commands are `(check-sat)` `(get-model)`.
-fn check_sat_and_get_model(input: &str) -> (String, String) {
+fn check_sat_and_get_model(input: &str) -> (String, String, String) {
     let commands = parse(input).expect("valid SMT-LIB input");
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).expect("execute succeeds");
+    let diagnostic = format!(
+        "reason={:?}, origin={:?}, detail={:?}",
+        exec.unknown_reason(),
+        exec.unknown_origin(),
+        exec.statistics().get_string("unknown.detail"),
+    );
     let mut outputs = outputs.into_iter();
     let verdict = outputs.next().expect("a check-sat verdict");
     let model = outputs.next().expect("a get-model output");
-    (verdict, model)
+    (verdict, model, diagnostic)
 }
 
 /// Strip the `(model ... )` wrapper, yielding the `define-fun` block so it can
@@ -121,6 +127,21 @@ fn assert_printed_model_satisfies(model: &str, assertions: &str) {
     let commands = parse(&replay).expect("printed model re-parses as input");
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).expect("replay executes");
+    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+        for &assertion in &exec.ctx.assertions {
+            eprintln!(
+                "CERT/default-row-replay-root: {assertion:?} {}",
+                exec.format_term(assertion)
+            );
+        }
+        eprintln!(
+            "CERT/default-row-replay-unknown: reason={:?} origin={:?} detail={:?} gate={:?}",
+            exec.unknown_reason(),
+            exec.unknown_origin(),
+            exec.statistics().get_string("unknown.detail"),
+            exec.statistics().get_string("model_check_gate.quantified"),
+        );
+    }
     let verdict = outputs.into_iter().next().expect("a check-sat verdict");
     assert_eq!(
         verdict, "sat",
@@ -131,8 +152,8 @@ fn assert_printed_model_satisfies(model: &str, assertions: &str) {
 
 #[test]
 fn certified_point_at_all_zeros_still_prints_a_consistent_table() {
-    let (verdict, model) = check_sat_and_get_model(ZERO_POINT_CERTIFICATE);
-    assert_eq!(verdict, "sat");
+    let (verdict, model, diagnostic) = check_sat_and_get_model(ZERO_POINT_CERTIFICATE);
+    assert_eq!(verdict, "sat", "{diagnostic}");
 
     // The specific fail-closed message the aliased default row produced.
     assert!(
@@ -150,7 +171,7 @@ fn certified_point_at_all_zeros_still_prints_a_consistent_table() {
     // the CERTIFIED one, not a tie broken in the printer.
     let body = model.replace(['\n', ' '], "");
     assert!(
-        body.contains("(ite(=x00)-10)"),
+        body.contains("(ite(=x00)(-1)0)"),
         "printed body is not the certified interpretation (ite (= x0 0) -1 0): {model}"
     );
 
@@ -159,15 +180,15 @@ fn certified_point_at_all_zeros_still_prints_a_consistent_table() {
 
 #[test]
 fn certified_point_off_all_zeros_is_unchanged() {
-    let (verdict, model) = check_sat_and_get_model(NONZERO_POINT_CERTIFICATE);
-    assert_eq!(verdict, "sat");
+    let (verdict, model, diagnostic) = check_sat_and_get_model(NONZERO_POINT_CERTIFICATE);
+    assert_eq!(verdict, "sat", "{diagnostic}");
     assert!(
         !model.contains("(error"),
         "get-model errored on a validated model: {model}"
     );
     let body = model.replace(['\n', ' '], "");
     assert!(
-        body.contains("(ite(=x01)-10)"),
+        body.contains("(ite(=x01)(-1)0)"),
         "printed body is not the certified interpretation (ite (= x0 1) -1 0): {model}"
     );
     assert_printed_model_satisfies(&model, NONZERO_POINT_ASSERTIONS);

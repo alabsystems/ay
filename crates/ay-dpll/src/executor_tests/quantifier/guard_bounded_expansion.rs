@@ -96,6 +96,30 @@ fn guarded_pointwise_axiom_in_range_conflict_stays_unsat() {
     );
 }
 
+/// A syntactic conjunction of Int bounds is not a guard on a universal: Int's
+/// carrier still includes every value outside the box. The former generic
+/// product path enumerated only `(0,0)`, folded the replacement to `true`, and
+/// could feed a false SAT candidate to later publication logic.
+#[test]
+fn conjunctively_bounded_multi_int_forall_never_publishes_sat() {
+    let input = r#"
+        (set-logic LIA)
+        (assert (forall ((x Int) (y Int))
+          (and (<= 0 x) (<= x 0) (<= 0 y) (<= y 0))))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execution succeeds");
+
+    assert_ne!(
+        outputs,
+        vec!["sat"],
+        "the authored universal is false outside (0,0); a bounded product must not replace it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #bv-forall-const-expansion — the expansion PROVENANCE record must survive an
 // expansion whose instances constant-fold.

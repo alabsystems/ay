@@ -7,9 +7,54 @@
 //! Methods for incremental optimization: objective registration, bound
 //! tightening, solution blocking, VSIDS activity boosting, and phase guidance.
 
+use std::collections::BTreeSet;
+
 use crate::variable::IntVarId;
 
 use super::CpSatEngine;
+
+/// Errors from incremental constraints that require an existing order literal.
+///
+/// [`CpSatEngine::pre_compile`] and [`CpSatEngine::solve`] allocate every
+/// in-domain order literal. Receiving this error therefore means an
+/// incremental constraint was requested before either operation completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IncrementalEncodingError {
+    /// An exact assignment to block contains a value outside the variable's
+    /// declared domain, so it is not a solver assignment.
+    #[error("cannot block value {value} for {variable:?}: value is outside domain [{lb}, {ub}]")]
+    AssignmentValueOutsideDomain {
+        /// Variable whose alleged assignment value is invalid.
+        variable: IntVarId,
+        /// Value supplied by the caller.
+        value: i64,
+        /// Declared lower bound.
+        lb: i64,
+        /// Declared upper bound.
+        ub: i64,
+    },
+
+    /// An assignment slice named the same integer variable more than once.
+    #[error("cannot block assignment: {variable:?} appears more than once")]
+    DuplicateAssignmentVariable {
+        /// Repeated variable identifier.
+        variable: IntVarId,
+    },
+
+    /// A non-trivial incremental bound needs an order literal that has not
+    /// been allocated yet.
+    #[error(
+        "{operation} requires an unallocated order literal for {variable:?} at bound {value}; call pre_compile() or solve() first"
+    )]
+    MissingOrderLiteral {
+        /// Incremental operation requesting the literal.
+        operation: &'static str,
+        /// Variable constrained by the operation.
+        variable: IntVarId,
+        /// User-facing bound or assignment value.
+        value: i64,
+    },
+}
 
 impl CpSatEngine {
     /// Set the optimization objective variable and direction.
@@ -33,47 +78,177 @@ impl CpSatEngine {
     /// from the given assignment. Uses the order encoding directly:
     /// `OR_i(¬[x_i >= v_i] ∨ [x_i >= v_i + 1])`.
     ///
-    /// Must be called after at least one `solve()` call (so that order-
-    /// encoding literals are pre-allocated).
+    /// Must normally be called after [`Self::pre_compile`] or [`Self::solve`]
+    /// so that order-encoding literals are allocated. Empty assignments and
+    /// assignments consisting only of fixed variables need no literals and
+    /// immediately add a contradiction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the assignment is invalid or a required order literal has
+    /// not been allocated. Use [`Self::try_block_assignment`] to handle that
+    /// misuse as a typed error.
     pub fn block_assignment(&mut self, assignment: &[(IntVarId, i64)]) {
+        self.try_block_assignment(assignment)
+            .expect("cannot block assignment");
+    }
+
+    /// Fallible form of [`Self::block_assignment`].
+    ///
+    /// The blocking clause is assembled completely before it is installed, so
+    /// an error leaves the SAT solver unchanged.
+    pub fn try_block_assignment(
+        &mut self,
+        assignment: &[(IntVarId, i64)],
+    ) -> Result<(), IncrementalEncodingError> {
+        // Validate the entire alleged assignment before looking up any order
+        // literal. This makes duplicate/out-of-domain diagnostics independent
+        // of preallocation state and keeps every failure atomic.
+        let mut seen = BTreeSet::new();
+        for &(var, val) in assignment {
+            if !seen.insert(var) {
+                return Err(IncrementalEncodingError::DuplicateAssignmentVariable {
+                    variable: var,
+                });
+            }
+            let (lb, ub) = self.encoder.var_bounds(var);
+            if val < lb || val > ub {
+                return Err(IncrementalEncodingError::AssignmentValueOutsideDomain {
+                    variable: var,
+                    value: val,
+                    lb,
+                    ub,
+                });
+            }
+        }
+
         let mut clause = Vec::new();
         for &(var, val) in assignment {
+            let (lb, ub) = self.encoder.var_bounds(var);
             // x_i != v_i ↔ (x_i < v_i) ∨ (x_i > v_i)
             // In order encoding: ¬[x_i >= v_i] ∨ [x_i >= v_i + 1]
-            if let Some(lit) = self.encoder.lookup_ge(var, val) {
-                clause.push(lit.negated()); // x_i < v_i
+            // Domain-impossible disjuncts are omitted. If every variable is
+            // fixed to the supplied value, the resulting empty clause is the
+            // required contradiction: there is no different assignment.
+            if val > lb {
+                let lit = self.encoder.lookup_ge(var, val).ok_or(
+                    IncrementalEncodingError::MissingOrderLiteral {
+                        operation: "blocking an assignment",
+                        variable: var,
+                        value: val,
+                    },
+                )?;
+                clause.push(lit.negated()); // x_i < val
             }
-            if let Some(next_value) = val.checked_add(1) {
-                if let Some(lit) = self.encoder.lookup_ge(var, next_value) {
-                    clause.push(lit); // x_i > v_i
-                }
+            if val < ub {
+                // `val < ub <= i64::MAX`, so the successor exists.
+                let next_value = val + 1;
+                let lit = self.encoder.lookup_ge(var, next_value).ok_or(
+                    IncrementalEncodingError::MissingOrderLiteral {
+                        operation: "blocking an assignment",
+                        variable: var,
+                        value: val,
+                    },
+                )?;
+                clause.push(lit); // x_i > val
             }
         }
-        if !clause.is_empty() {
+
+        // An empty clause is intentional for an empty projection or a
+        // projection made entirely of fixed variables: it blocks the sole
+        // projected solution and makes the next solve UNSAT.
+        if clause.is_empty() {
+            self.mark_permanently_inconsistent();
+        } else {
             self.sat.add_clause(clause);
         }
+        Ok(())
     }
 
     /// Add a direct SAT-level upper bound: `x <= value`.
     ///
     /// In order encoding this is `¬[x >= value + 1]`, added as a unit clause.
-    /// Must be called after at least one `solve()` call.
+    /// # Panics
+    ///
+    /// Panics when a non-trivial bound needs an order literal that has not
+    /// been allocated. Use [`Self::try_add_upper_bound`] to handle that misuse
+    /// as a typed error.
     pub fn add_upper_bound(&mut self, var: IntVarId, value: i64) {
-        if let Some(next_value) = value.checked_add(1) {
-            if let Some(lit) = self.encoder.lookup_ge(var, next_value) {
-                self.sat.add_clause(vec![lit.negated()]);
-            }
+        self.try_add_upper_bound(var, value)
+            .expect("cannot add upper bound");
+    }
+
+    /// Fallible form of [`Self::add_upper_bound`].
+    ///
+    /// Bounds at or above the declared upper bound are tautologies. Bounds
+    /// below the declared lower bound add an empty clause immediately. Only a
+    /// bound strictly inside the domain requires a pre-allocated literal.
+    pub fn try_add_upper_bound(
+        &mut self,
+        var: IntVarId,
+        value: i64,
+    ) -> Result<(), IncrementalEncodingError> {
+        let (lb, ub) = self.encoder.var_bounds(var);
+        if value >= ub {
+            return Ok(());
         }
+        if value < lb {
+            self.mark_permanently_inconsistent();
+            return Ok(());
+        }
+
+        let lit = self.encoder.lookup_le(var, value).ok_or(
+            IncrementalEncodingError::MissingOrderLiteral {
+                operation: "adding an upper bound",
+                variable: var,
+                value,
+            },
+        )?;
+        self.sat.add_clause(vec![lit]);
+        Ok(())
     }
 
     /// Add a direct SAT-level lower bound: `x >= value`.
     ///
     /// In order encoding this is `[x >= value]`, added as a unit clause.
-    /// Must be called after at least one `solve()` call.
+    /// # Panics
+    ///
+    /// Panics when a non-trivial bound needs an order literal that has not
+    /// been allocated. Use [`Self::try_add_lower_bound`] to handle that misuse
+    /// as a typed error.
     pub fn add_lower_bound(&mut self, var: IntVarId, value: i64) {
-        if let Some(lit) = self.encoder.lookup_ge(var, value) {
-            self.sat.add_clause(vec![lit]);
+        self.try_add_lower_bound(var, value)
+            .expect("cannot add lower bound");
+    }
+
+    /// Fallible form of [`Self::add_lower_bound`].
+    ///
+    /// Bounds at or below the declared lower bound are tautologies. Bounds
+    /// above the declared upper bound add an empty clause immediately. Only a
+    /// bound strictly inside the domain requires a pre-allocated literal.
+    pub fn try_add_lower_bound(
+        &mut self,
+        var: IntVarId,
+        value: i64,
+    ) -> Result<(), IncrementalEncodingError> {
+        let (lb, ub) = self.encoder.var_bounds(var);
+        if value <= lb {
+            return Ok(());
         }
+        if value > ub {
+            self.mark_permanently_inconsistent();
+            return Ok(());
+        }
+
+        let lit = self.encoder.lookup_ge(var, value).ok_or(
+            IncrementalEncodingError::MissingOrderLiteral {
+                operation: "adding a lower bound",
+                variable: var,
+                value,
+            },
+        )?;
+        self.sat.add_clause(vec![lit]);
+        Ok(())
     }
 
     /// Boost VSIDS activity of the objective variable's order-encoding literals
@@ -216,16 +391,31 @@ impl CpSatEngine {
         minimize: bool,
         probe_timeout: Option<std::time::Duration>,
     ) -> Option<bool> {
-        // Get the assumption literal for the bound.
+        if self.permanently_inconsistent {
+            return Some(false);
+        }
+        let (lb, ub) = self.encoder.var_bounds(var);
+
+        // Classify bounds against the declared domain before looking up an
+        // order literal. Outside bounds can be decided exactly, while a
+        // domain-tautological bound intentionally probes the base SAT model.
         let assumption = if minimize {
-            // obj <= value  →  assume ¬[obj >= value + 1]
-            value
-                .checked_add(1)
-                .and_then(|next_value| self.encoder.lookup_ge(var, next_value))
-                .map(ay_sat::Literal::negated)
+            if value < lb {
+                return Some(false);
+            }
+            if value >= ub {
+                None
+            } else {
+                // obj <= value, where lb <= value < ub.
+                Some(self.encoder.lookup_le(var, value)?)
+            }
+        } else if value > ub {
+            return Some(false);
+        } else if value <= lb {
+            None
         } else {
-            // obj >= value  →  assume [obj >= value]
-            self.encoder.lookup_ge(var, value)
+            // obj >= value, where lb < value <= ub.
+            Some(self.encoder.lookup_ge(var, value)?)
         };
 
         // Set a short timeout for probing.
@@ -279,18 +469,32 @@ impl CpSatEngine {
         let (domain_lb, domain_ub) = self.encoder.var_bounds(var);
 
         let (mut lo, mut hi) = if minimize {
-            // Search range for minimization: optimal is in [domain_lb, current_best - 1]
-            (domain_lb, current_best - 1)
+            // Search range for minimization: optimal is in
+            // [domain_lb, current_best - 1]. At i64::MIN there is no strictly
+            // better representable value.
+            let Some(hi) = current_best.checked_sub(1) else {
+                return domain_lb;
+            };
+            (domain_lb, hi)
         } else {
-            // Search range for maximization: optimal is in [current_best + 1, domain_ub]
-            (current_best + 1, domain_ub)
+            // Search range for maximization: optimal is in
+            // [current_best + 1, domain_ub]. At i64::MAX there is no strictly
+            // better representable value.
+            let Some(lo) = current_best.checked_add(1) else {
+                return domain_ub;
+            };
+            (lo, domain_ub)
         };
 
         let mut proven_bound = if minimize { domain_lb } else { domain_ub };
         let mut probes_done = 0;
 
         while lo <= hi && probes_done < max_probes {
-            let mid = lo + (hi - lo) / 2;
+            let mid = if minimize {
+                floor_midpoint(lo, hi)
+            } else {
+                ceil_midpoint(lo, hi)
+            };
 
             let result = self.probe_bound_feasible(var, mid, minimize, Some(probe_timeout));
             probes_done += 1;
@@ -328,5 +532,35 @@ impl CpSatEngine {
         }
 
         proven_bound
+    }
+}
+
+/// Midpoint rounded toward the lower endpoint, without overflowing i64.
+fn floor_midpoint(lo: i64, hi: i64) -> i64 {
+    debug_assert!(lo <= hi);
+    let midpoint = i128::from(lo) + (i128::from(hi) - i128::from(lo)) / 2;
+    midpoint as i64
+}
+
+/// Midpoint rounded toward the upper endpoint, without overflowing i64.
+fn ceil_midpoint(lo: i64, hi: i64) -> i64 {
+    debug_assert!(lo <= hi);
+    let distance = i128::from(hi) - i128::from(lo);
+    let midpoint = i128::from(lo) + (distance + 1) / 2;
+    midpoint as i64
+}
+
+#[cfg(test)]
+mod midpoint_tests {
+    use super::{ceil_midpoint, floor_midpoint};
+
+    #[test]
+    fn negative_adjacent_midpoint_makes_lower_progress() {
+        assert_eq!(floor_midpoint(-2, -1), -2);
+    }
+
+    #[test]
+    fn positive_adjacent_midpoint_makes_upper_progress() {
+        assert_eq!(ceil_midpoint(1, 2), 2);
     }
 }

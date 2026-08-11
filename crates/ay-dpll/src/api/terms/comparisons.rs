@@ -20,8 +20,11 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if arguments have different sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_eq(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("eq", a)?;
+        let b_id = self.resolve_term("eq", b)?;
         self.expect_same_sort("eq", a, b)?;
-        Ok(Term(self.terms_mut().mk_eq(a.0, b.0)))
+        let result = self.terms_mut().mk_eq(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an equality `(a = b)` WITHOUT the eager `(= x (ite c t e))`
@@ -44,8 +47,10 @@ impl Solver {
     /// different sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_eq_no_ite_expand(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
-        let a_sort = self.get_sort(a);
-        let b_sort = self.get_sort(b);
+        let a_id = self.resolve_term("eq_no_ite_expand", a)?;
+        let b_id = self.resolve_term("eq_no_ite_expand", b)?;
+        let a_sort = self.terms().sort(a_id).clone();
+        let b_sort = self.terms().sort(b_id).clone();
         // Mirror try_eq's same-sort precondition, but tolerate Int/Real which
         // mk_eq_coerce_no_ite_expand coerces internally.
         if a_sort != b_sort
@@ -60,7 +65,8 @@ impl Solver {
                 got: vec![a_sort, b_sort],
             });
         }
-        Ok(Term(self.terms_mut().mk_eq_coerce_no_ite_expand(a.0, b.0)))
+        let result = self.terms_mut().mk_eq_coerce_no_ite_expand(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a disequality (a != b).
@@ -122,14 +128,19 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if any two terms have different sorts.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_distinct(&mut self, terms: &[Term]) -> Result<Term, SolverError> {
+        let ids = terms
+            .iter()
+            .copied()
+            .map(|term| self.resolve_term("distinct", term))
+            .collect::<Result<Vec<_>, _>>()?;
         if terms.len() >= 2 {
             let first = terms[0];
             for t in &terms[1..] {
                 self.expect_same_sort("distinct", first, *t)?;
             }
         }
-        let ids: Vec<_> = terms.iter().map(|t| t.0).collect();
-        Ok(Term(self.terms_mut().mk_distinct(ids)))
+        let result = self.terms_mut().mk_distinct(ids);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a less-than comparison (a < b). Panics if sorts don't match.
@@ -140,8 +151,11 @@ impl Solver {
     /// Try to create a less-than comparison (a < b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_lt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("lt", a)?;
+        let b_id = self.resolve_term("lt", b)?;
         self.expect_same_arith_sort("lt", a, b)?;
-        Ok(Term(self.terms_mut().mk_lt(a.0, b.0)))
+        let result = self.terms_mut().mk_lt(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a less-than-or-equal comparison (a <= b). Panics if sorts don't match.
@@ -152,8 +166,11 @@ impl Solver {
     /// Try to create a less-than-or-equal comparison (a <= b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_le(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("le", a)?;
+        let b_id = self.resolve_term("le", b)?;
         self.expect_same_arith_sort("le", a, b)?;
-        Ok(Term(self.terms_mut().mk_le(a.0, b.0)))
+        let result = self.terms_mut().mk_le(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a greater-than comparison (a > b). Panics if sorts don't match.
@@ -164,8 +181,11 @@ impl Solver {
     /// Try to create a greater-than comparison (a > b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_gt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("gt", a)?;
+        let b_id = self.resolve_term("gt", b)?;
         self.expect_same_arith_sort("gt", a, b)?;
-        Ok(Term(self.terms_mut().mk_gt(a.0, b.0)))
+        let result = self.terms_mut().mk_gt(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a greater-than-or-equal comparison (a >= b). Panics if sorts don't match.
@@ -176,7 +196,10 @@ impl Solver {
     /// Try to create a greater-than-or-equal comparison (a >= b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_ge(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("ge", a)?;
+        let b_id = self.resolve_term("ge", b)?;
         self.expect_same_arith_sort("ge", a, b)?;
-        Ok(Term(self.terms_mut().mk_ge(a.0, b.0)))
+        let result = self.terms_mut().mk_ge(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 }

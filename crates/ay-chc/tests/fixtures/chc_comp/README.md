@@ -83,30 +83,29 @@ re-copy every fixture listed above, so the pin and the fixtures cannot drift.
 - `crates/ay-chc/tests/group_soundness/query_safety_free_vars_022c.rs` — `reve/*`
 - `crates/ay-chc/src/transform/interval_propagation_tests.rs` — `hcai/svcomp/O0/O0_lu.cmp_*`
 
-### Staged, not yet wired
+### Benchmark-only capability targets
 
 `solidity/abi_encode_array_slice.sol_0_no_adts_000.smt2` and
 `solidity/abi_encode_packed_array_slice.sol_0_no_adts_000.smt2` were vendored on
-2026-07-25 to de-`#[ignore]`
-`crates/ay-chc/src/bmc/tests.rs::nested_select_candidate_refutes_both_chccomp25_array_slice_targets`.
-
-**That test fails when actually run against these benchmarks**, so the wiring
-was not landed. It currently reads the corpus from `benchmarks/` and returns
-early when it is absent — and `benchmarks/chc/chc-comp25-benchmarks/` is
-gitignored — so it asserts nothing on any checkout that lacks the 1.2 GB
-corpus, and is `#[ignore]`d on those that have it.
+2026-07-25 while investigating nested-select BMC. They are not unit-test
+consumers: the end-to-end capability does not hold yet, so asserting an
+`Unsafe` verdict would be a known failure and conditionally skipping it would
+be vacuous coverage. The bounded synthetic regression in
+`src/bmc/tests.rs::nested_select_observation_candidate_is_not_a_verdict` pins
+the soundness boundary that does hold: a relaxed candidate is never itself
+published as a verdict and must pass unchanged original-clause replay.
 
 Observed against the fixtures above (identical to upstream at the pinned commit,
 verified byte-for-byte):
 
 | Test | Expected | Actual |
 |---|---|---|
-| `nested_select_candidate_refutes_...` | replay-validated `Unsafe` | `Unknown` |
+| array-slice nested-select BMC | replay-validated `Unsafe` | `Unknown` |
 
 Not a budget effect: it still fails with the budgets raised to 120 s and BMC
 depth raised to 64 (it concludes in ~2 s at the committed budgets). Once the
-underlying capability holds, swap the test to `include_str!` on the fixtures
-above and delete its `#[ignore]` and early-return.
+underlying capability holds, add a hermetic `include_str!` regression over the
+fixtures above.
 
 ## Why `lu.cmp` is asserted at the pass level, not end-to-end
 

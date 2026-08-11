@@ -8,7 +8,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use crate::command;
 use ay_core::Sort;
 
-use super::{is_reserved_symbol, Context, ElaborateError, Result, SymbolInfo};
+use super::{
+    is_canonical_theory_operator_identity, is_reserved_symbol, Context, ElaborateError, Result,
+    SymbolInfo,
+};
 
 /// Mangle a parametric-datatype instantiation `(Name A1 .. An)` into a unique,
 /// deterministic sort name used as `Sort::Uninterpreted(<mangled>)`.
@@ -16,7 +19,10 @@ use super::{is_reserved_symbol, Context, ElaborateError, Result, SymbolInfo};
 /// Each argument is wrapped in `!{...}` so nested instances stay unambiguous:
 /// `(Lst Int)` -> `Lst!{Int}`, `(Lst (Lst Int))` -> `Lst!{Lst!{Int}}`,
 /// `(Pair Int Bool)` -> `Pair!{Int}!{Bool}`. The braces are balanced, so no two
-/// distinct applied sorts can collide on the same name.
+/// distinct ordinary structured sorts normally produce readable names. This is
+/// a preferred display spelling only, not semantic identity: user sort names
+/// can contain the same delimiters and future [`Sort`] variants may share a
+/// rendering. Instance identity is keyed structurally in [`Context`].
 pub(crate) fn mangle_datatype_instance(name: &str, args: &[Sort]) -> String {
     let mut out = String::from(name);
     for arg in args {
@@ -70,9 +76,9 @@ fn mangle_sort_into(out: &mut String, sort: &Sort) {
             mangle_sort_into(out, elem);
             out.push('}');
         }
-        // `Sort` is #[non_exhaustive]; any future variant falls back to its Debug
-        // encoding, which stays injective for distinct sorts so the mangled
-        // instance name remains unambiguous.
+        // `Sort` is #[non_exhaustive]; future variants get a readable fallback.
+        // Correctness never relies on this display spelling: the instance cache
+        // keys on the complete structural `Sort` value plus template identity.
         other => {
             let _ = write!(out, "{other:?}");
         }
@@ -80,6 +86,62 @@ fn mangle_sort_into(out: &mut String, sort: &Sort) {
 }
 
 impl Context {
+    /// Claim a datatype-member core identity, falling back to a fresh private
+    /// identity when the preferred surface/mangled spelling has ever been used
+    /// in this term store. The reverse mapping keeps model and proof output at
+    /// the user-facing surface spelling.
+    fn datatype_member_internal_name(&mut self, surface: &str, preferred: &str) -> String {
+        let internal = if !is_canonical_theory_operator_identity(preferred)
+            && self.declaration_core_identity_is_available(preferred)
+        {
+            self.reserve_declaration_core_identity(preferred);
+            preferred.to_string()
+        } else {
+            self.fresh_private_declaration_core_identity()
+        };
+        if internal != surface {
+            self.track_internal_surface(internal.clone(), surface.to_string());
+        }
+        internal
+    }
+
+    /// Claim the linked constructor/tester identities as one unit. Several
+    /// datatype rewrites derive a tester core as `is-<constructor-core>`, so a
+    /// fresh constructor identity must also reserve that derived spelling.
+    fn datatype_constructor_internal_names(
+        &mut self,
+        surface: &str,
+        preferred: &str,
+    ) -> (String, String) {
+        let preferred_tester = format!("is-{preferred}");
+        let (constructor, tester) = if !is_canonical_theory_operator_identity(preferred)
+            && self.declaration_core_identity_is_available(preferred)
+            && self.declaration_core_identity_is_available(&preferred_tester)
+        {
+            self.reserve_declaration_core_identity(preferred);
+            self.reserve_declaration_core_identity(&preferred_tester);
+            (preferred.to_string(), preferred_tester)
+        } else {
+            loop {
+                let candidate = self.fresh_private_declaration_core_identity();
+                let tester = format!("is-{candidate}");
+                if self.declaration_core_identity_is_available(&tester) {
+                    self.reserve_declaration_core_identity(&tester);
+                    break (candidate, tester);
+                }
+            }
+        };
+
+        if constructor != surface {
+            self.track_internal_surface(constructor.clone(), surface.to_string());
+        }
+        let surface_tester = format!("is-{surface}");
+        if tester != surface_tester {
+            self.track_internal_surface(tester.clone(), surface_tester);
+        }
+        (constructor, tester)
+    }
+
     /// Register a datatype's constructors, selectors, and testers against the
     /// (already-registered) datatype sort `dt_sort`.
     ///
@@ -95,16 +157,15 @@ impl Context {
         constructors: &[command::ConstructorDec],
         subst: &HashMap<String, Sort>,
         instance: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let selector_sorts = self.elaborate_datatype_selector_sorts(constructors, subst)?;
-        self.register_elaborated_datatype_constructors(
+        Ok(self.register_elaborated_datatype_constructors(
             dt_name,
             dt_sort,
             constructors,
             &selector_sorts,
             instance,
-        );
-        Ok(())
+        ))
     }
 
     /// Elaborate every selector sort before datatype metadata is committed.
@@ -136,35 +197,44 @@ impl Context {
         constructors: &[command::ConstructorDec],
         selector_sorts: &[Vec<Sort>],
         instance: Option<&str>,
-    ) {
+    ) -> Vec<String> {
         debug_assert_eq!(constructors.len(), selector_sorts.len());
+        let mut registered_constructor_names = Vec::with_capacity(constructors.len());
         for (ctor, selector_sorts) in constructors.iter().zip(selector_sorts) {
             // For a monomorphized parametric INSTANCE, the constructor/selector/
             // tester get INTERNAL names that are name-disjoint per instance
             // (e.g. `osome@Opt!{Bool}`), so the DT theory treats each instance as
             // its own datatype. The user-facing surface names stay shared and are
-            // resolved to these internal names by argument/result sort. Monomorphic
-            // datatypes pass `instance = None` and use the surface names directly.
-            let mctor = mangle_member(&ctor.name, instance);
-            let ctor_internal = mctor.as_deref().unwrap_or(&ctor.name);
+            // resolved to these internal names by argument/result sort. A first
+            // monomorphic declaration uses its surface names; a scoped
+            // reincarnation receives fresh private identities as well.
+            let preferred_ctor =
+                mangle_member(&ctor.name, instance).unwrap_or_else(|| ctor.name.clone());
+            let (ctor_internal, tester_internal) =
+                self.datatype_constructor_internal_names(&ctor.name, &preferred_ctor);
             let sel_internals: Vec<String> = ctor
                 .selectors
                 .iter()
-                .map(|s| mangle_member(&s.name, instance).unwrap_or_else(|| s.name.clone()))
+                .map(|selector| {
+                    let preferred = mangle_member(&selector.name, instance)
+                        .unwrap_or_else(|| selector.name.clone());
+                    self.datatype_member_internal_name(&selector.name, &preferred)
+                })
                 .collect();
+            registered_constructor_names.push(ctor_internal.clone());
 
             // Track constructor -> selectors mapping (positional), keyed by the
             // internal constructor name.
             self.ctor_selectors
-                .insert(ctor_internal.to_string(), sel_internals.clone());
+                .insert(ctor_internal.clone(), sel_internals.clone());
             // Track constructor -> datatype mapping.
             self.constructors.insert(
-                ctor_internal.to_string(),
-                (dt_name.to_string(), ctor_internal.to_string()),
+                ctor_internal.clone(),
+                (dt_name.to_string(), ctor_internal.clone()),
             );
-            self.track_scoped_constructor(ctor_internal.to_string());
+            self.track_scoped_constructor(ctor_internal.clone());
             self.ctor_selector_info.insert(
-                ctor_internal.to_string(),
+                ctor_internal.clone(),
                 sel_internals
                     .iter()
                     .zip(selector_sorts.iter())
@@ -172,45 +242,34 @@ impl Context {
                     .collect(),
             );
 
-            // Record internal -> surface mappings for model un-mangling.
-            if instance.is_some() {
-                self.track_internal_surface(ctor_internal.to_string(), ctor.name.clone());
-                for (sel, sel_internal) in ctor.selectors.iter().zip(sel_internals.iter()) {
-                    self.track_internal_surface(sel_internal.clone(), sel.name.clone());
-                }
-                self.track_internal_surface(
-                    format!("is-{ctor_internal}"),
-                    format!("is-{}", ctor.name),
-                );
-            }
-
             // Constructor: (sel_sort1, ..., sel_sortN) -> DataType. The bound term
             // for a nullary constructor uses the INTERNAL name.
             let ctor_term = if selector_sorts.is_empty() {
                 let t = self
                     .terms
-                    .mk_fresh_named_var(ctor_internal, dt_sort.clone());
+                    .mk_fresh_named_var(&ctor_internal, dt_sort.clone());
                 // Record the exact term so constructor-shape folds recognize the
                 // nullary constructor (it is a Var, not an App). (#rec-dt-expansion)
-                self.nullary_ctor_terms.insert(ctor_internal.to_string(), t);
+                self.nullary_ctor_terms.insert(ctor_internal.clone(), t);
                 Some(t)
             } else {
                 None
             };
-            self.register_overloadable_symbol(
-                ctor.name.clone(),
-                SymbolInfo {
-                    term: ctor_term,
-                    sort: dt_sort.clone(),
-                    arg_sorts: selector_sorts.clone(),
-                    public_sort: super::PublicSort::from_engine(&dt_sort),
-                    public_arg_sorts: selector_sorts
-                        .iter()
-                        .map(super::PublicSort::from_engine)
-                        .collect(),
-                    internal_name: mctor.clone(),
-                },
+            let ctor_info = SymbolInfo::fresh(
+                ctor_term,
+                dt_sort.clone(),
+                selector_sorts.clone(),
+                super::PublicSort::from_engine(dt_sort),
+                selector_sorts
+                    .iter()
+                    .map(super::PublicSort::from_engine)
+                    .collect(),
+                (ctor_internal != ctor.name).then(|| ctor_internal.clone()),
+                super::DeclarationKind::DatatypeConstructor,
             );
+            self.datatype_member_symbols
+                .insert(ctor_internal.clone(), ctor_info.clone());
+            self.register_overloadable_symbol(ctor.name.clone(), ctor_info);
 
             // Selectors: DataType -> field_sort
             for ((sel, sel_sort), sel_internal) in ctor
@@ -219,33 +278,37 @@ impl Context {
                 .zip(selector_sorts.iter())
                 .zip(sel_internals.iter())
             {
-                self.register_overloadable_symbol(
-                    sel.name.clone(),
-                    SymbolInfo {
-                        term: None,
-                        sort: sel_sort.clone(),
-                        arg_sorts: vec![dt_sort.clone()],
-                        public_sort: super::PublicSort::from_engine(sel_sort),
-                        public_arg_sorts: vec![super::PublicSort::from_engine(&dt_sort)],
-                        internal_name: instance.map(|_| sel_internal.clone()),
-                    },
+                let selector_info = SymbolInfo::fresh(
+                    None,
+                    sel_sort.clone(),
+                    vec![dt_sort.clone()],
+                    super::PublicSort::from_engine(sel_sort),
+                    vec![super::PublicSort::from_engine(dt_sort)],
+                    (sel_internal != &sel.name).then(|| sel_internal.clone()),
+                    super::DeclarationKind::DatatypeSelector,
                 );
+                self.datatype_member_symbols
+                    .insert(sel_internal.clone(), selector_info.clone());
+                self.register_overloadable_symbol(sel.name.clone(), selector_info);
             }
 
             // Tester: DataType -> Bool. Surface `is-<ctor>` resolves to the
             // instance-internal `is-<ctor_internal>`.
-            self.register_overloadable_symbol(
-                format!("is-{}", ctor.name),
-                SymbolInfo {
-                    term: None,
-                    sort: Sort::Bool,
-                    arg_sorts: vec![dt_sort.clone()],
-                    public_sort: super::PublicSort::Core(Sort::Bool),
-                    public_arg_sorts: vec![super::PublicSort::from_engine(&dt_sort)],
-                    internal_name: instance.map(|_| format!("is-{ctor_internal}")),
-                },
+            let tester_surface = format!("is-{}", ctor.name);
+            let tester_info = SymbolInfo::fresh(
+                None,
+                Sort::Bool,
+                vec![dt_sort.clone()],
+                super::PublicSort::Core(Sort::Bool),
+                vec![super::PublicSort::from_engine(dt_sort)],
+                (tester_internal != tester_surface).then(|| tester_internal.clone()),
+                super::DeclarationKind::DatatypeTester,
             );
+            self.datatype_member_symbols
+                .insert(tester_internal, tester_info.clone());
+            self.register_overloadable_symbol(tester_surface, tester_info);
         }
+        registered_constructor_names
     }
 
     /// Whether `name` is a registered datatype member name — a constructor,
@@ -263,19 +326,7 @@ impl Context {
     /// documented embedder contract — via this same check plus
     /// [`Context::has_symbol_with_signature`].
     pub fn is_datatype_member_name(&self, name: &str) -> bool {
-        if self.constructors.contains_key(name) {
-            return true;
-        }
-        if let Some(ctor) = name.strip_prefix("is-") {
-            if self.constructors.contains_key(ctor) {
-                return true;
-            }
-        }
-        if self
-            .ctor_selector_info
-            .values()
-            .any(|sels| sels.iter().any(|(sel, _)| sel == name))
-        {
+        if self.is_live_datatype_member_identity(name) {
             return true;
         }
         // Parametric-INSTANCE members: ordinary declaration overloads also use
@@ -286,14 +337,7 @@ impl Context {
             if surface != name {
                 return false;
             }
-            self.constructors.contains_key(internal)
-                || internal
-                    .strip_prefix("is-")
-                    .is_some_and(|ctor| self.constructors.contains_key(ctor))
-                || self
-                    .ctor_selector_info
-                    .values()
-                    .any(|selectors| selectors.iter().any(|(selector, _)| selector == internal))
+            self.is_live_datatype_member_identity(internal)
         });
         if mapped_datatype_member {
             return true;
@@ -308,6 +352,97 @@ impl Context {
                     || ctor.selectors.iter().any(|sel| sel.name == name)
             })
         })
+    }
+
+    /// Whether `identity` is an exact member of a source-visible datatype
+    /// carrier. Exact member metadata is sticky for retained terms, so source
+    /// collision checks must never use membership in those maps by itself.
+    pub fn is_live_datatype_member_identity(&self, identity: &str) -> bool {
+        self.datatype_member_carrier(identity)
+            .is_some_and(|carrier| self.live_datatype_carriers.contains(carrier))
+    }
+
+    /// Sticky exact signature for a datatype member authenticated by its core
+    /// identity. This deliberately does not accept a surface name: generic
+    /// declaration lookup must remain live/scoped, while retained datatype
+    /// terms need their original constructor/selector/tester signature after
+    /// `pop` for proof and model reconstruction.
+    pub fn exact_datatype_member_info(&self, identity: &str) -> Option<&SymbolInfo> {
+        self.datatype_member_symbols.get(identity)
+    }
+
+    pub(super) fn datatype_member_identities_for_carrier(&self, carrier: &str) -> Vec<String> {
+        self.datatype_member_symbols
+            .keys()
+            .filter(|identity| self.datatype_member_carrier(identity) == Some(carrier))
+            .cloned()
+            .collect()
+    }
+
+    /// External spelling for an exact declaration identity. Ordinary private
+    /// overloads and unambiguous datatype members use their source surface.
+    /// Reincarnated datatype members whose carriers have the same source sort
+    /// description keep their exact core spellings, so old and new heads can
+    /// never be rendered as if they were one declaration.
+    pub fn output_symbol_name<'a>(&'a self, identity: &'a str) -> &'a str {
+        let surface = self.dt_surface_name(identity).unwrap_or(identity);
+        let Some(carrier) = self.datatype_member_carrier(identity) else {
+            return surface;
+        };
+        let collides = self.datatype_member_symbols.keys().any(|other| {
+            if other == identity || self.dt_surface_name(other).unwrap_or(other.as_str()) != surface
+            {
+                return false;
+            }
+            self.datatype_member_carrier(other)
+                .is_some_and(|other_carrier| {
+                    self.nominal_carriers_share_surface(carrier, other_carrier)
+                })
+        });
+        if collides {
+            identity
+        } else {
+            surface
+        }
+    }
+
+    /// Whether another exact nominal carrier has the same typed source
+    /// description. Formatting such carriers to that shared description would
+    /// collapse distinct declaration epochs.
+    pub(super) fn nominal_sort_surface_is_ambiguous(&self, identity: &str) -> bool {
+        let Some(surface) = self.nominal_sort_surfaces.get(identity) else {
+            return false;
+        };
+        self.nominal_sort_surfaces
+            .iter()
+            .any(|(other, other_surface)| other != identity && other_surface == surface)
+    }
+
+    fn nominal_carriers_share_surface(&self, left: &str, right: &str) -> bool {
+        match (
+            self.nominal_sort_surfaces.get(left),
+            self.nominal_sort_surfaces.get(right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
+    /// Exact carrier owning a constructor, selector, or tester identity.
+    fn datatype_member_carrier<'a>(&'a self, identity: &str) -> Option<&'a str> {
+        if let Some((carrier, _)) = self.constructors.get(identity) {
+            return Some(carrier);
+        }
+        if let Some(constructor) = identity.strip_prefix("is-") {
+            if let Some((carrier, _)) = self.constructors.get(constructor) {
+                return Some(carrier);
+            }
+        }
+        self.ctor_selector_info
+            .iter()
+            .find(|(_, selectors)| selectors.iter().any(|(selector, _)| selector == identity))
+            .and_then(|(constructor, _)| self.constructors.get(constructor))
+            .map(|(carrier, _)| carrier.as_str())
     }
 
     /// Reject a datatype declaration that re-uses an already-declared sort
@@ -325,7 +460,7 @@ impl Context {
     fn check_datatype_sort_redeclaration(&self, name: &str) -> Result<()> {
         if self.sort_defs.contains_key(name)
             || self.parametric_sort_defs.contains_key(name)
-            || self.datatypes.contains_key(name)
+            || self.live_datatype_carriers.contains(name)
             || self.parametric_datatypes.contains_key(name)
             || self.sort_parameters.contains(name)
         {
@@ -378,6 +513,7 @@ impl Context {
         context.public_sort_defs = self.public_sort_defs.clone();
         context.parametric_sort_defs = self.parametric_sort_defs.clone();
         context.parametric_datatypes = self.parametric_datatypes.clone();
+        context.parametric_datatype_ids = self.parametric_datatype_ids.clone();
         // The scratch context must accept exactly what the LIVE one will, or it
         // rejects field sorts the live pass would have accepted. In particular a
         // PROGRAMMATIC declaration may name an uninterpreted field sort into
@@ -427,6 +563,8 @@ impl Context {
         if !datatype_dec.type_params.is_empty() {
             self.parametric_datatypes
                 .insert(name.to_string(), datatype_dec.clone());
+            self.parametric_datatype_ids
+                .insert(name.to_string(), super::DeclarationId::fresh());
             self.track_scoped_parametric(name.to_string());
             return Ok(());
         }
@@ -448,7 +586,8 @@ impl Context {
         // scratch context, so the live elaboration cannot fail on user input —
         // but roll the registration back if it ever does, rather than leaving a
         // half-declared sort behind.
-        let sort = Sort::Uninterpreted(name.to_string());
+        let sort_identity = self.allocate_nominal_sort_identity(name, name);
+        let sort = Sort::Uninterpreted(sort_identity.clone());
         let sort_def_existed = self
             .sort_defs
             .insert(name.to_string(), sort.clone())
@@ -464,31 +603,26 @@ impl Context {
                 }
             };
 
-        // Collect constructor names for datatype lookup
-        let ctor_names: Vec<String> = datatype_dec
-            .constructors
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        self.datatypes.insert(name.to_string(), ctor_names);
         // Retain the full declaration so an exactly-identical re-declaration is
         // adopted as a no-op above (removed on scope pop alongside `datatypes`).
         self.monomorphic_datatype_decs
             .insert(name.to_string(), datatype_dec.clone());
 
         // Track datatype and its sort in current scope for push/pop.
-        self.track_scoped_datatype(name.to_string());
+        self.track_scoped_datatype(sort_identity.clone(), name.to_string());
         self.track_scoped_sort_def(name.to_string());
 
         // Register constructors, selectors, and testers. The fallible sort
         // elaboration completed above, so the state-changing phase is atomic.
-        self.register_elaborated_datatype_constructors(
-            name,
+        let ctor_names = self.register_elaborated_datatype_constructors(
+            &sort_identity,
             &sort,
             &datatype_dec.constructors,
             &selector_sorts,
             None,
         );
+        self.datatypes.insert(sort_identity.clone(), ctor_names);
+        self.live_datatype_carriers.insert(sort_identity);
         Ok(())
     }
 
@@ -563,6 +697,9 @@ impl Context {
                 preflight
                     .parametric_datatypes
                     .insert(sort_dec.name.clone(), datatype_dec.clone());
+                preflight
+                    .parametric_datatype_ids
+                    .insert(sort_dec.name.clone(), super::DeclarationId::fresh());
             }
         }
         for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
@@ -587,6 +724,8 @@ impl Context {
             if sort_dec.arity != 0 {
                 self.parametric_datatypes
                     .insert(sort_dec.name.clone(), datatype_dec.clone());
+                self.parametric_datatype_ids
+                    .insert(sort_dec.name.clone(), super::DeclarationId::fresh());
                 self.track_scoped_parametric(sort_dec.name.clone());
             }
         }
@@ -599,12 +738,19 @@ impl Context {
         // the error path below removes them again, and the preflight above has
         // already validated these same field sorts.
         let mut registered_sorts: Vec<&str> = Vec::new();
+        let mut monomorphic_sorts: HashMap<String, (String, Sort)> = HashMap::default();
         for sort_dec in sort_decs {
             if sort_dec.arity == 0 {
-                let sort = Sort::Uninterpreted(sort_dec.name.clone());
-                if self.sort_defs.insert(sort_dec.name.clone(), sort).is_none() {
+                let identity = self.allocate_nominal_sort_identity(&sort_dec.name, &sort_dec.name);
+                let sort = Sort::Uninterpreted(identity.clone());
+                if self
+                    .sort_defs
+                    .insert(sort_dec.name.clone(), sort.clone())
+                    .is_none()
+                {
                     registered_sorts.push(sort_dec.name.as_str());
                 }
+                monomorphic_sorts.insert(sort_dec.name.clone(), (identity, sort));
             }
         }
         let selector_sorts = sort_decs
@@ -627,6 +773,7 @@ impl Context {
                 // partially declared group.
                 for name in &parametric_names {
                     self.parametric_datatypes.remove(name);
+                    self.parametric_datatype_ids.remove(name);
                 }
                 for name in &registered_sorts {
                     self.sort_defs.remove(*name);
@@ -643,8 +790,6 @@ impl Context {
         // uninterpreted sort so the second pass can reference them.
         for sort_dec in sort_decs {
             if sort_dec.arity == 0 {
-                let sort = Sort::Uninterpreted(sort_dec.name.clone());
-                self.sort_defs.insert(sort_dec.name.clone(), sort);
                 self.track_scoped_sort_def(sort_dec.name.clone());
             }
         }
@@ -659,24 +804,24 @@ impl Context {
             if sort_dec.arity != 0 {
                 continue;
             }
-            let sort = Sort::Uninterpreted(sort_dec.name.clone());
+            let (sort_identity, sort) = monomorphic_sorts.get(&sort_dec.name).ok_or_else(|| {
+                ElaborateError::Unsupported(format!(
+                    "datatype '{}' is missing its nominal carrier identity",
+                    sort_dec.name
+                ))
+            })?;
 
-            // Collect constructor names for datatype lookup
-            let ctor_names: Vec<String> = datatype_dec
-                .constructors
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
-            self.datatypes.insert(sort_dec.name.clone(), ctor_names);
-            self.track_scoped_datatype(sort_dec.name.clone());
+            self.track_scoped_datatype(sort_identity.clone(), sort_dec.name.clone());
 
-            self.register_elaborated_datatype_constructors(
-                &sort_dec.name,
-                &sort,
+            let ctor_names = self.register_elaborated_datatype_constructors(
+                sort_identity,
+                sort,
                 &datatype_dec.constructors,
                 selector_sorts,
                 None,
             );
+            self.datatypes.insert(sort_identity.clone(), ctor_names);
+            self.live_datatype_carriers.insert(sort_identity.clone());
         }
 
         Ok(())
@@ -695,7 +840,7 @@ impl Context {
 
     /// Lazily monomorphize a parametric datatype instance `(Name A1 .. An)`.
     ///
-    /// Returns the instance sort `Sort::Uninterpreted(<mangled>)`. On first use
+    /// Returns the instance's exact nominal `Sort::Uninterpreted` carrier. On first use
     /// the instance's constructors/selectors/testers are registered with the
     /// user-facing surface names (resolved by argument/result sort via the
     /// overload machinery) and the type-parameter-substituted field sorts. The
@@ -708,11 +853,24 @@ impl Context {
         name: &str,
         args: &[Sort],
     ) -> Result<Sort> {
-        let instance_name = mangle_datatype_instance(name, args);
+        let template_id = self
+            .parametric_datatype_ids
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                ElaborateError::Unsupported(format!(
+                    "parametric datatype '{name}' has no declaration identity"
+                ))
+            })?;
+        let instance_key = (template_id.clone(), args.to_vec());
 
-        // Idempotent: a previously-registered instance just resolves to its sort.
-        if self.datatypes.contains_key(&instance_name) {
-            return Ok(Sort::Uninterpreted(instance_name));
+        // Idempotent by structural key, never by a display-style string mangle.
+        if let Some(instance_identity) = self.parametric_instance_sorts.get(&instance_key).cloned()
+        {
+            self.live_datatype_carriers
+                .insert(instance_identity.clone());
+            self.activate_parametric_instance_symbols(&instance_identity);
+            return Ok(Sort::Uninterpreted(instance_identity));
         }
 
         let template = self
@@ -737,39 +895,79 @@ impl Context {
             .zip(args.iter().cloned())
             .collect();
 
-        let instance_sort = Sort::Uninterpreted(instance_name.clone());
+        let preferred_instance_name = mangle_datatype_instance(name, args);
+        let instance_identity =
+            self.allocate_nominal_sort_identity(&preferred_instance_name, &preferred_instance_name);
+        self.record_parametric_sort_surface(
+            &instance_identity,
+            preferred_instance_name,
+            name,
+            args,
+        );
+        let instance_sort = Sort::Uninterpreted(instance_identity.clone());
 
-        // Register the instance sort + datatype metadata BEFORE elaborating its
-        // own field sorts (recursive self-reference resolution).
-        self.sort_defs
-            .insert(instance_name.clone(), instance_sort.clone());
-        // Store the INSTANCE-MANGLED constructor names so every consumer
-        // (`datatype_iter`, the DT theory, finite-enum cardinality detection,
-        // axiom generation) sees the same name-disjoint identity that the
-        // constructor/selector metadata and the elaborated terms use. Storing
-        // the surface names here would make those consumers look up
-        // `constructor_selector_info("onone")` (mangled-keyed, hence missing) and
-        // mis-classify a field-bearing instance as an all-nullary enum.
-        let ctor_names: Vec<String> = template
-            .constructors
-            .iter()
-            .map(|c| mangle_member(&c.name, Some(&instance_name)).unwrap_or_else(|| c.name.clone()))
-            .collect();
-        self.datatypes.insert(instance_name.clone(), ctor_names);
-        self.parametric_instance_args
-            .insert(instance_name.clone(), (name.to_string(), args.to_vec()));
-        self.track_scoped_sort_def(instance_name.clone());
-        self.track_scoped_datatype(instance_name.clone());
+        // Mark the instance in progress before recursively elaborating its
+        // selector sorts. The structural cache, not the display-style mangle or
+        // source `sort_defs` namespace, resolves a recursive `(Name Args...)`
+        // reference back to this exact carrier.
+        self.datatypes.insert(instance_identity.clone(), Vec::new());
+        self.parametric_instance_sorts
+            .insert(instance_key.clone(), instance_identity.clone());
+        self.parametric_instance_args.insert(
+            instance_identity.clone(),
+            (template_id, name.to_string(), args.to_vec()),
+        );
 
-        self.register_datatype_constructors(
-            &instance_name,
+        let ctor_names = match self.register_datatype_constructors(
+            &instance_identity,
             &instance_sort,
             &template.constructors,
             &subst,
-            Some(&instance_name),
-        )?;
-
+            Some(&instance_identity),
+        ) {
+            Ok(ctor_names) => ctor_names,
+            Err(error) => {
+                self.datatypes.remove(&instance_identity);
+                self.parametric_instance_sorts.remove(&instance_key);
+                self.parametric_instance_args.remove(&instance_identity);
+                return Err(error);
+            }
+        };
+        self.datatypes.insert(instance_identity.clone(), ctor_names);
+        self.live_datatype_carriers
+            .insert(instance_identity.clone());
         Ok(instance_sort)
+    }
+
+    /// Restore the exact member bindings for a cached ground instance after
+    /// the incidental first-use scope has popped them. The sticky semantic
+    /// maps are not enough for source elaboration: overload resolution needs
+    /// the original `SymbolInfo` (including declaration identity and private
+    /// core spelling) back in the live symbol table.
+    fn activate_parametric_instance_symbols(&mut self, instance_identity: &str) {
+        let bindings: Vec<(String, SymbolInfo)> = self
+            .datatype_member_symbols
+            .iter()
+            .filter(|(identity, _)| {
+                self.datatype_member_carrier(identity) == Some(instance_identity)
+            })
+            .map(|(identity, info)| {
+                (
+                    self.dt_surface_name(identity)
+                        .unwrap_or(identity)
+                        .to_string(),
+                    info.clone(),
+                )
+            })
+            .collect();
+        for (surface, info) in bindings {
+            let already_live = self.symbol_iter().any(|(live_surface, live_info)| {
+                live_surface == &surface && live_info.declaration_id() == info.declaration_id()
+            });
+            if !already_live {
+                self.register_overloadable_symbol(surface, info);
+            }
+        }
     }
 
     /// Ensure the parametric-datatype instance referenced by a BARE constructor
@@ -878,10 +1076,15 @@ impl Context {
                     // A nested parametric-datatype instance: recover its type
                     // arguments from the mangled instance name and recurse.
                     if let Sort::Uninterpreted(mangled) = actual {
-                        if let Some((inst_dt, inst_args)) =
+                        if let Some((template_id, inst_dt, inst_args)) =
                             self.parametric_instance_args.get(mangled).cloned()
                         {
-                            if inst_dt == *n && inst_args.len() == params.len() {
+                            let is_live_template = self
+                                .parametric_datatype_ids
+                                .get(n)
+                                .is_some_and(|live_id| live_id == &template_id);
+                            if is_live_template && inst_dt == *n && inst_args.len() == params.len()
+                            {
                                 for (p, a) in params.iter().zip(inst_args.iter()) {
                                     self.unify_template_sort(p, a, type_params, bindings);
                                 }

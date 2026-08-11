@@ -1739,7 +1739,7 @@ mod tests {
     /// full optimality proof.
     const WCNF: &str = "h -1 -2 -3 0\nh -4 -5 -6 0\n1 1 0\n1 2 0\n1 3 0\n1 4 0\n1 5 0\n1 6 0\n";
 
-    fn fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    fn fixture(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("t.wcnf");
         fs::write(&p, WCNF).unwrap();
         p
@@ -2032,7 +2032,7 @@ mod tests {
     const RUP_WCNF: &str = "h -1 -2 3 0\nh -3 -4 0\nh -5 -6 0\n\
                             1 1 0\n1 2 0\n1 4 0\n1 5 0\n1 6 0\n";
 
-    fn rup_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    fn rup_fixture(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("r.wcnf");
         fs::write(&p, RUP_WCNF).unwrap();
         p
@@ -2070,7 +2070,7 @@ mod tests {
     const NONRUP_WCNF: &str = "h -1 -2 5 6 0\nh -1 -2 5 -6 0\n\
                                h -1 -2 -5 6 0\nh -1 -2 -5 -6 0\n1 1 0\n1 2 0\n";
 
-    fn nonrup_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    fn nonrup_fixture(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("n.wcnf");
         fs::write(&p, NONRUP_WCNF).unwrap();
         p
@@ -2352,7 +2352,7 @@ mod tests {
     // certificate used to say `0 <= obj <= k` while AY privately knew better.
     // -----------------------------------------------------------------------
 
-    fn write_fixture(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    fn write_fixture(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);
         fs::write(&p, body).unwrap();
         p

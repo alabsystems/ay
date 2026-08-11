@@ -14,6 +14,7 @@ use crate::error::Result;
 use ay_cp::propagator::Constraint;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::{positive_big_m, product_size_within};
 use super::CpContext;
 
 impl CpContext {
@@ -49,9 +50,7 @@ impl CpContext {
                 let b = self.resolve_var(&c.args[1])?;
                 let (a_lb, a_ub) = self.get_var_bounds(a);
                 let (b_lb, b_ub) = self.get_var_bounds(b);
-                let domain_size = (a_ub - a_lb + 1).saturating_mul(b_ub - b_lb + 1);
-
-                if domain_size <= 10_000 {
+                if product_size_within((a_lb, a_ub), (b_lb, b_ub), 10_000) {
                     let mut tuples = Vec::new();
                     for av in a_lb..=a_ub {
                         for bv in b_lb..=b_ub {
@@ -82,6 +81,8 @@ impl CpContext {
         let r = self.resolve_var(&c.args[1])?;
         let (a_lb, a_ub) = self.get_var_bounds(a);
         let (_, r_ub) = self.get_var_bounds(r);
+        let m1 = positive_big_m(i128::from(r_ub) - i128::from(a_lb), &c.id)?;
+        let m2 = positive_big_m(i128::from(r_ub) + i128::from(a_ub), &c.id)?;
 
         // c >= a
         self.engine.add_constraint(Constraint::LinearGe {
@@ -97,10 +98,10 @@ impl CpContext {
         });
 
         let d = self.engine.new_bool_var(None);
+        self.var_bounds.insert(d, (0, 1));
 
         // c <= a + M1*d: c - a - M1*d <= 0
         // d=0 → c <= a; d=1 → relaxed
-        let m1 = (r_ub - a_lb).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![1, -1, -m1],
             vars: vec![r, a, d],
@@ -109,7 +110,6 @@ impl CpContext {
 
         // c <= -a + M2*(1-d): c + a + M2*d <= M2
         // d=0 → relaxed; d=1 → c + a <= 0 → c <= -a
-        let m2 = (r_ub + a_ub).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![1, 1, m2],
             vars: vec![r, a, d],
@@ -131,6 +131,8 @@ impl CpContext {
         let a_ub = self.get_var_bounds(a).1;
         let b_ub = self.get_var_bounds(b).1;
         let r_lb = self.get_var_bounds(r).0;
+        let m1 = positive_big_m(i128::from(a_ub) - i128::from(r_lb), &c.id)?;
+        let m2 = positive_big_m(i128::from(b_ub) - i128::from(r_lb), &c.id)?;
 
         // c <= a
         self.engine.add_constraint(Constraint::LinearLe {
@@ -146,10 +148,10 @@ impl CpContext {
         });
 
         let d = self.engine.new_bool_var(None);
+        self.var_bounds.insert(d, (0, 1));
 
         // c >= a - M1*(1-d): -c + a + M1*d <= M1
         // d=1 → -c + a <= 0 → c >= a; d=0 → relaxed
-        let m1 = (a_ub - r_lb).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![-1, 1, m1],
             vars: vec![r, a, d],
@@ -158,7 +160,6 @@ impl CpContext {
 
         // c >= b - M2*d: -c + b - M2*d <= 0
         // d=0 → -c + b <= 0 → c >= b; d=1 → relaxed
-        let m2 = (b_ub - r_lb).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![-1, 1, -m2],
             vars: vec![r, b, d],
@@ -180,6 +181,8 @@ impl CpContext {
         let a_lb = self.get_var_bounds(a).0;
         let b_lb = self.get_var_bounds(b).0;
         let r_ub = self.get_var_bounds(r).1;
+        let m1 = positive_big_m(i128::from(r_ub) - i128::from(a_lb), &c.id)?;
+        let m2 = positive_big_m(i128::from(r_ub) - i128::from(b_lb), &c.id)?;
 
         // c >= a
         self.engine.add_constraint(Constraint::LinearGe {
@@ -195,10 +198,10 @@ impl CpContext {
         });
 
         let d = self.engine.new_bool_var(None);
+        self.var_bounds.insert(d, (0, 1));
 
         // c <= a + M1*d: c - a - M1*d <= 0
         // d=0 → c <= a; d=1 → relaxed
-        let m1 = (r_ub - a_lb).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![1, -1, -m1],
             vars: vec![r, a, d],
@@ -207,7 +210,6 @@ impl CpContext {
 
         // c <= b + M2*(1-d): c - b + M2*d <= M2
         // d=0 → relaxed; d=1 → c <= b
-        let m2 = (r_ub - b_lb).max(1);
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![1, -1, m2],
             vars: vec![r, b, d],
@@ -225,6 +227,7 @@ impl CpContext {
     pub(super) fn translate_int_lin_ne(&mut self, c: &ConstraintItem) -> Result<()> {
         let coeffs = self.resolve_const_int_array(&c.args[0])?;
         let vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         let rhs = self.resolve_const_int(&c.args[2])?;
 
         // Fast path: 2-variable difference x - y != k → pairwise exclusion

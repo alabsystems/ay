@@ -31,6 +31,45 @@ use rustc_hash::FxHashMap;
 
 use crate::variable::IntVarId;
 
+/// Maximum total number of dense order literals materialized by one engine.
+pub const MAX_PREALLOCATED_ORDER_LITERALS: u128 = 1 << 20;
+
+/// Dense order-encoding preallocation would exceed a safe resource boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum OrderEncodingCapacityError {
+    /// Registered bounds are reversed.
+    #[error("integer variable {variable} has reversed bounds {lb}..{ub}")]
+    InvalidBounds {
+        /// Zero-based integer variable identifier.
+        variable: usize,
+        /// Inclusive lower bound.
+        lb: i64,
+        /// Inclusive upper bound.
+        ub: i64,
+    },
+    /// Total required literals exceed the fixed safety limit.
+    #[error("order encoding requires {required} literals, exceeding limit {limit}")]
+    LiteralLimitExceeded {
+        /// Total literals required, including bound sentinels.
+        required: u128,
+        /// Maximum literals the engine will preallocate.
+        limit: u128,
+    },
+    /// Integer variables were registered after dense preallocation completed.
+    /// Dynamic extension is not supported because it would leave the new
+    /// variables without a complete order encoding.
+    #[error(
+        "{registered} integer variables are registered but the order encoding was allocated for {allocated}"
+    )]
+    VariablesAddedAfterPreallocation {
+        /// Number of variables covered by the existing dense encoding.
+        allocated: usize,
+        /// Current number of registered variables.
+        registered: usize,
+    },
+}
+
 /// Maps between integer variable bounds and SAT literals.
 #[derive(Debug)]
 pub struct IntegerEncoder {
@@ -57,6 +96,9 @@ pub struct IntegerEncoder {
     /// Built by `pre_allocate_all()`. `None` for SAT variables that don't
     /// correspond to any integer bound literal.
     decode_array: Vec<Option<BoundLiteral>>,
+    /// Whether dense allocation has completed, including the zero-variable
+    /// case where `ge_array.is_empty()` cannot encode that state.
+    preallocated: bool,
 }
 
 /// What a SAT literal means in terms of integer bounds.
@@ -80,6 +122,7 @@ impl IntegerEncoder {
             var_bounds: Vec::new(),
             ge_array: Vec::new(),
             decode_array: Vec::new(),
+            preallocated: false,
         }
     }
 
@@ -283,14 +326,58 @@ impl IntegerEncoder {
     /// Pre-allocate all order-encoding literals for every registered variable.
     /// For variable `x ∈ [lb, ub]`, creates `[x >= v]` for all v in [lb, ub+1].
     /// Also builds dense lookup arrays for O(1) `lookup_ge()` and `decode()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the encoding exceeds the resource-safety limit, has invalid
+    /// bounds, or variables were registered after an earlier allocation. Use
+    /// [`try_pre_allocate_all`](Self::try_pre_allocate_all) to retain the typed
+    /// failure reason.
     pub fn pre_allocate_all(&mut self, sat: &mut SatSolver) {
-        if !self.ge_array.is_empty() {
-            debug_assert_eq!(
-                self.ge_array.len(),
-                self.var_bounds.len(),
-                "registering new CP variables after order pre-allocation is unsupported",
+        self.try_pre_allocate_all(sat)
+            .expect("order-encoding preallocation exceeds safe capacity");
+    }
+
+    /// Check the total dense order-encoding allocation without mutating state.
+    pub fn preallocation_plan(&self) -> Result<u128, OrderEncodingCapacityError> {
+        if self.preallocated && self.ge_array.len() != self.var_bounds.len() {
+            return Err(
+                OrderEncodingCapacityError::VariablesAddedAfterPreallocation {
+                    allocated: self.ge_array.len(),
+                    registered: self.var_bounds.len(),
+                },
             );
-            return;
+        }
+        let mut required = 0u128;
+        for (variable, &(lb, ub)) in self.var_bounds.iter().enumerate() {
+            if lb > ub {
+                return Err(OrderEncodingCapacityError::InvalidBounds { variable, lb, ub });
+            }
+            let span = (i128::from(ub) - i128::from(lb) + 1) as u128;
+            // `[x >= ub+1]` is the false upper sentinel except when ub is
+            // i64::MAX, where no successor exists and the endpoint helpers use
+            // the always-true lower-bound literal directly.
+            let literals = span + u128::from(ub != i64::MAX);
+            required = required.saturating_add(literals);
+            if required > MAX_PREALLOCATED_ORDER_LITERALS {
+                return Err(OrderEncodingCapacityError::LiteralLimitExceeded {
+                    required,
+                    limit: MAX_PREALLOCATED_ORDER_LITERALS,
+                });
+            }
+        }
+        Ok(required)
+    }
+
+    /// Fallible form of [`pre_allocate_all`](Self::pre_allocate_all) for
+    /// engines handling untrusted domain sizes.
+    pub fn try_pre_allocate_all(
+        &mut self,
+        sat: &mut SatSolver,
+    ) -> Result<(), OrderEncodingCapacityError> {
+        self.preallocation_plan()?;
+        if self.preallocated {
+            return Ok(());
         }
 
         for var_idx in 0..self.var_bounds.len() {
@@ -338,6 +425,8 @@ impl IntegerEncoder {
         self.ge_literals.clear();
         self.ge_literals.shrink_to_fit();
         self.sat_to_int.clear();
+        self.preallocated = true;
+        Ok(())
     }
 }
 

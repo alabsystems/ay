@@ -8303,6 +8303,13 @@ fn finish_dimacs_solve_with_source(
                 "c symmetry_skip:   {val:>12}",
                 val = sy.skipped.unwrap_or("-")
             );
+            // One line per route ATTEMPTED. `symmetry_skip` above is a single
+            // slot overwritten by whichever route ran last, so it cannot say
+            // which routes executed -- that is what made every flag fix in this
+            // area unverifiable (the development design notes).
+            for (route, outcome) in &sy.routes {
+                safe_eprintln!("c symmetry_route:  {route:<12} {outcome}");
+            }
             safe_eprintln!("c decomp_rounds:   {val:>12}", val = ds.rounds);
             safe_eprintln!("c decomp_subst:    {val:>12}", val = ds.substituted);
             safe_eprintln!("c transred_rounds: {val:>12}", val = ts.rounds);

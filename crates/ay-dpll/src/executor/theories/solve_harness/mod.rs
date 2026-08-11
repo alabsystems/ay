@@ -419,8 +419,8 @@ impl Executor {
     ///    solver-invented, so the reconstructed refutation's leaves for them
     ///    carry no `assume` authority, are demoted to unit `trust`, and strict
     ///    certification rejects a CORRECT refutation:
-    ///      pigeon_3_2  unknown 11ms -> unsat 2ms
-    ///      syn2_MIN    unknown 2335ms -> unsat 44ms
+    ///   pigeon_3_2  unknown 11ms -> unsat 2ms
+    ///   syn2_MIN    unknown 2335ms -> unsat 44ms
     ///
     /// 2. It blows the certification RESCUE budget. When the outer proof leans
     ///    on any trust step, `discharge_trust_steps_for_certification` re-decides

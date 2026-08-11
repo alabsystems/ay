@@ -2,9 +2,11 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use crate::spawn::OutputTimeout;
 use ntest::timeout;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 struct CleanupGuard(std::path::PathBuf);
 
@@ -402,6 +404,81 @@ fn test_cli_stats_flag_prints_statistics_after_check_sat() {
         stderr.contains("smt.theory_propagations:"),
         "Expected SMT theory propagations key in stderr: {stderr}"
     );
+}
+
+#[test]
+// A freshly linked macOS binary can spend minutes in first-launch validation
+// before `main`. Warm the exact test binary under its own process-group timeout
+// so that cost stays outside the two soundness assertions' effective budgets.
+// The outer timeout exceeds 180s + 2*30s and therefore never detaches a worker
+// that can still own an `ay` child.
+#[timeout(300_000)]
+fn test_cli_stats_authenticates_checked_projection_sat() {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    let input = r#"(set-logic UFBV)
+(declare-fun plain_projection ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+(assert
+  (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+    (=> (= x y) (= (plain_projection y x) y))))
+(check-sat)
+"#;
+    let (temp_path, _cleanup) = write_temp_smt2(input);
+
+    let warmup = Command::new(ay_path)
+        .arg("--version")
+        .output_timeout(Duration::from_secs(180))
+        .expect("failed to warm the freshly linked ay binary");
+    assert!(
+        warmup.status.success(),
+        "ay --version warmup failed: {:?}; stderr={}",
+        warmup.status,
+        String::from_utf8_lossy(&warmup.stderr)
+    );
+
+    for self_check in [false, true] {
+        let mut command = Command::new(ay_path);
+        command.arg("-st");
+        if self_check {
+            command.arg("--self-check");
+        }
+        let output = command
+            .arg(&temp_path)
+            .output_timeout(Duration::from_secs(30))
+            .expect("failed to spawn ay");
+
+        assert!(
+            output.status.success(),
+            "Expected zero exit status in self_check={self_check}, got {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next(),
+            Some("sat"),
+            "self_check={self_check}: {stdout}"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let certificate_lines: Vec<_> = stderr
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .starts_with("c model_validation.checked_projection_certificate:")
+            })
+            .collect();
+        assert_eq!(
+            certificate_lines.len(),
+            1,
+            "self_check={self_check}: the canonical statistics envelope must expose exactly one checked-projection certificate counter: {stderr}"
+        );
+        assert_eq!(
+            certificate_lines[0]
+                .strip_prefix("c model_validation.checked_projection_certificate:")
+                .map(str::trim),
+            Some("1"),
+            "self_check={self_check}: the SAT verdict must carry exactly one checked-projection certificate: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -246,7 +246,7 @@ impl Context {
         let exp_int = self.terms.extract_integer_constant(exp);
 
         if let Some(n) = exp_int {
-            return Ok(self.unfold_integer_power(base, &base_sort, &n));
+            return self.unfold_integer_power(base, &base_sort, &n);
         }
 
         Err(ElaborateError::Unsupported(
@@ -286,7 +286,7 @@ impl Context {
         }
 
         if let Some(exponent) = self.terms.extract_integer_constant(arg_ids[1]) {
-            Ok(self.unfold_smtlib_integer_power(arg_ids[0], &exponent))
+            self.unfold_smtlib_integer_power(arg_ids[0], &exponent)
         } else {
             Ok(self
                 .terms
@@ -295,36 +295,41 @@ impl Context {
     }
 
     /// Lower `(** base exponent)` for a concrete integer exponent.
-    fn unfold_smtlib_integer_power(&mut self, base: TermId, exponent: &BigInt) -> TermId {
+    fn unfold_smtlib_integer_power(&mut self, base: TermId, exponent: &BigInt) -> Result<TermId> {
         if exponent.is_zero() {
             // Required by SMT-LIB Ints, including (** 0 0) = 1.
-            return self.terms.mk_int(BigInt::one());
+            return Ok(self.terms.mk_int(BigInt::one()));
         }
 
-        let positive_power = self.repeated_product(base, &exponent.abs());
+        let positive_power = self.repeated_product(base, &exponent.abs())?;
         if !exponent.is_negative() {
-            return positive_power;
+            return Ok(positive_power);
         }
 
         let one = self.terms.mk_int(BigInt::one());
-        self.terms.mk_intdiv(one, positive_power)
+        Ok(self.terms.mk_intdiv(one, positive_power))
     }
 
     /// Unfold `(^ base n)` where `n` is a concrete integer.
-    fn unfold_integer_power(&mut self, base: TermId, base_sort: &Sort, n: &BigInt) -> TermId {
+    fn unfold_integer_power(
+        &mut self,
+        base: TermId,
+        base_sort: &Sort,
+        n: &BigInt,
+    ) -> Result<TermId> {
         // n == 0: return 1 in the base's sort.
         if n.is_zero() {
-            return match base_sort {
+            return Ok(match base_sort {
                 Sort::Real => self.terms.mk_rational(BigRational::one()),
                 _ => self.terms.mk_int(BigInt::one()),
-            };
+            });
         }
 
         let abs_n = n.abs();
-        let positive_power = self.repeated_product(base, &abs_n);
+        let positive_power = self.repeated_product(base, &abs_n)?;
 
         if !n.is_negative() {
-            return positive_power;
+            return Ok(positive_power);
         }
 
         // n < 0: (ite (= base 0) <fresh_uf> (/ 1 base^|n|))
@@ -361,16 +366,17 @@ impl Context {
             _ => (undefined, reciprocal),
         };
 
-        self.terms.mk_ite(is_base_zero, then_br, else_br)
+        Ok(self.terms.mk_ite(is_base_zero, then_br, else_br))
     }
 
     /// Compute `base^n` as a product of `n` copies of `base` using
     /// exponentiation-by-squaring to keep the term size O(log n).
-    fn repeated_product(&mut self, base: TermId, n: &BigInt) -> TermId {
-        debug_assert!(
-            !n.is_zero() && !n.is_negative(),
-            "repeated_product: expected positive exponent"
-        );
+    fn repeated_product(&mut self, base: TermId, n: &BigInt) -> Result<TermId> {
+        if n.is_zero() || n.is_negative() {
+            return Err(ElaborateError::InvalidConstant(
+                "repeated product requires a positive exponent".to_string(),
+            ));
+        }
 
         // For small exponents, build a flat product so the arithmetic
         // simplifiers see `x * x * ... * x` and can apply coefficient
@@ -379,7 +385,7 @@ impl Context {
         if let Some(n_u32) = n.to_u32() {
             if n_u32 <= small_limit {
                 let factors = vec![base; n_u32 as usize];
-                return self.terms.mk_mul(factors);
+                return Ok(self.terms.mk_mul(factors));
             }
         }
 
@@ -398,6 +404,10 @@ impl Context {
                 current_square = self.terms.mk_mul(vec![current_square, current_square]);
             }
         }
-        result.expect("repeated_product: positive exponent must set result")
+        result.ok_or_else(|| {
+            ElaborateError::InvalidConstant(
+                "positive exponent had no set bit during expansion".to_string(),
+            )
+        })
     }
 }

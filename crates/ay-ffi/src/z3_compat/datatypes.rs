@@ -616,9 +616,8 @@ pub unsafe extern "C" fn Z3_mk_datatypes(
 
     for i in 0..num_sorts as usize {
         // SAFETY: arrays point to `num_sorts` elems (checked above).
-        let name_sym = unsafe { *sort_names.add(i) };
-        let list_ptr = unsafe { *constructor_lists.add(i) };
-        let out_slot = unsafe { sorts.add(i) };
+        let (name_sym, list_ptr, out_slot) =
+            unsafe { (*sort_names.add(i), *constructor_lists.add(i), sorts.add(i)) };
         // Default each out slot to null so partial failure is observable.
         // SAFETY: `out_slot` is within the writable `sorts` array.
         unsafe { *out_slot = ptr::null_mut() };

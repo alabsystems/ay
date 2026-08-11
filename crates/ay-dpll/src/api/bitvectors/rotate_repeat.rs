@@ -29,8 +29,11 @@ impl Solver {
     /// [`bvsmod`]: Solver::bvsmod
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsmod(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsmod", a)?;
+        let b_id = self.resolve_term("bvsmod", b)?;
         self.expect_same_bitvec_width("bvsmod", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvsmod(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvsmod(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Repeat a bitvector `n` times (SMT-LIB: `(_ repeat n)`).
@@ -57,6 +60,7 @@ impl Solver {
     /// [`bvrepeat`]: Solver::bvrepeat
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvrepeat(&mut self, a: Term, n: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvrepeat", a)?;
         if n == 0 {
             return Err(SolverError::InvalidArgument {
                 operation: "bvrepeat",
@@ -72,7 +76,8 @@ impl Solver {
                 message: format!("resulting bitvector width overflows u32: {w} * {n}"),
             });
         }
-        Ok(Term(self.terms_mut().mk_bvrepeat(n, a.0)))
+        let result = self.terms_mut().mk_bvrepeat(n, a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Rotate a bitvector left by `n` bits (SMT-LIB: `(_ rotate_left n)`).
@@ -95,8 +100,10 @@ impl Solver {
     /// [`bvrotl`]: Solver::bvrotl
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvrotl(&mut self, a: Term, n: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvrotl", a)?;
         self.expect_bitvec_width("bvrotl", a)?;
-        Ok(Term(self.terms_mut().mk_bvrotate_left(n, a.0)))
+        let result = self.terms_mut().mk_bvrotate_left(n, a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Rotate a bitvector right by `n` bits (SMT-LIB: `(_ rotate_right n)`).
@@ -119,8 +126,10 @@ impl Solver {
     /// [`bvrotr`]: Solver::bvrotr
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvrotr(&mut self, a: Term, n: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvrotr", a)?;
         self.expect_bitvec_width("bvrotr", a)?;
-        Ok(Term(self.terms_mut().mk_bvrotate_right(n, a.0)))
+        let result = self.terms_mut().mk_bvrotate_right(n, a_id);
+        Ok(self.wrap_term(result))
     }
 
     // =========================================================================

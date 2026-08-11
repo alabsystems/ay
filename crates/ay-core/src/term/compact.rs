@@ -206,6 +206,12 @@ impl TermStore {
     pub fn mark_and_compact(&mut self, roots: &[TermId]) -> RemapTable {
         let old_len = self.terms.len();
 
+        // Compaction can shrink the arena and later appends can restore the old
+        // length with different terms. Retire length-keyed structural snapshots
+        // (and pre-compaction rollback checkpoints) before rewriting anything,
+        // so that sequence can never alias the old term universe.
+        self.advance_structural_generation();
+
         // Phase 1: collect roots. In addition to caller-supplied
         // roots, we pin:
         //   * the `true` and `false` sentinels (always live)
@@ -281,11 +287,13 @@ impl TermStore {
             // Move the entry out of the old arena to avoid cloning
             // the potentially-large TermData payload. We replace the
             // slot with a placeholder that we'll discard at the end.
+            let placeholder_stamp = self.terms[old_idx].stamp;
             let mut entry = std::mem::replace(
                 &mut self.terms[old_idx],
                 TermEntry {
                     term: TermData::Not(TermId(0)),
                     sort: Sort::Bool,
+                    stamp: placeholder_stamp,
                 },
             );
 
@@ -298,6 +306,9 @@ impl TermStore {
 
         // Phase 4: swap in the compacted arena.
         self.terms = new_terms;
+        // Memoized checker verdicts are keyed by `TermId` and every id has just
+        // been remapped, so the memo cannot be carried across compaction.
+        self.strict_bv_semantics_ok.get_mut().clear();
 
         // Phase 5: remap TermStore-owned pins.
         let remap = RemapTable { mapping };

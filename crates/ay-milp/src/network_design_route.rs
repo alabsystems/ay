@@ -128,6 +128,9 @@ pub(crate) enum CertifiedNetworkDesignDecision {
 /// its optional payload is a checked source-model incumbent to combine with
 /// that arm. Neither state may rerun eager projection, symmetry, or unaugmented
 /// PB. Only `NotApplicable` authorizes the complete default route.
+// This one-shot handoff is immediately consumed by `Session`; keeping payloads
+// inline avoids an allocation on every network-design attempt and never nests.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CertifiedNetworkDesignAttempt {
     NotApplicable,
     Decided(CertifiedNetworkDesignDecision),
@@ -135,6 +138,8 @@ pub(crate) enum CertifiedNetworkDesignAttempt {
     LazyOnly(Option<PbRouteDecision>),
 }
 
+// Internal form of the same non-recursive, immediately consumed handoff.
+#[allow(clippy::large_enum_variant)]
 enum CertifiedNetworkDesignDirectAttempt {
     ReadyReplay(PbRouteDecision),
     LazyOnly(Option<PbRouteDecision>),
@@ -449,7 +454,7 @@ fn lift_network_decision(
             incumbent_only,
         } => {
             let original_values = projection
-                .complete_exact(model, &model_values, Some(deadline))
+                .complete_exact(model, model_values, Some(deadline))
                 .ok()?;
             Some(PbRouteDecision::Feasible {
                 model_values: original_values,
@@ -461,7 +466,7 @@ fn lift_network_decision(
             model_values,
         } => {
             let original_values = projection
-                .complete_exact(model, &model_values, Some(deadline))
+                .complete_exact(model, model_values, Some(deadline))
                 .ok()?;
             if &model.objective_value_at(&original_values) != value {
                 return None;

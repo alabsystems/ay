@@ -1569,7 +1569,7 @@ fn snapshot_case_input(source_path: &Path, case_dir: &Path) -> Result<CaseInputS
         })?;
     let mut hasher = Sha256::new();
     let mut size_bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = source.read(&mut buffer).with_bench_context(|| {
             format!(

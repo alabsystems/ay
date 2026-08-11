@@ -13,8 +13,10 @@ mod memory_limit;
 fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
     let mut store = TermStore::new();
     let stable = store.mk_var("stable", Sort::Bool);
+    let stable_stamp = store.entry_stamp(stable).expect("stable entry");
     let checkpoint = store.rollback_checkpoint();
     let scratch = store.mk_var("scratch", Sort::Bool);
+    let scratch_stamp = store.entry_stamp(scratch).expect("scratch entry");
     let scratch_not = store.mk_not(scratch);
     let scratch_quantifier = store.mk_forall(vec![("q".to_string(), Sort::Bool)], scratch);
     store.mark_no_mbqi(scratch_quantifier);
@@ -28,6 +30,11 @@ fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
 
     assert!(store.len() < before_rollback);
     assert_eq!(store.get(stable), &TermData::Var("stable".to_string(), 0));
+    assert_eq!(
+        store.entry_stamp(stable),
+        Some(stable_stamp),
+        "rollback must preserve prefix entry identity"
+    );
     assert_eq!(store.true_term().index(), 0);
     assert_eq!(store.false_term().index(), 1);
     assert!(!store.has_var_name("scratch"));
@@ -43,12 +50,63 @@ fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
         replacement, scratch,
         "discarded suffix IDs should be reusable"
     );
+    assert_ne!(
+        store.entry_stamp(replacement),
+        Some(scratch_stamp),
+        "reusing a discarded numeric slot must not resurrect its birth identity"
+    );
     let replacement_not = store.mk_not(replacement);
     assert_eq!(
         store.get(replacement_not),
         &TermData::Not(replacement),
         "the discarded not-cache result {scratch_not} must not survive ID reuse"
     );
+}
+
+/// The strict BV validation memo is keyed by `TermId`, so it must not survive
+/// any operation that can change what a `TermId` means.
+///
+/// `rollback_to` re-mints the discarded suffix as entirely different terms
+/// (the test above pins exactly that id reuse) and `mark_and_compact` remaps
+/// every id; a memoized "this clause already passed the strict bit-blast
+/// decision procedure" verdict that survived either would be attached to terms
+/// nobody validated. `Clone` is a distinct store, so it starts empty (always
+/// correct — it only costs a re-validation).
+#[test]
+fn strict_bv_semantics_memo_does_not_survive_id_invalidation() {
+    let mut store = TermStore::new();
+    let stable = store.mk_var("stable", Sort::Bool);
+    let checkpoint = store.rollback_checkpoint();
+    let scratch = store.mk_var("scratch", Sort::Bool);
+    store.record_strict_bv_semantics_validated(&[stable]);
+    store.record_strict_bv_semantics_validated(&[scratch]);
+    assert!(store.strict_bv_semantics_validated(&[stable]));
+    assert!(store.strict_bv_semantics_validated(&[scratch]));
+
+    store.rollback_to(checkpoint);
+    assert!(
+        !store.strict_bv_semantics_validated(&[scratch]),
+        "a rollback re-mints the discarded ids; no memoized verdict may survive it"
+    );
+    assert!(
+        !store.strict_bv_semantics_validated(&[stable]),
+        "the memo is cleared wholesale, not filtered, on rollback"
+    );
+
+    // A clone is a separate store and starts with an empty memo.
+    store.record_strict_bv_semantics_validated(&[stable]);
+    assert!(store.strict_bv_semantics_validated(&[stable]));
+    assert!(!store.clone().strict_bv_semantics_validated(&[stable]));
+
+    // Compaction remaps every id, so nothing may survive it either.
+    let mut compacted = TermStore::new();
+    let root = compacted.mk_var("root", Sort::Bool);
+    let garbage = compacted.mk_var("garbage", Sort::Bool);
+    compacted.record_strict_bv_semantics_validated(&[root]);
+    compacted.record_strict_bv_semantics_validated(&[garbage]);
+    let remap = compacted.mark_and_compact(&[root]);
+    assert!(!compacted.strict_bv_semantics_validated(&[root]));
+    assert!(!compacted.strict_bv_semantics_validated(&[remap.remap(root)]));
 }
 
 #[test]
@@ -87,6 +145,87 @@ fn speculative_rollback_preserves_preallocated_boolean_floor() {
         store.get(store.false_term()),
         &TermData::Const(Constant::Bool(false))
     );
+}
+
+#[test]
+fn structural_snapshot_stamp_retires_on_every_term_universe_change() {
+    let mut store = TermStore::new();
+    let initial = store.snapshot_stamp();
+    assert_eq!(initial, store.snapshot_stamp());
+
+    let checkpoint = store.rollback_checkpoint();
+    let _scratch = store.mk_var("scratch", Sort::Int);
+    let appended = store.snapshot_stamp();
+    assert_ne!(initial, appended, "an append changes the indexed prefix");
+
+    store.rollback_to(checkpoint);
+    let rolled_back = store.snapshot_stamp();
+    assert_ne!(
+        initial, rolled_back,
+        "rollback generation prevents same-length snapshot aliasing"
+    );
+    assert_ne!(appended, rolled_back);
+
+    let cloned = store.clone();
+    assert_ne!(
+        rolled_back,
+        cloned.snapshot_stamp(),
+        "a cloned/replacement store owns a distinct term universe"
+    );
+
+    // A compact-then-append sequence can return to the old length with
+    // different entries. Length alone must not make that snapshot alias.
+    let mut compacted = TermStore::new();
+    let _dead = compacted.mk_int(BigInt::from(1));
+    let before_compaction = compacted.snapshot_stamp();
+    let _remap = compacted.mark_and_compact(&[]);
+    let _replacement = compacted.mk_int(BigInt::from(2));
+    assert_ne!(before_compaction, compacted.snapshot_stamp());
+}
+
+#[test]
+fn structural_snapshot_append_only_prefix_accepts_growth_but_rejects_rewrites() {
+    let mut store = TermStore::new();
+    let stable = store.mk_var("stable", Sort::Int);
+    let stable_entry = store.entry_stamp(stable);
+    let prefix = store.snapshot_stamp();
+    assert!(prefix.is_append_only_prefix_of(&store));
+
+    let checkpoint = store.rollback_checkpoint();
+    let scratch = store.mk_var("scratch", Sort::Int);
+    assert!(
+        prefix.is_append_only_prefix_of(&store),
+        "ordinary append-only growth preserves every captured entry"
+    );
+    assert_eq!(store.entry_stamp(stable), stable_entry);
+
+    let cloned = store.clone();
+    assert!(
+        !prefix.is_append_only_prefix_of(&cloned),
+        "an independently mutable clone is a different term universe"
+    );
+
+    store.rollback_to(checkpoint);
+    let replacement = store.mk_var("replacement", Sort::Int);
+    assert_eq!(
+        replacement, scratch,
+        "rollback should reuse the suffix slot"
+    );
+    assert!(
+        !prefix.is_append_only_prefix_of(&store),
+        "any rollback retires a transported-model prefix even when its length is restored"
+    );
+}
+
+#[test]
+fn cloned_store_preserves_existing_entry_birth_identity() {
+    let mut store = TermStore::new();
+    let term = store.mk_var("prefix", Sort::Int);
+    let stamp = store.entry_stamp(term).expect("prefix entry");
+
+    let cloned = store.clone();
+
+    assert_eq!(cloned.entry_stamp(term), Some(stamp));
 }
 
 #[test]

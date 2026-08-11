@@ -18,17 +18,17 @@ use std::cmp::max;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Node {
     /// Earliest completion time of tasks in Theta at this subtree.
-    pub(super) ect: i64,
+    pub(super) ect: i128,
     /// Sum of processing times of Theta tasks in this subtree.
-    pub(super) sum_p: i64,
+    pub(super) sum_p: i128,
     /// ECT if one Lambda task can be added to Theta.
-    pub(super) ect_bar: i64,
+    pub(super) ect_bar: i128,
     /// Sum of processing times if one Lambda task can be added.
-    pub(super) sum_p_bar: i64,
+    pub(super) sum_p_bar: i128,
 }
 
 /// Sentinel for "no task" — equivalent to i32::MIN in Pumpkin but for i64.
-const EMPTY: i64 = i64::MIN / 2; // Avoid overflow on addition
+const EMPTY: i128 = i128::MIN / 2; // Avoid overflow on addition
 
 impl Node {
     fn empty() -> Self {
@@ -41,7 +41,7 @@ impl Node {
     }
 
     /// White node: task is in Theta.
-    fn white(ect: i64, processing_time: i64) -> Self {
+    fn white(ect: i128, processing_time: i128) -> Self {
         Self {
             ect,
             sum_p: processing_time,
@@ -51,7 +51,7 @@ impl Node {
     }
 
     /// Gray node: task is in Lambda (candidate, not committed).
-    fn gray(ect: i64, processing_time: i64) -> Self {
+    fn gray(ect: i128, processing_time: i128) -> Self {
         Self {
             ect: EMPTY,
             sum_p: 0,
@@ -110,25 +110,25 @@ impl ThetaLambdaTree {
 
     /// ECT of the Theta set.
     #[inline]
-    pub(super) fn ect(&self) -> i64 {
+    pub(super) fn ect(&self) -> i128 {
         self.nodes[0].ect
     }
 
     /// ECT if one Lambda task is added to Theta.
     #[inline]
-    pub(super) fn ect_bar(&self) -> i64 {
+    pub(super) fn ect_bar(&self) -> i128 {
         self.nodes[0].ect_bar
     }
 
     /// Sum of processing times in Theta.
     #[cfg(test)]
     #[inline]
-    pub(super) fn sum_p(&self) -> i64 {
+    pub(super) fn sum_p(&self) -> i128 {
         self.nodes[0].sum_p
     }
 
     /// Add task to Theta (white node).
-    pub(super) fn add_to_theta(&mut self, task_idx: usize, ect: i64, processing_time: i64) {
+    pub(super) fn add_to_theta(&mut self, task_idx: usize, ect: i128, processing_time: i128) {
         let pos = self.n_internal + self.mapping[task_idx];
         self.nodes[pos] = Node::white(ect, processing_time);
         self.upheap(pos);
@@ -142,7 +142,7 @@ impl ThetaLambdaTree {
     }
 
     /// Add task to Lambda (gray node).
-    pub(super) fn add_to_lambda(&mut self, task_idx: usize, ect: i64, processing_time: i64) {
+    pub(super) fn add_to_lambda(&mut self, task_idx: usize, ect: i128, processing_time: i128) {
         let pos = self.n_internal + self.mapping[task_idx];
         self.nodes[pos] = Node::gray(ect, processing_time);
         self.upheap(pos);

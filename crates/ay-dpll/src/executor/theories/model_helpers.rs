@@ -232,22 +232,18 @@ impl Executor {
                 );
 
                 // Store the model first with original values
-                self.last_model = Some(Model {
-                    sat_model: model,
-                    term_to_var,
-                    bool_overrides: HashMap::default(),
-                    euf_model,
-                    array_model,
-                    lra_model,
-                    lia_model,
-                    bv_model,
-                    fp_model,
-                    string_model,
-                    seq_model,
-                    completed_values: HashMap::default(),
-                    dt_ground: HashMap::default(),
-                    dt_pins: HashMap::default(),
-                });
+                let mut assembled_model = Model::empty();
+                assembled_model.sat_model = model;
+                assembled_model.term_to_var = term_to_var;
+                assembled_model.euf_model = euf_model;
+                assembled_model.array_model = array_model;
+                assembled_model.lra_model = lra_model;
+                assembled_model.lia_model = lia_model;
+                assembled_model.bv_model = bv_model;
+                assembled_model.fp_model = fp_model;
+                assembled_model.string_model = string_model;
+                assembled_model.seq_model = seq_model;
+                self.last_model = Some(assembled_model);
 
                 // #qf-auflia-final-index-reconcile: re-key Int-indexed array
                 // interpretation cells under the FINAL assignment (extraction

@@ -95,8 +95,7 @@ fn solve_via_cli(path: &Path, budget_secs: u64) -> Option<String> {
     Some(
         out.lines()
             .map(str::trim)
-            .filter(|l| matches!(*l, "sat" | "unsat" | "unknown"))
-            .next_back()
+            .rfind(|l| matches!(*l, "sat" | "unsat" | "unknown"))
             .unwrap_or("unknown")
             .to_string(),
     )

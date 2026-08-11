@@ -456,7 +456,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("unsat-proofs timeout must be between 1ns and 3600 seconds".to_string());
     }
     let subject = contract
@@ -784,7 +784,7 @@ fn ay_fixture_row(
     capture: &CapturedProcess,
     proof: Option<&[u8]>,
 ) -> ValidatorCase {
-    let proof_sha = proof.map(|bytes| sha256_bytes(bytes));
+    let proof_sha = proof.map(sha256_bytes);
     let outcome = process_failure(capture).unwrap_or_else(|| {
         if capture.stdout.lines().any(|line| line == "unknown") {
             ValidatorCaseOutcome::Unknown

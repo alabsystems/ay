@@ -6,6 +6,13 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+#[path = "alethe_printer_resolution_args.rs"]
+mod resolution_args;
+mod surface_and_pos;
+mod surface_symm;
+mod surface_tokens;
+use surface_tokens::split_smt_terms;
+pub use surface_tokens::{split_alethe_application_bounded, AletheSurfaceParseError};
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
@@ -74,6 +81,13 @@ pub enum AlethePrintError {
         id: ProofId,
         /// Exact fail-closed reason.
         reason: String,
+    },
+    /// The solver retained an internally checked proof, but the external
+    /// presentation authority for that exact proof is absent or stale.
+    #[error("proof has no current authenticated external surface: {reason}")]
+    UnavailableAuthenticatedSurface {
+        /// Stable fail-closed reason supplied by the sealed producer.
+        reason: &'static str,
     },
     /// An `la_generic` / `lia_generic` step is missing its Farkas coefficient
     /// annotation. Carcara rejects these rules without `:args`, and the
@@ -234,6 +248,19 @@ enum RowChainPathProof {
     Step(String),
 }
 
+/// Immutable inputs describing one read-over-write chain walk.
+///
+/// Keeping the path's mutually dependent renderings together makes it harder
+/// for a caller to accidentally pair an index or tail with the wrong checked
+/// path.
+struct RowChainPathEmission<'a> {
+    prefix: &'a str,
+    read_index: TermId,
+    index_str: &'a str,
+    path: &'a crate::checker::RowChainPath,
+    tail: &'a str,
+}
+
 /// Alethe proof printer
 pub(crate) struct AlethePrinter<'a> {
     terms: &'a TermStore,
@@ -269,9 +296,7 @@ pub(crate) struct AlethePrinter<'a> {
     /// Internal clauses by proof id, populated eagerly so a resolution step
     /// can repair surface-order complements in its already-printed premises.
     proof_clauses: std::cell::RefCell<HashMap<ProofId, Vec<TermId>>>,
-    /// Accumulated rendering work (abstract units, roughly bytes touched by
-    /// term formatting and surface-tautology re-derivation). See
-    /// [`AlethePrintError::EmissionBudgetExhausted`].
+    /// Accumulated rendering work; see [`AlethePrintError::EmissionBudgetExhausted`].
     work: std::cell::Cell<u64>,
     /// Optional cap on `work` (#A2b, synthesized-default emission only).
     work_budget: Option<u64>,
@@ -1666,13 +1691,14 @@ impl<'a> AlethePrinter<'a> {
     fn charge(&self, amount: u64) {
         self.work.set(self.work.get().saturating_add(amount));
     }
-
-    /// `true` once accumulated work exceeds the configured budget (never
-    /// `true` when unbudgeted).
+    /// Return the actual accumulated rendering work.
+    pub(crate) fn work_used(&self) -> u64 {
+        self.work.get()
+    }
+    /// Whether accumulated work exceeds the configured budget.
     pub(crate) fn work_budget_exhausted(&self) -> bool {
         self.work_budget.is_some_and(|b| self.work.get() > b)
     }
-
     /// Typed exhaustion error for the caller's per-step check.
     pub(crate) fn work_budget_error(&self, steps_rendered: u32) -> AlethePrintError {
         AlethePrintError::EmissionBudgetExhausted {
@@ -1765,7 +1791,18 @@ impl<'a> AlethePrinter<'a> {
                 clause,
                 premises,
                 args,
-            } => self.format_generic_step(id, rule, clause, premises, args),
+            } => {
+                let rendered = self.format_generic_step(id, rule, clause, premises, args);
+                // A specialized bridge may finish assembling a candidate on
+                // the exact operation that crosses the budget. The current
+                // step has not been returned or written yet, so exhaustion
+                // dominates that candidate and counts only prior step ids.
+                if self.work_budget_exhausted() {
+                    Err(self.work_budget_error(id.0))
+                } else {
+                    rendered
+                }
+            }
             ProofStep::Anchor {
                 end_step,
                 variables,
@@ -2503,10 +2540,12 @@ impl<'a> AlethePrinter<'a> {
                     || printed_store_index != &store_index
                     || printed_read_index != &read_index
                 {
-                    return Err(invalid_surface(
-                        "ROW1 select/store surface override changes the certified array or index"
-                            .to_string(),
-                    ));
+                    return Err(invalid_surface(format!(
+                        "ROW1 select/store surface override changes the certified array or index: \
+                             base={printed_base:?}/{base:?}, \
+                             store_index={printed_store_index:?}/{store_index:?}, \
+                             read_index={printed_read_index:?}/{read_index:?}"
+                    )));
                 }
                 let needs_value_bridge = stored_value != &value;
                 if needs_value_bridge {
@@ -2866,10 +2905,13 @@ impl<'a> AlethePrinter<'a> {
                 let mut body: Vec<String> = Vec::new();
                 let RowChainPathProof::Step(step) = self.emit_row_chain_path(
                     &guards,
-                    &format!("{id}.p"),
-                    &index_str,
-                    path,
-                    &tail,
+                    RowChainPathEmission {
+                        prefix: &format!("{id}.p"),
+                        read_index: *read_index,
+                        index_str: &index_str,
+                        path,
+                        tail: &tail,
+                    },
                     &mut body,
                 )?
                 else {
@@ -2930,18 +2972,24 @@ impl<'a> AlethePrinter<'a> {
                 let mut body: Vec<String> = Vec::new();
                 let left_proof = self.emit_row_chain_path(
                     &guards,
-                    &format!("{id}.l"),
-                    &index_str,
-                    left,
-                    &left_tail,
+                    RowChainPathEmission {
+                        prefix: &format!("{id}.l"),
+                        read_index: *read_index,
+                        index_str: &index_str,
+                        path: left,
+                        tail: &left_tail,
+                    },
                     &mut body,
                 )?;
                 let right_proof = self.emit_row_chain_path(
                     &guards,
-                    &format!("{id}.r"),
-                    &index_str,
-                    right,
-                    &right_tail,
+                    RowChainPathEmission {
+                        prefix: &format!("{id}.r"),
+                        read_index: *read_index,
+                        index_str: &index_str,
+                        path: right,
+                        tail: &right_tail,
+                    },
                     &mut body,
                 )?;
                 body.push(format!(
@@ -3126,13 +3174,18 @@ impl<'a> AlethePrinter<'a> {
     fn emit_row_chain_path(
         &self,
         guards: &RowChainGuards,
-        prefix: &str,
-        index_str: &str,
-        path: &crate::checker::RowChainPath,
-        tail: &str,
+        emission: RowChainPathEmission<'_>,
         lines: &mut Vec<String>,
     ) -> Option<RowChainPathProof> {
         use crate::checker::RowChainEnd;
+
+        let RowChainPathEmission {
+            prefix,
+            read_index,
+            index_str,
+            path,
+            tail,
+        } = emission;
 
         let mut step_ids: Vec<String> = Vec::new();
         let mut current = self.format_term(path.root);
@@ -3188,8 +3241,33 @@ impl<'a> AlethePrinter<'a> {
                 if printed_base != current {
                     return None;
                 }
-                if tail != format!("(select {printed_base} {index_str})") {
-                    return None;
+                let canonical_tail = format!("(select {printed_base} {index_str})");
+                if tail != canonical_tail {
+                    let tail_args = split_application(tail, "select")?;
+                    let [tail_base, tail_index] = tail_args.as_slice() else {
+                        return None;
+                    };
+                    if tail_base != &printed_base
+                        || !self.is_zero_offset_surface_index(read_index, index_str, tail_index)
+                    {
+                        return None;
+                    }
+                    // The strict checker certified this endpoint as the exact
+                    // root read at `read_index`.  An authenticated enclosing
+                    // select can nevertheless retain the source spelling
+                    // `(+ read_index 0)`.  Keep that authored AST and bridge
+                    // it explicitly: arithmetic proves the index identity,
+                    // then congruence transports the read.  No surface string
+                    // is treated as definitionally equal by the array rule.
+                    let index_id = format!("{prefix}bi");
+                    let select_id = format!("{prefix}bs");
+                    lines.push(format!(
+                        "(step {index_id} (cl (= {index_str} {tail_index})) :rule la_generic :args (1))"
+                    ));
+                    lines.push(format!(
+                        "(step {select_id} (cl (= {canonical_tail} {tail})) :rule cong :premises ({index_id}))"
+                    ));
+                    step_ids.push(select_id);
                 }
             }
             // The internal checker re-derives select(const-array(v), i) = v,
@@ -3210,6 +3288,32 @@ impl<'a> AlethePrinter<'a> {
                 Some(RowChainPathProof::Step(step_id))
             }
         }
+    }
+
+    /// Whether an authored arithmetic index is exactly `(+ certified 0)` (or
+    /// its commuted spelling).  This is the one surface normalization for
+    /// which [`Self::emit_row_chain_path`] emits an explicit `la_generic`
+    /// bridge; every other mismatch remains fail-closed.
+    fn is_zero_offset_surface_index(
+        &self,
+        read_index: TermId,
+        certified: &str,
+        surface: &str,
+    ) -> bool {
+        if !matches!(self.terms.sort(read_index), Sort::Int | Sort::Real) {
+            return false;
+        }
+        let Some(parts) = split_application(surface, "+") else {
+            return false;
+        };
+        let [left, right] = parts.as_slice() else {
+            return false;
+        };
+        let is_zero = |term: &str| {
+            crate::la_generic_signs::parse_numeric_constant(term)
+                .is_some_and(|value| value.numer().sign() == Sign::NoSign)
+        };
+        (left == certified && is_zero(right)) || (right == certified && is_zero(left))
     }
 
     /// Restore a unit `(or guard row)` when AY's internally checked array
@@ -3416,21 +3520,15 @@ impl<'a> AlethePrinter<'a> {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<String, AlethePrintError> {
-        // A `th_resolution`/`resolution` step that cancels a printed
-        // `(distinct a b)` literal against an equality unit clause is not
-        // spec-valid Alethe over the printed premise (Carcara sees the
-        // `distinct` atom as opaque and reports "pivot was not eliminated").
-        // `ProofStep::Resolution` already routes through the same bridge in
-        // `format_resolution_step`; the n-ary `th_resolution` generic step
-        // needs it too. The bridge returns `None` (falling through to the
-        // ordinary rendering) unless it detects a `distinct`↔`(= …)`
-        // cancellation, so ordinary resolutions are byte-unchanged.
-        if premises.len() == 2
-            && matches!(
-                rule,
-                ay_core::AletheRule::ThResolution | ay_core::AletheRule::Resolution
-            )
-        {
+        if matches!(rule, ay_core::AletheRule::Symm) {
+            return self.format_surface_symm(id, clause, premises, args);
+        }
+        let is_resolution = resolution_args::is_generic_resolution(rule);
+        if is_resolution {
+            resolution_args::validate_generic_resolution_args(self.terms, premises.len(), args)
+                .map_err(|reason| AlethePrintError::InvalidSurfaceStep { id, reason })?;
+        }
+        if premises.len() == 2 && is_resolution {
             if let Some(text) =
                 self.distinct_eq_resolution_bridge(id, clause, premises[0], premises[1])
             {
@@ -3448,6 +3546,10 @@ impl<'a> AlethePrinter<'a> {
                         .to_string(),
                 });
             }
+        }
+        if is_resolution {
+            resolution_args::validate_generic_resolution_surface(self, clause, premises, args)
+                .map_err(|reason| AlethePrintError::InvalidSurfaceStep { id, reason })?;
         }
         // A comparison may carry the authored `>=`/`>` spelling while its
         // canonical internal term is the equivalent argument-reversed
@@ -3528,6 +3630,27 @@ impl<'a> AlethePrinter<'a> {
             if let Some(text) = self.resugar_and_pos_not_and(id, rule, clause, args) {
                 return Ok(text);
             }
+            if matches!(rule, ay_core::AletheRule::AndPos(_)) {
+                // Canonicalization can flatten `not (A => B)` to an AND, but
+                // that effective source needs a multi-rule implication bridge
+                // rather than a direct positional projection. Keep this
+                // specialized derivation ahead of the ordinary flat-AND gate.
+                if let [source] = args {
+                    let source_surface = self.format_term(*source);
+                    if let Some(text) = self.format_not_implies_and_pos(id, clause, &source_surface)
+                    {
+                        return Ok(text);
+                    }
+                }
+            }
+            // The specialized `and_pos` bridges above format their candidate
+            // source/gate before deciding whether they apply. Once that work
+            // exhausts the shared budget, `format_term` deliberately returns
+            // a private placeholder. Do not let the surface-shape guards below
+            // misclassify that placeholder as malformed input.
+            if matches!(rule, ay_core::AletheRule::AndPos(_)) && self.work_budget_exhausted() {
+                return Err(self.work_budget_error(id.0));
+            }
             // `or_pos` whose printed gate is a NESTED binary `or` while the
             // internal or-term is n-ary: carcara compares the gate's TOP-LEVEL
             // arity against the clause tail length, so a re-nested surface
@@ -3543,8 +3666,10 @@ impl<'a> AlethePrinter<'a> {
             // are re-derived from the printed operands: the spec-shaped
             // tautology, `not_not` bridge steps for each stripped literal,
             // and a final resolution restoring the exact traced clause.
-            if let Some(text) = self.format_surface_tautology(id, rule, clause, args) {
-                return Ok(text);
+            if !matches!(rule, ay_core::AletheRule::AndPos(_)) {
+                if let Some(text) = self.format_surface_tautology(id, rule, clause, args) {
+                    return Ok(text);
+                }
             }
             if matches!(rule, ay_core::AletheRule::AndPos(_))
                 && clause.iter().copied().any(|literal| {
@@ -3577,12 +3702,27 @@ impl<'a> AlethePrinter<'a> {
                 return Err(AlethePrintError::InvalidSurfaceStep { id, reason });
             }
         }
-        // An `or` decomposition step whose premise assume PRINTS as a De
-        // Morgan surface form `(not (and A1 .. An))` (elaboration
-        // canonicalizes that input to the or-term `(or (not A1) .. (not An))`)
-        // is not spec-valid Alethe over the printed premise; the spec-correct
-        // rule for the printed shape is `not_and`.
+        // Every remaining `and_pos` is owned by the exact flat-surface gate.
+        // Calling it outside the premise-free block is deliberate: malformed
+        // copied/generic steps with premises must reject rather than falling
+        // through to an invalid default wire rule.
+        if let Some(text) = self.format_flat_surface_and_pos(id, rule, clause, premises, args)? {
+            return Ok(text);
+        }
+        // An `or` decomposition step whose premise assume PRINTS as a
+        // right-associated implication chain is not spec-valid Alethe over
+        // the printed premise. Rebuild it from premiseless `implies_pos`
+        // tautologies and an n-ary resolution against the authored assume.
         if matches!(rule, ay_core::AletheRule::Or) && premises.len() == 1 {
+            match self.resugar_implies_decomposition(id, clause, premises[0]) {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(AlethePrintError::InvalidSurfaceStep { id, reason });
+                }
+            }
+            // The analogous De Morgan surface form `(not (and A1 .. An))`
+            // needs the spec-correct `not_and` rule instead.
             if let Some(text) = self.resugar_not_and_decomposition(id, clause, premises[0]) {
                 return Ok(text);
             }
@@ -4248,6 +4388,134 @@ impl<'a> AlethePrinter<'a> {
         ))
     }
 
+    /// Resugar an `or` decomposition whose single assume premise is an
+    /// internal canonical or-term but PRINTS as a right-associated binary
+    /// implication chain.
+    ///
+    /// For `(=> A (=> B C))`, the internal `or` rule concludes
+    /// `{(not A), (not B), C}` from the unit premise. The printed premise is
+    /// not an or-term, so rebuild the same clause with stock Alethe rules:
+    ///
+    /// ```text
+    /// imp0: (cl (not (=> A (=> B C))) (not A) (=> B C))  implies_pos
+    /// imp1: (cl (not (=> B C)) (not B) C)                 implies_pos
+    /// id:   (cl (not A) (not B) C)                        resolution premise,imp0,imp1
+    /// ```
+    ///
+    /// This is deliberately narrower than semantic implication recognition.
+    /// It fires only when all of these agree exactly as multisets and have the
+    /// same arity: the internal or operands, the internal traced clause, the
+    /// printed internal operands, and the literals obtained by flattening the
+    /// printed right-associated implication. The n-ary resolution performs
+    /// the same left-to-right pivot chain without quadratic intermediate
+    /// clauses and retains the original id for every downstream reference.
+    fn resugar_implies_decomposition(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premise: ProofId,
+    ) -> Result<Option<String>, String> {
+        let Some(&source) = self.assume_terms.borrow().get(&premise) else {
+            return Ok(None);
+        };
+        let source_str = self.format_term(source);
+        if split_binary_implies(&source_str).is_none() {
+            if split_application(&source_str, "=>").is_some() {
+                return Err("printed implication premise is not binary".to_string());
+            }
+            return Ok(None);
+        }
+        let TermData::App(Symbol::Named(name), source_disjuncts) = self.terms.get(source) else {
+            return Err("printed implication premise is not an internal or-term".to_string());
+        };
+        if name != "or" || source_disjuncts.len() < 2 || source_disjuncts.len() != clause.len() {
+            return Err("printed implication/internal or arity mismatch".to_string());
+        }
+
+        // Internal gate: the step must decompose this exact assumed or-term,
+        // not merely a same-arity clause that happens to print similarly.
+        let mut sorted_source = source_disjuncts.clone();
+        let mut sorted_clause = clause.to_vec();
+        sorted_source.sort_unstable();
+        sorted_clause.sort_unstable();
+        if sorted_source != sorted_clause {
+            return Err(
+                "or decomposition clause is not the assumed internal disjunct multiset".to_string(),
+            );
+        }
+
+        let mut implication = source_str.clone();
+        let mut links: Vec<(String, String, String)> = Vec::new();
+        let mut flattened: Vec<String> = Vec::new();
+        while let Some((antecedent, consequent)) = split_binary_implies(&implication) {
+            if links.len() >= PRINTED_NESTING_NODE_BUDGET {
+                return Err("printed implication nesting exceeds the printer limit".to_string());
+            }
+            flattened.push(format!("(not {antecedent})"));
+            links.push((implication, antecedent, consequent.clone()));
+            implication = consequent;
+        }
+        if links.is_empty() {
+            return Ok(None);
+        }
+        // `split_binary_implies` also returns `None` for a non-binary `=>`.
+        // Such a node is not an atomic final consequent of the admitted
+        // right-nested binary chain; reject it explicitly instead of treating
+        // the malformed implication application as a leaf.
+        if split_application(&implication, "=>").is_some() {
+            return Err("right-nested printed implication contains a non-binary link".to_string());
+        }
+        flattened.push(implication);
+        if flattened.len() != source_disjuncts.len() {
+            return Err("printed implication/internal or arity mismatch".to_string());
+        }
+
+        // Printed gate: surface overrides may change descendants as well as
+        // the root. Require both the source operands and the traced clause to
+        // be exactly the flattened implication literals, counting repeats.
+        let mut printed_source: Vec<String> = source_disjuncts
+            .iter()
+            .map(|&literal| self.format_term(literal))
+            .collect();
+        let printed_clause: Vec<String> = clause
+            .iter()
+            .map(|&literal| self.format_term(literal))
+            .collect();
+        let mut sorted_printed_clause = printed_clause.clone();
+        let mut sorted_flattened = flattened.clone();
+        printed_source.sort_unstable();
+        sorted_printed_clause.sort_unstable();
+        sorted_flattened.sort_unstable();
+        if printed_source != sorted_flattened || sorted_printed_clause != sorted_flattened {
+            return Err(
+                "printed implication literals do not match the internal source and conclusion"
+                    .to_string(),
+            );
+        }
+
+        let mut out = String::new();
+        let mut resolution_premises = vec![premise.to_string()];
+        for (index, (current, antecedent, consequent)) in links.iter().enumerate() {
+            let implication_id = format!("{id}.imp{index}");
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "(step {implication_id} (cl (not {current}) (not {antecedent}) {consequent}) :rule implies_pos)\n"
+                ),
+            );
+            resolution_premises.push(implication_id);
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "(step {id} (cl {}) :rule resolution :premises ({}))",
+                printed_clause.join(" "),
+                resolution_premises.join(" ")
+            ),
+        );
+        Ok(Some(out))
+    }
+
     /// Resugar an `or` decomposition step (see the call site in
     /// `format_generic_step`) whose premise assume prints as
     /// `(not (and A1 .. An))` into the spec-correct `not_and` step. Purely a
@@ -4905,31 +5173,6 @@ impl<'a> AlethePrinter<'a> {
                     }
                 }
             }
-            R::AndPos(_) => {
-                // Canonicalization flattens `not (A => B)` to an `and`, so an
-                // internally valid `and_pos` can have a problem-surface source
-                // that prints as the original negated implication.  Rebuild
-                // that projection with the actual surface rules (and, for a
-                // conjunctive antecedent, one genuine `and_pos`).
-                if let Some(text) = self.format_not_implies_and_pos(id, clause, &source_str) {
-                    return Some(text);
-                }
-                if let Some(ops) = split_application(&source_str, "and") {
-                    let ops_bytes: u64 = ops.iter().map(|o| o.len() as u64).sum();
-                    self.charge(ops_bytes.saturating_mul(ops.len() as u64));
-                    if self.work_budget_exhausted() {
-                        return None;
-                    }
-                    for k in n_ary_positions(ops.len()) {
-                        positional.push((
-                            ops.clone(),
-                            "and_pos",
-                            vec![Source(true), Operand(k, false)],
-                            k,
-                        ));
-                    }
-                }
-            }
             R::AndNeg => {
                 if let Some(ops) = split_application(&source_str, "and") {
                     let mut lits = vec![Source(false)];
@@ -5425,71 +5668,6 @@ fn split_single_binder_quantifier(s: &str, keyword: &str) -> Option<(String, Str
     Some((binder.clone(), body))
 }
 
-/// Split an SMT-LIB fragment into balanced top-level terms.
-fn split_smt_terms(s: &str) -> Option<Vec<String>> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut terms = Vec::new();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut index = 0usize;
-    let mut in_quoted_symbol = false;
-    let mut in_string = false;
-    while index < chars.len() {
-        let c = chars[index];
-        if in_string {
-            if c == '"' {
-                if index + 1 < chars.len() && chars[index + 1] == '"' {
-                    index += 2;
-                    continue;
-                }
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if in_quoted_symbol {
-            if c == '|' {
-                in_quoted_symbol = false;
-            }
-            index += 1;
-            continue;
-        }
-        match c {
-            '"' => {
-                start.get_or_insert(index);
-                in_string = true;
-            }
-            '|' => {
-                start.get_or_insert(index);
-                in_quoted_symbol = true;
-            }
-            '(' => {
-                start.get_or_insert(index);
-                depth += 1;
-            }
-            ')' => {
-                depth = depth.checked_sub(1)?;
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if let Some(term_start) = start.take() {
-                    terms.push(chars[term_start..index].iter().collect());
-                }
-            }
-            _ => {
-                start.get_or_insert(index);
-            }
-        }
-        index += 1;
-    }
-    if depth != 0 || in_quoted_symbol || in_string {
-        return None;
-    }
-    if let Some(term_start) = start {
-        terms.push(chars[term_start..].iter().collect());
-    }
-    Some(terms)
-}
-
 /// Replace one SMT-LIB symbol token without touching strings, quoted-symbol
 /// contents, or longer identifiers. The certified Skolem lane is restricted to
 /// quantifier-free bodies, so no nested binder can shadow the selected token.
@@ -5577,13 +5755,9 @@ fn split_not_and(s: &str) -> Option<Vec<String>> {
 /// argument strings by balanced-token scanning. Returns `None` when `s` is
 /// not an application of `op`.
 fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
-    let inner = s.strip_prefix('(')?.strip_prefix(op)?.strip_suffix(')')?;
-    // Require a token boundary after the operator (rejects e.g. `(orx ...)`
-    // when splitting on "or").
-    if !inner.starts_with(|c: char| c.is_whitespace()) {
-        return None;
-    }
-    split_sexpr_tokens(inner)
+    split_alethe_application_bounded(s, op, usize::MAX, usize::MAX)
+        .ok()
+        .map(|arguments| arguments.into_iter().map(str::to_string).collect())
 }
 
 /// Split the *body* of an s-expression into its top-level tokens by balanced
@@ -5591,40 +5765,7 @@ fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
 /// [`split_application`] no leading operator is stripped, so this also serves
 /// binding lists (`(?v_0 e0) (?v_1 e1)`). Returns `None` on unbalanced input.
 fn split_sexpr_tokens(inner: &str) -> Option<Vec<String>> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut depth = 0usize;
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in inner.chars() {
-        match c {
-            '|' => {
-                in_quote = !in_quote;
-                current.push(c);
-            }
-            _ if in_quote => current.push(c),
-            '(' => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                current.push(c);
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-    if depth != 0 || in_quote {
-        return None;
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    Some(tokens)
+    split_smt_terms(inner)
 }
 
 /// One `let` level of a printed surface term: its bindings and its body.
@@ -5866,7 +6007,7 @@ impl PrintedNesting {
                 continue;
             };
             let depth = self.path_to(node).len();
-            if best.is_none() || best.is_some_and(|(_, _, best_depth)| depth < best_depth) {
+            if best.is_none_or(|(_, _, best_depth)| depth < best_depth) {
                 best = Some((node, index, depth));
             }
         }

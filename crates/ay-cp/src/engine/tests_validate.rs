@@ -115,6 +115,36 @@ fn test_validate_accepts_cumulative_touching_intervals_6121() {
 
 #[test]
 #[cfg(debug_assertions)]
+#[should_panic(expected = "Cumulative violated")]
+fn test_validate_cumulative_uses_wide_endpoint_and_load_arithmetic() {
+    let mut engine = CpSatEngine::new();
+    let starts = [
+        const_var(&mut engine, i64::MAX),
+        const_var(&mut engine, i64::MAX),
+    ];
+    let durations = [const_var(&mut engine, 1), const_var(&mut engine, 1)];
+    let demands = [
+        const_var(&mut engine, i64::MAX),
+        const_var(&mut engine, i64::MAX),
+    ];
+    engine.debug_constraints.push(Constraint::Cumulative {
+        starts: starts.to_vec(),
+        durations: durations.to_vec(),
+        demands: demands.to_vec(),
+        capacity: i64::MAX,
+    });
+    engine.debug_validate_assignment(&[
+        (starts[0], i64::MAX),
+        (starts[1], i64::MAX),
+        (durations[0], 1),
+        (durations[1], 1),
+        (demands[0], i64::MAX),
+        (demands[1], i64::MAX),
+    ]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "Circuit violated: subcycle detected")]
 fn test_validate_catches_circuit_violation() {
     let mut engine = CpSatEngine::new();
@@ -237,5 +267,32 @@ fn test_validate_catches_diffn_violation() {
         (dx1, 2),
         (dy0, 2),
         (dy1, 2),
+    ]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Diffn violated")]
+fn test_validate_diffn_uses_wide_endpoint_arithmetic() {
+    let mut engine = CpSatEngine::new();
+    let x = [const_var(&mut engine, 1), const_var(&mut engine, 1)];
+    let y = [const_var(&mut engine, 0), const_var(&mut engine, 0)];
+    let dx = [const_var(&mut engine, i64::MAX), const_var(&mut engine, 1)];
+    let dy = [const_var(&mut engine, 1), const_var(&mut engine, 1)];
+    engine.debug_constraints.push(Constraint::Diffn {
+        x: x.to_vec(),
+        y: y.to_vec(),
+        dx: dx.to_vec(),
+        dy: dy.to_vec(),
+    });
+    engine.debug_validate_assignment(&[
+        (x[0], 1),
+        (x[1], 1),
+        (y[0], 0),
+        (y[1], 0),
+        (dx[0], i64::MAX),
+        (dx[1], 1),
+        (dy[0], 1),
+        (dy[1], 1),
     ]);
 }

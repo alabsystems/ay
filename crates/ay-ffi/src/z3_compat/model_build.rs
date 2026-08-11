@@ -92,8 +92,7 @@ pub unsafe extern "C" fn Z3_add_func_interp(
     }
     // SAFETY: `f` was null-checked; read the decl (clone) and its arity before
     // the guard (raw-pointer field reads).
-    let decl = unsafe { (*f).decl.clone() };
-    let arity = unsafe { (*f).decl.arity() } as c_uint;
+    let (decl, arity) = unsafe { ((*f).decl.clone(), (*f).decl.arity() as c_uint) };
     // SAFETY: `ffi_guard_ptr` null-checks `c` and catches panics; `m` is a
     // separate arena allocation, so `&mut *m` cannot alias `&mut Z3Context`.
     unsafe {

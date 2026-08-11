@@ -51,3 +51,26 @@ fn test_lazy_creation() {
     enc.get_or_create_ge(&mut sat, IntVarId(0), 500_000);
     assert_eq!(enc.num_literals(), 1);
 }
+
+#[test]
+fn preallocation_plan_is_checked_across_variables() {
+    let mut enc = IntegerEncoder::new();
+    enc.register_var(0, 600_000);
+    enc.register_var(0, 600_000);
+    assert!(matches!(
+        enc.preallocation_plan(),
+        Err(OrderEncodingCapacityError::LiteralLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn i64_max_domain_omits_the_unrepresentable_upper_sentinel() {
+    let mut enc = IntegerEncoder::new();
+    enc.register_var(i64::MAX - 2, i64::MAX);
+    assert_eq!(enc.preallocation_plan().unwrap(), 3);
+
+    let mut sat = SatSolver::new(0);
+    enc.try_pre_allocate_all(&mut sat).unwrap();
+    assert!(enc.lookup_ge(IntVarId(0), i64::MAX).is_some());
+    assert!(enc.lookup_le(IntVarId(0), i64::MAX).is_some());
+}

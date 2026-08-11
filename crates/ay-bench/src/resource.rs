@@ -25,6 +25,11 @@ pub(crate) const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_CORPUS_TRAVERSAL_ENTRIES: usize = 2_000_000;
 pub(crate) const MAX_CORPUS_PENDING_DIRECTORIES: usize = 100_000;
 pub(crate) const MAX_DISCOVERED_BENCHMARKS: usize = 1_000_000;
+// `Duration::from_days` is not stable/const on the workspace toolchain yet.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "the clearer day constructor is not available as a stable const fn"
+)]
 const MAX_BENCHMARK_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn monotonic_time_ns() -> Result<u64> {
@@ -1473,7 +1478,7 @@ pub(crate) struct LimitedFileCapture {
 }
 
 impl LimitedFileCapture {
-    pub fn start<R>(mut reader: R, mut output: std::fs::File, limit: u64) -> Self
+    pub(crate) fn start<R>(mut reader: R, mut output: std::fs::File, limit: u64) -> Self
     where
         R: std::io::Read + Send + 'static,
     {
@@ -1488,7 +1493,7 @@ impl LimitedFileCapture {
             let mut hasher = Sha256::new();
             let mut exceeded = false;
             let mut write_failed = false;
-            let mut chunk = [0_u8; 64 * 1024];
+            let mut chunk = vec![0_u8; 64 * 1024];
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
@@ -1534,11 +1539,11 @@ impl LimitedFileCapture {
         }
     }
 
-    pub fn breach_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn breach_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.limit_breached)
     }
 
-    pub fn finish(self) -> Result<LimitedFileOutput> {
+    pub(crate) fn finish(self) -> Result<LimitedFileOutput> {
         let (exceeded, write_failed, bytes_written, sha256) = self
             .receiver
             .recv_timeout(Duration::from_secs(5))
@@ -1554,7 +1559,7 @@ impl LimitedFileCapture {
 
 impl BoundedFileCapture {
     /// Drain a child pipe while writing/retaining at most one MiB.
-    pub fn start<R>(mut reader: R, mut evidence_file: std::fs::File) -> Self
+    pub(crate) fn start<R>(mut reader: R, mut evidence_file: std::fs::File) -> Self
     where
         R: std::io::Read + Send + 'static,
     {
@@ -1591,7 +1596,7 @@ impl BoundedFileCapture {
         Self { receiver }
     }
 
-    pub fn finish(self) -> Result<BoundedFileOutput> {
+    pub(crate) fn finish(self) -> Result<BoundedFileOutput> {
         let (bytes, truncated, failed) = self
             .receiver
             .recv_timeout(Duration::from_secs(5))
@@ -2938,7 +2943,7 @@ impl RssWatchdog {
     }
 
     /// Poll watchdog health while the guarded child is still running.
-    pub fn poll(&mut self) -> Result<Option<WatchdogOutcome>> {
+    pub(crate) fn poll(&mut self) -> Result<Option<WatchdogOutcome>> {
         self.ensure_aggregate_lease_alive()?;
         if let Some(breached) = self.terminal_breach {
             return Ok(Some(breached));
@@ -2974,7 +2979,7 @@ impl RssWatchdog {
     }
 
     /// Receive the terminal report for this registration.
-    pub fn finish(mut self) -> Result<WatchdogOutcome> {
+    pub(crate) fn finish(mut self) -> Result<WatchdogOutcome> {
         self.ensure_aggregate_lease_alive()?;
         if let Some(breached) = self.terminal_breach {
             self.target_pgid = None;

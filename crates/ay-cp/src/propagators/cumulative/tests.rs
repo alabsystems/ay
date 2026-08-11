@@ -273,3 +273,34 @@ fn test_cumulative_zero_lb_duration_skipped() {
         "zero-lb duration task should be skipped, got {result:?}"
     );
 }
+
+#[test]
+fn test_cumulative_extreme_endpoint_and_load_conflict() {
+    let mut trail = IntegerTrail::new();
+    let mut sat = SatSolver::new(0);
+    let mut encoder = IntegerEncoder::new();
+
+    // Both tasks occupy [i64::MAX, i64::MAX + 1) in mathematical time and
+    // together consume 2*i64::MAX resources. Neither total fits in i64, but
+    // the cumulative semantics and the expected conflict are unambiguous.
+    let s0 = const_var(&mut trail, i64::MAX);
+    let _ = encoder.register_var(i64::MAX, i64::MAX);
+    let s1 = const_var(&mut trail, i64::MAX);
+    let _ = encoder.register_var(i64::MAX, i64::MAX);
+    let d0 = const_var(&mut trail, 1);
+    let _ = encoder.register_var(1, 1);
+    let d1 = const_var(&mut trail, 1);
+    let _ = encoder.register_var(1, 1);
+    let r0 = const_var(&mut trail, i64::MAX);
+    let _ = encoder.register_var(i64::MAX, i64::MAX);
+    let r1 = const_var(&mut trail, i64::MAX);
+    let _ = encoder.register_var(i64::MAX, i64::MAX);
+    encoder.pre_allocate_all(&mut sat);
+
+    let mut prop = Cumulative::new(vec![s0, s1], vec![d0, d1], vec![r0, r1], i64::MAX);
+    let result = prop.propagate(&trail, &encoder);
+    assert!(
+        matches!(result, PropagationResult::Conflict(_)),
+        "wide endpoint/load arithmetic should detect overload, got {result:?}"
+    );
+}

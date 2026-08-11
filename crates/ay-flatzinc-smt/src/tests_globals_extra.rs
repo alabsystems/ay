@@ -17,6 +17,22 @@ fn translate_fzn_err(input: &str) -> TranslateError {
     translate(&model).expect_err("translation should fail")
 }
 
+fn solve_fzn_verdict(input: &str) -> String {
+    let result = translate_fzn(input);
+    let commands = ay_frontend::parse(&result.smtlib).expect("SMT-LIB should parse");
+    let mut executor = ay_dpll::Executor::new();
+    for command in &commands {
+        match executor.execute(command) {
+            Ok(Some(output)) if matches!(output.trim(), "sat" | "unsat" | "unknown") => {
+                return output.trim().to_string();
+            }
+            Ok(_) => {}
+            Err(error) => panic!("SMT execution failed before a verdict: {error}"),
+        }
+    }
+    panic!("translated model produced no solver verdict")
+}
+
 // --- Global: global_cardinality ---
 
 #[test]
@@ -190,6 +206,37 @@ fn test_lex_lesseq_int() {
     assert!(r.smtlib.contains("(and (= x_1 y_1) (= x_2 y_2))"));
 }
 
+#[test]
+fn test_lex_less_equal_prefix_uses_array_length() {
+    let shorter = translate_fzn(
+        "array [1..2] of var int: x;\n\
+         array [1..3] of var int: y;\n\
+         constraint fzn_lex_less_int(x, y);\n\
+         solve satisfy;\n",
+    );
+    assert!(shorter.smtlib.contains("(and (= x_1 y_1) (= x_2 y_2))"));
+
+    let longer = translate_fzn(
+        "array [1..3] of var int: x;\n\
+         array [1..2] of var int: y;\n\
+         constraint fzn_lex_lesseq_int(x, y);\n\
+         solve satisfy;\n",
+    );
+    assert!(!longer.smtlib.contains("(and (= x_1 y_1) (= x_2 y_2))"));
+}
+
+#[test]
+fn test_lex_less_empty_prefix_length_semantics() {
+    assert_eq!(
+        solve_fzn_verdict("constraint fzn_lex_less_int([], [1]);\nsolve satisfy;\n"),
+        "sat"
+    );
+    assert_eq!(
+        solve_fzn_verdict("constraint fzn_lex_lesseq_int([1], []);\nsolve satisfy;\n"),
+        "unsat"
+    );
+}
+
 // --- Global: bin_packing_load ---
 
 #[test]
@@ -211,6 +258,40 @@ fn test_bin_packing_load() {
     assert!(r.smtlib.contains("(assert (= load_2"));
 }
 
+#[test]
+fn test_bin_packing_load_uses_declared_load_indices_and_guards_bins() {
+    let r = translate_fzn(
+        "array [4..5] of var int: load;\n\
+         array [1..2] of var int: bin;\n\
+         array [1..2] of int: size = [3, 5];\n\
+         constraint fzn_bin_packing_load(load, bin, size);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r
+        .smtlib
+        .contains("(assert (and (>= bin_1 4) (<= bin_1 5)))"));
+    assert!(r
+        .smtlib
+        .contains("(assert (and (>= bin_2 4) (<= bin_2 5)))"));
+    assert!(r.smtlib.contains("(ite (= bin_1 4) 3 0)"));
+    assert!(r.smtlib.contains("(ite (= bin_1 5) 3 0)"));
+}
+
+#[test]
+fn test_bin_packing_load_rejects_out_of_range_bin_assignment() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [4..5] of var int: load;\n\
+             var int: bin;\n\
+             constraint fzn_bin_packing_load(load, [bin], [2]);\n\
+             constraint int_eq(bin, 3);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
+}
+
 // --- Global: subcircuit ---
 
 #[test]
@@ -225,8 +306,65 @@ fn test_subcircuit() {
     // Active tracking: succ[i] != i means active
     assert!(r.smtlib.contains("(declare-const _sc_act"));
     assert!(r.smtlib.contains("(not (= succ_1 1))"));
-    // MTZ order variables
+    // Selected-root rank variables
+    assert!(r.smtlib.contains("(declare-const _sc_root"));
     assert!(r.smtlib.contains("(declare-const _sc_ord"));
+}
+
+#[test]
+fn test_subcircuit_uses_declared_indices_and_ordinal_auxiliary_names() {
+    let r = translate_fzn(
+        "array [-1..1] of var int: succ;\n\
+         constraint fzn_subcircuit(succ);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r
+        .smtlib
+        .contains("(assert (and (>= succ_-1 (- 1)) (<= succ_-1 1)))"));
+    assert!(r.smtlib.contains("(not (= succ_-1 (- 1)))"));
+    assert!(r.smtlib.contains("(declare-const _sc_act0_0 Bool)"));
+    assert!(!r.smtlib.contains("_sc_act0_-1"));
+}
+
+#[test]
+fn test_subcircuit_accepts_cycle_excluding_first_declared_node() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [4..6] of var 4..6: succ;\n\
+             constraint int_eq(succ[4], 4);\n\
+             constraint int_eq(succ[5], 6);\n\
+             constraint int_eq(succ[6], 5);\n\
+             constraint fzn_subcircuit(succ);\n\
+             solve satisfy;\n"
+        ),
+        "sat"
+    );
+}
+
+#[test]
+fn test_subcircuit_rejects_out_of_range_successor_and_multiple_cycles() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [4..6] of var int: succ;\n\
+             constraint int_eq(succ[4], 3);\n\
+             constraint fzn_subcircuit(succ);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [4..7] of var 4..7: succ;\n\
+             constraint int_eq(succ[4], 5);\n\
+             constraint int_eq(succ[5], 4);\n\
+             constraint int_eq(succ[6], 7);\n\
+             constraint int_eq(succ[7], 6);\n\
+             constraint fzn_subcircuit(succ);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
 }
 
 // --- Global: disjunctive ---
@@ -242,6 +380,40 @@ fn test_disjunctive() {
     // s[1]+d[1] <= s[2] or s[2]+d[2] <= s[1]
     assert!(r.smtlib.contains("(<= (+ s_1 3) s_2)"));
     assert!(r.smtlib.contains("(<= (+ s_2 5) s_1)"));
+}
+
+#[test]
+fn test_disjunctive_zero_duration_differs_from_strict() {
+    let declarations = "array [1..2] of var 0..10: starts = [5, 0];\n\
+                        array [1..2] of var 0..10: durations = [0, 10];\n";
+    assert_eq!(
+        solve_fzn_verdict(&format!(
+            "{declarations}constraint disjunctive(starts, durations);\nsolve satisfy;\n"
+        )),
+        "sat"
+    );
+    assert_eq!(
+        solve_fzn_verdict(&format!(
+            "{declarations}constraint disjunctive_strict(starts, durations);\nsolve satisfy;\n"
+        )),
+        "unsat"
+    );
+}
+
+#[test]
+fn test_global_dispatch_rejects_bad_unary_arity() {
+    for constraint in [
+        "increasing_int()",
+        "increasing_int([], [])",
+        "subcircuit()",
+        "subcircuit([], [])",
+    ] {
+        let err = translate_fzn_err(&format!("constraint {constraint};\nsolve satisfy;\n"));
+        assert!(
+            matches!(err, TranslateError::WrongArgCount { expected: 1, .. }),
+            "unexpected error for {constraint}: {err}"
+        );
+    }
 }
 
 // --- Global: count variants ---
@@ -338,7 +510,74 @@ fn test_value_precede_int() {
     // Should declare seen-s tracking variables
     assert!(r.smtlib.contains("(declare-const _vp_s"));
     // First occurrence of t (=3) must be preceded by s (=1)
-    assert!(r.smtlib.contains("(=> (= x_1 3)"));
-    assert!(r.smtlib.contains("(=> (= x_2 3)"));
-    assert!(r.smtlib.contains("(=> (= x_3 3)"));
+    assert!(r.smtlib.contains("(assert (not (= x_1 3)))"));
+    assert!(r.smtlib.contains("(=> (= x_2 3) _vp_s0_0)"));
+    assert!(r.smtlib.contains("(=> (= x_3 3) _vp_s0_1)"));
+}
+
+#[test]
+fn test_value_precede_chain_encodes_each_adjacent_cover_pair() {
+    let r = translate_fzn(
+        "array [1..3] of var 1..3: x;\n\
+         constraint value_precede_chain_int([1, 2, 3], x);\n\
+         solve satisfy;\n",
+    );
+
+    assert!(r.smtlib.contains("(assert (not (= x_1 2)))"));
+    assert!(r.smtlib.contains("(assert (not (= x_1 3)))"));
+    assert!(r.smtlib.contains("(=> (= x_2 2) _vp_s0_0)"));
+    assert!(r.smtlib.contains("(=> (= x_2 3) _vp_s1_0)"));
+    assert_eq!(r.smtlib.matches("(declare-const _vp_s").count(), 6);
+}
+
+#[test]
+fn test_value_precede_chain_rejects_missing_predecessor() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [1..2] of var 1..3: x = [1, 3];\n\
+             constraint value_precede_chain_int([1, 2, 3], x);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
+    assert_eq!(
+        solve_fzn_verdict(
+            "array [1..3] of var 1..3: x = [1, 2, 3];\n\
+             constraint value_precede_chain_int([1, 2, 3], x);\n\
+             solve satisfy;\n"
+        ),
+        "sat"
+    );
+}
+
+#[test]
+fn test_value_precede_requires_a_strictly_earlier_equal_value() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "var 1..2: x = 2;\n\
+             constraint value_precede_int(2, 2, [x]);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
+    assert_eq!(
+        solve_fzn_verdict(
+            "var 1..2: x = 1;\n\
+             constraint value_precede_int(2, 2, [x]);\n\
+             solve satisfy;\n"
+        ),
+        "sat"
+    );
+}
+
+#[test]
+fn test_value_precede_chain_duplicate_cover_is_not_tautological() {
+    assert_eq!(
+        solve_fzn_verdict(
+            "var 1..2: x = 1;\n\
+             constraint value_precede_chain_int([1, 1], [x]);\n\
+             solve satisfy;\n"
+        ),
+        "unsat"
+    );
 }

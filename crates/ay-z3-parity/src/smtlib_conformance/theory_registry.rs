@@ -345,7 +345,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("theory-registry timeout must be between 1ns and 3600 seconds".to_string());
     }
     let prepared = prepare_campaign(declarations)?;
@@ -725,10 +725,10 @@ fn validate_field_shape(theory: &str, fields: &[ParsedField]) -> Result<(), Stri
         }
         match field.key.as_str() {
             ":sorts" | ":sort" | ":funs" | ":fun" => {
-                if !field
+                if field
                     .value
                     .as_ref()
-                    .is_some_and(|value| value.as_list().is_some())
+                    .is_none_or(|value| value.as_list().is_none())
                 {
                     return Err(format!(
                         "{theory} {}[{}] is not a machine declaration list",

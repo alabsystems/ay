@@ -239,6 +239,7 @@ impl Executor {
     ) -> Result<SolveResult> {
         let saved_result = self.last_result.clone();
         let saved_unknown_reason = self.last_unknown_reason;
+        let saved_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
         // #uc-minimize-proof-gate: park the entry UNSAT certificate across the
         // subset solves. Each subset solve is a full public decision that mints
         // its own one-shot certificate for a REDUCED problem; leaving that in
@@ -278,6 +279,8 @@ impl Executor {
         // 4 UC tests. Parking the entry proof restores the refutation the
         // published verdict actually rests on.
         let saved_proof = self.last_proof.take();
+        let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
+        let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
         let out = self.minimize_assumption_core_inner(combined, result, rescue_elapsed);
         // Unconditional: the take()s above must never be observable, whether or
         // not the inner pass did any work.
@@ -285,11 +288,14 @@ impl Executor {
         self.unsat_query_epoch = saved_epoch;
         self.proof_problem_assertion_provenance = saved_provenance;
         self.last_proof = saved_proof;
+        self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+        self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
         // Only restore the verdict when the pass was entered on an UNSAT (the
         // inner function is a no-op otherwise, so nothing was clobbered).
         if matches!(saved_result, Some(SolveResult::Unsat(_))) {
             self.last_result = saved_result;
             self.last_unknown_reason = saved_unknown_reason;
+            self.last_unsat_proof_reconstruction_suppressed = saved_proof_reconstruction_suppressed;
         }
         out
     }
@@ -717,7 +723,7 @@ impl Executor {
             // identical: `check-sat-assuming A` == `check-sat (base AND A)`,
             // and adoption still requires this fresh solve to return unsat.
             let scoped_engine = rescued || features.has_arrays;
-            let sub = if scoped_engine {
+            let mut sub = if scoped_engine {
                 // The scoped engine assumes a fresh per-check state (the
                 // rescue runs it exactly once per check, right after the
                 // entry reset). Repeating it WITHOUT the reset compounds
@@ -733,6 +739,37 @@ impl Executor {
             } else {
                 self.check_sat_assuming(&candidate)
             };
+            // A raw subset UNSAT is only a nomination.  This pass publishes a
+            // reduced public core, while the outer query's eventual
+            // UnsatCertificate authenticates the full original problem—not
+            // this candidate.  Recheck every prospective adoption in a
+            // disposable exact-root transaction and require its strict proof
+            // token before the subset can become authoritative.  Keeping the
+            // historical fast/incremental solve above preserves its useful
+            // SAT/Unknown behavior and core-harvest nomination; a failed strict
+            // check merely declines the reduction.
+            if matches!(sub, Ok(SolveResult::Unsat(_))) {
+                let mut obligation = base_assertions.clone();
+                obligation.extend(candidate.iter().copied());
+                let saved_attempt_deadline = self.solve_deadline.get();
+                let verification_deadline = Instant::now()
+                    .checked_add(attempt_budget)
+                    .map_or(shrink_deadline, |deadline| deadline.min(shrink_deadline));
+                self.solve_deadline.set(Some(verification_deadline));
+                let strictly_refuted = self
+                    .checked_exact_unsat_solve(
+                        obligation.clone(),
+                        u64::try_from(attempt_budget.as_millis())
+                            .unwrap_or(u64::MAX)
+                            .max(1),
+                    )
+                    .is_some_and(|checked| checked.consume(self, &obligation));
+                self.solve_deadline.set(saved_attempt_deadline);
+                if !strictly_refuted {
+                    sub = Ok(SolveResult::Unknown);
+                    self.last_assumption_core = None;
+                }
+            }
             // Adapt the headroom to the costliest attempt observed; the fuse
             // trips (after result processing — a late unsat is still a valid
             // verification) when the engine grossly ignored its per-solve

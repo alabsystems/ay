@@ -309,8 +309,12 @@ unsafe fn combine_probes(c: Z3_context, p1: Z3_probe, p2: Z3_probe, op: Cmp) -> 
     // Pre-extract the operand probes outside the guard (raw-pointer deref).
     // SAFETY: each handle, when non-null, is a live `ProbeHandle` kept in the
     // context's `probe_cache` (single-threaded per context). `as_ref` null-checks.
-    let a = unsafe { p1.as_ref() }.map(|h| h.probe.clone());
-    let b = unsafe { p2.as_ref() }.map(|h| h.probe.clone());
+    let (a, b) = unsafe {
+        (
+            p1.as_ref().map(|h| h.probe.clone()),
+            p2.as_ref().map(|h| h.probe.clone()),
+        )
+    };
 
     // SAFETY: `ffi_guard_ptr` handles a null context and catches panics.
     unsafe {
@@ -445,8 +449,12 @@ pub unsafe extern "C" fn Z3_probe_apply(c: Z3_context, p: Z3_probe, g: Z3_goal) 
     // Pre-extract the probe and the goal's formulas + depth (raw-pointer derefs).
     // SAFETY: both handles, when non-null, are arena-owned by the context and
     // single-threaded per context; `as_ref` null-checks.
-    let probe = unsafe { p.as_ref() }.map(|h| h.probe.clone());
-    let goal_data = unsafe { g.as_ref() }.map(|h| (h.formulas.clone(), h.depth));
+    let (probe, goal_data) = unsafe {
+        (
+            p.as_ref().map(|h| h.probe.clone()),
+            g.as_ref().map(|h| (h.formulas.clone(), h.depth)),
+        )
+    };
 
     // SAFETY: `ffi_guard_double` handles a null context and catches panics.
     unsafe {

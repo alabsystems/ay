@@ -37,6 +37,14 @@ use num_bigint::BigInt;
 use num_rational::{BigRational, Rational64};
 use num_traits::{One, Signed, Zero};
 
+#[path = "la_generic_surface_audit.rs"]
+mod surface_audit;
+pub use surface_audit::{
+    format_terms_alethe_with_overrides_and_canonical_bounded,
+    format_terms_alethe_with_overrides_and_canonical_bounded_with_work,
+    format_terms_alethe_with_overrides_bounded, printed_la_generic_certificate_is_valid_bounded,
+};
+
 /// A linear form over printed variable names plus a rational constant.
 #[derive(Clone, Debug, Default)]
 struct Lin {
@@ -230,8 +238,12 @@ fn parse_lin(s: &str) -> Option<Lin> {
                 } else if non_const.is_none() {
                     non_const = Some(sub);
                 } else {
-                    // Non-linear product: treat the whole term as opaque.
-                    return Some(Lin::var(s.to_string()));
+                    // A product with two symbolic factors is outside linear
+                    // arithmetic.  Do not treat it as an opaque variable:
+                    // Carcara normalizes arithmetic applications and can
+                    // reject a certificate that merely cancels the printed
+                    // non-linear syntax as though it were an EUF atom.
+                    return None;
                 }
             }
             Some(match non_const {
@@ -270,11 +282,17 @@ pub(crate) fn parse_numeric_constant(s: &str) -> Option<BigRational> {
 /// `None` for a disequality or a non-arithmetic / unparseable atom.
 fn hypothesis(printed: &str, value: bool) -> Option<(Lin, bool, bool)> {
     let mut s = printed.trim().to_string();
+    let clause_has_outer_not = value;
     let mut value = value;
+    let mut printed_nots = 0usize;
     // Strip leading `(not ...)`, flipping polarity.
     loop {
         let parts = split_sexpr(&s)?;
         if parts.len() == 2 && parts[0] == "not" {
+            printed_nots += 1;
+            if printed_nots + usize::from(clause_has_outer_not) > 1 {
+                return None;
+            }
             s = parts[1].clone();
             value = !value;
         } else {
@@ -330,6 +348,17 @@ fn coeffs_valid(hyps: &[(Lin, bool, bool)], coeffs: &[Rational64]) -> bool {
     }
     sum.coeffs.is_empty()
         && (sum.constant < BigRational::zero() || (sum.constant.is_zero() && has_strict))
+}
+
+/// Return whether a printed literal has a directly checkable linear-arithmetic
+/// surface shape for `la_generic`.
+///
+/// This applies the same parser used for final printed-certificate replay and
+/// rejects nonlinear products, disequalities, and excess leading negations.
+#[must_use]
+pub fn printed_linear_arithmetic_literal_is_supported(printed: &str) -> bool {
+    surface_audit::printed_atom_is_bounded(printed)
+        && (hypothesis(printed, false).is_some() || hypothesis(printed, true).is_some())
 }
 
 /// Choose the coefficient vector to PRINT for an Alethe `la_generic` step whose

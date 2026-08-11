@@ -92,11 +92,16 @@ pub(crate) fn run(args: &AllSatArgs) -> Result<()> {
     // ay-allsat's Internal backend uses 1-indexed variables matching DIMACS,
     // so we can pass the projected variables through unchanged.
     let mut solver = AllSatSolver::new();
+    solver
+        .try_ensure_num_vars(formula.num_vars)
+        .context("DIMACS variable count is unsupported by AllSAT")?;
     for clause in formula.clauses {
         // AllSatSolver::add_clause takes a SignedClause (Vec<i32>), so we map
         // each Literal through its DIMACS representation.
         let signed: Vec<i32> = clause.iter().map(|lit| lit.to_dimacs()).collect();
-        solver.add_clause(signed);
+        solver
+            .try_add_clause(signed)
+            .context("DIMACS clause is unsupported by AllSAT")?;
     }
 
     let max_solutions = if args.max_models == 0 {
@@ -132,17 +137,25 @@ pub(crate) fn run(args: &AllSatArgs) -> Result<()> {
             println!();
         }
         first = false;
-        print_solution(&solution, &print_vars);
-        count += 1;
+        print_solution(&solution, &print_vars)?;
+        count = count
+            .checked_add(1)
+            .context("model count exceeds u64::MAX")?;
     }
     // After full consumption of the iterator, stats.outcome reflects whether
     // enumeration terminated naturally (Exhaustive) or hit the cap (Capped).
     let outcome_str = match solver.stats().outcome {
         AllSatOutcome::Exhaustive => "exhaustive",
         AllSatOutcome::Capped => "capped",
-        // AllSatOutcome is #[non_exhaustive]; treat unknown variants as
-        // exhaustive so tooling never sees a misleading "capped" label.
-        _ => "exhaustive",
+        AllSatOutcome::SolverUnknown => "solver-unknown",
+        AllSatOutcome::InvalidInput => "invalid-input",
+        AllSatOutcome::CallbackStopped => "callback-stopped",
+        AllSatOutcome::IteratorDropped => "iterator-dropped",
+        AllSatOutcome::CountOverflow => "count-overflow",
+        AllSatOutcome::InProgress => "in-progress",
+        // AllSatOutcome is non-exhaustive. A future termination reason must
+        // never be mislabeled as an exhaustive enumeration.
+        _ => "incomplete",
     };
     if !first {
         println!();
@@ -156,11 +169,21 @@ pub(crate) fn run(args: &AllSatArgs) -> Result<()> {
 ///
 /// Variables are rendered as `x<N>` where `<N>` is the 1-indexed DIMACS
 /// variable number. Each variable is declared as a `Bool` with `true`/`false`.
-fn print_solution(solution: &Solution, vars: &[u32]) {
+fn print_solution(solution: &Solution, vars: &[u32]) -> Result<()> {
+    let values = vars
+        .iter()
+        .map(|&variable| {
+            solution
+                .is_true(variable)
+                .map(|value| (variable, value))
+                .with_context(|| format!("solver model omitted variable x{variable}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     println!("(model");
-    for &v in vars {
-        let value = solution.is_true(v);
-        println!("  (define-fun x{v} () Bool {value})");
+    for (variable, value) in values {
+        println!("  (define-fun x{variable} () Bool {value})");
     }
     println!(")");
+    Ok(())
 }

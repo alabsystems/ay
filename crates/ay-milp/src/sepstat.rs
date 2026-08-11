@@ -639,7 +639,7 @@ pub fn dump() {
     // beside it because a magnitude without a population cannot be read at all:
     // one row here was 468 of its 473 hits from a single LP.
     let mut ranked = gate_report();
-    ranked.sort_by(|a, b| b.2.cmp(&a.2));
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     for (site, hits, cost, solves) in ranked {
         eprintln!(
             "FORGONE gate              cost={cost:<12} hits={hits:<8} solves={solves:<5} {}  [{}]",

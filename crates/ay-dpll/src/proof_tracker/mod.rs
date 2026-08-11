@@ -55,8 +55,8 @@ mod tests;
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
 use ay_core::{
-    AletheRule, FarkasAnnotation, Proof, ProofId, Sort, Symbol, TermId, TermStore, TheoryLemmaKind,
-    TheoryLit,
+    AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId, TermStore,
+    TheoryLemmaKind, TheoryLit,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,6 +64,29 @@ struct LemmaKey {
     kind: TheoryLemmaKind,
     clause: Vec<TermId>,
     farkas: Option<Vec<(i64, i64)>>,
+}
+
+/// Opaque snapshot for a speculative proof-tracking window.
+///
+/// Proof steps and the tracker's deduplication/scope metadata form one ledger:
+/// rolling back only `Proof::steps` would leave `ProofId`s that can alias later
+/// steps. Keep the snapshot private so callers can only restore the coherent
+/// step/map/scope ledger through [`ProofTracker::rollback_to`]. A ledger
+/// replacement is detected and reported because the moved proof may have
+/// escaped to another artifact.
+#[derive(Debug, Clone)]
+pub(crate) struct ProofTrackerCheckpoint {
+    steps: Vec<ProofStep>,
+    ledger_epoch: u64,
+    assumption_map: HashMap<TermId, ProofId>,
+    lemma_map: HashMap<LemmaKey, ProofId>,
+    named_steps: HashMap<String, ProofId>,
+    scope_stack: Vec<usize>,
+    scope_assumption_maps: Vec<HashMap<TermId, ProofId>>,
+    scope_lemma_maps: Vec<HashMap<LemmaKey, ProofId>>,
+    scope_named_steps: Vec<HashMap<String, ProofId>>,
+    enabled: bool,
+    theory_name: String,
 }
 
 impl LemmaKey {
@@ -116,6 +139,17 @@ pub(crate) struct ProofTracker {
     theory_name: String,
     /// Scope stack for incremental push/pop (stores proof step watermarks)
     scope_stack: Vec<usize>,
+    /// Exact map snapshots paired with `scope_stack`. A scoped insertion can
+    /// alias an older `ProofId` without adding a step, so an ID cutoff alone
+    /// cannot identify everything that push/pop must remove.
+    scope_assumption_maps: Vec<HashMap<TermId, ProofId>>,
+    scope_lemma_maps: Vec<HashMap<LemmaKey, ProofId>>,
+    scope_named_steps: Vec<HashMap<String, ProofId>>,
+    /// Changes whenever the proof ledger is moved/replaced. Ordinary
+    /// truncation is exactly reversible because checkpoints own the complete
+    /// retained step/map/scope prefix; a moved proof may have escaped and is
+    /// therefore reported rather than reconstructed.
+    ledger_epoch: u64,
 }
 
 impl ProofTracker {
@@ -129,6 +163,10 @@ impl ProofTracker {
             enabled: false,
             theory_name: "UNKNOWN".to_string(),
             scope_stack: Vec::new(),
+            scope_assumption_maps: Vec::new(),
+            scope_lemma_maps: Vec::new(),
+            scope_named_steps: Vec::new(),
+            ledger_epoch: 0,
         }
     }
 
@@ -151,6 +189,26 @@ impl ProofTracker {
     /// Set the theory name for subsequent theory lemmas
     pub(crate) fn set_theory(&mut self, theory: impl Into<String>) {
         self.theory_name = theory.into();
+    }
+
+    fn advance_ledger_epoch(&mut self) {
+        self.ledger_epoch = self
+            .ledger_epoch
+            .checked_add(1)
+            .expect("proof tracker ledger epoch exhausted");
+    }
+
+    fn clear_scope_ledger_snapshots(&mut self) {
+        self.scope_stack.fill(0);
+        for map in &mut self.scope_assumption_maps {
+            map.clear();
+        }
+        for map in &mut self.scope_lemma_maps {
+            map.clear();
+        }
+        for map in &mut self.scope_named_steps {
+            map.clear();
+        }
     }
 
     /// Record an assumption (input assertion)
@@ -737,7 +795,7 @@ impl ProofTracker {
             }
             substitution.insert(name.clone(), value);
         }
-        if crate::ematching::subst_vars(terms, body, &substitution) != instance {
+        if crate::ematching::subst_vars_exact_qf(terms, body, &substitution)? != instance {
             return None;
         }
 
@@ -762,6 +820,79 @@ impl ProofTracker {
         self.lemma_map
             .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None))
             .or_insert(unit);
+
+        // If the exact instance is itself arithmetically impossible, close the
+        // refutation here before downstream ground preprocessing can fold it to
+        // the unauthored constant `false`.  The shared independent Farkas
+        // verifier is the authority: unsupported/nonlinear instances simply
+        // skip this optimization and keep the derived unit above.
+        let complement = match terms.get(instance) {
+            TermData::Not(inner) => *inner,
+            _ => terms.mk_not_raw(instance),
+        };
+        let conflict_lit = match terms.get(complement) {
+            TermData::Not(inner) => TheoryLit::new(*inner, true),
+            _ => TheoryLit::new(complement, false),
+        };
+        let farkas = FarkasAnnotation::from_ints(&[1]);
+        let closed_by_farkas = if ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+            terms,
+            &[conflict_lit],
+            &farkas,
+        )
+        .is_ok()
+        {
+            if let Some(negated_unit) = self.add_theory_lemma_with_farkas_and_kind(
+                vec![complement],
+                farkas,
+                TheoryLemmaKind::LraFarkas,
+            ) {
+                self.proof
+                    .add_resolution(Vec::new(), instance, unit, negated_unit);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !closed_by_farkas && ay_proof::recognize_ground_evaluate(terms, complement) {
+            // Alethe's `evaluate` concludes an equality to a concrete value,
+            // not the evaluated Boolean literal directly.  Derive the literal
+            // from `(= complement true)` with the primitive equivalence and
+            // true rules so the internal checker and Carcara see the same
+            // certificate shape.
+            let truth = terms.true_term();
+            let evaluation = terms.mk_app(Symbol::named("="), [complement, truth], Sort::Bool);
+            let evaluated = self.proof.add_rule_step(
+                AletheRule::Evaluate,
+                vec![evaluation],
+                Vec::new(),
+                Vec::new(),
+            );
+            let not_evaluation = terms.mk_not_raw(evaluation);
+            let not_truth = terms.mk_not_raw(truth);
+            let equivalence = self.proof.add_rule_step(
+                AletheRule::EquivPos1,
+                vec![not_evaluation, complement, not_truth],
+                Vec::new(),
+                Vec::new(),
+            );
+            let truth_unit =
+                self.proof
+                    .add_rule_step(AletheRule::True, vec![truth], Vec::new(), Vec::new());
+            let implication = self.proof.add_resolution(
+                vec![not_evaluation, complement],
+                truth,
+                equivalence,
+                truth_unit,
+            );
+            let negated_unit =
+                self.proof
+                    .add_resolution(vec![complement], evaluation, evaluated, implication);
+            self.proof
+                .add_resolution(Vec::new(), instance, unit, negated_unit);
+        }
         Some(unit)
     }
 
@@ -809,67 +940,12 @@ impl ProofTracker {
             }
             substitution.insert(name.clone(), value);
         }
-        if crate::ematching::subst_vars(terms, normalized_body, &substitution) != instance {
+        if crate::ematching::subst_vars_exact_qf(terms, normalized_body, &substitution)? != instance
+        {
             return None;
         }
 
-        // Rebuild the authored body without any simplifying constructors. The
-        // strict forall_inst checker independently performs the same exact,
-        // simultaneous substitution and rejects nested binders/lets.
-        fn substitute_exact(
-            terms: &mut TermStore,
-            term: TermId,
-            substitution: &HashMap<String, TermId>,
-            work: &mut usize,
-        ) -> Option<TermId> {
-            const WORK_LIMIT: usize = 100_000;
-            if *work >= WORK_LIMIT {
-                return None;
-            }
-            *work += 1;
-            stacker::maybe_grow(32 * 1024, 1024 * 1024, || match terms.get(term).clone() {
-                TermData::Var(name, _) => Some(*substitution.get(&name).unwrap_or(&term)),
-                TermData::Const(..) => Some(term),
-                TermData::App(symbol, args) => {
-                    let sort = terms.sort(term).clone();
-                    let rewritten: Vec<TermId> = args
-                        .iter()
-                        .copied()
-                        .map(|arg| substitute_exact(terms, arg, substitution, work))
-                        .collect::<Option<_>>()?;
-                    if rewritten == args {
-                        Some(term)
-                    } else {
-                        Some(terms.mk_app(symbol, rewritten, sort))
-                    }
-                }
-                TermData::Not(inner) => {
-                    let rewritten = substitute_exact(terms, inner, substitution, work)?;
-                    if rewritten == inner {
-                        Some(term)
-                    } else {
-                        Some(terms.mk_not_raw(rewritten))
-                    }
-                }
-                TermData::Ite(cond, then_branch, else_branch) => {
-                    let rewritten_cond = substitute_exact(terms, cond, substitution, work)?;
-                    let rewritten_then = substitute_exact(terms, then_branch, substitution, work)?;
-                    let rewritten_else = substitute_exact(terms, else_branch, substitution, work)?;
-                    if (rewritten_cond, rewritten_then, rewritten_else)
-                        == (cond, then_branch, else_branch)
-                    {
-                        Some(term)
-                    } else {
-                        Some(terms.mk_ite_raw(rewritten_cond, rewritten_then, rewritten_else))
-                    }
-                }
-                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => None,
-                _ => None,
-            })
-        }
-
-        let mut work = 0usize;
-        let raw_instance = substitute_exact(terms, body, &substitution, &mut work)?;
+        let raw_instance = crate::ematching::subst_vars_exact_qf(terms, body, &substitution)?;
         let TermData::App(Symbol::Named(raw_name), raw_args) = terms.get(raw_instance).clone()
         else {
             return None;
@@ -901,7 +977,7 @@ impl ProofTracker {
                     _ => TheoryLit::new(literal, false),
                 })
                 .collect();
-            ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            ay_core::proof_validation::verify_farkas_conflict_lits_linear(
                 terms,
                 &conflict,
                 &annotation,
@@ -1110,7 +1186,7 @@ impl ProofTracker {
                     _ => TheoryLit::new(literal, false),
                 })
                 .collect();
-            ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            ay_core::proof_validation::verify_farkas_conflict_lits_linear(
                 terms,
                 &conflict,
                 &annotation,
@@ -1307,7 +1383,8 @@ impl ProofTracker {
         let proof = std::mem::take(&mut self.proof);
         self.assumption_map.clear();
         self.lemma_map.clear();
-        self.scope_stack.fill(0);
+        self.clear_scope_ledger_snapshots();
+        self.advance_ledger_epoch();
         proof
     }
 
@@ -1315,6 +1392,98 @@ impl ProofTracker {
     #[must_use]
     pub(crate) fn num_steps(&self) -> usize {
         self.proof.len()
+    }
+
+    /// Capture a coherent proof-ledger snapshot for speculative work.
+    #[must_use]
+    pub(crate) fn rollback_checkpoint(&self) -> ProofTrackerCheckpoint {
+        ProofTrackerCheckpoint {
+            steps: self.proof.steps.clone(),
+            ledger_epoch: self.ledger_epoch,
+            assumption_map: self.assumption_map.clone(),
+            lemma_map: self.lemma_map.clone(),
+            named_steps: self.proof.named_steps.clone(),
+            scope_stack: self.scope_stack.clone(),
+            scope_assumption_maps: self.scope_assumption_maps.clone(),
+            scope_lemma_maps: self.scope_lemma_maps.clone(),
+            scope_named_steps: self.scope_named_steps.clone(),
+            enabled: self.enabled,
+            theory_name: self.theory_name.clone(),
+        }
+    }
+
+    /// Restore non-positional tracker configuration without changing steps.
+    ///
+    /// This is used only by a fail-safe lane that deliberately retains a
+    /// speculative ledger (and therefore its terms) while still restoring the
+    /// enclosing solve's configuration for subsequent proof producers.
+    pub(crate) fn restore_checkpoint_metadata(&mut self, checkpoint: &ProofTrackerCheckpoint) {
+        self.enabled = checkpoint.enabled;
+        self.theory_name.clone_from(&checkpoint.theory_name);
+    }
+
+    /// Discard every proof artifact added after `checkpoint`.
+    ///
+    /// Besides proof steps, this truncates all maps containing positional
+    /// `ProofId`s and drops nested scopes opened by the discarded work.  The
+    /// retained scope snapshots are restored with the ledger.
+    ///
+    /// Returns `true` when the original ledger was still present and its
+    /// prefix was restored exactly. A `false` return means the speculative
+    /// work replaced/moved the ledger; the replacement ledger is cleared to
+    /// prevent `ProofId` aliasing. Because the moved proof may have escaped to
+    /// another artifact, callers that pair this with a `TermStore` rollback
+    /// must retain the terms on `false`.
+    #[must_use]
+    pub(crate) fn rollback_to(&mut self, checkpoint: ProofTrackerCheckpoint) -> bool {
+        let same_ledger = checkpoint.ledger_epoch == self.ledger_epoch;
+        if same_ledger {
+            self.proof.steps.clone_from(&checkpoint.steps);
+        } else {
+            // The entry ledger was moved/reset during the speculative window.
+            // Every step in the replacement ledger is post-checkpoint.
+            self.proof.steps.clear();
+        }
+
+        if same_ledger {
+            self.assumption_map.clone_from(&checkpoint.assumption_map);
+            self.lemma_map.clone_from(&checkpoint.lemma_map);
+            self.proof.named_steps.clone_from(&checkpoint.named_steps);
+            self.scope_stack.clone_from(&checkpoint.scope_stack);
+            self.scope_assumption_maps
+                .clone_from(&checkpoint.scope_assumption_maps);
+            self.scope_lemma_maps
+                .clone_from(&checkpoint.scope_lemma_maps);
+            self.scope_named_steps
+                .clone_from(&checkpoint.scope_named_steps);
+        } else {
+            self.assumption_map.clear();
+            self.lemma_map.clear();
+            self.proof.named_steps.clear();
+            self.scope_stack = vec![0; checkpoint.scope_stack.len()];
+            self.scope_assumption_maps = vec![HashMap::default(); checkpoint.scope_stack.len()];
+            self.scope_lemma_maps = vec![HashMap::default(); checkpoint.scope_stack.len()];
+            self.scope_named_steps = vec![HashMap::default(); checkpoint.scope_stack.len()];
+        }
+        self.restore_checkpoint_metadata(&checkpoint);
+        if !same_ledger {
+            self.advance_ledger_epoch();
+        }
+        same_ledger
+    }
+
+    /// Whether a producer has already closed an explicit proof dependency
+    /// cone. This is only a cheap prefilter: callers must still run the strict
+    /// authored-scope checker before treating the derivation as verdict
+    /// authority.
+    #[must_use]
+    pub(crate) fn has_empty_clause_derivation(&self) -> bool {
+        self.proof.steps.iter().any(|step| match step {
+            ProofStep::Resolution { clause, .. } | ProofStep::Step { clause, .. } => {
+                clause.is_empty()
+            }
+            _ => false,
+        })
     }
 
     /// Reset proof content for a new solving session without clearing scope state.
@@ -1326,9 +1495,10 @@ impl ProofTracker {
         self.proof = Proof::new();
         self.assumption_map.clear();
         self.lemma_map.clear();
+        self.advance_ledger_epoch();
         // Scope stack preserved — push/pop balance maintained across check-sat calls.
         // Update watermarks to point into the now-empty proof.
-        self.scope_stack.fill(0);
+        self.clear_scope_ledger_snapshots();
         // Keep enabled state and theory name
     }
 }
@@ -1338,6 +1508,9 @@ impl crate::incremental_state::IncrementalSubsystem for ProofTracker {
     /// will be removed by the matching `pop()`.
     fn push(&mut self) {
         self.scope_stack.push(self.proof.steps.len());
+        self.scope_assumption_maps.push(self.assumption_map.clone());
+        self.scope_lemma_maps.push(self.lemma_map.clone());
+        self.scope_named_steps.push(self.proof.named_steps.clone());
     }
 
     /// Restore to the last `push()` checkpoint: remove all proof steps,
@@ -1345,14 +1518,18 @@ impl crate::incremental_state::IncrementalSubsystem for ProofTracker {
     /// Returns false if no matching push exists.
     fn pop(&mut self) -> bool {
         if let Some(watermark) = self.scope_stack.pop() {
+            let assumption_map = self.scope_assumption_maps.pop().unwrap_or_default();
+            let lemma_map = self.scope_lemma_maps.pop().unwrap_or_default();
+            let named_steps = self.scope_named_steps.pop().unwrap_or_default();
             self.proof.steps.truncate(watermark);
-            // Remove map entries whose ProofId points beyond the watermark
-            let cutoff = watermark as u32;
-            self.assumption_map.retain(|_, id| id.0 < cutoff);
-            self.lemma_map.retain(|_, id| id.0 < cutoff);
-            self.proof.named_steps.retain(|_, id| id.0 < cutoff);
+            self.assumption_map = assumption_map;
+            self.lemma_map = lemma_map;
+            self.proof.named_steps = named_steps;
             true
         } else {
+            debug_assert!(self.scope_assumption_maps.is_empty());
+            debug_assert!(self.scope_lemma_maps.is_empty());
+            debug_assert!(self.scope_named_steps.is_empty());
             false
         }
     }
@@ -1363,6 +1540,10 @@ impl crate::incremental_state::IncrementalSubsystem for ProofTracker {
         self.assumption_map.clear();
         self.lemma_map.clear();
         self.scope_stack.clear();
+        self.scope_assumption_maps.clear();
+        self.scope_lemma_maps.clear();
+        self.scope_named_steps.clear();
+        self.advance_ledger_epoch();
         // Keep enabled state and theory name
     }
 }
@@ -1383,6 +1564,12 @@ impl ProofTracker {
     /// (callers treat that as a balanced no-op; the extension always pairs
     /// one `push()` with exactly one `pop()`-or-commit).
     pub(crate) fn commit_speculative_scope(&mut self) -> bool {
-        self.scope_stack.pop().is_some()
+        let committed = self.scope_stack.pop().is_some();
+        if committed {
+            let _ = self.scope_assumption_maps.pop();
+            let _ = self.scope_lemma_maps.pop();
+            let _ = self.scope_named_steps.pop();
+        }
+        committed
     }
 }

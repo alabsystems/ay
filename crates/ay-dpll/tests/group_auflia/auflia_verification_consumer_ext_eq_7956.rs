@@ -87,13 +87,13 @@ const QUANTIFIER_CONSUMER_SINGLETON_PREFIX_ARRAY_EXT_EQ: &str = r#"
 "#;
 
 #[test]
-fn test_quantifier_consumer_singleton_prefix_array_ext_eq_preconditions_sat() {
+fn test_quantifier_consumer_singleton_prefix_array_ext_eq_preconditions_fail_closed() {
     let smt = format!("{QUANTIFIER_CONSUMER_SINGLETON_PREFIX_ARRAY_EXT_EQ}\n(check-sat)\n");
     let result = run_executor_smt_with_timeout(&smt, 20).expect("execution should succeed");
     assert_eq!(
         result,
-        SolverOutcome::Sat,
-        "singleton-prefix array ext_eq preconditions must stay SAT"
+        SolverOutcome::Unknown,
+        "singleton-prefix array ext_eq preconditions lack a total quantified model certificate"
     );
 }
 
@@ -101,12 +101,52 @@ fn test_quantifier_consumer_singleton_prefix_array_ext_eq_preconditions_sat() {
 fn test_quantifier_consumer_singleton_prefix_array_ext_eq_proves_first_element() {
     let smt =
         format!("{QUANTIFIER_CONSUMER_SINGLETON_PREFIX_ARRAY_EXT_EQ}\n(assert (not (= v 42)))\n(check-sat)\n");
-    let result = run_executor_smt_with_timeout(&smt, 20).expect("execution should succeed");
-    assert_eq!(
-        result,
-        SolverOutcome::Unsat,
-        "singleton-prefix array ext_eq should prove v equals vec[0]"
-    );
+    // The former private 2s acceptance deadline produced, in six release runs
+    // of this exact query, `unknown unknown unknown unsat unsat unsat` depending
+    // only on machine load. Keep one debug run for suite cost, but replay the
+    // measured six-run release profile so a hidden wall-clock publication gate
+    // cannot return unnoticed.
+    let runs = if cfg!(debug_assertions) { 1 } else { 6 };
+    for run in 1..=runs {
+        let commands = ay_frontend::parse(&smt).expect("proof-mode #7956 input must parse");
+        let mut executor = ay_dpll::Executor::new();
+        executor.set_produce_proofs(true);
+        executor.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        ));
+        executor.set_memory_limit(Some(8 << 30));
+        let output = executor
+            .execute_all(&commands)
+            .expect("proof-mode #7956 execution should succeed");
+        let result = output
+            .iter()
+            .find(|line| matches!(line.trim(), "sat" | "unsat" | "unknown"))
+            .map(|line| SolverOutcome::from_output_line(line))
+            .unwrap_or(SolverOutcome::Unknown);
+        assert_eq!(
+            result,
+            SolverOutcome::Unsat,
+            "singleton-prefix array ext_eq should prove v equals vec[0] \
+             deterministically (run {run}/{runs})"
+        );
+        let alethe = executor
+            .try_export_last_proof_alethe_for_problem_scope()
+            .expect("proof-mode #7956 UNSAT must retain a proof")
+            .expect("proof-mode #7956 Alethe export must succeed");
+        assert!(
+            !alethe.contains(":rule trust") && !alethe.contains(":rule hole"),
+            "#7956 proof must contain no unchecked rule (run {run}/{runs}): {alethe}"
+        );
+        assert!(
+            alethe.contains(":rule arrays_idx")
+                && alethe.contains(":rule la_generic")
+                && alethe.contains(":rule cong")
+                && alethe.contains(":rule implies_pos"),
+            "#7956 proof must externally certify ROW1, its surface-index bridge, \
+             and the authored implication \
+             (run {run}/{runs}): {alethe}"
+        );
+    }
 }
 
 /// Exact verification-consumer ext_eq encoding: Tseitin Bool variable with three axioms,
@@ -185,26 +225,24 @@ const QUANTIFIER_CONSUMER_EXT_EQ_TSEITIN: &str = r#"
 (check-sat)
 "#;
 
-/// #7956: The core verification-consumer ext_eq encoding must return SAT.
-///
-/// Asserts SAT, not merely "did not error". The weaker `!Error` form passed
-/// VACUOUSLY for as long as this file existed, because a `Timeout` is not an
-/// `Error` — the solve was in fact diverging and the green tick hid it. It now
-/// genuinely answers `sat` (~15s), so pin that.
+/// #7956: the core verification-consumer ext_eq encoding has a known SAT witness
+/// (`v = 42`, `len(vec) = 1`), but its triggerless quantified ext-equality
+/// currently has no total materialized and rechecked model. The generic
+/// UF-completion shape shortcut is not SAT authority, so AY must fail closed.
 #[test]
-fn test_quantifier_consumer_ext_eq_tseitin_not_false_unsat_7956() {
+fn test_quantifier_consumer_ext_eq_tseitin_fails_closed_without_total_model_7956() {
     let result = run_executor_smt_with_timeout(QUANTIFIER_CONSUMER_EXT_EQ_TSEITIN, 60)
         .expect("execution should succeed");
     assert_eq!(
         result,
-        SolverOutcome::Sat,
-        "#7956: verification-consumer ext_eq Tseitin encoding must be SAT (v=42, len(vec)=1)"
+        SolverOutcome::Unknown,
+        "#7956: the SAT instance must remain fail-closed without a total-model certificate"
     );
 }
 
 /// Variant with push/pop refutation proof (verification-consumer's primary usage pattern).
 /// First check: negate v==42 (should be UNSAT because it IS provable).
-/// Second check: just the SAT formula (should be SAT).
+/// Second check: the semantically SAT formula may fail closed to UNKNOWN.
 const QUANTIFIER_CONSUMER_EXT_EQ_PUSH_POP: &str = r#"
 (set-logic AUFLIA)
 
@@ -284,11 +322,12 @@ const QUANTIFIER_CONSUMER_EXT_EQ_PUSH_POP: &str = r#"
 
 /// #7956: Push/pop refutation proof pattern must work correctly.
 /// First check-sat should be UNSAT (v==42 is provable, so not(v==42) is UNSAT).
-/// Second check-sat should be SAT (preconditions are satisfiable).
+/// Second check-sat is satisfiable but may be UNKNOWN without a total model.
 ///
 /// Note: `run_executor_smt_with_timeout` returns the FIRST check-sat result,
-/// so we verify the refutation proof (UNSAT) here. The SAT check is covered
-/// by `test_quantifier_consumer_ext_eq_tseitin_not_false_unsat_7956`.
+/// so we verify only the refutation proof (UNSAT) here. The fail-closed
+/// satisfiable check is covered by
+/// `test_quantifier_consumer_ext_eq_tseitin_fails_closed_without_total_model_7956`.
 #[test]
 fn test_quantifier_consumer_ext_eq_push_pop_refutation_7956() {
     let result = run_executor_smt_with_timeout(QUANTIFIER_CONSUMER_EXT_EQ_PUSH_POP, 60)
@@ -366,29 +405,21 @@ const QUANTIFIER_CONSUMER_EXT_EQ_EMPTY_NEXT: &str = r#"
 (check-sat)
 "#;
 
-/// #7956 variant: ext_eq with an empty `next` sequence must return SAT.
+/// #7956 variant: ext_eq with an empty `next` sequence is satisfiable, but AY
+/// must fail closed until it constructs and rechecks a total quantified model.
 ///
-/// Asserts SAT, not merely "did not error". The weak `!Error` gate this used to
-/// carry passed VACUOUSLY for the file's whole existence, because a **Timeout is
-/// not an Error** — the solve was in fact diverging and the green tick hid it.
-///
-/// It diverged because the pointwise `forall` was instantiated lazily forever,
-/// even though it is FINITE: its guard is `(and (>= i 0) (< i (seq_len vec)))`
-/// and the problem ENTAILS `seq_len vec = 1`
-/// (= len(concat(singleton(v), seq_empty)) = 1 + 0), so `i` ranges over exactly
-/// {0}. Two bugs kept that from being seen — see #nnf-trap (the guard disjuncts
-/// arrive as BARE comparisons, so the `Not(..)`-only matcher found no guard at
-/// all and bounded-Int expansion never fired for this shape) and
-/// #entailed-bound-expansion (the bound is a ground TERM, not a literal, and is
-/// now DERIVED solve-free). Now: sat in ~0.01s.
+/// The guard entails the finite range `{0}`, so bounded instantiation can cover
+/// the pointwise obligation. That still does not construct a total shared model
+/// for every surrounding sequence helper axiom, so the final SAT side is kept
+/// fail-closed rather than relying on per-axiom syntax.
 #[test]
-fn test_quantifier_consumer_ext_eq_empty_next_7956() {
+fn test_quantifier_consumer_ext_eq_empty_next_fails_closed_7956() {
     let result = run_executor_smt_with_timeout(QUANTIFIER_CONSUMER_EXT_EQ_EMPTY_NEXT, 60)
         .expect("execution should succeed");
     assert_eq!(
         result,
-        SolverOutcome::Sat,
-        "#7956 variant: ext_eq with empty next must be SAT (v=42, len(vec)=1)"
+        SolverOutcome::Unknown,
+        "#7956 variant: ext_eq with empty next lacks a total quantified model certificate"
     );
 }
 
@@ -453,17 +484,15 @@ const QUANTIFIER_CONSUMER_EXT_EQ_WITH_TRIGGERS: &str = r#"
 (check-sat)
 "#;
 
-/// #7956 variant: ext_eq with explicit triggers must return SAT.
-///
-/// Pinned to SAT rather than `!Error` for the same reason as the Tseitin case:
-/// `!Error` accepts a Timeout and therefore cannot detect a divergence.
+/// #7956 variant with explicit triggers remains satisfiable, but trigger
+/// coverage alone is not a total-model certificate.
 #[test]
-fn test_quantifier_consumer_ext_eq_with_triggers_7956() {
+fn test_quantifier_consumer_ext_eq_with_triggers_fails_closed_7956() {
     let result = run_executor_smt_with_timeout(QUANTIFIER_CONSUMER_EXT_EQ_WITH_TRIGGERS, 60)
         .expect("execution should succeed");
     assert_eq!(
         result,
-        SolverOutcome::Sat,
-        "#7956 variant: ext_eq with triggers must be SAT"
+        SolverOutcome::Unknown,
+        "#7956 variant: ext_eq triggers do not establish a total model"
     );
 }

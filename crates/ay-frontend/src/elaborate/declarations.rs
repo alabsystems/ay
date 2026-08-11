@@ -122,19 +122,20 @@ impl Context {
         self.reject_unrepresentable_overload(IntroKind::Declare, name)?;
         let public_sort = self.elaborate_public_sort(sort)?;
         let sort = self.elaborate_sort(sort)?;
-        let internal_name = self.ordinary_declaration_internal_name(name);
+        let internal_name = self.ordinary_source_binding_internal_name(name);
         let term_name = internal_name.as_deref().unwrap_or(name);
         let term = self.mk_declared_const_term(term_name, &sort, None);
         self.register_overloadable_symbol(
             name.to_string(),
-            SymbolInfo {
-                term: Some(term),
+            SymbolInfo::fresh_direct_source_declaration(
+                Some(term),
                 sort,
-                arg_sorts: vec![],
+                vec![],
                 public_sort,
-                public_arg_sorts: vec![],
+                vec![],
                 internal_name,
-            },
+                super::DeclarationKind::Uninterpreted,
+            ),
         );
         // A USER declaration always wins over a colliding solver-internal
         // registration: it must never be model-suppressed
@@ -337,14 +338,15 @@ impl Context {
                                 self.track_scoped_symbol(&field_name);
                                 self.symbols.insert(
                                     field_name.clone(),
-                                    SymbolInfo {
-                                        term: Some(field_term),
-                                        sort: field_sort.clone(),
-                                        arg_sorts: vec![],
-                                        public_sort: super::PublicSort::from_engine(field_sort),
-                                        public_arg_sorts: vec![],
-                                        internal_name: None,
-                                    },
+                                    SymbolInfo::fresh(
+                                        Some(field_term),
+                                        field_sort.clone(),
+                                        vec![],
+                                        super::PublicSort::from_engine(field_sort),
+                                        vec![],
+                                        None,
+                                        super::DeclarationKind::SolverInternal,
+                                    ),
                                 );
                                 // Solver-internal, NOT user-declared: `(get-model)`
                                 // must not print it (#mv-internal-symbol-suppression).
@@ -450,7 +452,7 @@ impl Context {
             )));
         }
 
-        let internal_name = self.ordinary_declaration_internal_name(name);
+        let internal_name = self.ordinary_source_binding_internal_name(name);
 
         // If no arguments, it's a constant — apply the same eager single-
         // constructor datatype elimination as declare-const.
@@ -473,14 +475,19 @@ impl Context {
 
         self.register_overloadable_symbol(
             name.to_string(),
-            SymbolInfo {
+            SymbolInfo::fresh_direct_source_declaration(
                 term,
-                sort: ret_sort,
+                ret_sort,
                 arg_sorts,
                 public_sort,
                 public_arg_sorts,
                 internal_name,
-            },
+                if declaration_activated {
+                    super::DeclarationKind::Theory
+                } else {
+                    super::DeclarationKind::Uninterpreted
+                },
+            ),
         );
         // A USER declaration always wins over a colliding solver-internal
         // registration (#mv-internal-symbol-suppression).
@@ -623,22 +630,31 @@ impl Context {
             (params.clone(), ret_sort.clone(), body.clone()),
         );
 
-        // Also add to symbol table
+        // Also add the definition's signature to the symbol table. Definitions
+        // remain keyed by their SURFACE name in `fun_defs`, so ordinary uses
+        // still macro-expand above declared-application dispatch. The symbol
+        // metadata nevertheless needs the same private core identity as a
+        // declaration when the surface spelling is also a builtin map target:
+        // downstream identity/provenance checks must never see a non-theory
+        // owner at the canonical `div`/`mod`/`and`/... identity.
         let arg_sorts: Vec<Sort> = params.iter().map(|(_, s)| s.clone()).collect();
+        let internal_name = self.ordinary_source_binding_internal_name(name);
         self.track_scoped_symbol(name);
         self.symbols.insert(
             name.to_string(),
-            SymbolInfo {
-                term: None,
-                sort: ret_sort,
+            SymbolInfo::fresh(
+                None,
+                ret_sort,
                 arg_sorts,
                 public_sort,
                 public_arg_sorts,
-                internal_name: None,
-            },
+                internal_name,
+                super::DeclarationKind::Defined,
+            ),
         );
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
+        self.advance_source_revision();
         Ok(())
     }
 
@@ -679,18 +695,26 @@ impl Context {
 
         // For recursive functions, add to symbol table first so body can reference the function
         let arg_sorts: Vec<Sort> = params.iter().map(|(_, s)| s.clone()).collect();
+        // `fun_defs` is intentionally not installed until the recursive body
+        // validates, so a recursive call encountered during validation is a
+        // declared application. Give that temporary application the same
+        // private identity that the completed definition advertises. Keeping
+        // lookup keyed by the surface name still preserves recursive macro
+        // expansion after the definition is committed.
+        let internal_name = self.ordinary_source_binding_internal_name(name);
         let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
         self.track_scoped_symbol(name);
         let previous_symbol = self.symbols.insert(
             name.to_string(),
-            SymbolInfo {
-                term: None,
-                sort: ret_sort.clone(),
+            SymbolInfo::fresh(
+                None,
+                ret_sort.clone(),
                 arg_sorts,
                 public_sort,
                 public_arg_sorts,
-                internal_name: None,
-            },
+                internal_name,
+                super::DeclarationKind::Defined,
+            ),
         );
 
         let validation = self
@@ -721,6 +745,8 @@ impl Context {
 
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
+
+        self.advance_source_revision();
 
         Ok(())
     }
@@ -813,25 +839,48 @@ impl Context {
             ));
         }
 
+        // Every fallible signature elaboration is complete before identities
+        // are claimed. As with the single recursive form, these identities are
+        // needed while validating bodies because `fun_defs` is installed only
+        // after all mutually recursive bodies pass. Surface-name lookup remains
+        // unchanged, so committed peer calls still expand recursively.
+        let elaborated_decls: Vec<_> = elaborated_decls
+            .into_iter()
+            .map(|(name, params, ret_sort, public_arg_sorts, public_sort)| {
+                let internal_name = self.ordinary_source_binding_internal_name(&name);
+                (
+                    name,
+                    params,
+                    ret_sort,
+                    public_arg_sorts,
+                    public_sort,
+                    internal_name,
+                )
+            })
+            .collect();
+
         // First commit phase: register all signatures so mutually recursive
         // bodies resolve every peer. Preserve the exact state needed to undo a
         // later body-validation error, including the current scope's lazy
         // symbol snapshots.
         let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
         let mut previous_symbols: Vec<(String, Option<SymbolInfo>)> = Vec::new();
-        for (name, params, ret_sort, public_arg_sorts, public_sort) in &elaborated_decls {
+        for (name, params, ret_sort, public_arg_sorts, public_sort, internal_name) in
+            &elaborated_decls
+        {
             let arg_sorts: Vec<Sort> = params.iter().map(|(_, sort)| sort.clone()).collect();
             self.track_scoped_symbol(name);
             let previous = self.symbols.insert(
                 name.clone(),
-                SymbolInfo {
-                    term: None,
-                    sort: ret_sort.clone(),
+                SymbolInfo::fresh(
+                    None,
+                    ret_sort.clone(),
                     arg_sorts,
-                    public_sort: public_sort.clone(),
-                    public_arg_sorts: public_arg_sorts.clone(),
-                    internal_name: None,
-                },
+                    public_sort.clone(),
+                    public_arg_sorts.clone(),
+                    internal_name.clone(),
+                    super::DeclarationKind::Defined,
+                ),
             );
             previous_symbols.push((name.clone(), previous));
         }
@@ -856,7 +905,7 @@ impl Context {
         }
 
         let validation = elaborated_decls.iter().zip(bodies.iter()).try_for_each(
-            |((_name, params, ret_sort, _, _), body)| {
+            |((_name, params, ret_sort, _, _, _), body)| {
                 self.validate_defined_function_body(params, ret_sort, body)
             },
         );
@@ -875,7 +924,7 @@ impl Context {
         }
 
         // Second pass: store all function definitions
-        for ((name, params, ret_sort, _, _), body) in
+        for ((name, params, ret_sort, _, _, _), body) in
             elaborated_decls.into_iter().zip(bodies.iter())
         {
             self.fun_defs
@@ -887,6 +936,7 @@ impl Context {
             self.track_scoped_fun_def(name.clone());
         }
 
+        self.advance_source_revision();
         Ok(())
     }
 }

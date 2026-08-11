@@ -77,6 +77,24 @@ fn fallible_solves_and_composite_operations_preserve_the_single_query_contract()
     );
     assert!(!dump.exists());
 
+    // Handle authentication precedes the exporter rejection. A foreign term
+    // must not let this composite API clear or replace an existing artifact as
+    // a side effect of discovering the invalid capability.
+    let mut foreign = Solver::new(Logic::QfBv);
+    let foreign_bool = foreign.bool_const(true);
+    write_stale();
+    assert!(matches!(
+        solver.synthesize_patch(x_is_one, &[foreign_bool]),
+        Err(SolverError::InvalidTermHandle {
+            operation: "synthesize_patch",
+            ..
+        })
+    ));
+    assert_eq!(
+        std::fs::read(&dump).expect("invalid-handle path preserves artifact"),
+        b"STALE\n"
+    );
+
     write_stale();
     assert_artifact_error(solver.try_minimize_model(), "try_minimize_model");
     assert!(!dump.exists());

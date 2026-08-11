@@ -881,7 +881,7 @@ fn validate_snapshot(snapshot: &Z3SourceSnapshot, profile: &Profile) -> Result<(
             .ok_or_else(|| format!("selected file {} is absent from full tree", file.path))?;
         if file.git_blob != entry.git_blob
             || file.size != entry.size
-            || file.content.as_bytes().len() != file.size
+            || file.content.len() != file.size
             || file.content_sha256 != sha256_bytes(file.content.as_bytes())
             || file.git_blob != git_blob_sha1(file.content.as_bytes())
         {
@@ -924,8 +924,7 @@ fn validate_snapshot(snapshot: &Z3SourceSnapshot, profile: &Profile) -> Result<(
             || line_number
                 .parse::<usize>()
                 .ok()
-                .filter(|line| *line > 0)
-                .is_none()
+                .is_none_or(|line| line == 0)
             || text.is_empty()
         {
             return Err(format!(
@@ -1083,7 +1082,11 @@ fn registration_disposition(path: &str, text: &str) -> Result<&'static str, Stri
     if path.starts_with("src/test/") {
         return Ok("nonobservable.internal-test-only");
     }
-    if path.ends_with("CMakeLists.txt") || path.ends_with(".yml") {
+    if path.ends_with("CMakeLists.txt")
+        || Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("yml"))
+    {
         return Ok("nonobservable.build-metadata");
     }
     if text.contains("ADD_TACTIC(\"") {
@@ -1122,11 +1125,11 @@ fn registration_disposition(path: &str, text: &str) -> Result<&'static str, Stri
     {
         return Ok("observable.command-registry-anchor");
     }
-    if path.ends_with(".h")
-        || path.ends_with(".def")
-        || path.ends_with(".pyg")
-        || path.ends_with(".in")
-    {
+    if Path::new(path).extension().is_some_and(|extension| {
+        ["h", "def", "pyg", "in"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    }) {
         return Ok("nonobservable.internal-declaration-or-schema-plumbing");
     }
     Ok("nonobservable.internal-implementation-reference")
@@ -1221,7 +1224,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3_600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("Z3 source-inventory timeout must be between 1ns and 3600 seconds".to_string());
     }
     validate_snapshot(snapshot, &contract.profile)?;
@@ -1247,8 +1250,7 @@ fn execute(
     .map_err(|error| error.to_string())?;
     if required_envelope.is_some_and(|expected| expected != resource_envelope) {
         return Err(format!(
-            "live Z3 source-inventory resource envelope drift: expected {:?}, got {:?}",
-            required_envelope, resource_envelope
+            "live Z3 source-inventory resource envelope drift: expected {required_envelope:?}, got {resource_envelope:?}"
         ));
     }
 
@@ -1768,13 +1770,10 @@ fn parse_command_help(output: &str) -> Result<BTreeMap<String, String>, String> 
             .or_else(|| line.strip_prefix(" ("));
         let Some(rest) = rest else { continue };
         let end = rest
-            .find(|character: char| character == ' ' || character == ')')
+            .find([' ', ')'])
             .ok_or("Z3 command help line has no command terminator")?;
         let name = &rest[..end];
-        let detail = line
-            .trim_start_matches(|character| character == '\"' || character == ' ')
-            .trim()
-            .to_string();
+        let detail = line.trim_start_matches(['\"', ' ']).trim().to_string();
         if commands.insert(name.to_string(), detail).is_some() {
             return Err(format!("duplicate live Z3 command {name}"));
         }

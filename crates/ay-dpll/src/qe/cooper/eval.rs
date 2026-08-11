@@ -4,7 +4,7 @@
 
 //! A small, self-contained ground evaluator for quantifier-free LIA terms.
 //!
-//! This is the independent oracle used by the soundness self-check. It is
+//! This is the independent oracle used by the bounded differential check. It is
 //! deliberately separate from the production theory solver: keeping the checker
 //! independent of the procedure it validates is what makes the gate meaningful.
 //!
@@ -13,7 +13,7 @@
 //! variables (looked up in a provided assignment), `+ - * div mod` over
 //! integers, the comparisons `= < <= > >= distinct`, and the boolean
 //! connectives `and or not =>` and `ite`. Anything else makes evaluation return
-//! [`EvalResult::Unknown`], which the self-check treats as a failure (so an
+//! [`EvalResult::Unknown`], which the differential check treats as a failure (so an
 //! unrecognized shape can never be silently accepted).
 
 use ay_core::term::{Constant, Symbol, TermData};

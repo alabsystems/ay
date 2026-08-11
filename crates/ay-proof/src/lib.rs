@@ -69,7 +69,9 @@ pub use alethe_parser::{
     check_alethe_document, checkable_rule_names, AletheDefect, AletheDocumentChecker,
     AletheDocumentReport, AletheSelfCheckWriter, Pos as AlethePos, ProblemScope,
 };
-pub use alethe_printer::AlethePrintError;
+pub use alethe_printer::{
+    split_alethe_application_bounded, AlethePrintError, AletheSurfaceParseError,
+};
 pub use bundle::{
     re_check_bundle_strict, render_term_canonical, BundleReCheck, SerializableProofBundle,
     PROOF_BUNDLE_SCHEMA,
@@ -86,8 +88,7 @@ pub use bv_blast_solver::{
     BvSolvedExportError, SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
-pub use checker::recognize_fp_forward_error;
-pub use checker::recognize_fp_rounding_mode_domain;
+pub use checker::recognize_ground_evaluate;
 pub use checker::recognize_ite_same;
 pub use checker::recognize_nra_interval_unsat;
 pub use checker::recognize_nra_univariate_unsat;
@@ -97,8 +98,13 @@ pub use checker::recognize_rounding_mode_domain;
 pub use checker::recognize_string_ground_eval;
 pub use checker::recognize_string_length_lemma;
 pub use checker::{
-    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
-    recognize_bv_ground_evaluate, MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+    authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
+    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+};
+pub use checker::{
+    authenticate_bv_lia_unsat_query, AuthenticatedBvLiaUnsatQuery, BvLiaUnsatAuthenticationError,
 };
 pub use checker::{
     check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,
@@ -114,11 +120,20 @@ pub use checker::{
     recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
 };
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
+pub use checker::{
+    recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_rounding_mode_domain,
+};
+pub use la_generic_signs::*;
 pub use partial::{check_proof_partial, PartialProofCheck};
 pub use quality::{
+    authenticate_premise_clauses_strict_with_context,
+    authenticate_premise_clauses_strict_with_context_and_progress,
+    authenticate_premise_clauses_with_deferred_generic_theory_and_progress,
     check_proof_partial_with_quality, check_proof_strict, check_proof_strict_with_context,
-    check_proof_strict_with_datatypes, check_proof_strict_with_datatypes_and_selectors,
-    check_proof_with_quality, validate_array_extensionality_provenance, ProofQuality,
+    check_proof_strict_with_context_and_progress, check_proof_strict_with_datatypes,
+    check_proof_strict_with_datatypes_and_selectors, check_proof_with_quality,
+    validate_array_extensionality_provenance, AuthenticatedPremiseClauses,
+    PremiseClausesWithDeferredGeneric, ProofQuality,
 };
 pub use terminal_trust::{
     terminal_trust_report, terminal_trust_report_with_provenance, TerminalTrustReport,
@@ -163,6 +178,21 @@ impl From<SymbolSortConflict> for AlethePrintError {
 #[must_use]
 pub fn format_term_alethe(terms: &TermStore, term: TermId) -> String {
     AlethePrinter::new(terms).format_term(term)
+}
+
+/// Render one term with the same source-syntax override table used by Alethe
+/// proof export.
+///
+/// Certificate producers that synthesize a larger surface term around an
+/// existing proof argument must use this function so substituted arguments
+/// have exactly the spelling the proof printer will emit.
+#[must_use]
+pub fn format_term_alethe_with_overrides(
+    terms: &TermStore,
+    term: TermId,
+    overrides: &ay_core::kani_compat::DetHashMap<TermId, String>,
+) -> String {
+    AlethePrinter::new_with_overrides(terms, Some(overrides)).format_term(term)
 }
 
 /// Export a proof to Alethe format.
@@ -323,12 +353,14 @@ pub fn try_export_alethe_with_problem_scope_and_overrides(
 /// (#A2b).
 ///
 /// `work_budget` caps the printer's rendering work (abstract units, roughly
-/// bytes touched). Pass `Some(..)` ONLY for the synthesized-default
-/// certificate: the by-default `<input>.alethe` must never trade a fast
-/// UNSAT verdict for minutes of proof materialization (QF_ALIA pp-family:
-/// 2s solves whose emission ground 300s+ without completing). Explicit
-/// `--proof` / `--strict-proofs` / `--self-check` / `(get-proof)` exports
-/// must pass `None`.
+/// bytes touched). Pass `Some(..)` only for the synthesized-default
+/// certificate, or for an explicitly requested finite-enum certificate whose
+/// exact proof, source assumptions, query epoch, and resource envelope were
+/// independently checked and sealed by the caller. The by-default
+/// `<input>.alethe` must never trade a fast UNSAT verdict for minutes of proof
+/// materialization (QF_ALIA pp-family: 2s solves whose emission ground 300s+
+/// without completing). Other explicit `--proof` / `--strict-proofs` /
+/// `--self-check` / `(get-proof)` exports must pass `None`.
 ///
 /// # Errors
 ///
@@ -529,9 +561,9 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
     // already wired at `crates/ay/src/run.rs` behind `AY_PROOF_SELF_CHECK` and
     // default-OFF because its false-reject rate over the corpus is measured,
     // not proved. Making it default-ON is a separate, measured decision.
-    let (definitions, defined) = if definitions.is_empty() {
-        (definitions, defined)
-    } else if skolem_definition_preamble_resolves(&definitions, terms, problem_assertions) {
+    let (definitions, defined) = if definitions.is_empty()
+        || skolem_definition_preamble_resolves(&definitions, terms, problem_assertions)
+    {
         (definitions, defined)
     } else {
         (Vec::new(), HashSet::default())
@@ -581,6 +613,7 @@ pub fn validate_reachable_assumes_in_problem_scope(
     proof: &Proof,
     problem_assertions: &[TermId],
 ) -> Result<(), AlethePrintError> {
+    let problem_assertions: HashSet<TermId> = problem_assertions.iter().copied().collect();
     let mut reachable = vec![false; proof.steps.len()];
     let mut stack = Vec::new();
     for (index, step) in proof.steps.iter().enumerate() {

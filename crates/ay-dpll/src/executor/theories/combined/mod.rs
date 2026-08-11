@@ -3064,12 +3064,6 @@ impl Executor {
         self.read_pin_repair_done = false;
         self.sat_validated_by_mod_div_or_branch = false;
 
-        if let Some(result) = self.try_sat_via_quantifier_consumer_completion_preprocess()? {
-            self.mod_div_or_branch_rescue_depth -= 1;
-            self.ctx.assertions = saved_assertions;
-            return Ok(Some(result));
-        }
-
         let result = self.solve_auf_lia();
         self.mod_div_or_branch_rescue_depth -= 1;
         self.ctx.assertions = saved_assertions;
@@ -3715,7 +3709,7 @@ impl Executor {
         self.read_pin_repair_done = false;
         self.sat_validated_by_mod_div_or_branch = false;
 
-        if let Some(result) = self.try_sat_via_quantifier_consumer_completion_preprocess()? {
+        if let Some(result) = self.try_unsat_via_quantifier_consumer_completion_preprocess()? {
             self.mod_div_or_branch_rescue_depth -= 1;
             return Ok(Some(result));
         }
@@ -3751,7 +3745,11 @@ impl Executor {
         }
     }
 
-    fn try_sat_via_quantifier_consumer_completion_preprocess(
+    /// Run QuantifierConsumer-specific preprocessing only as a consequence-preserving
+    /// refutation probe. Syntactic "completion support" is not a SAT
+    /// certificate: it constructs no total interpretation and model/cost
+    /// filtering may have omitted quantified instances.
+    fn try_unsat_via_quantifier_consumer_completion_preprocess(
         &mut self,
     ) -> Result<Option<SolveResult>> {
         let (preprocessed_assertions, _, _) =
@@ -3764,75 +3762,7 @@ impl Executor {
         if self.assertion_window_has_completion_forced_false(&preprocessed_assertions) {
             return Ok(Some(SolveResult::unsat()));
         }
-        let features =
-            crate::features::StaticFeatures::collect(&self.ctx.terms, &preprocessed_assertions);
-        let all_assertions_supported = preprocessed_assertions.iter().copied().all(|assertion| {
-            self.quantifier_consumer_ground_assertion_supported_by_completion(assertion)
-        });
-        if features.has_int_div_mod {
-            // #symbolic-mod-uf-empty-model — never claim a SYMBOLIC-divisor
-            // window.
-            //
-            // The `Sat` below is granted on this function's admission
-            // certificate: `quantifier_consumer_ground_assertion_supported_by_completion`
-            // says model completion is FREE to choose values for the
-            // completable UF applications. It then installs a Model with EVERY
-            // field empty and never performs that completion. For a
-            // CONSTANT-divisor window the certificate is discharged downstream;
-            // for a symbolic divisor nothing can discharge it, because
-            // `preprocess_auflia_*` runs only
-            // `eliminate_int_mod_div_by_constant` and no solver ever runs on
-            // this route (measured on `(= (f k2) (mod (g k2) d))`:
-            // `:decisions 0`, `:num-vars 0`, term count 8 in and 8 out).
-            //
-            // So the certificate is unbacked and only the mandatory independent
-            // gate stood between it and a published wrong answer — the
-            // #quantifier_consumer-arith hazard `mbqi.rs` already names. Declining lets the
-            // window fall through to the honest `unsupported arithmetic` bail,
-            // where the NIA re-route can decide it for real.
-            //
-            // Tested on `preprocessed_assertions`, NOT `self.ctx.assertions`: a
-            // divisor that is symbolic in the source but constant-folds during
-            // preprocessing (`(= n 8)` … `(mod (g k) n)`) is eliminated here and
-            // must keep its current decision. Reading the pre-preprocessing
-            // window instead cost a sibling attempt a measured 3/3 `unsat` ->
-            // `unknown` regression on exactly that idiom.
-            if crate::executor::mod_div_elim::contains_symbolic_int_mod_div(
-                &self.ctx.terms,
-                &preprocessed_assertions,
-            ) {
-                return Ok(None);
-            }
-            if features.has_seq_ops
-                || !all_assertions_supported
-                || self.has_forced_concrete_quantifier_consumer_mod_contradiction()
-            {
-                return Ok(None);
-            }
-        } else if !all_assertions_supported {
-            return Ok(None);
-        }
-
-        self.last_model = Some(Model {
-            sat_model: Vec::new(),
-            term_to_var: HashMap::default(),
-            bool_overrides: HashMap::default(),
-            euf_model: None,
-            array_model: None,
-            lra_model: None,
-            lia_model: None,
-            bv_model: None,
-            fp_model: None,
-            string_model: None,
-            seq_model: None,
-            completed_values: HashMap::default(),
-            dt_ground: HashMap::default(),
-            dt_pins: HashMap::default(),
-        });
-        self.last_model_validated = false;
-        self.sat_validated_by_mod_div_or_branch = true;
-        self.last_unknown_reason = None;
-        Ok(Some(SolveResult::Sat))
+        Ok(None)
     }
 
     pub(in crate::executor) fn assertions_have_simple_int_contradiction(
@@ -5648,10 +5578,15 @@ impl Executor {
         }
         let saved_proof_tracker = std::mem::replace(&mut self.proof_tracker, verifier_tracker);
         let saved_last_proof = self.last_proof.take();
+        let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
+        let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
+        let saved_proof_reconstruction_suppressed =
+            std::mem::replace(&mut self.last_unsat_proof_reconstruction_suppressed, false);
         let saved_last_lrat_certificate = self.last_lrat_certificate.take();
         let saved_last_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_last_proof_quality = self.last_proof_quality.take();
         let saved_last_clause_trace = self.last_clause_trace.take();
+        let saved_last_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_last_var_to_term = self.last_var_to_term.take();
         let saved_last_trail_provenance = self.last_trail_provenance.take();
         let saved_last_negations = self.last_negations.take();
@@ -5685,10 +5620,14 @@ impl Executor {
         self.last_statistics = saved_statistics;
         self.proof_tracker = saved_proof_tracker;
         self.last_proof = saved_last_proof;
+        self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+        self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+        self.last_unsat_proof_reconstruction_suppressed = saved_proof_reconstruction_suppressed;
         self.last_lrat_certificate = saved_last_lrat_certificate;
         self.last_proof_term_overrides = saved_last_proof_term_overrides;
         self.last_proof_quality = saved_last_proof_quality;
         self.last_clause_trace = saved_last_clause_trace;
+        self.last_checked_sat_refutation = saved_last_checked_sat_refutation;
         self.last_var_to_term = saved_last_var_to_term;
         self.last_trail_provenance = saved_last_trail_provenance;
         self.last_negations = saved_last_negations;
@@ -6635,10 +6574,15 @@ impl Executor {
         }
         let saved_proof_tracker = std::mem::replace(&mut self.proof_tracker, auxiliary_tracker);
         let saved_last_proof = self.last_proof.take();
+        let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
+        let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
+        let saved_proof_reconstruction_suppressed =
+            std::mem::replace(&mut self.last_unsat_proof_reconstruction_suppressed, false);
         let saved_last_lrat_certificate = self.last_lrat_certificate.take();
         let saved_last_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_last_proof_quality = self.last_proof_quality.take();
         let saved_last_clause_trace = self.last_clause_trace.take();
+        let saved_last_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_last_var_to_term = self.last_var_to_term.take();
         let saved_last_trail_provenance = self.last_trail_provenance.take();
         let saved_last_negations = self.last_negations.take();
@@ -6688,9 +6632,11 @@ impl Executor {
                 // SAT trace and LRAT bytes certify a different CNF, so they
                 // cannot accompany the original problem artifact.
                 self.rescope_store_flat_row_proof_to_problem(&proof_export_scope);
+                self.clear_finite_enum_proof_state();
                 self.last_lrat_certificate = None;
                 self.last_proof_quality = None;
                 self.last_clause_trace = None;
+                self.last_checked_sat_refutation = None;
                 self.last_var_to_term = None;
                 self.last_trail_provenance = None;
                 self.last_negations = None;
@@ -6715,10 +6661,15 @@ impl Executor {
                 self.last_result = saved_result;
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
                 self.last_proof = saved_last_proof;
+                self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+                self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+                self.last_unsat_proof_reconstruction_suppressed =
+                    saved_proof_reconstruction_suppressed;
                 self.last_lrat_certificate = saved_last_lrat_certificate;
                 self.last_proof_term_overrides = saved_last_proof_term_overrides;
                 self.last_proof_quality = saved_last_proof_quality;
                 self.last_clause_trace = saved_last_clause_trace;
+                self.last_checked_sat_refutation = saved_last_checked_sat_refutation;
                 self.last_var_to_term = saved_last_var_to_term;
                 self.last_trail_provenance = saved_last_trail_provenance;
                 self.last_negations = saved_last_negations;
@@ -6738,10 +6689,15 @@ impl Executor {
                 self.last_result = saved_result;
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
                 self.last_proof = saved_last_proof;
+                self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
+                self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+                self.last_unsat_proof_reconstruction_suppressed =
+                    saved_proof_reconstruction_suppressed;
                 self.last_lrat_certificate = saved_last_lrat_certificate;
                 self.last_proof_term_overrides = saved_last_proof_term_overrides;
                 self.last_proof_quality = saved_last_proof_quality;
                 self.last_clause_trace = saved_last_clause_trace;
+                self.last_checked_sat_refutation = saved_last_checked_sat_refutation;
                 self.last_var_to_term = saved_last_var_to_term;
                 self.last_trail_provenance = saved_last_trail_provenance;
                 self.last_negations = saved_last_negations;
@@ -6771,12 +6727,12 @@ impl Executor {
     /// the set under the membership test and under both cardinality bounds --
     /// without it this would licence `x in s => |t| >= 1` for an unrelated `t`.
     pub(in crate::executor) fn is_set_card_member_lower_bound_axiom(
-        terms: &ay_core::TermStore,
+        terms: &TermStore,
         term: TermId,
     ) -> bool {
         use ay_core::{Constant, TermData};
 
-        fn membership_set(terms: &ay_core::TermStore, term: TermId) -> Option<TermId> {
+        fn membership_set(terms: &TermStore, term: TermId) -> Option<TermId> {
             let TermData::App(operator, args) = terms.get(term) else {
                 return None;
             };
@@ -6787,7 +6743,7 @@ impl Executor {
             }
         }
 
-        fn card_bounded_by(terms: &ay_core::TermStore, term: TermId, bound: i64) -> Option<TermId> {
+        fn card_bounded_by(terms: &TermStore, term: TermId, bound: i64) -> Option<TermId> {
             let TermData::App(comparison, comparison_args) = terms.get(term) else {
                 return None;
             };
@@ -6822,13 +6778,10 @@ impl Executor {
     /// Mirrors the strict checker's schema, including that a `const-array`
     /// fill must be `false`: a `true` fill is the UNIVERSAL set, whose
     /// cardinality is the index sort's size.
-    pub(in crate::executor) fn is_set_card_empty_axiom(
-        terms: &ay_core::TermStore,
-        term: TermId,
-    ) -> bool {
+    pub(in crate::executor) fn is_set_card_empty_axiom(terms: &TermStore, term: TermId) -> bool {
         use ay_core::{Constant, TermData};
 
-        fn syntactically_empty(terms: &ay_core::TermStore, term: TermId) -> bool {
+        fn syntactically_empty(terms: &TermStore, term: TermId) -> bool {
             let TermData::App(operator, args) = terms.get(term) else {
                 return false;
             };
@@ -6871,12 +6824,12 @@ impl Executor {
     /// element, so counting them separately would licence a bound the set does
     /// not have.
     pub(in crate::executor) fn is_set_card_member_count_axiom(
-        terms: &ay_core::TermStore,
+        terms: &TermStore,
         term: TermId,
     ) -> bool {
         use ay_core::{Constant, TermData};
 
-        fn member_index(terms: &ay_core::TermStore, term: TermId) -> Option<(TermId, TermId)> {
+        fn member_index(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
             let TermData::App(operator, args) = terms.get(term) else {
                 return None;
             };
@@ -6887,7 +6840,7 @@ impl Executor {
             }
         }
 
-        fn leaf_bound(terms: &ay_core::TermStore, term: TermId, count: usize) -> Option<TermId> {
+        fn leaf_bound(terms: &TermStore, term: TermId, count: usize) -> Option<TermId> {
             let TermData::App(comparison, comparison_args) = terms.get(term) else {
                 return None;
             };
@@ -6908,11 +6861,11 @@ impl Executor {
         }
 
         fn walk(
-            terms: &ay_core::TermStore,
+            terms: &TermStore,
             node: TermId,
             set: TermId,
             card: &mut Option<TermId>,
-            path: &mut Vec<num_bigint::BigInt>,
+            path: &mut Vec<BigInt>,
         ) -> bool {
             let TermData::Ite(condition, then_branch, else_branch) = terms.get(node) else {
                 let Some(bounded) = leaf_bound(terms, node, path.len()) else {
@@ -6959,10 +6912,7 @@ impl Executor {
     /// is the CHECKER's business, decided against a registry built from the
     /// problem's top-level asserted equalities; classifying here merely routes
     /// the step to that check instead of leaving it an unexaminable `Trust`.
-    pub(in crate::executor) fn is_set_card_zero_axiom(
-        terms: &ay_core::TermStore,
-        term: TermId,
-    ) -> bool {
+    pub(in crate::executor) fn is_set_card_zero_axiom(terms: &TermStore, term: TermId) -> bool {
         use ay_core::{Constant, TermData};
 
         let TermData::App(equality, equality_args) = terms.get(term) else {
@@ -6984,7 +6934,7 @@ impl Executor {
     }
 
     pub(in crate::executor) fn is_set_card_non_negative_axiom(
-        terms: &ay_core::TermStore,
+        terms: &TermStore,
         term: TermId,
     ) -> bool {
         use ay_core::{Constant, Symbol, TermData};
@@ -7016,6 +6966,7 @@ impl Executor {
     fn rescope_store_flat_row_proof_to_problem(&mut self, problem_assertions: &[TermId]) {
         use ay_core::{AletheRule, ProofStep, TheoryLemmaKind};
 
+        self.clear_finite_enum_proof_state();
         let Some(mut proof) = self.last_proof.take() else {
             return;
         };
@@ -7103,7 +7054,7 @@ impl Executor {
             )
             && !assertion_window_has_top_level_not(&self.ctx.terms, &self.ctx.assertions)
         {
-            if let Some(result) = self.try_sat_via_quantifier_consumer_completion_preprocess()? {
+            if let Some(result) = self.try_unsat_via_quantifier_consumer_completion_preprocess()? {
                 return Ok(result);
             }
         }
@@ -7193,7 +7144,7 @@ impl Executor {
             if let Some(result) = self.try_sat_via_mod_free_or_branch()? {
                 return Ok(result);
             }
-            if let Some(result) = self.try_sat_via_quantifier_consumer_completion_preprocess()? {
+            if let Some(result) = self.try_unsat_via_quantifier_consumer_completion_preprocess()? {
                 return Ok(result);
             }
             // #symbolic-mod-uf-empty-model — LAST RESORT, on the bail only.
@@ -8271,6 +8222,7 @@ mod nested_row_refutation_state_tests {
                 TheoryLemmaKind::ArraySelectStore { index_eq: true },
             )
             .expect("proof tracking is enabled");
+        exec.last_unsat_proof_reconstruction_suppressed = true;
 
         assert!(!exec.sat_validated_by_mod_div_or_branch);
         let result = exec
@@ -8282,6 +8234,10 @@ mod nested_row_refutation_state_tests {
         assert!(
             !exec.sat_validated_by_mod_div_or_branch,
             "a discarded private solve must not authorize the outer SAT path"
+        );
+        assert!(
+            exec.last_unsat_proof_reconstruction_suppressed,
+            "a discarded private solve must restore the outer proof-authority marker"
         );
         assert_eq!(
             exec.proof_tracker.num_steps(),
@@ -8320,6 +8276,7 @@ mod post_split_verify_tests {
         let mut outer_negations = HashMap::default();
         outer_negations.insert(outer_lemma, outer_negation);
         exec.last_negations = Some(outer_negations.clone());
+        exec.last_unsat_proof_reconstruction_suppressed = true;
         let contradiction = exec.ctx.terms.false_term();
 
         assert!(
@@ -8335,6 +8292,10 @@ mod post_split_verify_tests {
             exec.last_negations,
             Some(outer_negations),
             "the nested verifier must not consume the outer SAT negation map"
+        );
+        assert!(
+            exec.last_unsat_proof_reconstruction_suppressed,
+            "the nested verifier must restore the outer proof-authority marker"
         );
         let proof = exec.proof_tracker.take_proof();
         assert!(matches!(

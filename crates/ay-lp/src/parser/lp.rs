@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::error::LpError;
 use crate::model::{Constraint, Problem, RowKind, VarKind, Variable};
+use crate::parser::checked_finite_add;
 use crate::parser::lp_tok::{tokenize, Section, SpannedTok, Tok};
 
 /// Parses a CPLEX LP file into a [`Problem`].
@@ -29,6 +30,13 @@ struct LpParser {
     pos: usize,
     problem: Problem,
     col_index: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Comparator {
+    Le,
+    Ge,
+    Eq,
 }
 
 impl LpParser {
@@ -108,9 +116,10 @@ impl LpParser {
             }
         }
         let terms = self.parse_expression_until_header()?;
-        let _ = hdr_line; // line kept for potential error reporting
         for (var_idx, coeff) in terms {
-            self.problem.variables[var_idx].obj_coeff += coeff;
+            let current = self.problem.variables[var_idx].obj_coeff;
+            self.problem.variables[var_idx].obj_coeff =
+                checked_finite_add(current, coeff, hdr_line, "objective coefficient sum")?;
         }
         Ok(())
     }
@@ -126,6 +135,7 @@ impl LpParser {
     }
 
     fn parse_constraint(&mut self) -> Result<(), LpError> {
+        let constraint_line = self.tokens.get(self.pos).map_or(0, |token| token.line);
         // Optional name:
         let name = if let (Some(a), Some(b)) =
             (self.tokens.get(self.pos), self.tokens.get(self.pos + 1))
@@ -143,13 +153,13 @@ impl LpParser {
 
         // Parse LHS expression until a comparator.
         let (lhs, op) = self.parse_lhs_until_op()?;
+        let lhs = aggregate_constraint_terms(lhs, constraint_line)?;
         let rhs = self.parse_rhs_number()?;
 
         let kind = match op {
-            Tok::Le => RowKind::Le,
-            Tok::Ge => RowKind::Ge,
-            Tok::Eq => RowKind::Eq,
-            _ => unreachable!("parse_lhs_until_op returns only comparators"),
+            Comparator::Le => RowKind::Le,
+            Comparator::Ge => RowKind::Ge,
+            Comparator::Eq => RowKind::Eq,
         };
 
         self.problem.constraints.push(Constraint {
@@ -206,40 +216,56 @@ impl LpParser {
             self.peek().map(|t| &t.tok),
             Some(Tok::Num(_) | Tok::Plus | Tok::Minus)
         ) {
-            let lo = self.consume_signed_number_or_inf(start_line)?;
-            self.expect_op(start_line)?;
+            let first_value = self.consume_signed_number_or_inf(start_line)?;
+            let first_op = self.expect_op(start_line)?;
             let name = self.expect_word(start_line)?;
             let idx = self.intern_var(&name);
             if self.peek_is_op() {
-                self.advance(); // swallow second <= or >=
-                let hi = self.consume_signed_number_or_inf(start_line)?;
-                self.problem.variables[idx].lower = lo;
-                self.problem.variables[idx].upper = hi;
+                let second_op = self.expect_op(start_line)?;
+                let second_value = self.consume_signed_number_or_inf(start_line)?;
+                match (first_op, second_op) {
+                    // `lo <= x <= hi`.
+                    (Comparator::Le, Comparator::Le) => {
+                        self.problem.variables[idx].lower = first_value;
+                        self.problem.variables[idx].upper = second_value;
+                    }
+                    // The equivalent reversed spelling: `hi >= x >= lo`.
+                    (Comparator::Ge, Comparator::Ge) => {
+                        self.problem.variables[idx].upper = first_value;
+                        self.problem.variables[idx].lower = second_value;
+                    }
+                    _ => {
+                        return Err(LpError::Parse {
+                            line: start_line,
+                            msg: "ranged bound comparators must use matching directions"
+                                .to_string(),
+                        });
+                    }
+                }
             } else {
-                // `<lo> <= <name>` implies lower bound.
-                self.problem.variables[idx].lower = lo;
+                match first_op {
+                    // `<lo> <= <name>` implies a lower bound.
+                    Comparator::Le => self.problem.variables[idx].lower = first_value,
+                    // `<hi> >= <name>` implies an upper bound.
+                    Comparator::Ge => self.problem.variables[idx].upper = first_value,
+                    Comparator::Eq => {
+                        self.problem.variables[idx].lower = first_value;
+                        self.problem.variables[idx].upper = first_value;
+                    }
+                }
             }
             Ok(())
         } else {
             let name = self.expect_word(start_line)?;
             let idx = self.intern_var(&name);
-            let op_tok = self.advance_clone().ok_or_else(|| LpError::Parse {
-                line: start_line,
-                msg: "bound requires a comparator".to_string(),
-            })?;
+            let op = self.expect_op(start_line)?;
             let value = self.consume_signed_number_or_inf(start_line)?;
-            match op_tok.tok {
-                Tok::Le => self.problem.variables[idx].upper = value,
-                Tok::Ge => self.problem.variables[idx].lower = value,
-                Tok::Eq => {
+            match op {
+                Comparator::Le => self.problem.variables[idx].upper = value,
+                Comparator::Ge => self.problem.variables[idx].lower = value,
+                Comparator::Eq => {
                     self.problem.variables[idx].lower = value;
                     self.problem.variables[idx].upper = value;
-                }
-                _ => {
-                    return Err(LpError::Parse {
-                        line: op_tok.line,
-                        msg: "bound requires <=, >=, or =".to_string(),
-                    });
                 }
             }
             Ok(())
@@ -309,7 +335,12 @@ impl LpParser {
                         // Standalone numeric term. Fold into objective constant
                         // via an "extra" phantom entry — here we return to the
                         // caller which only uses this for the objective.
-                        self.problem.obj_constant += coef;
+                        self.problem.obj_constant = checked_finite_add(
+                            self.problem.obj_constant,
+                            coef,
+                            tok.line,
+                            "objective constant sum",
+                        )?;
                     }
                     sign = 1.0;
                 }
@@ -325,13 +356,23 @@ impl LpParser {
         Ok(out)
     }
 
-    fn parse_lhs_until_op(&mut self) -> Result<(Vec<(usize, f64)>, Tok), LpError> {
+    fn parse_lhs_until_op(&mut self) -> Result<(Vec<(usize, f64)>, Comparator), LpError> {
         let mut out: Vec<(usize, f64)> = Vec::new();
         let mut sign = 1.0;
         while let Some(tok) = self.tokens.get(self.pos).cloned() {
             match tok.tok {
                 Tok::Le | Tok::Ge | Tok::Eq => {
-                    let op = tok.tok.clone();
+                    let op = match tok.tok {
+                        Tok::Le => Comparator::Le,
+                        Tok::Ge => Comparator::Ge,
+                        Tok::Eq => Comparator::Eq,
+                        _ => {
+                            return Err(LpError::Parse {
+                                line: tok.line,
+                                msg: "constraint requires <=, >=, or =".to_string(),
+                            });
+                        }
+                    };
                     self.pos += 1;
                     return Ok((out, op));
                 }
@@ -436,12 +477,11 @@ impl LpParser {
         }
     }
 
-    fn expect_op(&mut self, default_line: usize) -> Result<(), LpError> {
+    fn expect_op(&mut self, default_line: usize) -> Result<Comparator, LpError> {
         match self.advance_clone() {
-            Some(SpannedTok {
-                tok: Tok::Le | Tok::Ge | Tok::Eq,
-                ..
-            }) => Ok(()),
+            Some(SpannedTok { tok: Tok::Le, .. }) => Ok(Comparator::Le),
+            Some(SpannedTok { tok: Tok::Ge, .. }) => Ok(Comparator::Ge),
+            Some(SpannedTok { tok: Tok::Eq, .. }) => Ok(Comparator::Eq),
             other => Err(LpError::Parse {
                 line: other.as_ref().map_or(default_line, |t| t.line),
                 msg: "expected <=, >=, or =".to_string(),
@@ -475,14 +515,6 @@ impl LpParser {
         self.tokens.get(self.pos)
     }
 
-    fn advance(&mut self) -> Option<&SpannedTok> {
-        let cur = self.tokens.get(self.pos);
-        if cur.is_some() {
-            self.pos += 1;
-        }
-        cur
-    }
-
     fn advance_clone(&mut self) -> Option<SpannedTok> {
         let cur = self.tokens.get(self.pos).cloned();
         if cur.is_some() {
@@ -504,6 +536,22 @@ impl LpParser {
             Some(Tok::Le | Tok::Ge | Tok::Eq)
         )
     }
+}
+
+/// Normalize a row to at most one coefficient per variable. Repeated LP terms
+/// are additive, so their sum must remain finite just like an objective
+/// coefficient sum.
+fn aggregate_constraint_terms(
+    terms: Vec<(usize, f64)>,
+    line: usize,
+) -> Result<Vec<(usize, f64)>, LpError> {
+    let mut aggregated = BTreeMap::new();
+    for (variable, coefficient) in terms {
+        let current = aggregated.get(&variable).copied().unwrap_or(0.0);
+        let sum = checked_finite_add(current, coefficient, line, "constraint coefficient sum")?;
+        aggregated.insert(variable, sum);
+    }
+    Ok(aggregated.into_iter().collect())
 }
 
 // Unit tests live in `tests/parser_lp.rs` (module budget).

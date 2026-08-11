@@ -96,11 +96,11 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the goal is not Bool.
     #[must_use = "this returns a Result that must be checked"]
     pub fn abduce(&mut self, goal: Term, vocabulary: &[Term]) -> Result<Option<Term>, SolverError> {
-        self.reject_composite_bv_cnf_export("abduce")?;
         self.expect_bool("abduce", goal)?;
         for v in vocabulary {
             self.expect_bool("abduce", *v)?;
         }
+        self.reject_composite_bv_cnf_export("abduce")?;
 
         // Step 1: Check if goal is already implied by current assertions.
         // If assertions AND NOT(goal) is UNSAT, the goal is already implied.
@@ -108,7 +108,7 @@ impl Solver {
         self.try_push()?;
         self.try_assert_term(not_goal)?;
 
-        let baseline = self.check_sat();
+        let baseline = self.check_sat_internal_api();
         if baseline.is_unsat() {
             // Goal is already implied — no guard needed.
             self.try_pop()?;
@@ -126,7 +126,7 @@ impl Solver {
             self.try_assert_term(not_goal)?;
             self.try_assert_term(vocab_term)?;
 
-            let result = self.check_sat();
+            let result = self.check_sat_internal_api();
             self.try_pop()?;
 
             if result.is_unsat() {
@@ -150,7 +150,7 @@ impl Solver {
                     self.try_assert_term(vocabulary[i])?;
                     self.try_assert_term(vocabulary[j])?;
 
-                    let result = self.check_sat();
+                    let result = self.check_sat_internal_api();
                     self.try_pop()?;
 
                     if result.is_unsat() {
@@ -198,11 +198,11 @@ impl Solver {
         vuln_condition: Term,
         patch_points: &[Term],
     ) -> Result<Option<PatchSuggestion>, SolverError> {
-        self.reject_composite_bv_cnf_export("synthesize_patch")?;
         self.expect_bool("synthesize_patch", vuln_condition)?;
         for pp in patch_points {
             self.expect_bool("synthesize_patch", *pp)?;
         }
+        self.reject_composite_bv_cnf_export("synthesize_patch")?;
 
         if patch_points.is_empty() {
             return Ok(None);
@@ -211,7 +211,7 @@ impl Solver {
         // Check if vulnerability is already unreachable.
         self.try_push()?;
         self.try_assert_term(vuln_condition)?;
-        let baseline = self.check_sat();
+        let baseline = self.check_sat_internal_api();
         self.try_pop()?;
 
         if baseline.is_unsat() {
@@ -229,7 +229,7 @@ impl Solver {
             self.try_assert_term(patch)?;
             self.try_assert_term(vuln_condition)?;
 
-            let result = self.check_sat();
+            let result = self.check_sat_internal_api();
             self.try_pop()?;
 
             if result.is_unsat() {
@@ -255,7 +255,7 @@ impl Solver {
                     self.try_assert_term(patch_points[j])?;
                     self.try_assert_term(vuln_condition)?;
 
-                    let result = self.check_sat();
+                    let result = self.check_sat_internal_api();
                     self.try_pop()?;
 
                     if result.is_unsat() {
@@ -278,7 +278,7 @@ impl Solver {
             }
             self.try_assert_term(vuln_condition)?;
 
-            let result = self.check_sat();
+            let result = self.check_sat_internal_api();
             self.try_pop()?;
 
             if result.is_unsat() {

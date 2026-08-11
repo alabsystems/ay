@@ -41,9 +41,8 @@
 //! `optimize_check` fails closed with `Unknown(Unsupported)` whenever API softs
 //! are registered instead of silently discarding them.
 
-use ay_core::time::Instant;
 use ay_core::Sort;
-use ay_frontend::{Command, Objective, ObjectiveDirection};
+use ay_frontend::{Objective, ObjectiveDirection};
 
 use crate::api::types::{
     NativeReplayEventKind, ObjectiveValue, SolveResult, SolverError, Term, VerifiedSolveResult,
@@ -91,9 +90,10 @@ impl Solver {
         term: Term,
         direction: ObjectiveDirection,
     ) -> Result<usize, SolverError> {
+        let term_id = self.resolve_term("register_objective", term)?;
         if let Some(message) = self
             .executor
-            .array_ext_witness_registration_error(&[term.0])
+            .array_ext_witness_registration_error(&[term_id])
         {
             return Err(SolverError::InvalidArgument {
                 operation: "register_objective",
@@ -101,11 +101,11 @@ impl Solver {
             });
         }
         self.executor.note_api_optimization_mutation();
-        let ctx = self.executor.context_mut();
+        let ctx = self.executor.context_mut_internal();
         let idx = ctx.objectives().len();
         ctx.add_objective(Objective {
             direction,
-            term: term.0,
+            term: term_id,
         });
         Ok(idx)
     }
@@ -121,8 +121,11 @@ impl Solver {
     /// When objectives are registered this runs the executor's objective
     /// optimizer (lexicographic by default; `box` / `pareto` via the
     /// `opt.priority` option), exactly as a `(check-sat)` would for a script that
-    /// contains `(maximize ...)` / `(minimize ...)`. When NO objectives are
-    /// registered this is equivalent to [`check_sat`](Self::check_sat).
+    /// contains `(maximize ...)` / `(minimize ...)`. With no arithmetic
+    /// objectives it runs the same generic `(check-sat)` dispatch (including
+    /// parsed-soft MaxSMT), but deliberately remains a composite/internal-origin
+    /// operation: it cannot acquire the authored-only checked-projection
+    /// authority of [`check_sat`](Self::check_sat).
     ///
     /// After a SAT result, read each objective's optimum with
     /// [`get_objective_value`](Self::get_objective_value).
@@ -146,8 +149,8 @@ impl Solver {
             return self.finish_verified_result(SolveResult::Unknown);
         }
 
-        let deadline = self.timeout.map(|duration| Instant::now() + duration);
-        if let Some(early) = self.preflight_check(deadline) {
+        let controls = self.native_publication_controls();
+        if let Some(early) = self.preflight_check(controls) {
             return early;
         }
 
@@ -155,28 +158,27 @@ impl Solver {
         // API must install the same interrupt/deadline/memory and clause-budget
         // envelope as `check_sat` around the ENTIRE executor command. The
         // executor's own timeout alone does not carry Solver-level controls.
-        self.install_solve_controls(deadline);
+        self.install_solve_controls(controls);
 
-        // Drive the executor's `(check-sat)` dispatch, which routes to
-        // `optimize_check_sat` because objectives are non-empty. This reuses the
-        // SAME optimizer the SMT-LIB front end uses, so the optima here are
-        // exactly the optima a `(check-sat)` + `(get-objectives)` would report.
-        let exec_result = self.executor.execute(&Command::CheckSat);
-        self.executor.clear_solve_controls();
-        if let Err(e) = exec_result {
-            self.record_executor_failure_unknown(&e);
-            return self.finish_verified_result(SolveResult::Unknown);
-        }
-
-        let result = self
-            .executor
-            .last_result()
-            .cloned()
-            .unwrap_or(SolveResult::Unknown);
+        // Drive the executor's SAME `(check-sat)` routing used by SMT-LIB, but
+        // do not publish a text result. The unpublished native entrypoint leaves
+        // the one-shot SAT certificate for `VerifiedSolveResult` below instead
+        // of consuming it once for text and then incorrectly requiring it a
+        // second time here.
+        let exec_result = self.executor.execute_native_optimization_check_sat();
+        let result = match exec_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_executor_failure_unknown(&e);
+                SolveResult::Unknown
+            }
+        };
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(deadline);
+            self.classify_unknown_reason(controls);
         }
-        self.finish_verified_result(result)
+        let verified = self.finish_verified_result(result);
+        self.restore_solve_controls(controls);
+        verified
     }
 
     /// Get the optimum value of objective `idx` after [`optimize_check`](Self::optimize_check).
@@ -233,7 +235,7 @@ impl Solver {
     #[must_use]
     pub fn objective_term(&self, idx: usize) -> Option<Term> {
         let obj = self.executor.context().objectives().get(idx)?;
-        Some(Term(obj.term))
+        Some(self.wrap_term(obj.term))
     }
 
     /// The direction (`Maximize` / `Minimize`) of objective `idx`, or `None` if
@@ -273,11 +275,123 @@ mod tests {
         let obj = s.maximize(x);
         assert_eq!(obj, 0);
         assert_eq!(s.num_objectives(), 1);
-        assert!(s.optimize_check().is_sat());
+        let result = s.optimize_check();
+        assert!(result.is_sat());
+        assert!(result.was_model_validated());
+        assert!(s.model_for_consumer().is_some());
+        assert!(s.executor.take_sat_certificate().is_none());
         assert_eq!(
             s.get_objective_value(obj),
             Some(ObjectiveValue::Finite(rat(10)))
         );
+    }
+
+    /// With no objectives, the optimization facade still transfers the one
+    /// native SAT certificate exactly once without acquiring authored-query
+    /// authority merely because its internal command has check-sat shape.
+    #[test]
+    fn optimize_without_objectives_stays_internal_and_consumes_once() {
+        let mut s = Solver::try_new(Logic::QfUf).unwrap();
+        let truth = s.bool_const(true);
+        s.try_assert_term(truth).unwrap();
+
+        let result = s.optimize_check();
+        assert!(result.is_sat());
+        assert!(result.was_model_validated());
+        assert!(s.model_for_consumer().is_some());
+        assert!(s.executor.take_sat_certificate().is_none());
+        assert!(!s.executor.last_check_saw_authored_query_authority());
+    }
+
+    /// Parsed softs and arithmetic objectives are a composite problem for which
+    /// AY has no joint optimizer. The native unpublished route must preserve
+    /// the text dispatch's fail-closed rejection.
+    #[test]
+    fn optimize_rejects_parsed_soft_and_objective_mix() {
+        let mut s = Solver::try_new(Logic::QfLia).unwrap();
+        let x = s.declare_const("x", Sort::Int);
+        let zero = s.int_const(0);
+        let ten = s.int_const(10);
+        for bound in [s.try_ge(x, zero).unwrap(), s.try_le(x, ten).unwrap()] {
+            s.try_assert_term(bound).unwrap();
+        }
+        let objective = s.maximize(x);
+        assert!(s.optimize_check().is_sat());
+        assert_eq!(
+            s.get_objective_value(objective),
+            Some(ObjectiveValue::Finite(rat(10)))
+        );
+
+        s.parse_smtlib2("(assert-soft true :weight 1)").unwrap();
+
+        let result = s.optimize_check();
+        assert!(result.is_unknown());
+        assert_eq!(s.unknown_reason(), Some(crate::UnknownReason::Unsupported));
+        assert!(s.model_for_consumer().is_none());
+        assert_eq!(s.get_objective_value(objective), None);
+        assert!(s.executor.take_sat_certificate().is_none());
+    }
+
+    /// With parsed softs but no arithmetic objectives, native optimize follows
+    /// the shared MaxSMT dispatch and transfers its admitted SAT certificate to
+    /// the native wrapper exactly once.
+    #[test]
+    fn optimize_parsed_soft_only_transfers_maxsmt_certificate_once() {
+        let mut s = Solver::try_new(Logic::QfUf).unwrap();
+        s.parse_smtlib2("(declare-const a Bool) (assert a) (assert-soft false :weight 3)")
+            .unwrap();
+
+        let result = s.optimize_check();
+        assert!(result.is_sat());
+        assert!(result.was_model_validated());
+        assert!(s.model_for_consumer().is_some());
+        let (violated_weight, optimal, violated_softs) = s
+            .executor
+            .last_maxsmt_outcome()
+            .expect("parsed soft must route through MaxSMT accounting");
+        assert_eq!(violated_weight, 3);
+        assert!(optimal);
+        assert_eq!(violated_softs, &[0]);
+        assert!(s.executor.last_result_is_sat());
+        assert!(s.executor.take_sat_certificate().is_none());
+        assert!(!s.executor.last_check_saw_authored_query_authority());
+    }
+
+    /// A missing native certificate must downgrade both the returned wrapper
+    /// and the executor state. Otherwise a caller could observe `Unknown` and
+    /// still retrieve the provisional SAT model/objective afterward.
+    #[test]
+    fn missing_native_optimization_certificate_canonicalizes_unknown() {
+        let mut s = Solver::try_new(Logic::QfLia).unwrap();
+        let x = s.declare_const("x", Sort::Int);
+        let zero = s.int_const(0);
+        let ten = s.int_const(10);
+        for bound in [s.try_ge(x, zero).unwrap(), s.try_le(x, ten).unwrap()] {
+            s.try_assert_term(bound).unwrap();
+        }
+        let objective = s.maximize(x);
+
+        s.clear_last_solve_state(true, true);
+        let raw = s.executor.execute_native_optimization_check_sat().unwrap();
+        assert!(raw.is_sat());
+        assert!(s.executor.take_sat_certificate().is_some());
+
+        let result = s.finish_verified_result(raw);
+        assert!(result.is_unknown());
+        assert_eq!(
+            s.unknown_reason(),
+            Some(crate::UnknownReason::SelfCheckRejected)
+        );
+        assert_eq!(
+            s.executor.unknown_origin(),
+            Some(crate::UnknownOrigin::VerdictCertification)
+        );
+        assert!(s.executor.last_result_is_unknown());
+        assert!(s.model().is_none());
+        assert!(s.model_for_consumer().is_none());
+        assert_eq!(s.get_objective_value(objective), None);
+        assert!(s.executor.take_sat_certificate().is_none());
+        assert!(s.executor.take_unsat_certificate().is_none());
     }
 
     /// `(minimize x)` under `3 <= x <= 100` → optimum 3.

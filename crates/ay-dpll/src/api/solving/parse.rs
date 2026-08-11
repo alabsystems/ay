@@ -58,26 +58,30 @@ pub struct ParsedSmtlib2Batch {
     pub symbol_signatures: Vec<PublicSymbolSignature>,
 }
 
-fn wrap_public_term(metadata: PublicTermMetadata) -> ParsedPublicTermMetadata {
+fn wrap_public_term(solver: &Solver, metadata: PublicTermMetadata) -> ParsedPublicTermMetadata {
     ParsedPublicTermMetadata {
-        engine_term: Term(metadata.engine_term),
+        engine_term: solver.wrap_term(metadata.engine_term),
         public_sort: metadata.public_sort,
         finite_set_op: metadata.finite_set_op,
         public_bound_sorts: metadata.public_bound_sorts,
         arguments: metadata
             .arguments
             .into_iter()
-            .map(wrap_public_term)
+            .map(|argument| wrap_public_term(solver, argument))
             .collect(),
     }
 }
 
-fn wrap_formula(term: ay_core::TermId, metadata: PublicAssertionMetadata) -> ParsedSmtlib2Formula {
+fn wrap_formula(
+    solver: &Solver,
+    term: ay_core::TermId,
+    metadata: PublicAssertionMetadata,
+) -> ParsedSmtlib2Formula {
     ParsedSmtlib2Formula {
-        term: Term(term),
+        term: solver.wrap_term(term),
         metadata: ParsedPublicFormulaMetadata {
             finite_sets: metadata.finite_sets,
-            root: metadata.root.map(wrap_public_term),
+            root: metadata.root.map(|root| wrap_public_term(solver, root)),
         },
     }
 }
@@ -158,7 +162,7 @@ impl Solver {
         let before_objectives = self.executor.context().objectives().len();
         let previous_mode = self.executor.context().finite_set_typing_mode();
         self.executor
-            .context_mut()
+            .context_mut_internal()
             .set_finite_set_typing_mode(typing_mode);
 
         let execution = (|| {
@@ -194,7 +198,7 @@ impl Solver {
             Ok::<(), SolverError>(())
         })();
         self.executor
-            .context_mut()
+            .context_mut_internal()
             .set_finite_set_typing_mode(previous_mode);
         execution?;
 
@@ -225,17 +229,17 @@ impl Solver {
             .iter()
             .copied()
             .zip(assertion_metadata.iter().cloned())
-            .map(|(term, metadata)| wrap_formula(term, metadata))
+            .map(|(term, metadata)| wrap_formula(self, term, metadata))
             .collect();
         let soft_constraints = soft_terms
             .iter()
             .zip(soft_metadata.iter().cloned())
-            .map(|(soft, metadata)| wrap_formula(soft.term, metadata))
+            .map(|(soft, metadata)| wrap_formula(self, soft.term, metadata))
             .collect();
         let objectives = objective_terms
             .iter()
             .zip(objective_metadata.iter().cloned())
-            .map(|(objective, metadata)| wrap_formula(objective.term, metadata))
+            .map(|(objective, metadata)| wrap_formula(self, objective.term, metadata))
             .collect();
         Ok(ParsedSmtlib2Batch {
             assertions,

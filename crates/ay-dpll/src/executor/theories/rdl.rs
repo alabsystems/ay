@@ -312,7 +312,7 @@ impl Executor {
                 if rdl_engine_debug() {
                     ay_core::safe_eprintln!(
                         "[RDL] non-definite verdict ({:?}, reason {:?}); retrying with solve_lra",
-                        other.as_ref().map(|r| std::mem::discriminant(r)),
+                        other.as_ref().map(std::mem::discriminant),
                         self.last_unknown_reason
                     );
                 }

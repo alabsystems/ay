@@ -912,6 +912,7 @@ impl Executor {
     ) {
         use ay_core::{AletheRule, ProofStep, TheoryLemmaKind};
 
+        self.clear_finite_enum_proof_state();
         let Some(mut proof) = self.last_proof.take() else {
             return;
         };

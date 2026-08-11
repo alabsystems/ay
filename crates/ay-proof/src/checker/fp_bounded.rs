@@ -41,14 +41,17 @@
 //! conversions `to_fp`/`fp.to_*`) are intentionally UNSUPPORTED here — they
 //! require a correctly-rounded exact-rational arithmetic evaluator that does not
 //! yet exist in the checker, and the only existing evaluator (`eval_fp.rs`) is
-//! f64-based double-rounding, unsuitable as a proof oracle. Any clause
+//! f64-based double-rounding, unsuitable as a proof oracle. There is one
+//! width-independent path: the five IEEE exponent/significand classes (NaN,
+//! infinity, zero, normal, and subnormal) form an exact disjoint partition, so
+//! their pairwise-exclusion clauses are checked symbolically. Any other clause
 //! mentioning an unsupported op, or whose enumerated FP width exceeds the bound,
 //! fails closed.
 
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
-use ay_core::{Constant, FpOp, ProofId, Sort, TermData, TermId, TermStore};
+use ay_core::{Constant, FpOp, ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
 
@@ -63,9 +66,10 @@ const MAX_FP_ASSIGNMENT_BITS: u32 = 16;
 /// would accept it. The exact inverse of the validator: the proof classifier
 /// (`ay-dpll`) calls this to upgrade a `Generic`/trust FP lemma into the
 /// strict-checkable `FpClassification` kind ONLY when strict mode will
-/// independently re-validate it by exhaustive bounded evaluation — so the
-/// classifier and checker cannot drift. A non-tautological clause, an
-/// unsupported FP op, or a too-wide width is rejected.
+/// independently re-validate it by either an exact IEEE class-partition rule or
+/// exhaustive bounded evaluation — so the classifier and checker cannot drift.
+/// A non-tautological clause, an unsupported FP op, or a too-wide clause outside
+/// that exact schema is rejected.
 #[must_use]
 pub fn recognize_fp_classification(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_fp_classification(terms, ProofId(0), clause).is_ok()
@@ -75,9 +79,9 @@ pub fn recognize_fp_classification(terms: &TermStore, clause: &[TermId]) -> bool
 /// principal FP operation of the clause (for the `FpClassification { operation }`
 /// annotation's rendering / diagnostics). Returns `None` exactly when the
 /// validator would reject. The op is purely descriptive — validation re-derives
-/// soundness from the clause by exhaustive evaluation, never from this op — so
-/// any FP op present in an accepted clause is a sound choice; we pick the first
-/// in clause order for determinism.
+/// soundness from the clause, never from this op — so any FP op present in an
+/// accepted clause is a sound choice; we pick the first in clause order for
+/// determinism.
 #[must_use]
 pub fn recognize_fp_classification_op(terms: &TermStore, clause: &[TermId]) -> Option<FpOp> {
     if !recognize_fp_classification(terms, clause) {
@@ -316,14 +320,113 @@ pub(crate) fn validate_fp_rounding_mode_domain(
     }
 }
 
-/// Validate an `FpClassification` lemma in strict mode by exhaustive bounded
-/// evaluation over its FP variables.
+/// One member of the exact IEEE exponent/significand partition.
+///
+/// These predicates depend only on whether the exponent is zero/all-ones and
+/// whether the trailing significand is zero. Consequently, exactly one member
+/// holds for every well-sorted floating-point value, independently of its
+/// width, sign, or how the value was computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FpValueClass {
+    Nan,
+    Infinite,
+    Zero,
+    Normal,
+    Subnormal,
+}
+
+/// Recognize a positive application of one exact IEEE value-class predicate.
+///
+/// The argument itself may be an arbitrary FP expression. The partition law is
+/// about its resulting IEEE bit pattern, so no evaluation of that expression is
+/// needed. Requiring the exact unary Bool-over-FP shape prevents a user symbol
+/// with the same text but a different signature from becoming proof authority.
+fn fp_value_class_atom(terms: &TermStore, term: TermId) -> Option<(TermId, FpValueClass)> {
+    if terms.sort(term) != &Sort::Bool {
+        return None;
+    }
+    let TermData::App(symbol, args) = terms.get(term) else {
+        return None;
+    };
+    let [argument] = args.as_slice() else {
+        return None;
+    };
+    if !matches!(terms.sort(*argument), Sort::FloatingPoint(_, _)) {
+        return None;
+    }
+    let Symbol::Named(operator) = symbol else {
+        return None;
+    };
+    let class = match operator.as_str() {
+        "fp.isNaN" => FpValueClass::Nan,
+        "fp.isInfinite" => FpValueClass::Infinite,
+        "fp.isZero" => FpValueClass::Zero,
+        "fp.isNormal" => FpValueClass::Normal,
+        "fp.isSubnormal" => FpValueClass::Subnormal,
+        _ => return None,
+    };
+    Some((*argument, class))
+}
+
+/// Collect class atoms that must be true when `term` is true.
+///
+/// Only conjunction is decomposed: truth of `and` entails truth of each child.
+/// Ignoring every other shape is fail-closed. The recursion limit mirrors the
+/// bounded evaluator and prevents an adversarial proof from exhausting the
+/// checker stack.
+fn collect_required_fp_value_classes(
+    terms: &TermStore,
+    term: TermId,
+    required: &mut Vec<(TermId, FpValueClass)>,
+    depth: usize,
+) {
+    if depth > 512 {
+        return;
+    }
+    if let Some(atom) = fp_value_class_atom(terms, term) {
+        required.push(atom);
+        return;
+    }
+    if let TermData::App(Symbol::Named(operator), args) = terms.get(term) {
+        if operator == "and" && terms.sort(term) == &Sort::Bool {
+            for &argument in args {
+                collect_required_fp_value_classes(terms, argument, required, depth + 1);
+            }
+        }
+    }
+}
+
+/// Check a width-independent IEEE class-partition tautology.
+///
+/// A clause is false only when every negated literal's inner proposition is
+/// true. For `not P` and `not Q` (including atoms nested beneath a true `and`),
+/// that would require both class predicates to hold. Distinct members of the
+/// exact five-way partition cannot hold on the same FP value, so finding such a
+/// pair independently proves the whole clause, even if it contains weakening
+/// literals that this rule does not inspect.
+fn is_exact_fp_value_class_exclusion(terms: &TermStore, clause: &[TermId]) -> bool {
+    let mut required = Vec::new();
+    for &literal in clause {
+        if let TermData::Not(inner) = terms.get(literal) {
+            collect_required_fp_value_classes(terms, *inner, &mut required, 0);
+        }
+    }
+    required.iter().enumerate().any(|(index, &(term, class))| {
+        required[index + 1..]
+            .iter()
+            .any(|&(other_term, other_class)| term == other_term && class != other_class)
+    })
+}
+
+/// Validate an `FpClassification` lemma in strict mode by an exact symbolic
+/// IEEE partition rule or exhaustive bounded evaluation over its FP variables.
 ///
 /// Every literal must be `Bool`-sorted (a classification/comparison/equality
 /// clause is propositional). The clause must mention at least one FP-sorted
-/// sub-term (otherwise it is not an FP lemma — route it elsewhere). All FP
-/// variables must be enumerable within the bit budget, and every assignment of
-/// those variables must satisfy the clause.
+/// sub-term (otherwise it is not an FP lemma — route it elsewhere). Outside the
+/// width-independent class-exclusion schema, all FP variables must be enumerable
+/// within the bit budget, and every assignment of those variables must satisfy
+/// the clause.
 pub(crate) fn validate_fp_classification(
     terms: &TermStore,
     step_id: ProofId,
@@ -346,6 +449,14 @@ pub(crate) fn validate_fp_classification(
                 ),
             });
         }
+    }
+
+    // The five core IEEE classes are defined by the mutually exclusive
+    // exponent/significand cases (zero/nonzero exponent, all-ones exponent,
+    // zero/nonzero trailing significand). This proof is width-parametric and
+    // does not depend on the bit-blaster that produced the UNSAT candidate.
+    if is_exact_fp_value_class_exclusion(terms, clause) {
+        return Ok(());
     }
 
     // Collect the FP-sorted variables, fail closed on any unsupported op/term.
@@ -1053,7 +1164,6 @@ fn bv_const(terms: &TermStore, term: TermId) -> Option<(u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ay_core::Symbol;
 
     /// Build `(_ FloatingPoint eb sb)` variable.
     fn fp_var(terms: &mut TermStore, name: &str, eb: u32, sb: u32) -> TermId {
@@ -1107,6 +1217,105 @@ mod tests {
         let conj = t.mk_app(Symbol::named("and"), vec![is_nan, is_normal], Sort::Bool);
         let lemma = t.mk_not(conj);
         assert!(validate_fp_classification(&t, ProofId(0), &[lemma]).is_ok());
+    }
+
+    #[test]
+    fn accepts_all_wide_ieee_class_exclusions_symbolically() {
+        // The exact IEEE value classes are pairwise disjoint at every width.
+        // Float32 deliberately exceeds the exhaustive checker budget, so each
+        // acceptance below must come from the width-independent partition rule.
+        let mut t = TermStore::new();
+        let x = fp_var(&mut t, "x", 8, 24);
+        let predicates = [
+            "fp.isNaN",
+            "fp.isInfinite",
+            "fp.isZero",
+            "fp.isNormal",
+            "fp.isSubnormal",
+        ]
+        .map(|name| app1(&mut t, name, x, Sort::Bool));
+
+        for (left_index, &left) in predicates.iter().enumerate() {
+            for &right in &predicates[left_index + 1..] {
+                // This is the exact clause produced by the trust closer for
+                // two separately authored positive classification assertions.
+                let not_left = t.mk_not(left);
+                let not_right = t.mk_not(right);
+                assert!(
+                    validate_fp_classification(&t, ProofId(0), &[not_left, not_right]).is_ok(),
+                    "every pair of distinct IEEE value classes must be disjoint"
+                );
+
+                // The same theorem may remain packed as one authored `and`.
+                let conjunction = t.mk_app(Symbol::named("and"), vec![left, right], Sort::Bool);
+                // Preserve the explicit packed proof literal. `mk_not` is a
+                // formula smart constructor and would De Morgan-normalize this
+                // to an `or`, whereas proof clauses retain raw literal shape.
+                let packed = t.mk_not_raw(conjunction);
+                assert!(
+                    validate_fp_classification(&t, ProofId(0), &[packed]).is_ok(),
+                    "a packed pair of distinct IEEE value classes must be disjoint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_partition_rule_rejects_non_exclusions() {
+        let mut t = TermStore::new();
+        let x = fp_var(&mut t, "x", 8, 24);
+        let y = fp_var(&mut t, "y", 8, 24);
+        let zero_x = app1(&mut t, "fp.isZero", x, Sort::Bool);
+        let zero_y = app1(&mut t, "fp.isZero", y, Sort::Bool);
+        let normal_y = app1(&mut t, "fp.isNormal", y, Sort::Bool);
+        let positive_x = app1(&mut t, "fp.isPositive", x, Sort::Bool);
+        let not_zero_x = t.mk_not(zero_x);
+        let not_zero_y = t.mk_not(zero_y);
+        let not_normal_y = t.mk_not(normal_y);
+        let not_positive_x = t.mk_not(positive_x);
+
+        assert!(
+            validate_fp_classification(&t, ProofId(0), &[not_zero_x, not_normal_y]).is_err(),
+            "classes of different FP terms need not be disjoint"
+        );
+        assert!(
+            validate_fp_classification(&t, ProofId(0), &[not_zero_x, not_zero_y]).is_err(),
+            "repeating one class is not an exclusion theorem"
+        );
+        assert!(
+            validate_fp_classification(&t, ProofId(0), &[not_zero_x, not_positive_x]).is_err(),
+            "+zero is both zero and positive, so sign predicates are not partition members"
+        );
+    }
+
+    #[test]
+    fn wide_partition_rule_rejects_indexed_builtin_lookalikes() {
+        // Indexed symbols can carry the same display name as a builtin, but
+        // they are not that builtin's core identity. Float32 keeps this test
+        // outside the exhaustive fallback so only the symbolic theorem could
+        // (incorrectly) authorize either mutant.
+        let mut t = TermStore::new();
+        let x = fp_var(&mut t, "x", 8, 24);
+        let indexed_nan = t.mk_app(Symbol::indexed("fp.isNaN", vec![0]), vec![x], Sort::Bool);
+        let normal = app1(&mut t, "fp.isNormal", x, Sort::Bool);
+        let not_indexed_nan = t.mk_not(indexed_nan);
+        let not_normal = t.mk_not(normal);
+        assert!(
+            validate_fp_classification(&t, ProofId(0), &[not_indexed_nan, not_normal]).is_err(),
+            "an indexed class lookalike must not receive builtin partition authority"
+        );
+
+        let nan = app1(&mut t, "fp.isNaN", x, Sort::Bool);
+        let indexed_and = t.mk_app(
+            Symbol::indexed("and", vec![0]),
+            vec![nan, normal],
+            Sort::Bool,
+        );
+        let packed = t.mk_not_raw(indexed_and);
+        assert!(
+            validate_fp_classification(&t, ProofId(0), &[packed]).is_err(),
+            "an indexed connective lookalike must not be decomposed as builtin and"
+        );
     }
 
     #[test]

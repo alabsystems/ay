@@ -8,7 +8,9 @@ use ay_test_support::{
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+const AY_TEST_MEMORY_MIB: &str = "512";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -25,11 +27,24 @@ fn exact_ay_cli() -> &'static BuiltWorkspaceBinary {
 }
 
 pub(crate) fn ay_command() -> Command {
-    exact_ay_cli().command()
+    let mut command = exact_ay_cli().command();
+    command.args(["--memory", AY_TEST_MEMORY_MIB]);
+    command
+}
+
+/// Serialize spawned main-AY children behind a one-child, 512 MiB envelope.
+///
+/// The main binary's automatic memory default is sibling-blind. Callers must
+/// hold this guard for the child's complete lifetime so parallel Rust tests do
+/// not multiply that default across the machine.
+pub(crate) fn ay_process_guard() -> MutexGuard<'static, ()> {
+    static AY_PROCESS: Mutex<()> = Mutex::new(());
+    AY_PROCESS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[test]
 fn exact_cli_lane_runs_without_ay_path_or_ambient_target_binary() {
+    let _ay_guard = ay_process_guard();
     let built = exact_ay_cli();
     let target_root = workspace_root().join("target");
     assert_eq!(
@@ -53,8 +68,19 @@ fn exact_cli_lane_runs_without_ay_path_or_ambient_target_binary() {
         "unexpected isolated AY CLI target {target_name:?}"
     );
 
-    let mut child = built
-        .command()
+    let mut command = ay_command();
+    let command_args: Vec<_> = command
+        .get_args()
+        .filter_map(std::ffi::OsStr::to_str)
+        .collect();
+    assert!(
+        command_args
+            .windows(2)
+            .any(|args| args == ["--memory", AY_TEST_MEMORY_MIB]),
+        "FlatZinc AY children must carry the enforced memory envelope: {command_args:?}"
+    );
+
+    let mut child = command
         .args(["-smt2", "-in"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

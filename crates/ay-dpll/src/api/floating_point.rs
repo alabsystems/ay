@@ -25,7 +25,8 @@ impl Solver {
         operation: &'static str,
         t: Term,
     ) -> Result<(u32, u32), SolverError> {
-        let sort = self.terms().sort(t.0).clone();
+        let id = self.resolve_term(operation, t)?;
+        let sort = self.terms().sort(id).clone();
         match sort {
             Sort::FloatingPoint(eb, sb) => {
                 self.checked_fp_total_width(operation, eb, sb)?;
@@ -175,11 +176,10 @@ impl Solver {
     pub fn try_fp_plus_infinity(&mut self, eb: u32, sb: u32) -> Result<Term, SolverError> {
         self.checked_fp_total_width("fp_plus_infinity", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("+oo", vec![eb, sb]),
-            vec![],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::indexed("+oo", vec![eb, sb]), vec![], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP -infinity constant for the given precision.
@@ -197,11 +197,10 @@ impl Solver {
     pub fn try_fp_minus_infinity(&mut self, eb: u32, sb: u32) -> Result<Term, SolverError> {
         self.checked_fp_total_width("fp_minus_infinity", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("-oo", vec![eb, sb]),
-            vec![],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::indexed("-oo", vec![eb, sb]), vec![], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP NaN constant for the given precision.
@@ -218,11 +217,10 @@ impl Solver {
     pub fn try_fp_nan(&mut self, eb: u32, sb: u32) -> Result<Term, SolverError> {
         self.checked_fp_total_width("fp_nan", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("NaN", vec![eb, sb]),
-            vec![],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::indexed("NaN", vec![eb, sb]), vec![], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP +zero constant for the given precision.
@@ -240,11 +238,10 @@ impl Solver {
     pub fn try_fp_plus_zero(&mut self, eb: u32, sb: u32) -> Result<Term, SolverError> {
         self.checked_fp_total_width("fp_plus_zero", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("+zero", vec![eb, sb]),
-            vec![],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::indexed("+zero", vec![eb, sb]), vec![], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP -zero constant for the given precision.
@@ -262,11 +259,10 @@ impl Solver {
     pub fn try_fp_minus_zero(&mut self, eb: u32, sb: u32) -> Result<Term, SolverError> {
         self.checked_fp_total_width("fp_minus_zero", eb, sb)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::indexed("-zero", vec![eb, sb]),
-            vec![],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::indexed("-zero", vec![eb, sb]), vec![], sort);
+        Ok(self.wrap_term(result))
     }
 
     // --- FP unary operations ---
@@ -279,13 +275,13 @@ impl Solver {
     /// Try to create FP absolute value (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_abs(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.abs", a)?;
         let (eb, sb) = self.expect_fp("fp.abs", a)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.abs"),
-            vec![a.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.abs"), vec![a_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP negation.
@@ -296,13 +292,13 @@ impl Solver {
     /// Try to create FP negation (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_neg(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.neg", a)?;
         let (eb, sb) = self.expect_fp("fp.neg", a)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.neg"),
-            vec![a.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.neg"), vec![a_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     // --- FP comparison predicates (return Bool) ---
@@ -315,12 +311,13 @@ impl Solver {
     /// Try to create FP IEEE equality (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_eq(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.eq", a)?;
+        let b_id = self.resolve_term("fp.eq", b)?;
         self.expect_same_fp("fp.eq", a, b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.eq"),
-            vec![a.0, b.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.eq"), vec![a_id, b_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP less-than.
@@ -331,12 +328,13 @@ impl Solver {
     /// Try to create FP less-than (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_lt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.lt", a)?;
+        let b_id = self.resolve_term("fp.lt", b)?;
         self.expect_same_fp("fp.lt", a, b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.lt"),
-            vec![a.0, b.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.lt"), vec![a_id, b_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP less-than-or-equal.
@@ -347,12 +345,13 @@ impl Solver {
     /// Try to create FP less-than-or-equal (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_le(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.leq", a)?;
+        let b_id = self.resolve_term("fp.leq", b)?;
         self.expect_same_fp("fp.leq", a, b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.leq"),
-            vec![a.0, b.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.leq"), vec![a_id, b_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP greater-than.
@@ -363,12 +362,13 @@ impl Solver {
     /// Try to create FP greater-than (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_gt(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.gt", a)?;
+        let b_id = self.resolve_term("fp.gt", b)?;
         self.expect_same_fp("fp.gt", a, b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.gt"),
-            vec![a.0, b.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.gt"), vec![a_id, b_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP greater-than-or-equal.
@@ -379,12 +379,13 @@ impl Solver {
     /// Try to create FP greater-than-or-equal (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_ge(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.geq", a)?;
+        let b_id = self.resolve_term("fp.geq", b)?;
         self.expect_same_fp("fp.geq", a, b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.geq"),
-            vec![a.0, b.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.geq"), vec![a_id, b_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     // --- FP classification predicates (return Bool) ---
@@ -397,12 +398,12 @@ impl Solver {
     /// Try to create FP isNaN predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_nan(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isNaN", a)?;
         self.expect_fp("fp.isNaN", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isNaN"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.isNaN"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isInfinite predicate.
@@ -413,12 +414,12 @@ impl Solver {
     /// Try to create FP isInfinite predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_infinite(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isInfinite", a)?;
         self.expect_fp("fp.isInfinite", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isInfinite"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.isInfinite"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isZero predicate.
@@ -429,12 +430,12 @@ impl Solver {
     /// Try to create FP isZero predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_zero(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isZero", a)?;
         self.expect_fp("fp.isZero", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isZero"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.isZero"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isNormal predicate.
@@ -445,12 +446,12 @@ impl Solver {
     /// Try to create FP isNormal predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_normal(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isNormal", a)?;
         self.expect_fp("fp.isNormal", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isNormal"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.isNormal"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isSubnormal predicate.
@@ -462,12 +463,12 @@ impl Solver {
     /// Try to create FP isSubnormal predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_subnormal(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isSubnormal", a)?;
         self.expect_fp("fp.isSubnormal", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isSubnormal"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.isSubnormal"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isPositive predicate.
@@ -478,12 +479,12 @@ impl Solver {
     /// Try to create FP isPositive predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_positive(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isPositive", a)?;
         self.expect_fp("fp.isPositive", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isPositive"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.isPositive"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP isNegative predicate.
@@ -494,12 +495,12 @@ impl Solver {
     /// Try to create FP isNegative predicate (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_is_negative(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.isNegative", a)?;
         self.expect_fp("fp.isNegative", a)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.isNegative"),
-            vec![a.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("fp.isNegative"), vec![a_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     // --- FP min/max ---
@@ -512,13 +513,14 @@ impl Solver {
     /// Try to create FP minimum (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_min(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.min", a)?;
+        let b_id = self.resolve_term("fp.min", b)?;
         let (eb, sb) = self.expect_same_fp("fp.min", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.min"),
-            vec![a.0, b.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.min"), vec![a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     /// Create FP maximum.
@@ -529,13 +531,14 @@ impl Solver {
     /// Try to create FP maximum (fallible).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_max(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("fp.max", a)?;
+        let b_id = self.resolve_term("fp.max", b)?;
         let (eb, sb) = self.expect_same_fp("fp.max", a, b)?;
         let sort = Sort::FloatingPoint(eb, sb);
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("fp.max"),
-            vec![a.0, b.0],
-            sort,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("fp.max"), vec![a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 
     // --- Rounding mode ---
@@ -556,8 +559,8 @@ impl Solver {
 
     /// Try to create a rounding mode term from its SMT-LIB short name.
     ///
-    /// Returns [`SolverError::InvalidArgument`] if `name` is not one of
-    /// "RNE", "RNA", "RTP", "RTN", "RTZ".
+    /// Returns [`SolverError::InvalidArgument`] unless `name` is one of "RNE",
+    /// "RNA", "RTP", "RTN", or "RTZ".
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_fp_rounding_mode(&mut self, name: &str) -> Result<Term, SolverError> {
         if !matches!(name, "RNE" | "RNA" | "RTP" | "RTN" | "RTZ") {
@@ -568,16 +571,13 @@ impl Solver {
                 ),
             });
         }
-        // RoundingMode-sorted, matching both the frontend's literal elaboration
-        // and the sort of a declared `RoundingMode` constant. The historical
-        // `Sort::Bool` encoding made `rm == RTP()` panic on the sort mismatch
-        // in `Term::eq` (#P0.2 symbolic RoundingMode).
-        Ok(Term(self.terms_mut().mk_app(
+        // Match frontend literals and declared `RoundingMode` constants. The old
+        // Bool encoding made `rm == RTP()` panic in `Term::eq` (#P0.2).
+        let result = self.terms_mut().mk_app(
             Symbol::named(name),
             vec![],
             Sort::Uninterpreted("RoundingMode".to_string()),
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
-
-    // Conversion and arithmetic operations are in floating_point_conv.rs.
 }

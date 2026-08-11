@@ -14,6 +14,27 @@ fn translate_fzn(input: &str) -> TranslationResult {
     translate(&model).expect("translate failed")
 }
 
+fn translate_fzn_err(input: &str) -> TranslateError {
+    let model = ay_flatzinc_parser::parse_flatzinc(input).expect("parse failed");
+    translate(&model).expect_err("translation should fail")
+}
+
+fn solve_fzn_verdict(input: &str) -> String {
+    let result = translate_fzn(input);
+    let commands = ay_frontend::parse(&result.smtlib).expect("SMT-LIB should parse");
+    let mut executor = ay_dpll::Executor::new();
+    for command in &commands {
+        match executor.execute(command) {
+            Ok(Some(output)) if matches!(output.trim(), "sat" | "unsat" | "unknown") => {
+                return output.trim().to_string();
+            }
+            Ok(_) => {}
+            Err(error) => panic!("SMT execution failed before a verdict: {error}"),
+        }
+    }
+    panic!("translated model produced no solver verdict")
+}
+
 // --- Reified constraint tests ---
 
 #[test]
@@ -208,7 +229,9 @@ fn test_int_div() {
         "var int: x;\nvar int: y;\nvar int: z;\n\
          constraint int_div(x, y, z);\nsolve satisfy;\n",
     );
-    assert!(r.smtlib.contains("(assert (= z (div x y)))"));
+    assert!(r.smtlib.contains("(assert (not (= y 0)))"));
+    assert!(r.smtlib.contains("(div (ite (>= x 0) x (- x))"));
+    assert!(r.smtlib.contains("(assert (= z (ite"));
 }
 
 #[test]
@@ -217,7 +240,40 @@ fn test_int_mod() {
         "var int: x;\nvar int: y;\nvar int: z;\n\
          constraint int_mod(x, y, z);\nsolve satisfy;\n",
     );
-    assert!(r.smtlib.contains("(assert (= z (mod x y)))"));
+    assert!(r.smtlib.contains("(assert (not (= y 0)))"));
+    assert!(r.smtlib.contains("(assert (= z (- x (* (ite"));
+}
+
+#[test]
+fn test_int_div_and_mod_match_flatzinc_sign_semantics() {
+    for (dividend, divisor, quotient, remainder) in [
+        (7, 3, 2, 1),
+        (-7, 3, -2, -1),
+        (7, -3, -2, 1),
+        (-7, -3, 2, -1),
+    ] {
+        let input = format!(
+            "var int: q;\nvar int: r;\n\
+             constraint int_div({dividend}, {divisor}, q);\n\
+             constraint int_mod({dividend}, {divisor}, r);\n\
+             constraint int_eq(q, {quotient});\n\
+             constraint int_eq(r, {remainder});\n\
+             solve satisfy;\n"
+        );
+        assert_eq!(
+            solve_fzn_verdict(&input),
+            "sat",
+            "unexpected div/mod result for {dividend}, {divisor}"
+        );
+    }
+}
+
+#[test]
+fn test_int_div_and_mod_reject_zero_divisor() {
+    for constraint in ["int_div(7, 0, result)", "int_mod(7, 0, result)"] {
+        let input = format!("var int: result;\nconstraint {constraint};\nsolve satisfy;\n");
+        assert_eq!(solve_fzn_verdict(&input), "unsat");
+    }
 }
 
 #[test]
@@ -272,6 +328,35 @@ fn test_bool_lin_le() {
     assert!(r
         .smtlib
         .contains("(assert (<= (+ (* 2 (ite a 1 0)) (* 3 (ite b 1 0))) 4))"));
+}
+
+#[test]
+fn test_linear_constraints_reject_parallel_array_length_mismatch() {
+    let extra_coefficient = translate_fzn_err(
+        "var int: x;\n\
+         constraint int_lin_eq([1, 2], [x], 0);\n\
+         solve satisfy;\n",
+    );
+    assert!(
+        matches!(extra_coefficient, TranslateError::UnsupportedType(ref message)
+            if message.contains("coefficient array length 2")
+                && message.contains("variable array length 1")),
+        "unexpected error: {extra_coefficient}"
+    );
+
+    let extra_boolean = translate_fzn_err(
+        "var bool: a;\n\
+         var bool: b;\n\
+         var bool: r;\n\
+         constraint bool_lin_eq([1], [a, b], 1);\n\
+         solve satisfy;\n",
+    );
+    assert!(
+        matches!(extra_boolean, TranslateError::UnsupportedType(ref message)
+            if message.contains("coefficient array length 1")
+                && message.contains("variable array length 2")),
+        "unexpected error: {extra_boolean}"
+    );
 }
 
 // --- Array boolean constraint tests ---
@@ -419,13 +504,76 @@ fn test_detect_logic_param_times_var_is_qf_lia() {
 #[test]
 fn test_detect_logic_int_pow_var_var_is_qf_nia() {
     let r = translate_fzn(
-        "var int: x;\nvar int: y;\nvar int: z;\n\
+        "var int: x;\nvar 0..3: y;\nvar int: z;\n\
          constraint int_pow(x, y, z);\nsolve satisfy;\n",
     );
     assert!(
         r.smtlib.contains("(set-logic QF_NIA)"),
         "int_pow(var, var) should produce QF_NIA"
     );
+}
+
+#[test]
+fn test_detect_logic_variable_base_constant_square_is_qf_nia() {
+    let r = translate_fzn(
+        "var int: x;\nvar int: z;\n\
+         constraint int_pow(x, 2, z);\nsolve satisfy;\n",
+    );
+    assert!(
+        r.smtlib.contains("(set-logic QF_NIA)"),
+        "x^2 emits variable multiplication and must use QF_NIA"
+    );
+}
+
+#[test]
+fn test_int_pow_rejects_unbounded_negative_and_too_large_exponents() {
+    let cases = [
+        (
+            "var int: exponent;\nvar int: result;\n\
+             constraint int_pow(2, exponent, result);\nsolve satisfy;\n",
+            "finite non-negative integer domain",
+        ),
+        (
+            "var -1..2: exponent;\nvar int: result;\n\
+             constraint int_pow(2, exponent, result);\nsolve satisfy;\n",
+            "negative exponent",
+        ),
+        (
+            "var 65..65: exponent;\nvar int: result = 1;\n\
+             constraint int_pow(2, exponent, result);\nsolve satisfy;\n",
+            "exceeds the maximum supported",
+        ),
+    ];
+    for (input, expected_message) in cases {
+        let error = translate_fzn_err(input);
+        assert!(
+            matches!(error, TranslateError::UnsupportedType(ref message)
+                if message.contains(expected_message)),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_int_pow_enumerates_unsorted_integer_set_domain_exactly() {
+    let r = translate_fzn(
+        "var int: x;\nvar {3, 1}: exponent;\nvar int: result;\n\
+         constraint int_pow(x, exponent, result);\nsolve satisfy;\n",
+    );
+    assert!(r.smtlib.contains("(= exponent 1)"));
+    assert!(r.smtlib.contains("(= exponent 3)"));
+    assert!(!r.smtlib.contains("(= exponent 2)"));
+    assert!(r.smtlib.contains("(* x (* x x))"));
+}
+
+#[test]
+fn test_logic_detection_handles_full_width_scalar_range() {
+    let r = translate_fzn(
+        "var -9223372036854775808..9223372036854775807: x;\n\
+         var int: y;\nvar int: z;\n\
+         constraint int_times(x, y, z);\nsolve satisfy;\n",
+    );
+    assert!(r.smtlib.contains("(set-logic QF_NIA)"));
 }
 
 #[test]
@@ -438,5 +586,33 @@ fn test_detect_logic_int_pow_const_const_is_qf_lia() {
     assert!(
         r.smtlib.contains("(set-logic QF_LIA)"),
         "int_pow(constant, constant) should produce QF_LIA"
+    );
+}
+
+#[test]
+fn quadratic_encoding_work_guard_accepts_budget_and_rejects_next_square() {
+    translate::ensure_quadratic_work("boundary", 1024, 1024, 1)
+        .expect("the exact materialization budget is accepted");
+    let error = translate::ensure_quadratic_work("boundary", 1025, 1025, 1)
+        .expect_err("the next square must exceed the materialization budget");
+    assert!(
+        matches!(error, TranslateError::UnsupportedType(ref message)
+            if message.contains("quadratic encoding")
+                && message.contains("1050625")
+                && message.contains("1048576")),
+        "unexpected work-limit error: {error}"
+    );
+}
+
+#[test]
+fn oversized_all_different_fails_before_quadratic_emission() {
+    let error = translate_fzn_err(
+        "array [1..1025] of var 0..1: xs;\n\
+         constraint all_different_int(xs);\nsolve satisfy;\n",
+    );
+    assert!(
+        matches!(error, TranslateError::UnsupportedType(ref message)
+            if message.contains("all_different") && message.contains("1050625")),
+        "unexpected all_different work-limit error: {error}"
     );
 }

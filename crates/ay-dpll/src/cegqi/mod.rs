@@ -83,9 +83,17 @@ impl CegqiInstantiator {
         let mut bound_to_ce = HashMap::default();
 
         for (name, sort) in &vars {
-            // Create a fresh CE constant for this bound variable
-            let ce_name = format!("__ce_{name}");
-            let ce_var = terms.mk_var(&ce_name, sort.clone());
+            // CE constants are solver-internal witnesses. Their identity must
+            // not be recoverable from a user-visible spelling: a declaration
+            // named `__ce_x`, or another quantifier whose binder is also `x`,
+            // must never alias this witness.
+            //
+            // Mint the spelling in the frontend-reserved namespace, then bind
+            // that spelling to one exact TermId in the TermStore. The frontend
+            // rejects user declarations in this namespace, and the monotonic
+            // internal-symbol counter keeps separate instantiators disjoint.
+            let ce_name = terms.mk_internal_symbol(&format!("ce_{name}"));
+            let ce_var = terms.mk_var(ce_name, sort.clone());
             bound_to_ce.insert(name.clone(), ce_var);
         }
 

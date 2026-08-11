@@ -237,7 +237,7 @@ impl PdrSolver {
             );
         }
 
-        let merged = Self::merge_case_split_safe_models(&safe_models, *arg_idx);
+        let merged = Self::merge_case_split_safe_models(&safe_models, *pred_id, *arg_idx);
         if Self::case_split_deadline_expired(case_split_deadline) {
             if config.verbose {
                 safe_eprintln!(
@@ -319,6 +319,7 @@ impl PdrSolver {
 
     fn merge_case_split_safe_models(
         safe_models: &[(CaseConstraint, InvariantModel)],
+        split_pred_id: PredicateId,
         split_arg_idx: usize,
     ) -> InvariantModel {
         debug_assert!(!safe_models.is_empty(), "merge requires at least one model");
@@ -346,11 +347,17 @@ impl PdrSolver {
                 case_interps.push((case, interp));
             }
 
-            // For predicates that DO have the split argument, use guarded implications
-            // (implies guard interp). For predicates that DON'T (e.g., SAD in dillig12_m
-            // where the split was on FUN's arg 4), use or_vec — the split variable doesn't
-            // exist in this predicate so both case interpretations are valid. (#1306)
-            let formula = if vars.len() > split_arg_idx {
+            // Only the predicate selected for case splitting carries the
+            // discriminator at `split_arg_idx`. An unrelated predicate may
+            // happen to have an argument at the same numeric position, but
+            // that argument has no semantic connection to the split. Guarding
+            // its interpretations with that value rejects reachable states.
+            // Merge every non-owner predicate by branch union instead. (#1306)
+            let formula = if pred_id == split_pred_id {
+                debug_assert!(
+                    vars.len() > split_arg_idx,
+                    "case-split argument index is out of range for its predicate"
+                );
                 let mode_var = vars[split_arg_idx].clone();
                 ChcExpr::and_vec(
                     case_interps
@@ -444,3 +451,7 @@ impl PdrSolver {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests;
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod safe_tests;

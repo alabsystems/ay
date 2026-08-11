@@ -689,6 +689,64 @@ fn test_finite_domain_bounded_int_forall() {
     assert!(result.is_some(), "bounded int forall [0,2] should expand");
 }
 
+fn symbolic_upper_bound_forall(terms: &mut TermStore) -> (TermId, TermId) {
+    let i = terms.mk_var("i", Sort::Int);
+    let n = terms.mk_var("n", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let ten = terms.mk_int(BigInt::from(10));
+    let lower = terms.mk_le(zero, i);
+    let upper = terms.mk_le(i, n);
+    let guard = terms.mk_and(vec![lower, upper]);
+    let payload = terms.mk_lt(i, ten);
+    let body = terms.mk_implies(guard, payload);
+    let forall = terms.mk_forall(vec![("i".to_string(), Sort::Int)], body);
+    (forall, n)
+}
+
+#[test]
+fn standalone_finite_domain_replay_ignores_and_restores_ambient_hints() {
+    let mut terms = TermStore::new();
+    let (forall, n) = symbolic_upper_bound_forall(&mut terms);
+    let mut derived = ay_core::kani_compat::DetHashMap::default();
+    derived.insert(n, BigInt::from(1));
+
+    let _derived_scope = scoped_derived_consts(derived);
+    assert!(
+        finite_domain_expand(&mut terms, forall).is_some(),
+        "the producer hint should unlock the symbolic guarded range"
+    );
+    {
+        let _standalone = scoped_standalone_finite_domain_replay();
+        assert!(
+            finite_domain_expand(&mut terms, forall).is_none(),
+            "certificate replay must use literal bounds only"
+        );
+    }
+    assert!(
+        finite_domain_expand(&mut terms, forall).is_some(),
+        "standalone replay must restore its predecessor state"
+    );
+}
+
+#[test]
+fn derived_finite_domain_scope_restores_after_unwind() {
+    let mut terms = TermStore::new();
+    let (forall, n) = symbolic_upper_bound_forall(&mut terms);
+    let mut derived = ay_core::kani_compat::DetHashMap::default();
+    derived.insert(n, BigInt::from(1));
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _derived_scope = scoped_derived_consts(derived);
+        assert!(finite_domain_expand(&mut terms, forall).is_some());
+        panic!("exercise finite-domain ambient-state unwind restoration");
+    }));
+    assert!(unwind.is_err());
+    assert!(
+        finite_domain_expand(&mut terms, forall).is_none(),
+        "unwinding must not leak derived facts into the next expansion"
+    );
+}
+
 /// Bounded integer forall with strict less-than:
 /// `(forall ((i Int)) (=> (and (<= 0 i) (< i 3)) (< i 10)))` → range [0,2]
 #[test]
@@ -729,6 +787,54 @@ fn test_finite_domain_bounded_int_exists() {
 
     let result = finite_domain_expand(&mut terms, exists);
     assert!(result.is_some(), "bounded int exists [0,5] should expand");
+}
+
+/// A conjunction that bounds the variables syntactically does not restrict the
+/// carrier of a universal. The authored formula is false outside `(0,0)`; the
+/// generic product expander used to enumerate only `(0,0)` and fold it to
+/// `true`, losing every outside-domain obligation.
+#[test]
+fn test_conjunctively_bounded_multi_int_forall_is_not_finite_domain() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let zero_le_x = terms.mk_le(zero, x);
+    let x_le_zero = terms.mk_le(x, zero);
+    let zero_le_y = terms.mk_le(zero, y);
+    let y_le_zero = terms.mk_le(y, zero);
+    let body = terms.mk_and(vec![zero_le_x, x_le_zero, zero_le_y, y_le_zero]);
+    let forall = terms.mk_forall(
+        vec![("x".to_string(), Sort::Int), ("y".to_string(), Sort::Int)],
+        body,
+    );
+
+    assert!(
+        finite_domain_expand(&mut terms, forall).is_none(),
+        "a conjunctive box is not a finite Int carrier for forall"
+    );
+}
+
+/// The same fail-closed rule applies to a mixed finite-sort/Int cross product:
+/// Bool is finite, but the conjuncts do not make the Int carrier finite.
+#[test]
+fn test_mixed_bool_int_conjunctive_forall_is_not_finite_domain() {
+    let mut terms = TermStore::new();
+    let b = terms.mk_var("b", Sort::Bool);
+    let x = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let zero_le_x = terms.mk_le(zero, x);
+    let x_le_zero = terms.mk_le(x, zero);
+    let body = terms.mk_and(vec![b, zero_le_x, x_le_zero]);
+    let forall = terms.mk_forall(
+        vec![("b".to_string(), Sort::Bool), ("x".to_string(), Sort::Int)],
+        body,
+    );
+
+    assert!(
+        finite_domain_expand(&mut terms, forall).is_none(),
+        "mixed Bool+Int universal must not enter generic finite expansion"
+    );
 }
 
 // --- classA_residual_halfbounded: half-bounded existential fold + miniscope ---

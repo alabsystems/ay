@@ -56,7 +56,9 @@ fn test_int_div() {
         "var int: x;\nvar int: y;\nvar int: z;\n\
          constraint int_div(x, y, z);\nsolve satisfy;\n",
     );
-    assert!(r.smtlib.contains("(assert (= z (div x y)))"));
+    assert!(r.smtlib.contains("(assert (not (= y 0)))"));
+    assert!(r.smtlib.contains("(assert (= z (ite (= (>= x 0) (>= y 0))"));
+    assert!(r.smtlib.contains("(div (ite (>= x 0) x (- x))"));
 }
 
 #[test]
@@ -65,7 +67,10 @@ fn test_int_mod() {
         "var int: x;\nvar int: y;\nvar int: z;\n\
          constraint int_mod(x, y, z);\nsolve satisfy;\n",
     );
-    assert!(r.smtlib.contains("(assert (= z (mod x y)))"));
+    assert!(r.smtlib.contains("(assert (not (= y 0)))"));
+    assert!(r
+        .smtlib
+        .contains("(assert (= z (- x (* (ite (= (>= x 0) (>= y 0))"));
 }
 
 #[test]
@@ -855,19 +860,16 @@ fn test_int_pow_variable_exponent() {
 }
 
 #[test]
-fn test_int_pow_constant_exponent_uses_qf_lia() {
-    // int_pow(x, 2, z) — exponent `2` is a constant, so the multiplication
-    // is `z = x * x` which is nonlinear in the SMT-LIB2 encoding but the
-    // improved detect_logic correctly identifies `2` as a constant and emits
-    // QF_LIA. This avoids ay's QF_NIA completeness gap (returns "unknown"
-    // for problems its QF_LIA solver handles fine).
+fn test_int_pow_variable_base_square_uses_qf_nia() {
+    // int_pow(x, 2, z) emits z = x*x, so it is nonlinear even though the
+    // exponent itself is constant.
     let r = translate_fzn(
         "var int: x;\nvar int: z;\n\
          constraint int_pow(x, 2, z);\nsolve satisfy;\n",
     );
     assert!(
-        r.smtlib.contains("(set-logic QF_LIA)"),
-        "int_pow with constant exponent should use QF_LIA.\nSMT:\n{}",
+        r.smtlib.contains("(set-logic QF_NIA)"),
+        "int_pow with variable base and exponent 2 should use QF_NIA.\nSMT:\n{}",
         r.smtlib
     );
 }

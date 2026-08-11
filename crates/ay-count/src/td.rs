@@ -38,7 +38,7 @@ pub fn td_scores(
     decow: f64,
     flow_cutter: &std::path::Path,
 ) -> Option<Vec<f64>> {
-    if num_vars == 0 || num_vars > TD_MAX_VARS {
+    if num_vars == 0 || num_vars > TD_MAX_VARS || !decow.is_finite() || decow < 0.0 {
         return None;
     }
     // Primal graph: edge between every pair of vars sharing a clause.
@@ -302,7 +302,11 @@ fn scores_from_td(td: &TreeDecomp, num_vars: usize, decow: f64) -> Vec<f64> {
     // coef = decow * exp(n/width)/n, capped at 1e7 (sharpsat-td weight mode 1)
     let n = num_vars as f64;
     let width = td.width.max(1) as f64;
-    let coef = (decow * (n / width).exp() / n).min(1e7);
+    let coef = if decow == 0.0 {
+        0.0
+    } else {
+        (decow * (n / width).exp() / n).min(1e7)
+    };
     let mut scores = vec![0.0; num_vars];
     for v in 1..=num_vars {
         let d = var_depth[v];

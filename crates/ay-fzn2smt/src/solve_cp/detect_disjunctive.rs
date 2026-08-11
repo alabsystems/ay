@@ -137,14 +137,26 @@ impl CpContext {
         // each task has a SINGLE consistent duration across all pairs on the
         // same machine. We verify this and extract it.
         let mut task_durations: HashMap<IntVarId, i64> = HashMap::new();
+        let mut inconsistent_tasks: HashSet<IntVarId> = HashSet::new();
         let mut adj: HashMap<IntVarId, HashSet<IntVarId>> = HashMap::new();
 
         for p in &pairs {
-            // Record duration for each task variable.
-            // If a task appears with inconsistent durations across pairs,
-            // it may be from different machines. We use first-seen duration.
-            task_durations.entry(p.var_a).or_insert(p.dur_a);
-            task_durations.entry(p.var_b).or_insert(p.dur_b);
+            // A native disjunctive constraint has one processing time per
+            // task. If generated pair constraints disagree, substituting a
+            // first-seen duration would weaken or strengthen the model while
+            // deleting its exact reified constraints. Mark the whole task
+            // ineligible for reconstruction instead.
+            for (var, duration) in [(p.var_a, p.dur_a), (p.var_b, p.dur_b)] {
+                if duration < 0
+                    || task_durations
+                        .get(&var)
+                        .is_some_and(|existing| *existing != duration)
+                {
+                    inconsistent_tasks.insert(var);
+                } else {
+                    task_durations.entry(var).or_insert(duration);
+                }
+            }
 
             adj.entry(p.var_a).or_default().insert(p.var_b);
             adj.entry(p.var_b).or_default().insert(p.var_a);
@@ -192,10 +204,12 @@ impl CpContext {
             }
 
             if clique.len() >= 2 {
-                for &v in &clique {
-                    used.insert(v);
+                if clique.iter().all(|v| !inconsistent_tasks.contains(v)) {
+                    for &v in &clique {
+                        used.insert(v);
+                    }
+                    machines.push(clique);
                 }
-                machines.push(clique);
             }
         }
 
@@ -267,7 +281,7 @@ impl CpContext {
             return None;
         }
 
-        let dur = -rhs;
+        let dur = rhs.checked_neg()?;
         let indicator = self.resolve_var_opt(&c.args[3])?;
         Some((vars[0], vars[1], dur, indicator))
     }

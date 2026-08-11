@@ -203,11 +203,13 @@ impl Executor {
             return false;
         };
         let changed = self.materialize_symbolic_array_defaults_in_model(&mut model);
-        self.last_model = Some(model);
         if changed {
+            model.revoke_cegqi_uf_recompletion();
+            self.cegqi_uf_recompletion_grant = None;
             self.last_model_validated = false;
             super::eval_memo_clear();
         }
+        self.last_model = Some(model);
         changed
     }
 

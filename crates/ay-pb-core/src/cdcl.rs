@@ -2137,6 +2137,7 @@ impl PbCdclSolver {
     /// `decision_level <= assumption_boundary` check runs BEFORE the stop poll,
     /// so a conflict that refutes the assumption prefix is reported even when it
     /// is the same conflict that trips the cap.
+    #[cfg(test)]
     pub(crate) fn solve_with_assumptions_conflict_capped<F>(
         &mut self,
         assumptions: &[PbLit],

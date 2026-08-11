@@ -80,6 +80,44 @@ fn allsat_enumerates_known_model_count() {
     );
 }
 
+/// DIMACS header variables are part of the formula even when no clause
+/// mentions them. They must appear in models and contribute both truth values
+/// to full enumeration.
+#[test]
+#[timeout(30_000)]
+fn allsat_enumerates_header_declared_free_variables() {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    for (cnf, expected_models) in [("p cnf 2 0\n", 4), ("p cnf 2 1\n1 0\n", 2)] {
+        let (path, _cleanup) = write_temp_cnf(cnf);
+        let output = Command::new(ay_path)
+            .arg("allsat")
+            .arg(&path)
+            .output()
+            .expect("spawn ay allsat");
+        assert!(
+            output.status.success(),
+            "free-variable enumeration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(count_models(&stdout), expected_models, "{stdout}");
+        assert!(
+            stdout.contains(&format!(
+                "{expected_models} model(s) enumerated (exhaustive)"
+            )),
+            "{stdout}"
+        );
+        assert_eq!(
+            stdout.matches("(define-fun x2 () Bool").count(),
+            expected_models,
+            "free x2 must be printed in every model: {stdout}"
+        );
+        assert!(stdout.contains("(define-fun x2 () Bool false)"), "{stdout}");
+        assert!(stdout.contains("(define-fun x2 () Bool true)"), "{stdout}");
+    }
+}
+
 /// `--max-models 1` truncates enumeration and reports `capped`.
 #[test]
 #[timeout(30_000)]

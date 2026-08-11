@@ -46,6 +46,17 @@ pub enum Fzn2smtError {
     #[error("cannot resolve identifier as array: {name}")]
     UnknownArray { name: String },
 
+    /// A FlatZinc integer variable domain cannot be represented safely by the
+    /// direct CP backend.
+    #[error("invalid CP integer domain for {variable}: {source}")]
+    InvalidCpIntegerDomain {
+        /// FlatZinc variable whose domain was rejected.
+        variable: String,
+        /// Typed CP-domain construction failure.
+        #[source]
+        source: ay_cp::domain::DomainCreationError,
+    },
+
     /// A constant-integer array parameter lookup failed.
     #[error("unknown int array parameter: {name}")]
     UnknownIntArray { name: String },
@@ -154,6 +165,72 @@ pub enum Fzn2smtError {
         constraint: String,
     },
 
+    /// A known FlatZinc constraint was called with the wrong number of
+    /// arguments. Arity is validated before translation so malformed input
+    /// cannot reach translators that index the argument list directly.
+    #[error("{constraint}: expected {expected} arguments, got {actual}")]
+    InvalidConstraintArity {
+        /// The FlatZinc constraint name.
+        constraint: String,
+        /// Human-readable accepted arity, such as `"3"` or `"2 or 3"`.
+        expected: String,
+        /// Number of arguments present in the input.
+        actual: usize,
+    },
+
+    /// A linear constraint received coefficient and variable arrays with
+    /// different lengths. Keeping this check at the translation boundary
+    /// prevents malformed FlatZinc from reaching CP propagator constructors,
+    /// which require a one-to-one coefficient/variable mapping.
+    #[error(
+        "{constraint}: coefficient and variable arrays must have equal length: coefficients has {coefficients}, variables has {variables}"
+    )]
+    LinearArrayLengthMismatch {
+        /// The FlatZinc constraint name.
+        constraint: String,
+        /// Number of coefficients.
+        coefficients: usize,
+        /// Number of variables.
+        variables: usize,
+    },
+
+    /// Bounds require a coefficient outside the i64 representation used by
+    /// the direct CP linear encoding. The solver must reject this model rather
+    /// than truncate or wrap a Big-M coefficient and risk a wrong verdict.
+    #[error("{constraint}: bounds are too wide for the direct CP linear encoding")]
+    LinearEncodingOverflow {
+        /// The FlatZinc constraint name.
+        constraint: String,
+    },
+
+    /// The CP engine returned a SAT assignment without the registered
+    /// optimization objective. This is an internal solver contract violation.
+    #[error("CP assignment is missing the optimization objective variable")]
+    MissingObjectiveValue,
+
+    /// A SAT assignment omitted a variable needed to render an output value.
+    #[error("CP assignment is missing a value required for output {output}")]
+    MissingOutputAssignment { output: String },
+
+    /// Output rendering referenced a set variable absent from the CP context.
+    #[error("CP output references unknown set variable: {name}")]
+    UnknownOutputSetVariable { name: String },
+
+    /// Incremental order-encoding failed while adding an optimization bound.
+    #[error(transparent)]
+    IncrementalEncoding(#[from] ay_cp::engine::IncrementalEncodingError),
+
+    /// A known constraint reached a translator that does not implement it.
+    /// This indicates an internal dispatch-table defect rather than malformed
+    /// FlatZinc input.
+    #[error("constraint {constraint} was routed to the incompatible {translator} translator")]
+    InvalidConstraintRoute {
+        /// The FlatZinc constraint name.
+        constraint: String,
+        /// The specialized translator that received it.
+        translator: &'static str,
+    },
+
     /// The direct CP portfolio received an unusable worker count.
     #[error("parallel worker count must be in 1..={maximum}, got {requested}")]
     InvalidWorkerCount {
@@ -162,6 +239,12 @@ pub enum Fzn2smtError {
         /// Maximum number of distinct worker configurations available.
         maximum: usize,
     },
+
+    /// A millisecond timeout cannot be represented as a portable monotonic
+    /// deadline. Reject it at the public boundary before any solver path uses
+    /// unchecked `Instant` addition.
+    #[error("timeout of {timeout_ms} milliseconds is too large to represent safely")]
+    InvalidTimeout { timeout_ms: u64 },
 
     /// A translation step received an expression shape it cannot handle
     /// (e.g. a literal where an identifier was required).

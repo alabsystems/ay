@@ -126,6 +126,149 @@ fn test_executor_qf_lia_linear_constraint_unsat() {
     assert_eq!(outputs, vec!["unsat"]);
 }
 
+fn arithmetic_ite_nonnegative_problem(
+    extra_setup: &str,
+    definition: &str,
+    contradiction: &str,
+) -> String {
+    format!(
+        r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_LIA)
+        (declare-const A Int)
+        (declare-const B Int)
+        (declare-const C Int)
+        (declare-const D Int)
+        (declare-const E Int)
+        (declare-const F Int)
+        (declare-const G Int)
+        (declare-const H Int)
+        (declare-const I Int)
+        (declare-const J Int)
+        {extra_setup}
+        {definition}
+        (assert (= H (+ C F)))
+        (assert (= G (+ B 1)))
+        (assert (= F (+ A 1)))
+        (assert (= E (+ D G)))
+        (assert (>= D 0))
+        (assert (>= A 0))
+        (assert (>= B 0))
+        (assert (>= C 0))
+        {contradiction}
+        (check-sat)
+    "#
+    )
+}
+
+fn assert_arithmetic_ite_nonnegative_has_strict_proof(
+    extra_setup: &str,
+    definition: &str,
+    contradiction: &str,
+) {
+    let input = arithmetic_ite_nonnegative_problem(extra_setup, definition, contradiction);
+    let commands = parse(&input).expect("valid QF_LIA fixture");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("solver executes");
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let proof = exec.last_proof().expect("UNSAT publishes a proof");
+    let quality = ay_proof::check_proof_strict(proof, exec.terms())
+        .expect("arithmetic-ITE contradiction has a strict proof");
+    assert_eq!(
+        quality.trust_count, 0,
+        "proof must be trust-free: {quality}"
+    );
+    assert!(
+        ay_proof::terminal_trust_report(proof).is_trust_free(),
+        "the empty-clause derivation must not depend on trust"
+    );
+}
+
+fn assert_arithmetic_ite_surface_is_strict_or_fails_closed(definition: &str) {
+    let input = arithmetic_ite_nonnegative_problem("", definition, "(assert (< I 0))");
+    let commands = parse(&input).expect("valid negated-condition fixture");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("solver executes");
+    match outputs.as_slice() {
+        [status] if status == "unknown" => assert!(exec.last_proof().is_none()),
+        [status] if status == "unsat" => {
+            let proof = exec.last_proof().expect("UNSAT publishes a proof");
+            let quality = ay_proof::check_proof_strict(proof, exec.terms())
+                .expect("published proof is strict");
+            assert_eq!(quality.trust_count, 0, "proof must be trust-free");
+        }
+        _ => panic!("expected strict UNSAT or fail-closed UNKNOWN, got {outputs:?}"),
+    }
+}
+
+/// Regression for the formula-level arithmetic-ITE trust gap isolated from
+/// dillig12_m. Every branch is contradictory: `E = D + B + 1` and
+/// `F = A + 1`, so `I` is nonnegative under either guard.
+#[test]
+fn arithmetic_ite_nonnegative_contradiction_has_strict_proof() {
+    assert_arithmetic_ite_nonnegative_has_strict_proof(
+        "",
+        "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+        "(assert (< I 0))",
+    );
+}
+
+/// The source spelling before formula-level ITE lifting must reach the same
+/// strict, trust-free proof. This exercises the established `ite_intro`
+/// fallback rather than relying on the post-lift provenance repair alone.
+#[test]
+fn rhs_arithmetic_ite_nonnegative_contradiction_has_strict_proof() {
+    assert_arithmetic_ite_nonnegative_has_strict_proof(
+        "",
+        "(assert (= I (ite (= J 1) (+ E F) E)))",
+        "(assert (< I 0))",
+    );
+}
+
+/// Canonical ITE construction swaps branches under a negated condition. The
+/// surface-aware repair must either bridge that spelling exactly or decline
+/// publication; native TermIds alone are not sufficient proof authority.
+#[test]
+fn negated_condition_ite_surfaces_are_strict_or_fail_closed() {
+    for definition in [
+        "(assert (ite (not (= J 1)) (= I E) (= I (+ E F))))",
+        "(assert (= I (ite (not (= J 1)) E (+ E F))))",
+    ] {
+        assert_arithmetic_ite_surface_is_strict_or_fails_closed(definition);
+    }
+}
+
+/// A Boolean definition can enter the exact provenance source set through a
+/// substitution chain even though it contributes nothing to the final linear
+/// contradiction. The exported Farkas step must omit that zero-weight,
+/// non-arithmetic row while retaining exact authored-premise authority.
+#[test]
+fn arithmetic_ite_irrelevant_bool_provenance_has_strict_proof() {
+    assert_arithmetic_ite_nonnegative_has_strict_proof(
+        r#"
+        (declare-const K Bool)
+        (declare-const W Int)
+        (assert (= K true))
+        (assert (= W (ite K 0 1)))
+        "#,
+        "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+        "(assert (< (+ I W (- W)) 0))",
+    );
+}
+
+/// Regression for dillig12_m's successor-failure trust leaf. The authored
+/// disjunction claims one derived value is negative, while the exact equality,
+/// ITE, and nonnegative-input premises make every disjunct impossible.
+#[test]
+fn arithmetic_ite_successor_failure_or_has_strict_proof() {
+    assert_arithmetic_ite_nonnegative_has_strict_proof(
+        "",
+        "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+        "(assert (or (< F 0) (< G 0) (< H 0) (< I 0)))",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Integer div/mod-by-zero soundness (#div0).
 //

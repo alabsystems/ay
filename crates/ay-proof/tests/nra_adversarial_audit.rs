@@ -712,7 +712,10 @@ fn fuzz_univariate_irrational_witness_systems_must_reject() {
         let mut t = TermStore::new();
         let x = t.mk_var("x", Sort::Real);
         let a = nonsquares[pick(&mut seed, nonsquares.len() as u64) as usize];
-        let isqrt = (1..).find(|&k| k * k > a).unwrap() - 1; // floor sqrt
+        let isqrt = (1..=a)
+            .find(|&k| k * k > a)
+            .expect("a positive nonsquare has a bounded integer square-root bracket")
+            - 1;
         let zero = rterm(&mut t, 0, 1);
         let a_t = rterm(&mut t, a, 1);
         let sq = t.mk_mul(vec![x, x]);

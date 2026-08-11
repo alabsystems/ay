@@ -166,6 +166,65 @@ fn test_forall_over_exists_int_still_sat() {
     assert_eq!(results, vec!["sat"], "forall-over-exists Int should be sat");
 }
 
+/// A universal below a satisfied disjunction is not an asserted obligation.
+/// CEGQI used to conjoin one of its instances anyway, deriving `p` against the
+/// asserted `not p` and reporting a wrong UNSAT despite the `c` disjunct.
+#[test]
+#[timeout(20000)]
+fn test_nonconjunctive_forall_refinement_never_manufactures_unsat() {
+    let smt = r#"
+        (set-logic NIA)
+        (declare-const c Bool)
+        (declare-const p Bool)
+        (assert c)
+        (assert (not p))
+        (assert (or c (forall ((x Int)) (or (not (= (* x x) 4)) p))))
+        (check-sat)
+    "#;
+    assert_not_unsat(smt, "nonconjunctive CEGQI instance under true disjunct");
+}
+
+/// Both universal operands are valid and logically equivalent, so their XOR
+/// is false. A local CEGQI validity result for either operand must not certify
+/// the whole non-conjunctive formula SAT.
+#[test]
+#[timeout(20000)]
+fn test_nonconjunctive_forall_validity_never_certifies_xor_sat() {
+    let smt = r#"
+        (set-logic NIA)
+        (assert
+          (xor (forall ((x Int)) (>= (* x x) 0))
+               (forall ((y Int)) (not (< (* y y) 0)))))
+        (check-sat)
+    "#;
+    assert_not_sat(smt, "XOR of equivalent valid universals");
+}
+
+/// Disambiguation can honestly return Unknown for nested alternating
+/// universals. The follow-up MBQI refuter must not conjoin their instances as
+/// though they were top-level assertions: the asserted `c` already satisfies
+/// the outer disjunction, so the complete formula is SAT independently of the
+/// quantified branch.
+#[test]
+#[timeout(20000)]
+fn test_nonconjunctive_disambiguation_unknown_never_enters_mbqi_refuter() {
+    let smt = r#"
+        (set-logic LIA)
+        (declare-const c Bool)
+        (declare-const p Bool)
+        (assert c)
+        (assert
+          (or c
+              (and
+                (forall ((x Int))
+                  (or p (exists ((z Int)) (= x (+ z z)))))
+                (forall ((y Int))
+                  (or (not p) (exists ((w Int)) (= y (+ w w))))))))
+        (check-sat)
+    "#;
+    assert_not_unsat(smt, "nonconjunctive CEGQI Unknown-to-MBQI route");
+}
+
 // ---------------------------------------------------------------------------
 // CEGQI Int var=var wrong-SAT.
 // ---------------------------------------------------------------------------

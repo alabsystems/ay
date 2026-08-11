@@ -27,6 +27,7 @@ pub(crate) const Z3_500_FULL_VERSION: &str = "Z3 5.0.0.0";
 /// graph. The canonical signature spelling is produced by Clang's C11 AST
 /// after including the byte-authenticated header set below.
 pub(crate) const PUBLIC_C_DECLARATION_COUNT: usize = 805;
+#[cfg(test)]
 pub(crate) const AUTHENTICATED_CALLABILITY_COUNT: usize = 217;
 pub(crate) const PUBLIC_C_DECLARATION_MANIFEST_SHA256: &str =
     "d4447ff654fd3b6bc6102d8e4959c5f12fb3b0d643f85bd7c4262167130ba2a0";
@@ -750,7 +751,7 @@ fn probe_library(path: &Path, required: &[String]) -> Result<LibraryObservation,
         0xc00cu32.to_string(),
     );
     match Api::load(&library) {
-        Ok(api) => match run_finite_set_probes(api) {
+        Ok(api) => match run_finite_set_probes(&api) {
             Ok(observed) => {
                 probes.extend(observed);
             }
@@ -962,12 +963,12 @@ unsafe fn load_symbol<T: Copy>(
     }
 }
 
-struct ContextGuard {
-    api: Api,
+struct ContextGuard<'a> {
+    api: &'a Api,
     context: Ptr,
 }
 
-impl Drop for ContextGuard {
+impl Drop for ContextGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this context was returned by `Z3_mk_context` from the same
         // loaded API and is deleted exactly once after all child probes.
@@ -977,7 +978,7 @@ impl Drop for ContextGuard {
     }
 }
 
-fn run_finite_set_probes(api: Api) -> Result<BTreeMap<String, String>, String> {
+fn run_finite_set_probes(api: &Api) -> Result<BTreeMap<String, String>, String> {
     // SAFETY: every call uses handles created by this exact API/context and
     // the corresponding Z3 5.0.0 signature. The entire sequence is isolated
     // in the guarded probe child.
@@ -999,7 +1000,7 @@ fn run_finite_set_probes(api: Api) -> Result<BTreeMap<String, String>, String> {
 }
 
 unsafe fn run_finite_set_probes_unsafe(
-    api: Api,
+    api: &Api,
     selected_semantic: Option<&str>,
 ) -> Result<BTreeMap<String, String>, String> {
     // SAFETY: upheld by `run_finite_set_probes`.
@@ -1521,7 +1522,7 @@ fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn app_decl(api: Api, context: Ptr, ast: Ptr) -> Result<Ptr, String> {
+fn app_decl(api: &Api, context: Ptr, ast: Ptr) -> Result<Ptr, String> {
     // SAFETY: `ast` is an application owned by the active probe context.
     let app = require_ptr(unsafe { (api.to_app)(context, ast) }, "Z3_to_app")?;
     // SAFETY: `app` belongs to the active probe context.
@@ -1533,7 +1534,7 @@ fn app_decl(api: Api, context: Ptr, ast: Ptr) -> Result<Ptr, String> {
 
 fn record_ast_observation(
     observed: &mut BTreeMap<String, String>,
-    api: Api,
+    api: &Api,
     context: Ptr,
     id: &str,
     ast: Ptr,
@@ -1591,17 +1592,17 @@ fn record_ast_observation(
     Ok(())
 }
 
-fn mk_int(api: Api, context: Ptr, sort: Ptr, value: i32) -> Result<Ptr, String> {
+fn mk_int(api: &Api, context: Ptr, sort: Ptr, value: i32) -> Result<Ptr, String> {
     // SAFETY: context and sort are owned by the active probe context.
     require_ptr(unsafe { (api.mk_int)(context, value, sort) }, "Z3_mk_int")
 }
 
-fn mk_eq(api: Api, context: Ptr, left: Ptr, right: Ptr) -> Result<Ptr, String> {
+fn mk_eq(api: &Api, context: Ptr, left: Ptr, right: Ptr) -> Result<Ptr, String> {
     // SAFETY: both terms are owned by the active probe context.
     require_ptr(unsafe { (api.mk_eq)(context, left, right) }, "Z3_mk_eq")
 }
 
-fn mk_member(api: Api, context: Ptr, element: Ptr, set: Ptr) -> Result<Ptr, String> {
+fn mk_member(api: &Api, context: Ptr, element: Ptr, set: Ptr) -> Result<Ptr, String> {
     // SAFETY: both terms are owned by the active probe context and sorted for
     // the finite-set membership constructor.
     require_ptr(
@@ -1610,7 +1611,7 @@ fn mk_member(api: Api, context: Ptr, element: Ptr, set: Ptr) -> Result<Ptr, Stri
     )
 }
 
-fn mk_size(api: Api, context: Ptr, set: Ptr) -> Result<Ptr, String> {
+fn mk_size(api: &Api, context: Ptr, set: Ptr) -> Result<Ptr, String> {
     // SAFETY: the finite-set term is owned by the active probe context.
     require_ptr(
         unsafe { (api.mk_finite_set_size)(context, set) },
@@ -1618,13 +1619,13 @@ fn mk_size(api: Api, context: Ptr, set: Ptr) -> Result<Ptr, String> {
     )
 }
 
-fn decl_kind(api: Api, context: Ptr, ast: Ptr) -> Result<u32, String> {
+fn decl_kind(api: &Api, context: Ptr, ast: Ptr) -> Result<u32, String> {
     let decl = app_decl(api, context, ast)?;
     // SAFETY: `decl` belongs to the active probe context.
     Ok(unsafe { (api.get_decl_kind)(context, decl) })
 }
 
-fn has_finite_int_sort(api: Api, context: Ptr, ast: Ptr, int_sort: Ptr) -> Result<bool, String> {
+fn has_finite_int_sort(api: &Api, context: Ptr, ast: Ptr, int_sort: Ptr) -> Result<bool, String> {
     // SAFETY: `ast` belongs to the active probe context.
     let sort = require_ptr(unsafe { (api.get_sort)(context, ast) }, "Z3_get_sort")?;
     // SAFETY: all sort handles belong to the active probe context.
@@ -1643,7 +1644,7 @@ fn has_finite_int_sort(api: Api, context: Ptr, ast: Ptr, int_sort: Ptr) -> Resul
 fn record_law(
     observed: &mut BTreeMap<String, String>,
     selected_semantic: Option<&str>,
-    api: Api,
+    api: &Api,
     context: Ptr,
     name: &str,
     proposition: Ptr,
@@ -1658,7 +1659,7 @@ fn record_law(
 }
 
 fn prove_boolean(
-    api: Api,
+    api: &Api,
     context: Ptr,
     proposition: Ptr,
     expected_true: bool,

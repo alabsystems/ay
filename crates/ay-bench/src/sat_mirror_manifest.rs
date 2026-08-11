@@ -291,8 +291,7 @@ fn build_manifest(args: &SatMirrorManifestArgs) -> Result<ManifestOutcome> {
         .saturating_sub(materialized_unknown_label_count);
     if unresolved_missing_label_count != 0 && !args.allow_unknown {
         errors.push(format!(
-            "{} benchmark files have no expected-result label or official-unknown row",
-            unresolved_missing_label_count
+            "{unresolved_missing_label_count} benchmark files have no expected-result label or official-unknown row"
         ));
     }
     if !stale_labels.is_empty() {

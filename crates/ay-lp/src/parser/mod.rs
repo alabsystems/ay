@@ -14,3 +14,22 @@ pub(crate) mod mps;
 
 pub use lp::parse_lp;
 pub use mps::parse_mps;
+
+/// Add two parser-produced finite values without letting an aggregate overflow
+/// smuggle an infinity into the normalized problem.
+pub(crate) fn checked_finite_add(
+    left: f64,
+    right: f64,
+    line: usize,
+    field: &str,
+) -> Result<f64, crate::error::LpError> {
+    let sum = left + right;
+    if sum.is_finite() {
+        Ok(sum)
+    } else {
+        Err(crate::error::LpError::Parse {
+            line,
+            msg: format!("{field} exceeds the finite numeric range"),
+        })
+    }
+}

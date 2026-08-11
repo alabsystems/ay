@@ -273,7 +273,7 @@ impl Context {
         // sort combination keep their existing behavior. Uses the resolved
         // internal name so parametric instances are checked against their own
         // (monomorphized) field sorts.
-        if self.is_constructor(name).is_some() {
+        if self.is_constructor(&app_name).is_some() {
             if let Some(field_info) = self.constructor_selector_info(&app_name) {
                 if field_info.len() == arg_ids.len() {
                     let expected: Vec<Sort> = field_info.iter().map(|(_, s)| s.clone()).collect();

@@ -6,6 +6,7 @@ use super::*;
 use ay_core::term::{Symbol, TermData};
 use ay_core::Sort;
 use num_bigint::BigInt;
+use num_rational::BigRational;
 
 #[test]
 fn test_datatype_variable_elimination_folds_nested_selector() {
@@ -94,6 +95,38 @@ fn test_simple_substitution() {
     // The new assertion should be (= x #b01)
     let expected_eq = terms.mk_eq(x, const_01);
     assert_eq!(assertions[1], expected_eq);
+}
+
+#[test]
+fn test_to_real_bridge_substitution_tightens_open_unit_interval() {
+    let mut terms = TermStore::new();
+    let n = terms.mk_var("n", Sort::Int);
+    let r = terms.mk_var("r", Sort::Real);
+    let to_real_n = terms.mk_to_real(n);
+    let zero_real = terms.mk_rational(BigRational::from_integer(BigInt::from(0)));
+    let one_real = terms.mk_rational(BigRational::from_integer(BigInt::from(1)));
+
+    // The mixed LIRA retry first substitutes the definitional bridge, then
+    // rebuilds comparisons through the canonical constructors. Those
+    // constructors must preserve Int integrality rather than relaxing n to a
+    // Real in the open interval (0, 1).
+    let bridge = terms.mk_eq(r, to_real_n);
+    let positive = terms.mk_lt(zero_real, r);
+    let below_one = terms.mk_lt(r, one_real);
+    let mut assertions = vec![bridge, positive, below_one];
+    let mut pass = VariableSubstitution::new();
+
+    assert!(pass.apply(&mut terms, &mut assertions));
+    assert_eq!(pass.substitutions().get(&r), Some(&to_real_n));
+
+    let zero_int = terms.mk_int(BigInt::from(0));
+    let one_int = terms.mk_int(BigInt::from(1));
+    let at_least_one = terms.mk_le(one_int, n);
+    let at_most_zero = terms.mk_le(n, zero_int);
+    assert_eq!(
+        assertions,
+        vec![terms.true_term(), at_least_one, at_most_zero]
+    );
 }
 
 #[test]

@@ -53,22 +53,147 @@ reproducible results and independently checked evidence.
 
 ## Known limitations (0.1.0)
 
-- **Quantified search remains incomplete; public SAT publication now fails
-  closed in every mode.** The underlying quantified procedures can still fail
-  to construct enough evidence to justify a candidate `sat`. The mandatory
-  publication boundary now treats a deferred quantified conjunct or any
-  independent-model `CannotConfirm` exactly as missing evidence: it returns
-  `unknown` and revokes model/proof/core authority, regardless of
-  `--self-check`. This closes the former default-mode wrong-`sat` publication
-  channel; it does not make the quantified search complete, so some previously
-  reported `sat` answers now become sound `unknown`.
+- **Quantified search remains incomplete; public SAT publication fails closed
+  unless a complete checked evidence lane succeeds.** Runtime-checked recovery
+  was implemented 2026-08-01 for the restricted quantified-UFBV projection
+  fragment; guarded external remeasurement is still pending. The 2026-07-31
+  emergency closure remains in force elsewhere: syntactic
+  UF-completion and QuantifierConsumer/sequence shapes are not SAT certificates, and a
+  quantified assertion that model validation defers or cannot check converts
+  `sat` to `unknown` in default mode as well as `--self-check`. Model-less
+  quantified SAT, incomplete E-matching, finite-domain certificates, and
+  non-conjunctive CEGQI refinement likewise fail closed unless they carry their
+  specific semantic evidence.
 
-  **Historical evidence below predates that universal publication boundary.**
-  It remains useful for understanding the untrusted search defect and the
-  capability cost of failing closed, but statements that default mode “ships”
-  those candidate verdicts are not descriptions of current behavior.
+  The production recovery accepts only a caller-authored, plain hard
+  `check-sat`. An untrusted projection candidate must pass the unsafe-free,
+  solver-independent implication checker and an independent positive source
+  binding. The source layer uses allocation-stable `DeclarationId`s, a closed
+  `DeclarationKind`, and a context-identity/revision stamp; only an exact live
+  primary `Uninterpreted` declaration is eligible. The query layer uses a fresh
+  pointer-identity epoch and an ordered inventory of roots, assumptions,
+  objectives, parsed/native soft constraints, scope depth, and term count. Its
+  non-`Clone` permit is captured and consumed inside one borrow-bound exclusive
+  `Executor` transaction, so generic, assumption, optimization, internal, or
+  stale query origins cannot acquire it.
 
-  **RE-MEASURED AT HEAD 2026-07-29 — the class is smaller, still OPEN, and its
+  Accepted semantic, source, and query evidence is sealed and non-`Clone`. The
+  emission boundary installs the exact total selector functions, boundedly
+  completes only proof-neutral output values, rechecks the frozen graph,
+  declaration identities/kinds/signatures, source and query epochs, and final
+  projection map, then mints a private one-shot SAT certificate. Assertion/model
+  evaluation, the independent model view, `get-value`, `get-model` rendering,
+  and round-trip checking all consume the same exact symbol/signature/projection
+  map. Unsupported shapes, signature conflicts, stale evidence, and resource
+  stops decline to the ordinary sound fallback or `unknown`.
+
+  The checked output-completion lane keeps the cached solve result revoked; it
+  does not install even a provisional `Sat` while completing the model. Only
+  the final currentness/model checks can publish cached `Sat` and mint the
+  certificate. An interrupt, deadline, or memory stop clears the incomplete
+  model, validation bit, and certificate and explicitly caches `Unknown`, so a
+  later model/API read cannot revive a stopped solve as SAT.
+
+  The sole full-family campaign is the checked-in guarded external harness
+  `scripts/ufbv_fixpoint_audit.py`. It pins the exact 121-file family to
+  canonical manifest SHA-256
+  `ef9912b78e493410189a3bfa733987a873a1e7ca5d36a529f42426f312391dd9`
+  (sorted basename, NUL, raw bytes, NUL) and requires the exact 26/74/21 declared
+  status distribution. It launches 121 fresh default processes and 121 fresh
+  `--self-check` processes, with `-st` enabled in both lanes. The closure gate
+  exits nonzero unless **both** lanes return `sat` on all 26 declared-SAT cases
+  and every one of those 52 SAT runs exposes exactly one canonical statistics
+  block with `model_validation.checked_projection_certificate=1`. It also
+  requires neither lane to return `sat` on any of the 74 declared-UNSAT or 21
+  declared-unknown cases, both lanes to have zero wrong and zero invalid
+  results, and the fresh self-check lane to reproduce every decisive default
+  result. Self-check is reproducibility/check-policy evidence from another AY
+  process, not independent corroboration or external proof replay.
+
+  The campaign is serial under the `_oom_guard.py` host lease and planned
+  per-child envelope. It passes `ay --memory`, `MEMLIMIT`, and `NBCORE`, wraps
+  each process group in the zero-grace RSS watchdog, supplies a sanitized
+  non-inherited environment, waits for build quiescence, and cancels/discards a
+  child if its continuous build monitor sees Cargo/Targo/rustc/compiler_consumer. Its JSON
+  binds the clean source HEAD, binary identity/SHA-256 and self-attested commit,
+  corpus manifest and per-file hashes, harness and OOM-guard hashes, timeouts,
+  resource plan, proof/checker modes, raw verdict evidence, and resumable
+  byte-identical checkpoint provenance. Run it only against the final aligned
+  binary:
+
+  ```sh
+  python3 scripts/ufbv_fixpoint_audit.py OUT.json
+  ```
+
+  A stored v3 report is not trusted from its summary fields. Reverify its
+  integrity, raw records, statistics evidence, corpus/harness/OOM-guard binding,
+  recomputed closure, and measured source identity with:
+
+  ```sh
+  python3 scripts/ufbv_fixpoint_audit.py \
+    --verify-report REPORT --expect-head SHA
+  ```
+
+  Verification requires the exact measured executable at its recorded path or
+  a byte-identical relocated copy supplied with `--binary`; it rechecks size and
+  SHA-256 and re-runs only `ay --version` under the recorded sanitized
+  environment. The report checksum and replay establish structural consistency,
+  not execution authenticity: the workspace and resumable checkpoint are
+  trusted-local inputs, `--expect-head` is a historical assertion, and pathname
+  rechecks narrow but cannot eliminate adversarial filesystem races.
+
+  The former environment-gated, effectively skipped in-process Rust campaign
+  was removed: without its environment switch it counted as a passing test
+  while doing no work, and its cooperative in-process limits were not an
+  enforceable child RSS boundary. Always-on compact rotation checks and typed
+  source/query/evidence, model-consumer, stop-cleanup, and end-to-end regressions
+  remain in `cargo test`; full-corpus evidence comes only from the guarded
+  external harness.
+
+  The current Clean/Trust campaign discharges 264/264 obligations in an
+  abstract semantic model and rejects 43/43 adversarial red cases. This is
+  design evidence only. There is no proved refinement from the live Rust/MIR to
+  that model and no hash-bound source/compiler/proof manifest, so the production
+  lane is runtime checked and source-conformance tested, **not formally
+  verified**.
+
+  **POST-IMPLEMENTATION EXTERNAL MEASUREMENT: not yet recorded.** Do not fill in
+  final counts, binary hashes, proof/checker verdicts, or performance deltas
+  until the aligned release binary has completed the guarded 121-file sweep.
+
+  **HISTORICAL BASELINE MEASURED 2026-07-31: 0 wrong answers in the exact
+  121-file family.** This binary predates the production projection recovery.
+  Default mode, 15 seconds per file, serial, guarded by `scripts/_oom_guard.py`;
+  binary SHA-256 `e5c547f732b2a617fd13d0a839fb7424e3fb1fb9ed0a300e0ff99aacbe01eddc`;
+  corpus family SHA-256
+  `ef9912b78e493410189a3bfa733987a873a1e7ca5d36a529f42426f312391dd9`.
+  Evidence:
+  [the development design notes](the development design notes)
+  and [raw JSON](the development design notes).
+
+  | declared → AY | count |
+  | --- | ---: |
+  | `unsat` → `unsat` | 66 |
+  | `unsat` → `unknown` / timeout | 2 / 6 |
+  | `sat` → `unknown` | 26 |
+  | `unknown` → `unknown` / timeout | 16 / 5 |
+  | **known wrong polarity** | **0** |
+
+  In that historical run, all 26 declared-SAT files returned `unknown` and 34
+  files with known status were unresolved. Default Alethe synthesis was enabled,
+  but no proof checker was run, so invalid proof count was unmeasured and the 66
+  UNSAT results were not independent certificate claims. The older UFNIRA
+  wrong-`sat` family was not re-measured; broader quantified fragments remain
+  experimental. Do not generalize either the historical baseline or the
+  restricted new certificate lane into a full-Z3-replacement claim.
+
+  **Historical record below (superseded for current behavior).** It preserves the
+  2026-07-26/29 diagnosis, rejected blanket-fix measurement, and partial-fix
+  trail. Statements that the UFBV family is open or has two remaining wrong
+  files describe those historical builds, not the 2026-07-31 closure or the
+  2026-08-01 runtime-checked implementation.
+
+  **HISTORICAL 2026-07-29 — the class was smaller, still OPEN, and its
   membership has fully turned over.** Full family sweep, all 121 UFBV
   `wintersteiger fmsd13 fixpoint` files, 15s, `ay 0.5.0+build.6235` @ `de03e266`,
   default mode. Evidence and reproduction:

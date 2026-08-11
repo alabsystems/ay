@@ -1009,8 +1009,11 @@ impl Executor {
             let Some(card_term) = self.existing_card_term(var) else {
                 continue;
             };
+            let TermData::App(card_symbol, _) = self.ctx.terms.get(card_term) else {
+                continue;
+            };
             let assigned =
-                self.evaluate_uninterpreted_app(model, OP_CARD, &[var], &Sort::Int, card_term);
+                self.evaluate_uninterpreted_app(model, card_symbol, &[var], &Sort::Int, card_term);
             let EvalValue::Rational(ref r) = assigned else {
                 continue;
             };

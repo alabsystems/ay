@@ -25,7 +25,7 @@
 //! ## LIFO Enforcement
 //!
 //! Frames must be popped in reverse order of creation (LIFO). `pop_frame`
-//! validates that the frame being popped is the most recently pushed frame.
+//! returns that validation as part of its Bool constraint.
 
 use crate::expr::Expr;
 use crate::memory::{MemoryModel, OBJECT_ID_WIDTH, OFFSET_WIDTH, POINTER_WIDTH};
@@ -70,9 +70,9 @@ impl MemoryModel {
 
     /// Pop the top stack frame, deallocating it and all its sub-allocations.
     ///
-    /// Validates LIFO ordering: the `frame_id` must correspond to the most
-    /// recently pushed frame. All objects allocated via `stack_alloca` within
-    /// this frame are deallocated before the frame itself.
+    /// Encodes LIFO ordering: the returned constraint requires `frame_id` to
+    /// correspond to the most recently pushed frame. All objects allocated via
+    /// `stack_alloca` within this frame are deallocated before the frame itself.
     ///
     /// # Arguments
     /// * `frame_id` - The object ID of the frame to pop (BitVec32).
@@ -91,7 +91,6 @@ impl MemoryModel {
     /// # Panics
     /// - Panics if `frame_id` is not BitVec(32).
     /// - Panics if there are no active stack frames.
-    /// - Panics if `frame_id` does not match the top frame (LIFO violation).
     #[must_use]
     pub fn pop_frame(mut self, frame_id: Expr) -> (Expr, Self) {
         assert!(
@@ -156,7 +155,7 @@ impl MemoryModel {
     /// will be automatically deallocated.
     ///
     /// # Arguments
-    /// * `frame_id` - The object ID of the owning frame (BitVec32)
+    /// * `frame_id` - The concrete object ID of the owning frame (BitVec32)
     /// * `size` - Size of the allocation in bytes (BitVec32)
     ///
     /// # Returns
@@ -164,14 +163,14 @@ impl MemoryModel {
     /// - Pointer to the allocated memory (BitVec64, offset=0)
     /// - Updated `MemoryModel` with the allocation tracked
     ///
-    /// REQUIRES: frame_id.sort().bitvec_width() == Some(32)
+    /// REQUIRES: frame_id is a concrete BitVec(32) constant
     /// REQUIRES: size.sort().bitvec_width() == Some(32)
     /// ENSURES: result.0.sort().bitvec_width() == Some(64)
     ///
     /// # Panics
     /// - Panics if `frame_id` is not BitVec(32).
     /// - Panics if `size` is not BitVec(32).
-    /// - Panics if `frame_id` does not match any active frame.
+    /// - Panics if `frame_id` is symbolic or does not match any active frame.
     #[must_use]
     pub fn stack_alloca(mut self, frame_id: Expr, size: Expr) -> (Expr, Self) {
         assert!(
@@ -193,13 +192,11 @@ impl MemoryModel {
         self = model;
 
         // Find the frame index to associate this allocation with
+        let frame_id_value = extract_concrete_u32(&frame_id);
         let frame_idx = self
             .stack_frames
             .iter()
-            .position(|&fid| {
-                // frame_id is a concrete BV32 constant matching fid
-                fid == extract_concrete_u32(&frame_id)
-            })
+            .position(|&fid| fid == frame_id_value)
             .expect("stack_alloca: frame_id does not match any active frame");
 
         self.frame_allocations[frame_idx].push(alloc_obj_id);
@@ -246,28 +243,23 @@ impl MemoryModel {
         // The pointer must not reference the frame object itself
         let not_frame = ptr_obj.clone().eq(frame_id.clone()).not();
 
-        // The pointer must not reference any sub-allocation of this frame
-        let frame_id_val = extract_concrete_u32(&frame_id);
-        let frame_idx = self
-            .stack_frames
-            .iter()
-            .position(|&fid| fid == frame_id_val);
-
-        match frame_idx {
-            Some(idx) => {
-                let mut constraints = vec![not_frame];
-                for &alloc_id in &self.frame_allocations[idx] {
-                    let alloc_id_expr = Expr::bitvec_const(alloc_id, OBJECT_ID_WIDTH);
-                    constraints.push(ptr_obj.clone().eq(alloc_id_expr).not());
-                }
-                Expr::and_many(constraints)
-            }
-            None => {
-                // Frame not found in active frames — could have been popped already.
-                // Just check against the frame object ID itself.
-                not_frame
+        // When `frame_id` is symbolic, each active frame guards the exclusions
+        // for its own sub-allocations. For a concrete active ID this simplifies
+        // to the same conjunction previously emitted by this method.
+        let mut constraints = vec![not_frame];
+        for (&active_frame, allocations) in self.stack_frames.iter().zip(&self.frame_allocations) {
+            let selects_frame = frame_id
+                .clone()
+                .eq(Expr::bitvec_const(active_frame, OBJECT_ID_WIDTH));
+            for &alloc_id in allocations {
+                let not_allocation = ptr_obj
+                    .clone()
+                    .eq(Expr::bitvec_const(alloc_id, OBJECT_ID_WIDTH))
+                    .not();
+                constraints.push(selects_frame.clone().implies(not_allocation));
             }
         }
+        Expr::and_many(constraints)
     }
 
     /// Returns the number of active stack frames.

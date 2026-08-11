@@ -47,6 +47,7 @@ mod ast_identity;
 mod ast_inspect;
 mod bitvectors;
 mod bitvectors_overflow;
+mod bounded_arrays;
 mod context;
 mod datatypes;
 mod engine_ext;
@@ -104,6 +105,10 @@ pub use ast_identity::*;
 pub use ast_inspect::*;
 pub use bitvectors::*;
 pub use bitvectors_overflow::*;
+// Crate-internal: the bounded-carrier array encoding has no `extern "C"`
+// surface of its own, it only constrains what the quantifier entry points
+// register and what a check injects.
+pub(crate) use bounded_arrays::*;
 pub use context::*;
 pub use datatypes::*;
 pub use engine_ext::*;
@@ -377,6 +382,7 @@ pub(crate) unsafe fn ffi_counts_within_limit(
 /// exact-polynomial allocations.
 pub(crate) const MAX_FFI_ALGEBRAIC_EXPONENT: c_uint = 4_096;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, CString};
 use std::ptr;
@@ -394,7 +400,7 @@ use ay_dpll::Statistics;
 pub type Z3_context = *mut Z3Context;
 /// Opaque config handle
 pub type Z3_config = *mut Z3Config;
-/// AST handle (an opaque context-salted encoding of AY's Copy 32-bit term index)
+/// AST handle (an opaque context-salted index into a context-owned AST arena)
 pub type Z3_ast = u64;
 /// Sort handle (heap-allocated)
 pub type Z3_sort = *mut SortHandle;
@@ -450,8 +456,9 @@ pub type Z3_probe = *mut ProbeHandle;
 
 /// High-bit tag distinguishing a proof-AST handle from an ordinary term handle.
 ///
-/// Ordinary `Z3_ast` values keep `TermId + 1` in the low 33-bit payload and a
-/// context salt below the reserved top nibble. A proof handle returned by
+/// Ordinary `Z3_ast` values keep a 1-based context-owned term-capability index
+/// in the low 33-bit payload and a context salt below the reserved top nibble.
+/// A proof handle returned by
 /// `Z3_solver_get_proof` sets bit 63, carries the same context salt in bits
 /// 32–58, and stores its proof-text index in the low 32 bits, so it can never
 /// alias a real term or a proof from another context and `Z3_ast_to_string` can
@@ -522,9 +529,9 @@ pub(crate) const HANDLE_SALT_SHIFT: u32 = 32;
 /// and func-decl). Bits 32–58 are reserved for the context salt.
 pub(crate) const TAGGED_AST_INDEX_MASK: u64 = u32::MAX as u64;
 
-/// Ordinary term AST payload (`TermId + 1`) occupies bits 0–32. The 33rd bit
-/// is needed for the theoretical `u32::MAX` term id; keeping it avoids a
-/// wrapping alias even though a store of that size is not practical.
+/// Ordinary term AST payload (a 1-based context-owned capability-arena index)
+/// occupies bits 0–32. The 33rd bit permits the theoretical final `u32` index
+/// without wrapping even though an arena of that size is not practical.
 pub(crate) const TERM_AST_PAYLOAD_MASK: u64 = (1u64 << 33) - 1;
 /// Ordinary term ASTs carry the same nonzero context salt in bits 33–59.
 pub(crate) const TERM_AST_SALT_SHIFT: u32 = 33;
@@ -546,6 +553,35 @@ pub(crate) fn next_handle_salt() -> u32 {
         if salt != 0 {
             return salt;
         }
+    }
+}
+
+/// Context-owned identity arena for ordinary term AST handles.
+///
+/// Both directions are kept together so minting an AST is one invariant-
+/// preserving operation: `ids[terms[index]] == index`. The full authenticated
+/// [`Term`] is stored, never just its reusable numeric slot.
+#[derive(Default)]
+pub(crate) struct TermAstArena {
+    ids: HashMap<Term, u32>,
+    terms: Vec<Term>,
+}
+
+impl TermAstArena {
+    fn intern(&mut self, term: Term) -> Option<u32> {
+        if let Some(index) = self.ids.get(&term).copied() {
+            return Some(index);
+        }
+        let index = u32::try_from(self.terms.len()).ok()?;
+        self.terms.try_reserve(1).ok()?;
+        self.ids.try_reserve(1).ok()?;
+        self.terms.push(term);
+        self.ids.insert(term, index);
+        Some(index)
+    }
+
+    fn get(&self, index: usize) -> Option<Term> {
+        self.terms.get(index).copied()
     }
 }
 
@@ -847,6 +883,15 @@ pub struct Z3Context {
     pub(crate) ffi_used_decl_names: std::collections::HashSet<String>,
     /// Monotonic identity/name source shared by fresh constants and functions.
     pub(crate) next_ffi_fresh_id: u64,
+    /// Canonical AST identity for each exact native term capability.
+    ///
+    /// A raw `TermId` is only a reusable slot. Keeping the full authenticated
+    /// [`Term`] as the key prevents a declaration reset or speculative suffix
+    /// rollback from making an old `Z3_ast` compare equal to a reincarnated
+    /// term that later occupies the same slot. Interior mutability keeps
+    /// [`term_to_ast`] usable from read-only introspection paths; Z3 contexts
+    /// already require externally synchronized, non-aliased access.
+    pub(crate) term_asts: RefCell<TermAstArena>,
     /// Track sorts associated with AST handles for sort queries
     pub(crate) ast_sorts: Vec<Option<Sort>>,
     /// Public Z3 5.0.0 finite-set sort identity -> public element sort.
@@ -1068,6 +1113,22 @@ pub struct Z3Context {
     /// bound — while the SAME term recorded at a DIFFERENT bound still gets its
     /// own (sound, conjoined) invariant.
     pub(crate) range_bounded: std::collections::HashSet<(Term, i64)>,
+    /// Public array-extensionality lemmas, keyed by the quantifier that entails
+    /// them.
+    ///
+    /// Registered by [`record_bounded_array_ext_lemma`]: a public
+    /// `forall i:BoundedIndex. select(a,i) = select(b,i)` entails core `a = b`
+    /// under the canonical-extension model construction proved in the
+    /// [`bounded_arrays`] module docs — but ONLY for goals whose array terms
+    /// are all free constants, which is re-verified per check by
+    /// [`goal_admits_canonical_extension`].
+    ///
+    /// Injected at check time only for handles whose goal actually contains the
+    /// key assertion, so no unrelated solver handle — and no context that never
+    /// writes such a formula — is constrained by it. Kept out of `assertions`
+    /// so `Z3_solver_get_assertions` and unsat cores stay faithful to what the
+    /// caller asserted.
+    pub(crate) bounded_array_ext_lemmas: HashMap<Term, BoundedArrayExtLemma>,
     /// Cache of array-extensionality witness indices minted by
     /// `Z3_mk_array_ext`, keyed by the (ordered) argument pair, so repeated
     /// calls on the same `(a, b)` return the IDENTICAL witness AST and inject
@@ -1213,6 +1274,9 @@ pub(crate) fn ensure_cross_context_translation_semantics(
     }
     if !source.transitive_closure_regs.is_empty() {
         missing.push("transitive-closure registrations/verifier state");
+    }
+    if !source.bounded_array_ext_lemmas.is_empty() {
+        missing.push("bounded-carrier array extensionality lemmas");
     }
     // Quantifier attributes are AST-local. The metadata-transfer walk below
     // rejects them only when their quantifier is reachable from a requested
@@ -1813,11 +1877,11 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
             );
         }
         if let Some(decl) = decl {
-            if target
-                .ffi_func_decls
-                .get(key)
-                .is_some_and(|existing| existing != decl)
-            {
+            if target.ffi_func_decls.get(key).is_some_and(|existing| {
+                existing.declaration_identity_name() != name
+                    || existing.domain() != decl.domain()
+                    || existing.range() != decl.range()
+            }) {
                 return translation_metadata_error(
                     target,
                     operation,
@@ -1866,11 +1930,11 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
                 "reachable array-map term has no authenticated function signature",
             );
         };
-        if target
-            .map_fn_sigs
-            .get(&name)
-            .is_some_and(|existing| existing != &decl)
-        {
+        if target.map_fn_sigs.get(&name).is_some_and(|existing| {
+            existing.declaration_identity_name() != name
+                || existing.domain() != decl.domain()
+                || existing.range() != decl.range()
+        }) {
             return translation_metadata_error(
                 target,
                 operation,
@@ -1878,6 +1942,63 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
             );
         }
         map_signature_copies.push((name, decl));
+    }
+
+    // FuncDecl capabilities are context-bound. Never copy the source handle
+    // into the destination metadata: remint the same semantic declaration in
+    // the destination context (or reuse its exact current registration) so a
+    // later `Z3_mk_app`, parser-context alias, or substitution cannot launder a
+    // source-context declaration id through translated metadata.
+    let mut rebound_function_copies = Vec::with_capacity(function_copies.len());
+    for (key, name, source_decl) in function_copies {
+        let target_decl = if let Some(source_decl) = source_decl {
+            if let Some(existing) = target.ffi_func_decls.get(&key).cloned() {
+                Some(existing)
+            } else {
+                match target.solver.try_declare_fun(
+                    &name,
+                    source_decl.domain(),
+                    source_decl.range().clone(),
+                ) {
+                    Ok(decl) => Some(decl),
+                    Err(error) => {
+                        let detail = format!(
+                            "translated function could not be rebound in the target context: {error}"
+                        );
+                        return translation_metadata_error(target, operation, &detail);
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        rebound_function_copies.push((key, name, target_decl));
+    }
+    let mut rebound_map_signature_copies = Vec::with_capacity(map_signature_copies.len());
+    for (name, source_decl) in map_signature_copies {
+        let rebound = rebound_function_copies
+            .iter()
+            .filter_map(|(_, _, decl)| decl.as_ref())
+            .find(|decl| {
+                decl.declaration_identity_name() == name
+                    && decl.domain() == source_decl.domain()
+                    && decl.range() == source_decl.range()
+            })
+            .cloned();
+        let target_decl = if let Some(rebound) = rebound {
+            rebound
+        } else if source_decl.has_declaration_authority() {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated array-map declaration could not be rebound in the target context",
+            );
+        } else {
+            // Synthetic builtin operator descriptors carry no context-bound
+            // capability and are safe to copy as inert map-signature metadata.
+            source_decl
+        };
+        rebound_map_signature_copies.push((name, target_decl));
     }
 
     for (term, identity, symbol, sort) in const_copies {
@@ -1892,7 +2013,7 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
         target.ffi_decl_symbols.insert(name, symbol.clone());
         target.ffi_used_decl_names.insert(symbol.display_name());
     }
-    for (key, name, decl) in function_copies {
+    for (key, name, decl) in rebound_function_copies {
         target.ffi_func_names.insert(key.clone(), name);
         if let Some(decl) = decl {
             target.ffi_func_decls.insert(key, decl);
@@ -1915,7 +2036,7 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
             .parsed_quantifier_public_bound_sorts
             .insert(quantifier, public_sorts);
     }
-    for (name, decl) in map_signature_copies {
+    for (name, decl) in rebound_map_signature_copies {
         target.map_fn_sigs.insert(name, decl);
     }
     for (term, metadata) in quantifier_metadata_copies {
@@ -2843,14 +2964,22 @@ pub struct ParserContextHandle {
 // Helpers
 // ============================================================================
 
-/// Convert AY Term to Z3_ast (u64).
-/// Adds 1 so that TermId 0 has payload 1, reserving 0 as null, and embeds the
-/// owning context's salt. `Z3_ast` is opaque at the C ABI, so the salt changes
-/// no public layout while making same-number cross-context aliases
-/// distinguishable.
+/// Convert one exact AY term capability to its canonical context-owned AST.
+///
+/// The payload is a stable 1-based index into [`Z3Context::term_asts`],
+/// not the reusable raw `TermId`. Re-exporting the same live [`Term`] therefore
+/// preserves Z3's hash-consed AST identity, while a later term born in the same
+/// raw slot receives a different handle. The context salt keeps otherwise
+/// equal arena indices from aliasing across contexts.
 #[inline]
 pub(crate) fn term_to_ast(ctx: &Z3Context, term: Term) -> Z3_ast {
-    (u64::from(ctx.handle_salt) << TERM_AST_SALT_SHIFT) | (u64::from(term.to_raw()) + 1)
+    if !ctx.solver.is_valid_term(term) {
+        return 0;
+    }
+    let Some(index) = ctx.term_asts.borrow_mut().intern(term) else {
+        return 0;
+    };
+    (u64::from(ctx.handle_salt) << TERM_AST_SALT_SHIFT) | (u64::from(index) + 1)
 }
 
 /// True exactly when an untagged, non-null term AST carries `ctx`'s salt and a
@@ -2864,11 +2993,12 @@ pub(crate) fn term_ast_belongs_to(ctx: &Z3Context, ast: Z3_ast) -> bool {
 }
 
 /// Decode a term AST only when it is structurally valid, salted for `ctx`, and
-/// names a live entry in that context's term store.
+/// its exact stored capability still names the same live native term entry.
 ///
 /// This is the sole term-handle decoder. Keeping the payload conversion behind
-/// the context check makes it impossible for a consumer to accidentally accept
-/// a same-number handle minted by another context.
+/// the context check and capability arena makes it impossible for a consumer
+/// to accept a same-number handle minted by another context or by a later term
+/// incarnation in this context.
 #[inline]
 pub(crate) fn checked_ast_to_term(ctx: &Z3Context, ast: Z3_ast) -> Option<Term> {
     if !term_ast_belongs_to(ctx, ast) {
@@ -2878,7 +3008,8 @@ pub(crate) fn checked_ast_to_term(ctx: &Z3Context, ast: Z3_ast) -> Option<Term> 
     if payload > u64::from(u32::MAX) + 1 {
         return None;
     }
-    let term = Term::from_raw((payload - 1) as u32);
+    let index = usize::try_from(payload - 1).ok()?;
+    let term = ctx.term_asts.borrow().get(index)?;
     ctx.solver.is_valid_term(term).then_some(term)
 }
 
@@ -3323,9 +3454,7 @@ pub(crate) fn bounded_sort_hi(sort: &Sort) -> Option<i64> {
 
 /// Look up sort for an AST handle
 pub(crate) fn lookup_ast_sort(ctx: &Z3Context, ast: Z3_ast) -> Option<&Sort> {
-    if !term_ast_belongs_to(ctx, ast) {
-        return None;
-    }
+    checked_ast_to_term(ctx, ast)?;
     let idx = (ast & TERM_AST_PAYLOAD_MASK) as usize;
     ctx.ast_sorts.get(idx).and_then(|s| s.as_ref())
 }
@@ -3649,8 +3778,7 @@ pub(crate) fn cache_dt_func_decl(
             }),
     };
     let (decl, dt_op) = if let Some((dt_name, dt_sort)) = self_dt_sort {
-        let resolved_decl = FuncDecl::new(
-            decl.name().to_string(),
+        let resolved_decl = decl.with_instantiated_signature(
             decl.domain()
                 .iter()
                 .map(|s| resolve_dt_self_sort(s, &dt_name, &dt_sort))
@@ -3667,6 +3795,19 @@ pub(crate) fn cache_dt_func_decl(
         (resolved_decl, resolved_op)
     } else {
         (decl, dt_op)
+    };
+    // Upgrade the synthetic FFI descriptor to the exact frontend declaration
+    // capability whenever this datatype member is live. The specialized
+    // datatype builders below do not need that capability, so retaining the
+    // descriptor on an adoption failure preserves their existing fail-closed
+    // behavior; declaration-authenticating consumers (parser-context aliases,
+    // function substitution) will then reject it instead of trusting its name.
+    let decl = match ctx
+        .solver
+        .try_declare_fun(decl.name(), decl.domain(), decl.range().clone())
+    {
+        Ok(authenticated) => authenticated,
+        Err(_) => decl,
     };
     let symbol = ctx.ffi_decl_symbols.get(decl.name()).cloned();
     let decl_id = ctx.next_decl_id;

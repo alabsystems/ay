@@ -5,6 +5,7 @@
 //! Tests for public Term handle inspection and pretty-printing (#1494).
 
 use crate::api::*;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[test]
 fn term_id_raw_roundtrip_and_display_are_stable_handles() {
@@ -13,7 +14,12 @@ fn term_id_raw_roundtrip_and_display_are_stable_handles() {
 
     let id: TermId = x.id();
     assert_eq!(id.index() as u32, x.to_raw());
-    assert_eq!(Term::from_raw(x.to_raw()).id(), id);
+    let stripped = Term::from_raw(x.to_raw());
+    assert_eq!(stripped.id(), id);
+    assert_ne!(
+        stripped, x,
+        "raw round-trip must not recreate term authority"
+    );
     assert_eq!(format!("{x}"), format!("Term({id})"));
 }
 
@@ -140,7 +146,7 @@ fn update_term_checks_non_application_children_and_binder_bodies() {
 fn update_term_rejects_wrong_sort_occurrences_captured_by_preserved_binders() {
     let mut solver = Solver::try_new(Logic::Uflia).expect("UFLIA should construct");
     let bound = solver.fresh_var("captured", Sort::Int);
-    let bound_name = match solver.terms().get(bound.0) {
+    let bound_name = match solver.terms().get(bound.id()) {
         ay_core::term::TermData::Var(name, _) => name.clone(),
         other => panic!("fresh variable should be a Var, got {other:?}"),
     };
@@ -153,11 +159,10 @@ fn update_term_rejects_wrong_sort_occurrences_captured_by_preserved_binders() {
     // Manufacture a distinct Bool variable with the exact binder spelling.
     // Immediate child validation sees a Bool quantifier body either way; the
     // preserved binder must additionally reject capture at the wrong sort.
-    let wrong_sort = Term(
-        solver
-            .terms_mut()
-            .mk_fresh_named_var(bound_name.clone(), Sort::Bool),
-    );
+    let wrong_sort_id = solver
+        .terms_mut()
+        .mk_fresh_named_var(bound_name.clone(), Sort::Bool);
+    let wrong_sort = solver.wrap_term(wrong_sort_id);
     assert!(matches!(
         solver.try_update_term(forall, &[wrong_sort]),
         Err(SolverError::InvalidArgument {
@@ -177,22 +182,19 @@ fn update_term_rejects_wrong_sort_occurrences_captured_by_preserved_binders() {
 
     // The same capture rule applies to a preserved `let` name.  Binding values
     // precede the body in update-term child order.
-    let let_var = Term(
-        solver
-            .terms_mut()
-            .mk_fresh_named_var("let_captured", Sort::Int),
-    );
+    let let_var_id = solver
+        .terms_mut()
+        .mk_fresh_named_var("let_captured", Sort::Int);
+    let let_var = solver.wrap_term(let_var_id);
     let let_body = solver.try_gt(let_var, zero).expect("well-sorted let body");
-    let let_term = Term(
-        solver
-            .terms_mut()
-            .mk_let(vec![("let_captured".to_string(), zero.0)], let_body.0),
-    );
-    let wrong_let_var = Term(
-        solver
-            .terms_mut()
-            .mk_fresh_named_var("let_captured", Sort::Bool),
-    );
+    let let_term_id = solver
+        .terms_mut()
+        .mk_let(vec![("let_captured".to_string(), zero.id())], let_body.id());
+    let let_term = solver.wrap_term(let_term_id);
+    let wrong_let_var_id = solver
+        .terms_mut()
+        .mk_fresh_named_var("let_captured", Sort::Bool);
+    let wrong_let_var = solver.wrap_term(wrong_let_var_id);
     assert!(matches!(
         solver.try_update_term(let_term, &[zero, wrong_let_var]),
         Err(SolverError::InvalidArgument {
@@ -211,14 +213,14 @@ fn update_term_rejects_invalid_handles_and_child_counts_without_panicking() {
 
     assert!(matches!(
         solver.try_update_term(invalid, &[]),
-        Err(SolverError::InvalidArgument {
+        Err(SolverError::InvalidTermHandle {
             operation: "update_term",
             ..
         })
     ));
     assert!(matches!(
         solver.try_update_term(not_p, &[invalid]),
-        Err(SolverError::InvalidArgument {
+        Err(SolverError::InvalidTermHandle {
             operation: "update_term",
             ..
         })
@@ -233,4 +235,102 @@ fn update_term_rejects_invalid_handles_and_child_counts_without_panicking() {
     assert_eq!(solver.update_term(invalid, &[]), None);
     assert_eq!(solver.update_term(not_p, &[invalid]), None);
     assert_eq!(solver.update_term(not_p, &[]), None);
+}
+
+#[test]
+fn term_handles_reject_foreign_solver_aliases_before_indexing() {
+    let mut first = Solver::new(Logic::All);
+    let mut second = Solver::new(Logic::All);
+
+    let foreign_same_sort = first.declare_const("p", Sort::Bool);
+    let local_same_sort = second.declare_const("q", Sort::Bool);
+    assert_eq!(foreign_same_sort.to_raw(), local_same_sort.to_raw());
+    assert!(matches!(
+        second.try_not(foreign_same_sort),
+        Err(SolverError::InvalidTermHandle {
+            operation: "not",
+            ..
+        })
+    ));
+
+    let foreign_different_sort = first.declare_const("i", Sort::Int);
+    let local_different_sort = second.declare_const("r", Sort::Real);
+    assert_eq!(
+        foreign_different_sort.to_raw(),
+        local_different_sort.to_raw()
+    );
+    assert!(matches!(
+        second.try_add(foreign_different_sort, foreign_different_sort),
+        Err(SolverError::InvalidTermHandle {
+            operation: "add",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn full_reset_rotates_term_authority_even_when_numeric_ids_repeat() {
+    let mut solver = Solver::new(Logic::All);
+    let stale = solver.declare_const("before-reset", Sort::Bool);
+
+    solver.try_reset().expect("full reset");
+    let current = solver.declare_const("after-reset", Sort::Bool);
+    assert_eq!(stale.to_raw(), current.to_raw());
+    assert_ne!(stale, current);
+    assert!(matches!(
+        solver.try_not(stale),
+        Err(SolverError::InvalidTermHandle {
+            operation: "not",
+            ..
+        })
+    ));
+    assert!(solver.try_not(current).is_ok());
+}
+
+#[test]
+fn logical_scopes_preserve_live_term_authority() {
+    let mut solver = Solver::new(Logic::All);
+    let before = solver.declare_const("before-scope", Sort::Bool);
+    solver.try_push().expect("push");
+    let inside = solver.declare_const("inside-scope", Sort::Bool);
+    solver.try_pop().expect("pop");
+
+    assert!(solver.try_not(before).is_ok());
+    assert!(solver.try_not(inside).is_ok());
+    solver
+        .try_reset_assertions()
+        .expect("reset-assertions preserves the term arena");
+    assert!(solver.try_not(before).is_ok());
+    assert!(solver.try_not(inside).is_ok());
+}
+
+#[test]
+fn arbitrary_raw_terms_fail_with_typed_errors_without_panicking() {
+    let mut solver = Solver::new(Logic::All);
+    let live = solver.declare_const("live", Sort::Bool);
+
+    for invalid in [Term::from_raw(live.to_raw()), Term::from_raw(u32::MAX)] {
+        assert!(matches!(
+            solver.try_not(invalid),
+            Err(SolverError::InvalidTermHandle {
+                operation: "not",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn canonical_proof_renderer_authenticates_term_handles_before_store_access() {
+    let mut first = Solver::new(Logic::All);
+    let second = Solver::new(Logic::All);
+    let foreign = first.declare_const("foreign-proof-term", Sort::Bool);
+
+    for invalid in [foreign, Term::from_raw(foreign.to_raw())] {
+        let result = catch_unwind(AssertUnwindSafe(|| second.render_term_canonical(invalid)));
+        assert!(
+            result.is_err(),
+            "unauthenticated term reached proof renderer"
+        );
+    }
 }

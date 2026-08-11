@@ -189,7 +189,7 @@ pub(crate) fn try_solve_projection(
 }
 
 fn trace_result(
-    projection: &crate::network_design_pb::NetworkDesignProjection,
+    projection: &NetworkDesignProjection,
     initial_rows: usize,
     cuts: usize,
     verdict: &str,
@@ -217,7 +217,7 @@ fn trace_result(
 }
 
 fn trace_iteration(
-    projection: &crate::network_design_pb::NetworkDesignProjection,
+    projection: &NetworkDesignProjection,
     cuts: usize,
     started: Instant,
     pb_wall: Duration,

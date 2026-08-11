@@ -79,6 +79,7 @@ struct Answer {
     outcome: Outcome,
     typed_certificate: bool,
     replay_only: bool,
+    deferred_lane: Option<(&'static str, &'static str)>,
 }
 
 fn solve(model: &Model, opts: &SolveOpts) -> Answer {
@@ -112,6 +113,7 @@ fn solve(model: &Model, opts: &SolveOpts) -> Answer {
         outcome,
         typed_certificate,
         replay_only: !session.replay_claims().is_empty(),
+        deferred_lane: session.deferred_lane(),
     }
 }
 
@@ -316,6 +318,10 @@ fn the_verdict_does_not_depend_on_whether_the_floor_deferred() {
             && matches!(greedy.outcome, Outcome::Infeasible { .. }),
         "both arms must still refute PHP(8,7)"
     );
+    assert_eq!(
+        greedy.deferred_lane, None,
+        "the zero-tree-capacity arm must recover immediate greedy closure"
+    );
 }
 
 /// **THE EVIDENCE FLOOR IS LOAD-BEARING, NOT DECORATIVE.**
@@ -377,35 +383,6 @@ fn posture_never_inverts_the_evidence_it_admits() {
             strict.typed_certificate,
         );
     }
-}
-
-/// **THE DEGENERATE POINT.** `AY_MILP_ANCHOR_FIRST_REFUSAL_MS=0` turns deferral
-/// off, which must recover exactly the pre-portfolio greedy behaviour.
-///
-/// This is what makes the invariant a property of ONE program with a parameter
-/// rather than an argument about two programs: the same binary, one integer
-/// changed, and the difference is visible. With the cap at zero the REPLAY
-/// refutation closes the solve and no certificate is exported; with the cap at
-/// its default the anchor gets first refusal and one is.
-///
-/// The environment write is why this test is `#[ignore]` by default — it is a
-/// process-global and this crate's suite runs tests in parallel. Run it with
-/// `cargo test -p ay-milp --test portfolio_dominance -- --ignored --test-threads=1`.
-#[test]
-#[ignore = "mutates a process-global env var; run serially with --ignored"]
-fn deferral_disabled_recovers_greedy_close() {
-    let model = unsat_clause_milp();
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(20));
-
-    // SAFETY: single-threaded by the `--test-threads=1` contract above.
-    unsafe { std::env::set_var("AY_MILP_ANCHOR_FIRST_REFUSAL_MS", "0") };
-    let greedy = solve(&model, &opts);
-    unsafe { std::env::remove_var("AY_MILP_ANCHOR_FIRST_REFUSAL_MS") };
-
-    assert!(
-        matches!(greedy.outcome, Outcome::Infeasible { .. }),
-        "the degenerate arm must still DECIDE; it only gives up evidence"
-    );
 }
 
 /// **A LANE MAY NOT WIDEN THE CALLER'S DEADLINE.**

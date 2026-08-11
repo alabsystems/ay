@@ -105,22 +105,11 @@ impl Executor {
             return ValidationObservation::Skip(ValidationSkipKind::Internal);
         }
         if flags & TERM_FLAG_QUANTIFIER != 0 {
-            // (#7979) Instead of blindly skipping quantified assertions, check
-            // SAT-level evidence. When E-matching has instantiated ground
-            // instances and the SAT solver assigned the quantifier literal TRUE,
-            // the model satisfies all known ground instances. This is incomplete
-            // (not all domain values are checked) but is the best evidence
-            // available. Using SAT-fallback instead of Skip prevents the
-            // "no verification evidence" rejection that degrades SAT to Unknown.
-            if matches!(target, ValidationTarget::GroundAssertion)
-                && self.sat_term_assigned_true(model, term)
-            {
-                let term_str = self.format_term(term);
-                return ValidationObservation::fallback(format!(
-                    "{}: {term_str} used SAT-fallback for quantifier validation",
-                    target.entry(index),
-                ));
-            }
+            // A SAT assignment to the quantifier's Boolean proxy proves only
+            // that the finite set of emitted ground instances is consistent.
+            // It does not validate the universal over its full domain. Record a
+            // quantifier skip so the restoration and final emission gates demand
+            // an exhaustive or explicitly constructed model certificate.
             return ValidationObservation::Skip(ValidationSkipKind::Quantifier);
         }
 
@@ -963,7 +952,8 @@ impl Executor {
                                 target,
                                 format!(
                                     "{}: {} pure BV assertion evaluates to Unknown with BV model present",
-                                    target.entry(index), term_str(),
+                                    target.entry(index),
+                                    term_str(),
                                 ),
                             );
                         }
@@ -1029,7 +1019,7 @@ impl Executor {
             return false;
         }
         let name = sym.name();
-        if Self::is_known_theory_symbol(name) || self.is_dt_internal_symbol(name) {
+        if Self::is_known_theory_symbol(name) || self.is_exact_dt_internal_symbol(name) {
             return false;
         }
         let Some(euf_model) = model.euf_model.as_ref() else {
@@ -1061,7 +1051,7 @@ impl Executor {
                     let name = sym.name();
                     if self.ctx.terms.sort(term).is_seq()
                         && !Self::is_known_theory_symbol(name)
-                        && !self.is_dt_internal_symbol(name)
+                        && !self.is_exact_dt_internal_symbol(name)
                         && args.iter().any(|&arg| self.contains_datatype_term(arg))
                     {
                         return true;
@@ -1333,7 +1323,7 @@ impl Executor {
         for idx in 0..self.ctx.terms.len() {
             let tid = TermId(idx as u32);
             if let TermData::App(sym, args) = self.ctx.terms.get(tid) {
-                if args.contains(&x) && self.is_dt_internal_symbol(sym.name()) {
+                if args.contains(&x) && self.is_exact_dt_internal_symbol(sym.name()) {
                     return true;
                 }
             }
@@ -2037,7 +2027,7 @@ impl Executor {
                 return Err(ModelValidationError::violated(
                     VerificationBoundary::SmtAssumption,
                     "Assumption validation requires SAT result",
-                ))
+                ));
             }
         };
 

@@ -95,7 +95,7 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
             }
             BlockingClauseResult::Unsat => {
                 if $proof_enabled {
-                    let _pmc_clause_trace = $solver.clause_trace().cloned();
+                    let _pmc_clause_trace = $solver.snapshot_clause_trace();
                     let (_pmc_clausification_proofs, _pmc_theory_proofs) = {
                         if let Some(ref _pmc_trace) = _pmc_clause_trace {
                             let _pmc_count = _pmc_trace.original_clauses().count();

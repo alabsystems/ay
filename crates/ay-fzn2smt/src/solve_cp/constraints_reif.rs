@@ -11,39 +11,106 @@
 // M_fwd = max(sum) - d, M_bwd = d + 1 - min(sum)
 // max(sum) = sum(max(c_i*x_i)), min(sum) = sum(min(c_i*x_i))
 
-use crate::error::Result;
+use crate::error::{Fzn2smtError, Result};
 use ay_cp::propagator::Constraint;
 use ay_cp::variable::IntVarId;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::{encoding_i64, linear_encoding_overflow};
 use super::CpContext;
 
 impl CpContext {
-    /// Compute Big-M values for a linear expression sum(c_i * x_i) ≤ d.
-    /// Returns (M_fwd, M_bwd) where:
-    ///   M_fwd = max(sum) - d (for forward implication)
-    ///   M_bwd = d + 1 - min(sum) (for backward implication)
-    fn compute_big_m(&self, coeffs: &[i64], vars: &[IntVarId], rhs: i64) -> (i64, i64) {
-        let mut max_sum: i64 = 0;
-        let mut min_sum: i64 = 0;
+    /// Compute exact expression extrema in a wider representation. Returning a
+    /// typed error on i128 accumulation overflow is conservative; saturating an
+    /// extremum can make a Big-M coefficient too small and admit false models.
+    fn linear_extrema(
+        &self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        context: &str,
+    ) -> Result<(i128, i128)> {
+        if coeffs.len() != vars.len() {
+            return Err(Fzn2smtError::LinearArrayLengthMismatch {
+                constraint: context.to_string(),
+                coefficients: coeffs.len(),
+                variables: vars.len(),
+            });
+        }
+
+        let mut max_sum = 0i128;
+        let mut min_sum = 0i128;
         for (&c, &v) in coeffs.iter().zip(vars.iter()) {
             let (lb, ub) = self.get_var_bounds(v);
-            if c >= 0 {
-                max_sum = max_sum.saturating_add(c.saturating_mul(ub));
-                min_sum = min_sum.saturating_add(c.saturating_mul(lb));
+            let c = i128::from(c);
+            let lb = i128::from(lb);
+            let ub = i128::from(ub);
+            let (min_term, max_term) = if c >= 0 {
+                (c * lb, c * ub)
             } else {
-                max_sum = max_sum.saturating_add(c.saturating_mul(lb));
-                min_sum = min_sum.saturating_add(c.saturating_mul(ub));
-            }
+                (c * ub, c * lb)
+            };
+            min_sum = min_sum
+                .checked_add(min_term)
+                .ok_or_else(|| linear_encoding_overflow(context))?;
+            max_sum = max_sum
+                .checked_add(max_term)
+                .ok_or_else(|| linear_encoding_overflow(context))?;
         }
-        let m_fwd = (max_sum - rhs).max(0);
-        let m_bwd = (rhs + 1 - min_sum).max(0);
-        (m_fwd, m_bwd)
+        Ok((min_sum, max_sum))
+    }
+
+    fn forward_big_m(
+        &self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        rhs: i64,
+        context: &str,
+    ) -> Result<(i64, i64)> {
+        let (_, max_sum) = self.linear_extrema(coeffs, vars, context)?;
+        let rhs = i128::from(rhs);
+        let m = max_sum
+            .checked_sub(rhs)
+            .ok_or_else(|| linear_encoding_overflow(context))?
+            .max(0);
+        // rhs + M is exactly max(max_sum, rhs), avoiding an unnecessary
+        // potentially overflowing addition.
+        Ok((
+            encoding_i64(m, context)?,
+            encoding_i64(max_sum.max(rhs), context)?,
+        ))
+    }
+
+    fn backward_big_m(
+        &self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        rhs: i64,
+        context: &str,
+    ) -> Result<(i64, i64)> {
+        let (min_sum, _) = self.linear_extrema(coeffs, vars, context)?;
+        let strict_rhs = i128::from(rhs) + 1;
+        let m = strict_rhs
+            .checked_sub(min_sum)
+            .ok_or_else(|| linear_encoding_overflow(context))?
+            .max(0);
+        Ok((
+            encoding_i64(m, context)?,
+            encoding_i64(-strict_rhs, context)?,
+        ))
     }
 
     /// Encode r ↔ (sum(c_i * x_i) ≤ d) using Big-M.
-    pub(super) fn add_reif_le(&mut self, coeffs: &[i64], vars: &[IntVarId], rhs: i64, r: IntVarId) {
-        let (m_fwd, m_bwd) = self.compute_big_m(coeffs, vars, rhs);
+    pub(super) fn add_reif_le(
+        &mut self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        rhs: i64,
+        r: IntVarId,
+        context: &str,
+    ) -> Result<()> {
+        let (m_fwd, forward_rhs) = self.forward_big_m(coeffs, vars, rhs, context)?;
+        let (m_bwd, backward_rhs) = self.backward_big_m(coeffs, vars, rhs, context)?;
+        let neg_coeffs = checked_negated_coefficients(coeffs, context)?;
 
         // Forward: sum(c_i * x_i) + M_fwd * r ≤ rhs + M_fwd
         // i.e., sum(c_i * x_i) ≤ rhs + M_fwd * (1 - r)
@@ -55,7 +122,7 @@ impl CpContext {
             self.engine.add_constraint(Constraint::LinearLe {
                 coeffs: c,
                 vars: v,
-                rhs: rhs + m_fwd,
+                rhs: forward_rhs,
             });
         }
 
@@ -64,21 +131,39 @@ impl CpContext {
         // When r=0: sum ≥ rhs + 1 (constraint is violated)
         // When r=1: sum ≥ rhs + 1 - M_bwd (trivially true)
         {
-            let mut c: Vec<i64> = coeffs.iter().map(|x| -x).collect();
+            let mut c = neg_coeffs;
             c.push(-m_bwd);
             let mut v = vars.to_vec();
             v.push(r);
             self.engine.add_constraint(Constraint::LinearLe {
                 coeffs: c,
                 vars: v,
-                rhs: -(rhs + 1),
+                rhs: backward_rhs,
             });
         }
+        Ok(())
     }
 
     /// Encode r ↔ (sum(c_i * x_i) = d) using Big-M.
     /// Decomposed as: r ↔ (sum ≤ d ∧ sum ≥ d).
-    pub(super) fn add_reif_eq(&mut self, coeffs: &[i64], vars: &[IntVarId], rhs: i64, r: IntVarId) {
+    pub(super) fn add_reif_eq(
+        &mut self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        rhs: i64,
+        r: IntVarId,
+        context: &str,
+    ) -> Result<()> {
+        // Validate both orientations before mutating the model.
+        let neg_coeffs = checked_negated_coefficients(coeffs, context)?;
+        let neg_rhs = rhs
+            .checked_neg()
+            .ok_or_else(|| linear_encoding_overflow(context))?;
+        self.forward_big_m(coeffs, vars, rhs, context)?;
+        self.backward_big_m(coeffs, vars, rhs, context)?;
+        self.forward_big_m(&neg_coeffs, vars, neg_rhs, context)?;
+        self.backward_big_m(&neg_coeffs, vars, neg_rhs, context)?;
+
         // Introduce two auxiliary booleans: r1 ↔ (sum ≤ d), r2 ↔ (sum ≥ d)
         // Then r = r1 ∧ r2
         let r1 = self.engine.new_bool_var(None);
@@ -87,11 +172,10 @@ impl CpContext {
         self.var_bounds.insert(r2, (0, 1));
 
         // r1 ↔ (sum ≤ d)
-        self.add_reif_le(coeffs, vars, rhs, r1);
+        self.add_reif_le(coeffs, vars, rhs, r1, context)?;
 
         // r2 ↔ (-sum ≤ -d) i.e. (sum ≥ d)
-        let neg_coeffs: Vec<i64> = coeffs.iter().map(|c| -c).collect();
-        self.add_reif_le(&neg_coeffs, vars, -rhs, r2);
+        self.add_reif_le(&neg_coeffs, vars, neg_rhs, r2, context)?;
 
         // r = r1 ∧ r2: r ≤ r1, r ≤ r2, r1 + r2 - r ≤ 1
         self.engine.add_constraint(Constraint::LinearLe {
@@ -109,11 +193,19 @@ impl CpContext {
             vars: vec![r1, r2, r],
             rhs: 1,
         });
+        Ok(())
     }
 
     /// Encode r → (sum(c_i * x_i) ≤ d) (half-reification / implication).
-    fn add_imp_le(&mut self, coeffs: &[i64], vars: &[IntVarId], rhs: i64, r: IntVarId) {
-        let (m_fwd, _) = self.compute_big_m(coeffs, vars, rhs);
+    fn add_imp_le(
+        &mut self,
+        coeffs: &[i64],
+        vars: &[IntVarId],
+        rhs: i64,
+        r: IntVarId,
+        context: &str,
+    ) -> Result<()> {
+        let (m_fwd, forward_rhs) = self.forward_big_m(coeffs, vars, rhs, context)?;
         let mut c = coeffs.to_vec();
         c.push(m_fwd);
         let mut v = vars.to_vec();
@@ -121,8 +213,9 @@ impl CpContext {
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: c,
             vars: v,
-            rhs: rhs + m_fwd,
+            rhs: forward_rhs,
         });
+        Ok(())
     }
 
     /// int_eq_reif(a, b, r) etc.
@@ -134,23 +227,23 @@ impl CpContext {
         match c.id.as_str() {
             "int_le_reif" | "bool_le_reif" => {
                 // r ↔ (a ≤ b) → r ↔ (a - b ≤ 0)
-                self.add_reif_le(&[1, -1], &[a, b], 0, r);
+                self.add_reif_le(&[1, -1], &[a, b], 0, r, &c.id)?;
             }
             "int_lt_reif" | "bool_lt_reif" => {
                 // r ↔ (a < b) → r ↔ (a - b ≤ -1)
-                self.add_reif_le(&[1, -1], &[a, b], -1, r);
+                self.add_reif_le(&[1, -1], &[a, b], -1, r, &c.id)?;
             }
             "int_ge_reif" | "bool_ge_reif" => {
                 // r ↔ (a ≥ b) → r ↔ (b - a ≤ 0)
-                self.add_reif_le(&[-1, 1], &[a, b], 0, r);
+                self.add_reif_le(&[-1, 1], &[a, b], 0, r, &c.id)?;
             }
             "int_gt_reif" | "bool_gt_reif" => {
                 // r ↔ (a > b) → r ↔ (b - a ≤ -1)
-                self.add_reif_le(&[-1, 1], &[a, b], -1, r);
+                self.add_reif_le(&[-1, 1], &[a, b], -1, r, &c.id)?;
             }
             "int_eq_reif" => {
                 // r ↔ (a = b) → r ↔ (a - b = 0)
-                self.add_reif_eq(&[1, -1], &[a, b], 0, r);
+                self.add_reif_eq(&[1, -1], &[a, b], 0, r, &c.id)?;
             }
             "int_ne_reif" => {
                 // r ↔ (a ≠ b) → not_r ↔ (a = b), r = 1 - not_r
@@ -162,9 +255,9 @@ impl CpContext {
                     vars: vec![r, not_r],
                     rhs: 1,
                 });
-                self.add_reif_eq(&[1, -1], &[a, b], 0, not_r);
+                self.add_reif_eq(&[1, -1], &[a, b], 0, not_r, &c.id)?;
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "reified integer comparison")),
         }
         Ok(())
     }
@@ -173,17 +266,18 @@ impl CpContext {
     pub(super) fn translate_int_linear_reif(&mut self, c: &ConstraintItem) -> Result<()> {
         let coeffs = self.resolve_const_int_array(&c.args[0])?;
         let vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         let rhs = self.resolve_const_int(&c.args[2])?;
         let r = self.resolve_var(&c.args[3])?;
 
         match c.id.as_str() {
             "int_lin_le_reif" | "bool_lin_le_reif" => {
-                self.add_reif_le(&coeffs, &vars, rhs, r);
+                self.add_reif_le(&coeffs, &vars, rhs, r, &c.id)?;
             }
             "int_lin_eq_reif" | "bool_lin_eq_reif" => {
-                self.add_reif_eq(&coeffs, &vars, rhs, r);
+                self.add_reif_eq(&coeffs, &vars, rhs, r, &c.id)?;
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "reified integer linear")),
         }
         Ok(())
     }
@@ -193,7 +287,7 @@ impl CpContext {
         let a = self.resolve_var(&c.args[0])?;
         let b = self.resolve_var(&c.args[1])?;
         let r = self.resolve_var(&c.args[2])?;
-        self.add_reif_eq(&[1, -1], &[a, b], 0, r);
+        self.add_reif_eq(&[1, -1], &[a, b], 0, r, &c.id)?;
         Ok(())
     }
 
@@ -213,7 +307,7 @@ impl CpContext {
             rhs: 1,
         });
         // not_r ↔ (a = b)
-        self.add_reif_eq(&[1, -1], &[a, b], 0, not_r);
+        self.add_reif_eq(&[1, -1], &[a, b], 0, not_r, &c.id)?;
         Ok(())
     }
 
@@ -222,6 +316,7 @@ impl CpContext {
     pub(super) fn translate_int_linear_ne_reif(&mut self, c: &ConstraintItem) -> Result<()> {
         let coeffs = self.resolve_const_int_array(&c.args[0])?;
         let vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         let rhs = self.resolve_const_int(&c.args[2])?;
         let r = self.resolve_var(&c.args[3])?;
 
@@ -234,7 +329,7 @@ impl CpContext {
             rhs: 1,
         });
         // not_r ↔ (sum = rhs)
-        self.add_reif_eq(&coeffs, &vars, rhs, not_r);
+        self.add_reif_eq(&coeffs, &vars, rhs, not_r, &c.id)?;
         Ok(())
     }
 
@@ -243,13 +338,14 @@ impl CpContext {
     pub(super) fn translate_int_linear_ne_imp(&mut self, c: &ConstraintItem) -> Result<()> {
         let coeffs = self.resolve_const_int_array(&c.args[0])?;
         let vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         let rhs = self.resolve_const_int(&c.args[2])?;
         let r = self.resolve_var(&c.args[3])?;
 
         let eq_ind = self.engine.new_bool_var(None);
         self.var_bounds.insert(eq_ind, (0, 1));
         // eq_ind ↔ (sum = rhs)
-        self.add_reif_eq(&coeffs, &vars, rhs, eq_ind);
+        self.add_reif_eq(&coeffs, &vars, rhs, eq_ind, &c.id)?;
         // r + eq_ind ≤ 1 (both can't be true: if r=1, sum ≠ rhs)
         self.engine.add_constraint(Constraint::LinearLe {
             coeffs: vec![1, 1],
@@ -312,30 +408,16 @@ impl CpContext {
         let pos = self.resolve_var_array(&c.args[0])?;
         let neg = self.resolve_var_array(&c.args[1])?;
         let r = self.resolve_var(&c.args[2])?;
-        let neg_len = neg.len() as i64;
+        let neg_len = i64::try_from(neg.len()).map_err(|_| linear_encoding_overflow(&c.id))?;
 
-        // The clause is: sum(pos) - sum(neg) >= 1 - L
-        // Rewrite as: sum(pos) + sum(1-neg) >= 1
-        // i.e., sum(pos) - sum(neg) + L >= 1
-
-        // Forward: r → clause holds
-        // sum(pos) - sum(neg) >= 1 - L - M*(1-r)
-        // Backward: ¬clause → ¬r
-        // ¬clause means sum(pos) - sum(neg) < 1 - L, i.e. sum(pos) - sum(neg) <= -L
-        // When clause fails: r must be 0
-
-        // Use Big-M reification on the linear form:
-        // clause is: sum(pos_i) + sum(1-neg_j) >= 1
-        // Rewrite: -sum(pos_i) + sum(neg_j) <= L - 1  (negated ≤ form)
-        // So: r ↔ (-sum(pos) + sum(neg) ≤ L - 1) ... no that's wrong direction
-
-        // r ↔ (sum(pos) - sum(neg) >= 1 - L)
-        // Rewrite: r ↔ (-sum(pos) + sum(neg) ≤ L - 1)
+        // The clause is sum(pos) + sum(1-neg) >= 1. With L negative
+        // literals, its equivalent <= form is
+        // -sum(pos) + sum(neg) <= L - 1.
         let mut coeffs: Vec<i64> = pos.iter().map(|_| -1i64).collect();
         coeffs.extend(neg.iter().map(|_| 1i64));
         let mut vars = pos;
         vars.extend(neg);
-        self.add_reif_le(&coeffs, &vars, neg_len - 1, r);
+        self.add_reif_le(&coeffs, &vars, neg_len - 1, r, &c.id)?;
         Ok(())
     }
 
@@ -346,46 +428,45 @@ impl CpContext {
         let r = self.resolve_var(&c.args[2])?;
 
         match c.id.as_str() {
-            "int_le_imp" | "bool_le_imp" => self.add_imp_le(&[1, -1], &[a, b], 0, r),
-            "int_lt_imp" | "bool_lt_imp" => self.add_imp_le(&[1, -1], &[a, b], -1, r),
-            "int_ge_imp" | "bool_ge_imp" => self.add_imp_le(&[-1, 1], &[a, b], 0, r),
-            "int_gt_imp" | "bool_gt_imp" => self.add_imp_le(&[-1, 1], &[a, b], -1, r),
+            "int_le_imp" | "bool_le_imp" => {
+                self.add_imp_le(&[1, -1], &[a, b], 0, r, &c.id)?;
+            }
+            "int_lt_imp" | "bool_lt_imp" => {
+                self.add_imp_le(&[1, -1], &[a, b], -1, r, &c.id)?;
+            }
+            "int_ge_imp" | "bool_ge_imp" => {
+                self.add_imp_le(&[-1, 1], &[a, b], 0, r, &c.id)?;
+            }
+            "int_gt_imp" | "bool_gt_imp" => {
+                self.add_imp_le(&[-1, 1], &[a, b], -1, r, &c.id)?;
+            }
             "int_eq_imp" => {
                 // r → (a = b): r → (a ≤ b) ∧ r → (a ≥ b)
-                self.add_imp_le(&[1, -1], &[a, b], 0, r);
-                self.add_imp_le(&[-1, 1], &[a, b], 0, r);
+                self.add_imp_le(&[1, -1], &[a, b], 0, r, &c.id)?;
+                self.add_imp_le(&[-1, 1], &[a, b], 0, r, &c.id)?;
             }
             "int_ne_imp" => {
-                // r → (a ≠ b): when r=1, force a < b or a > b.
-                // Auxiliary indicator d selects which disjunct:
-                //   r=1, d=0: a - b ≤ -1 (a < b)
-                //   r=1, d=1: b - a ≤ -1 (a > b)
-                //   r=0: unconstrained
-                let (a_lb, a_ub) = self.get_var_bounds(a);
-                let (b_lb, b_ub) = self.get_var_bounds(b);
-                let d = self.engine.new_bool_var(None);
-                self.var_bounds.insert(d, (0, 1));
-
-                let m_ab = (a_ub - b_lb + 1).max(1);
-                let m_ba = (b_ub - a_lb + 1).max(1);
-
-                // a - b ≤ -1 + m_ab*d + m_ab*(1-r)
-                // Rearranged: a - b - m_ab*d + m_ab*r ≤ m_ab - 1
-                self.engine.add_constraint(Constraint::LinearLe {
-                    coeffs: vec![1, -1, -m_ab, m_ab],
-                    vars: vec![a, b, d, r],
-                    rhs: m_ab - 1,
+                // Split the disjunction into two activation variables. This
+                // avoids the old `2*M-1` formulation, which overflowed even
+                // when each individual Big-M coefficient was representable.
+                let less = self.engine.new_bool_var(None);
+                let greater = self.engine.new_bool_var(None);
+                self.var_bounds.insert(less, (0, 1));
+                self.var_bounds.insert(greater, (0, 1));
+                self.engine.add_constraint(Constraint::LinearEq {
+                    coeffs: vec![1, 1, -1],
+                    vars: vec![less, greater, r],
+                    rhs: 0,
                 });
-
-                // b - a ≤ -1 + m_ba*(1-d) + m_ba*(1-r)
-                // Rearranged: b - a + m_ba*d + m_ba*r ≤ 2*m_ba - 1
-                self.engine.add_constraint(Constraint::LinearLe {
-                    coeffs: vec![-1, 1, m_ba, m_ba],
-                    vars: vec![a, b, d, r],
-                    rhs: 2 * m_ba - 1,
-                });
+                self.add_imp_le(&[1, -1], &[a, b], -1, less, &c.id)?;
+                self.add_imp_le(&[-1, 1], &[a, b], -1, greater, &c.id)?;
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(invalid_constraint_route(
+                    c,
+                    "integer comparison implication",
+                ))
+            }
         }
         Ok(())
     }
@@ -394,20 +475,24 @@ impl CpContext {
     pub(super) fn translate_int_linear_imp(&mut self, c: &ConstraintItem) -> Result<()> {
         let coeffs = self.resolve_const_int_array(&c.args[0])?;
         let vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         let rhs = self.resolve_const_int(&c.args[2])?;
         let r = self.resolve_var(&c.args[3])?;
 
         match c.id.as_str() {
             "int_lin_le_imp" | "bool_lin_le_imp" => {
-                self.add_imp_le(&coeffs, &vars, rhs, r);
+                self.add_imp_le(&coeffs, &vars, rhs, r, &c.id)?;
             }
             "int_lin_eq_imp" | "bool_lin_eq_imp" => {
                 // r → (sum = d): r → (sum ≤ d) ∧ r → (sum ≥ d)
-                self.add_imp_le(&coeffs, &vars, rhs, r);
-                let neg_coeffs: Vec<i64> = coeffs.iter().map(|x| -x).collect();
-                self.add_imp_le(&neg_coeffs, &vars, -rhs, r);
+                let neg_coeffs = checked_negated_coefficients(&coeffs, &c.id)?;
+                let neg_rhs = rhs
+                    .checked_neg()
+                    .ok_or_else(|| linear_encoding_overflow(&c.id))?;
+                self.add_imp_le(&coeffs, &vars, rhs, r, &c.id)?;
+                self.add_imp_le(&neg_coeffs, &vars, neg_rhs, r, &c.id)?;
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "integer linear implication")),
         }
         Ok(())
     }
@@ -439,4 +524,22 @@ impl CpContext {
         });
         Ok(())
     }
+}
+
+fn invalid_constraint_route(c: &ConstraintItem, translator: &'static str) -> Fzn2smtError {
+    Fzn2smtError::InvalidConstraintRoute {
+        constraint: c.id.clone(),
+        translator,
+    }
+}
+
+fn checked_negated_coefficients(coeffs: &[i64], context: &str) -> Result<Vec<i64>> {
+    coeffs
+        .iter()
+        .map(|coefficient| {
+            coefficient
+                .checked_neg()
+                .ok_or_else(|| linear_encoding_overflow(context))
+        })
+        .collect()
 }

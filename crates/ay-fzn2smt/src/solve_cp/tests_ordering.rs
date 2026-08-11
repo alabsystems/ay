@@ -116,6 +116,65 @@ fn test_lex_less_equal_prefix_violation() {
     }
 }
 
+#[test]
+fn lex_lesseq_obeys_proper_prefix_ordering() {
+    for (left, right, expected) in [
+        ("[]", "[1]", true),
+        ("[1]", "[]", false),
+        ("[1]", "[1, 2]", true),
+        ("[1, 2]", "[1]", false),
+        ("[0, 2]", "[1]", true),
+    ] {
+        let fzn = format!("constraint fzn_lex_lesseq_int({left}, {right});\nsolve satisfy;\n");
+        let result = parse_and_solve(&fzn);
+        assert_eq!(
+            matches!(result, CpSolveResult::Sat(_)),
+            expected,
+            "unexpected lex_lesseq result for {left} and {right}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn lex_less_obeys_proper_prefix_ordering() {
+    for (left, right, expected) in [
+        ("[]", "[1]", true),
+        ("[]", "[]", false),
+        ("[1]", "[]", false),
+        ("[1]", "[1, 2]", true),
+        ("[1, 2]", "[1]", false),
+        ("[1]", "[1]", false),
+    ] {
+        let fzn = format!("constraint fzn_lex_less_int({left}, {right});\nsolve satisfy;\n");
+        let result = parse_and_solve(&fzn);
+        assert_eq!(
+            matches!(result, CpSolveResult::Sat(_)),
+            expected,
+            "unexpected lex_less result for {left} and {right}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn oversized_lex_big_m_is_a_typed_error() {
+    let fzn = "\
+        var -9223372036854775808..9223372036854775807: x;\n\
+        var -9223372036854775808..9223372036854775807: y;\n\
+        constraint fzn_lex_less_int([0, x], [0, y]);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let err = super::unsupported_constraints(&model)
+        .expect_err("an unrepresentable Big-M coefficient must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::error::Fzn2smtError::LinearEncodingOverflow { .. }
+                | crate::error::Fzn2smtError::InvalidCpIntegerDomain { .. }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
 // ── set_le soundness tests (half-reification fix) ────────────────────
 
 /// set_le: S1={1,3} ≤ S2={1,2} should be UNSAT.

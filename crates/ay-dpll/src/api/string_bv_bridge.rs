@@ -217,11 +217,18 @@ impl Solver {
         args: &[Term],
         buf_size_bv: Term,
     ) -> Result<Term, SolverError> {
+        let _fmt_id = self.resolve_term("format_string_vuln_check (fmt)", fmt)?;
+        let arg_ids = args
+            .iter()
+            .copied()
+            .map(|arg| self.resolve_term("format_string_vuln_check (arg)", arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _buf_size_id = self.resolve_term("format_string_vuln_check (buf_size)", buf_size_bv)?;
         self.expect_string("format_string_vuln_check (fmt)", fmt)?;
-        for (i, arg) in args.iter().enumerate() {
+        for arg_id in &arg_ids {
             // We allow both String and BV args. BV args contribute their decimal
             // string length. String args contribute directly.
-            let sort = self.terms().sort(arg.0).clone();
+            let sort = self.terms().sort(*arg_id).clone();
             match &sort {
                 ay_core::Sort::String | ay_core::Sort::BitVec(_) => {}
                 _ => {
@@ -232,7 +239,6 @@ impl Solver {
                     });
                 }
             }
-            let _ = i; // suppress unused warning
         }
         let bv_width =
             self.expect_bitvec_width("format_string_vuln_check (buf_size)", buf_size_bv)?;
@@ -248,8 +254,8 @@ impl Solver {
         let mut total_len = self.try_str_len(fmt)?;
 
         // Add each argument's contribution.
-        for arg in args {
-            let sort = self.terms().sort(arg.0).clone();
+        for (arg, arg_id) in args.iter().zip(arg_ids) {
+            let sort = self.terms().sort(arg_id).clone();
             let arg_len = match &sort {
                 ay_core::Sort::String => self.try_str_len(*arg)?,
                 ay_core::Sort::BitVec(_) => {

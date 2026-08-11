@@ -425,7 +425,9 @@ fn num_inv(x: &RcfNum) -> Result<RcfNum, String> {
         RcfNum::Infinitesimal { index, series } => {
             if series.len() == 1 {
                 // Exact: (q·ε^k)^{-1} = q^{-1}·ε^{-k}.
-                let (&e, c) = series.iter().next().expect("len == 1");
+                let Some((&e, c)) = series.iter().next() else {
+                    return Err("empty infinitesimal series has no reciprocal".into());
+                };
                 let mut out = BTreeMap::new();
                 out.insert(-e, c.recip());
                 Ok(mk_inf(*index, out))
@@ -1317,8 +1319,8 @@ fn inf_string(index: c_uint, series: &BTreeMap<i64, BigRational>) -> String {
         };
         parts.push(base);
     }
-    match parts.len() {
-        1 => parts.pop().expect("len == 1"),
+    match parts.as_slice() {
+        [part] => part.clone(),
         _ => format!("(+ {})", parts.join(" ")),
     }
 }

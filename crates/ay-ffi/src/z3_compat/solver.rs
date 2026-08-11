@@ -18,7 +18,7 @@ use ay_dpll::api::{
 use ay_frontend::Command;
 
 use super::{
-    apply_supported_params, cache_ast_vector, cache_string,
+    apply_supported_params, bounded_array_ext_consequences, cache_ast_vector, cache_string,
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
@@ -612,6 +612,11 @@ pub(crate) unsafe fn check_solver_handle(
     // The goal is the handle's own assertion list, transformed by its tactic
     // when it has one (equivalence-preserving: identical verdict and models).
     let mut goal = handle.assertions.clone();
+    // Snapshot the caller's own top-level assertions BEFORE a tactic can rewrite
+    // the observable list: they are the keys the bounded-array extensionality
+    // lemmas hang off (see `bounded_arrays`). A tactic is equivalence-preserving,
+    // so a pre-transform assertion is still a fact of this check.
+    let asserted_keys: Vec<Term> = handle.assertions.clone();
     // Tracking literals from `Z3_solver_assert_and_track`: every `p` is passed
     // as an assumption so the tracked assertion's contribution to an UNSAT is
     // reported by `Z3_solver_get_unsat_core` (a subset of these `p`s plus any
@@ -718,6 +723,31 @@ pub(crate) unsafe fn check_solver_handle(
                 }
             }
         }
+    }
+
+    // Public array extensionality over a BOUNDED carrier (see `bounded_arrays`).
+    // Each equality is a consequence of a top-level assertion of THIS check, and
+    // is released only after the whole term set this check will hand the engine
+    // is re-verified to admit the canonical extension the proof needs — never
+    // context-globally, and never for a goal holding an interpreted array term.
+    // It stays out of `handle.assertions`, so `Z3_solver_get_assertions` and
+    // unsat cores keep reporting only what the caller asserted.
+    {
+        let mut canonicity_roots: Vec<Term> = Vec::new();
+        canonicity_roots.extend(asserted_keys.iter().copied());
+        canonicity_roots.extend(goal.iter().copied());
+        canonicity_roots.extend(effective.iter().copied());
+        canonicity_roots.extend(lemmas.iter().copied());
+        canonicity_roots.extend(ctx.background_axioms.iter().copied());
+        canonicity_roots.extend(ctx.global_definition_axioms.iter().copied());
+        canonicity_roots.extend(ctx.finite_set_reachable_axioms.values().flatten().copied());
+        let mut keys: Vec<Term> = asserted_keys.clone();
+        keys.extend(goal.iter().copied());
+        goal.extend(bounded_array_ext_consequences(
+            ctx,
+            &keys,
+            &canonicity_roots,
+        ));
     }
 
     // Load THIS handle's goal into the shared engine, replacing the goal the
@@ -1893,12 +1923,18 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
 ) -> c_int {
     // Pre-extract the input vectors (raw derefs) outside the guard.
     // SAFETY: caller contract: these are valid `Z3_ast_vector` handles (or null).
-    let assumption_asts: Vec<Z3_ast> = unsafe { assumptions.as_ref() }
-        .map(|v| v.asts.clone())
-        .unwrap_or_default();
-    let variable_asts: Vec<Z3_ast> = unsafe { variables.as_ref() }
-        .map(|v| v.asts.clone())
-        .unwrap_or_default();
+    let (assumption_asts, variable_asts): (Vec<Z3_ast>, Vec<Z3_ast>) = unsafe {
+        (
+            assumptions
+                .as_ref()
+                .map(|v| v.asts.clone())
+                .unwrap_or_default(),
+            variables
+                .as_ref()
+                .map(|v| v.asts.clone())
+                .unwrap_or_default(),
+        )
+    };
     // SAFETY: `ffi_guard_int` validates/guards `c`; `s`/`consequences` are
     // null-checked before use.
     unsafe {

@@ -1230,7 +1230,7 @@ where
     // returning. Wrapping the stop closure makes every intra-round solve — and
     // every trimming solve beneath it — honour the same deadline, so the round
     // ends with the cores it has instead of hanging.
-    let mut round_stop = |elapsed: &mut dyn FnMut() -> bool| {
+    let round_stop = |elapsed: &mut dyn FnMut() -> bool| {
         round_started.elapsed() >= DISJOINT_CORE_ROUND_BUDGET || elapsed()
     };
     while collected.len() < round_core_cap
@@ -1602,7 +1602,7 @@ const LP_FLOOR_MAX_VARS: u32 = 5_500;
 /// `stopped=true` after 7-8 rounds and ~1000 of the 1500 permitted cuts, still
 /// improving. Raising the round cap alone therefore does nothing. Measured
 /// 2000ms -> dual 143, 6000ms -> 144.
-const SUBGRADIENT_FLOOR_BUDGET: std::time::Duration = std::time::Duration::from_millis(6_000);
+const SUBGRADIENT_FLOOR_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Maximum wall-clock budget for the LP-floor incumbent probe (`objective <= floor`
 /// realize query). When the LP floor is tight (integral LP relaxation, e.g. the

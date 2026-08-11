@@ -174,6 +174,355 @@ fn test_evaluate_term_bool_uf_prefers_function_table_over_sat_literal() {
     assert_eq!(executor.evaluate_term(&model, p_u), EvalValue::Bool(true));
 }
 
+#[test]
+fn test_total_uf_table_overrides_stale_app_values_and_supplies_default() {
+    let mut executor = Executor::new();
+    let zero = executor.ctx.terms.mk_int(BigInt::zero());
+    let one = executor.ctx.terms.mk_int(BigInt::one());
+    let f_zero = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![zero], Sort::Int);
+    let f_one = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+    let plus_one = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("+"), vec![f_one, one], Sort::Int);
+
+    let mut model = empty_model();
+    let mut euf = EufModel::default();
+    // These are values from the pre-completion candidate M. The explicit
+    // total interpretation M' must override both sources.
+    euf.func_app_const_terms.insert(f_one, one);
+    euf.term_values.insert(f_one, "1".to_string());
+    model.euf_model = Some(euf);
+    let mut lia_values = HashMap::default();
+    lia_values.insert(f_one, BigInt::one());
+    model.lia_model = Some(LiaModel { values: lia_values });
+    // The first row is the certified exception. `f(1)` exercises the typed
+    // default; installation derives the printer table from these same values.
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            vec![(
+                vec![EvalValue::Rational(BigRational::zero())],
+                EvalValue::Rational(BigRational::one()),
+            )],
+            EvalValue::Rational(BigRational::zero()),
+        )
+        .expect("well-typed total table");
+
+    assert_eq!(
+        executor.evaluate_term(&model, f_zero),
+        EvalValue::Rational(BigRational::one())
+    );
+    assert_eq!(
+        executor.evaluate_term(&model, f_one),
+        EvalValue::Rational(BigRational::zero())
+    );
+    assert_eq!(
+        executor.evaluate_term(&model, plus_one),
+        EvalValue::Rational(BigRational::one())
+    );
+}
+
+#[test]
+fn test_raw_table_cleanup_preserves_certified_total_interpretation() {
+    let mut executor = Executor::new();
+    let zero = executor.ctx.terms.mk_int(BigInt::zero());
+    let one = executor.ctx.terms.mk_int(BigInt::one());
+    let f_zero = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![zero], Sort::Int);
+    let f_one = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![one], Sort::Int);
+
+    let mut model = empty_model();
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            vec![(
+                vec![EvalValue::Rational(BigRational::zero())],
+                EvalValue::Rational(BigRational::one()),
+            )],
+            EvalValue::Rational(BigRational::zero()),
+        )
+        .expect("well-typed total table");
+    assert!(model
+        .euf_model
+        .as_ref()
+        .is_some_and(|euf| euf.function_tables.contains_key("f")));
+
+    // DT post-certificate cleanup strips only the stale raw representation.
+    // The typed M' remains the sole evaluation and output authority.
+    model.remove_raw_uf_table_interpretation("f");
+
+    assert!(model.has_certified_total_uf("f"));
+    assert!(model
+        .euf_model
+        .as_ref()
+        .is_some_and(|euf| !euf.function_tables.contains_key("f")));
+    assert_eq!(
+        executor.evaluate_term(&model, f_zero),
+        EvalValue::Rational(BigRational::one())
+    );
+    assert_eq!(
+        executor.evaluate_term(&model, f_one),
+        EvalValue::Rational(BigRational::zero())
+    );
+}
+
+#[test]
+fn test_cegqi_model_epoch_is_affine_across_clone_and_table_replacement() {
+    let mut model = empty_model();
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            Vec::new(),
+            EvalValue::Rational(BigRational::zero()),
+        )
+        .expect("well-typed constant total table");
+    let epoch = model.seal_cegqi_uf_recompletion();
+
+    assert!(model.carries_cegqi_uf_recompletion(&epoch));
+    assert!(
+        !model.clone().carries_cegqi_uf_recompletion(&epoch),
+        "cloning model values must not duplicate an affine certificate identity"
+    );
+
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            Vec::new(),
+            EvalValue::Rational(BigRational::one()),
+        )
+        .expect("replacement table is independently well typed");
+    assert!(
+        !model.carries_cegqi_uf_recompletion(&epoch),
+        "changing a certified interpretation must revoke the theorem's model identity"
+    );
+}
+
+#[test]
+fn test_certified_total_uf_rejects_argument_value_of_wrong_kind() {
+    let mut executor = Executor::new();
+    let malformed_int = executor.ctx.terms.mk_app(
+        Symbol::named("malformed_int"),
+        Vec::<TermId>::new(),
+        Sort::Int,
+    );
+    let f_malformed = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![malformed_int], Sort::Int);
+
+    let mut model = empty_model();
+    let mut euf = EufModel::default();
+    // Deliberately malformed model evidence: an Int-sorted term resolves to an
+    // element token. The certified evaluator must not interpret that as an
+    // unlisted Int point and silently return its default.
+    euf.term_values
+        .insert(malformed_int, "opaque-element".to_string());
+    model.euf_model = Some(euf);
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            Vec::new(),
+            EvalValue::Rational(BigRational::from_integer(BigInt::from(9))),
+        )
+        .expect("well-typed certified total UF");
+
+    assert_eq!(
+        executor.evaluate_term(&model, f_malformed),
+        EvalValue::Unknown,
+        "wrong-kind model evidence must fail closed before default lookup"
+    );
+}
+
+#[test]
+fn test_certified_real_uf_accepts_exact_algebraic_argument() {
+    let mut executor = Executor::new();
+    let algebraic_arg = executor.ctx.terms.mk_var("a", Sort::Real);
+    let f_algebraic = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![algebraic_arg], Sort::Int);
+    let irrational = ay_nra::rcf_api::real_roots(&[
+        BigRational::from_integer(BigInt::from(-2)),
+        BigRational::zero(),
+        BigRational::one(),
+    ])
+    .expect("x^2 - 2 root isolation")
+    .into_iter()
+    .find_map(|root| match root {
+        ay_nra::RealScalar::Algebraic(value) => Some(value),
+        ay_nra::RealScalar::Rational(_) => None,
+    })
+    .expect("x^2 - 2 has irrational real roots");
+    executor
+        .nra_algebraic_model
+        .insert(algebraic_arg, irrational);
+
+    let mut model = empty_model();
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Real],
+            Sort::Int,
+            vec![(
+                vec![EvalValue::Rational(BigRational::zero())],
+                EvalValue::Rational(BigRational::one()),
+            )],
+            EvalValue::Rational(BigRational::from_integer(BigInt::from(9))),
+        )
+        .expect("well-typed certified Real UF");
+
+    assert!(matches!(
+        executor.evaluate_term(&model, algebraic_arg),
+        EvalValue::Algebraic(_)
+    ));
+    assert_eq!(
+        executor.evaluate_term(&model, f_algebraic),
+        EvalValue::Rational(BigRational::from_integer(BigInt::from(9))),
+        "an exact algebraic is a valid Real argument and differs from the rational exception"
+    );
+}
+
+#[test]
+fn test_certified_dt_uf_rejects_abstract_argument_and_rendered_key_collision() {
+    let mut executor = Executor::new();
+    let dt_sort = Sort::Uninterpreted("D".to_string());
+    let abstract_arg = executor.ctx.terms.mk_var("d", dt_sort.clone());
+    let score = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("score"), vec![abstract_arg], Sort::Int);
+
+    let mut model = empty_model();
+    let mut euf = EufModel::default();
+    euf.term_values.insert(abstract_arg, "@D!0".to_string());
+    model.euf_model = Some(euf);
+    model
+        .install_certified_total_dt_uf(
+            "score".to_string(),
+            vec![dt_sort.clone()],
+            Sort::Int,
+            Vec::new(),
+            Vec::new(),
+            EvalValue::Rational(BigRational::from_integer(BigInt::from(7))),
+        )
+        .expect("well-typed certified datatype UF");
+    assert_eq!(
+        executor.evaluate_term(&model, score),
+        EvalValue::Unknown,
+        "an unresolved abstract datatype element may denote an exception row"
+    );
+
+    let mut collision = empty_model();
+    assert!(
+        collision
+            .install_certified_total_dt_uf(
+                "score".to_string(),
+                vec![dt_sort],
+                Sort::Int,
+                vec![
+                    (
+                        vec![EvalValue::Element("(C 0)".to_string())],
+                        EvalValue::Rational(BigRational::from_integer(BigInt::from(1))),
+                    ),
+                    (
+                        vec![EvalValue::Element("(C 1)".to_string())],
+                        EvalValue::Rational(BigRational::from_integer(BigInt::from(2))),
+                    ),
+                ],
+                vec![vec!["(C 0)".to_string()], vec!["(C 0)".to_string()]],
+                EvalValue::Rational(BigRational::zero()),
+            )
+            .is_none(),
+        "two typed rows may not collapse to one printed constructor key"
+    );
+}
+
+#[test]
+fn test_total_uf_table_matches_negative_int_and_real_keys_semantically() {
+    let mut executor = Executor::new();
+    let minus_one_value = BigRational::from_integer(BigInt::from(-1));
+    let minus_one = executor.ctx.terms.mk_int(BigInt::from(-1));
+    let f_minus_one = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), vec![minus_one], Sort::Int);
+
+    let minus_half_value = BigRational::new(BigInt::from(-1), BigInt::from(2));
+    let minus_half = executor.ctx.terms.mk_rational(minus_half_value.clone());
+    let g_minus_half = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("g"), vec![minus_half], Sort::Real);
+    let three_halves = BigRational::new(BigInt::from(3), BigInt::from(2));
+
+    let mut model = empty_model();
+    model
+        .install_certified_total_uf(
+            "f".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+            vec![(
+                vec![EvalValue::Rational(minus_one_value)],
+                EvalValue::Rational(BigRational::from_integer(BigInt::from(7))),
+            )],
+            EvalValue::Rational(BigRational::zero()),
+        )
+        .expect("well-typed negative Int table");
+    model
+        .install_certified_total_uf(
+            "g".to_string(),
+            vec![Sort::Real],
+            Sort::Real,
+            vec![(
+                vec![EvalValue::Rational(minus_half_value)],
+                EvalValue::Rational(three_halves.clone()),
+            )],
+            EvalValue::Rational(BigRational::zero()),
+        )
+        .expect("well-typed negative Real table");
+
+    let euf = model.euf_model.as_ref().expect("rendered EUF tables");
+    assert_eq!(euf.function_tables["f"][0].0, vec!["(- 1)".to_string()]);
+    assert_eq!(
+        euf.function_tables["g"][0],
+        (
+            vec!["(- (/ 1.0 2.0))".to_string()],
+            "(/ 3.0 2.0)".to_string()
+        )
+    );
+
+    assert_eq!(
+        executor.evaluate_term(&model, f_minus_one),
+        EvalValue::Rational(BigRational::from_integer(BigInt::from(7)))
+    );
+    assert_eq!(
+        executor.evaluate_term(&model, g_minus_half),
+        EvalValue::Rational(three_halves)
+    );
+}
+
 /// Regression (#9007): EUF function-table placeholders for arithmetic
 /// arguments must not be resolved through arbitrary LIA/LRA model defaults.
 /// verification-consumer's persistent-array VC has a positive

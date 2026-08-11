@@ -39,6 +39,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
@@ -585,8 +586,8 @@ pub fn cmd_harvest(args: HarvestArgs) -> Result<usize> {
     }
     let root = crate::runner::repo_root_public();
     let requested_jobs = if args.jobs == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
+        thread::available_parallelism()
+            .map(NonZeroUsize::get)
             .unwrap_or(1)
     } else {
         args.jobs.max(1)
@@ -922,7 +923,7 @@ impl PipeCapture {
     /// retaining unlimited diagnostics lets a noisy solver OOM the harness.
     fn start<R>(mut reader: R) -> Self
     where
-        R: std::io::Read + Send + 'static,
+        R: Read + Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -1029,7 +1030,7 @@ fn run_solver(
     // the exact memory enforcement for every child.
     match kind {
         SolverKind::Z3 => {
-            args.push(format!("-T:{}", timeout_sec_u64));
+            args.push(format!("-T:{timeout_sec_u64}"));
         }
         SolverKind::Golem => {
             let logic = match read_smt_metadata(benchmark) {
@@ -1272,8 +1273,7 @@ pub(crate) fn read_expected_for_id(path: &Path, benchmark_id: &str) -> Result<Ex
     let path_label = expected_from_relative_id(benchmark_id)?;
     if header.is_some() && path_label.is_some() && header != path_label {
         return Err(BenchError::msg(format!(
-            "benchmark expected-status conflict between SMT-LIB header {:?} and corpus-relative path {:?}: {benchmark_id}",
-            header, path_label
+            "benchmark expected-status conflict between SMT-LIB header {header:?} and corpus-relative path {path_label:?}: {benchmark_id}",
         )));
     }
     let (value, source) = match (header, path_label) {
@@ -1402,7 +1402,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
     let mut token = Vec::<u8>::new();
     let mut token_oversized = false;
     let mut metadata = SmtMetadata::default();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -1942,8 +1942,7 @@ pub fn cmd_verify(args: VerifyArgs) -> Result<VerifyReport> {
         )));
     }
     validate_uniform_campaign(&selected)?;
-    let mut by_path: std::collections::BTreeMap<String, &BaselineRow> =
-        std::collections::BTreeMap::new();
+    let mut by_path: BTreeMap<String, &BaselineRow> = BTreeMap::new();
     for r in &selected {
         if r.benchmark_path.trim().is_empty()
             || !is_stable_sha256(&r.content_hash)

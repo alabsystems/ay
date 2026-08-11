@@ -204,7 +204,10 @@ impl<E: EngineId> FixedOrderSchedule<E> {
     /// Build a schedule from explicit `(engine, weight)` pairs.
     ///
     /// Weights are normalised to `1.0`. Negative weights are clamped to zero.
-    /// If all weights are zero the allocation falls back to equal share.
+    /// If all weights are zero the allocation falls back to equal share. The
+    /// full integer-nanosecond budget is conserved; any rounding remainder is
+    /// assigned to the final maximum-weight entry (or final entry in the
+    /// equal-share fallback).
     #[must_use]
     pub fn weighted(weights: Vec<(E, f64)>, total: Duration) -> Self {
         if weights.is_empty() {
@@ -216,15 +219,65 @@ impl<E: EngineId> FixedOrderSchedule<E> {
             .into_iter()
             .map(|(e, w)| (e, if w.is_finite() && w > 0.0 { w } else { 0.0 }))
             .collect();
-        let sum: f64 = clamped.iter().map(|(_, w)| w).sum();
-        if sum <= 0.0 || total.is_zero() {
-            let engines: Vec<E> = clamped.into_iter().map(|(e, _)| e).collect();
-            return Self::equal_share(engines, total);
+        let max_weight = clamped
+            .iter()
+            .map(|(_, weight)| *weight)
+            .fold(0.0_f64, f64::max);
+        let equal_share = max_weight <= 0.0;
+        // Scale before summing so several individually finite weights near
+        // `f64::MAX` cannot overflow the normalisation sum to infinity and
+        // silently give every engine a zero-duration budget.
+        let scaled_sum = if equal_share {
+            clamped.len() as f64
+        } else {
+            clamped.iter().map(|(_, weight)| weight / max_weight).sum()
+        };
+        // Apportion every other entry first and give the residual to a largest
+        // entry. This is more than a tie-break detail: if weights are
+        // `[1.0, 1e-17]`, `1.0 + 1e-17` rounds to `1.0`. Giving the first arm
+        // its independently rounded share would then consume all of a very
+        // large Duration even though the second arm is owed many nanoseconds.
+        // Reserving the residual for a maximum-weight arm prevents that loss.
+        let residual_index = if equal_share {
+            clamped.len() - 1
+        } else {
+            clamped
+                .iter()
+                .rposition(|(_, weight)| *weight == max_weight)
+                .unwrap_or(clamped.len() - 1)
+        };
+        let total_nanos =
+            u128::from(total.as_secs()) * 1_000_000_000 + u128::from(total.subsec_nanos());
+        let mut remaining_nanos = total_nanos;
+        let mut allocations = vec![0u128; clamped.len()];
+        for (index, (_, weight)) in clamped.iter().enumerate() {
+            if index == residual_index {
+                continue;
+            }
+            let share = if equal_share {
+                1.0 / scaled_sum
+            } else {
+                (*weight / max_weight) / scaled_sum
+            };
+            // Work in integer nanoseconds. `Duration::MAX.as_secs_f64()`
+            // rounds above the representable Duration range, so converting
+            // that float back with `from_secs_f64` panics even at share 1.
+            let requested = ((total_nanos as f64) * share).floor() as u128;
+            let allocated = requested.min(remaining_nanos);
+            allocations[index] = allocated;
+            remaining_nanos -= allocated;
         }
-        let total_secs = total.as_secs_f64();
+        allocations[residual_index] = remaining_nanos;
+
         let entries = clamped
             .into_iter()
-            .map(|(e, w)| (e, Duration::from_secs_f64(total_secs * (w / sum))))
+            .enumerate()
+            .map(|(index, (e, _))| {
+                let allocated = allocations[index];
+                let secs = (allocated / 1_000_000_000) as u64;
+                let nanos = (allocated % 1_000_000_000) as u32;
+                (e, Duration::new(secs, nanos))
+            })
             .collect();
         Self { entries }
     }
@@ -300,5 +353,59 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, Duration::from_secs(10));
         assert_eq!(entries[1].1, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn weighted_avoids_overflow_when_finite_weights_sum_to_infinity() {
+        let s = FixedOrderSchedule::weighted(
+            vec![(E::A, f64::MAX), (E::B, f64::MAX)],
+            Duration::from_secs(20),
+        );
+        assert_eq!(s.entries()[0].1, Duration::from_secs(10));
+        assert_eq!(s.entries()[1].1, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn weighted_accepts_duration_max_without_float_rounding_panic() {
+        let single = FixedOrderSchedule::weighted(vec![(E::A, 1.0)], Duration::MAX);
+        assert_eq!(single.entries()[0].1, Duration::MAX);
+
+        let split = FixedOrderSchedule::weighted(vec![(E::A, 1.0), (E::B, 1.0)], Duration::MAX);
+        let allocated = split.entries()[0]
+            .1
+            .checked_add(split.entries()[1].1)
+            .expect("allocation must not exceed Duration::MAX");
+        assert_eq!(allocated, Duration::MAX);
+    }
+
+    #[test]
+    fn weighted_assigns_rounding_remainder_to_final_maximum_weight_entry() {
+        let schedule = FixedOrderSchedule::weighted(
+            vec![(E::A, 1.0), (E::B, 1.0), (E::C, 1.0)],
+            Duration::from_nanos(10),
+        );
+        let entries = schedule.entries();
+        assert_eq!(entries[0].1, Duration::from_nanos(3));
+        assert_eq!(entries[1].1, Duration::from_nanos(3));
+        assert_eq!(entries[2].1, Duration::from_nanos(4));
+        assert_eq!(
+            entries.iter().map(|(_, budget)| *budget).sum::<Duration>(),
+            Duration::from_nanos(10)
+        );
+    }
+
+    #[test]
+    fn weighted_does_not_erase_a_small_but_material_duration_share() {
+        let schedule =
+            FixedOrderSchedule::weighted(vec![(E::A, 1.0), (E::B, 1e-17)], Duration::MAX);
+        let entries = schedule.entries();
+        assert!(
+            entries[1].1 >= Duration::from_secs(100),
+            "small positive weight was rounded away: {entries:?}"
+        );
+        assert_eq!(
+            entries.iter().map(|(_, budget)| *budget).sum::<Duration>(),
+            Duration::MAX
+        );
     }
 }

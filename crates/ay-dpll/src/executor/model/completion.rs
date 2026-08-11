@@ -34,10 +34,12 @@
 
 use ay_arrays::ArrayInterpretation;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::term::{Symbol, TermData};
+use ay_core::term::{Symbol, TermData, TermEntryStamp};
 use ay_core::time::Instant;
 use ay_core::{Sort, TermId};
 use ay_fp::FpModelValue;
+use ay_frontend::DeclarationKind;
+use ay_model_check::CheckedProjectionImplication;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
@@ -46,6 +48,76 @@ use std::time::Duration;
 use super::{string_witness, EvalValue, Model};
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
+
+/// Deterministic upper bound on graph, declaration, and commit work performed
+/// by checked-projection output completion.
+///
+/// Resource exhaustion is reported as [`CheckedProjectionOutputCompletion::Stopped`]
+/// and can never mint partial evidence. The semantic/source checker uses the
+/// same ten-million-term envelope, so this does not silently admit a larger
+/// post-check traversal than the proof-producing phase.
+const MAX_CHECKED_PROJECTION_COMPLETION_WORK: usize = 10_000_000;
+
+/// Maximum proof-neutral completion operations between external stop polls.
+const CHECKED_PROJECTION_COMPLETION_POLL_INTERVAL: usize = 64;
+
+/// Typed outcome of the output-only completion pass for a checked projection
+/// model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum CheckedProjectionOutputCompletion {
+    /// Every eligible declaration was considered and the installed projection
+    /// model remained byte-for-byte equivalent to the checked definitions.
+    Completed,
+    /// The caller requested cancellation or the deterministic work envelope was
+    /// exhausted. Any fill-only defaults already committed remain semantically
+    /// harmless, but the caller must fail closed and mint no SAT certificate.
+    Stopped,
+    /// The live query, declaration signatures, or installed model conflicted
+    /// with the checked projection evidence.
+    Conflict,
+}
+
+/// Cooperative stop and deterministic-work accounting for checked-projection
+/// completion. A callback poll occurs at every phase boundary and at least once
+/// every 64 units of graph/declaration/commit work.
+struct CheckedProjectionCompletionPoller<'a, F>
+where
+    F: FnMut() -> bool,
+{
+    should_stop: &'a mut F,
+    work: usize,
+    until_poll: usize,
+}
+
+impl<'a, F> CheckedProjectionCompletionPoller<'a, F>
+where
+    F: FnMut() -> bool,
+{
+    fn new(should_stop: &'a mut F) -> Self {
+        Self {
+            should_stop,
+            work: 0,
+            until_poll: CHECKED_PROJECTION_COMPLETION_POLL_INTERVAL,
+        }
+    }
+
+    fn boundary(&mut self) -> bool {
+        !(self.should_stop)()
+    }
+
+    fn step(&mut self) -> bool {
+        if self.work == MAX_CHECKED_PROJECTION_COMPLETION_WORK {
+            return false;
+        }
+        self.work += 1;
+        self.until_poll -= 1;
+        if self.until_poll == 0 {
+            self.until_poll = CHECKED_PROJECTION_COMPLETION_POLL_INTERVAL;
+            return !(self.should_stop)();
+        }
+        true
+    }
+}
 
 /// How [`Executor::complete_constrained_gaps`] chooses a candidate value for a
 /// constrained-but-unpinned gap variable. Strategies are tried in declaration
@@ -688,30 +760,31 @@ impl Executor {
                 .collect();
         }
 
-        let arrays = model.array_model.get_or_insert_with(Default::default);
-        for term in &tainted {
-            if arrays.read_conflicted.insert(*term) {
-                model_changed = true;
-            }
-        }
-
         let mut completed = 0usize;
         let mut ordered_candidates: Vec<_> = candidates.into_iter().collect();
         ordered_candidates.sort_by_key(|(term, _)| term.index());
-        for (term, candidate) in ordered_candidates {
-            if tainted.contains(&term) {
-                continue;
+        if !tainted.is_empty() || !ordered_candidates.is_empty() {
+            let arrays = model.array_model.get_or_insert_with(Default::default);
+            for term in &tainted {
+                if arrays.read_conflicted.insert(*term) {
+                    model_changed = true;
+                }
             }
-            if arrays
-                .array_values
-                .get(&term)
-                .is_some_and(|old| Self::same_array_interpretation(old, &candidate))
-            {
-                continue;
+            for (term, candidate) in ordered_candidates {
+                if tainted.contains(&term) {
+                    continue;
+                }
+                if arrays
+                    .array_values
+                    .get(&term)
+                    .is_some_and(|old| Self::same_array_interpretation(old, &candidate))
+                {
+                    continue;
+                }
+                arrays.array_values.insert(term, candidate);
+                completed += 1;
+                model_changed = true;
             }
-            arrays.array_values.insert(term, candidate);
-            completed += 1;
-            model_changed = true;
         }
 
         if model_changed {
@@ -1290,7 +1363,9 @@ impl Executor {
         // constants from quantifier/let binders, whose Var nodes must never be
         // completed as declarations.
         for (name, info) in self.ctx.symbol_iter() {
-            if !info.arg_sorts.is_empty() || self.is_dt_internal_symbol(name) {
+            if !info.arg_sorts.is_empty()
+                || self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
+            {
                 continue;
             }
             let Some(term) = info.term else {
@@ -2637,9 +2712,30 @@ impl Executor {
         var: TermId,
         value: &EvalValue,
     ) -> bool {
+        let well_sorted = match (terms.sort(var), value) {
+            (Sort::Bool, EvalValue::Bool(_)) => true,
+            (Sort::Int, EvalValue::Rational(r)) => r.is_integer(),
+            (Sort::Real, EvalValue::Rational(_)) => true,
+            (Sort::BitVec(w), EvalValue::BitVec { width, .. }) => *width == w.width,
+            (Sort::String, EvalValue::String(_))
+            | (Sort::Seq(_), EvalValue::Seq(_))
+            | (Sort::RegLan, EvalValue::Element(_))
+            | (Sort::Uninterpreted(_), EvalValue::Element(_)) => true,
+            (Sort::FloatingPoint(eb, sb), EvalValue::Fp(fp)) => fp.eb() == *eb && fp.sb() == *sb,
+            _ => false,
+        };
+        if !well_sorted {
+            return false;
+        }
+
         // Any model mutation invalidates the `evaluate_term` result memo so no
         // cached value outlives its model state (#eval-memo).
         super::eval_memo_clear();
+        // Every completed value is semantic model data. Even an interpretation
+        // proved irrelevant to one root window must be installed before that
+        // window's producer seals its theorem; no exact-model authority may
+        // survive an in-place write and be rebound generically afterward.
+        model.revoke_all_quantified_model_seals();
         match (terms.sort(var), value) {
             (Sort::Bool, EvalValue::Bool(b)) => {
                 model.bool_overrides.insert(var, *b);
@@ -2697,6 +2793,531 @@ impl Executor {
             }
             _ => false,
         }
+    }
+
+    /// Complete only declarations proved absent from one exact quantified
+    /// theorem's authored roots, before the producer seals that theorem model.
+    ///
+    /// This is the sole completion operation permitted on DT/MBQI/finite/
+    /// constant-interpretation/CEGQI theorem models.  The scan walks the term
+    /// store's generic child relation, so adding a new `TermData` form cannot
+    /// silently hide a constrained declaration here.  Source identity and the
+    /// birth stamp of every exact root are captured before planning and checked
+    /// again immediately before and after commit.  Every write uses the normal
+    /// semantic mutation primitive and therefore revokes any accidental old
+    /// seal; the certificate producer must seal only after this method returns.
+    #[must_use]
+    pub(in crate::executor) fn complete_quantified_output_model_before_seal(
+        &mut self,
+        model: &mut Model,
+        exact_roots: &[TermId],
+    ) -> bool {
+        // `model` is deliberately not installed in `self.last_model` yet. The
+        // ordinary evaluator memo is keyed by TermId, not model identity, so
+        // ambient entries from the predecessor model are not valid here.
+        // Isolate the complete planning/commit operation panic-safely for every
+        // certificate producer, rather than relying on each caller to remember
+        // an ad-hoc cache clear.
+        super::with_isolated_eval_memo(|| {
+            self.complete_quantified_output_model_before_seal_isolated(model, exact_roots)
+        })
+    }
+
+    fn complete_quantified_output_model_before_seal_isolated(
+        &mut self,
+        model: &mut Model,
+        exact_roots: &[TermId],
+    ) -> bool {
+        // Work on an unsealed semantic clone and publish it only after every
+        // source/root/binding/default check succeeds. A false return therefore
+        // leaves the caller's producer model byte-for-byte untouched.
+        let mut completed = model.clone();
+        let source_stamp = self.ctx.source_context_stamp();
+        let Some(root_entries) = exact_roots
+            .iter()
+            .map(|&root| self.ctx.terms.entry_stamp(root))
+            .collect::<Option<Vec<TermEntryStamp>>>()
+        else {
+            return false;
+        };
+        let roots_are_current = |executor: &Executor| {
+            executor.ctx.source_context_stamp() == source_stamp
+                && root_entries.iter().copied().map(Some).eq(exact_roots
+                    .iter()
+                    .map(|&root| executor.ctx.terms.entry_stamp(root)))
+        };
+        if !roots_are_current(self)
+            || completed
+                .euf_model
+                .as_ref()
+                .is_some_and(|euf| !euf.function_table_conflicts.is_empty())
+        {
+            return false;
+        }
+
+        // Record semantic occurrences with exact core identities. Triggers are
+        // intentionally not children of quantifiers in `TermStore::children`:
+        // they guide search but do not constrain the interpretation.
+        let mut seen = HashSet::default();
+        let mut occurring_constants = HashSet::default();
+        let mut occurring_functions = HashSet::default();
+        let mut stack = exact_roots.to_vec();
+        while let Some(term) = stack.pop() {
+            if self.ctx.terms.entry_stamp(term).is_none() {
+                return false;
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::Var(_, _) => {
+                    occurring_constants.insert(term);
+                }
+                TermData::App(symbol, arguments) if !arguments.is_empty() => {
+                    occurring_functions.insert(symbol.clone());
+                }
+                _ => {}
+            }
+            stack.extend(self.ctx.terms.children(term));
+        }
+
+        // Plan the complete extension while `model` is immutable. Only direct
+        // ordinary source declarations are eligible; aliases, overload
+        // implementation names, definitions, theory heads, and internals are
+        // conservatively omitted.
+        let substituted: HashSet<TermId> =
+            self.recorded_var_substitutions.keys().copied().collect();
+        let mut constant_defaults = Vec::new();
+        let mut function_defaults = Vec::new();
+        for (surface_name, info) in self.ctx.symbol_iter() {
+            let identity = self.ctx.symbol_identity_name(surface_name, info);
+            let symbol = Symbol::named(identity);
+            let is_ordinary_free_primary = info.declaration_kind()
+                == DeclarationKind::Uninterpreted
+                && info.internal_name.is_none()
+                && !self.ctx.is_internal_symbol(surface_name)
+                && !self.ctx.is_defined_fun(surface_name)
+                && self.ctx.adopted_macro_interp(surface_name).is_none();
+            if !is_ordinary_free_primary {
+                continue;
+            }
+            if info.arg_sorts.is_empty() {
+                let Some(term) = info.term else {
+                    return false;
+                };
+                if occurring_constants.contains(&term)
+                    || substituted.contains(&term)
+                    || !matches!(self.evaluate_term(&completed, term), EvalValue::Unknown)
+                {
+                    continue;
+                }
+                if let Some(default) = self.unconstrained_default_value(&info.sort) {
+                    constant_defaults.push((term, default));
+                }
+                continue;
+            }
+            if occurring_functions.contains(&symbol)
+                || completed.has_certified_const_interp_symbol(&symbol)
+                || completed.has_certified_total_uf(identity)
+            {
+                continue;
+            }
+            match completed.projection_ufs.projected_argument_for_signature(
+                &symbol,
+                &info.arg_sorts,
+                &info.sort,
+            ) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            if completed.euf_model.as_ref().is_some_and(|euf| {
+                euf.function_tables.contains_key(identity)
+                    || euf.function_table_terms.contains_key(identity)
+                    || euf.function_table_conflicts.contains(identity)
+            }) {
+                continue;
+            }
+            let Some(default) = self.unconstrained_default_value(&info.sort) else {
+                continue;
+            };
+            let request = ay_frontend::ProjectionBindingRequest {
+                symbol,
+                parameter_sorts: info.arg_sorts.clone(),
+                result_sort: info.sort.clone(),
+            };
+            let Ok(binding) = self.ctx.check_projection_declaration(&request) else {
+                return false;
+            };
+            function_defaults.push((binding, default));
+        }
+        constant_defaults.sort_by_key(|(term, _)| term.index());
+        constant_defaults.dedup_by_key(|(term, _)| *term);
+        function_defaults
+            .sort_by(|(left, _), (right, _)| left.symbol().name().cmp(right.symbol().name()));
+
+        if !roots_are_current(self) {
+            return false;
+        }
+        let functions_filled = function_defaults.len();
+        if completed
+            .install_formula_neutral_function_defaults(&self.ctx, function_defaults)
+            .is_none()
+        {
+            return false;
+        }
+        let mut constants_filled = 0usize;
+        for (term, default) in constant_defaults {
+            if !Self::insert_completed_value(&self.ctx.terms, &mut completed, term, &default) {
+                return false;
+            }
+            constants_filled += 1;
+        }
+        if !roots_are_current(self) {
+            return false;
+        }
+        *model = completed;
+        if constants_filled > 0 {
+            self.last_statistics.set_int(
+                "model_completion.quantified_formula_neutral_constants",
+                constants_filled as u64,
+            );
+        }
+        if functions_filled > 0 {
+            self.last_statistics.set_int(
+                "model_completion.quantified_formula_neutral_functions",
+                functions_filled as u64,
+            );
+        }
+        true
+    }
+
+    /// Complete output-only declarations on an already installed, independently
+    /// checked total-projection model.
+    ///
+    /// This is intentionally narrower than
+    /// [`Self::complete_unconstrained_constants_for_output`]. The ordinary SAT
+    /// path may derive constrained gaps, reconcile arrays, and invoke model
+    /// gates. None of those operations is part of the projection proof. Here the
+    /// only permitted mutations are:
+    ///
+    /// * a canonical value for a missing ordinary free constant. The checked
+    ///   implication is parametric in every free constant, so choosing one value
+    ///   preserves it; and
+    /// * an empty (canonical-else) table for an ordinary free function that is
+    ///   absent from every checked root. Such a declaration cannot affect the
+    ///   proved formula.
+    ///
+    /// Selected functions are never inserted into the finite EUF table. Their
+    /// exact symbolic projections are checked before planning, before commit,
+    /// and after commit. Signature ambiguity, stale roots, unexpected model
+    /// state, and future unknown term shapes all fail closed as
+    /// [`CheckedProjectionOutputCompletion::Conflict`]. Cancellation and the
+    /// deterministic work cap return `Stopped`; a caller must then discard the
+    /// provisional result rather than minting a SAT certificate.
+    #[must_use]
+    pub(in crate::executor) fn complete_checked_projection_model_for_output(
+        &mut self,
+        checked: &CheckedProjectionImplication,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> CheckedProjectionOutputCompletion {
+        let mut poller = CheckedProjectionCompletionPoller::new(&mut should_stop);
+        if !poller.boundary() {
+            return CheckedProjectionOutputCompletion::Stopped;
+        }
+
+        let Some(model) = self.last_model.as_ref() else {
+            return CheckedProjectionOutputCompletion::Conflict;
+        };
+        if checked.assertions() != self.ctx.assertions.as_slice()
+            || !checked.matches_snapshot(&self.ctx.terms, &self.ctx.assertions)
+            || !model.projection_ufs.matches_checked(checked)
+            || model
+                .euf_model
+                .as_ref()
+                .is_some_and(|euf| !euf.function_table_conflicts.is_empty())
+        {
+            return CheckedProjectionOutputCompletion::Conflict;
+        }
+        for definition in checked.definitions() {
+            if !poller.step() {
+                return CheckedProjectionOutputCompletion::Stopped;
+            }
+            let Symbol::Named(name) = definition.symbol() else {
+                return CheckedProjectionOutputCompletion::Conflict;
+            };
+            if model
+                .euf_model
+                .as_ref()
+                .is_some_and(|euf| euf.function_tables.contains_key(name))
+            {
+                return CheckedProjectionOutputCompletion::Conflict;
+            }
+        }
+
+        let occurring_functions = match self.collect_checked_projection_function_names(&mut poller)
+        {
+            Ok(names) => names,
+            Err(outcome) => return outcome,
+        };
+        if !poller.boundary() {
+            return CheckedProjectionOutputCompletion::Stopped;
+        }
+
+        // Plan every mutation while the installed model is immutable. A stop or
+        // declaration conflict during this phase therefore leaves it untouched.
+        let mut constant_defaults = Vec::new();
+        let mut function_defaults = Vec::new();
+        let mut matched_projections: HashSet<Symbol> = HashSet::default();
+        for (surface_name, info) in self.ctx.symbol_iter() {
+            if !poller.step() {
+                return CheckedProjectionOutputCompletion::Stopped;
+            }
+            let identity = self.ctx.symbol_identity_name(surface_name, info);
+            let symbol = Symbol::named(identity);
+            let is_ordinary_free_primary = info.declaration_kind()
+                == DeclarationKind::Uninterpreted
+                && info.internal_name.is_none()
+                && !self.ctx.is_internal_symbol(surface_name)
+                && !self.ctx.is_defined_fun(surface_name)
+                && self.ctx.adopted_macro_interp(surface_name).is_none();
+
+            match model.projection_ufs.projected_argument_for_signature(
+                &symbol,
+                &info.arg_sorts,
+                &info.sort,
+            ) {
+                Ok(Some(_)) => {
+                    // Source evidence admits only one ordinary primary free-UF
+                    // binding per checked core symbol. Recheck that positive
+                    // property here before any output-visible mutation.
+                    if !is_ordinary_free_primary || !matched_projections.insert(symbol) {
+                        return CheckedProjectionOutputCompletion::Conflict;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "checked-projection output completion found a signature conflict"
+                    );
+                    return CheckedProjectionOutputCompletion::Conflict;
+                }
+            }
+
+            // Completing aliases, overload implementation names, definitions,
+            // adopted macros, theory declarations, or solver internals would
+            // invent semantics not justified by the projection proof. Leave all
+            // such declarations to their owning component.
+            if !is_ordinary_free_primary {
+                continue;
+            }
+            if info.arg_sorts.is_empty() {
+                let Some(term) = info.term else {
+                    return CheckedProjectionOutputCompletion::Conflict;
+                };
+                if term.index() >= self.ctx.terms.len()
+                    || !matches!(self.ctx.terms.get(term), TermData::Var(..))
+                {
+                    return CheckedProjectionOutputCompletion::Conflict;
+                }
+                if !matches!(self.evaluate_term(model, term), EvalValue::Unknown) {
+                    continue;
+                }
+                if let Some(default) = self.unconstrained_default_value(&info.sort) {
+                    constant_defaults.push((term, default));
+                }
+            } else if !occurring_functions.contains(identity)
+                && !model
+                    .euf_model
+                    .as_ref()
+                    .is_some_and(|euf| euf.function_tables.contains_key(identity))
+            {
+                function_defaults.push(identity.to_string());
+            }
+        }
+        if matched_projections.len() != checked.definitions().len() {
+            return CheckedProjectionOutputCompletion::Conflict;
+        }
+
+        constant_defaults.sort_by_key(|(term, _)| term.index());
+        constant_defaults.dedup_by_key(|(term, _)| *term);
+        function_defaults.sort();
+        function_defaults.dedup();
+        if !poller.boundary() {
+            return CheckedProjectionOutputCompletion::Stopped;
+        }
+
+        // No public validation evidence may survive a mutation, even though
+        // each mutation below is proof-neutral for the checked implication.
+        if !constant_defaults.is_empty() || !function_defaults.is_empty() {
+            self.last_model_validated = false;
+        }
+        let mut constants_filled = 0usize;
+        for (term, default) in constant_defaults {
+            if !poller.step() {
+                return CheckedProjectionOutputCompletion::Stopped;
+            }
+            let Some(model) = self.last_model.as_mut() else {
+                return CheckedProjectionOutputCompletion::Conflict;
+            };
+            if !Self::insert_completed_value(&self.ctx.terms, model, term, &default) {
+                return CheckedProjectionOutputCompletion::Conflict;
+            }
+            constants_filled += 1;
+        }
+
+        let mut functions_filled = 0usize;
+        for name in function_defaults {
+            if !poller.step() {
+                return CheckedProjectionOutputCompletion::Stopped;
+            }
+            let Some(model) = self.last_model.as_mut() else {
+                return CheckedProjectionOutputCompletion::Conflict;
+            };
+            let euf_model = model.euf_model.get_or_insert_with(Default::default);
+            if !euf_model.function_tables.contains_key(&name) {
+                euf_model.function_tables.insert(name, Vec::new());
+                super::eval_memo_clear();
+                functions_filled += 1;
+            }
+        }
+
+        if !poller.boundary() {
+            return CheckedProjectionOutputCompletion::Stopped;
+        }
+        let Some(model) = self.last_model.as_ref() else {
+            return CheckedProjectionOutputCompletion::Conflict;
+        };
+        if !model.projection_ufs.matches_checked(checked)
+            || model
+                .euf_model
+                .as_ref()
+                .is_some_and(|euf| !euf.function_table_conflicts.is_empty())
+        {
+            return CheckedProjectionOutputCompletion::Conflict;
+        }
+        for definition in checked.definitions() {
+            if !poller.step() {
+                return CheckedProjectionOutputCompletion::Stopped;
+            }
+            let Symbol::Named(name) = definition.symbol() else {
+                return CheckedProjectionOutputCompletion::Conflict;
+            };
+            if model
+                .euf_model
+                .as_ref()
+                .is_some_and(|euf| euf.function_tables.contains_key(name))
+            {
+                return CheckedProjectionOutputCompletion::Conflict;
+            }
+        }
+        if !poller.boundary() {
+            return CheckedProjectionOutputCompletion::Stopped;
+        }
+
+        if constants_filled > 0 {
+            self.last_statistics.set_int(
+                "model_completion.checked_projection_constants",
+                constants_filled as u64,
+            );
+        }
+        if functions_filled > 0 {
+            self.last_statistics.set_int(
+                "model_completion.checked_projection_functions",
+                functions_filled as u64,
+            );
+        }
+        CheckedProjectionOutputCompletion::Completed
+    }
+
+    /// Bounded collection of every application head reachable from the exact
+    /// checked roots. Unknown future term variants fail closed: silently
+    /// skipping their children could misclassify a constrained function as
+    /// nonoccurring and install an unjustified default table.
+    fn collect_checked_projection_function_names<F>(
+        &self,
+        poller: &mut CheckedProjectionCompletionPoller<'_, F>,
+    ) -> Result<HashSet<String>, CheckedProjectionOutputCompletion>
+    where
+        F: FnMut() -> bool,
+    {
+        let terms = &self.ctx.terms;
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut names: HashSet<String> = HashSet::default();
+        let mut stack = Vec::new();
+        for &root in &self.ctx.assertions {
+            if !poller.step() {
+                return Err(CheckedProjectionOutputCompletion::Stopped);
+            }
+            stack.push(root);
+        }
+        while let Some(term) = stack.pop() {
+            if !poller.step() {
+                return Err(CheckedProjectionOutputCompletion::Stopped);
+            }
+            if term.index() >= terms.len() {
+                return Err(CheckedProjectionOutputCompletion::Conflict);
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+            let mut schedule = |child: TermId| {
+                if !poller.step() {
+                    return false;
+                }
+                stack.push(child);
+                true
+            };
+            match terms.get(term) {
+                TermData::Const(_) | TermData::Var(..) => {}
+                TermData::App(symbol, arguments) => {
+                    if !arguments.is_empty() {
+                        names.insert(symbol.name().to_string());
+                    }
+                    for &argument in arguments {
+                        if !schedule(argument) {
+                            return Err(CheckedProjectionOutputCompletion::Stopped);
+                        }
+                    }
+                }
+                TermData::Let(bindings, body) => {
+                    for &(_, value) in bindings {
+                        if !schedule(value) {
+                            return Err(CheckedProjectionOutputCompletion::Stopped);
+                        }
+                    }
+                    if !schedule(*body) {
+                        return Err(CheckedProjectionOutputCompletion::Stopped);
+                    }
+                }
+                TermData::Not(inner) => {
+                    if !schedule(*inner) {
+                        return Err(CheckedProjectionOutputCompletion::Stopped);
+                    }
+                }
+                TermData::Ite(condition, then_term, else_term) => {
+                    for child in [*condition, *then_term, *else_term] {
+                        if !schedule(child) {
+                            return Err(CheckedProjectionOutputCompletion::Stopped);
+                        }
+                    }
+                }
+                TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                    if !schedule(*body) {
+                        return Err(CheckedProjectionOutputCompletion::Stopped);
+                    }
+                    for &trigger in triggers.iter().flatten() {
+                        if !schedule(trigger) {
+                            return Err(CheckedProjectionOutputCompletion::Stopped);
+                        }
+                    }
+                }
+                _ => return Err(CheckedProjectionOutputCompletion::Conflict),
+            }
+        }
+        Ok(names)
     }
 
     /// Default every DECLARED constant that occurs in no assertion (and no
@@ -2805,7 +3426,7 @@ impl Executor {
             .filter(|(name, info)| {
                 info.arg_sorts.is_empty()
                     && info.term.is_some()
-                    && !self.is_dt_internal_symbol(name)
+                    && !self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
             })
             .filter_map(|(_, info)| info.term)
             .collect();
@@ -2845,13 +3466,11 @@ impl Executor {
         // Unlike the unconstrained defaults above, these variables occur in an
         // assertion/assumption or substitution definition. Candidate completion
         // can therefore change the validated formula's witness. Invalidate old
-        // evidence before the first candidate mutation; emit_sat_verdict will run
-        // canonical validation over assertions + assumption roots afterward.
-        if !gap_vars.is_empty() {
-            self.last_model_validated = false;
-        }
+        // evidence only when candidate completion actually mutates the model;
+        // merely discovering an unfillable gap is semantically inert.
         let filled_gaps = self.complete_constrained_gaps(&mut model, &gap_vars);
         if filled_gaps > 0 {
+            self.last_model_validated = false;
             self.last_statistics
                 .set_int("model_completion.constrained_gaps", filled_gaps as u64);
         }
@@ -2880,6 +3499,10 @@ impl Executor {
         }
         if arrays_changed {
             self.last_model_validated = false;
+        }
+        if filled_gaps > 0 || repaired_defaults > 0 || arrays_changed {
+            model.revoke_cegqi_uf_recompletion();
+            self.cegqi_uf_recompletion_grant = None;
         }
         self.last_model = Some(model);
     }
@@ -3010,6 +3633,8 @@ impl Executor {
         };
         let repaired = self.complete_opaque_array_default_disequalities(&mut model);
         if repaired > 0 {
+            model.revoke_cegqi_uf_recompletion();
+            self.cegqi_uf_recompletion_grant = None;
             self.last_model_validated = false;
             self.last_statistics
                 .set_int("model_completion.opaque_array_defaults", repaired as u64);
@@ -3116,8 +3741,10 @@ impl Executor {
     /// (`format_function_table` / `uf_unlisted_point_value` render it as
     /// `format_default_value(result_sort)`).
     ///
-    /// ORDERING — runs AFTER the strict + independent model-validation gates,
-    /// unlike the constant sweep which runs before them. The gates read
+    /// ORDERING — ordinary models run this AFTER the strict + independent
+    /// model-validation gates, unlike the constant sweep which runs before
+    /// them. Affine quantified-certificate models run it immediately before
+    /// their one final model seal. The gates read
     /// `model.euf_model.is_some()` as EUF verification evidence (`euf_backed`
     /// in the validation pipeline), so materializing an otherwise-absent
     /// `euf_model` before validation would WEAKEN those gates. Because an
@@ -3131,18 +3758,19 @@ impl Executor {
     /// MUST be called at the OUTER check-sat level only (same rationale as the
     /// constant sweep): inner theory dispatch swaps/lowers `ctx.assertions`, so
     /// "occurs in no assertion" is not evidence of unconstrainedness there.
+    #[must_use]
     pub(in crate::executor) fn complete_unconstrained_functions_for_output(
         &mut self,
         extra_roots: &[TermId],
-    ) {
+    ) -> bool {
         if !matches!(self.last_result, Some(SolveResult::Sat)) {
-            return;
+            return true;
         }
         let Some(mut model) = self.last_model.take() else {
             // Trivially-SAT (no theory model): the output paths build a fresh
             // `completed_default_model()`, which populates the same empty
             // function tables — nothing to complete here.
-            return;
+            return true;
         };
         let occurring = self.collect_occurring_function_names(extra_roots);
         // A problem-DEFINED symbol (define-fun/-rec) is NOT unconstrained: its
@@ -3151,16 +3779,44 @@ impl Executor {
         // head — without this filter the sweep fabricated an empty table for
         // it, which the printer rendered as a WRONG constant body (e.g.
         // `min/max = 0.0` on QF_LRA blending/12.smt2) (#mv-defined-fun-emit).
-        let mut names: Vec<String> = self
-            .ctx
-            .symbol_iter()
-            .filter(|(name, info)| {
-                !info.arg_sorts.is_empty()
-                    && !self.is_dt_internal_symbol(name)
-                    && !self.ctx.is_defined_fun(name)
-            })
-            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        let mut projection_conflict = None;
+        for (name, info) in self.ctx.symbol_iter() {
+            let identity = self.ctx.symbol_identity_name(name, info);
+            let symbol = Symbol::named(identity);
+            match model.projection_ufs.projected_argument_for_signature(
+                &symbol,
+                &info.arg_sorts,
+                &info.sort,
+            ) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => {
+                    projection_conflict = Some(error);
+                    break;
+                }
+            }
+            if model.has_certified_const_interp_symbol(&symbol) {
+                continue;
+            }
+            if !info.arg_sorts.is_empty()
+                && !self.is_exact_dt_internal_symbol(identity)
+                && !self.ctx.is_defined_fun(name)
+            {
+                names.push(identity.to_string());
+            }
+        }
+        if let Some(error) = projection_conflict {
+            tracing::error!(
+                %error,
+                "refusing unconstrained-function completion over a conflicting projection signature"
+            );
+            self.last_model = Some(model);
+            self.last_model_validated = false;
+            self.last_statistics
+                .set_int("model_validation.projection_signature_conflict", 1);
+            return false;
+        }
         names.sort();
         names.dedup();
 
@@ -3172,10 +3828,23 @@ impl Executor {
                 // over a real constraint.
                 continue;
             }
-            let euf_model = model.euf_model.get_or_insert_with(Default::default);
-            // Fill-only: an existing table (constrained function) is authoritative.
-            euf_model.function_tables.entry(name).or_default();
-            filled += 1;
+            let missing = model
+                .euf_model
+                .as_ref()
+                .is_none_or(|euf| !euf.function_tables.contains_key(&name));
+            if missing {
+                // This is semantic model data. Quantified theorem paths must
+                // have completed before sealing and never reach this ordinary
+                // post-gate sweep; revoke every identity defensively if a
+                // future caller violates that routing contract.
+                model.revoke_all_quantified_model_seals();
+                model
+                    .euf_model
+                    .get_or_insert_with(Default::default)
+                    .function_tables
+                    .insert(name, Vec::new());
+                filled += 1;
+            }
         }
         if filled > 0 {
             tracing::debug!(
@@ -3186,6 +3855,7 @@ impl Executor {
                 .set_int("model_completion.unconstrained_functions", filled as u64);
         }
         self.last_model = Some(model);
+        true
     }
 
     /// The set of function/UF names that appear as APPLICATION heads anywhere in
@@ -3769,7 +4439,7 @@ impl Executor {
             .filter(|(name, info)| {
                 info.arg_sorts.is_empty()
                     && info.term.is_some()
-                    && !self.is_dt_internal_symbol(name)
+                    && !self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
             })
             .filter_map(|(_, info)| info.term)
             .collect();
@@ -3807,7 +4477,7 @@ impl Executor {
             .symbol_iter()
             .filter(|(name, info)| {
                 !info.arg_sorts.is_empty()
-                    && !self.is_dt_internal_symbol(name)
+                    && !self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
                     && !self.ctx.is_defined_fun(name)
             })
             .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
@@ -4076,6 +4746,7 @@ mod equality_carrier_completion_tests {
     #[test]
     fn nested_sat_true_sequence_equality_gets_one_model_class_without_bv() {
         let mut exec = Executor::new();
+        exec.set_self_check(true);
         let seq_int = Sort::Seq(Box::new(Sort::Int));
         let x = declared_seq_var(&mut exec, "seq-class-x", seq_int.clone());
         let y = declared_seq_var(&mut exec, "seq-class-y", seq_int.clone());
@@ -4103,6 +4774,37 @@ mod equality_carrier_completion_tests {
                     .is_some_and(|v| v.starts_with("@ay-seq"))
             })
         }));
+    }
+
+    #[test]
+    fn default_completion_ignores_independent_gate_only_authored_roots() {
+        let mut exec = Executor::new();
+        let seq_int = Sort::Seq(Box::new(Sort::Int));
+        let x = declared_seq_var(&mut exec, "seq-gate-only-x", seq_int.clone());
+        let y = declared_seq_var(&mut exec, "seq-gate-only-y", seq_int.clone());
+        let z = declared_seq_var(&mut exec, "seq-gate-only-z", seq_int);
+        let equal = exec.ctx.terms.mk_eq(x, y);
+        let guard = exec.ctx.terms.mk_var("seq-gate-only-guard", Sort::Bool);
+        let nested = exec.ctx.terms.mk_or(vec![equal, guard]);
+        let distinct = exec.ctx.terms.mk_distinct(vec![x, z]);
+        exec.independent_gate_authored_assertions = Some(vec![nested, distinct]);
+        assert!(!exec.self_check(), "the regression exercises default mode");
+        assert!(exec.self_check_authored_assertions.is_none());
+        assert!(exec.ctx.assertions.is_empty());
+
+        let mut model = Model::empty();
+        model.sat_model = vec![true];
+        model.term_to_var.insert(equal, 0);
+
+        exec.complete_uninterpreted_sort_model(&mut model, &[]);
+
+        assert!(
+            [x, y, z]
+                .iter()
+                .all(|term| !model.completed_values.contains_key(term)),
+            "installing independent-gate roots must not make default model \
+             completion consume self-check-only carrier roots"
+        );
     }
 
     #[test]
@@ -4456,5 +5158,378 @@ mod uf_table_conflict_discard_tests {
 
         assert!(exec.last_model.is_none());
         assert!(!exec.uflia_congruence_gate_rejected);
+    }
+}
+
+#[cfg(test)]
+mod checked_projection_output_completion_tests {
+    use super::{CheckedProjectionOutputCompletion, EvalValue, Executor};
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use ay_frontend::parse;
+    use ay_model_check::{
+        check_projection_implication, CheckedProjectionImplication, ProjectionImplicationCandidate,
+        ProjectionUfCandidate,
+    };
+    use num_bigint::BigInt;
+    use num_traits::Zero;
+
+    fn installed_projection_fixture(
+        f_declaration: &str,
+    ) -> (Executor, CheckedProjectionImplication, ay_core::TermId) {
+        let input = format!(
+            r#"
+            (set-logic UFBV)
+            {f_declaration}
+            (declare-fun g ((_ BitVec 8)) (_ BitVec 8))
+            (declare-const c (_ BitVec 8))
+            "#
+        );
+        let commands = parse(&input).expect("valid projection declarations");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("declarations execute");
+
+        let constant = executor
+            .ctx
+            .symbol_iter()
+            .find(|(name, _)| name.as_str() == "c")
+            .and_then(|(_, info)| info.term)
+            .expect("declared constant term");
+        let bv8 = Sort::bitvec(8);
+        let x = executor.ctx.terms.mk_var("x", bv8.clone());
+        let y = executor.ctx.terms.mk_var("y", bv8.clone());
+        let premise = executor.ctx.terms.mk_eq(x, constant);
+        let application = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![y, x], bv8.clone());
+        let conclusion = executor.ctx.terms.mk_eq(application, constant);
+        let body = executor.ctx.terms.mk_implies(premise, conclusion);
+        let root = executor.ctx.terms.mk_forall(
+            vec![
+                ("x".to_string(), bv8.clone()),
+                ("y".to_string(), bv8.clone()),
+            ],
+            body,
+        );
+        executor.ctx.assertions = vec![root];
+        let candidate = ProjectionImplicationCandidate {
+            definitions: vec![ProjectionUfCandidate {
+                symbol: Symbol::named("f"),
+                parameter_sorts: vec![bv8.clone(), bv8.clone()],
+                result_sort: bv8,
+                projected_parameter: 1,
+            }],
+            conclusion,
+        };
+        let checked =
+            check_projection_implication(&executor.ctx.terms, &executor.ctx.assertions, &candidate)
+                .expect(
+                    "the second-argument projection proves the implication parametrically in c",
+                );
+        executor
+            .install_checked_projection_model(&checked, &[root])
+            .expect("test-only semantic model installation");
+        (executor, checked, constant)
+    }
+
+    #[test]
+    fn checked_completion_preserves_projection_and_adds_only_neutral_defaults() {
+        let (mut executor, checked, constant) = installed_projection_fixture(
+            "(declare-fun f ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))",
+        );
+
+        assert_eq!(
+            executor.complete_checked_projection_model_for_output(&checked, || false),
+            CheckedProjectionOutputCompletion::Completed
+        );
+
+        let model = executor
+            .last_model
+            .as_ref()
+            .expect("installed model remains");
+        assert!(model.projection_ufs.matches_checked(&checked));
+        assert_eq!(
+            executor.evaluate_term(model, constant),
+            EvalValue::BitVec {
+                value: BigInt::zero(),
+                width: 8,
+            },
+            "the free constant may take a canonical value because the proof is parametric"
+        );
+        let tables = &model
+            .euf_model
+            .as_ref()
+            .expect("the unused function receives a canonical table")
+            .function_tables;
+        assert!(tables.get("g").is_some_and(Vec::is_empty));
+        assert!(
+            !tables.contains_key("f"),
+            "the selected UF must remain an exact symbolic projection"
+        );
+    }
+
+    #[test]
+    fn checked_completion_stop_exposes_no_certificate_and_no_unplanned_mutation() {
+        let (mut executor, checked, _) = installed_projection_fixture(
+            "(declare-fun f ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))",
+        );
+        let mut polls = 0usize;
+
+        assert_eq!(
+            executor.complete_checked_projection_model_for_output(&checked, || {
+                polls += 1;
+                true
+            }),
+            CheckedProjectionOutputCompletion::Stopped
+        );
+        assert_eq!(polls, 1);
+        let model = executor
+            .last_model
+            .as_ref()
+            .expect("installed model remains");
+        assert!(model.projection_ufs.matches_checked(&checked));
+        assert!(model.completed_values.is_empty());
+        assert!(model.euf_model.is_none());
+    }
+
+    #[test]
+    fn checked_completion_rejects_live_projection_signature_conflict() {
+        // The semantic checker sees a BV projection, while the deliberately
+        // fault-injected frontend declaration with the same core spelling has a
+        // Bool signature. Production source evidence rejects this earlier; the
+        // output boundary must still fail closed independently.
+        let (mut executor, checked, _) =
+            installed_projection_fixture("(declare-fun f (Bool) Bool)");
+
+        assert_eq!(
+            executor.complete_checked_projection_model_for_output(&checked, || false),
+            CheckedProjectionOutputCompletion::Conflict
+        );
+        let model = executor
+            .last_model
+            .as_ref()
+            .expect("installed model remains");
+        assert!(model.projection_ufs.matches_checked(&checked));
+        assert!(model.completed_values.is_empty());
+        assert!(model.euf_model.is_none());
+    }
+}
+
+#[cfg(test)]
+mod quantified_output_completion_tests {
+    use super::{EvalValue, Executor, Model};
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use ay_frontend::parse;
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+
+    fn executor_with_absent_g() -> Executor {
+        let mut executor = Executor::new();
+        executor
+            .execute_all(
+                &parse(
+                    "(set-logic UFLIA)\n\
+                     (set-option :produce-models true)\n\
+                     (declare-fun g (Int) Int)\n\
+                     (assert true)",
+                )
+                .expect("valid quantified-output completion fixture"),
+            )
+            .expect("fixture executes");
+        executor
+    }
+
+    fn g_at_zero(executor: &mut Executor) -> ay_core::TermId {
+        let zero = executor.ctx.terms.mk_int(BigInt::from(0));
+        executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("g"), vec![zero], Sort::Int)
+    }
+
+    #[test]
+    fn quantified_preseal_completion_isolates_the_candidate_from_ambient_eval_memo() {
+        let mut executor = Executor::new();
+        executor
+            .execute_all(
+                &parse(
+                    "(set-logic LIA)\n\
+                     (assert true)",
+                )
+                .expect("valid memo-isolation fixture"),
+            )
+            .expect("fixture executes");
+        let roots = executor.ctx.assertions.clone();
+        // Use the low-level primary registrar so this fixture remains an
+        // eligible formula-neutral constant even if surface declarations are
+        // collision-mangled by the frontend's stable-identity layer.
+        let c = executor.ctx.terms.mk_var("c", Sort::Bool);
+        executor.ctx.register_symbol("c".to_string(), c, Sort::Bool);
+        let info = executor.ctx.symbol_info("c").expect("registered constant");
+        assert_eq!(
+            info.declaration_kind(),
+            ay_frontend::DeclarationKind::Uninterpreted
+        );
+        assert!(info.internal_name.is_none());
+        assert!(!executor.ctx.is_internal_symbol("c"));
+        assert_eq!(
+            executor.evaluate_term(&Model::empty(), c),
+            EvalValue::Unknown
+        );
+        let stale = EvalValue::Bool(true);
+        let canonical_default = EvalValue::Bool(false);
+
+        // Simulate an outer validation pass over a different predecessor model.
+        // Completion must neither read this value nor overwrite it with the
+        // candidate's value when its nested evaluation finishes.
+        let memo_session = crate::executor::model::EvalMemoSession::new();
+        crate::executor::model::seed_eval_memo_for_test(c, stale.clone());
+        assert_eq!(
+            crate::executor::model::with_isolated_eval_memo(|| {
+                executor.evaluate_term(&Model::empty(), c)
+            }),
+            EvalValue::Unknown,
+            "an isolated candidate evaluation must not read the outer memo"
+        );
+        let mut candidate = Model::empty();
+        assert!(executor.complete_quantified_output_model_before_seal(&mut candidate, &roots,));
+        assert_eq!(candidate.bool_overrides.get(&c), Some(&false));
+        assert_eq!(
+            executor.evaluate_term(&Model::empty(), c),
+            stale,
+            "the ambient predecessor memo must be restored byte-for-byte"
+        );
+
+        drop(memo_session);
+        assert_eq!(executor.evaluate_term(&candidate, c), canonical_default);
+    }
+
+    #[test]
+    fn quantified_authority_publication_clears_the_predecessor_eval_memo() {
+        #[derive(Clone, Copy)]
+        enum AuthorityLane {
+            Datatype,
+            Mbqi,
+        }
+
+        for lane in [AuthorityLane::Datatype, AuthorityLane::Mbqi] {
+            let mut executor = Executor::new();
+            executor
+                .execute_all(
+                    &parse("(set-logic ALL)\n(assert true)").expect("valid authority memo fixture"),
+                )
+                .expect("fixture executes");
+            let roots = executor.ctx.assertions.clone();
+            let c = executor.ctx.terms.mk_var("memo-c", Sort::Bool);
+            executor
+                .ctx
+                .register_symbol("memo-c".to_string(), c, Sort::Bool);
+            executor.last_model = Some(Model::empty());
+
+            let memo_session = crate::executor::model::EvalMemoSession::new();
+            crate::executor::model::seed_eval_memo_for_test(c, EvalValue::Bool(true));
+            assert_eq!(
+                executor
+                    .evaluate_term(executor.last_model.as_ref().expect("predecessor model"), c,),
+                EvalValue::Bool(true)
+            );
+
+            let admitted = match lane {
+                AuthorityLane::Datatype => {
+                    crate::executor::mbqi::CheckedDtSatAuthority::for_test(&mut executor, &roots)
+                        .is_some()
+                }
+                AuthorityLane::Mbqi => {
+                    crate::executor::mbqi::CheckedMbqiSatAuthority::for_test(&mut executor, &roots)
+                        .is_some()
+                }
+            };
+            assert!(admitted, "authority constructor must accept its fixture");
+            assert_eq!(
+                executor.evaluate_term(executor.last_model.as_ref().expect("completed model"), c,),
+                EvalValue::Bool(false),
+                "installing the completed model must invalidate predecessor memo entries"
+            );
+            drop(memo_session);
+        }
+    }
+
+    #[test]
+    fn quantified_preseal_function_default_is_not_euf_evidence_and_round_trips() {
+        let mut executor = executor_with_absent_g();
+        let roots = executor.ctx.assertions.clone();
+        let application = g_at_zero(&mut executor);
+        let mut model = Model::empty();
+
+        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &roots));
+        assert!(
+            model.euf_model.is_none(),
+            "output completion must not create EUF gate evidence"
+        );
+        assert_eq!(
+            executor.evaluate_term(&model, application),
+            EvalValue::Rational(BigRational::from_integer(BigInt::from(0)))
+        );
+        assert_eq!(model.formula_neutral_function_default_entries().len(), 1);
+
+        executor.last_model = Some(model);
+        let evidence =
+            crate::executor::mbqi::CheckedMbqiSatAuthority::for_test(&mut executor, &roots)
+                .expect("preseal completion retains a model-bound theorem");
+        assert!(executor.install_mbqi_sat_authority(evidence));
+        assert!(executor
+            .mbqi_sat_cert_query_grant
+            .as_ref()
+            .is_some_and(|grant| grant.is_current_for(&executor, &roots)));
+        executor.last_result = Some(crate::executor_types::SolveResult::Sat);
+        let printed = executor.model();
+        assert!(
+            printed.contains("(define-fun g ((x!0 Int)) Int\n    0)"),
+            "get-model must print the same canonical value returned by evaluation: {printed}"
+        );
+    }
+
+    #[test]
+    fn quantified_function_default_fails_closed_after_source_epoch_change() {
+        let mut executor = executor_with_absent_g();
+        let roots = executor.ctx.assertions.clone();
+        let application = g_at_zero(&mut executor);
+        let mut model = Model::empty();
+        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &roots));
+
+        executor
+            .execute(&ay_frontend::Command::Push(1))
+            .expect("scope mutation succeeds");
+        assert!(!model.formula_neutral_function_defaults_are_current(&executor.ctx));
+        assert_eq!(
+            executor.evaluate_term(&model, application),
+            EvalValue::Unknown
+        );
+    }
+
+    #[test]
+    fn replanning_with_function_in_exact_roots_clears_prior_default_package() {
+        let mut executor = executor_with_absent_g();
+        let initial_roots = executor.ctx.assertions.clone();
+        let application = g_at_zero(&mut executor);
+        let mut model = Model::empty();
+        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &initial_roots));
+        assert_eq!(model.formula_neutral_function_default_entries().len(), 1);
+
+        let zero = executor.ctx.terms.mk_int(BigInt::from(0));
+        let constrained_root = executor.ctx.terms.mk_eq(application, zero);
+        assert!(
+            executor.complete_quantified_output_model_before_seal(&mut model, &[constrained_root],)
+        );
+        assert!(model.formula_neutral_function_default_entries().is_empty());
+        assert!(model.euf_model.is_none());
+        assert_eq!(
+            executor.evaluate_term(&model, application),
+            EvalValue::Unknown
+        );
     }
 }

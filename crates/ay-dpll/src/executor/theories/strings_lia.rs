@@ -576,22 +576,9 @@ impl Executor {
                 values.insert(*v, val);
             }
 
-            self.last_model = Some(super::super::model::Model {
-                sat_model: Vec::new(),
-                term_to_var: HashMap::default(),
-                bool_overrides: HashMap::default(),
-                euf_model: None,
-                array_model: None,
-                lra_model: None,
-                lia_model: None,
-                bv_model: None,
-                fp_model: None,
-                string_model: Some(ay_strings::StringModel { values }),
-                seq_model: None,
-                completed_values: HashMap::default(),
-                dt_ground: HashMap::default(),
-                dt_pins: HashMap::default(),
-            });
+            let mut model = super::super::model::Model::empty();
+            model.string_model = Some(ay_strings::StringModel { values });
+            self.last_model = Some(model);
             self.last_result = Some(SolveResult::Sat);
             self.last_model_validated = false;
             match self.finalize_sat_model_validation() {
@@ -1212,22 +1199,7 @@ impl Executor {
             // (not skip_model_eval) so finalize_sat_model_validation is not
             // called and the postcondition in check_sat is satisfied (#8456).
             if non_trivial.is_empty() {
-                self.last_model = Some(super::super::model::Model {
-                    sat_model: Vec::new(),
-                    term_to_var: HashMap::default(),
-                    bool_overrides: HashMap::default(),
-                    euf_model: None,
-                    array_model: None,
-                    lra_model: None,
-                    lia_model: None,
-                    bv_model: None,
-                    fp_model: None,
-                    string_model: None,
-                    seq_model: None,
-                    completed_values: HashMap::default(),
-                    dt_ground: HashMap::default(),
-                    dt_pins: HashMap::default(),
-                });
+                self.last_model = Some(super::super::model::Model::empty());
                 self.last_model_validated = true;
                 return Ok(SolveResult::Sat);
             }
@@ -1639,10 +1611,10 @@ impl Executor {
                                             );
                                             if debug_auflia_enabled() {
                                                 safe_eprintln!(
-                                                "[SLIA] Pivot enum: candidate {} '{}' → SAT (model verified)",
-                                                i,
-                                                candidates[i]
-                                            );
+                                                    "[SLIA] Pivot enum: candidate {} '{}' → SAT (model verified)",
+                                                    i,
+                                                    candidates[i]
+                                                );
                                             }
                                             self.pivot_enum_depth -= 1;
                                             self.solve_deadline.set(saved_deadline);
@@ -1653,10 +1625,10 @@ impl Executor {
                                         // Unknown and try next candidate.
                                         if debug_auflia_enabled() {
                                             safe_eprintln!(
-                                            "[SLIA] Pivot enum: candidate {} '{}' → SAT but model violates length bounds",
-                                            i,
-                                            candidates[i]
-                                        );
+                                                "[SLIA] Pivot enum: candidate {} '{}' → SAT but model violates length bounds",
+                                                i,
+                                                candidates[i]
+                                            );
                                         }
                                         all_unsat = false;
                                     }
@@ -1673,10 +1645,10 @@ impl Executor {
                                         all_unsat = false;
                                         if debug_auflia_enabled() {
                                             safe_eprintln!(
-                                            "[SLIA] Pivot enum: candidate {} '{}' → Unknown/Error",
-                                            i,
-                                            candidates[i]
-                                        );
+                                                "[SLIA] Pivot enum: candidate {} '{}' → Unknown/Error",
+                                                i,
+                                                candidates[i]
+                                            );
                                         }
                                     }
                                 }

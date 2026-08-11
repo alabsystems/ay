@@ -31,6 +31,7 @@ fn exact_ay() -> ExactAy {
 
 /// Run ay on an SMT-LIB2 script. Returns (exit_code, stdout, stderr).
 fn run_ay(smtlib: &str, _ay: &ExactAy) -> (i32, String, String) {
+    let _ay_guard = common::ay_process_guard();
     let mut child = common::ay_command()
         .args(["-smt2", "-in"])
         .stdin(Stdio::piped())

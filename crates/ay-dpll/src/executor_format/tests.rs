@@ -167,35 +167,31 @@ fn format_model_atom_quotes_uninterpreted_values() {
 
 #[test]
 fn format_default_value_produces_smt_lib_defaults() {
-    assert_eq!(format_default_value(&Sort::Bool), "false");
-    assert_eq!(format_default_value(&Sort::Int), "0");
-    assert_eq!(format_default_value(&Sort::Real), "0.0");
-    assert_eq!(format_default_value(&Sort::String), "\"\"");
-    assert_eq!(format_default_value(&Sort::RegLan), "re.none");
+    let context = ay_frontend::Context::new();
+    let format = |sort: &Sort| format_default_value_surface(&context, sort);
+    assert_eq!(format(&Sort::Bool), "false");
+    assert_eq!(format(&Sort::Int), "0");
+    assert_eq!(format(&Sort::Real), "0.0");
+    assert_eq!(format(&Sort::String), "\"\"");
+    assert_eq!(format(&Sort::RegLan), "re.none");
     // width%4==0 uses hex (#1793)
-    assert_eq!(format_default_value(&Sort::bitvec(8)), "#x00");
-    assert_eq!(format_default_value(&Sort::bitvec(4)), "#x0");
-    assert_eq!(format_default_value(&Sort::bitvec(16)), "#x0000");
+    assert_eq!(format(&Sort::bitvec(8)), "#x00");
+    assert_eq!(format(&Sort::bitvec(4)), "#x0");
+    assert_eq!(format(&Sort::bitvec(16)), "#x0000");
     // width%4!=0 uses binary (#1793)
-    assert_eq!(format_default_value(&Sort::bitvec(1)), "#b0");
-    assert_eq!(format_default_value(&Sort::bitvec(7)), "#b0000000");
-    assert_eq!(
-        format_default_value(&Sort::FloatingPoint(8, 24)),
-        "(_ +zero 8 24)"
-    );
+    assert_eq!(format(&Sort::bitvec(1)), "#b0");
+    assert_eq!(format(&Sort::bitvec(7)), "#b0000000");
+    assert_eq!(format(&Sort::FloatingPoint(8, 24)), "(_ +zero 8 24)");
     // Abstract `@Sort!n` defaults are sort-ascribed so they validate as model
     // values (#mv-abstract-value-ascription).
+    assert_eq!(format(&Sort::Uninterpreted("U".to_string())), "(as @U!0 U)");
     assert_eq!(
-        format_default_value(&Sort::Uninterpreted("U".to_string())),
-        "(as @U!0 U)"
-    );
-    assert_eq!(
-        format_default_value(&Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]))),
+        format(&Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]))),
         "(as @List!0 List)"
     );
     // Nested array sort
     assert_eq!(
-        format_default_value(&Sort::array(Sort::Int, Sort::Bool)),
+        format(&Sort::array(Sort::Int, Sort::Bool)),
         "((as const (Array Int Bool)) false)"
     );
 }

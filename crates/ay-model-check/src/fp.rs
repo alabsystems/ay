@@ -181,7 +181,7 @@ pub type Fields = Fp;
 /// An FP datum's value on the extended reals: the domain the arithmetic rules
 /// below are stated over.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Ext {
+pub(crate) enum Ext {
     /// Not a number. Unordered with everything, itself included.
     Nan,
     /// `+oo` when `false`, `-oo` when `true`.
@@ -368,7 +368,7 @@ impl Fp {
     }
 
     /// The datum's exact value on the extended reals.
-    pub(crate) fn ext(self) -> Result<Ext, String> {
+    fn ext(self) -> Result<Ext, String> {
         if self.is_nan() {
             return Ok(Ext::Nan);
         }
@@ -396,6 +396,10 @@ impl Fp {
             .ok_or_else(|| "exponent out of range".to_string())?;
         let magnitude = scale_pow2(&BigRational::from_integer(m), e)?;
         Ok(Ext::Fin(if self.sign { -magnitude } else { magnitude }))
+    }
+
+    fn same_format(self, other: Self) -> bool {
+        self.eb == other.eb && self.sb == other.sb
     }
 
     /// The exact rational value, or `None` for NaN, the infinities, and any
@@ -704,6 +708,7 @@ pub fn predicate(name: &str, value: &ModelValue) -> Result<bool, String> {
 /// Kept as a named helper because both lineages' test suites unit-test this
 /// relation directly — it is the fact that makes `fp.geq` not the negation of
 /// `fp.lt`.
+#[cfg(test)]
 pub(crate) fn ext_cmp(a: &Ext, b: &Ext) -> Option<core::cmp::Ordering> {
     use core::cmp::Ordering;
     match (a, b) {
@@ -1567,7 +1572,7 @@ pub fn min_max_unspecified(name: &str, values: &[ModelValue]) -> bool {
     let (Ok(x), Ok(y)) = (Fp::from_value(a), Fp::from_value(b)) else {
         return false;
     };
-    x.is_zero() && y.is_zero() && x.sign != y.sign && (x.eb, x.sb) == (y.eb, y.sb)
+    x.is_zero() && y.is_zero() && x.sign != y.sign && x.same_format(y)
 }
 
 /// Whether `value` is a zero in the same format as `like`.
@@ -1576,7 +1581,7 @@ pub fn is_zero_of_format(value: &ModelValue, like: &ModelValue) -> bool {
     let (Ok(v), Ok(l)) = (Fp::from_value(value), Fp::from_value(like)) else {
         return false;
     };
-    v.is_zero() && (v.eb, v.sb) == (l.eb, l.sb)
+    v.is_zero() && v.same_format(l)
 }
 
 /// Whether `adopted` is an admissible `fp.min` / `fp.max` result for `operands`
@@ -1594,11 +1599,11 @@ pub fn check_min_max_choice(operands: &[ModelValue], adopted: &ModelValue) -> Re
     };
     let x = Fp::from_value(a)?;
     let y = Fp::from_value(b)?;
-    if !(x.is_zero() && y.is_zero() && x.sign != y.sign && (x.eb, x.sb) == (y.eb, y.sb)) {
+    if !(x.is_zero() && y.is_zero() && x.sign != y.sign && x.same_format(y)) {
         return Err("fp.min/fp.max is not underspecified on these operands".to_string());
     }
     let z = Fp::from_value(adopted)?;
-    if !(z.is_zero() && (z.eb, z.sb) == (x.eb, x.sb)) {
+    if !(z.is_zero() && z.same_format(x)) {
         return Err("fp.min/fp.max of +0 and -0 must be a zero of that format".to_string());
     }
     Ok(())

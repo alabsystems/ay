@@ -1282,10 +1282,20 @@ fn mark_written(generation: u64, seal: ArtifactSeal) {
     });
 }
 
+/// The provenance marker a consumer uses to prove this CNF came from the solver
+/// invocation it launched.
+///
+/// ⚑ Uses the ROOT pid, not `std::process::id()`. `ay_sys::govern::arm` re-execs
+/// this image under `taskpolicy` so the jetsam memlimit binds the real binary,
+/// so by the time the writer runs the live pid need NOT be the pid the caller
+/// spawned. Emitting the live pid made external-codegen's `c ay export pid <PID>`
+/// binding unsatisfiable: it compared against the pid it launched and saw a
+/// different number. `root_pid()` falls back to the live pid when nothing
+/// re-exec'd, which is precisely when they coincide.
 fn generation_marker(generation: u64) -> String {
     format!(
         "c ay export pid {} generation {generation}",
-        std::process::id()
+        ay_sys::govern::root_pid()
     )
 }
 

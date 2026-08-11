@@ -337,7 +337,7 @@ fn test_datatype_push_pop_scoping() {
     }
 
     // Verify Color is visible
-    assert_eq!(ctx.datatype_iter().count(), 1);
+    assert_eq!(ctx.live_datatype_iter().count(), 1);
     assert!(ctx.is_constructor("Red").is_some());
 
     // Push a scope and declare Option inside it
@@ -348,7 +348,7 @@ fn test_datatype_push_pop_scoping() {
     }
 
     // Both datatypes should be visible
-    assert_eq!(ctx.datatype_iter().count(), 2);
+    assert_eq!(ctx.live_datatype_iter().count(), 2);
     assert!(ctx.is_constructor("Red").is_some());
     assert!(ctx.is_constructor("None").is_some());
     assert!(ctx.is_constructor("Some").is_some());
@@ -356,11 +356,15 @@ fn test_datatype_push_pop_scoping() {
     // Pop the scope
     assert!(ctx.pop(), "pop should succeed after push");
 
-    // Only Color should remain, Option and its constructors should be gone
-    assert_eq!(ctx.datatype_iter().count(), 1);
+    // Only Color remains source-visible. Exact Option semantics stay sticky so
+    // a retained old TermId can still be solved soundly after this pop.
+    assert_eq!(ctx.live_datatype_iter().count(), 1);
+    assert_eq!(ctx.datatype_iter().count(), 2);
     assert!(ctx.is_constructor("Red").is_some());
-    assert!(ctx.is_constructor("None").is_none());
-    assert!(ctx.is_constructor("Some").is_none());
+    assert!(ctx.is_constructor("None").is_some());
+    assert!(ctx.is_constructor("Some").is_some());
+    assert!(!ctx.is_datatype_member_name("None"));
+    assert!(!ctx.is_datatype_member_name("Some"));
 
     // Verify symbols are also scoped (constructors, selectors, testers)
     assert!(ctx.symbols.contains_key("Red")); // Color constructor still exists
@@ -374,6 +378,453 @@ fn test_datatype_push_pop_scoping() {
     // Verify sort_defs are also scoped
     assert!(ctx.sort_defs.contains_key("Color")); // Color sort still exists
     assert!(!ctx.sort_defs.contains_key("Option")); // Option sort gone
+}
+
+#[test]
+fn popped_datatype_member_core_identities_are_never_reused() {
+    fn identity(ctx: &Context, surface: &str, args: &[Sort], result: &Sort) -> String {
+        let info = ctx
+            .symbol_info_with_signature(surface, args, result)
+            .unwrap_or_else(|| panic!("missing exact datatype member {surface}"));
+        ctx.symbol_identity_name(surface, info).to_string()
+    }
+
+    let declaration = "(declare-datatype ScopedDt ((ScopedC (scoped-field Int)) (ScopedOther)))";
+    let mut ctx = Context::new();
+    ctx.push();
+    for command in parse(declaration).expect("parse first datatype") {
+        ctx.process_command(&command)
+            .expect("declare first scoped datatype");
+    }
+    let old_carrier = ctx
+        .sort_definition("ScopedDt")
+        .expect("first datatype carrier")
+        .clone();
+    let old_ctor = identity(&ctx, "ScopedC", &[Sort::Int], &old_carrier);
+    let old_selector = identity(
+        &ctx,
+        "scoped-field",
+        std::slice::from_ref(&old_carrier),
+        &Sort::Int,
+    );
+    let old_tester = identity(
+        &ctx,
+        "is-ScopedC",
+        std::slice::from_ref(&old_carrier),
+        &Sort::Bool,
+    );
+    assert_eq!(old_ctor, "ScopedC");
+    assert_eq!(old_selector, "scoped-field");
+    assert_eq!(old_tester, "is-ScopedC");
+
+    assert!(ctx.pop(), "pop first datatype declaration");
+    assert_eq!(
+        ctx.surface_sort(&old_carrier),
+        Some(command::Sort::Simple("ScopedDt".to_string())),
+        "popped carrier keeps sticky source rendering while its terms survive"
+    );
+    for command in parse(declaration).expect("parse reincarnated datatype") {
+        ctx.process_command(&command)
+            .expect("declare reincarnated datatype");
+    }
+    let new_carrier = ctx
+        .sort_definition("ScopedDt")
+        .expect("reincarnated datatype carrier")
+        .clone();
+    let new_ctor = identity(&ctx, "ScopedC", &[Sort::Int], &new_carrier);
+    let new_selector = identity(
+        &ctx,
+        "scoped-field",
+        std::slice::from_ref(&new_carrier),
+        &Sort::Int,
+    );
+    let new_tester = identity(
+        &ctx,
+        "is-ScopedC",
+        std::slice::from_ref(&new_carrier),
+        &Sort::Bool,
+    );
+
+    assert_ne!(new_carrier, old_carrier);
+    assert_ne!(new_ctor, old_ctor);
+    assert_ne!(new_selector, old_selector);
+    assert_ne!(new_tester, old_tester);
+    assert_eq!(ctx.dt_surface_name(&new_ctor), Some("ScopedC"));
+    assert_eq!(ctx.dt_surface_name(&new_selector), Some("scoped-field"));
+    assert_eq!(ctx.dt_surface_name(&new_tester), Some("is-ScopedC"));
+    assert_eq!(ctx.output_symbol_name(&old_ctor), old_ctor);
+    assert_eq!(ctx.output_symbol_name(&new_ctor), new_ctor);
+    assert_eq!(
+        ctx.format_sort_surface(&old_carrier),
+        Some(ay_core::quote_symbol(match &old_carrier {
+            Sort::Uninterpreted(identity) => identity,
+            _ => unreachable!("datatype carrier must be nominal"),
+        }))
+    );
+    assert_eq!(
+        ctx.format_sort_surface(&new_carrier),
+        Some(ay_core::quote_symbol(match &new_carrier {
+            Sort::Uninterpreted(identity) => identity,
+            _ => unreachable!("datatype carrier must be nominal"),
+        }))
+    );
+    let Sort::Uninterpreted(new_carrier_name) = &new_carrier else {
+        panic!("datatype carrier must be nominal")
+    };
+    assert_eq!(
+        ctx.datatypes
+            .get(new_carrier_name)
+            .and_then(|constructors| constructors.first()),
+        Some(&new_ctor),
+        "datatype metadata must carry the fresh constructor identity"
+    );
+    assert_eq!(
+        ctx.constructor_selector_info(&new_ctor)
+            .and_then(|fields| fields.first())
+            .map(|(name, _)| name),
+        Some(&new_selector),
+        "selector metadata must carry the fresh selector identity"
+    );
+}
+
+#[test]
+fn popped_parametric_instance_member_core_identities_are_never_reused() {
+    let template = "(declare-datatypes ((ScopedBox 1)) \
+        ((par (T) ((scoped-box (scoped-unbox T))))))";
+    let preferred_instance = "ScopedBox!{Int}";
+    let mut ctx = Context::new();
+    ctx.push();
+    for command in parse(&format!(
+        "{template} (declare-const first-scoped-box (ScopedBox Int))"
+    ))
+    .expect("parse first parametric instance")
+    {
+        ctx.process_command(&command)
+            .expect("instantiate first parametric datatype");
+    }
+    let old_instance = ctx
+        .parametric_instance_sorts
+        .get(&(
+            ctx.parametric_datatype_ids["ScopedBox"].clone(),
+            vec![Sort::Int],
+        ))
+        .expect("first instance carrier")
+        .clone();
+    let old_ctor = ctx.datatypes[&old_instance][0].clone();
+    let old_selector = ctx.constructor_selector_info(&old_ctor).unwrap()[0]
+        .0
+        .clone();
+
+    assert!(ctx.pop(), "pop first parametric datatype");
+    for command in parse(&format!(
+        "{template} (declare-const second-scoped-box (ScopedBox Int))"
+    ))
+    .expect("parse reincarnated parametric instance")
+    {
+        ctx.process_command(&command)
+            .expect("instantiate reincarnated parametric datatype");
+    }
+    let new_instance = ctx
+        .parametric_instance_sorts
+        .get(&(
+            ctx.parametric_datatype_ids["ScopedBox"].clone(),
+            vec![Sort::Int],
+        ))
+        .expect("reincarnated instance carrier")
+        .clone();
+    let new_ctor = ctx.datatypes[&new_instance][0].clone();
+    let new_selector = ctx.constructor_selector_info(&new_ctor).unwrap()[0]
+        .0
+        .clone();
+
+    assert_ne!(new_instance, old_instance);
+    assert_ne!(new_ctor, old_ctor);
+    assert_ne!(new_selector, old_selector);
+    assert_eq!(ctx.dt_surface_name(&new_ctor), Some("scoped-box"));
+    assert_eq!(ctx.dt_surface_name(&new_selector), Some("scoped-unbox"));
+    assert_eq!(ctx.sort_surface_name(&new_instance), preferred_instance);
+    assert!(ctx.is_parametric_datatype_instance(&new_instance));
+    assert_eq!(
+        ctx.surface_sort(&Sort::Uninterpreted(new_instance.clone())),
+        Some(command::Sort::Parameterized(
+            "ScopedBox".to_string(),
+            vec![command::Sort::Simple("Int".to_string())]
+        ))
+    );
+    assert_eq!(
+        ctx.format_sort_surface(&Sort::Uninterpreted(old_instance.clone())),
+        Some(ay_core::quote_symbol(&old_instance))
+    );
+    assert_eq!(
+        ctx.format_sort_surface(&Sort::Uninterpreted(new_instance.clone())),
+        Some(ay_core::quote_symbol(&new_instance))
+    );
+}
+
+#[test]
+fn parametric_instance_lifetime_follows_its_template_not_first_use_scope() {
+    let mut ctx = Context::new();
+    for command in parse(
+        "(declare-datatypes ((StableBox 1)) \
+         ((par (T) ((stable-box (stable-unbox T))))))",
+    )
+    .expect("parse outer template")
+    {
+        ctx.process_command(&command)
+            .expect("declare outer template");
+    }
+    let template_id = ctx.parametric_datatype_ids["StableBox"].clone();
+
+    ctx.push();
+    for command in
+        parse("(declare-const inner-box (StableBox Int))").expect("parse first ground use")
+    {
+        ctx.process_command(&command)
+            .expect("instantiate inside nested scope");
+    }
+    let instance_key = (template_id, vec![Sort::Int]);
+    let first_carrier = ctx.parametric_instance_sorts[&instance_key].clone();
+    let first_constructor = ctx.datatypes[&first_carrier][0].clone();
+    let first_declaration = ctx
+        .exact_datatype_member_info(&first_constructor)
+        .expect("sticky constructor signature")
+        .declaration_id()
+        .clone();
+
+    assert!(ctx.pop(), "pop incidental first-use scope");
+    assert!(ctx.is_live_datatype_carrier(&first_carrier));
+    assert!(!ctx.symbols.contains_key("stable-box"));
+
+    for command in
+        parse("(declare-const outer-box (StableBox Int))").expect("parse repeated ground use")
+    {
+        ctx.process_command(&command)
+            .expect("reactivate exact cached instance");
+    }
+    let second_carrier = ctx.parametric_instance_sorts[&instance_key].clone();
+    assert_eq!(second_carrier, first_carrier);
+    let info = ctx
+        .symbol_info_with_signature(
+            "stable-box",
+            &[Sort::Int],
+            &Sort::Uninterpreted(second_carrier),
+        )
+        .expect("reactivated constructor binding");
+    assert_eq!(
+        ctx.symbol_identity_name("stable-box", info),
+        first_constructor
+    );
+    assert_eq!(info.declaration_id(), &first_declaration);
+}
+
+#[test]
+fn scoped_parametric_template_pop_removes_members_activated_as_global() {
+    let template = "(declare-datatypes ((OptionFlipBox 1)) \
+        ((par (T) ((option-flip-box (option-flip-unbox T))))))";
+    let mut ctx = Context::new();
+    for command in
+        parse("(declare-fun option-flip-box (Bool) Bool)").expect("parse unrelated overload")
+    {
+        ctx.process_command(&command)
+            .expect("declare unrelated overload before the template");
+    }
+    ctx.push();
+    for command in parse(template).expect("parse scoped template") {
+        ctx.process_command(&command)
+            .expect("declare scoped template while declarations are local");
+    }
+    for command in parse(
+        "(set-option :global-declarations true) \
+         (declare-const old-option-flip-box (OptionFlipBox Int)) \
+         (assert (= (option-flip-box 1) (option-flip-box 2)))",
+    )
+    .expect("parse option flip and lazy instance")
+    {
+        ctx.process_command(&command)
+            .expect("instantiate after enabling global declarations");
+    }
+    let old_template_id = ctx.parametric_datatype_ids["OptionFlipBox"].clone();
+    let old_carrier = ctx.parametric_instance_sorts[&(old_template_id, vec![Sort::Int])].clone();
+    let old_constructor = ctx.datatypes[&old_carrier][0].clone();
+    let old_assertion = ctx.assertions[0];
+
+    assert!(ctx.pop(), "pop scoped template");
+    assert!(!ctx.is_live_datatype_carrier(&old_carrier));
+    assert!(ctx
+        .symbol_info_with_signature("option-flip-box", &[Sort::Bool], &Sort::Bool)
+        .is_some());
+    assert!(ctx
+        .symbol_info_with_signature(
+            "option-flip-box",
+            &[Sort::Int],
+            &Sort::Uninterpreted(old_carrier.clone())
+        )
+        .is_none());
+    assert!(!ctx.symbols.contains_key("option-flip-unbox"));
+    assert!(!ctx.symbols.contains_key("is-option-flip-box"));
+    assert!(!ctx.is_datatype_member_name("option-flip-box"));
+    assert!(ctx.datatypes.contains_key(&old_carrier));
+    assert!(ctx.exact_datatype_member_info(&old_constructor).is_some());
+    assert_eq!(ctx.terms.sort(old_assertion), &Sort::Bool);
+
+    for command in parse(&format!(
+        "{template} (declare-const new-option-flip-box (OptionFlipBox Int))"
+    ))
+    .expect("parse reincarnated template")
+    {
+        ctx.process_command(&command)
+            .expect("redeclare template and instantiate fresh epoch");
+    }
+    let new_template_id = ctx.parametric_datatype_ids["OptionFlipBox"].clone();
+    let new_carrier = ctx.parametric_instance_sorts[&(new_template_id, vec![Sort::Int])].clone();
+    let new_constructor = ctx.datatypes[&new_carrier][0].clone();
+    assert_ne!(new_carrier, old_carrier);
+    assert_ne!(new_constructor, old_constructor);
+    assert!(ctx.is_live_datatype_carrier(&new_carrier));
+}
+
+#[test]
+fn full_reset_clears_sticky_datatype_semantics() {
+    let mut ctx = Context::new();
+    for command in parse(
+        "(declare-datatype ResetDt ((reset-ctor (reset-field Int)))) \
+         (reset)",
+    )
+    .expect("parse datatype and reset")
+    {
+        ctx.process_command(&command)
+            .expect("process datatype and full reset");
+    }
+
+    assert_eq!(ctx.datatype_iter().count(), 0);
+    assert_eq!(ctx.live_datatype_iter().count(), 0);
+    assert!(ctx.datatype_member_symbols.is_empty());
+    assert!(ctx.nominal_sort_surfaces.is_empty());
+    assert!(ctx.parametric_instance_args.is_empty());
+    assert!(ctx.parametric_instance_sorts.is_empty());
+}
+
+#[test]
+fn parametric_instance_identity_is_structural_not_display_mangled() {
+    let mut ctx = Context::new();
+    let script = r#"
+        (declare-sort |Array!{Int}!{Bool}| 0)
+        (declare-datatypes ((Box 1)) ((par (T) ((box (unbox T))))))
+        (declare-const atom-box (Box |Array!{Int}!{Bool}|))
+        (declare-const array-box (Box (Array Int Bool)))
+    "#;
+    for command in parse(script).expect("parse structurally colliding instances") {
+        ctx.process_command(&command)
+            .expect("structurally distinct instances must coexist");
+    }
+
+    let template_id = ctx.parametric_datatype_ids["Box"].clone();
+    let atom_sort = ctx
+        .sort_definition("Array!{Int}!{Bool}")
+        .expect("declared atom sort")
+        .clone();
+    let atom_instance = ctx
+        .parametric_instance_sorts
+        .get(&(template_id.clone(), vec![atom_sort]))
+        .expect("Box over the atom sort")
+        .clone();
+    let array_instance = ctx
+        .parametric_instance_sorts
+        .get(&(template_id, vec![Sort::array(Sort::Int, Sort::Bool)]))
+        .expect("Box over the Array sort")
+        .clone();
+
+    assert_ne!(atom_instance, array_instance);
+    assert_ne!(
+        ctx.datatypes[&atom_instance][0],
+        ctx.datatypes[&array_instance][0]
+    );
+    assert_eq!(
+        ctx.sort_surface_name(&atom_instance),
+        "Box!{Array!{Int}!{Bool}}"
+    );
+    assert_eq!(
+        ctx.sort_surface_name(&array_instance),
+        "Box!{Array!{Int}!{Bool}}"
+    );
+    assert_eq!(
+        ctx.surface_sort(&Sort::Uninterpreted(atom_instance)),
+        Some(command::Sort::Parameterized(
+            "Box".to_string(),
+            vec![command::Sort::Simple("Array!{Int}!{Bool}".to_string())]
+        ))
+    );
+    assert_eq!(
+        ctx.surface_sort(&Sort::seq(Sort::Uninterpreted(array_instance))),
+        Some(command::Sort::Parameterized(
+            "Seq".to_string(),
+            vec![command::Sort::Parameterized(
+                "Box".to_string(),
+                vec![command::Sort::Parameterized(
+                    "Array".to_string(),
+                    vec![
+                        command::Sort::Simple("Int".to_string()),
+                        command::Sort::Simple("Bool".to_string())
+                    ]
+                )]
+            )]
+        ))
+    );
+}
+
+#[test]
+fn parametric_instance_does_not_capture_a_sort_alias_named_like_its_mangle() {
+    let mut ctx = Context::new();
+    let script = r#"
+        (define-sort |Box!{Int}| () Int)
+        (declare-datatypes ((Box 1)) ((par (T) ((box (unbox T))))))
+        (declare-const boxed-int (Box Int))
+        (declare-const alias-int |Box!{Int}|)
+    "#;
+    for command in parse(script).expect("parse alias-collision fixture") {
+        ctx.process_command(&command)
+            .expect("parametric instance must not overwrite the live alias");
+    }
+
+    assert_eq!(ctx.sort_definition("Box!{Int}"), Some(&Sort::Int));
+    let template_id = ctx.parametric_datatype_ids["Box"].clone();
+    let instance = ctx
+        .parametric_instance_sorts
+        .get(&(template_id, vec![Sort::Int]))
+        .expect("Box Int instance carrier");
+    assert_ne!(instance, "Box!{Int}");
+    assert!(ctx.datatypes.contains_key(instance));
+    assert_eq!(
+        ctx.terms
+            .sort(ctx.symbols["alias-int"].term.expect("alias constant")),
+        &Sort::Int
+    );
+}
+
+#[test]
+fn failed_parametric_instance_registration_rolls_back_live_indices() {
+    let commands = parse(
+        "(declare-datatypes ((BrokenBox 1)) \
+         ((par (T) ((broken-box (broken-field (Unknown T))))))) \
+         (declare-const broken (BrokenBox Int))",
+    )
+    .expect("parse invalid parametric instance fixture");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("template registration is lazy");
+
+    assert!(ctx.process_command(&commands[1]).is_err());
+    assert!(ctx.parametric_instance_sorts.is_empty());
+    assert!(ctx.parametric_instance_args.is_empty());
+    assert!(ctx.datatypes.is_empty());
+    assert!(!ctx.symbols.contains_key("broken-box"));
+    assert!(!ctx.symbols.contains_key("broken-field"));
+    assert!(!ctx.symbols.contains_key("is-broken-box"));
+
+    assert!(ctx.process_command(&commands[1]).is_err());
+    assert!(ctx.parametric_instance_sorts.is_empty());
+    assert!(ctx.parametric_instance_args.is_empty());
+    assert!(ctx.datatypes.is_empty());
 }
 
 /// Test datatype_iter and is_constructor work with declare-datatypes (mutually recursive)
@@ -592,6 +1043,27 @@ fn test_datatype_member_forgery_rejected() {
             rejected,
             "forged member declaration must be rejected: {what} via `{decl}`"
         );
+    }
+}
+
+#[test]
+fn datatype_map_target_members_never_own_canonical_theory_identities() {
+    let commands = parse("(declare-datatype Op ((div (mod Int))))").unwrap();
+    let mut context = Context::new();
+    for command in &commands {
+        context.process_command(command).unwrap();
+    }
+
+    for (surface, kind) in [
+        ("div", DeclarationKind::DatatypeConstructor),
+        ("mod", DeclarationKind::DatatypeSelector),
+    ] {
+        let info = context.symbol_info(surface).expect("datatype member");
+        let core = context.symbol_identity_name(surface, info);
+        assert!(core.starts_with("__ay_overload_"));
+        assert_ne!(core, surface);
+        assert_eq!(info.declaration_kind(), kind);
+        assert!(context.symbol_info_by_identity(surface).is_none());
     }
 }
 

@@ -27,7 +27,8 @@ impl Cumulative {
         encoder: &IntegerEncoder,
     ) -> Option<Vec<Literal>> {
         // Sweep the profile to find the peak
-        let mut current_load: i64 = 0;
+        let mut current_load = 0i128;
+        let capacity = i128::from(self.capacity);
 
         // Reuse pre-allocated active-task flags
         self.ws_active_tasks.fill(false);
@@ -45,7 +46,7 @@ impl Cumulative {
             }
 
             // Check if current load exceeds capacity
-            if current_load > self.capacity {
+            if current_load > capacity {
                 return self.build_overload_explanation(trail, encoder, &self.ws_active_tasks);
             }
         }
@@ -119,35 +120,48 @@ impl Cumulative {
 
             let est_j = trail.lb(self.starts[j]);
             let lst_j = trail.ub(self.starts[j]);
+            let est_j_wide = i128::from(est_j);
+            let lst_j_wide = i128::from(lst_j);
 
             // Compute task j's own compulsory part for exclusion from profile
             let exclude_cp = self
                 .compulsory_part(j, trail)
-                .map(|(lst, ect)| (lst, ect, dem_j));
+                .map(|(lst, ect)| (lst, ect, i128::from(dem_j)));
 
             // Forward propagation: find earliest feasible start time
             let new_est = Self::find_earliest_start(
                 profile,
-                est_j,
-                lst_j,
-                dur_j,
-                dem_j,
-                self.capacity,
+                est_j_wide,
+                lst_j_wide,
+                i128::from(dur_j),
+                i128::from(dem_j),
+                i128::from(self.capacity),
                 exclude_cp,
             );
-            if new_est > est_j {
-                if new_est > lst_j {
-                    if let Some(conflict) =
-                        self.build_pruning_explanation(trail, encoder, j, est_j, new_est - 1, true)
-                    {
+            if new_est > est_j_wide {
+                if new_est > lst_j_wide {
+                    if let Some(conflict) = self.build_pruning_explanation(
+                        trail,
+                        encoder,
+                        j,
+                        est_j_wide,
+                        new_est - 1,
+                        true,
+                    ) {
                         return PropagationResult::Conflict(conflict);
                     }
                     return PropagationResult::NoChange;
                 }
+                let new_est = clamp_time_to_i64(new_est);
                 if let Some(conclusion) = encoder.lookup_ge(self.starts[j], new_est) {
-                    if let Some(reasons) =
-                        self.build_pruning_reasons(trail, encoder, j, est_j, new_est - 1, true)
-                    {
+                    if let Some(reasons) = self.build_pruning_reasons(
+                        trail,
+                        encoder,
+                        j,
+                        est_j_wide,
+                        i128::from(new_est) - 1,
+                        true,
+                    ) {
                         let explanation = Explanation::new(reasons);
                         clauses.push(explanation.into_clause(conclusion));
                     }
@@ -157,26 +171,37 @@ impl Cumulative {
             // Backward propagation: find latest feasible start time
             let new_lst = Self::find_latest_start(
                 profile,
-                est_j,
-                lst_j,
-                dur_j,
-                dem_j,
-                self.capacity,
+                est_j_wide,
+                lst_j_wide,
+                i128::from(dur_j),
+                i128::from(dem_j),
+                i128::from(self.capacity),
                 exclude_cp,
             );
-            if new_lst < lst_j {
-                if new_lst < est_j {
-                    if let Some(conflict) =
-                        self.build_pruning_explanation(trail, encoder, j, new_lst + 1, lst_j, false)
-                    {
+            if new_lst < lst_j_wide {
+                if new_lst < est_j_wide {
+                    if let Some(conflict) = self.build_pruning_explanation(
+                        trail,
+                        encoder,
+                        j,
+                        new_lst + 1,
+                        lst_j_wide,
+                        false,
+                    ) {
                         return PropagationResult::Conflict(conflict);
                     }
                     return PropagationResult::NoChange;
                 }
+                let new_lst = clamp_time_to_i64(new_lst);
                 if let Some(conclusion) = encoder.lookup_le(self.starts[j], new_lst) {
-                    if let Some(reasons) =
-                        self.build_pruning_reasons(trail, encoder, j, new_lst + 1, lst_j, false)
-                    {
+                    if let Some(reasons) = self.build_pruning_reasons(
+                        trail,
+                        encoder,
+                        j,
+                        i128::from(new_lst) + 1,
+                        lst_j_wide,
+                        false,
+                    ) {
                         let explanation = Explanation::new(reasons);
                         clauses.push(explanation.into_clause(conclusion));
                     }
@@ -196,13 +221,13 @@ impl Cumulative {
     /// where k = number of steps) instead of every integer time point (O(n·d)).
     fn find_earliest_start(
         profile: &ProfileStepFunction,
-        est_j: i64,
-        lst_j: i64,
-        dur_j: i64,
-        dem_j: i64,
-        capacity: i64,
-        exclude_cp: Option<(i64, i64, i64)>,
-    ) -> i64 {
+        est_j: i128,
+        lst_j: i128,
+        dur_j: i128,
+        dem_j: i128,
+        capacity: i128,
+        exclude_cp: Option<(i128, i128, i128)>,
+    ) -> i128 {
         let mut candidate = est_j;
 
         while candidate <= lst_j {
@@ -221,13 +246,13 @@ impl Cumulative {
     /// profile step function.
     fn find_latest_start(
         profile: &ProfileStepFunction,
-        est_j: i64,
-        lst_j: i64,
-        dur_j: i64,
-        dem_j: i64,
-        capacity: i64,
-        exclude_cp: Option<(i64, i64, i64)>,
-    ) -> i64 {
+        est_j: i128,
+        lst_j: i128,
+        dur_j: i128,
+        dem_j: i128,
+        capacity: i128,
+        exclude_cp: Option<(i128, i128, i128)>,
+    ) -> i128 {
         let mut candidate = lst_j;
 
         while candidate >= est_j {
@@ -254,8 +279,8 @@ impl Cumulative {
         trail: &IntegerTrail,
         encoder: &IntegerEncoder,
         j: usize,
-        from_t: i64,
-        to_t: i64,
+        from_t: i128,
+        to_t: i128,
         is_lower_bound: bool,
     ) -> Option<Vec<Literal>> {
         let mut reasons = Vec::new();
@@ -316,8 +341,8 @@ impl Cumulative {
         trail: &IntegerTrail,
         encoder: &IntegerEncoder,
         j: usize,
-        from_t: i64,
-        to_t: i64,
+        from_t: i128,
+        to_t: i128,
         is_lower_bound: bool,
     ) -> Option<Vec<Literal>> {
         let mut all_reasons =
@@ -336,4 +361,8 @@ impl Cumulative {
         let explanation = Explanation::new(all_reasons);
         Some(explanation.into_conflict_clause())
     }
+}
+
+fn clamp_time_to_i64(time: i128) -> i64 {
+    time.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }

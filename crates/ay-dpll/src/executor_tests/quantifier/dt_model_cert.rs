@@ -59,8 +59,8 @@ fn solve_in_subprocess_bounded(
 
 /// Extended isolated-child solve: additionally sets (`Some`) or removes
 /// (`None`) `AY_DT_CERT_BRIDGE_ROUTE` in the child, and returns
-/// `(result, child stderr)` so the W1 bridge-route shadow log lines
-/// (`[BRIDGE-ROUTE] would-claim/would-grant/decline`) can be pinned.
+/// `(result, child stderr)` so W1 claim and model-authority decline logs can be
+/// pinned.
 fn solve_in_subprocess_full(
     cert: Option<&str>,
     lazy_override: Option<Option<&str>>,
@@ -214,11 +214,12 @@ fn dt_cert_subprocess_worker() {
         None
     };
     let outputs = exec.execute_all(&commands).unwrap();
-    println!(
-        "{}{}",
-        SUBPROCESS_RESULT_PREFIX,
-        outputs.last().cloned().unwrap_or_default()
-    );
+    let result = outputs
+        .last()
+        .cloned()
+        .unwrap_or_default()
+        .replace('\n', "\\n");
+    println!("{}{}", SUBPROCESS_RESULT_PREFIX, result);
 }
 
 #[test]
@@ -352,6 +353,102 @@ fn dt_cert_grants_free_uf_no_observation() {
     assert_eq!(verdict, "sat");
 }
 
+#[test]
+fn dt_cert_materializes_f4_row_and_default_for_model_queries() {
+    // The certificate proves the completed interpretation M', not the incoming
+    // ground candidate M.  Both an observed exception and an unobserved point
+    // must therefore be readable from the published model after the SAT grant.
+    let value = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (declare-const self List)
+        (declare-fun logic_sum (List) Int)
+        (assert (forall ((x List)) (<= 0 (logic_sum x))))
+        (assert (is-Cons self))
+        (assert (= (hd self) 7))
+        (assert (= (tl self) Nil))
+        (assert (= (logic_sum self) 5))
+        (check-sat)
+        (eval (and
+            (= (logic_sum self) 5)
+            (= (logic_sum (Cons 7 Nil)) 5)
+            (= (logic_sum Nil) 0)
+            (= (logic_sum (Cons 8 Nil)) 0)))
+    "#,
+    );
+    assert_eq!(value, "true");
+}
+
+#[test]
+fn dt_cert_prints_parametric_f4_rows_with_surface_constructors() {
+    // Parametric datatype instances use mangled constructor identities in the
+    // core.  The typed lookup key must retain that identity, while get-model
+    // prints the original surface constructor term and the explicit default.
+    let model = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-logic ALL)
+        (declare-datatypes ((Lst 1)) ((par (T) ((nil) (cons (hd T) (tl (Lst T)))))))
+        (declare-const self (Lst Int))
+        (declare-fun score ((Lst Int)) Int)
+        (assert (forall ((x (Lst Int))) (<= 0 (score x))))
+        (assert ((_ is cons) self))
+        (assert (= (hd self) 7))
+        (assert (= (tl self) (as nil (Lst Int))))
+        (assert (= (score self) 5))
+        (check-sat)
+        (get-model)
+    "#,
+    );
+    assert!(
+        model.contains("define-fun score"),
+        "missing score model: {model}"
+    );
+    assert!(
+        model.contains("(cons 7 nil)"),
+        "row key leaked an internal constructor identity: {model}"
+    );
+    assert!(
+        model.contains(" 5 0)"),
+        "model did not preserve the exception and explicit default: {model}"
+    );
+}
+
+#[test]
+fn dt_cert_f4_model_retains_x_free_support_function() {
+    // `support(0)` is x-free but semantically participates in every F4 cell.
+    // The certificate replaces only `score`; post-grant cleanup must retain
+    // the raw interpretation of `support` that the cell proof consumed.
+    let model = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (declare-const self List)
+        (declare-fun score (List) Int)
+        (declare-fun support (Int) Int)
+        (assert (is-Cons self))
+        (assert (= (hd self) 7))
+        (assert (= (tl self) Nil))
+        (assert (= (score self) 5))
+        (assert (= (support 0) 3))
+        (assert (forall ((x List)) (>= (score x) (support 0))))
+        (check-sat)
+        (get-model)
+    "#,
+    );
+    assert!(
+        model.contains("define-fun score"),
+        "missing certified F4 interpretation: {model}"
+    );
+    assert!(
+        model.contains("define-fun support"),
+        "x-free support interpretation was stripped: {model}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The Int-binder control is UNTOUCHED (finite-table cert path, gate-agnostic).
 // ---------------------------------------------------------------------------
@@ -411,12 +508,51 @@ fn dt_cert_refuses_selector_on_binder() {
 }
 
 #[test]
+fn dt_cert_refuses_defined_f4_head() {
+    // A syntactically UF-shaped application is not free when its source
+    // declaration is a definition.  Re-completing `fixed` with default 1
+    // would turn this UNSAT universal into a false SAT certificate.
+    let verdict = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-option :timeout 2000)
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (define-fun fixed ((x List)) Int 0)
+        (assert (forall ((x List)) (= (fixed x) 1)))
+        (check-sat)
+    "#,
+    );
+    assert_ne!(verdict, "sat");
+}
+
+#[test]
+fn dt_cert_refuses_defined_f3_bridge_head() {
+    // The F3 spelling pattern does not authorize replacing a defined
+    // function by a selector.  `fixed_tail` is constantly Nil, so requiring it
+    // to equal every Cons tail is UNSAT (take a Cons whose tail is non-Nil).
+    let verdict = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-option :timeout 2000)
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (define-fun fixed_tail ((x List)) List Nil)
+        (assert (forall ((x List))
+            (or (= (fixed_tail x) (tl x)) (not (is-Cons x)))))
+        (check-sat)
+    "#,
+    );
+    assert_ne!(verdict, "sat");
+}
+
+#[test]
 fn dt_cert_refuses_all_or_nothing_unroutable() {
     // A grantable F4 forall plus a forall that matches NO route (a bridge UF read
     // at a NESTED selector argument `(tl y)` — not F2/F3/G/F4): all-or-nothing
     // means the cert must decline the whole snapshot. (M4: the pure-bridge shape
     // `(= (list_cons_1 y) (tl y)) ∨ ¬is-Cons y` is now the sanctioned F3 route —
-    // see `dt_cert_grants_f3_bridge_default` — so the discipline is exercised here
+    // see `dt_cert_withholds_unmaterialized_f3_bridge_default` — so the discipline is exercised here
     // with a genuinely unroutable forall instead.)
     let verdict = solve_with_mode_bounded(
         Some("on"),
@@ -437,9 +573,9 @@ fn dt_cert_refuses_all_or_nothing_unroutable() {
 }
 
 // ---------------------------------------------------------------------------
-// M4 routes: G (ground-reduction), F2 (selector tautology), F3 (bridge
-// symbolic default) — GRANTS (only under AY_DT_CERT=on, via the ground-core
-// re-sequencing probe).
+// M4 routes: G (ground-reduction), F2 (selector tautology), and F3 (bridge
+// symbolic default). F4/F2/G can grant with a materialized model; F3 is
+// withheld until its selector completion has an exact model representation.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -465,13 +601,14 @@ fn dt_cert_grants_f2_selector_tautology() {
 }
 
 #[test]
-fn dt_cert_grants_f3_bridge_default() {
-    // F3: `is-Cons x => list_cons_1(x) = tl(x)` closes via the SYMBOLIC selector
-    // default (list_cons_1 ≡ tl). The ground core forces the exception rows to
-    // agree with the selector; the default is the selector by construction.
+fn dt_cert_withholds_unmaterialized_f3_bridge_default() {
+    // F3 proves a symbolic selector completion (`list_cons_1` ≡ `tl`), but the
+    // published model has no sealed selector-lambda representation yet.  The
+    // certificate must therefore withhold SAT instead of publishing the raw M.
     let verdict = solve_with_mode(
         Some("on"),
         r#"
+        (set-option :timeout 2000)
         (set-logic ALL)
         (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
         (declare-const self List)
@@ -486,7 +623,7 @@ fn dt_cert_grants_f3_bridge_default() {
         (check-sat)
     "#,
     );
-    assert_eq!(verdict, "sat");
+    assert_ne!(verdict, "sat");
 }
 
 #[test]
@@ -537,6 +674,35 @@ fn dt_cert_grants_g_vacuous_when_not_cons() {
     assert_eq!(verdict, "sat");
 }
 
+#[test]
+fn dt_cert_g_model_retains_consequent_predicate() {
+    // Injectivity reduces the G forall to the single point `a = 0`, where the
+    // incoming model's `p(0)` row discharges the consequent.  That row remains
+    // part of the published model; it is not certificate-owned F4 state.
+    let model = solve_with_mode(
+        Some("on"),
+        r#"
+        (set-logic ALL)
+        (declare-datatypes ((D 0)) (((C (value Int)))))
+        (declare-const self D)
+        (declare-fun p (Int) Bool)
+        (assert (= self (C 0)))
+        (assert (p 0))
+        (assert (forall ((a Int)) (or (p a) (not (= self (C a))))))
+        (check-sat)
+        (get-model)
+    "#,
+    );
+    assert!(
+        model.contains("define-fun p"),
+        "G-consequent predicate interpretation was stripped: {model}"
+    );
+    assert!(
+        model.contains("true"),
+        "published p interpretation lost its certified point: {model}"
+    );
+}
+
 // The fullsort shape in miniature: F4 + F2 + F3 + two G foralls (one reading
 // the bridge, exercising the M' rewrite) over one Cons constant.
 const MIXED_ALL_ROUTES_INPUT: &str = r#"
@@ -561,15 +727,17 @@ const MIXED_ALL_ROUTES_INPUT: &str = r#"
     "#;
 
 #[test]
-fn dt_cert_grants_mixed_all_routes() {
-    let verdict = solve_with_mode(Some("on"), MIXED_ALL_ROUTES_INPUT);
-    assert_eq!(verdict, "sat");
+fn dt_cert_withholds_mixed_routes_with_unmaterialized_bridge() {
+    let input = format!("(set-option :timeout 2000)\n{MIXED_ALL_ROUTES_INPUT}");
+    let verdict = solve_with_mode(Some("on"), &input);
+    assert_ne!(verdict, "sat");
 }
 
 #[test]
-fn dt_cert_postsolve_grant_survives_emission_gates() {
-    let verdict = solve_with_postsolve_certificate(Some("on"), MIXED_ALL_ROUTES_INPUT);
-    assert_eq!(verdict, "sat");
+fn dt_cert_postsolve_withholds_unmaterialized_bridge() {
+    let input = format!("(set-option :timeout 2000)\n{MIXED_ALL_ROUTES_INPUT}");
+    let verdict = solve_with_postsolve_certificate(Some("on"), &input);
+    assert_ne!(verdict, "sat");
 }
 
 #[test]
@@ -580,8 +748,8 @@ fn dt_cert_mixed_all_routes_without_grant_fails_closed() {
 
 // ---------------------------------------------------------------------------
 // W1 bridge route (`AY_DT_CERT_BRIDGE_ROUTE`, SAT-side base-recheck campaign).
-// SHADOW-ONLY in this increment: would-claim / would-grant are logged, and any
-// grant that depends on a bridge claim is WITHHELD — never `sat`.
+// Structural claims are audited and logged, but every grant is withheld until
+// the selector-lambda completion can be represented exactly in the model.
 // ---------------------------------------------------------------------------
 
 /// Locked wrapper for the bridge-route pins: `AY_DT_CERT` = `cert`,
@@ -634,17 +802,38 @@ const BRIDGE_ROUTE_FREE_BRIDGE_INPUT: &str = r#"
     "#;
 
 #[test]
-fn dt_cert_bridge_route_grants_under_authoritative() {
-    // FLIP (faithfulness-gated): with `AY_DT_CERT_BRIDGE_ROUTE`=1 (authoritative)
-    // the route claims the W1 tautology via its premise pin, the certificate
-    // passes the EUF-extraction faithfulness guarantee (logic_sum(self)=2 committed
-    // == certified cell), and GRANTS — the verdict is `sat`.
-    let (verdict, stderr) =
-        solve_with_bridge_route(Some("on"), false, Some("1"), BRIDGE_ROUTE_INPUT);
-    assert_eq!(
-        verdict, "sat",
-        "authoritative bridge route must grant:\n{stderr}"
+fn dt_cert_bridge_route_refuses_defined_w1_head() {
+    // W1 and its F3 premise may nominate only an ordinary free source UF.  A
+    // defined function with the same application shape cannot be reinterpreted
+    // as `tl`, even when the experimental bridge route is authoritative.
+    let (verdict, stderr) = solve_with_bridge_route(
+        Some("on"),
+        false,
+        Some("1"),
+        r#"
+        (set-option :timeout 2000)
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (define-fun fixed_tail ((x List)) List Nil)
+        (assert (forall ((a Int) (b List)) (= b (fixed_tail (Cons a b)))))
+        (assert (forall ((x List))
+            (or (= (fixed_tail x) (tl x)) (not (is-Cons x)))))
+        (check-sat)
+    "#,
     );
+    assert_ne!(
+        verdict, "sat",
+        "defined W1/F3 head must never gain free-UF authority:\n{stderr}"
+    );
+}
+
+#[test]
+fn dt_cert_bridge_route_withholds_without_model_representation() {
+    // Even the formerly authoritative `=1` setting may not grant: the
+    // selector-completed bridge has no exact published-model representation.
+    let input = format!("(set-option :timeout 2000)\n{BRIDGE_ROUTE_INPUT}");
+    let (verdict, stderr) = solve_with_bridge_route(Some("on"), false, Some("1"), &input);
+    assert_ne!(verdict, "sat", "bridge route must withhold:\n{stderr}");
     assert!(
         stderr.contains("[BRIDGE-ROUTE] would-claim forall"),
         "missing would-claim log:\n{stderr}"
@@ -654,16 +843,16 @@ fn dt_cert_bridge_route_grants_under_authoritative() {
         "missing faithfulness-verified log:\n{stderr}"
     );
     assert!(
-        stderr.contains("[BRIDGE-ROUTE] grant (authoritative, faithfulness-verified)"),
-        "missing authoritative grant log:\n{stderr}"
+        stderr.contains("selector-bridge completion is not representable"),
+        "missing model-authority decline log:\n{stderr}"
     );
 }
 
 #[test]
 fn dt_cert_bridge_route_shadow_withholds() {
-    // `AY_DT_CERT_BRIDGE_ROUTE`=shadow: the route still classifies + logs a
-    // would-grant (faithfulness runs first and passes), but the grant is
-    // WITHHELD — the verdict stays byte-identical to the route being absent.
+    // `AY_DT_CERT_BRIDGE_ROUTE`=shadow: the route still classifies and runs
+    // faithfulness, but model-authority withholding keeps the verdict
+    // byte-identical to the route being absent.
     // Bound the deliberately hard fallback exactly like the flag-off twin
     // below; otherwise this one negative control serializes the full suite
     // behind `ENV_LOCK` for minutes after it has already exercised the route.
@@ -678,27 +867,27 @@ fn dt_cert_bridge_route_shadow_withholds() {
         "missing would-claim shadow log:\n{stderr}"
     );
     assert!(
-        stderr.contains("[BRIDGE-ROUTE] would-grant base (bridge route in shadow"),
-        "missing shadow would-grant log:\n{stderr}"
+        stderr.contains("selector-bridge completion is not representable"),
+        "missing shadow model-authority decline log:\n{stderr}"
     );
 }
 
 #[test]
 fn dt_cert_bridge_route_declines_free_bridge() {
     // NO selector-bridge pin: the W1 premise gate must DECLINE (a claim on a
-    // genuinely free bridge UF is the wrong-grant vector). Post-solve arm —
-    // the re-sequence probe's precheck already declines this shape; bypassing
-    // it pins the full-certificate gate itself.
-    let (verdict, stderr) =
-        solve_with_bridge_route(Some("on"), true, Some("1"), BRIDGE_ROUTE_FREE_BRIDGE_INPUT);
+    // genuinely free bridge UF is the wrong-grant vector). This integration
+    // check pins the public safety property (`sat` must never escape). The
+    // bounded normal solve is allowed to stop before reaching the optional
+    // post-solve certificate consult, so the exact premise-gate branch and its
+    // diagnostic are pinned deterministically by
+    // `mbqi::bridge_route_tests::premise_gate_declines_free_bridge` instead of
+    // making this test depend on host scheduling.
+    let input = format!("(set-option :timeout 2000)\n{BRIDGE_ROUTE_FREE_BRIDGE_INPUT}");
+    let (verdict, stderr) = solve_with_bridge_route(Some("on"), true, Some("1"), &input);
     assert_ne!(verdict, "sat");
     assert!(
         !stderr.contains("would-grant"),
         "free bridge must never reach would-grant:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("has no in-snapshot selector-bridge pin"),
-        "missing premise-gate decline:\n{stderr}"
     );
 }
 

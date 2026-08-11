@@ -943,6 +943,48 @@ fn ordinary_overloads_get_disjoint_core_identities_and_complete_iteration() {
 }
 
 #[test]
+fn user_declared_map_target_has_private_identity_from_builtin() {
+    fn find_head<'a>(ctx: &'a Context, root: TermId, wanted: &str) -> Option<&'a str> {
+        let mut stack = vec![root];
+        while let Some(term) = stack.pop() {
+            if let TermData::App(Symbol::Named(name), args) = ctx.terms.get(term) {
+                if ctx.dt_surface_name(name).unwrap_or(name) == wanted {
+                    return Some(name);
+                }
+                stack.extend(args);
+            } else {
+                stack.extend(ctx.terms.children(term));
+            }
+        }
+        None
+    }
+
+    let declared = parse(
+        "(declare-fun rem (Int Int) Int) \
+         (assert (forall ((x Int) (y Int)) (= (rem x y) 0)))",
+    )
+    .unwrap();
+    let mut declared_ctx = Context::new();
+    for command in &declared {
+        declared_ctx.process_command(command).unwrap();
+    }
+    let declared_head = find_head(&declared_ctx, declared_ctx.assertions[0], "rem")
+        .expect("declared rem occurrence");
+    assert!(declared_head.starts_with(INTERNAL_SYMBOL_PREFIX));
+    assert_ne!(declared_head, "rem");
+    assert_eq!(declared_ctx.dt_surface_name(declared_head), Some("rem"));
+
+    let builtin = parse("(assert (forall ((x Int) (y Int)) (= (rem x y) 0)))").unwrap();
+    let mut builtin_ctx = Context::new();
+    builtin_ctx.process_command(&builtin[0]).unwrap();
+    assert_eq!(
+        find_head(&builtin_ctx, builtin_ctx.assertions[0], "rem"),
+        Some("rem"),
+        "undeclared builtin syntax must retain the checker-recognized identity"
+    );
+}
+
+#[test]
 fn result_sort_overloads_selected_by_ascription_have_disjoint_identities() {
     let commands = parse(
         "(declare-fun f (Int) Int) (declare-fun f (Int) Bool) \
@@ -1370,9 +1412,17 @@ fn z3_500_basic_alias_declarations_shadow_builtins() {
             ctx.process_command(command)
                 .expect("declared alias must shadow the builtin");
         }
+        let info = ctx
+            .symbol_info(expected_name)
+            .expect("the surface declaration must remain live");
+        let private_identity = info
+            .internal_name
+            .as_deref()
+            .expect("a builtin-colliding declaration must use a private core identity");
+        assert_ne!(private_identity, expected_name);
         assert!(matches!(
             ctx.terms.get(ctx.assertions[0]),
-            TermData::App(Symbol::Named(name), _) if name == expected_name
+            TermData::App(Symbol::Named(name), _) if name == private_identity
         ));
     }
 }
@@ -2290,11 +2340,11 @@ fn test_is_reserved_op_name_classification() {
     }
     // The explicit exclusion table matches the helper, and no name is in both
     // tables.
-    for &(op, reason) in EXCLUDED_DECLARABLE_OP_NAMES {
+    for &(op, class) in EXCLUDED_DECLARABLE_OP_NAMES {
         assert!(is_excluded_declarable_op_name(op));
         assert!(
             !is_reserved_op_name(op),
-            "`{op}` ({reason}) is in BOTH the reserved and excluded tables"
+            "`{op}` ({class:?}) is in BOTH the reserved and excluded tables"
         );
     }
     assert!(!is_excluded_declarable_op_name("select"));
@@ -2629,6 +2679,62 @@ fn test_is_reserved_symbol() {
     assert!(!is_reserved_symbol("_ay_test"));
     assert!(!is_reserved_symbol("__z3_test"));
     assert!(!is_reserved_symbol("normal"));
+}
+
+#[test]
+fn canonical_theory_identity_includes_private_declaration_spellings() {
+    assert!(is_canonical_theory_operator_identity("fp.min"));
+    assert!(is_canonical_theory_operator_identity("div"));
+    assert!(is_canonical_theory_operator_identity("set.subset"));
+    assert!(!is_canonical_theory_operator_identity("const"));
+    assert!(!is_canonical_theory_operator_identity("map"));
+    assert!(!is_canonical_theory_operator_identity("ordinary_uf"));
+}
+
+#[test]
+fn excluded_declarable_rows_drive_exact_operator_classifiers() {
+    let mut represented_classes = [false; 5];
+
+    for &(operator, class) in EXCLUDED_DECLARABLE_OP_NAMES {
+        let (class_index, canonical_theory_identity, private_core_identity, declaration_activated) =
+            match class {
+                MapTarget => (0, true, true, false),
+                IndexedOnly => (1, false, false, false),
+                PatternBinder => (2, false, false, false),
+                DeclaredShadowed => (3, false, false, false),
+                DeclarationActivated => (4, true, false, true),
+            };
+        represented_classes[class_index] = true;
+
+        assert_eq!(
+            excluded_declarable_op_class(operator),
+            Some(class),
+            "row lookup drifted for `{operator}`"
+        );
+        assert!(is_excluded_declarable_op_name(operator));
+        assert_eq!(
+            is_canonical_theory_operator_identity(operator),
+            canonical_theory_identity,
+            "canonical-theory classification drifted for `{operator}` ({class:?})"
+        );
+        assert_eq!(
+            declaration_requires_private_core_identity(operator),
+            private_core_identity,
+            "private-identity classification drifted for `{operator}` ({class:?})"
+        );
+        assert_eq!(
+            is_declaration_activated_op_name(operator),
+            declaration_activated,
+            "declaration-activation classification drifted for `{operator}` ({class:?})"
+        );
+    }
+
+    assert!(
+        represented_classes
+            .into_iter()
+            .all(|represented| represented),
+        "every exclusion class must be exercised by at least one table row"
+    );
 }
 
 /// Regression test for #2992: undeclared functions in application position
@@ -3135,6 +3241,155 @@ fn reset_assertions_clears_named_formula_provenance() {
     );
 }
 
+#[test]
+fn internal_query_window_isolates_and_exactly_restores_query_local_state() {
+    let commands = parse(
+        "(declare-const p Bool) \
+         (push 1) \
+         (assert (! p :named keep)) \
+         (maximize (ite p 1 0)) \
+         (assert-soft p :weight 3 :id soft-keep)",
+    )
+    .expect("internal-window fixture parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("internal-window fixture elaborates");
+    }
+    ctx.set_retain_parsed_assertions(true);
+    let Command::Assert(parsed_probe) = &commands[2] else {
+        panic!("fixture command 2 must be an assertion");
+    };
+    ctx.polymorphic_assertions.push(PolymorphicAssertion {
+        term: parsed_probe.clone(),
+        parameters: vec!["T".to_string()],
+        persistent_definition: false,
+    });
+    ctx.materialized_polymorphic_assertions = 7;
+    ctx.polymorphic_instantiation_complete = false;
+
+    let source_before = ctx.source_context_stamp();
+    let assertions_before = ctx.assertions.clone();
+    let assertion_metadata_before = ctx.assertion_finite_set_metadata.clone();
+    let parsed_before = ctx.assertions_parsed.clone();
+    let objectives_before = ctx.objectives.clone();
+    let objective_metadata_before = ctx.objective_finite_set_metadata.clone();
+    let soft_before = ctx.soft_constraints.clone();
+    let soft_metadata_before = ctx.soft_finite_set_metadata.clone();
+    let named_before = ctx.named_terms.clone();
+    let polymorphic_before = format!("{:?}", ctx.polymorphic_assertions);
+    let authored_before = format!("{:?}", ctx.authored_assertions);
+    let scope_depth_before = ctx.scope_depth();
+
+    let probe_root = ctx.terms.false_term();
+    let window = ctx
+        .begin_internal_query_window(vec![probe_root])
+        .expect("live Boolean probe root is accepted");
+
+    assert_eq!(ctx.assertions, vec![probe_root]);
+    assert_eq!(
+        ctx.assertion_finite_set_metadata,
+        vec![PublicAssertionMetadata::default()]
+    );
+    assert!(ctx.assertions_parsed.is_empty());
+    assert!(!ctx.retain_parsed_assertions);
+    assert!(ctx.objectives.is_empty());
+    assert!(ctx.objective_finite_set_metadata.is_empty());
+    assert!(ctx.soft_constraints.is_empty());
+    assert!(ctx.soft_finite_set_metadata.is_empty());
+    assert!(ctx.named_terms.is_empty());
+    assert!(ctx.polymorphic_assertions.is_empty());
+    assert!(ctx.authored_assertions.is_empty());
+    assert_eq!(ctx.materialized_polymorphic_assertions, 0);
+    assert!(ctx.polymorphic_instantiation_complete);
+    assert_eq!(ctx.scope_depth(), scope_depth_before);
+    assert_eq!(ctx.source_context_stamp(), source_before);
+
+    // A same-Context solve is allowed to extend the term arena and to change
+    // the parsed-retention policy inside the temporary view.
+    let appended = ctx.terms.mk_var("probe-only", Sort::Bool);
+    assert!(ctx.terms.entry_stamp(appended).is_some());
+    ctx.set_retain_parsed_assertions(true);
+
+    assert!(
+        ctx.restore_internal_query_window(window),
+        "append-only growth preserves the enclosing query authority"
+    );
+    assert_eq!(ctx.source_context_stamp(), source_before);
+    assert_eq!(ctx.assertions, assertions_before);
+    assert_eq!(ctx.assertion_finite_set_metadata, assertion_metadata_before);
+    assert_eq!(ctx.assertions_parsed, parsed_before);
+    assert!(ctx.retain_parsed_assertions);
+    assert_eq!(ctx.objectives, objectives_before);
+    assert_eq!(ctx.objective_finite_set_metadata, objective_metadata_before);
+    assert_eq!(ctx.soft_constraints, soft_before);
+    assert_eq!(ctx.soft_finite_set_metadata, soft_metadata_before);
+    assert_eq!(ctx.named_terms, named_before);
+    assert_eq!(
+        format!("{:?}", ctx.polymorphic_assertions),
+        polymorphic_before
+    );
+    assert_eq!(format!("{:?}", ctx.authored_assertions), authored_before);
+    assert_eq!(ctx.materialized_polymorphic_assertions, 7);
+    assert!(!ctx.polymorphic_instantiation_complete);
+    assert_eq!(ctx.scope_depth(), scope_depth_before);
+}
+
+#[test]
+fn internal_query_window_validates_roots_before_mutation() {
+    let mut ctx = Context::new();
+    let original = ctx.terms.true_term();
+    ctx.assertions.push(original);
+    ctx.assertion_finite_set_metadata
+        .push(PublicAssertionMetadata::default());
+
+    let int_root = ctx.terms.mk_int(1.into());
+    assert!(ctx.begin_internal_query_window(vec![int_root]).is_err());
+    assert_eq!(ctx.assertions, vec![original]);
+
+    assert!(ctx
+        .begin_internal_query_window(vec![TermId(u32::MAX)])
+        .is_err());
+    assert_eq!(ctx.assertions, vec![original]);
+}
+
+#[test]
+fn internal_query_window_reports_source_or_term_rewrites_after_restoring_bytes() {
+    let mut rolled_back = Context::new();
+    let original = rolled_back.terms.true_term();
+    rolled_back.assertions.push(original);
+    rolled_back
+        .assertion_finite_set_metadata
+        .push(PublicAssertionMetadata::default());
+    let checkpoint = rolled_back.terms.rollback_checkpoint();
+    let window = rolled_back
+        .begin_internal_query_window(vec![original])
+        .expect("probe root is valid");
+    let _scratch = rolled_back.terms.mk_var("scratch", Sort::Bool);
+    rolled_back.terms.rollback_to(checkpoint);
+    assert!(
+        !rolled_back.restore_internal_query_window(window),
+        "rollback must retire every model/query capability minted in the window"
+    );
+    assert_eq!(rolled_back.assertions, vec![original]);
+
+    let mut source_changed = Context::new();
+    let original = source_changed.terms.true_term();
+    source_changed.assertions.push(original);
+    source_changed
+        .assertion_finite_set_metadata
+        .push(PublicAssertionMetadata::default());
+    let window = source_changed
+        .begin_internal_query_window(vec![original])
+        .expect("probe root is valid");
+    source_changed.set_logic("QF_UF".to_string());
+    assert!(
+        !source_changed.restore_internal_query_window(window),
+        "a source/declaration revision cannot authorize the enclosing query"
+    );
+    assert_eq!(source_changed.assertions, vec![original]);
+}
+
 /// `let` binds in PARALLEL (SMT-LIB 2.6 §3.6.1): a binding's value is
 /// elaborated in the environment as it stood BEFORE its own level, so siblings
 /// are not in scope for one another. `let*` must be written as nested `let`s.
@@ -3508,6 +3763,43 @@ fn test_declare_sort_does_not_outlive_its_pop() {
         matches!(err, Some(ElaborateError::UnknownSort(ref s)) if s == "S"),
         "a sort declared inside a push must not survive the pop, got: {err:?}"
     );
+}
+
+#[test]
+fn popped_uninterpreted_sort_identity_is_never_reused() {
+    let declaration = "(declare-sort ScopedCarrier 0) \
+                       (declare-const scoped-carrier-value ScopedCarrier)";
+    let mut ctx = Context::new();
+    ctx.push();
+    for command in parse(declaration).expect("parse first scoped sort") {
+        ctx.process_command(&command)
+            .expect("declare first scoped sort and constant");
+    }
+    let old_sort = ctx
+        .sort_definition("ScopedCarrier")
+        .expect("first carrier identity")
+        .clone();
+    let old_term = ctx.symbols["scoped-carrier-value"]
+        .term
+        .expect("first scoped constant term");
+
+    assert!(ctx.pop(), "pop first sort declaration");
+    for command in parse(declaration).expect("parse reincarnated sort") {
+        ctx.process_command(&command)
+            .expect("declare reincarnated sort and constant");
+    }
+    let new_sort = ctx
+        .sort_definition("ScopedCarrier")
+        .expect("reincarnated carrier identity")
+        .clone();
+    let new_term = ctx.symbols["scoped-carrier-value"]
+        .term
+        .expect("reincarnated scoped constant term");
+
+    assert_ne!(old_sort, new_sort);
+    assert_ne!(old_term, new_term);
+    assert_eq!(ctx.terms.sort(old_term), &old_sort);
+    assert_eq!(ctx.terms.sort(new_term), &new_sort);
 }
 
 #[test]

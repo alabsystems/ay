@@ -263,7 +263,7 @@ pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
         solver.assert_term(negated);
     }
 
-    let result = solver.check_sat();
+    let result = solver.check_sat_internal_query();
     if result.is_unsat() {
         BvStepVerdict::Valid
     } else if result.is_sat() {
@@ -358,7 +358,7 @@ pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> Bv
         solver.assert_term(translated);
     }
 
-    let result = solver.check_sat();
+    let result = solver.check_sat_internal_query();
     if result.is_unsat() {
         BvStepVerdict::Valid
     } else if result.is_sat() {

@@ -202,8 +202,7 @@ pub unsafe extern "C" fn Z3_update_param_value(
 ) {
     // Decode both strings outside the guard (raw-pointer derefs).
     // SAFETY: each pointer, when non-null, is a valid C string per the contract.
-    let key = unsafe { cstr_opt(param_id) };
-    let value = unsafe { cstr_opt(param_value) };
+    let (key, value) = unsafe { (cstr_opt(param_id), cstr_opt(param_value)) };
     // SAFETY: `ffi_guard_void` handles a null context and catches panics.
     unsafe {
         ffi_guard_void(c, |ctx| match (key, value) {
@@ -663,10 +662,14 @@ pub unsafe extern "C" fn Z3_params_to_string(c: Z3_context, p: Z3_params) -> Z3_
 pub unsafe extern "C" fn Z3_params_validate(c: Z3_context, p: Z3_params, d: Z3_param_descrs) {
     // Pre-extract keys and descriptor names outside the guard (raw derefs).
     // SAFETY: `p`/`d`, when non-null, are live handles; `as_ref` null-checks.
-    let keys =
-        unsafe { p.as_ref() }.map(|h| h.params.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
-    let names =
-        unsafe { d.as_ref() }.map(|h| h.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>());
+    let (keys, names) = unsafe {
+        (
+            p.as_ref()
+                .map(|h| h.params.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()),
+            d.as_ref()
+                .map(|h| h.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()),
+        )
+    };
     // SAFETY: `ffi_guard_void` handles a null context and catches panics.
     unsafe {
         ffi_guard_void(c, |ctx| {
@@ -890,6 +893,8 @@ pub unsafe extern "C" fn Z3_apply_result_to_string(c: Z3_context, r: Z3_apply_re
         h.subgoals
             .iter()
             .map(|&g| {
+                // SAFETY: every non-null subgoal handle is owned by the same
+                // context cache as `r`; `as_ref` handles a defensive null.
                 unsafe { g.as_ref() }
                     .map(|gh| gh.formulas.clone())
                     .unwrap_or_default()
@@ -1151,10 +1156,14 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
     }
     // Decode the header strings and collect the assertion handles outside the guard.
     // SAFETY: each string, when non-null, is a valid C string per the contract.
-    let name = unsafe { cstr_opt(name) }.unwrap_or_default();
-    let logic = unsafe { cstr_opt(logic) }.unwrap_or_default();
-    let status = unsafe { cstr_opt(status) }.unwrap_or_default();
-    let attributes = unsafe { cstr_opt(attributes) }.unwrap_or_default();
+    let (name, logic, status, attributes) = unsafe {
+        (
+            cstr_opt(name).unwrap_or_default(),
+            cstr_opt(logic).unwrap_or_default(),
+            cstr_opt(status).unwrap_or_default(),
+            cstr_opt(attributes).unwrap_or_default(),
+        )
+    };
 
     let mut all_asts: Vec<Z3_ast> = Vec::new();
     if num_assumptions > 0 && !assumptions.is_null() {

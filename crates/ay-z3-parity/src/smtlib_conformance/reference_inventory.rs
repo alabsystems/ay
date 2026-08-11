@@ -835,7 +835,12 @@ fn registry_logic_declarations(
     let actual_paths = snapshot
         .files
         .iter()
-        .filter(|file| file.path.starts_with("Logics/") && file.path.ends_with(".smt2"))
+        .filter(|file| {
+            file.path.starts_with("Logics/")
+                && Path::new(&file.path)
+                    .extension()
+                    .is_some_and(|extension| extension == "smt2")
+        })
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
     let expected_paths = SMTLIB_LOGICS
@@ -875,7 +880,12 @@ fn registry_theory_declarations(
     let actual_paths = snapshot
         .files
         .iter()
-        .filter(|file| file.path.starts_with("Theories/") && file.path.ends_with(".smt2"))
+        .filter(|file| {
+            file.path.starts_with("Theories/")
+                && Path::new(&file.path)
+                    .extension()
+                    .is_some_and(|extension| extension == "smt2")
+        })
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
     let expected_paths = SMTLIB_THEORIES
@@ -1199,6 +1209,7 @@ fn command_productions_from_source(source: &str) -> Result<Vec<(String, String)>
     Ok(alternatives)
 }
 
+#[cfg(test)]
 fn command_names_from_source(source: &str) -> Result<BTreeSet<String>, String> {
     Ok(command_productions_from_source(source)?
         .into_iter()

@@ -539,6 +539,7 @@ impl Model {
     /// Panics if the row or column is out of range, the column is not the
     /// highest-indexed column, the coefficient is non-finite or zero, or the
     /// append would violate the row's strict column ordering.
+    #[cfg(test)]
     pub(crate) fn append_row_coeff(&mut self, row: Row, col: Col, coefficient: f64) {
         assert!(
             row.index() < self.rows.len(),
@@ -663,6 +664,7 @@ impl Model {
     ///
     /// # Panics
     /// Panics if the coefficient is non-finite or the column is out of range.
+    #[cfg(test)]
     pub(crate) fn set_obj_coeff(&mut self, col: Col, coefficient: f64) {
         assert!(
             coefficient.is_finite(),

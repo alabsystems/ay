@@ -300,14 +300,29 @@ impl Solver {
         ctor: &str,
         args: &[Term],
     ) -> Result<Term, SolverError> {
-        let dt_sort = Sort::Uninterpreted(dt.name.clone());
-        let (ctor_term, ctor_sort, ctor_arg_sorts) = {
+        let dt_sort = self.lower_live_sort(&Sort::Datatype(dt.clone()));
+        let arg_ids: Vec<TermId> = args
+            .iter()
+            .map(|term| self.resolve_term("datatype_constructor", *term))
+            .collect::<Result<_, _>>()?;
+        let ctor_arg_sorts: Vec<Sort> = dt
+            .constructors
+            .iter()
+            .find(|candidate| candidate.name == ctor)
+            .ok_or_else(|| SolverError::InvalidArgument {
+                operation: "datatype_constructor",
+                message: format!("constructor '{ctor}' is not part of datatype '{}'", dt.name),
+            })?
+            .fields
+            .iter()
+            .map(|field| self.lower_live_sort(&field.sort))
+            .collect();
+        let (ctor_term, ctor_sort, ctor_identity) = {
             let ctx = self.executor.context();
 
-            if !ctx
-                .datatype_iter()
-                .any(|(name, _)| name == dt.name.as_str())
-            {
+            let is_live_datatype = matches!(&dt_sort, Sort::Uninterpreted(identity)
+                if ctx.is_live_datatype_carrier(identity));
+            if !is_live_datatype {
                 return Err(SolverError::InvalidArgument {
                     operation: "datatype_constructor",
                     message: format!(
@@ -317,18 +332,20 @@ impl Solver {
                 });
             }
 
-            let symbol_info = ctx.symbol_info(ctor).ok_or_else(|| SolverError::InvalidArgument {
-                operation: "datatype_constructor",
-                message: format!(
-                    "constructor '{}' not declared. Ensure datatype '{}' has been declared with declare_datatype",
-                    ctor, dt.name
-                ),
-            })?;
+            let symbol_info = ctx
+                .symbol_info_with_signature(ctor, &ctor_arg_sorts, &dt_sort)
+                .ok_or_else(|| SolverError::InvalidArgument {
+                    operation: "datatype_constructor",
+                    message: format!(
+                        "constructor '{}' not declared for datatype '{}'. Ensure the exact datatype has been declared with declare_datatype",
+                        ctor, dt.name
+                    ),
+                })?;
 
             (
                 symbol_info.term,
                 symbol_info.sort.clone(),
-                symbol_info.arg_sorts.clone(),
+                ctx.symbol_identity_name(ctor, symbol_info).to_string(),
             )
         };
 
@@ -354,8 +371,8 @@ impl Solver {
             });
         }
 
-        for (arg, expected_sort) in args.iter().zip(ctor_arg_sorts.iter()) {
-            let arg_sort = self.terms().sort(arg.0).clone();
+        for (arg, expected_sort) in arg_ids.iter().zip(ctor_arg_sorts.iter()) {
+            let arg_sort = self.terms().sort(*arg).clone();
             if &arg_sort != expected_sort {
                 return Err(SolverError::SortMismatch {
                     operation: "datatype_constructor",
@@ -367,17 +384,16 @@ impl Solver {
 
         if args.is_empty() {
             if let Some(term) = ctor_term {
-                Ok(Term(term))
+                Ok(self.wrap_term(term))
             } else {
-                Ok(Term(self.terms_mut().mk_var(ctor, dt_sort)))
+                let term = self.terms_mut().mk_var(&ctor_identity, dt_sort);
+                Ok(self.wrap_term(term))
             }
         } else {
-            let arg_ids: Vec<_> = args.iter().map(|t| t.0).collect();
-            Ok(Term(self.terms_mut().mk_app(
-                Symbol::Named(ctor.to_string()),
-                arg_ids,
-                dt_sort,
-            )))
+            let term = self
+                .terms_mut()
+                .mk_app(Symbol::Named(ctor_identity), arg_ids, dt_sort);
+            Ok(self.wrap_term(term))
         }
     }
 
@@ -396,10 +412,15 @@ impl Solver {
     #[must_use]
     pub fn is_nullary_constructor(&self, name: &str) -> bool {
         let ctx = self.executor.context();
-        ctx.is_constructor(name).is_some()
-            && ctx
-                .constructor_selectors(name)
-                .is_none_or(|sels| sels.is_empty())
+        ctx.symbols_iter()
+            .filter(|(surface, _)| surface.as_str() == name)
+            .any(|(surface, info)| {
+                let identity = ctx.symbol_identity_name(surface, info);
+                ctx.is_constructor(identity).is_some()
+                    && ctx
+                        .constructor_selectors(identity)
+                        .is_none_or(|sels| sels.is_empty())
+            })
     }
 
     /// Try to build a datatype selector (field access) term.
@@ -422,14 +443,56 @@ impl Solver {
         expr: Term,
         result_sort: Sort,
     ) -> Result<Term, SolverError> {
-        let symbol_info = self.executor.context().symbol_info(selector).ok_or_else(|| {
-            SolverError::InvalidArgument {
-                operation: "datatype_selector",
-                message: format!(
-                    "selector '{selector}' not declared. Ensure the datatype has been declared with declare_datatype"
-                ),
-            }
-        })?;
+        let expected_sort = self.lower_live_sort(&result_sort);
+        let expr = self.resolve_term("datatype_selector", expr)?;
+        let expr_sort = self.terms().sort(expr).clone();
+        let (symbol_info, selector_identity) = {
+            let ctx = self.executor.context();
+            let info = if let Some(info) = ctx.symbol_info_with_signature(
+                selector,
+                std::slice::from_ref(&expr_sort),
+                &expected_sort,
+            ) {
+                info
+            } else {
+                let candidates: Vec<_> = ctx
+                    .symbols_iter()
+                    .filter(|(surface, info)| {
+                        surface.as_str() == selector
+                            && info.declaration_kind()
+                                == ay_frontend::DeclarationKind::DatatypeSelector
+                    })
+                    .map(|(_, info)| info)
+                    .collect();
+                if candidates
+                    .iter()
+                    .any(|info| info.arg_sorts == std::slice::from_ref(&expr_sort))
+                {
+                    return Err(SolverError::SortMismatch {
+                        operation: "datatype_selector",
+                        expected: "result_sort matching selector's return sort",
+                        got: vec![expected_sort],
+                    });
+                }
+                if candidates.iter().any(|info| info.sort == expected_sort) {
+                    return Err(SolverError::SortMismatch {
+                        operation: "datatype_selector",
+                        expected: "expr sort matching selector's argument sort",
+                        got: vec![expr_sort],
+                    });
+                }
+                return Err(SolverError::InvalidArgument {
+                    operation: "datatype_selector",
+                    message: format!(
+                        "selector '{selector}' is not declared with the requested argument and result sorts"
+                    ),
+                });
+            };
+            (
+                info.clone(),
+                ctx.symbol_identity_name(selector, info).to_string(),
+            )
+        };
 
         if symbol_info.arg_sorts.len() != 1 {
             return Err(SolverError::InvalidArgument {
@@ -443,7 +506,6 @@ impl Solver {
         }
 
         let declared_sort = &symbol_info.sort;
-        let expected_sort = result_sort.as_term_sort();
         if *declared_sort != expected_sort {
             return Err(SolverError::SortMismatch {
                 operation: "datatype_selector",
@@ -452,7 +514,6 @@ impl Solver {
             });
         }
 
-        let expr_sort = self.terms().sort(expr.0).clone();
         if expr_sort != symbol_info.arg_sorts[0] {
             return Err(SolverError::SortMismatch {
                 operation: "datatype_selector",
@@ -461,11 +522,10 @@ impl Solver {
             });
         }
 
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::Named(selector.to_string()),
-            vec![expr.0],
-            expected_sort,
-        )))
+        let term =
+            self.terms_mut()
+                .mk_app(Symbol::Named(selector_identity), vec![expr], expected_sort);
+        Ok(self.wrap_term(term))
     }
 
     /// Try to build a datatype tester (is-Constructor) term.
@@ -483,17 +543,38 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_datatype_tester(&mut self, ctor: &str, expr: Term) -> Result<Term, SolverError> {
         let tester_name = format!("is-{ctor}");
-
-        let symbol_info =
-            self.executor
-                .context()
-                .symbol_info(&tester_name)
-                .ok_or_else(|| SolverError::InvalidArgument {
+        let expr = self.resolve_term("datatype_tester", expr)?;
+        let expr_sort = self.terms().sort(expr).clone();
+        let (symbol_info, tester_identity) = {
+            let ctx = self.executor.context();
+            let info = if let Some(info) = ctx.symbol_info_with_signature(
+                &tester_name,
+                std::slice::from_ref(&expr_sort),
+                &Sort::Bool,
+            ) {
+                info
+            } else if ctx.symbols_iter().any(|(surface, info)| {
+                surface == &tester_name
+                    && info.declaration_kind() == ay_frontend::DeclarationKind::DatatypeTester
+            }) {
+                return Err(SolverError::SortMismatch {
+                    operation: "datatype_tester",
+                    expected: "expr sort matching tester's argument sort",
+                    got: vec![expr_sort],
+                });
+            } else {
+                return Err(SolverError::InvalidArgument {
                     operation: "datatype_tester",
                     message: format!(
-                        "tester '{tester_name}' not declared. Ensure the datatype with constructor '{ctor}' has been declared"
+                        "tester '{tester_name}' is not declared for the supplied datatype sort"
                     ),
-                })?;
+                });
+            };
+            (
+                info.clone(),
+                ctx.symbol_identity_name(&tester_name, info).to_string(),
+            )
+        };
 
         if symbol_info.arg_sorts.len() != 1 {
             return Err(SolverError::InvalidArgument {
@@ -516,7 +597,6 @@ impl Solver {
             });
         }
 
-        let expr_sort = self.terms().sort(expr.0).clone();
         if expr_sort != symbol_info.arg_sorts[0] {
             return Err(SolverError::SortMismatch {
                 operation: "datatype_tester",
@@ -525,10 +605,9 @@ impl Solver {
             });
         }
 
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::Named(tester_name),
-            vec![expr.0],
-            Sort::Bool,
-        )))
+        let term = self
+            .terms_mut()
+            .mk_app(Symbol::Named(tester_identity), vec![expr], Sort::Bool);
+        Ok(self.wrap_term(term))
     }
 }

@@ -4055,12 +4055,7 @@ impl AdaptivePortfolio {
             let mut smt = problem.make_smt_context();
             smt.set_global_solve_deadline(Some(Instant::now() + query_budget));
             for query in &queries {
-                let constraint = query
-                    .body
-                    .constraint
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(ChcExpr::Bool(true));
+                let constraint = query.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
                 smt.reset();
                 if !matches!(
                     smt.check_sat(&constraint),

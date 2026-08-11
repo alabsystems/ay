@@ -42,6 +42,44 @@ const QF_UF_UNSAT: &str = r#"
 (check-sat)
 "#;
 
+const QF_DT_FINITE_ENUM_PIGEONHOLE_UNSAT: &str = r#"
+(set-logic QF_DT)
+(declare-datatype Unit ((u0) (u1) (u2)))
+(declare-const p0 Unit)
+(declare-const p1 Unit)
+(declare-const p2 Unit)
+(declare-const p3 Unit)
+(assert (not (= p0 p1)))
+(assert (not (= p0 p2)))
+(assert (not (= p0 p3)))
+(assert (not (= p1 p2)))
+(assert (not (= p1 p3)))
+(assert (not (= p2 p3)))
+(check-sat)
+"#;
+
+// Carcara 1.1.0 has no datatype parser or exhaustiveness rule. Give its proof
+// checker the exact six authored assumptions over an uninterpreted carrier so
+// it can validate every `assume` and resolution around the explicit `hole`.
+// AY still solves and natively checks the real datatype problem above; this
+// erased checker scope cannot turn the missing exhaustiveness inference into a
+// valid external proof, and the required verdict remains `holey`.
+const QF_DT_FINITE_ENUM_PIGEONHOLE_CARCARA_SCOPE: &str = r#"
+(set-logic QF_UF)
+(declare-sort Unit 0)
+(declare-const p0 Unit)
+(declare-const p1 Unit)
+(declare-const p2 Unit)
+(declare-const p3 Unit)
+(assert (not (= p0 p1)))
+(assert (not (= p0 p2)))
+(assert (not (= p0 p3)))
+(assert (not (= p1 p2)))
+(assert (not (= p1 p3)))
+(assert (not (= p2 p3)))
+(check-sat)
+"#;
+
 const QF_UF_COMPOSED_AUTHORED_ROOT_UNSAT: &str = r#"
 (set-logic QF_UF)
 (declare-const x Int)
@@ -157,6 +195,40 @@ const QF_LIA_UNSAT: &str = r#"
 (assert (< x 5))
 (check-sat)
 "#;
+
+fn arithmetic_ite_nonnegative_problem(
+    extra_setup: &str,
+    definition: &str,
+    contradiction: &str,
+) -> String {
+    format!(
+        r#"
+(set-logic QF_LIA)
+(declare-const A Int)
+(declare-const B Int)
+(declare-const C Int)
+(declare-const D Int)
+(declare-const E Int)
+(declare-const F Int)
+(declare-const G Int)
+(declare-const H Int)
+(declare-const I Int)
+(declare-const J Int)
+{extra_setup}
+{definition}
+(assert (= H (+ C F)))
+(assert (= G (+ B 1)))
+(assert (= F (+ A 1)))
+(assert (= E (+ D G)))
+(assert (>= D 0))
+(assert (>= A 0))
+(assert (>= B 0))
+(assert (>= C 0))
+{contradiction}
+(check-sat)
+"#
+    )
+}
 
 const QF_UFLIA_UNSAT: &str = r#"
 (set-logic QF_UFLIA)
@@ -284,6 +356,38 @@ fn solve_unsat_and_get_proof(problem: &str, label: &str) -> String {
     );
 
     proof
+}
+
+/// Return a proof only when the solver can publish UNSAT. Unsupported proof
+/// shapes must fail closed as UNKNOWN; SAT is never valid for these fixtures.
+fn solve_or_fail_closed_and_maybe_get_proof(problem: &str, label: &str) -> Option<String> {
+    let script = format!("(set-option :produce-proofs true)\n{problem}\n");
+    let commands = parse(&script).expect("parse SMT-LIB script");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute SMT-LIB script");
+
+    match outputs.last().map(String::as_str) {
+        Some("unknown") => {
+            assert!(
+                exec.last_proof().is_none(),
+                "{label}: UNKNOWN must not retain a publishable proof"
+            );
+            None
+        }
+        Some("unsat") => {
+            let get_proof = parse("(get-proof)").expect("parse get-proof");
+            let proof_outputs = exec
+                .execute_all(&get_proof)
+                .expect("export proof after UNSAT");
+            let proof = proof_outputs.last().cloned().expect("proof output");
+            assert!(
+                proof.contains("(assume ") || proof.contains("(step "),
+                "{label}: proof output must contain Alethe commands:\n{proof}"
+            );
+            Some(proof)
+        }
+        status => panic!("{label}: expected UNSAT or fail-closed UNKNOWN, got {status:?}"),
+    }
 }
 
 fn normalize_whitespace(text: &str) -> String {
@@ -454,9 +558,10 @@ fn run_carcara_trust_free(carcara: &Path, label: &str, problem: &str, proof: &st
         .output()
         .expect("run carcara check (trust-free)");
 
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let keep_artifacts = keep_alethe_artifacts() || !output.status.success();
+    let valid = trust_free_carcara_verdict_is_valid(output.status.success(), &stdout);
+    let keep_artifacts = keep_alethe_artifacts() || !valid;
     if keep_artifacts {
         eprintln!(
             "Preserving Alethe artifacts ({label} trust-free): smt2={} alethe={}",
@@ -468,16 +573,28 @@ fn run_carcara_trust_free(carcara: &Path, label: &str, problem: &str, proof: &st
         let _ = std::fs::remove_file(&proof_path);
     }
 
-    if !output.status.success() {
+    if !valid {
         eprintln!(
-            "carcara REJECTED trust-free ({label}): status={:?} stderr={}",
+            "carcara REJECTED trust-free ({label}): status={:?} stdout={} stderr={}",
             output.status.code(),
+            stdout.trim(),
             stderr.trim()
         );
         return false;
     }
 
     true
+}
+
+fn trust_free_carcara_verdict_is_valid(status_success: bool, stdout: &str) -> bool {
+    status_success && stdout.trim() == "valid"
+}
+
+#[test]
+fn trust_free_carcara_verdict_rejects_holey_success() {
+    assert!(trust_free_carcara_verdict_is_valid(true, "valid\n"));
+    assert!(!trust_free_carcara_verdict_is_valid(true, "holey\n"));
+    assert!(!trust_free_carcara_verdict_is_valid(false, "valid\n"));
 }
 
 /// QF_BOOL proofs should be fully verifiable without trust steps.
@@ -506,6 +623,122 @@ fn test_carcara_trust_free_qf_lra() {
         run_carcara_trust_free(&carcara, "trust_free_qf_lra", QF_LRA_UNSAT, &proof),
         "QF_LRA proof must be trust-free verifiable by carcara"
     );
+}
+
+/// Both the post-lift formula-level ITE and its original RHS-ITE spelling
+/// must export proofs accepted by an independent Alethe checker without
+/// allowing trust. The two cases exercise the provenance repair and the
+/// established `ite_intro` fallback respectively.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_arithmetic_ite_lift_and_fallback() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let cases = [
+        (
+            "trust_free_formula_arithmetic_ite",
+            "",
+            "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+            "(assert (< I 0))",
+        ),
+        (
+            "trust_free_rhs_arithmetic_ite",
+            "",
+            "(assert (= I (ite (= J 1) (+ E F) E)))",
+            "(assert (< I 0))",
+        ),
+        (
+            "trust_free_formula_arithmetic_ite_irrelevant_bool_source",
+            r#"
+(declare-const K Bool)
+(declare-const W Int)
+(assert (= K true))
+(assert (= W (ite K 0 1)))
+"#,
+            "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+            "(assert (< (+ I W (- W)) 0))",
+        ),
+        (
+            "trust_free_arithmetic_ite_successor_failure_or",
+            "",
+            "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+            "(assert (or (< F 0) (< G 0) (< H 0) (< I 0)))",
+        ),
+    ];
+
+    for (label, extra_setup, definition, contradiction) in cases {
+        let problem = arithmetic_ite_nonnegative_problem(extra_setup, definition, contradiction);
+        let proof = solve_unsat_and_get_proof(&problem, label);
+        assert!(
+            !proof.contains(":rule trust"),
+            "{label}: proof contains trust:\n{proof}"
+        );
+        assert!(
+            run_carcara_trust_free(&carcara, label, &problem, &proof),
+            "{label}: Carcara must accept the proof without allowed trust"
+        );
+    }
+}
+
+/// A nested top-level OR may canonicalize to a flattened internal term. The
+/// exporter must either derive the exact immediate surface disjunct structure
+/// or decline the proof; emitting one flattened `or` step from the nested
+/// authored premise is not externally valid.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_nested_provenance_or_is_valid_or_fails_closed() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let problem = arithmetic_ite_nonnegative_problem(
+        "",
+        "(assert (ite (= J 1) (= I (+ E F)) (= I E)))",
+        "(assert (or (< F 0) (or (< G 0) (< H 0) (< I 0))))",
+    );
+    let label = "nested_arithmetic_ite_successor_failure_or";
+    let Some(proof) = solve_or_fail_closed_and_maybe_get_proof(&problem, label) else {
+        return;
+    };
+    assert!(
+        !proof.contains(":rule trust"),
+        "{label}: proof contains trust:\n{proof}"
+    );
+    assert!(
+        run_carcara_trust_free(&carcara, label, &problem, &proof),
+        "{label}: Carcara must accept any published proof without allowed trust"
+    );
+}
+
+/// A negated ITE condition canonicalizes by swapping branch order. Any proof
+/// that is still published must honor the authored positional surface when
+/// checked independently; declining the unsupported spelling is also sound.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_negated_condition_ite_is_valid_or_fails_closed() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    for (label, definition) in [
+        (
+            "negated_condition_formula_ite",
+            "(assert (ite (not (= J 1)) (= I E) (= I (+ E F))))",
+        ),
+        (
+            "negated_condition_rhs_ite",
+            "(assert (= I (ite (not (= J 1)) E (+ E F))))",
+        ),
+    ] {
+        let problem = arithmetic_ite_nonnegative_problem("", definition, "(assert (< I 0))");
+        let Some(proof) = solve_or_fail_closed_and_maybe_get_proof(&problem, label) else {
+            continue;
+        };
+        assert!(!proof.contains(":rule trust"), "{label}: {proof}");
+        assert!(
+            run_carcara_trust_free(&carcara, label, &problem, &proof),
+            "{label}: Carcara must accept any published proof"
+        );
+    }
 }
 
 /// QF_UF proofs on simple benchmarks should be fully verifiable without trust steps.
@@ -682,6 +915,44 @@ fn test_carcara_trust_free_qf_uf_transitivity_fixture() {
     );
 }
 
+/// A logically inert authored Boolean-equality wrapper installs the surface
+/// spelling `(= (= a b) false)` for AY's canonical `not (= a b)` term. That
+/// spelling is not a legal negated-equality hypothesis of `eq_transitive`.
+/// Standalone generic-EUF promotion must therefore either leave publication
+/// to a later fully audited repair or make the proof request fail closed; it
+/// must never publish the native-only rendering.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_qf_uf_boolean_equality_surface_is_valid_or_fails_closed() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    const PROBLEM: &str = r#"
+(set-logic QF_UF)
+(declare-const a Int)
+(declare-const b Int)
+(declare-const c Int)
+(assert (= a b))
+(assert (= b c))
+(assert (not (= a c)))
+; Tautological, but its first child supplies the adversarial surface alias.
+(assert (or (= (= a b) false) (= a b)))
+(check-sat)
+"#;
+    let label = "qf_uf_boolean_equality_surface";
+    let Some(proof) = solve_or_fail_closed_and_maybe_get_proof(PROBLEM, label) else {
+        return;
+    };
+    assert!(
+        !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+        "{label}: any published proof must be fully checkable:\n{proof}"
+    );
+    assert!(
+        run_carcara_trust_free(&carcara, label, PROBLEM, &proof),
+        "{label}: Carcara must accept any published proof"
+    );
+}
+
 /// QF_LIA arithmetic proofs may still contain `trust`-backed theory steps when
 /// coefficient annotations are unavailable. This test checks the current export
 /// contract: the proof must remain structurally valid via carcara with AY's
@@ -695,6 +966,55 @@ fn test_carcara_qf_lia_holey_valid() {
 
     let proof = solve_unsat_and_get_proof(QF_LIA_UNSAT, "qf_lia_holey");
     verify_alethe_with_carcara(&carcara, "qf_lia_holey", QF_LIA_UNSAT, &proof);
+}
+
+/// AY strictly validates datatype exhaustiveness in its native proof IR, but
+/// the pinned Alethe calculus has no corresponding inference. The exported
+/// diagnostic must therefore be structurally accepted as `holey`, never claim
+/// `valid`, and never invent an unsupported wire-rule name.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_finite_enum_pigeonhole_is_honestly_holey() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "finite_enum_pigeonhole_holey";
+    let proof = solve_unsat_and_get_proof(QF_DT_FINITE_ENUM_PIGEONHOLE_UNSAT, label);
+    assert_eq!(proof.matches(":rule hole").count(), 1, "{proof}");
+    assert_eq!(
+        proof
+            .lines()
+            .filter(|line| line.starts_with("(assume "))
+            .count(),
+        6,
+        "{proof}"
+    );
+    assert_eq!(proof.matches(":rule resolution").count(), 1, "{proof}");
+    assert!(!proof.contains(":rule dt_enum_pigeonhole"), "{proof}");
+    let (problem_path, proof_path) =
+        write_problem_and_proof(label, QF_DT_FINITE_ENUM_PIGEONHOLE_CARCARA_SCOPE, &proof);
+    let output = std::process::Command::new(&carcara)
+        .arg("check")
+        .arg("--expand-let-bindings")
+        .arg("--")
+        .arg(&proof_path)
+        .arg(&problem_path)
+        .output()
+        .expect("run carcara finite-enum holey check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let keep_artifacts = keep_alethe_artifacts() || !output.status.success();
+    if !keep_artifacts {
+        let _ = std::fs::remove_file(&problem_path);
+        let _ = std::fs::remove_file(&proof_path);
+    }
+    assert!(
+        output.status.success(),
+        "Carcara rejected finite-enum skeleton: stdout={} stderr={}",
+        stdout.trim(),
+        stderr.trim()
+    );
+    assert_eq!(stdout.trim(), "holey");
 }
 
 /// The trust-FREE normalized-assume class: every step is checkable, but the
@@ -964,9 +1284,10 @@ fn solve_corpus_with_timeout(content: &str, label: &str) -> CorpusSolve {
     let _ = cancel_tx.send(());
     let _ = timer.join();
 
-    if timed_out {
-        panic!("{label}: solving timed out ({PER_BENCHMARK_TIMEOUT_SECS}s limit)");
-    }
+    assert!(
+        !timed_out,
+        "{label}: solving timed out ({PER_BENCHMARK_TIMEOUT_SECS}s limit)"
+    );
 
     let outputs = outputs.unwrap_or_else(|e| panic!("{label}: execution error: {e}"));
 

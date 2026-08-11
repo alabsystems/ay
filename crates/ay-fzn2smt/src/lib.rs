@@ -23,3 +23,27 @@ pub mod solve;
 pub mod solve_cp;
 
 pub use error::{Fzn2smtError, Result};
+
+use std::time::{Duration, Instant};
+
+/// Largest timeout whose nanosecond representation fits a signed 64-bit
+/// monotonic-clock interval. This is deliberately conservative across the
+/// platform-specific `Instant` representations while still exceeding any
+/// practical solver run (roughly 292 years).
+const MAX_PORTABLE_TIMEOUT_MS: u64 = (i64::MAX as u64) / 1_000_000;
+
+/// Convert an optional public millisecond timeout to a checked monotonic
+/// deadline. Public solve entrypoints must use this instead of `Instant +
+/// Duration`, whose overflow behavior is a panic and varies by platform.
+pub(crate) fn checked_deadline(timeout_ms: Option<u64>) -> Result<Option<Instant>> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(None);
+    };
+    if timeout_ms > MAX_PORTABLE_TIMEOUT_MS {
+        return Err(Fzn2smtError::InvalidTimeout { timeout_ms });
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .map(Some)
+        .ok_or(Fzn2smtError::InvalidTimeout { timeout_ms })
+}

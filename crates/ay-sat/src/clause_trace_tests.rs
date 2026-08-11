@@ -4,7 +4,11 @@
 
 use super::*;
 use super::{HintOmission, HintOmissionStats};
+use crate::clause_trace_resolution::{
+    validate_clause_trace_resolution, ClauseTraceResolutionError,
+};
 use crate::literal::Variable;
+use crate::resolution_validate::ResolutionValidationLimits;
 
 #[test]
 fn test_clause_trace_basic() {
@@ -143,6 +147,19 @@ fn test_clause_trace_budget_empty_clause_always_recorded() {
 }
 
 #[test]
+fn resolution_conversion_rejects_truncated_trace() {
+    let mut trace = ClauseTrace::new();
+    trace.budget_bytes = 0;
+    trace.add_clause(1, vec![Literal::positive(Variable(0))], true);
+
+    assert_eq!(
+        validate_clause_trace_resolution(&trace, 1, &ResolutionValidationLimits::unbounded())
+            .unwrap_err(),
+        ClauseTraceResolutionError::Truncated
+    );
+}
+
+#[test]
 fn hint_omission_stats_count_each_cause_separately() {
     let trace = ClauseTrace::new();
     assert_eq!(trace.hint_omission_stats(), HintOmissionStats::default());
@@ -166,4 +183,26 @@ fn hint_omission_stats_count_each_cause_separately() {
         stats.queries,
         "resolved + omitted must account for every query"
     );
+}
+
+#[test]
+fn solver_namespace_stamp_is_opaque_clone_stable_and_mutation_sensitive() {
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable(0))], true);
+    assert_eq!(trace.solver_num_vars(), None);
+
+    trace.stamp_solver_num_vars(7);
+    assert_eq!(trace.solver_num_vars(), Some(7));
+    assert_eq!(trace.clone().solver_num_vars(), Some(7));
+
+    // Diagnostic counters do not change certificate content.
+    trace.record_hint_lookup(None);
+    assert_eq!(trace.solver_num_vars(), Some(7));
+
+    trace.set_resolution_hints(1, vec![2]);
+    assert_eq!(trace.solver_num_vars(), None);
+
+    trace.stamp_solver_num_vars(7);
+    trace.mark_empty();
+    assert_eq!(trace.solver_num_vars(), None);
 }

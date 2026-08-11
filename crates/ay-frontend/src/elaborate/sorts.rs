@@ -336,7 +336,8 @@ impl Context {
                         // Registering it (rather than returning an unregistered
                         // sort) is what makes the name resolvable afterwards.
                         if self.native_global_declaration {
-                            let sort = Sort::Uninterpreted(other.to_string());
+                            let identity = self.allocate_nominal_sort_identity(other, other);
+                            let sort = Sort::Uninterpreted(identity);
                             self.sort_defs.insert(other.to_string(), sort.clone());
                             self.track_scoped_sort_def(other.to_string());
                             return Ok(sort);

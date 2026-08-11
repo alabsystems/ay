@@ -734,7 +734,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     // Stash proof data for post-loop finalization (#6705)
                     if proof_enabled {
                         _itp_negations.sync_pending(&mut $self.ctx.terms);
-                        let _itp_clause_trace = solver.clause_trace().cloned();
+                        let _itp_clause_trace = solver.snapshot_clause_trace();
                         // Resize clausification proofs to match trace (#6705, #6686)
                         if let Some(ref trace) = _itp_clause_trace {
                             let original_count = trace.original_clauses().count();
@@ -1387,7 +1387,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 SatResult::Unsat(_) => {
                     if proof_enabled {
                         _itp_negations.sync_pending(&mut $self.ctx.terms);
-                        let _itp_clause_trace = solver.clause_trace().cloned();
+                        let _itp_clause_trace = solver.snapshot_clause_trace();
                         if let Some(ref trace) = _itp_clause_trace {
                             let original_count = trace.original_clauses().count();
                             if state.clausification_proofs.len() < original_count {

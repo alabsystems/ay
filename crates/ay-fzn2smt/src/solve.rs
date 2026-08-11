@@ -12,10 +12,10 @@
 //   - Flush stdout after each solution (scoring uses best-found)
 
 use std::io;
-use std::time::{Duration, Instant};
 
 use ay_flatzinc_smt::{SolverConfig, TranslationResult};
 
+use crate::checked_deadline;
 use crate::error::{Fzn2smtError, Result};
 
 /// Solve a translated FlatZinc model through AY's in-process solver API.
@@ -34,7 +34,7 @@ pub fn cmd_solve(
     fd_search: bool,
     all_solutions: bool,
 ) -> Result<()> {
-    let global_deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let global_deadline = checked_deadline(timeout_ms)?;
     let config = SolverConfig {
         timeout_ms,
         all_solutions,
@@ -49,4 +49,25 @@ pub fn cmd_solve(
             .map_err(|e| Fzn2smtError::Solver(e.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_timeout_is_rejected_before_smt_solving() {
+        let model = ay_flatzinc_parser::parse_flatzinc("solve satisfy;\n")
+            .expect("FlatZinc model must parse");
+        let translated = ay_flatzinc_smt::translate(&model).expect("model must translate");
+
+        let error = cmd_solve(&translated, Some(u64::MAX), false, false)
+            .expect_err("oversized timeout must be rejected");
+        assert!(matches!(
+            error,
+            Fzn2smtError::InvalidTimeout {
+                timeout_ms: u64::MAX
+            }
+        ));
+    }
 }

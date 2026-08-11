@@ -462,26 +462,17 @@ impl Executor {
             .iter()
             .map(|(&t, &v)| (t, v - 1))
             .collect();
-        self.last_model = Some(Model {
-            sat_model: sat_model.to_vec(),
-            term_to_var,
-            bool_overrides: HashMap::default(),
-            euf_model: mixed.euf_model,
-            array_model: None,
-            lra_model: if lra_model.values.is_empty() {
-                None
-            } else {
-                Some(lra_model)
-            },
-            lia_model: None,
-            bv_model: None,
-            fp_model: Some(fp_model.clone()),
-            string_model: None,
-            seq_model: None,
-            completed_values: HashMap::default(),
-            dt_ground: HashMap::default(),
-            dt_pins: HashMap::default(),
-        });
+        let mut model = Model::empty();
+        model.sat_model = sat_model.to_vec();
+        model.term_to_var = term_to_var;
+        model.euf_model = mixed.euf_model;
+        model.lra_model = if lra_model.values.is_empty() {
+            None
+        } else {
+            Some(lra_model)
+        };
+        model.fp_model = Some(fp_model.clone());
+        self.last_model = Some(model);
         // #8456: Model validation now runs for FP theories.
         self.last_model_validated = false;
         self.last_result = Some(SolveResult::Sat);

@@ -204,7 +204,7 @@ impl Solver {
     ///
     /// This is the fail-closed witness extraction primitive for downstream
     /// callers. It returns `None` unless the last result was SAT, model
-    /// generation succeeded, and AY's SAT model-validation acceptance gate
+    /// generation succeeded, and one of AY's sealed SAT model-evidence lanes
     /// passed. Use [`try_get_model_for_consumer`](Self::try_get_model_for_consumer)
     /// when the caller needs typed failure attribution.
     #[must_use]
@@ -216,9 +216,10 @@ impl Solver {
     ///
     /// This centralizes the same acceptance policy as
     /// [`SolveDetails::accept_for_consumer`](crate::api::types::SolveDetails::accept_for_consumer):
-    /// a SAT model is available to consumers only after model validation passed.
-    /// It prevents downstream adapters from reimplementing a weaker local
-    /// witness acceptance check.
+    /// a SAT model is available to consumers only after ordinary validation or
+    /// an independently checked constructive model certificate passed. It
+    /// prevents downstream adapters from reimplementing a weaker local witness
+    /// acceptance check.
     ///
     /// Returns a typed error distinguishing:
     /// - [`SolverError::NoResult`] — no `check_sat` has been called
@@ -252,7 +253,7 @@ impl Solver {
         let mut vars: Vec<_> = self.var_names.iter().collect();
         vars.sort_unstable_by_key(|(term_id, _)| term_id.0);
         vars.into_iter()
-            .map(|(term_id, name)| (name.as_str(), Term(*term_id)))
+            .map(|(term_id, name)| (name.as_str(), self.wrap_term(*term_id)))
     }
 
     /// Structured model map for all declared variables.
@@ -384,6 +385,7 @@ impl Solver {
     /// - [`SolverError::ModelGenerationFailed`] — value extraction failed
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_values(&self, terms: &[Term]) -> Result<Vec<ModelValue>, SolverError> {
+        let term_ids = self.resolve_terms("get_value", terms)?;
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
         if !last_result.is_sat() {
             return Err(SolverError::NotSat);
@@ -395,9 +397,9 @@ impl Solver {
 
         // The typed builder API has no original SMT-LIB source text, so echo the
         // formatted (elaborated) term as the key — the same behavior as before.
-        let pairs: Vec<(String, TermId)> = terms
+        let pairs: Vec<(String, TermId)> = term_ids
             .iter()
-            .map(|t| (self.executor.format_term(t.0), t.0))
+            .map(|&id| (self.executor.format_term(id), id))
             .collect();
         let output = self.executor.values(&pairs);
 
@@ -417,6 +419,7 @@ impl Solver {
     /// Returns the unparsed output string, useful for debugging or custom parsing.
     #[must_use]
     pub fn values_smtlib(&self, terms: &[Term]) -> Option<String> {
+        let term_ids = self.resolve_terms("values_smtlib", terms).ok()?;
         let last_result = self.executor.last_result()?;
         if !last_result.is_sat() {
             return None;
@@ -428,9 +431,9 @@ impl Solver {
 
         // The typed builder API has no original SMT-LIB source text, so echo the
         // formatted (elaborated) term as the key — the same behavior as before.
-        let pairs: Vec<(String, TermId)> = terms
+        let pairs: Vec<(String, TermId)> = term_ids
             .iter()
-            .map(|t| (self.executor.format_term(t.0), t.0))
+            .map(|&id| (self.executor.format_term(id), id))
             .collect();
         let output = self.executor.values(&pairs);
 

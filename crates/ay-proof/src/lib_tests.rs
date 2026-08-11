@@ -5,7 +5,12 @@
 use super::*;
 use ay_core::{string_literal, AletheRule, Sort};
 
-// Note: quote_symbol tests are in ay-core::smtlib
+#[path = "alethe_printer_resolution_args_tests.rs"]
+mod alethe_printer_resolution_args_tests;
+#[path = "alethe_printer_surface_and_pos_tests.rs"]
+mod alethe_printer_surface_and_pos_tests;
+#[path = "alethe_printer_surface_symm_tests.rs"]
+mod alethe_printer_surface_symm_tests;
 
 /// A problem scope covering every term the proof mentions.
 ///
@@ -76,11 +81,12 @@ fn test_step_with_premises() {
     let mut proof = Proof::new();
     let h1 = proof.add_assume(x, None);
     let h2 = proof.add_assume(not_x, None);
+    let yes = terms.mk_bool(true);
     proof.add_rule_step(
         AletheRule::Resolution,
         vec![], // empty clause = contradiction
         vec![h1, h2],
-        vec![x], // pivot
+        vec![x, yes], // pivot and polarity
     );
 
     let output = export_alethe(&proof, &terms);
@@ -126,6 +132,28 @@ fn test_theory_lemma_generic() {
     assert!(output.contains(":rule hole"), "{output}");
     assert!(!output.contains(":rule trust"), "{output}");
     assert!(output.contains("(= a b)"));
+}
+
+#[test]
+fn datatype_enum_pigeonhole_keeps_native_identity_but_prints_hole() {
+    use ay_core::TheoryLemmaKind;
+
+    let mut terms = TermStore::new();
+    let sort = Sort::Uninterpreted("FiniteEnum".to_string());
+    let a = terms.mk_var("a", sort.clone());
+    let b = terms.mk_var("b", sort);
+    let equality = terms.mk_eq(a, b);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "DT",
+        vec![equality],
+        TheoryLemmaKind::DatatypeEnumPigeonhole,
+    );
+
+    let output = export_alethe(&proof, &terms);
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule dt_enum_pigeonhole"), "{output}");
 }
 
 #[test]
@@ -895,6 +923,134 @@ fn test_or_pos_with_implies_override_resugars_to_implies_pos() {
     );
 }
 
+/// An internal `or` decomposition over a premise that prints as an authored
+/// right-associated implication cannot remain `:rule or`: the external rule
+/// sees an implication, not AY's flattened canonical or-term. Rebuild the
+/// exact flat clause with one premiseless `implies_pos` per binary link and a
+/// single n-ary resolution whose command retains the traced step id.
+#[test]
+fn test_or_decomposition_with_nested_implies_override_resugars_to_resolution_chain() {
+    use ay_core::kani_compat::DetHashMap;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let not_a = terms.mk_not(a);
+    let not_b = terms.mk_not(b);
+    let inner = terms.mk_implies(b, c);
+    let source = terms.mk_implies(a, inner);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(source, "(=> a (=> b c))".to_string());
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(source, None);
+    // Deliberately use a different order from the authored implication. The
+    // bridge's multiset gate permits only reordering, and its final resolution
+    // must reproduce this exact traced clause under t1.
+    proof.add_rule_step(AletheRule::Or, vec![c, not_b, not_a], vec![premise], vec![]);
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[source],
+        Some(&overrides),
+    )
+    .expect("the implication decomposition must render through stock Alethe rules");
+    assert!(output.contains("(assume t0 (=> a (=> b c)))"), "{output}");
+    assert!(
+        output.contains(
+            "(step t1.imp0 (cl (not (=> a (=> b c))) (not a) (=> b c)) :rule implies_pos)\n\
+             (step t1.imp1 (cl (not (=> b c)) (not b) c) :rule implies_pos)\n\
+             (step t1 (cl c (not b) (not a)) :rule resolution :premises (t0 t1.imp0 t1.imp1))"
+        ),
+        "{output}"
+    );
+    assert_eq!(output.matches(":rule implies_pos").count(), 2, "{output}");
+    assert!(!output.contains("(step t1 (cl c (not b) (not a)) :rule or"));
+}
+
+/// The bridge is not a general implication/or equivalence rewrite. A traced
+/// clause that differs from the assumed canonical or-term must miss the
+/// internal TermId multiset gate and fail loudly instead of shipping an `or`
+/// rule over a printed implication premise.
+#[test]
+fn test_implies_decomposition_declines_a_different_internal_clause() {
+    use ay_core::kani_compat::DetHashMap;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let d = terms.mk_var("d", Sort::Bool);
+    let not_b = terms.mk_not(b);
+    let inner = terms.mk_implies(b, c);
+    let source = terms.mk_implies(a, inner);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(source, "(=> a (=> b c))".to_string());
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(source, None);
+    proof.add_rule_step(AletheRule::Or, vec![c, not_b, d], vec![premise], vec![]);
+    let error = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[source, d],
+        Some(&overrides),
+    )
+    .expect_err("a mismatched implication decomposition must fail loudly");
+    assert!(
+        matches!(
+            error,
+            AlethePrintError::InvalidSurfaceStep { id: ProofId(1), .. }
+        ),
+        "{error}"
+    );
+}
+
+/// Same-arity forged surface literals and a shorter binary implication both
+/// fail the printed-literal/arity gates. Neither may be force-fitted to the
+/// valid internal decomposition merely because the root prints with `=>`.
+#[test]
+fn test_implies_decomposition_declines_printed_literal_or_arity_mismatch() {
+    use ay_core::kani_compat::DetHashMap;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let d = terms.mk_var("d", Sort::Bool);
+    let not_a = terms.mk_not(a);
+    let not_b = terms.mk_not(b);
+    let inner = terms.mk_implies(b, c);
+    let source = terms.mk_implies(a, inner);
+
+    for surface in ["(=> a (=> d c))", "(=> a c)", "(=> a (=> b c d))"] {
+        let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+        overrides.insert(source, surface.to_string());
+
+        let mut proof = Proof::new();
+        let premise = proof.add_assume(source, None);
+        proof.add_rule_step(AletheRule::Or, vec![c, not_b, not_a], vec![premise], vec![]);
+        let error = try_export_alethe_with_problem_scope_and_overrides(
+            &proof,
+            &terms,
+            &[source, d],
+            Some(&overrides),
+        )
+        .expect_err("a malformed implication decomposition must fail loudly");
+        assert!(
+            matches!(
+                error,
+                AlethePrintError::InvalidSurfaceStep { id: ProofId(1), .. }
+            ),
+            "surface {surface} produced the wrong error: {error}"
+        );
+    }
+}
+
 /// or_neg over a NEGATED disjunct: the traced clause literal is the
 /// double-negation-stripped inner term, but strict Alethe concludes
 /// `(cl (or ...) (not (not a)))`. The printer must emit the honest
@@ -1411,11 +1567,12 @@ fn test_surface_distinct_non_unit_resolution_mismatch_fails_closed() {
     let mut generic_proof = Proof::new();
     let distinct_clause = generic_proof.add_theory_lemma("test", vec![disequality, p]);
     let equality_clause = generic_proof.add_theory_lemma("test", vec![equality, q]);
+    let yes = terms.mk_bool(true);
     generic_proof.add_rule_step(
         AletheRule::ThResolution,
         vec![p, q],
         vec![distinct_clause, equality_clause],
-        vec![equality],
+        vec![equality, yes],
     );
     let error = try_export_alethe_with_problem_scope_and_overrides(
         &generic_proof,
@@ -1968,7 +2125,7 @@ fn test_emission_work_budget_exhaustion_and_unbudgeted_parity() {
     let mut proof = Proof::new();
     let h1 = proof.add_assume(x, None);
     let h2 = proof.add_assume(not_x, None);
-    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2], vec![x]);
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2], Vec::new());
 
     // Budget of 0 units: the very first rendered step exceeds it.
     let err = try_export_alethe_with_problem_scope_overrides_and_budget(
@@ -2033,7 +2190,7 @@ fn overloaded_symbol_proof() -> (Proof, TermStore, Vec<TermId>) {
     let mut proof = Proof::new();
     let h1 = proof.add_assume(eq_a, None);
     let h2 = proof.add_assume(eq_b, None);
-    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2], vec![eq_a]);
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2], Vec::new());
     (proof, terms, vec![eq_a, eq_b])
 }
 
@@ -2106,7 +2263,7 @@ fn distinct_symbols_at_distinct_sorts_still_export() {
     let h1 = proof.add_assume(eq_a, None);
     let h2 = proof.add_assume(eq_b, None);
     let h3 = proof.add_assume(eq_again, None);
-    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2, h3], vec![eq_a]);
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2, h3], Vec::new());
 
     let output = try_export_alethe(&proof, &terms).expect("no name clash — must export");
     assert!(output.contains("(declare-fun p () A)"), "{output}");

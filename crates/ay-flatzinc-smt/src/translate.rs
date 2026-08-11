@@ -10,6 +10,7 @@ use ay_flatzinc_parser::ast::*;
 use crate::builtins;
 use crate::error::TranslateError;
 use crate::globals;
+use crate::logic;
 use crate::search::{self, SearchAnnotation};
 
 /// Maximum number of scalar items a single FlatZinc range may materialize.
@@ -38,6 +39,35 @@ pub(crate) fn materialized_range_len(
             "{context} range {lo}..{hi} is too large to materialize"
         ))
     })
+}
+
+/// Reject product-shaped encodings before they allocate auxiliary terms or
+/// append a partial SMT script.
+///
+/// `terms_per_cell` accounts for encodings that emit several declarations or
+/// assertions for every pair. Keeping the aggregate under the same budget as
+/// scalar range materialization prevents individually bounded arrays from
+/// multiplying into an unbounded quadratic translation.
+pub(crate) fn ensure_quadratic_work(
+    context: &str,
+    left: usize,
+    right: usize,
+    terms_per_cell: usize,
+) -> Result<(), TranslateError> {
+    let work = (left as u128)
+        .checked_mul(right as u128)
+        .and_then(|cells| cells.checked_mul(terms_per_cell as u128))
+        .ok_or_else(|| {
+            TranslateError::UnsupportedType(format!(
+                "{context}: quadratic encoding work exceeds the representable range"
+            ))
+        })?;
+    if work > MAX_MATERIALIZED_ITEMS as u128 {
+        return Err(TranslateError::UnsupportedType(format!(
+            "{context}: quadratic encoding materializes {work} work items, exceeding the maximum supported {MAX_MATERIALIZED_ITEMS}"
+        )));
+    }
+    Ok(())
 }
 
 /// Domain of an SMT variable, used by branching search to enumerate values.
@@ -349,7 +379,7 @@ impl Context {
             Some(other) => {
                 return Err(TranslateError::UnsupportedType(format!(
                     "array set variable {name}: expected array initializer, got {other:?}"
-                )))
+                )));
             }
             None => {
                 validate_array_len(name, lo, hi, 0)?;
@@ -569,107 +599,11 @@ fn has_output_annotation(annotations: &[Annotation]) -> bool {
     })
 }
 
-/// Check if an expression is a constant (integer literal or parameter reference).
-///
-/// Used by `detect_logic` to distinguish truly nonlinear constraints
-/// (variable * variable) from linear ones (constant * variable).
-fn is_constant_expr(param_names: &ay_core::kani_compat::DetHashSet<&str>, expr: &Expr) -> bool {
-    match expr {
-        Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) => true,
-        Expr::Ident(name) => param_names.contains(name.as_str()),
-        _ => false,
-    }
-}
-
-/// Detect the appropriate SMT-LIB logic for the model.
-///
-/// Set variables use boolean decomposition (no bitvectors), so they are
-/// compatible with QF_LIA. Returns `QF_NIA` only if genuinely nonlinear
-/// operations are detected (both operands are variables), `QF_LIA` otherwise.
-///
-/// `int_times(a, b, r)` where one of a/b is a constant is just linear
-/// multiplication (e.g., `r = 3 * x`). Only `variable * variable` requires
-/// QF_NIA. Similarly, `int_mod(constant, constant, r)` is a constant
-/// computation — not nonlinear.
-/// Maximum domain size considered for linearization in logic detection.
-/// Must match LINEARIZE_DOMAIN_LIMIT in builtins.rs.
-const DETECT_LOGIC_LINEARIZE_LIMIT: i64 = 32;
-
-fn detect_logic(model: &FznModel) -> &'static str {
-    // Build a set of parameter names for constant detection.
-    let param_names: ay_core::kani_compat::DetHashSet<&str> =
-        model.parameters.iter().map(|p| p.id.as_str()).collect();
-
-    // Build a map of variable domain sizes for linearization detection.
-    let var_domain_size: HashMap<&str, i64> = model
-        .variables
-        .iter()
-        .filter_map(|v| {
-            let size = match &v.ty {
-                FznType::Bool => 2,
-                FznType::IntRange(lo, hi) => hi - lo + 1,
-                FznType::IntSet(vals) => vals.len() as i64,
-                _ => return None,
-            };
-            Some((v.id.as_str(), size))
-        })
-        .collect();
-
-    let has_nonlinear = model.constraints.iter().any(|c| {
-        match c.id.as_str() {
-            "int_times" => {
-                // Nonlinear only if both operands are variables AND neither has a
-                // small enough domain for ITE-chain linearization.
-                if c.args.len() < 2 {
-                    return false;
-                }
-                if is_constant_expr(&param_names, &c.args[0])
-                    || is_constant_expr(&param_names, &c.args[1])
-                {
-                    return false;
-                }
-                // If either operand is a variable with a small domain, it will be
-                // linearized by the builtins handler — not truly nonlinear.
-                let a_small = expr_has_small_domain(&c.args[0], &var_domain_size);
-                let b_small = expr_has_small_domain(&c.args[1], &var_domain_size);
-                !a_small && !b_small
-            }
-            "int_div" | "int_mod" => {
-                c.args.len() >= 2
-                    && !is_constant_expr(&param_names, &c.args[0])
-                    && !is_constant_expr(&param_names, &c.args[1])
-            }
-            "int_pow" => {
-                c.args.len() >= 2
-                    && !is_constant_expr(&param_names, &c.args[0])
-                    && !is_constant_expr(&param_names, &c.args[1])
-            }
-            _ => false,
-        }
-    });
-    if has_nonlinear {
-        "QF_NIA"
-    } else {
-        "QF_LIA"
-    }
-}
-
-/// Check if a FlatZinc expression refers to a variable with a small enough domain
-/// for linearization.
-fn expr_has_small_domain(expr: &Expr, var_domain_size: &HashMap<&str, i64>) -> bool {
-    match expr {
-        Expr::Ident(name) => var_domain_size
-            .get(name.as_str())
-            .is_some_and(|&size| size > 0 && size <= DETECT_LOGIC_LINEARIZE_LIMIT),
-        _ => false,
-    }
-}
-
 /// Translate a FlatZinc model to SMT-LIB2.
 pub fn translate(model: &FznModel) -> Result<TranslationResult, TranslateError> {
     let mut ctx = Context::new();
 
-    let logic = detect_logic(model);
+    let logic = logic::detect_logic(model);
     ctx.emit("; Generated by flatzinc-smt");
     ctx.emit_fmt(format_args!("(set-logic {logic})"));
 

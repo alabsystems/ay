@@ -20,6 +20,7 @@ use super::collect_and_conjuncts;
 use crate::cegqi::{is_cegqi_candidate, CegqiInstantiator};
 use crate::ematching::{
     collect_ground_terms_by_sort, contains_quantifier, enumerative_instantiation, subst_vars,
+    subst_vars_exact_qf,
 };
 use crate::preprocess::{FlattenAnd, PreprocessingPass};
 use crate::quantifier_manager::QuantifierManager;
@@ -544,6 +545,80 @@ impl Executor {
         );
     }
 
+    /// Reconstruct the strict-checker-visible instance of one forall binding.
+    ///
+    /// The binding is positional and sort-checked against the quantifier.  The
+    /// substitution map is built here from exactly those binders, so auxiliary
+    /// CEGQI variables or same-spelled declarations cannot be smuggled into the
+    /// proof instance.  The shared exact-QF walker preserves raw constructors
+    /// and fails closed on lets, nested quantifiers, or excessive DAG work.
+    pub(super) fn exact_forall_instance(
+        &mut self,
+        quantifier: TermId,
+        binding: &[TermId],
+    ) -> Option<TermId> {
+        let TermData::Forall(vars, body, _) = self.ctx.terms.get(quantifier).clone() else {
+            return None;
+        };
+        if vars.is_empty() || vars.len() != binding.len() {
+            return None;
+        }
+        let mut substitution = HashMap::default();
+        for ((name, sort), &value) in vars.iter().zip(binding) {
+            if self.ctx.terms.sort(value) != sort {
+                return None;
+            }
+            substitution.insert(name.clone(), value);
+        }
+        subst_vars_exact_qf(&mut self.ctx.terms, body, &substitution)
+    }
+
+    /// Replace every proof-authorized E-matching consequence with the exact
+    /// structural forall instance checked by Alethe.
+    ///
+    /// E-matching itself may use simplifying constructors for search.  Before
+    /// any authenticated instance reaches the solver, this chokepoint rewrites
+    /// the instance vector, support-root set, and provenance record together.
+    /// Unsupported records remain solver-visible for completeness but mark the
+    /// proof translation incomplete, so an UNSAT depending on them cannot be
+    /// published without a certificate.
+    pub(super) fn materialize_exact_ematching_instances(
+        &mut self,
+        instantiations: &mut Vec<TermId>,
+        roots: &mut HashSet<TermId>,
+        records: &mut [crate::ematching::ForallInstantiationProvenance],
+    ) {
+        if !self.produce_proofs_enabled() || records.is_empty() {
+            return;
+        }
+
+        let mut replaced = HashSet::default();
+        let mut failed = HashSet::default();
+        let mut exact_instances = Vec::with_capacity(records.len());
+        for record in records {
+            let old = record.instance;
+            let Some(exact) = self.exact_forall_instance(record.quantifier, &record.binding) else {
+                self.quantified_proof_translation_incomplete = true;
+                failed.insert(old);
+                continue;
+            };
+            record.instance = exact;
+            exact_instances.push(exact);
+            if exact != old {
+                replaced.insert(old);
+            }
+        }
+
+        instantiations.retain(|instance| !replaced.contains(instance) || failed.contains(instance));
+        roots.retain(|instance| !replaced.contains(instance) || failed.contains(instance));
+        for exact in exact_instances {
+            if !instantiations.contains(&exact) {
+                instantiations.push(exact);
+            }
+            roots.insert(exact);
+        }
+    }
+
     /// Register strict proof derivations for exact E-matching instances whose
     /// source is itself a direct authenticated problem assertion.
     ///
@@ -578,7 +653,7 @@ impl Executor {
             })
             .unwrap_or_default();
         for record in records {
-            if direct_sources.contains(&record.quantifier) {
+            let registered = if direct_sources.contains(&record.quantifier) {
                 let registered = self.proof_tracker.add_forall_instantiated_assertion(
                     &mut self.ctx.terms,
                     record.quantifier,
@@ -598,16 +673,24 @@ impl Executor {
                         }
                     }
                 }
+                registered
             } else if let Some(&source) = normalized_sources.get(&record.quantifier) {
-                let _ = self
-                    .proof_tracker
+                self.proof_tracker
                     .add_normalized_forall_instantiated_assertion(
                         &mut self.ctx.terms,
                         source,
                         record.quantifier,
                         &record.binding,
                         record.instance,
-                    );
+                    )
+            } else {
+                None
+            };
+            if registered.is_none() {
+                // The instance remains a valid semantic consequence, but no
+                // authored-scope derivation exists for its solver assumption.
+                // Result mapping must not export a raw proof that depends on it.
+                self.quantified_proof_translation_incomplete = true;
             }
         }
     }
@@ -643,7 +726,7 @@ impl Executor {
     pub(super) fn add_diagonal_forall_instances(&mut self, quantifiers: &[TermId]) {
         let seed = self.ctx.assertions.clone();
         let by_sort = collect_ground_terms_by_sort(&self.ctx.terms, &seed);
-        let mut to_add: Vec<TermId> = Vec::new();
+        let mut to_add: Vec<crate::ematching::ForallInstantiationProvenance> = Vec::new();
         for &quant in quantifiers {
             // A no_mbqi ("E-matching only") quantifier — the Hilbert-`choose`
             // combined axiom `forall i,j. P(i,j) => P(chosen)` — must NOT receive
@@ -681,14 +764,34 @@ impl Executor {
                 for n in &names {
                     subst.insert(n.clone(), c);
                 }
-                to_add.push(subst_vars(&mut self.ctx.terms, body, &subst));
+                let instance = subst_vars(&mut self.ctx.terms, body, &subst);
+                to_add.push(crate::ematching::ForallInstantiationProvenance {
+                    quantifier: quant,
+                    binding: vec![c; vars.len()],
+                    instance,
+                });
             }
         }
         if !to_add.is_empty() {
+            if self.produce_proofs_enabled() {
+                for record in &mut to_add {
+                    match self.exact_forall_instance(record.quantifier, &record.binding) {
+                        Some(exact) => record.instance = exact,
+                        None => self.quantified_proof_translation_incomplete = true,
+                    }
+                }
+            }
+            self.register_ematching_proof_provenance(&to_add);
             let mut seen: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
-            self.ctx
-                .assertions
-                .extend(to_add.into_iter().filter(|t| seen.insert(*t)));
+            for record in to_add {
+                if seen.insert(record.instance) {
+                    self.ctx.assertions.push(record.instance);
+                }
+                // The term is now present either as an authored/root assertion
+                // or as the just-added consequence.  Record its independently
+                // authenticated universal support in both cases.
+                self.push_active_support_axiom(record.instance);
+            }
         }
     }
 
@@ -711,7 +814,8 @@ impl Executor {
         let mut bool_candidates =
             crate::ematching::collect_bool_uf_arg_terms(&self.ctx.terms, &self.ctx.assertions);
         bool_candidates.truncate(MAX_BOOL_GROUND_CANDIDATES);
-        crate::skolemize::set_bool_ground_instantiation_candidates(bool_candidates);
+        let _bool_ground_scope =
+            crate::skolemize::scoped_bool_ground_instantiation_candidates(bool_candidates);
         let mut expanded = Vec::new();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
@@ -821,10 +925,8 @@ impl Executor {
             }
             self.ctx.assertions[idx] = ground;
         }
-        // #bool-ground-inst: clear the scoped candidate set (mirrors the
-        // `set_derived_consts` discipline — never visible to a nested
-        // sub-solve, which must re-derive candidates from ITS assertions).
-        crate::skolemize::set_bool_ground_instantiation_candidates(Vec::new());
+        // `_bool_ground_scope` restores the predecessor here (and on unwind),
+        // so a nested sub-solve must derive candidates from ITS assertions.
     }
 
     /// Skolemize existential quantifiers via polarity-aware deep walk.
@@ -1942,6 +2044,13 @@ impl Executor {
         } else {
             0
         };
+        if promoted_count > 0 {
+            // Deferred entries are currently promoted as bare TermIds; their
+            // source quantifier and binding are not threaded into the proof
+            // tracker.  Keep the semantic consequence, but require the final
+            // UNSAT to pass through the verdict-only artifact firewall.
+            self.quantified_proof_translation_incomplete = true;
+        }
         promoted_count
     }
 
@@ -2019,6 +2128,15 @@ impl Executor {
             let is_forall = matches!(self.ctx.terms.get(quant), TermData::Forall(..));
             let is_triggerless_cegqi_forall =
                 !has_triggers && is_forall && is_cegqi_candidate(&self.ctx.terms, quant);
+            // Some fixed arithmetic predicates/conversions (notably `is_int`)
+            // are intentionally outside the general CEGQI candidate fragment,
+            // but exact ground evaluation can still refute a false universal at
+            // the deterministic arithmetic basis supplied by enumeration. This
+            // only enables consequence generation; a non-refuting finite basis
+            // remains unhandled and therefore cannot authorize SAT.
+            let is_triggerless_interpreted_forall = !has_triggers
+                && is_forall
+                && crate::ematching::contains_fixed_interpreted_arithmetic(&self.ctx.terms, quant);
             // (#auflia-disjunct-forall-false-unsat) A `forall` the assertion set
             // does NOT ENTAIL — one reachable only under a positive `or`/`=>` or
             // an `ite` — must not be instantiated here either. `enumerative_
@@ -2043,6 +2161,7 @@ impl Executor {
             let should_process = !self.ctx.terms.is_no_mbqi(quant)
                 && quant_is_entailed_forall
                 && (is_triggerless_cegqi_forall
+                    || is_triggerless_interpreted_forall
                     || (ematching_has_uninstantiated
                         && ematching_uninstantiated_quantifiers.contains(&quant)));
             if !should_process {
@@ -2069,9 +2188,33 @@ impl Executor {
                     quant,
                     100,
                 );
-                for inst in enum_insts {
+                let mut proof_records = Vec::with_capacity(enum_insts.len());
+                let exact_instances_required = self.produce_proofs_enabled();
+                for (binding, simplified_instance) in enum_insts {
+                    let inst = if exact_instances_required {
+                        match self.exact_forall_instance(quant, &binding) {
+                            Some(exact) => exact,
+                            None => {
+                                // Keep the semantic instance for solver
+                                // completeness.  Its UNSAT use remains blocked
+                                // because no strict forall_inst translation was
+                                // produced for this unsupported body shape.
+                                self.quantified_proof_translation_incomplete = true;
+                                simplified_instance
+                            }
+                        }
+                    } else {
+                        simplified_instance
+                    };
                     self.ctx.assertions.push(inst);
+                    self.push_active_support_axiom(inst);
+                    proof_records.push(crate::ematching::ForallInstantiationProvenance {
+                        quantifier: quant,
+                        binding,
+                        instance: inst,
+                    });
                 }
+                self.register_ematching_proof_provenance(&proof_records);
             }
 
             let mut handled_by_cegqi = false;
@@ -2211,15 +2354,37 @@ impl Executor {
         &mut self,
         refinement_assertions: &Option<Vec<TermId>>,
         _prev_uninstantiated: &HashSet<TermId>,
+        cegqi_ce_lemma_ids: &[TermId],
     ) -> (bool, Option<EmatchingSummary>) {
         let Some(ref_assertions) = refinement_assertions else {
             return (false, None);
         };
 
-        // Build combined assertion set: current stripped assertions + quantifiers
-        // from the refinement snapshot. This lets E-matching see both the new
-        // ground terms from enumerative/CEGQI and the quantifier patterns.
-        let mut combined = self.ctx.assertions.clone();
+        // Build the post-pass index from genuine ground assertions and sound
+        // instances, never from CEGQI's temporary counterexample assumptions.
+        //
+        // Indexing `not B(ce)` lets the matcher use the internal CE witness as
+        // a ground substitution for the same `forall x. B(x)`. It then asserts
+        // `B(ce)` beside `not B(ce)`, manufacturing an immediate conflict that
+        // says nothing about the authored problem. In particular,
+        //
+        //   forall i. 0 <= f(i),  f(x) = 5
+        //
+        // is satisfiable, but the unquarantined pass added `0 <= f(ce)` beside
+        // its search assumption `f(ce) < 0` and reported UNSAT. The CE IDs are
+        // CE-exclusive (the setup filter deliberately omits any hash-consed ID
+        // that was already a genuine assertion), so removing these roots cannot
+        // hide authored ground evidence. Enumerative and prior E-matching
+        // instances remain indexed and preserve this pass's intended trigger
+        // propagation.
+        let ce_only: HashSet<TermId> = cegqi_ce_lemma_ids.iter().copied().collect();
+        let mut combined: Vec<TermId> = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .filter(|term| !ce_only.contains(term))
+            .collect();
         for &a in ref_assertions {
             if contains_quantifier(&self.ctx.terms, a) && !combined.contains(&a) {
                 combined.push(a);
@@ -2245,8 +2410,13 @@ impl Executor {
         // exact function of `combined`, so no separate cache invalidation is
         // needed here (the incremental match-state design supersedes the old
         // `invalidate_index` cached-TermIndex path).
-        let ematching_result =
+        let mut ematching_result =
             qm.run_ematching_round(&mut self.ctx.terms, &combined, euf_model_ref, &should_stop);
+        self.materialize_exact_ematching_instances(
+            &mut ematching_result.instantiations,
+            &mut ematching_result.unconditional_forall_roots,
+            &mut ematching_result.unconditional_forall_instantiations,
+        );
         self.register_ematching_proof_provenance(
             &ematching_result.unconditional_forall_instantiations,
         );
@@ -2601,7 +2771,7 @@ mod tests {
     ) -> (TermId, String) {
         let binder_name = format!("{prefix}_x");
         let x = terms.mk_var(&binder_name, Sort::Int);
-        let upper = terms.mk_var(&format!("{prefix}_upper"), Sort::Int);
+        let upper = terms.mk_var(format!("{prefix}_upper"), Sort::Int);
         let zero = terms.mk_int(BigInt::from(0));
         let p_x = terms.mk_app(Symbol::named(predicate), [x], Sort::Bool);
         let nonnegative = terms.mk_le(zero, x);
@@ -2775,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_nnf_record_from_nested_nonroot_forall_is_filtered() {
+    fn uncertified_nested_nnf_rewrite_is_retained_and_filtered() {
         let mut exec = Executor::new();
         exec.set_produce_proofs(true);
         let (nested, binder_name) =
@@ -2801,7 +2971,14 @@ mod tests {
             .copied()
             .find(|&term| matches!(exec.ctx.terms.get(term), TermData::Forall(..)))
             .expect("nested forall must remain present");
-        assert_ne!(normalized, nested);
+        assert_eq!(
+            *rewritten_root, root,
+            "proof mode must retain a nested rewrite whose conjunction projection is not certified"
+        );
+        assert_eq!(
+            normalized, nested,
+            "retaining the authored root must also retain its unauthored nested forall"
+        );
         let (_, exact_sources) = classify_ematching_proof_sources(
             exec.proof_problem_assertion_provenance
                 .as_ref()
@@ -2809,7 +2986,7 @@ mod tests {
         );
         assert!(
             !exact_sources.contains_key(&normalized),
-            "a constructor-minted record cannot authorize a non-root source"
+            "an uncertified nested rewrite cannot authorize a non-root source"
         );
 
         let value = exec.ctx.terms.mk_var("nested_nnf_k", Sort::Int);

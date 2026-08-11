@@ -7,12 +7,19 @@
 //! Implements propositional resolution checking and reverse-unit-propagation
 //! (RUP) for DRUP proof steps in Alethe proofs.
 
-use super::boolean::{matches_negation_of_term, matches_positive_literal_of_term};
+#[path = "resolution_exact.rs"]
+mod exact;
+#[path = "resolution_parity.rs"]
+mod parity;
+
 // #8529/#8857: Use deterministic hash collections for reproducible proof output.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{AletheRule, ProofId, TermData, TermId, TermStore};
+use ay_core::kani_compat::{
+    det_hash_set_with_capacity, DetHashMap as HashMap, DetHashSet as HashSet,
+};
+use ay_core::{AletheRule, Constant, ProofId, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
+use parity::{chain_resolve_candidates, clause_as_set, resolves_to};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct SignedLiteral {
@@ -29,40 +36,14 @@ impl SignedLiteral {
     }
 }
 
-pub(crate) fn decode_literal(terms: &TermStore, literal: TermId) -> SignedLiteral {
-    match terms.get(literal) {
-        TermData::Not(inner) => SignedLiteral {
-            atom: *inner,
-            positive: false,
-        },
-        _ => SignedLiteral {
-            atom: literal,
-            positive: true,
-        },
+fn decode_literal(terms: &TermStore, literal: TermId) -> SignedLiteral {
+    let mut atom = literal;
+    let mut positive = true;
+    while let TermData::Not(inner) = terms.get(atom) {
+        atom = *inner;
+        positive = !positive;
     }
-}
-
-/// Decode a clause into a sorted, deduplicated literal set.
-///
-/// #proof-tax: this used to build a `DetHashSet` per clause per resolution
-/// step — three hash-table allocations + rehashes for every checked step,
-/// which dominated the checker's profile on resolution-heavy proofs
-/// (`storecomm` QF_AX family). A sorted `Vec` with `binary_search` has the
-/// identical SET semantics (dedup + membership) at a fraction of the cost
-/// for conflict-analysis-sized clauses.
-fn clause_as_set(terms: &TermStore, clause: &[TermId]) -> Vec<SignedLiteral> {
-    let mut set: Vec<SignedLiteral> = clause
-        .iter()
-        .map(|literal| decode_literal(terms, *literal))
-        .collect();
-    set.sort_unstable();
-    set.dedup();
-    set
-}
-
-#[inline]
-fn set_contains(set: &[SignedLiteral], lit: SignedLiteral) -> bool {
-    set.binary_search(&lit).is_ok()
+    SignedLiteral { atom, positive }
 }
 
 pub(crate) fn is_valid_binary_resolution(
@@ -78,145 +59,21 @@ pub(crate) fn is_valid_binary_resolution(
 
     if let Some(pivot_term) = pivot {
         let pivot_lit = decode_literal(terms, pivot_term);
-        if resolve_on_pivot(&clause1_set, &clause2_set, pivot_lit, &conclusion_set)
-            || resolve_on_pivot(
+        return resolves_to(&clause1_set, &clause2_set, pivot_lit, &conclusion_set)
+            || resolves_to(
                 &clause1_set,
                 &clause2_set,
                 pivot_lit.negated(),
                 &conclusion_set,
-            )
-        {
-            return true;
-        }
-
-        return resolve_on_semantic_pivot(terms, clause1, clause2, conclusion, Some(pivot_term));
+            );
     }
 
-    if clause1_set
+    clause1_set
         .iter()
-        .any(|pivot_lit| resolve_on_pivot(&clause1_set, &clause2_set, *pivot_lit, &conclusion_set))
-        || clause2_set.iter().any(|pivot_lit| {
-            resolve_on_pivot(&clause2_set, &clause1_set, *pivot_lit, &conclusion_set)
-        })
-    {
-        return true;
-    }
-
-    resolve_on_semantic_pivot(terms, clause1, clause2, conclusion, None)
-}
-
-fn resolve_on_pivot(
-    left: &[SignedLiteral],
-    right: &[SignedLiteral],
-    pivot: SignedLiteral,
-    expected: &[SignedLiteral],
-) -> bool {
-    let neg_pivot = pivot.negated();
-    if !set_contains(left, pivot) || !set_contains(right, neg_pivot) {
-        return false;
-    }
-
-    // The resolvent is (left \ {pivot}) ∪ (right \ {¬pivot}); check equality
-    // with `expected` by a single three-way merge over the sorted, deduped
-    // literal sets (#proof-tax — per-literal membership probes made this the
-    // hottest checker leaf on wide-clause QF_AX proofs). `left` skips ONLY
-    // `pivot` and `right` skips ONLY `¬pivot` (each may still contribute the
-    // other's pivot literal), exactly the legacy set-equality semantics.
-    let mut i = 0usize; // left cursor
-    let mut j = 0usize; // right cursor
-    let mut k = 0usize; // expected cursor
-    loop {
-        if i < left.len() && left[i] == pivot {
-            i += 1;
-            continue;
-        }
-        if j < right.len() && right[j] == neg_pivot {
-            j += 1;
-            continue;
-        }
-        // Next element of the union in sorted order (dedup across sides).
-        let next = match (left.get(i), right.get(j)) {
-            (None, None) => break,
-            (Some(&l), None) => {
-                i += 1;
-                l
-            }
-            (None, Some(&r)) => {
-                j += 1;
-                r
-            }
-            (Some(&l), Some(&r)) => {
-                if l < r {
-                    i += 1;
-                    l
-                } else if r < l {
-                    j += 1;
-                    r
-                } else {
-                    i += 1;
-                    j += 1;
-                    l
-                }
-            }
-        };
-        if k >= expected.len() || expected[k] != next {
-            return false;
-        }
-        k += 1;
-    }
-    k == expected.len()
-}
-
-fn resolve_on_semantic_pivot(
-    terms: &TermStore,
-    left: &[TermId],
-    right: &[TermId],
-    expected: &[TermId],
-    pivot: Option<TermId>,
-) -> bool {
-    let expected_set: HashSet<TermId> = expected.iter().copied().collect();
-    for (left_idx, &left_lit) in left.iter().enumerate() {
-        for (right_idx, &right_lit) in right.iter().enumerate() {
-            if !are_complements(terms, left_lit, right_lit) {
-                continue;
-            }
-            if let Some(pivot_term) = pivot {
-                if !pair_matches_pivot(terms, left_lit, right_lit, pivot_term) {
-                    continue;
-                }
-            }
-
-            let mut resolvent: HashSet<TermId> = HashSet::default();
-            for (idx, &lit) in left.iter().enumerate() {
-                if idx != left_idx {
-                    resolvent.insert(lit);
-                }
-            }
-            for (idx, &lit) in right.iter().enumerate() {
-                if idx != right_idx {
-                    resolvent.insert(lit);
-                }
-            }
-
-            if resolvent == expected_set {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn are_complements(terms: &TermStore, left: TermId, right: TermId) -> bool {
-    matches_negation_of_term(terms, left, right) || matches_negation_of_term(terms, right, left)
-}
-
-fn pair_matches_pivot(terms: &TermStore, left: TermId, right: TermId, pivot: TermId) -> bool {
-    // Either left matches pivot positively and right matches negation, or vice versa.
-    // (Previous version had 4 arms; arms 3 and 4 duplicated arms 2 and 1.)
-    (matches_positive_literal_of_term(terms, left, pivot)
-        && matches_negation_of_term(terms, right, pivot))
-        || (matches_positive_literal_of_term(terms, right, pivot)
-            && matches_negation_of_term(terms, left, pivot))
+        .any(|pivot| resolves_to(&clause1_set, &clause2_set, *pivot, &conclusion_set))
+        || clause2_set
+            .iter()
+            .any(|pivot| resolves_to(&clause2_set, &clause1_set, *pivot, &conclusion_set))
 }
 
 pub(crate) fn is_valid_rup_step(
@@ -315,22 +172,33 @@ fn assign_literal(assignments: &mut HashMap<TermId, bool>, literal: SignedLitera
     }
 }
 
-/// `resolution` / `th_resolution` of ANY arity. Arity 2 keeps the exact
-/// binary check it always had; every other arity folds the chain (see
-/// [`validate_chain_resolution_rule`]).
+/// `resolution` / `th_resolution` of any arity. A non-empty Alethe `:args`
+/// list selects the pivot-directed form; otherwise binary resolution infers a
+/// pivot and larger arities use the bounded chain search.
 pub(crate) fn validate_resolution_rule(
     terms: &TermStore,
     step_id: ProofId,
     rule: &AletheRule,
     clause: &[TermId],
     premise_clauses: &[&[TermId]],
-    pivot: Option<TermId>,
+    args: &[TermId],
 ) -> Result<(), ProofCheckError> {
+    if !args.is_empty() {
+        return validate_pivot_directed_resolution_rule(
+            terms,
+            step_id,
+            rule,
+            clause,
+            premise_clauses,
+            args,
+        );
+    }
+
     if premise_clauses.len() != 2 {
         return validate_chain_resolution_rule(terms, step_id, rule, clause, premise_clauses);
     }
 
-    if !is_valid_binary_resolution(terms, premise_clauses[0], premise_clauses[1], clause, pivot) {
+    if !is_valid_binary_resolution(terms, premise_clauses[0], premise_clauses[1], clause, None) {
         return Err(ProofCheckError::InvalidResolution {
             step: step_id,
             rule: rule.name().to_string(),
@@ -338,6 +206,54 @@ pub(crate) fn validate_resolution_rule(
     }
 
     Ok(())
+}
+
+/// Alethe's argument-directed resolution form. Each link contributes exactly
+/// `(pivot, polarity)`: `true` means the pivot occurs in the accumulator and
+/// its negation occurs in the next premise; `false` means the reverse.
+fn validate_pivot_directed_resolution_rule(
+    terms: &TermStore,
+    step_id: ProofId,
+    rule: &AletheRule,
+    clause: &[TermId],
+    premise_clauses: &[&[TermId]],
+    args: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let invalid = || ProofCheckError::InvalidResolution {
+        step: step_id,
+        rule: rule.name().to_string(),
+    };
+    if premise_clauses.len() < 2
+        || args.len() != premise_clauses.len().saturating_sub(1).saturating_mul(2)
+    {
+        return Err(invalid());
+    }
+
+    let mut accumulator =
+        exact::clause_as_unique_set(terms, premise_clauses[0]).ok_or_else(&invalid)?;
+    for (next, annotation) in premise_clauses[1..].iter().zip(args.chunks_exact(2)) {
+        let polarity = match terms.get(annotation[1]) {
+            TermData::Const(Constant::Bool(value)) => *value,
+            _ => return Err(invalid()),
+        };
+        let pivot = exact::decode_literal(terms, annotation[0]);
+        let negated_pivot = pivot.with_outer_not().ok_or_else(&invalid)?;
+        let (current_pivot, next_pivot) = if polarity {
+            (pivot, negated_pivot)
+        } else {
+            (negated_pivot, pivot)
+        };
+        let next = exact::clause_as_unique_set(terms, next).ok_or_else(&invalid)?;
+        accumulator = exact::resolve_clause(&accumulator, &next, current_pivot, next_pivot)
+            .ok_or_else(&invalid)?;
+    }
+
+    let conclusion = exact::clause_as_unique_set(terms, clause).ok_or_else(&invalid)?;
+    if accumulator == conclusion {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 /// N-ary (chain) `resolution` / `th_resolution`.
@@ -361,22 +277,17 @@ pub(crate) fn validate_resolution_rule(
 ///
 /// SEMANTICS — deliberately STRICTER than carcara. The accumulator starts at
 /// the first premise; every later premise must contribute exactly one
-/// complementary literal pair, and the accumulator loses the pivot. Two
-/// deviations from carcara 1.1.0, both fail-closed:
+/// complementary literal pair, and the accumulator loses the pivot. One
+/// deliberate deviation from carcara 1.1.0 is fail-closed:
 ///
 ///  * carcara silently ABSORBS premises once the accumulator is empty
 ///    (verified: `(cl (not P1)) , P1 , P2 ⊢ (cl)` checks there, though the true
 ///    resolvent is `{P2}`). Here a premise that does not resolve is an error.
-///  * an AMBIGUOUS link (two distinct complementary pairs, i.e. two different
-///    resolvents) is rejected rather than guessed, since guessing wrong would
-///    silently change the accumulated clause.
 ///
-/// Complement detection is `are_complements`, the same notion the binary path
-/// falls back on (`resolve_on_semantic_pivot`), so double negations such as
-/// `(not (not X))` vs `(not X)` pair up exactly as they do today. `:args` are
-/// ignored: for a chain they are per-link (pivot, polarity) pairs, and the
-/// folded resolvent is compared against the declared clause regardless, so they
-/// can only ever be a hint.
+/// Literals are normalized only by leading-`not` parity. This matches
+/// Carcara's argument-free RUP fallback. A De Morgan equivalent such as
+/// `(and a b)` versus `(or (not a) (not b))` remains a distinct atom and is not
+/// a resolution pivot.
 pub(crate) fn validate_chain_resolution_rule(
     terms: &TermStore,
     step_id: ProofId,
@@ -399,7 +310,38 @@ pub(crate) fn validate_chain_resolution_rule(
         rule: rule.name().to_string(),
     };
 
-    let target = dedup_terms(clause);
+    // The finite-enum certificate is a complete positive equality graph
+    // followed by one negative unit for every edge. Validate that common
+    // unit-tail shape as a deterministic set subtraction. Besides avoiding the
+    // generic ambiguity search, this avoids rebuilding the shrinking
+    // accumulator once per edge (quadratic work on large direct cliques).
+    // Any all-unit-tail chain is decided here; malformed instances do not fall
+    // through to a more permissive interpretation.
+    if premise_clauses[1..]
+        .iter()
+        .all(|premise| premise.len() == 1)
+    {
+        let mut accumulator = det_hash_set_with_capacity(premise_clauses[0].len());
+        for &literal in premise_clauses[0] {
+            accumulator.insert(decode_literal(terms, literal));
+        }
+        for premise in &premise_clauses[1..] {
+            let unit = decode_literal(terms, premise[0]);
+            if !accumulator.remove(&unit.negated()) {
+                return Err(invalid());
+            }
+        }
+        let mut target = det_hash_set_with_capacity(clause.len());
+        for &literal in clause {
+            target.insert(decode_literal(terms, literal));
+        }
+        if accumulator == target {
+            return Ok(());
+        }
+        return Err(invalid());
+    }
+
+    let target = clause_as_set(terms, clause);
 
     // BOUNDED SEARCH over the ambiguous links, not a unique-pair demand.
     //
@@ -415,11 +357,9 @@ pub(crate) fn validate_chain_resolution_rule(
     // (a link that resolves on nothing is still an error), so this only relaxes
     // UNIQUENESS.
     //
-    // `:args` cannot help here even though the doc above suggests they might:
-    // every n-ary `th_resolution` emitter in `ay-dpll` passes `Vec::new()` for
-    // args (`executor/proof_rewrite_division.rs`), so the per-link pivots are
-    // simply absent from AY's own proofs. Searching is the only route that works
-    // on them.
+    // This is the argument-FREE fallback. AY's n-ary `th_resolution` emitter
+    // currently omits pivots, so ambiguous links must be searched rather than
+    // guessed; annotated proofs take the directed path above instead.
     //
     // Cost of the old behaviour, measured: `pushscope_repro` computes a correct
     // `unsat`, certification rejects `step t110 has invalid th_resolution
@@ -434,7 +374,8 @@ pub(crate) fn validate_chain_resolution_rule(
         .saturating_mul(CHAIN_BRANCH_BUDGET_PER_LINK)
         .saturating_add(CHAIN_BRANCH_BUDGET_BASE);
 
-    let mut stack: Vec<(usize, Vec<TermId>)> = vec![(1, dedup_terms(premise_clauses[0]))];
+    let mut stack: Vec<(usize, Vec<SignedLiteral>)> =
+        vec![(1, clause_as_set(terms, premise_clauses[0]))];
     while let Some((idx, acc)) = stack.pop() {
         if idx == premise_clauses.len() {
             if acc == target {
@@ -446,7 +387,8 @@ pub(crate) fn validate_chain_resolution_rule(
             break;
         }
         budget -= 1;
-        for resolvent in chain_resolve_candidates(terms, &acc, premise_clauses[idx]) {
+        let next = clause_as_set(terms, premise_clauses[idx]);
+        for resolvent in chain_resolve_candidates(&acc, &next, CHAIN_MAX_PAIRS_PER_LINK) {
             stack.push((idx + 1, resolvent));
         }
     }
@@ -460,50 +402,3 @@ const CHAIN_BRANCH_BUDGET_BASE: usize = 256;
 /// Most complementary pairs considered at one link. Beyond this the link is too
 /// ambiguous to search and the step is rejected.
 const CHAIN_MAX_PAIRS_PER_LINK: usize = 8;
-
-/// Sorted, deduplicated literal set. Terms are hash-consed, so `TermId`
-/// equality IS syntactic literal equality and this is the same set the
-/// `SignedLiteral` decoding would produce (the decoding is injective on
-/// `TermId`s), just without the per-clause re-decode.
-fn dedup_terms(clause: &[TermId]) -> Vec<TermId> {
-    let mut set = clause.to_vec();
-    set.sort_unstable();
-    set.dedup();
-    set
-}
-
-/// One link of the chain: resolve `acc` against `next` on their unique
-/// complementary literal pair. `None` (→ rejection) when the pair does not
-/// exist or is not unique.
-fn chain_resolve_candidates(
-    terms: &TermStore,
-    acc: &[TermId],
-    next: &[TermId],
-) -> Vec<Vec<TermId>> {
-    let next_set = dedup_terms(next);
-
-    let mut pairs: Vec<(TermId, TermId)> = Vec::new();
-    for &left in acc {
-        for &right in &next_set {
-            if !are_complements(terms, left, right) {
-                continue;
-            }
-            pairs.push((left, right));
-            if pairs.len() > CHAIN_MAX_PAIRS_PER_LINK {
-                // Too ambiguous to search; fail closed.
-                return Vec::new();
-            }
-        }
-    }
-
-    pairs
-        .into_iter()
-        .map(|(pivot, neg_pivot)| {
-            let mut resolvent: Vec<TermId> = acc.iter().copied().filter(|&l| l != pivot).collect();
-            resolvent.extend(next_set.iter().copied().filter(|&l| l != neg_pivot));
-            resolvent.sort_unstable();
-            resolvent.dedup();
-            resolvent
-        })
-        .collect()
-}

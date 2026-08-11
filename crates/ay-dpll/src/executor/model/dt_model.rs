@@ -14,7 +14,7 @@ use ay_core::term::TermData;
 use ay_core::{quote_symbol, Sort, TermId, TermStore};
 use num_rational::BigRational;
 
-use crate::executor_format::{format_default_value, format_sort};
+use crate::executor_format::{format_default_value_surface, format_sort_surface};
 
 use super::{EvalValue, Executor, Model};
 
@@ -196,6 +196,7 @@ pub(super) fn with_dt_field_overrides_for_test<R>(
 impl Executor {
     /// Check whether a symbol is a datatype-internal symbol (constructor, tester,
     /// or selector) that should be excluded from `get-model` output (#5412).
+    #[cfg(test)]
     pub(in crate::executor) fn is_dt_internal_symbol(&self, name: &str) -> bool {
         // Ask the declaration registry, which checks both exact internal
         // identities and their surface aliases. This is essential for native
@@ -205,10 +206,74 @@ impl Executor {
         self.ctx.is_datatype_member_name(name)
     }
 
+    /// Classify a core identity already read from `TermData`. Unlike the live
+    /// surface predicate above, this remains true for an authenticated member
+    /// of a popped datatype declaration whose exact term is still retained.
+    pub(in crate::executor) fn is_exact_dt_internal_symbol(&self, identity: &str) -> bool {
+        self.ctx.exact_datatype_member_info(identity).is_some()
+    }
+
     /// User-facing surface name of a (possibly instance-mangled) datatype
     /// constructor/selector internal name, for model / `get-value` output.
     pub(super) fn dt_surface<'a>(&'a self, name: &'a str) -> &'a str {
-        self.ctx.dt_surface_name(name).unwrap_or(name)
+        self.ctx.output_symbol_name(name)
+    }
+
+    /// The NULLARY constructor the EUF model puts in `term`'s OWN equivalence
+    /// class, or `None` (#dt-app-euf-class).
+    ///
+    /// This READS the model: `EufModel::term_values` maps a term to the element
+    /// token of its congruence class, so `term_values[term] ==
+    /// term_values[ctor_term]` is the model's own statement that `term = cK`.
+    /// Returning `cK` therefore publishes a value the solver committed — it is
+    /// the same equivalence-class match `(get-value)` already prints through
+    /// [`Self::resolve_dt_value`] strategy 2, factored out so the independent
+    /// gate can read the PRINTED value without also inheriting that function's
+    /// under-determined canonical-default fallback, which would be exactly the
+    /// model invention the gate exists to prevent.
+    ///
+    /// FAIL-CLOSED, three ways:
+    /// * no EUF model, or no token for `term` ⇒ `None`;
+    /// * no nullary constructor shares the token ⇒ `None` (the class is an
+    ///   abstract `@Sort!n` representative and nothing pins it to a value);
+    /// * TWO OR MORE DISTINCT constructors share the token ⇒ `None`. That
+    ///   would be the model asserting `c0 = c1` between distinct nullary
+    ///   constructors, which no datatype model satisfies; taking the first (as
+    ///   the printer's first-match loop did) would let an incoherent class
+    ///   decide a gate value. Requiring uniqueness is strictly stronger.
+    ///
+    /// Cost is `O(#constructors)` hash lookups — deliberately NOT the
+    /// `O(#terms)` tester scan in `resolve_dt_value`, whose per-leaf cost is the
+    /// measured 39x model-emit regression that confines the leaf-side printed
+    /// backstop to selector-bearing datatypes (see `independent_gate::leaf_value`).
+    pub(super) fn dt_euf_class_constructor(&self, model: &Model, term: TermId) -> Option<String> {
+        let sort = self.ctx.terms.sort(term).clone();
+        let dt_name = self.datatype_sort_name(&sort)?;
+        let euf_model = model.euf_model.as_ref()?;
+        let elem = euf_model.term_values.get(&term)?;
+        let (_, constructors) = self.ctx.datatype_iter().find(|(dt, _)| *dt == dt_name)?;
+        let mut found: Option<String> = None;
+        for ctor_name in constructors {
+            let Some(info) = self.ctx.symbol_info_by_identity(ctor_name) else {
+                continue;
+            };
+            if !info.arg_sorts.is_empty() {
+                continue; // non-nullary: a bare class token carries no fields
+            }
+            let Some(ctor_term_id) = info.term else {
+                continue;
+            };
+            if euf_model.term_values.get(&ctor_term_id) != Some(elem) {
+                continue;
+            }
+            match &found {
+                None => found = Some(ctor_name.clone()),
+                // A second, DIFFERENT constructor in the same class: incoherent.
+                Some(prev) if prev != ctor_name => return None,
+                Some(_) => {}
+            }
+        }
+        found
     }
 
     /// Resolve a DT-sorted variable's value to a constructor expression (#5412).
@@ -299,21 +364,18 @@ impl Executor {
             }
 
             // Strategy 2: For combined DT+UF solvers with EUF model, match by
-            // equivalence class (nullary constructors share the same element name).
-            if let Some(ref euf_model) = model.euf_model {
-                if let Some(elem) = euf_model.term_values.get(&var_term_id) {
-                    for ctor_name in constructors {
-                        if let Some(info) = self.ctx.symbol_info_by_identity(ctor_name) {
-                            if info.arg_sorts.is_empty() {
-                                if let Some(ctor_term_id) = info.term {
-                                    if euf_model.term_values.get(&ctor_term_id) == Some(elem) {
-                                        return Some(ctor_name.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            // equivalence class (nullary constructors share the same element
+            // name). Delegated to `dt_euf_class_constructor` so the printer and
+            // the independent gate read the SAME class match from ONE
+            // implementation and cannot drift (#dt-app-euf-class). The only
+            // behavioural difference from the inlined first-match loop this
+            // replaced is that a class containing two DISTINCT nullary
+            // constructors now declines instead of printing whichever came
+            // first: that class is an incoherent model either way, and
+            // declining falls through to the strategies below rather than
+            // committing to an arbitrary one of two contradictory values.
+            if let Some(ctor_name) = self.dt_euf_class_constructor(model, var_term_id) {
+                return Some(ctor_name);
             }
 
             // Strategy 3: Single-constructor DTs always use that constructor.
@@ -542,7 +604,7 @@ impl Executor {
                     .map(|(_, fs)| fs.clone())
                     .or_else(|| {
                         self.ctx
-                            .symbol_info_by_identity(sel_name)
+                            .exact_datatype_member_info(sel_name)
                             .map(|info| info.sort.clone())
                     });
                 if let Some(sel_sort) = field_sort {
@@ -851,6 +913,38 @@ impl Executor {
         }
     }
 
+    /// Exact datatype carriers relevant to the current query/model boundary.
+    /// Live declarations are always eligible. A popped declaration becomes
+    /// eligible only when an authenticated retained term using its carrier was
+    /// explicitly re-asserted; merely surviving in the sticky term store must
+    /// not make model output re-expose its old source names.
+    fn query_relevant_datatype_carriers(&self) -> HashSet<String> {
+        let all: HashSet<String> = self
+            .ctx
+            .datatype_iter()
+            .map(|(carrier, _)| carrier.to_string())
+            .collect();
+        let mut relevant: HashSet<String> = self
+            .ctx
+            .live_datatype_iter()
+            .map(|(carrier, _)| carrier.to_string())
+            .collect();
+        let mut stack = self.ctx.assertions.clone();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        while let Some(term) = stack.pop() {
+            if !visited.insert(term) {
+                continue;
+            }
+            if let Sort::Uninterpreted(carrier) = self.ctx.terms.sort(term) {
+                if all.contains(carrier) {
+                    relevant.insert(carrier.clone());
+                }
+            }
+            stack.extend(self.ctx.terms.children(term));
+        }
+        relevant
+    }
+
     /// A concrete, skolem-free canonical default value of any sort, as SMT-LIB
     /// text — for rendering a fully unconstrained / under-determined model value
     /// (#model-witness-no-skolem).
@@ -869,16 +963,16 @@ impl Executor {
         match sort {
             Sort::Array(arr) => format!(
                 "((as const {}) {})",
-                format_sort(sort),
+                format_sort_surface(&self.ctx, sort),
                 self.canonical_default_value_guarded(&arr.element_sort, visited)
             ),
             Sort::Datatype(dt) => self
                 .datatype_canonical_value(&dt.name, visited)
-                .unwrap_or_else(|| format_default_value(sort)),
+                .unwrap_or_else(|| format_default_value_surface(&self.ctx, sort)),
             Sort::Uninterpreted(name) => self
                 .datatype_canonical_value(name, visited)
-                .unwrap_or_else(|| format_default_value(sort)),
-            _ => format_default_value(sort),
+                .unwrap_or_else(|| format_default_value_surface(&self.ctx, sort)),
+            _ => format_default_value_surface(&self.ctx, sort),
         }
     }
 
@@ -2682,10 +2776,16 @@ impl Executor {
         // Insertion-ordered (name, info) list; datatype_iter order is
         // deterministic and small, so linear find is fine.
         let mut sel_infos: Vec<(String, SelInfo)> = Vec::new();
+        let relevant_carriers = self.query_relevant_datatype_carriers();
         for (dt_name, ctors) in self.ctx.datatype_iter() {
-            // A parametric INSTANCE registers members under mangled internal
-            // names with a surface mapping — skip the whole instance.
-            if ctors.iter().any(|c| self.ctx.dt_surface_name(c).is_some()) {
+            if !relevant_carriers.contains(dt_name) {
+                continue;
+            }
+            // Selector totalization for parametric instances is handled by
+            // their instance-specific path. Do not infer this from member
+            // surface mappings: scoped monomorphic reincarnations also carry
+            // private mapped member identities.
+            if self.ctx.is_parametric_datatype_instance(dt_name) {
                 continue;
             }
             for ctor in ctors {
@@ -2894,7 +2994,7 @@ impl Executor {
                     "  (define-fun {sel} ((@p0 {dt})) {ret} ({sel} @p0))",
                     sel = quote_symbol(name),
                     dt = quote_symbol(&info.dt_name),
-                    ret = format_sort(&info.ret_sort),
+                    ret = format_sort_surface(&self.ctx, &info.ret_sort),
                 ));
                 continue;
             }
@@ -2919,7 +3019,7 @@ impl Executor {
                 "  (define-fun {sel} ((@p0 {dt})) {ret} (ite {cond} ({sel} @p0) {els}))",
                 sel = quote_symbol(name),
                 dt = quote_symbol(&info.dt_name),
-                ret = format_sort(&info.ret_sort),
+                ret = format_sort_surface(&self.ctx, &info.ret_sort),
             ));
         }
         defs

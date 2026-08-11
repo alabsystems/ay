@@ -29,6 +29,7 @@ mod compile;
 mod encoding;
 mod extension;
 mod optimization;
+pub use optimization::IncrementalEncodingError;
 mod solve;
 #[cfg(debug_assertions)]
 mod validate;
@@ -182,6 +183,16 @@ pub struct CpSatEngine {
     /// conditions where stale timers set the interrupt during subsequent
     /// solves (#6231).
     timer: Mutex<Option<TimerHandle>>,
+    /// A permanent incremental constraint proved the model inconsistent.
+    ///
+    /// This cannot be represented by a transient SAT empty-clause flag:
+    /// incremental solve setup clears that flag between calls.
+    permanently_inconsistent: bool,
+    /// Number of registered domains whose sparse holes have been encoded.
+    /// Hole clauses are deferred until after the global order-encoding
+    /// capacity preflight, avoiding unbounded SAT allocation during variable
+    /// registration.
+    domain_holes_encoded: usize,
 }
 
 impl CpSatEngine {
@@ -227,6 +238,8 @@ impl CpSatEngine {
             deadline: None,
             objective: None,
             timer: Mutex::new(None),
+            permanently_inconsistent: false,
+            domain_holes_encoded: 0,
         }
     }
 
@@ -313,25 +326,32 @@ impl CpSatEngine {
         self.value_choice = choice;
     }
 
-    /// Set an interrupt flag for cooperative timeout.
+    /// Install an interrupt flag for cooperative cancellation and timeouts.
     ///
-    /// When the flag is set to `true`, the underlying SAT solver will
-    /// stop at the next check point and return `Unknown`.
+    /// The engine and underlying SAT solver retain the same handle, so later
+    /// [`set_timeout`](Self::set_timeout) and deadline timers also signal the
+    /// caller-provided flag. Any timer attached to the previous handle is
+    /// cancelled before replacement.
     pub fn set_interrupt(&mut self, handle: Arc<AtomicBool>) {
+        let prev = self
+            .timer
+            .lock()
+            .expect("invariant: timer mutex not poisoned")
+            .take();
+        if let Some(old) = prev {
+            old.cancel();
+        }
+        self.interrupt = Arc::clone(&handle);
         self.sat.set_interrupt(handle);
     }
 
     /// Add an integer variable with the given domain.
     pub fn new_int_var(&mut self, domain: crate::domain::Domain, name: Option<&str>) -> IntVarId {
-        let hole_values = domain.missing_values();
         let lb = domain.lb();
         let ub = domain.ub();
         let trail_id = self.trail.register_domain(domain);
         let enc_id = self.encoder.register_var(lb, ub);
         debug_assert_eq!(trail_id, enc_id, "trail and encoder must agree on var ids");
-        for value in hole_values {
-            self.encoder.forbid_value(&mut self.sat, trail_id, value);
-        }
         self.var_names.push(name.map(String::from));
         trail_id
     }
@@ -361,14 +381,54 @@ impl CpSatEngine {
     /// new constraints were added. `solve()` also calls these internally,
     /// so calling `pre_compile()` is optional — it only matters when you
     /// want compilation to happen outside the timed window.
-    pub fn pre_compile(&mut self) {
+    ///
+    /// Returns `false` without compiling when dense order encoding would
+    /// exceed its resource-safety limit. Use [`try_pre_compile`](Self::try_pre_compile)
+    /// to retain the typed failure reason.
+    pub fn pre_compile(&mut self) -> bool {
+        self.try_pre_compile().is_ok()
+    }
+
+    /// Typed, fallible form of [`pre_compile`](Self::pre_compile).
+    pub fn try_pre_compile(&mut self) -> Result<(), crate::encoder::OrderEncodingCapacityError> {
+        if self.permanently_inconsistent {
+            return Ok(());
+        }
+        // Run this before compilation because some constraint compilers inspect
+        // or enumerate domains. Compilation can introduce auxiliary variables,
+        // so re-check before allocating the dense encoding as well.
+        self.prepare_domain_holes()?;
         self.detect_alldifferent();
         self.detect_shifted_alldifferent();
         #[cfg(debug_assertions)]
         self.debug_constraints
             .extend(self.constraints.iter().cloned());
         self.compile_constraints();
-        self.encoder.pre_allocate_all(&mut self.sat);
+        self.prepare_domain_holes()?;
+        self.encoder.try_pre_allocate_all(&mut self.sat)?;
+        Ok(())
+    }
+
+    /// Capacity-check all domains, then encode sparse holes for variables not
+    /// seen by an earlier preflight. The plan bounds total materialization
+    /// before `missing_values()` or SAT clauses are allocated.
+    fn prepare_domain_holes(&mut self) -> Result<(), crate::encoder::OrderEncodingCapacityError> {
+        self.encoder.preallocation_plan()?;
+        let registered = self.trail.num_vars();
+        for index in self.domain_holes_encoded..registered {
+            let var = IntVarId(index as u32);
+            for value in self.trail.missing_values(var) {
+                self.encoder.forbid_value(&mut self.sat, var, value);
+            }
+        }
+        self.domain_holes_encoded = registered;
+        Ok(())
+    }
+
+    /// Record a contradiction introduced by a permanent incremental
+    /// constraint. All subsequent solve variants return UNSAT before encoding.
+    pub(super) fn mark_permanently_inconsistent(&mut self) {
+        self.permanently_inconsistent = true;
     }
 
     // solve, apply_root_propagation, solve_pure_sat, solve_with_cp_extension,

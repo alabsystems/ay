@@ -175,7 +175,7 @@ impl Context {
                     })?;
                     Self::checked_bitvector_sort(expanded_width)?;
                 }
-                Ok(Some(self.elaborate_bv_overflow(name, arg_ids, bv.width)))
+                Ok(Some(self.elaborate_bv_overflow(name, arg_ids, bv.width)?))
             }
             // BV reduction ops (z3 / SMT-LIB). Each returns a 1-bit BitVec and
             // desugars to existing ops via its standard definition (bvcomp
@@ -210,9 +210,9 @@ impl Context {
     /// Elaborate a BitVec overflow predicate to its standard definition over
     /// existing BV operations (#bv-overflow-predicates). Each formula was
     /// validated to be EXACTLY equivalent to z3's builtin across widths 1..=8.
-    fn elaborate_bv_overflow(&mut self, name: &str, args: &[TermId], n: u32) -> TermId {
+    fn elaborate_bv_overflow(&mut self, name: &str, args: &[TermId], n: u32) -> Result<TermId> {
         let x = args[0];
-        match name {
+        let result = match name {
             // bvnego(x): negation overflows iff x is the signed minimum 1000..0.
             "bvnego" => {
                 let smin = self.terms.mk_bitvec(BigInt::from(1) << (n as usize - 1), n);
@@ -286,7 +286,12 @@ impl Context {
                 let y_neg1 = self.terms.mk_eq(y, all_ones);
                 self.terms.mk_and(vec![x_smin, y_neg1])
             }
-            _ => unreachable!("elaborate_bv_overflow called with non-overflow op {name}"),
-        }
+            _ => {
+                return Err(ElaborateError::Unsupported(format!(
+                    "unknown bit-vector overflow predicate {name}"
+                )))
+            }
+        };
+        Ok(result)
     }
 }

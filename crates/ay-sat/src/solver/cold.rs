@@ -8,6 +8,7 @@
 //! cold tail lives here behind a single box so restart/proof/incremental/
 //! tracing state no longer inflates the main solver shell.
 
+use super::inprocessing::FactorSkipReason;
 use super::*;
 
 pub(super) const BCP_LEARNED_1963_BLOCKER_CERT_ELISION_ENV: &str =
@@ -575,7 +576,7 @@ pub(crate) struct ColdState {
     /// SAT-COMP 2026 instance); without this there is no way to see from a run
     /// whether AY's factor pass is losing to a schedule gate or genuinely
     /// finding nothing.
-    pub(super) factor_skip_counts: [u64; crate::solver::inprocessing::FactorSkipReason::COUNT],
+    pub(super) factor_skip_counts: [u64; FactorSkipReason::COUNT],
     /// Set when `should_compact_arena` fires at a moment the solver is not
     /// quiescent (inside `reduce_db`, where conflict analysis has just
     /// enqueued the asserting literal). The search loop performs the
@@ -1895,7 +1896,7 @@ impl ColdState {
             num_flushes: 0,
             num_arena_compactions: 0,
             num_arena_compaction_skips: 0,
-            factor_skip_counts: [0; crate::solver::inprocessing::FactorSkipReason::COUNT],
+            factor_skip_counts: [0; FactorSkipReason::COUNT],
             arena_compaction_pending: false,
             scoped_clauses_reclaimed: 0,
             eager_subsumed: 0,

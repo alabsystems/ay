@@ -744,7 +744,7 @@ const ORGANIC_DESCENT_BUDGET_DIVISOR: u32 = 8;
 
 /// Clamp for the budget-scaled organic slice.
 const ORGANIC_DESCENT_SLICE_MIN: Duration = Duration::from_secs(10);
-const ORGANIC_DESCENT_SLICE_MAX: Duration = Duration::from_secs(300);
+const ORGANIC_DESCENT_SLICE_MAX: Duration = Duration::from_mins(5);
 
 /// A/B escape for [`OllEngine::descent_kick_gap_cap`]: restore the pre-2026-08-02
 /// ABSOLUTE kick gap bar (`DESCENT_KICK_GAP`, ignoring the objective's own
@@ -6200,8 +6200,7 @@ impl OllEngine {
         }
         // Same quantity restricted to ORIGINAL soft selectors, to separate the
         // original-soft terms from the relax_core sum-selector terms.
-        let orig: std::collections::HashSet<Literal> =
-            self.soft_selectors.iter().copied().collect();
+        let orig: HashSet<Literal> = self.soft_selectors.iter().copied().collect();
         let mut sigma_orig: Weight = 0;
         let mut sigma_sum: Weight = 0;
         for (&sel, &w) in self.active.iter() {

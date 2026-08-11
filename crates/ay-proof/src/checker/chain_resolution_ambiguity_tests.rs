@@ -30,7 +30,7 @@
 //! the verdict is published as `unknown` — a caught-and-discarded refutation.
 
 use crate::checker::*;
-use ay_core::{AletheRule, Proof, ProofId, Sort, TermId, TermStore};
+use ay_core::{AletheRule, Proof, ProofId, Sort, Symbol, TermId, TermStore};
 
 fn boolvar(terms: &mut TermStore, name: &str) -> TermId {
     terms.mk_var(name, Sort::Bool)
@@ -68,12 +68,19 @@ fn check_chain(
     proof: &mut Proof,
     clause: Vec<TermId>,
 ) -> Result<(), ProofCheckError> {
-    proof.add_rule_step(
-        AletheRule::ThResolution,
-        clause,
-        vec![ProofId(0), ProofId(1), ProofId(2)],
-        Vec::new(),
-    );
+    check_chain_with_args(terms, proof, clause, Vec::new())
+}
+
+fn check_chain_with_args(
+    terms: &TermStore,
+    proof: &mut Proof,
+    clause: Vec<TermId>,
+    args: Vec<TermId>,
+) -> Result<(), ProofCheckError> {
+    let premises = (0..proof.steps.len())
+        .map(|index| ProofId(index as u32))
+        .collect();
+    proof.add_rule_step(AletheRule::ThResolution, clause, premises, args);
     let mut derived: Vec<Option<Vec<TermId>>> = vec![];
     for (i, step) in proof.steps.iter().enumerate() {
         validate_step(terms, &mut derived, ProofId(i as u32), step, false, None)?;
@@ -169,4 +176,193 @@ fn an_unambiguous_chain_is_unchanged() {
     proof.add_rule_step(AletheRule::Trust, vec![nb], Vec::new(), Vec::new());
 
     check_chain(&terms, &mut proof, vec![c]).expect("plain chain resolution must still pass");
+}
+
+#[test]
+fn unit_tail_chain_removes_each_complement_once() {
+    let mut terms = TermStore::new();
+    let atoms: Vec<TermId> = (0..128)
+        .map(|index| boolvar(&mut terms, &format!("unit_tail_{index}")))
+        .collect();
+    let negated: Vec<TermId> = atoms.iter().map(|&atom| terms.mk_not(atom)).collect();
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, atoms, Vec::new(), Vec::new());
+    for literal in negated {
+        proof.add_rule_step(AletheRule::Trust, vec![literal], Vec::new(), Vec::new());
+    }
+
+    check_chain(&terms, &mut proof, Vec::new())
+        .expect("a complete unit tail must resolve the accumulator to empty");
+}
+
+#[test]
+fn unit_tail_chain_rejects_a_repeated_removal() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "unit_tail_repeat_a");
+    let b = boolvar(&mut terms, "unit_tail_repeat_b");
+    let not_a = terms.mk_not(a);
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, vec![a, b], Vec::new(), Vec::new());
+    proof.add_rule_step(AletheRule::Trust, vec![not_a], Vec::new(), Vec::new());
+    proof.add_rule_step(AletheRule::Trust, vec![not_a], Vec::new(), Vec::new());
+
+    check_chain(&terms, &mut proof, vec![b])
+        .expect_err("one accumulator literal cannot be removed twice");
+}
+
+#[test]
+fn unit_tail_chain_preserves_set_semantics_for_duplicate_end_clauses() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "unit_tail_duplicate_a");
+    let b = boolvar(&mut terms, "unit_tail_duplicate_b");
+    let c = boolvar(&mut terms, "unit_tail_duplicate_c");
+    let not_a = terms.mk_not(a);
+    let not_b = terms.mk_not(b);
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, vec![a, a, b, c], Vec::new(), Vec::new());
+    proof.add_rule_step(AletheRule::Trust, vec![not_a], Vec::new(), Vec::new());
+    proof.add_rule_step(AletheRule::Trust, vec![not_b], Vec::new(), Vec::new());
+
+    check_chain(&terms, &mut proof, vec![c, c])
+        .expect("argument-free resolution treats duplicate first/target literals as a set");
+}
+
+#[test]
+fn annotated_chain_requires_one_pivot_polarity_pair_per_link() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "a");
+    let b = boolvar(&mut terms, "b");
+    let na = terms.mk_not(a);
+    let nb = terms.mk_not(b);
+    let yes = terms.mk_bool(true);
+
+    let build = || {
+        let mut proof = Proof::new();
+        proof.add_rule_step(AletheRule::Trust, vec![a, b], Vec::new(), Vec::new());
+        proof.add_rule_step(AletheRule::Trust, vec![nb], Vec::new(), Vec::new());
+        proof.add_rule_step(AletheRule::Trust, vec![na], Vec::new(), Vec::new());
+        proof
+    };
+
+    check_chain_with_args(&terms, &mut build(), vec![], vec![b, yes, a, yes])
+        .expect("the declared pivots eliminate b and then a");
+
+    check_chain_with_args(&terms, &mut build(), vec![], vec![b])
+        .expect_err("a partial :args annotation must not be silently ignored");
+
+    check_chain_with_args(&terms, &mut build(), vec![], vec![a, yes, b, yes])
+        .expect_err("a pivot that is absent from its link must be rejected");
+}
+
+#[test]
+fn annotated_binary_resolution_honors_false_polarity() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "a");
+    let na = terms.mk_not(a);
+    let no = terms.mk_bool(false);
+    let mut proof = Proof::new();
+    let left = proof.add_rule_step(AletheRule::Trust, vec![na], Vec::new(), Vec::new());
+    let right = proof.add_rule_step(AletheRule::Trust, vec![a], Vec::new(), Vec::new());
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        vec![],
+        vec![left, right],
+        vec![a, no],
+    );
+
+    let mut derived = Vec::new();
+    for (index, step) in proof.steps.iter().enumerate() {
+        validate_step(
+            &terms,
+            &mut derived,
+            ProofId(index as u32),
+            step,
+            false,
+            None,
+        )
+        .expect("false means the negated pivot is in the accumulator");
+    }
+}
+
+#[test]
+fn argument_free_resolution_normalizes_leading_not_parity() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "a");
+    let not_a = terms.mk_not_raw(a);
+    let not_not_a = terms.mk_not_raw(not_a);
+    let not_not_not_a = terms.mk_not_raw(not_not_a);
+    let mut proof = Proof::new();
+    let left = proof.add_rule_step(
+        AletheRule::Trust,
+        vec![not_not_not_a],
+        Vec::new(),
+        Vec::new(),
+    );
+    let right = proof.add_rule_step(AletheRule::Trust, vec![a], Vec::new(), Vec::new());
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        vec![],
+        vec![left, right],
+        Vec::new(),
+    );
+
+    let mut derived = Vec::new();
+    for (index, step) in proof.steps.iter().enumerate() {
+        validate_step(
+            &terms,
+            &mut derived,
+            ProofId(index as u32),
+            step,
+            false,
+            None,
+        )
+        .expect("argument-free resolution retains Carcara's parity semantics");
+    }
+}
+
+#[test]
+fn demorgan_equivalence_is_not_a_resolution_pivot() {
+    let mut terms = TermStore::new();
+    let a = boolvar(&mut terms, "a");
+    let b = boolvar(&mut terms, "b");
+    let na = terms.mk_not(a);
+    let nb = terms.mk_not(b);
+    let conjunction = terms.mk_app(Symbol::Named("and".to_string()), [a, b], Sort::Bool);
+    let negated_components = terms.mk_app(Symbol::Named("or".to_string()), [na, nb], Sort::Bool);
+    let mut proof = Proof::new();
+    let left = proof.add_rule_step(AletheRule::Trust, vec![conjunction], Vec::new(), Vec::new());
+    let right = proof.add_rule_step(
+        AletheRule::Trust,
+        vec![negated_components],
+        Vec::new(),
+        Vec::new(),
+    );
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        vec![],
+        vec![left, right],
+        Vec::new(),
+    );
+
+    let mut derived = Vec::new();
+    let mut rejected = false;
+    for (index, step) in proof.steps.iter().enumerate() {
+        if validate_step(
+            &terms,
+            &mut derived,
+            ProofId(index as u32),
+            step,
+            false,
+            None,
+        )
+        .is_err()
+        {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "Alethe requires an explicit Boolean derivation between De Morgan equivalents"
+    );
 }

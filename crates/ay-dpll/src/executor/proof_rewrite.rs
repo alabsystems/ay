@@ -10,14 +10,67 @@
 //! rewrite canonical terms back to their surface syntax before export.
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
-use ay_core::{Proof, ProofStep, TermId};
+use ay_core::{AletheRule, Proof, ProofStep, Symbol, TermId};
 
-use super::proof_surface_syntax::collect_surface_term_overrides;
+use super::proof_surface_syntax::{
+    collect_surface_term_overrides, format_forall_instance_surface, strip_frontend_annotations,
+    surface_override_map_is_bounded,
+};
 use super::Executor;
 
 impl Executor {
+    /// Whether an internally valid arithmetic `evaluate` step is outside the
+    /// portable Alethe evaluator implemented by Carcara.
+    ///
+    /// Carcara has no integer `rem` operator, and its current `div`/`mod`
+    /// evaluator uses host truncating remainder semantics for negative inputs.
+    /// AY's strict checker follows SMT-LIB/Z3 Euclidean semantics.  Keep those
+    /// internally certified verdicts, but suppress a printable certificate
+    /// rather than emit a rule whose external meaning differs.  The traversal
+    /// is bounded and fails closed on excessive proof terms.
+    fn proof_has_nonportable_ground_evaluate(terms: &ay_core::TermStore, proof: &Proof) -> bool {
+        const WORK_LIMIT: usize = 100_000;
+        for step in &proof.steps {
+            let ProofStep::Step {
+                rule: AletheRule::Evaluate,
+                clause,
+                ..
+            } = step
+            else {
+                continue;
+            };
+            let [equality] = clause.as_slice() else {
+                continue;
+            };
+            let TermData::App(Symbol::Named(name), args) = terms.get(*equality) else {
+                continue;
+            };
+            if name != "=" || args.len() != 2 {
+                continue;
+            }
+            let mut stack = vec![args[0]];
+            let mut seen = HashSet::default();
+            while let Some(term) = stack.pop() {
+                if !seen.insert(term) {
+                    continue;
+                }
+                if seen.len() > WORK_LIMIT {
+                    return true;
+                }
+                if matches!(
+                    terms.get(term),
+                    TermData::App(Symbol::Named(name), _) if matches!(name.as_str(), "div" | "mod" | "rem")
+                ) {
+                    return true;
+                }
+                stack.extend(terms.children(term));
+            }
+        }
+        false
+    }
+
     /// Original problem assertions that still have source-syntax provenance.
     pub(crate) fn proof_problem_assertions(&self) -> Vec<TermId> {
         if let Some(provenance) = &self.proof_problem_assertion_provenance {
@@ -158,7 +211,18 @@ impl Executor {
     /// an empty parsed stack yields no pairs and no term overrides.
     pub(super) fn apply_input_syntax_rewrites_to_proof(&mut self, proof: &mut Proof) {
         self.last_proof_term_overrides = None;
+        if Self::proof_has_nonportable_ground_evaluate(&self.ctx.terms, proof) {
+            self.suppress_unsat_proof_reconstruction();
+        }
         if self.ctx.assertions.is_empty() {
+            return;
+        }
+        if !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
+            self.ctx.assertions_parsed(),
+        ) {
+            let mut poisoned = Proof::new();
+            poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+            *proof = poisoned;
             return;
         }
 
@@ -167,31 +231,55 @@ impl Executor {
         let mut rewrites: HashMap<TermId, TermId> = HashMap::default();
         let mut term_overrides: HashMap<TermId, String> = HashMap::default();
         let problem_assertions = self.proof_problem_assertions();
+        let original_problem_assertions = self.proof_original_problem_assertions();
         // Borrow, don't deep-clone: the parsed assertion ASTs are only read
         // while building `override_pairs` (which clones exactly the pairs it
         // keeps); the wholesale `.to_vec()` doubled that cost on every UNSAT
         // (#proof-tax: recursive `Term::clone` of the whole problem was the
         // single largest rewrite-pass leaf on the qg5 QF_UF family).
         let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
-        // Collect (canonical, parsed) pairs first: override collection
-        // re-elaborates surface subterms, which needs `&mut self.ctx`.
-        let override_pairs: Vec<(TermId, ay_frontend::command::Term)> =
+        // Select and deduplicate borrowed source indices before cloning any
+        // parsed AST. Provenance may mention the same source through many
+        // derived assertions, so pair count and repeated source work are
+        // bounded explicitly.
+        const MAX_OVERRIDE_PAIRS: usize = 8_192;
+        const MAX_OVERRIDE_SOURCE_SCAN: usize = 100_000;
+        let mut override_plan_valid = problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN
+            && original_problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN;
+        let mut source_scan_work = problem_assertions.len();
+        let mut pair_specs: Vec<(TermId, usize)> = if override_plan_valid {
             if let Some(provenance) = &self.proof_problem_assertion_provenance {
-                let original_problem_assertions = self.proof_original_problem_assertions();
-                let parsed_by_original: HashMap<TermId, _> = original_problem_assertions
+                let parsed_by_original: HashMap<TermId, usize> = original_problem_assertions
                     .iter()
                     .copied()
-                    .zip(parsed_assertions.iter())
+                    .enumerate()
+                    .map(|(index, term)| (term, index))
                     .collect();
                 let mut pairs = Vec::new();
-                for &canonical in &problem_assertions {
+                let mut seen = HashSet::default();
+                'problem_sources: for &canonical in &problem_assertions {
                     let Some(source_sets) = provenance.assertion_sources.get(&canonical) else {
                         continue;
                     };
+                    let Some(next_work) = source_scan_work.checked_add(source_sets.len()) else {
+                        override_plan_valid = false;
+                        break;
+                    };
+                    if next_work > MAX_OVERRIDE_SOURCE_SCAN {
+                        override_plan_valid = false;
+                        break;
+                    }
+                    source_scan_work = next_work;
                     for source_set in source_sets {
                         if let [source] = source_set.as_slice() {
-                            if let Some(parsed) = parsed_by_original.get(source) {
-                                pairs.push((canonical, (*parsed).clone()));
+                            if let Some(&parsed_index) = parsed_by_original.get(source) {
+                                if seen.insert((canonical, parsed_index)) {
+                                    if pairs.len() >= MAX_OVERRIDE_PAIRS {
+                                        override_plan_valid = false;
+                                        break 'problem_sources;
+                                    }
+                                    pairs.push((canonical, parsed_index));
+                                }
                             }
                         }
                     }
@@ -206,30 +294,173 @@ impl Executor {
                 // them to the original premises.
                 let mut paired: ay_core::kani_compat::DetHashSet<TermId> =
                     pairs.iter().map(|(c, _)| *c).collect();
-                for source_sets in provenance.assertion_sources.values() {
+                'all_sources: for source_sets in provenance.assertion_sources.values() {
+                    let Some(next_work) = source_scan_work.checked_add(source_sets.len()) else {
+                        override_plan_valid = false;
+                        break;
+                    };
+                    if next_work > MAX_OVERRIDE_SOURCE_SCAN {
+                        override_plan_valid = false;
+                        break;
+                    }
+                    source_scan_work = next_work;
                     for source_set in source_sets {
                         if source_set.len() < 2 {
                             continue;
                         }
+                        let Some(next_work) = source_scan_work.checked_add(source_set.len()) else {
+                            override_plan_valid = false;
+                            break 'all_sources;
+                        };
+                        if next_work > MAX_OVERRIDE_SOURCE_SCAN {
+                            override_plan_valid = false;
+                            break 'all_sources;
+                        }
+                        source_scan_work = next_work;
                         for &source in source_set {
                             if paired.insert(source) {
-                                if let Some(parsed) = parsed_by_original.get(&source) {
-                                    pairs.push((source, (*parsed).clone()));
+                                if let Some(&parsed_index) = parsed_by_original.get(&source) {
+                                    if seen.insert((source, parsed_index)) {
+                                        if pairs.len() >= MAX_OVERRIDE_PAIRS {
+                                            override_plan_valid = false;
+                                            break 'all_sources;
+                                        }
+                                        pairs.push((source, parsed_index));
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 pairs
-            } else {
+            } else if problem_assertions.len() <= MAX_OVERRIDE_PAIRS {
                 problem_assertions
                     .iter()
-                    .zip(parsed_assertions.iter())
-                    .map(|(&canonical, parsed)| (canonical, parsed.clone()))
+                    .enumerate()
+                    .map(|(index, &canonical)| (canonical, index))
                     .collect()
-            };
+            } else {
+                override_plan_valid = false;
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let canonical_plan_is_bounded =
+            super::proof_surface_syntax::surface_override_roots_have_bounded_work(
+                &self.ctx.terms,
+                pair_specs.iter().map(|(canonical, _)| *canonical),
+            );
+        if !override_plan_valid
+            || pair_specs.len() > MAX_OVERRIDE_PAIRS
+            || !canonical_plan_is_bounded
+            || pair_specs
+                .iter()
+                .any(|(_, index)| *index >= parsed_assertions.len())
+            || !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
+                pair_specs
+                    .iter()
+                    .filter_map(|(_, index)| parsed_assertions.get(*index)),
+            )
+        {
+            let mut poisoned = Proof::new();
+            poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+            *proof = poisoned;
+            return;
+        }
+        let override_pairs: Vec<(TermId, ay_frontend::command::Term)> = pair_specs
+            .drain(..)
+            .filter_map(|(canonical, index)| {
+                parsed_assertions
+                    .get(index)
+                    .cloned()
+                    .map(|parsed| (canonical, parsed))
+            })
+            .collect();
         for (canonical, parsed) in &override_pairs {
-            collect_surface_term_overrides(&mut self.ctx, *canonical, parsed, &mut term_overrides);
+            if !collect_surface_term_overrides(
+                &mut self.ctx,
+                *canonical,
+                parsed,
+                &mut term_overrides,
+            ) || !surface_override_map_is_bounded(&term_overrides)
+            {
+                let mut poisoned = Proof::new();
+                poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+                *proof = poisoned;
+                return;
+            }
+        }
+
+        // A `forall_inst` instance must use the source quantifier's own
+        // surface spelling.  Canonical term rewriting alone is insufficient:
+        // `(forall ((x Int)) (> x 0))` is stored as `< 0 x`, and its exact
+        // ground instance is a different TermId that the ordinary source walk
+        // never visits.  Derive an override from the parsed binder body and
+        // the step's positional arguments.  A conflicting rendering for one
+        // shared TermId cannot be represented by the global printer table, so
+        // suppress external export rather than emit a certificate an external
+        // checker would reject; the internal strict verdict certificate is
+        // unaffected.
+        let parsed_foralls: HashMap<TermId, ay_frontend::command::Term> = override_pairs
+            .iter()
+            .filter(|(_, parsed)| {
+                matches!(
+                    strip_frontend_annotations(parsed),
+                    ay_frontend::command::Term::Forall(..)
+                )
+            })
+            .cloned()
+            .collect();
+        let mut forall_instance_override_failed = false;
+        for step in &proof.steps {
+            let ProofStep::Step {
+                rule: AletheRule::ForallInst,
+                clause,
+                args,
+                ..
+            } = step
+            else {
+                continue;
+            };
+            let [implication] = clause.as_slice() else {
+                continue;
+            };
+            let TermData::App(Symbol::Named(name), disjuncts) = self.ctx.terms.get(*implication)
+            else {
+                continue;
+            };
+            if name != "or" || disjuncts.len() != 2 {
+                continue;
+            }
+            let TermData::Not(quantifier) = self.ctx.terms.get(disjuncts[0]) else {
+                continue;
+            };
+            let Some(parsed) = parsed_foralls.get(quantifier) else {
+                continue;
+            };
+            let instance = disjuncts[1];
+            let Some(surface) =
+                format_forall_instance_surface(&self.ctx.terms, parsed, args, &term_overrides)
+            else {
+                // The internal proof uses canonical terms, but an external
+                // checker reads the authored SMT-LIB surface.  If we cannot
+                // reconstruct the exact authored substitution, there is no
+                // safe printable rendering for this step.
+                forall_instance_override_failed = true;
+                break;
+            };
+            if term_overrides
+                .get(&instance)
+                .is_some_and(|existing| existing != &surface)
+            {
+                forall_instance_override_failed = true;
+                break;
+            }
+            term_overrides.insert(instance, surface);
+        }
+        if forall_instance_override_failed {
+            self.suppress_unsat_proof_reconstruction();
         }
 
         Self::infer_auxiliary_division_rewrites(&mut self.ctx.terms, proof, &mut rewrites);

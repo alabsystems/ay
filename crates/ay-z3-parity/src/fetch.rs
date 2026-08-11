@@ -420,8 +420,7 @@ fn selected_entries<'a>(
 fn expansion_budget(archive_bytes: u64) -> u64 {
     archive_bytes
         .saturating_mul(MAX_ARCHIVE_EXPANSION_RATIO)
-        .max(MIN_ARCHIVE_EXPANSION_BUDGET)
-        .min(MAX_ARCHIVE_EXPANSION_BYTES)
+        .clamp(MIN_ARCHIVE_EXPANSION_BUDGET, MAX_ARCHIVE_EXPANSION_BYTES)
 }
 
 /// No cap (`None`, the default) never excludes anything. A caller-selected cap

@@ -153,6 +153,7 @@ impl RecognitionBudget {
 
 /// Try the bounded scheduling route. A miss is not an error: it leaves the
 /// native MILP path authoritative.
+#[cfg(test)]
 pub(crate) fn try_solve(
     model: &Model,
     outer_deadline: Option<Instant>,

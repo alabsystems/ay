@@ -309,6 +309,118 @@ pub(crate) fn subst_vars(
     }) // stacker::maybe_grow
 }
 
+/// Substitute variables without applying any semantic simplification.
+///
+/// This deliberately supports only the quantifier-free fragment accepted by
+/// Alethe's strict `forall_inst` checker.  It is the certificate-producing
+/// counterpart of [`subst_vars`]: applications, negations, and ITEs are rebuilt
+/// with raw constructors so an instance such as `(< 0 0)` cannot collapse to
+/// `false` before the checker compares it with the authored quantifier body.
+/// Nested binders and lets fail closed instead of approximating capture rules
+/// that the checker does not accept.
+pub(crate) fn subst_vars_exact_qf(
+    terms: &mut TermStore,
+    term: TermId,
+    subst: &HashMap<String, TermId>,
+) -> Option<TermId> {
+    const WORK_LIMIT: usize = 100_000;
+
+    fn visit(
+        terms: &mut TermStore,
+        term: TermId,
+        subst: &HashMap<String, TermId>,
+        memo: &mut HashMap<TermId, TermId>,
+        matched_var_ids: &mut HashMap<String, u32>,
+        work: &mut usize,
+    ) -> Option<TermId> {
+        if let Some(&rewritten) = memo.get(&term) {
+            return Some(rewritten);
+        }
+        if *work >= WORK_LIMIT {
+            return None;
+        }
+        *work += 1;
+        let rewritten =
+            stacker::maybe_grow(SUBST_STACK_RED_ZONE, SUBST_STACK_SIZE, || {
+                match terms.get(term).clone() {
+                    TermData::Var(name, id) => {
+                        let Some(&replacement) = subst.get(&name) else {
+                            return Some(term);
+                        };
+                        if terms.sort(term) != terms.sort(replacement) {
+                            return None;
+                        }
+                        match matched_var_ids.get(&name) {
+                            Some(&seen) if seen != id => return None,
+                            Some(_) => {}
+                            None => {
+                                matched_var_ids.insert(name, id);
+                            }
+                        }
+                        Some(replacement)
+                    }
+                    TermData::Const(_) => Some(term),
+                    TermData::App(symbol, args) => {
+                        let sort = terms.sort(term).clone();
+                        let rewritten: Vec<TermId> = args
+                            .iter()
+                            .copied()
+                            .map(|arg| visit(terms, arg, subst, memo, matched_var_ids, work))
+                            .collect::<Option<_>>()?;
+                        if rewritten == args {
+                            Some(term)
+                        } else {
+                            Some(terms.mk_app(symbol, rewritten, sort))
+                        }
+                    }
+                    TermData::Not(inner) => {
+                        let rewritten = visit(terms, inner, subst, memo, matched_var_ids, work)?;
+                        if rewritten == inner {
+                            Some(term)
+                        } else {
+                            Some(terms.mk_not_raw(rewritten))
+                        }
+                    }
+                    TermData::Ite(condition, then_branch, else_branch) => {
+                        let rewritten_condition =
+                            visit(terms, condition, subst, memo, matched_var_ids, work)?;
+                        let rewritten_then =
+                            visit(terms, then_branch, subst, memo, matched_var_ids, work)?;
+                        let rewritten_else =
+                            visit(terms, else_branch, subst, memo, matched_var_ids, work)?;
+                        if (rewritten_condition, rewritten_then, rewritten_else)
+                            == (condition, then_branch, else_branch)
+                        {
+                            Some(term)
+                        } else {
+                            Some(terms.mk_ite_raw(
+                                rewritten_condition,
+                                rewritten_then,
+                                rewritten_else,
+                            ))
+                        }
+                    }
+                    TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => None,
+                    _ => None,
+                }
+            })?;
+        memo.insert(term, rewritten);
+        Some(rewritten)
+    }
+
+    let mut work = 0usize;
+    let mut memo = HashMap::default();
+    let mut matched_var_ids = HashMap::default();
+    visit(
+        terms,
+        term,
+        subst,
+        &mut memo,
+        &mut matched_var_ids,
+        &mut work,
+    )
+}
+
 /// Construct an App term using simplifying constructors where available.
 pub(crate) fn mk_app_simplified(
     terms: &mut TermStore,

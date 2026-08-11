@@ -32,12 +32,11 @@ mod common;
 
 fn solve_one(rel: &str) -> String {
     let path = common::workspace_path(rel);
-    if !path.is_file() {
-        panic!(
-            "regression asset missing: {} — it is committed in-tree and must not be deleted",
-            path.display()
-        );
-    }
+    assert!(
+        path.is_file(),
+        "regression asset missing: {} — it is committed in-tree and must not be deleted",
+        path.display()
+    );
     let smt = std::fs::read_to_string(&path).expect("read regression asset");
     let outputs = common::solve_vec(&smt);
     outputs.first().cloned().unwrap_or_else(|| {

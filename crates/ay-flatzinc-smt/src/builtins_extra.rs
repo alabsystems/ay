@@ -10,6 +10,10 @@ use crate::builtins::check_args;
 use crate::error::TranslateError;
 use crate::translate::{Context, SmtInt};
 
+/// Keep the repeated-multiplication encoding bounded. Larger exponents are
+/// rejected explicitly instead of being assigned an incorrect fallback value.
+const MAX_UNROLLED_EXPONENT: i64 = 64;
+
 // --- Integer exponentiation ---
 
 /// `int_pow(a, b, r)` → r = a^b (integer exponentiation)
@@ -24,16 +28,30 @@ pub(crate) fn int_pow(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateE
 
     // Try to resolve b as a constant first (literal or parameter)
     if let Ok(exp) = ctx.resolve_int(&args[1]) {
+        validate_exponent(exp)?;
         let pow_expr = build_pow_expr(&a, exp);
         ctx.emit_fmt(format_args!("(assert (= {r} {pow_expr}))"));
         return Ok(());
     }
 
-    // b is a variable: build ite chain over its domain
+    // A variable exponent is sound only when every value in its finite domain
+    // is represented. `expr_to_smt` also resolves constant array accesses to
+    // the scalar SMT name recorded in `var_domains`.
     let b = ctx.expr_to_smt(&args[1])?;
-    let range = exponent_range(ctx, &args[1]);
-    let mut ite_expr = String::from("1"); // fallback for out-of-range
-    for exp in range.rev() {
+    let exponents = exponent_values(ctx, &b)?;
+    let domain_cases: Vec<String> = exponents
+        .iter()
+        .map(|&exp| format!("(= {b} {})", SmtInt(exp)))
+        .collect();
+    if domain_cases.len() == 1 {
+        ctx.emit_fmt(format_args!("(assert {})", domain_cases[0]));
+    } else {
+        ctx.emit_fmt(format_args!("(assert (or {}))", domain_cases.join(" ")));
+    }
+
+    // The explicit domain assertion makes the final fallback unreachable.
+    let mut ite_expr = String::from("0");
+    for &exp in exponents.iter().rev() {
         let pow_val = build_pow_expr(&a, exp);
         ite_expr = format!("(ite (= {b} {}) {pow_val} {ite_expr})", SmtInt(exp));
     }
@@ -46,7 +64,6 @@ fn build_pow_expr(base: &str, exp: i64) -> String {
     match exp {
         0 => "1".to_string(),
         1 => base.to_string(),
-        n if n < 0 => "0".to_string(), // integer division: a^(-n) rounds to 0
         _ => {
             let mut expr = base.to_string();
             for _ in 1..exp {
@@ -57,29 +74,57 @@ fn build_pow_expr(base: &str, exp: i64) -> String {
     }
 }
 
-/// Determine the range of exponent values for the ite chain.
-/// Uses the variable's domain if available, otherwise defaults to 0..=16.
-fn exponent_range(ctx: &Context, expr: &Expr) -> std::ops::RangeInclusive<i64> {
-    if let Expr::Ident(name) = expr {
-        if let Some(domain) = ctx.var_domains.get(name) {
-            match domain {
-                crate::translate::VarDomain::IntRange(lo, hi) => {
-                    let lo = (*lo).max(0); // negative exponents → 0 in int
-                    let hi = (*hi).min(64); // cap at 64 to avoid huge expressions
-                    return lo..=hi;
-                }
-                crate::translate::VarDomain::IntSet(values) => {
-                    if let (Some(&lo), Some(&hi)) = (values.first(), values.last()) {
-                        let lo = lo.max(0);
-                        let hi = hi.min(64);
-                        return lo..=hi;
-                    }
-                }
-                _ => {}
-            }
-        }
+fn validate_exponent(exp: i64) -> Result<(), TranslateError> {
+    if exp < 0 {
+        return Err(TranslateError::UnsupportedType(format!(
+            "int_pow: negative exponent {exp} is not supported for integer power"
+        )));
     }
-    0..=16 // reasonable default for unbounded exponents
+    if exp > MAX_UNROLLED_EXPONENT {
+        return Err(TranslateError::UnsupportedType(format!(
+            "int_pow: exponent {exp} exceeds the maximum supported {MAX_UNROLLED_EXPONENT}"
+        )));
+    }
+    Ok(())
+}
+
+fn exponent_values(ctx: &Context, smt_name: &str) -> Result<Vec<i64>, TranslateError> {
+    let domain = ctx.var_domains.get(smt_name).ok_or_else(|| {
+        TranslateError::UnsupportedType(
+            "int_pow: variable exponent must have a finite integer domain".into(),
+        )
+    })?;
+    let mut values = match domain {
+        crate::translate::VarDomain::IntRange(lo, hi) => {
+            validate_exponent(*lo)?;
+            validate_exponent(*hi)?;
+            if hi < lo {
+                return Err(TranslateError::UnsupportedType(
+                    "int_pow: exponent domain is empty".into(),
+                ));
+            }
+            (*lo..=*hi).collect()
+        }
+        crate::translate::VarDomain::IntSet(values) => {
+            if values.is_empty() {
+                return Err(TranslateError::UnsupportedType(
+                    "int_pow: exponent domain is empty".into(),
+                ));
+            }
+            for &value in values {
+                validate_exponent(value)?;
+            }
+            values.clone()
+        }
+        crate::translate::VarDomain::Bool | crate::translate::VarDomain::IntUnbounded => {
+            return Err(TranslateError::UnsupportedType(
+                "int_pow: variable exponent must have a finite non-negative integer domain".into(),
+            ));
+        }
+    };
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
 }
 
 // --- Linear sum constraints ---
@@ -90,8 +135,7 @@ pub(crate) fn build_linear_sum(
     coeffs_expr: &Expr,
     vars_expr: &Expr,
 ) -> Result<String, TranslateError> {
-    let cs = ctx.resolve_int_array(coeffs_expr)?;
-    let xs = ctx.expr_to_smt_array(vars_expr)?;
+    let (cs, xs) = resolve_linear_arrays(ctx, coeffs_expr, vars_expr)?;
     let terms: Vec<String> = cs
         .iter()
         .zip(xs.iter())
@@ -133,8 +177,7 @@ fn build_bool_linear_sum(
     coeffs_expr: &Expr,
     bools_expr: &Expr,
 ) -> Result<String, TranslateError> {
-    let cs = ctx.resolve_int_array(coeffs_expr)?;
-    let bs = ctx.expr_to_smt_array(bools_expr)?;
+    let (cs, bs) = resolve_linear_arrays(ctx, coeffs_expr, bools_expr)?;
     let terms: Vec<String> = cs
         .iter()
         .zip(bs.iter())
@@ -155,6 +198,23 @@ fn build_bool_linear_sum(
         1 => Ok(terms[0].clone()),
         _ => Ok(format!("(+ {})", terms.join(" "))),
     }
+}
+
+fn resolve_linear_arrays(
+    ctx: &Context,
+    coeffs_expr: &Expr,
+    vars_expr: &Expr,
+) -> Result<(Vec<i64>, Vec<String>), TranslateError> {
+    let coeffs = ctx.resolve_int_array(coeffs_expr)?;
+    let vars = ctx.expr_to_smt_array(vars_expr)?;
+    if coeffs.len() != vars.len() {
+        return Err(TranslateError::UnsupportedType(format!(
+            "linear constraint: coefficient array length {} does not match variable array length {}",
+            coeffs.len(),
+            vars.len()
+        )));
+    }
+    Ok((coeffs, vars))
 }
 
 /// `bool_lin_eq/le(cs, bs, k)` → `(assert (op sum k))`

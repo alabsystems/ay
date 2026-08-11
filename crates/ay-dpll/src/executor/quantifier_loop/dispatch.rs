@@ -132,6 +132,7 @@ impl Executor {
     pub(in crate::executor) fn try_ematching_refinement_round(
         &mut self,
         original_assertions: &[TermId],
+        cegqi_ce_lemma_ids: &[TermId],
     ) -> Option<EmatchingRefinementRound> {
         // Deadline/interrupt guard (#quantifier-deadline): if the budget is
         // exhausted, return a round flagged `reached_limit = true` with no new
@@ -154,7 +155,21 @@ impl Executor {
         let euf_model_ref = self.last_model.as_ref().and_then(|m| m.euf_model.as_ref());
         euf_model_ref?;
 
-        let mut combined_assertions: Vec<TermId> = self.ctx.assertions.clone();
+        // Counterexample lemmas are temporary validity-check assumptions, not
+        // authored ground evidence. If `not B(ce)` enters the E-matching
+        // index, the same universal can bind its variable to `ce` and add
+        // `B(ce)`, manufacturing an UNSAT conflict with its own search
+        // assumption. The setup path keeps this list CE-exclusive by omitting
+        // any TermId that was already a genuine assertion, so exact-root
+        // removal cannot hide user input or a sound prior instance.
+        let ce_only: HashSet<TermId> = cegqi_ce_lemma_ids.iter().copied().collect();
+        let mut combined_assertions: Vec<TermId> = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .filter(|term| !ce_only.contains(term))
+            .collect();
         for &a in original_assertions {
             if contains_quantifier(&self.ctx.terms, a) && !combined_assertions.contains(&a) {
                 combined_assertions.push(a);
@@ -171,11 +186,16 @@ impl Executor {
         // (the seen memo persists across the epoch).
         qm.begin_round_group();
 
-        let ematching_result = qm.run_ematching_round(
+        let mut ematching_result = qm.run_ematching_round(
             &mut self.ctx.terms,
             &combined_assertions,
             euf_model_ref,
             &should_stop,
+        );
+        self.materialize_exact_ematching_instances(
+            &mut ematching_result.instantiations,
+            &mut ematching_result.unconditional_forall_roots,
+            &mut ematching_result.unconditional_forall_instantiations,
         );
         self.register_ematching_proof_provenance(
             &ematching_result.unconditional_forall_instantiations,

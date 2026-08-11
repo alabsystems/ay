@@ -995,7 +995,10 @@ impl ApplyTactic {
     /// to that child (the composition of one tactic is itself).
     fn sequence(mut children: Vec<Self>, wrap: impl FnOnce(Vec<Self>) -> Self) -> Self {
         if children.len() == 1 {
-            children.pop().expect("len checked == 1")
+            match children.pop() {
+                Some(child) => child,
+                None => wrap(children),
+            }
         } else {
             wrap(children)
         }

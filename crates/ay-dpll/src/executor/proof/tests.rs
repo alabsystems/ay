@@ -9,11 +9,417 @@ use crate::executor::theories::{
 use ay_core::{AletheRule, ProofId, Sort};
 use ay_frontend::parse;
 use ay_proof::check_proof_partial;
+use ntest::timeout;
 use num_bigint::BigInt;
 
 fn emit_firewall_lean(exec: &Executor, proof: &Proof) -> Vec<String> {
     exec.emit_datatype_firewall_lean_bounded(proof, usize::MAX, usize::MAX)
         .expect("test fixture must fit in the address-space bounds")
+}
+
+#[test]
+fn over_depth_authored_source_poison_is_installed_before_proof_clones() {
+    let mut exec = Executor::new();
+    let atom = exec
+        .ctx
+        .terms
+        .mk_var("over_depth_authored_source", Sort::Bool);
+    let mut parsed = FrontendTerm::Symbol("over_depth_authored_source".to_string());
+    for _ in 0..300 {
+        parsed = FrontendTerm::App("not".to_string(), vec![parsed]);
+    }
+    exec.ctx.add_assertion_with_parsed(atom, parsed);
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 1,
+        members: Vec::new(),
+        edge_sources: Default::default(),
+    });
+
+    exec.build_unsat_proof();
+
+    let proof = exec.last_proof.as_ref().expect("poison proof is retained");
+    assert!(matches!(
+        proof.steps.as_slice(),
+        [ProofStep::Step {
+            rule: AletheRule::Trust,
+            clause,
+            premises,
+            ..
+        }] if clause.is_empty() && premises.is_empty()
+    ));
+    assert!(exec.last_checked_finite_enum_pigeonhole.is_none());
+}
+
+const OVERSIZED_PROOF_ROOTS: usize = 100_001;
+
+fn oversized_direct_finite_enum_script() -> String {
+    let mut script = String::from(
+        "(set-option :produce-proofs true)\n\
+         (set-option :check-proofs-strict true)\n\
+         (set-logic QF_DT)\n\
+         (declare-datatype Unit ((u0) (u1) (u2)))\n",
+    );
+    for index in 0..4 {
+        script.push_str(&format!("(declare-fun p{index} () Unit)\n"));
+    }
+    // Cross the generic proof-source root cap with cheap authored roots. The
+    // finite-enum exception must select only the six authenticated edges.
+    for _ in 0..OVERSIZED_PROOF_ROOTS {
+        script.push_str("(assert true)\n");
+    }
+    for left in 0..4 {
+        for right in (left + 1)..4 {
+            script.push_str(&format!("(assert (not (= p{left} p{right})))\n"));
+        }
+    }
+    script.push_str("(check-sat)\n(get-proof)\n");
+    script
+}
+
+fn deep_surface_binary_distinct_script() -> String {
+    let mut script = String::from(
+        "(set-option :produce-proofs true)\n\
+         (set-option :check-proofs-strict true)\n\
+         (set-logic QF_DT)\n\
+         (declare-datatype Unit ((u0) (u1) (u2)))\n",
+    );
+    for index in 0..4 {
+        script.push_str(&format!("(declare-fun p{index} () Unit)\n"));
+    }
+    let mut deep_true = "true".to_string();
+    for _ in 0..300 {
+        deep_true = format!("(not {deep_true})");
+    }
+    script.push_str(&format!("(assert {deep_true})\n"));
+    script.push_str("(assert (distinct p0 p1))\n");
+    for left in 0..4 {
+        for right in (left + 1)..4 {
+            if (left, right) != (0, 1) {
+                script.push_str(&format!("(assert (not (= p{left} p{right})))\n"));
+            }
+        }
+    }
+    script.push_str("(check-sat)\n(get-proof)\n");
+    script
+}
+
+fn direct_finite_enum_assertions_only() -> String {
+    let mut script = String::from(
+        "(set-logic QF_DT)\n\
+         (declare-datatype Unit ((u0) (u1) (u2)))\n",
+    );
+    for index in 0..4 {
+        script.push_str(&format!("(declare-fun p{index} () Unit)\n"));
+    }
+    for left in 0..4 {
+        for right in (left + 1)..4 {
+            script.push_str(&format!("(assert (not (= p{left} p{right})))\n"));
+        }
+    }
+    script
+}
+
+#[test]
+fn finite_enum_internal_certificate_does_not_require_parsed_retention() {
+    let commands = parse(&direct_finite_enum_assertions_only()).expect("parse direct enum roots");
+    let mut exec = Executor::new();
+    exec.set_retain_parsed_assertions(false);
+    assert!(exec
+        .execute_all(&commands)
+        .expect("install direct enum roots")
+        .is_empty());
+    assert!(exec.ctx.assertions_parsed().is_empty());
+    exec.begin_public_solve(false);
+    exec.bind_unsat_query_assumptions(&[]);
+
+    let members: Vec<TermId> = (0..4)
+        .map(|index| {
+            exec.ctx
+                .terms
+                .lookup(&format!("p{index}"))
+                .expect("declared member")
+        })
+        .collect();
+    let mut edge_sources = ay_core::kani_compat::DetHashMap::default();
+    for &source in &exec.ctx.assertions {
+        let TermData::Not(equality) = exec.ctx.terms.get(source) else {
+            continue;
+        };
+        let TermData::App(Symbol::Named(name), args) = exec.ctx.terms.get(*equality) else {
+            continue;
+        };
+        let [left, right] = args.as_slice() else {
+            continue;
+        };
+        if name == "=" {
+            let key = if left.0 < right.0 {
+                (*left, *right)
+            } else {
+                (*right, *left)
+            };
+            edge_sources.insert(key, source);
+        }
+    }
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 3,
+        members,
+        edge_sources,
+    });
+
+    assert!(exec.try_install_bounded_finite_enum_pigeonhole_proof());
+    let proof = exec.last_proof.as_ref().expect("installed internal proof");
+    assert!(exec.last_proof_is_checked_finite_enum());
+    exec.check_proof_strict_with_datatypes(proof)
+        .expect("parsed-free internal proof must replay strictly");
+    assert!(exec
+        .finite_enum_surface_overrides_for_proof(proof)
+        .is_none());
+    assert!(matches!(
+        exec.try_export_last_proof_alethe_for_problem_scope(),
+        Some(Err(
+            AlethePrintError::UnavailableAuthenticatedSurface { .. }
+        ))
+    ));
+}
+
+#[test]
+#[timeout(120_000)]
+fn oversized_finite_enum_exception_is_internal_strict_and_second_build_stable() {
+    let commands =
+        parse(&oversized_direct_finite_enum_script()).expect("parse oversized direct enum clique");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("solve oversized direct enum clique");
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+    let alethe = outputs.get(1).expect("bounded get-proof output");
+    assert!(
+        alethe.contains(":rule hole"),
+        "the pinned Alethe calculus has no datatype-exhaustiveness rule: {alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule dt_enum_pigeonhole"),
+        "an unsupported internal rule name must never be emitted: {alethe}"
+    );
+    let original = exec.last_proof().expect("checked proof").clone();
+    assert_eq!(
+        exec.finite_enum_scope_for_proof(&original)
+            .expect("sealed direct-root scope")
+            .len(),
+        6
+    );
+
+    // The generic trace has already been consumed. A repeated build must keep
+    // the exact checked proof/capability instead of reaching source poison.
+    exec.build_unsat_proof();
+    assert!(exec
+        .finite_enum_scope_for_proof(exec.last_proof().expect("retained proof"))
+        .is_some());
+
+    // A foreign candidate cannot borrow the stored proof's narrow root scope.
+    let foreign = exec
+        .ctx
+        .terms
+        .mk_var("finite_enum_foreign_assume", Sort::Bool);
+    let mut forged = original.clone();
+    forged.steps[1] = ProofStep::Assume(foreign);
+    assert!(exec.finite_enum_scope_for_proof(&forged).is_none());
+    assert!(exec.check_proof_strict_with_datatypes(&forged).is_err());
+
+    assert!(exec
+        .finite_enum_surface_overrides_for_proof(&original)
+        .is_some());
+
+    // Even a byte-for-byte proof clone loses the capability after a new public
+    // decision rotates the opaque query epoch.
+    exec.advance_query_authority_epoch();
+    assert!(exec.finite_enum_scope_for_proof(&original).is_none());
+    assert!(matches!(
+        exec.try_export_last_proof_alethe_for_problem_scope(),
+        Some(Err(
+            AlethePrintError::UnavailableAuthenticatedSurface { .. }
+        ))
+    ));
+    let mut stale_output = Vec::new();
+    assert!(matches!(
+        exec.try_export_last_proof_alethe_for_problem_scope_to(&mut stale_output),
+        Some(Err(ay_proof::AletheStreamError::Print(
+            AlethePrintError::UnavailableAuthenticatedSurface { .. }
+        )))
+    ));
+    assert!(stale_output.is_empty());
+    assert!(exec.get_proof().contains("proof authority is stale"));
+
+    // Result invalidation retires a newly recorded detector candidate together
+    // with the stale capability sidecar.
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 1,
+        members: Vec::new(),
+        edge_sources: Default::default(),
+    });
+    exec.invalidate_last_check_result();
+    assert!(exec.last_finite_enum_pigeonhole.is_none());
+    assert!(exec.last_checked_finite_enum_pigeonhole.is_none());
+}
+
+#[test]
+#[timeout(30_000)]
+fn binary_distinct_special_proof_is_internal_only_and_all_alethe_exports_decline() {
+    let commands = parse(&deep_surface_binary_distinct_script())
+        .expect("parse binary-distinct finite enum script");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("solve binary-distinct finite enum script");
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+    assert!(outputs
+        .get(1)
+        .is_some_and(|output| output.contains("no authenticated external surface")));
+
+    let proof = exec.last_proof().expect("internally checked proof");
+    assert!(exec.last_proof_is_checked_finite_enum());
+    exec.check_proof_strict_with_datatypes(proof)
+        .expect("binary distinct canonical root remains valid internal authority");
+    assert!(exec
+        .finite_enum_surface_overrides_for_proof(proof)
+        .is_none());
+    assert!(matches!(
+        exec.try_export_last_proof_alethe_for_problem_scope(),
+        Some(Err(
+            AlethePrintError::UnavailableAuthenticatedSurface { .. }
+        ))
+    ));
+    let mut output = Vec::new();
+    assert!(matches!(
+        exec.try_export_last_proof_alethe_for_problem_scope_to(&mut output),
+        Some(Err(ay_proof::AletheStreamError::Print(
+            AlethePrintError::UnavailableAuthenticatedSurface { .. }
+        )))
+    ));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn finite_enum_witness_cannot_replace_an_unrelated_proof() {
+    let mut exec = Executor::new();
+    let sort = Sort::Uninterpreted("UnrelatedProofUnit".to_string());
+    let left = exec.ctx.terms.mk_var("unrelated_left", sort.clone());
+    let right = exec.ctx.terms.mk_var("unrelated_right", sort);
+    let equality = exec.ctx.terms.mk_eq(left, right);
+    let source = exec.ctx.terms.mk_not_raw(equality);
+    let key = if left.0 < right.0 {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 1,
+        members: vec![left, right],
+        edge_sources: [(key, source)].into_iter().collect(),
+    });
+
+    let foreign = exec.ctx.terms.mk_var(
+        "unrelated_foreign",
+        Sort::Uninterpreted("UnrelatedProofUnit".to_string()),
+    );
+    let foreign_equality = exec.ctx.terms.mk_eq(left, foreign);
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("foreign", vec![foreign_equality], TheoryLemmaKind::Generic);
+    let before = format!("{:?}", proof.steps);
+    exec.rebuild_finite_enum_pigeonhole_refutation(&mut proof);
+    assert_eq!(format!("{:?}", proof.steps), before);
+}
+
+#[test]
+fn finite_enum_witness_owns_its_normalized_complete_equality_clause() {
+    let mut exec = Executor::new();
+    let sort = Sort::Uninterpreted("NormalizedProofUnit".to_string());
+    let left = exec.ctx.terms.mk_var("normalized_left", sort.clone());
+    let right = exec.ctx.terms.mk_var("normalized_right", sort);
+    let equality = exec.ctx.terms.mk_eq(left, right);
+    let source = exec.ctx.terms.mk_not_raw(equality);
+    exec.ctx.assertions.push(source);
+    let key = if left.0 < right.0 {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 1,
+        members: vec![left, right],
+        edge_sources: [(key, source)].into_iter().collect(),
+    });
+
+    let normalized_complement = exec.ctx.terms.mk_not_raw(source);
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "normalized",
+        vec![normalized_complement],
+        TheoryLemmaKind::Generic,
+    );
+    exec.rebuild_finite_enum_pigeonhole_refutation(&mut proof);
+
+    assert!(matches!(
+        proof.steps.as_slice(),
+        [
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::DatatypeEnumPigeonhole,
+                clause,
+                ..
+            },
+            ProofStep::Assume(assumption),
+            ProofStep::Step {
+                rule: AletheRule::Resolution,
+                clause: conclusion,
+                premises,
+                args,
+            }
+        ] if clause == &[equality]
+            && *assumption == source
+            && conclusion.is_empty()
+            && premises == &[ProofId(0), ProofId(1)]
+            && args.is_empty()
+    ));
+}
+
+#[test]
+fn finite_enum_witness_rejects_duplicate_normalized_edge() {
+    let mut exec = Executor::new();
+    let sort = Sort::Uninterpreted("DuplicateProofUnit".to_string());
+    let a = exec.ctx.terms.mk_var("duplicate_a", sort.clone());
+    let b = exec.ctx.terms.mk_var("duplicate_b", sort.clone());
+    let c = exec.ctx.terms.mk_var("duplicate_c", sort);
+    let ab = exec.ctx.terms.mk_eq(a, b);
+    let ac = exec.ctx.terms.mk_eq(a, c);
+    let bc = exec.ctx.terms.mk_eq(b, c);
+    let not_ab = exec.ctx.terms.mk_not_raw(ab);
+    let not_ac = exec.ctx.terms.mk_not_raw(ac);
+    let not_bc = exec.ctx.terms.mk_not_raw(bc);
+    exec.ctx.assertions.extend([not_ab, not_ac, not_bc]);
+    let pair = |left: TermId, right: TermId| {
+        if left.0 < right.0 {
+            (left, right)
+        } else {
+            (right, left)
+        }
+    };
+    exec.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+        k: 2,
+        members: vec![a, b, c],
+        edge_sources: [
+            (pair(a, b), not_ab),
+            (pair(a, c), not_ac),
+            (pair(b, c), not_bc),
+        ]
+        .into_iter()
+        .collect(),
+    });
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("duplicate", vec![ab, ac, ac], TheoryLemmaKind::Generic);
+    let before = format!("{:?}", proof.steps);
+    exec.rebuild_finite_enum_pigeonhole_refutation(&mut proof);
+    assert_eq!(format!("{:?}", proof.steps), before);
 }
 
 #[test]
@@ -619,6 +1025,74 @@ fn contextual_row2_unit_is_rebuilt_as_guarded_strict_proof() {
 }
 
 #[test]
+fn direct_authored_row2_is_rebuilt_after_sat_side_ite_expansion() {
+    let mut exec = Executor::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = exec.ctx.terms.mk_var("a", array_sort);
+    let i = exec.ctx.terms.mk_var("i", Sort::Int);
+    let j = exec.ctx.terms.mk_var("j", Sort::Int);
+    let v = exec.ctx.terms.mk_var("v", Sort::Int);
+    let store = exec.ctx.terms.mk_store(a, i, v);
+    let store_read = exec.ctx.terms.mk_select(store, j);
+    let base_read = exec.ctx.terms.mk_select(a, j);
+    let row_eq = exec.ctx.terms.mk_eq(store_read, base_read);
+    let not_row_eq = exec.ctx.terms.mk_not(row_eq);
+    let index_eq = exec.ctx.terms.mk_eq(i, j);
+    let not_index_eq = exec.ctx.terms.mk_not(index_eq);
+    exec.ctx.assertions = vec![not_index_eq, not_row_eq];
+    exec.proof_problem_assertion_provenance = Some(
+        crate::executor::theories::solve_harness::ProofProblemAssertionProvenance {
+            original_problem_assertions: exec.ctx.assertions.clone(),
+            problem_assertions: exec.ctx.assertions.clone(),
+            assertion_sources: Default::default(),
+        },
+    );
+
+    // Exact shape retained after ABV's select-store expansion: the current
+    // proof speaks about an internal ITE equality, not the authored ROW2 term.
+    // The repair must derive the contradiction only from the frozen authored
+    // roots above.
+    let expanded_read = exec.ctx.terms.mk_ite(index_eq, v, base_read);
+    let expanded_eq = exec.ctx.terms.mk_eq(expanded_read, base_read);
+    let not_expanded_eq = exec.ctx.terms.mk_not(expanded_eq);
+    let mut proof = Proof::new();
+    let negative = proof.add_rule_step(
+        AletheRule::Trust,
+        vec![not_expanded_eq],
+        Vec::new(),
+        Vec::new(),
+    );
+    let positive =
+        proof.add_rule_step(AletheRule::Trust, vec![expanded_eq], Vec::new(), Vec::new());
+    proof.add_resolution(Vec::new(), expanded_eq, negative, positive);
+
+    exec.replace_with_exact_authored_array_row2_refutation(&mut proof);
+
+    assert_eq!(proof.steps.len(), 5);
+    assert!(proof.steps.iter().any(|step| {
+        matches!(
+            step,
+            ProofStep::TheoryLemma {
+                clause,
+                kind: TheoryLemmaKind::ArraySelectStore { index_eq: false },
+                ..
+            } if clause.as_slice() == [index_eq, row_eq]
+        )
+    }));
+    assert!(proof.steps.iter().all(|step| !matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::Trust,
+            ..
+        }
+    )));
+    ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &exec.ctx.assertions)
+        .expect("rebuilt direct ROW2 proof may assume only exact authored roots");
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("rebuilt direct ROW2 proof must pass strict checking");
+}
+
+#[test]
 fn contextual_row2_repair_skips_unowned_candidate_and_uses_later_owned_unit() {
     let mut exec = Executor::new();
     let array_sort = Sort::array(Sort::Int, Sort::Int);
@@ -894,6 +1368,43 @@ fn test_get_proof_after_unsat() {
         outputs[1].starts_with('('),
         "Expected proof output, got: {}",
         outputs[1]
+    );
+}
+
+/// The external-codegen dom-bounds obligation family: `(and P (not (= P true)))` with
+/// `P` a BV comparison atom folds to `false` at elaboration and used to export
+/// the Carcara-rejected `:rule false` collapse.
+/// `promote_and_true_eq_contradiction_collapse` must rebuild it into the
+/// checkable and_pos/not_equiv2/true refutation (cand6) — no `false`, no
+/// `trust`.
+#[test]
+fn test_and_true_eq_contradiction_promotes_to_checkable_proof() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_BV)
+        (declare-const bridge_dom_bce_idx (_ BitVec 64))
+        (assert (and (bvult bridge_dom_bce_idx (_ bv1024 64)) (not (= (bvult bridge_dom_bce_idx (_ bv1024 64)) true))))
+        (check-sat)
+        (get-proof)
+    "#;
+
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs[0], "unsat");
+    let proof = &outputs[1];
+    assert!(
+        !proof.contains(":rule false"),
+        "dom-bounds proof must not use the Carcara-rejected false collapse:\n{proof}"
+    );
+    assert!(
+        !proof.contains(":rule trust"),
+        "dom-bounds proof must be fully checkable, no trust step:\n{proof}"
+    );
+    assert!(
+        proof.contains("and_pos") && proof.contains("not_equiv2") && proof.contains(":rule true"),
+        "dom-bounds proof must be the cand6 and_pos/not_equiv2/true refutation:\n{proof}"
     );
 }
 
@@ -1561,8 +2072,18 @@ fn test_closed_identity_classes_emit_firewall_lean() {
     // the three that the from-parsed emitters could not reach (no constant to
     // infer the model from), now handled per-lemma-kind with TermStore access.
     let cases = [
-        ("QF_BV", "(declare-const x (_ BitVec 4))", "(not (= (bvand x x) x))", "Bv_"),
-        ("QF_NIA", "(declare-const x Int)", "(not (= (* x 0) 0))", "NiaIdent_"),
+        (
+            "QF_BV",
+            "(declare-const x (_ BitVec 4))",
+            "(not (= (bvand x x) x))",
+            "Bv_",
+        ),
+        (
+            "QF_NIA",
+            "(declare-const x Int)",
+            "(not (= (* x 0) 0))",
+            "NiaIdent_",
+        ),
         (
             "QF_DT",
             "(declare-datatypes ((Pair 0)) (((mk (fst Int) (snd Int)))))(declare-const a Int)(declare-const b Int)",
@@ -1614,6 +2135,38 @@ fn test_qf_dt_tester_exclusion_emits_firewall_lean() {
 }
 
 #[test]
+fn test_scoped_reincarnated_dt_selector_projection_collapse_is_strict_checkable() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_DT)
+        (push 1)
+        (declare-datatypes ((ScopedPair 0)) (((scoped-mk (scoped-fst Int) (scoped-snd Int)))))
+        (pop 1)
+        (declare-datatypes ((ScopedPair 0)) (((scoped-mk (scoped-fst Int) (scoped-snd Int)))))
+        (declare-const scoped-a Int)
+        (declare-const scoped-b Int)
+        (assert (not (= (scoped-fst (scoped-mk scoped-a scoped-b)) scoped-a)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+    let text = exec.get_proof();
+    assert!(
+        !text.contains(":rule trust"),
+        "private member identities must retain trust-free reconstruction:\n{text}"
+    );
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    match exec.check_proof_strict_with_datatypes(proof) {
+        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
+        Err(error) => panic!(
+            "scoped datatype selector-projection proof must pass strict check, got {error:?}"
+        ),
+    }
+}
+
+#[test]
 fn test_qf_dt_exhaustiveness_emits_firewall_lean() {
     // bench `qf_dt/v2l60078.cvc.smt2` core conflict: over `list` (cons|null),
     // `(not ((_ is cons) (cdr x4)))` AND `(cdr x4) != null` — a value that is
@@ -1661,20 +2214,15 @@ fn test_qf_dt_selector_over_matching_ctor_emits_firewall_lean() {
     assert!(f.contains("def sel : D -> Int"));
 }
 
-/// Pin the shape-3 (`false`-constant) collapse recognizer directly.
+/// Schema reconstruction is attempted for every completed refutation.
 ///
-/// The seven collapse promoters all gate on `proof_is_single_empty_trust`.
-/// Elaboration now folds an identity-negation assertion all the way to the
-/// `false` CONSTANT and records the refutation as
-/// `Assume(false) + lemma[(not false)] + resolution` — a third encoding that
-/// neither the legacy single-`trust` shape nor the `:rule false` shape matched,
-/// so every promoter no-opped and the step printed as an untyped `hole`. This
-/// test pins both directions: the degenerate shape is recognised, and a proof
-/// carrying ANY real content is not (which is what keeps the promoters — all of
-/// which clear the proof before rebuilding — from clobbering a genuine
-/// derivation).
+/// The individual promoters independently recognize the exact authored
+/// theorem and strict-check their replacement before committing it. Their
+/// common gate therefore only needs to establish that the existing proof
+/// derives the empty clause; limiting it to historical collapse shapes would
+/// miss valid reconstruction opportunities as proof production evolves.
 #[test]
-fn false_constant_collapse_is_recognized_and_content_bearing_proofs_are_not() {
+fn schema_collapse_reconstruction_gate_tracks_completed_refutations() {
     let mut exec = Executor::new();
     let false_t = exec.ctx.terms.false_term();
     let not_false = exec.ctx.terms.mk_not_raw(false_t);
@@ -1690,13 +2238,13 @@ fn false_constant_collapse_is_recognized_and_content_bearing_proofs_are_not() {
     );
     collapsed.add_resolution(vec![], false_t, assume_id, lemma_id);
     assert!(
-        Executor::proof_is_single_empty_trust(&collapsed),
-        "the false-constant collapse must be recognised as a degenerate proof"
+        Executor::proof_needs_schema_collapse_reconstruction(&collapsed),
+        "the false-constant collapse is a completed refutation"
     );
 
-    // Same three-step skeleton, but the assumption is a real atom rather than
-    // the `false` constant: this proof carries content and must NOT be treated
-    // as a collapse.
+    // A content-bearing proof is also eligible: a mismatched promoter leaves it
+    // untouched, while a matching promoter may replace it with a stricter
+    // authored proof.
     let p = exec.ctx.terms.mk_var("shape3-p", Sort::Bool);
     let not_p = exec.ctx.terms.mk_not_raw(p);
     let mut real = Proof::new();
@@ -1704,11 +2252,12 @@ fn false_constant_collapse_is_recognized_and_content_bearing_proofs_are_not() {
     let l = real.add_theory_lemma_with_kind("Bool", vec![not_p], TheoryLemmaKind::BoolTautology);
     real.add_resolution(vec![], p, a, l);
     assert!(
-        !Executor::proof_is_single_empty_trust(&real),
-        "a proof whose assumption is a real atom is not the false-constant collapse"
+        Executor::proof_needs_schema_collapse_reconstruction(&real),
+        "every completed refutation is eligible for an independently checked reconstruction"
     );
 
-    // A fourth step of genuine theory content also disqualifies the shape.
+    // Extra proof content does not change eligibility when the empty clause is
+    // still derived.
     let mut extra = Proof::new();
     let assume_id = extra.add_assume(false_t, None);
     let lemma_id =
@@ -1716,8 +2265,15 @@ fn false_constant_collapse_is_recognized_and_content_bearing_proofs_are_not() {
     extra.add_theory_lemma_with_kind("Bool", vec![p], TheoryLemmaKind::BoolTautology);
     extra.add_resolution(vec![], false_t, assume_id, lemma_id);
     assert!(
-        !Executor::proof_is_single_empty_trust(&extra),
-        "a proof with an extra content step is not the false-constant collapse"
+        Executor::proof_needs_schema_collapse_reconstruction(&extra),
+        "a completed proof with additional content remains eligible"
+    );
+
+    let mut incomplete = Proof::new();
+    incomplete.add_assume(p, None);
+    assert!(
+        !Executor::proof_needs_schema_collapse_reconstruction(&incomplete),
+        "an incomplete proof must not trigger reconstruction"
     );
 }
 
@@ -2300,6 +2856,49 @@ fn test_prune_to_empty_clause_derivation_removes_unreachable_steps() {
         }
         other => panic!("expected Step, got {other:?}"),
     }
+}
+
+#[test]
+fn test_prune_to_selected_earlier_empty_clause() {
+    use ay_core::{AletheRule, TermId};
+
+    let early_term = TermId::new(1);
+    let late_term = TermId::new(2);
+    let mut proof = Proof::new();
+    let early_assume = proof.add_assume(early_term, Some("early".to_string()));
+    let early_empty = proof.add_rule_step(
+        AletheRule::ThResolution,
+        Vec::new(),
+        vec![early_assume],
+        Vec::new(),
+    );
+    let late_assume = proof.add_assume(late_term, Some("late".to_string()));
+    proof.add_rule_step(
+        AletheRule::ThResolution,
+        Vec::new(),
+        vec![late_assume],
+        Vec::new(),
+    );
+
+    assert!(
+        crate::executor::proof_resolution::prune_to_empty_clause_derivation_at(
+            &mut proof,
+            early_empty.0 as usize,
+        )
+    );
+    assert_eq!(proof.steps.len(), 2);
+    assert!(matches!(proof.steps[0], ProofStep::Assume(term) if term == early_term));
+    assert!(matches!(
+        &proof.steps[1],
+        ProofStep::Step {
+            rule: AletheRule::ThResolution,
+            clause,
+            premises,
+            ..
+        } if clause.is_empty() && premises == &[ProofId(0)]
+    ));
+    assert_eq!(proof.named_steps.get("early"), Some(&ProofId(0)));
+    assert!(!proof.named_steps.contains_key("late"));
 }
 
 #[test]
@@ -4253,4 +4852,97 @@ fn a_problem_asserted_extensionality_shaped_clause_is_never_promoted() {
         "a problem-asserted clause must stay an assume, got {:?}",
         proof.steps
     );
+}
+
+/// A surface override inside a BINDER may re-spell a term, never re-write it.
+///
+/// `collect_bound_surface_overrides` re-elaborates every subterm of a
+/// quantified body and attaches its authored spelling to the resulting
+/// `TermId`. Elaboration FOLDS, so `(+ x 0)` interns as the bare bound
+/// variable `x` — and the override then renamed the VARIABLE, making every
+/// occurrence of `x` in the document print as `(+ x 0)`.
+///
+/// That is not cosmetic here. The certified `sko_forall` printer re-reads
+/// these overrides and installs the binder-substituted spelling on the Skolem
+/// witness, which then disagrees with the `(choice ...)` the same pass already
+/// installed for that witness. Measured on this exact fixture before the
+/// containment guard, `(get-proof)` returned
+///
+/// ```text
+/// (error "UNVERIFIABLE PROOF: invalid certified sko_forall step t1: term t13
+///  acquired incompatible choice renderings
+///  `(choice ((x Int)) (not (or (<= (+ x 0) y) p)))`
+///  and `(+ (choice ((x Int)) (not (or (<= (+ x 0) y) p))) 0)`")
+/// ```
+///
+/// — the whole certificate replaced by the unverifiable marker, while the
+/// verdict `unsat` (z3 5.0.0 agrees) was correct throughout.
+///
+/// The assertions below pin BOTH directions, so the guard cannot be satisfied
+/// by simply dropping every override:
+/// 1. no override may map a bound-variable/leaf `TermId` to a composite
+///    spelling (the re-write);
+/// 2. the genuine re-spelling `(<= (+ x 0) y)` — whose canonical `(<= x y)`
+///    strictly contains both operands — must SURVIVE;
+/// 3. the exported document must be a real Alethe proof, not the marker.
+#[test]
+fn a_bound_surface_override_respells_a_term_and_never_rewrites_it() {
+    // `(* 1 x)` folds the same way and is a second, independent operator.
+    for body_lhs in ["(+ x 0)", "(* 1 x)"] {
+        let input = format!(
+            r#"(set-option :produce-proofs true)
+            (set-logic LIA)
+            (declare-const y Int)
+            (declare-const p Bool)
+            (assert (not (forall ((x Int)) (or (<= {body_lhs} y) p))))
+            (assert p)
+            (check-sat)"#
+        );
+        let commands = parse(&input).unwrap();
+        let mut exec = Executor::new();
+        assert_eq!(
+            exec.execute_all(&commands).unwrap(),
+            vec!["unsat"],
+            "{body_lhs}: verdict must stay unsat (z3 5.0.0: unsat)"
+        );
+
+        let overrides = exec
+            .proof_export_term_overrides()
+            .expect("the binder lane must still collect surface overrides");
+
+        // (1) No LEAF term may carry a composite spelling.
+        for (&term, spelling) in &overrides {
+            let is_leaf = matches!(
+                exec.ctx.terms.get(term),
+                TermData::Var(..) | TermData::Const(..)
+            );
+            assert!(
+                !(is_leaf && spelling.starts_with('(')),
+                "{body_lhs}: a surface override re-WROTE the leaf {term:?} \
+                 ({:?}) as the composite `{spelling}`",
+                exec.ctx.terms.get(term)
+            );
+        }
+
+        // (2) NON-VACUITY: the genuine re-spelling must survive. Without this
+        // the guard could pass by collecting nothing at all.
+        assert!(
+            overrides
+                .values()
+                .any(|spelling| spelling == &format!("(<= {body_lhs} y)")),
+            "{body_lhs}: the authored spelling of the comparison must survive \
+             the guard; collected {overrides:?}"
+        );
+
+        // (3) The document must be a certificate, not the refusal marker.
+        let text = exec.get_proof();
+        assert!(
+            !text.contains("UNVERIFIABLE PROOF"),
+            "{body_lhs}: the sko_forall certificate must still print; got:\n{text}"
+        );
+        assert!(
+            text.contains("(assume "),
+            "{body_lhs}: the exported proof must anchor on the problem assertion; got:\n{text}"
+        );
+    }
 }

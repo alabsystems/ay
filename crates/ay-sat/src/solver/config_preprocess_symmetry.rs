@@ -6,6 +6,7 @@
 
 use super::mutate::AddResult;
 use super::*;
+use std::collections::BTreeSet;
 
 const SYMMETRY_MAX_VARS: usize = 4_096;
 /// Variable ceiling for the CHEAP aux-free-SR / php-matrix route.
@@ -147,7 +148,19 @@ impl Solver {
             && self.cold.symmetry_stats.runs == 1
             && orbitope_fits
         {
+            let before = self.cold.symmetry_stats.sb_clauses_added;
             let (unsat, changed) = self.preprocess_symmetry_orbitope();
+            let added = self.cold.symmetry_stats.sb_clauses_added - before;
+            self.cold.symmetry_stats.record_route(
+                "orbitope",
+                if unsat {
+                    "derived UNSAT".to_string()
+                } else if changed {
+                    format!("added {added} clauses")
+                } else {
+                    "ran, found nothing".to_string()
+                },
+            );
             if unsat || changed {
                 return (unsat, changed);
             }
@@ -173,7 +186,31 @@ impl Solver {
             })
         };
         let sr_auxfree_enabled = sr_auxfree_enabled && self.cold.symmetry_oneshot;
-        if !self.cold.symmetry_enabled && !composite_symmetry && !sr_auxfree_enabled {
+        // The signed route's flag is read further down, AFTER this gate, so
+        // `AY_SAT_SIGNED_SYMMETRY=1` alone never reached it: `symmetry_enabled`
+        // defaults false and its only re-enable (`adaptive.rs`) is guarded by
+        // `num_vars < 4096`. Verified 2026-08-10 on a 139 160-variable instance:
+        // with the flag set, the trace still reports `enabled=false` and
+        // `symmetry_sb_cls: 0`.
+        //
+        // That is not merely a dead switch — it invalidated a recorded verdict.
+        // The full-400 A/B that REJECTED signed symmetry (-3 solved) measured a
+        // technique that was inert on every instance above 4096 variables, i.e.
+        // on most of the corpus. Re-judge that decision now the route can run.
+        let signed_enabled = {
+            use std::sync::OnceLock;
+            static F: OnceLock<bool> = OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some())
+        };
+        // Signed lex leaders remove models just like every other structural
+        // symmetry route. An environment flag must not silently opt an
+        // embedder or assumption solver into that one-shot-only transform.
+        let signed_route = signed_enabled && self.cold.symmetry_oneshot;
+        if !self.cold.symmetry_enabled
+            && !composite_symmetry
+            && !sr_auxfree_enabled
+            && !signed_route
+        {
             self.cold
                 .symmetry_stats
                 .skip(crate::symmetry::SymmetrySkipReason::Disabled);
@@ -185,11 +222,6 @@ impl Solver {
         // survives competition polarity shuffling. Like the orbitope units, the
         // emitted lex-leader clauses are satisfiability-preserving rather than
         // RUP, so they stay off any proof surface for now.
-        let signed_route = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some())
-        };
         // `AY_SAT_SIGNED_SYMMETRY_SR` promotes the route to a certificate-bearing
         // one: each lex-leader clause is written as a DSR `a`-line witnessed by
         // the signed automorphism σ, verified externally by
@@ -212,7 +244,19 @@ impl Solver {
             && self.num_vars <= SIGNED_SYMMETRY_MAX_VARS
             && self.arena.active_clause_count() <= SIGNED_SYMMETRY_MAX_CLAUSES
         {
+            let before = self.cold.symmetry_stats.sb_clauses_added;
             let (unsat, changed) = self.preprocess_symmetry_signed(signed_sr);
+            let added = self.cold.symmetry_stats.sb_clauses_added - before;
+            self.cold.symmetry_stats.record_route(
+                "signed",
+                if unsat {
+                    "derived UNSAT".to_string()
+                } else if changed {
+                    format!("added {added} clauses")
+                } else {
+                    "ran, found nothing".to_string()
+                },
+            );
             if unsat || changed {
                 return (unsat, changed);
             }
@@ -471,7 +515,15 @@ impl Solver {
         // final `0`). Only fires for the pigeonhole family; otherwise it is a no-op
         // and the solver proceeds with symmetry off (still sound).
         if sr_auxfree_route {
-            if let Some(steps) = crate::symmetry::detector::detect_php_aux_free_sr(&clauses) {
+            let auxfree_steps = crate::symmetry::detector::detect_php_aux_free_sr(&clauses);
+            self.cold.symmetry_stats.record_route(
+                "auxfree-sr",
+                match &auxfree_steps {
+                    Some(v) => format!("php matrix, {} steps", v.len()),
+                    None => "ran, no php matrix".to_string(),
+                },
+            );
+            if let Some(steps) = auxfree_steps {
                 let mut changed = false;
                 for lc in steps {
                     let crate::symmetry::detector::LexClause::Sr { clause, witness } = lc else {
@@ -530,7 +582,7 @@ impl Solver {
                 self.ensure_num_vars(fresh_base as usize + aux as usize);
             }
             let existing_clause_counts = crate::symmetry::build_formula_counts(&clauses);
-            let mut seen: std::collections::BTreeSet<Vec<u32>> = std::collections::BTreeSet::new();
+            let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
             let mut changed = false;
             for lc in tagged {
                 let crate::symmetry::detector::LexClause::Sr { clause, witness } = lc else {
@@ -567,7 +619,7 @@ impl Solver {
                 detector.detect_and_encode_composite_with_witness(&clauses, fresh_base);
             // Keep only the PR (j=0 binary) clauses; drop every Aux clause.
             let existing_clause_counts = crate::symmetry::build_formula_counts(&clauses);
-            let mut seen: std::collections::BTreeSet<Vec<u32>> = std::collections::BTreeSet::new();
+            let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
             let mut changed = false;
             for lc in tagged {
                 let crate::symmetry::detector::LexClause::Pr { clause, witness } = lc else {
@@ -733,6 +785,13 @@ impl Solver {
             max_gens,
         );
         if generators.is_empty() {
+            // Record that the search RAN and found nothing. Returning silently
+            // here is indistinguishable in `--stats` from the route never
+            // executing, which is exactly how this route stayed inert while a
+            // full-400 A/B "rejected" it.
+            self.cold
+                .symmetry_stats
+                .skip(crate::symmetry::SymmetrySkipReason::NoGenerators);
             return (false, false);
         }
         // Substantiality gate. Adding symmetry-breaking clauses perturbs the
@@ -750,7 +809,7 @@ impl Solver {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
-        let moved: std::collections::BTreeSet<crate::Variable> = generators
+        let moved: BTreeSet<Variable> = generators
             .iter()
             .flat_map(|perm| perm.keys().map(|l| l.variable()))
             .collect();
@@ -774,7 +833,7 @@ impl Solver {
         );
 
         let existing = crate::symmetry::build_formula_counts(&clauses);
-        let mut seen: std::collections::BTreeSet<Vec<u32>> = std::collections::BTreeSet::new();
+        let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
         let mut changed = false;
         for perm in &generators {
             // Smallest moved variable, and the literal its positive form goes to.

@@ -361,22 +361,10 @@ impl Executor {
                 // restored assertions are not all `true`, and the empty model
                 // still lets the output layer resolve array/selector values from
                 // the restored assertions.
-                self.last_model = Some(crate::executor::model::Model {
-                    sat_model: Vec::new(),
-                    term_to_var: Default::default(),
-                    bool_overrides: bool_overrides.into_iter().collect(),
-                    euf_model: None,
-                    array_model: None,
-                    lra_model: None,
-                    lia_model,
-                    bv_model: None,
-                    fp_model: None,
-                    string_model: None,
-                    seq_model: None,
-                    completed_values: Default::default(),
-                    dt_ground: Default::default(),
-                    dt_pins: Default::default(),
-                });
+                let mut model = crate::executor::model::Model::empty();
+                model.bool_overrides = bool_overrides.into_iter().collect();
+                model.lia_model = lia_model;
+                self.last_model = Some(model);
                 self.last_model_validated = true;
                 return Ok(SolveResult::Sat);
             }
@@ -974,7 +962,10 @@ impl Executor {
                         if d > 0 {
                             eprintln!(
                                 "[auflia_fix] outer={} round={} store_value_cong added {} axioms, terms={}",
-                                _outer, _round, d, self.ctx.terms.len(),
+                                _outer,
+                                _round,
+                                d,
+                                self.ctx.terms.len(),
                             );
                             for i in _aa0.._aa0 + d.min(4) {
                                 let t = self.ctx.assertions[i];
@@ -999,7 +990,10 @@ impl Executor {
                         if d > 0 {
                             eprintln!(
                                 "[auflia_fix] outer={} round={} store_other_side_cong added {} axioms, terms={}",
-                                _outer, _round, d, self.ctx.terms.len(),
+                                _outer,
+                                _round,
+                                d,
+                                self.ctx.terms.len(),
                             );
                             for i in _aa1.._aa1 + d.min(4) {
                                 let t = self.ctx.assertions[i];
@@ -1024,7 +1018,10 @@ impl Executor {
                         if d > 0 {
                             eprintln!(
                                 "[auflia_fix] outer={} round={} store_disj_index added {} axioms, terms={}",
-                                _outer, _round, d, self.ctx.terms.len(),
+                                _outer,
+                                _round,
+                                d,
+                                self.ctx.terms.len(),
                             );
                             for i in _aa2.._aa2 + d.min(4) {
                                 let t = self.ctx.assertions[i];
@@ -1066,7 +1063,10 @@ impl Executor {
                         if d > 0 {
                             eprintln!(
                                 "[auflia_fix] outer={} round={} array_congruence added {} axioms, terms={}",
-                                _outer, _round, d, self.ctx.terms.len(),
+                                _outer,
+                                _round,
+                                d,
+                                self.ctx.terms.len(),
                             );
                         }
                     }
@@ -1083,7 +1083,10 @@ impl Executor {
                         if d > 0 {
                             eprintln!(
                                 "[auflia_fix] outer={} round={} seed_row_terms added {} terms (total={})",
-                                _outer, _round, d, self.ctx.terms.len(),
+                                _outer,
+                                _round,
+                                d,
+                                self.ctx.terms.len(),
                             );
                         }
                     }

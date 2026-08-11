@@ -191,7 +191,7 @@ fn probe_scaled_deadline(
 /// a documented 60-second route deadline; this is above the known production
 /// corpus maximum while retaining a finite control-loop bound.
 fn sat_relu_proof_trial_deadline(outer_deadline: Option<Instant>, now: Instant) -> Option<Instant> {
-    const DEFAULT_ROUTE_LIMIT: Duration = Duration::from_secs(60);
+    const DEFAULT_ROUTE_LIMIT: Duration = Duration::from_mins(1);
     match outer_deadline {
         Some(outer) => (outer > now).then_some(outer),
         None => now.checked_add(DEFAULT_ROUTE_LIMIT),
@@ -10082,7 +10082,6 @@ mod tests {
 
     #[test]
     fn rigorous_bound_expr_matches_the_single_column_form() {
-        use num_traits::ToPrimitive as _;
         // The expression API must agree with the column API on a one-column objective,
         // otherwise callers cannot migrate to it.
         let mut m = Model::new();

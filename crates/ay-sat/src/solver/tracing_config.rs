@@ -200,8 +200,10 @@ impl Solver {
     ///
     /// Returns `None` if clause trace was not enabled.
     pub fn take_clause_trace(&mut self) -> Option<ClauseTrace> {
-        let trace = self.cold.clause_trace.take();
-        if let Some(t) = trace.as_ref() {
+        let solver_num_vars = self.total_num_vars();
+        let mut trace = self.cold.clause_trace.take();
+        if let Some(t) = trace.as_mut() {
+            t.stamp_solver_num_vars(solver_num_vars);
             // #A2b observability: the two search-time proof bookkeeping
             // meters (trace bytes recorded, root-trail entries rescanned by
             // level-0 LRAT materialization) that calibrate the construction
@@ -217,6 +219,18 @@ impl Solver {
             );
         }
         trace
+    }
+
+    /// Clone the clause trace and bind the snapshot to this solver's exact
+    /// variable namespace.
+    ///
+    /// Unlike [`Self::clause_trace`], the returned value is an immutable proof
+    /// candidate with bundled namespace provenance. Mutating its proof content
+    /// through a public [`ClauseTrace`] mutator clears that provenance.
+    pub fn snapshot_clause_trace(&self) -> Option<ClauseTrace> {
+        let mut trace = self.cold.clause_trace.clone()?;
+        trace.stamp_solver_num_vars(self.total_num_vars());
+        Some(trace)
     }
 
     /// Get a reference to the clause trace

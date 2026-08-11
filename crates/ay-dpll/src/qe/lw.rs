@@ -24,7 +24,7 @@
 //! literal whose head is not one of the supported relations. One mixed-sort
 //! bridge IS supported: `(to_real t)` applications over Int-sorted `t` are
 //! purified into fresh Real variables before parsing and substituted back
-//! into the verified output (see [`purify_to_real`]), which is what lets
+//! into the screened output (see [`purify_to_real`]), which is what lets
 //! mixed-sort `∀n:Int ∃r:Real` blocks eliminate.
 //!
 //! # Algorithm (Loos-Weispfenning, −∞ / lower-endpoint form)
@@ -52,17 +52,19 @@
 //! disequality `true`, and `a·x + r < 0` (or `≤`) becomes `v < 0` when
 //! `a > 0` and `v ≤ 0` when `a < 0`, where `v = a·e + r`.
 //!
-//! # Soundness gate
+//! # Candidate regression gate
 //!
-//! Mirroring [`super::cooper::selfcheck`]: the output is verified against the
+//! Mirroring [`super::cooper::selfcheck`]: the output is tested against the
 //! input on a battery of ground rational assignments before being returned.
 //! For each sampled assignment `σ`, `∃x.φ[σ]` is decided EXACTLY by interval
 //! intersection over the one-variable bounds (complete for a one-variable
 //! linear real conjunction, including strict/nonstrict endpoints and `≠`
 //! punctures — finitely many punctures cannot empty an interval with
 //! interior over the dense reals), and compared with an independent
-//! evaluation of the LW output. ANY disagreement or unknown evaluation
-//! refuses the elimination (fail-closed).
+//! evaluation of the LW output. ANY observed disagreement or unknown
+//! evaluation refuses the elimination. The battery is finite, so passing it is
+//! not a proof of the outer equivalence for every free-variable valuation and
+//! cannot serve as public verdict authority by itself.
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
@@ -88,11 +90,11 @@ const RANDOM_SAMPLES: usize = 200;
 /// purifying each bridge node into a fresh Real variable first (see
 /// [`purify_to_real`] for the soundness argument), running the UNCHANGED
 /// parse/LW/self-check pipeline on the purified body, and substituting the
-/// bridge terms back into the verified output.
+/// bridge terms back into the screened output.
 ///
 /// # Returns
-/// * [`QeResult::Eliminated`] with the quantifier-free equivalent, **only**
-///   after it has passed the interval-exact equivalence self-check.
+/// * [`QeResult::Eliminated`] with the quantifier-free candidate, **only**
+///   after it has passed the bounded differential check.
 /// * [`QeResult::NotSupported`] if the input is out of fragment or the
 ///   self-check fails (fail-closed).
 pub fn eliminate_exists_real(terms: &mut TermStore, body: TermId, var: TermId) -> QeResult {
@@ -112,7 +114,7 @@ pub fn eliminate_exists_real(terms: &mut TermStore, body: TermId, var: TermId) -
             origs,
         } => match eliminate_core(terms, purified, var) {
             QeResult::Eliminated(qf) => {
-                // Instantiate the verified equivalence at `u := to_real(t)`.
+                // Instantiate the screened candidate at `u := to_real(t)`.
                 // The back-substitution rebuilds through the folding
                 // constructors (`mk_le`/`mk_lt`/`mk_eq_coerce` via
                 // `rebuild_app`), so `to_real(n) ⋈ c` atoms fold to pure Int
@@ -150,7 +152,9 @@ fn eliminate_core(terms: &mut TermStore, body: TermId, var: TermId) -> QeResult 
 
     let result = lw(terms, &parsed, var);
 
-    // HARD soundness gate: independently verify `result ≡ ∃x.φ` before use.
+    // Bounded differential gate: each grounded one-variable obligation is
+    // decided exactly, but only finitely many free-variable assignments are
+    // exercised. Public use needs separate symbolic authority.
     if equivalence_self_check(terms, &parsed, var, result) {
         QeResult::Eliminated(result)
     } else {

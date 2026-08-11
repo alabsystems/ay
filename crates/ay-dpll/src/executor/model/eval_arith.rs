@@ -31,7 +31,7 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, Zero};
 
-use super::{EvalValue, Executor, Model};
+use super::{DivWitnessFamily, EvalValue, Executor, Model};
 
 /// Lift an evaluated value into an exact real scalar, or `None` for
 /// non-numeric / unknown values.
@@ -51,25 +51,6 @@ fn from_scalar(s: RealScalar) -> EvalValue {
     }
 }
 
-/// Parse the operand term ids `mod_div_elim` encoded in a witness variable's
-/// name, given the name with its family prefix already stripped.
-///
-/// The literal-zero-divisor form is keyed by the dividend alone
-/// (`_ay_zerodiv_{op}_{dividend}`); the symbolic form is keyed by BOTH operands
-/// (`…_{dividend}_{divisor}`), because the pair is what identifies the
-/// application. A name that does not parse is not one of ours and is skipped.
-fn parse_witness_operands(rest: &str, keyed_by_divisor: bool) -> Option<(u32, Option<u32>)> {
-    if keyed_by_divisor {
-        let (dividend, divisor) = rest.split_once('_')?;
-        Some((
-            dividend.parse::<u32>().ok()?,
-            Some(divisor.parse::<u32>().ok()?),
-        ))
-    } else {
-        Some((rest.parse::<u32>().ok()?, None))
-    }
-}
-
 impl Executor {
     /// The value the solve CHOSE for `(div a 0)` or `(mod a 0)`.
     ///
@@ -84,10 +65,10 @@ impl Executor {
     /// came out as `unknown` (`(assert (< 0 (div 1 0)))` is `sat` in z3 and was
     /// `unknown` here), for EVERY model mentioning a zero divisor.
     ///
-    /// Two witness spellings exist, and both are searched:
+    /// Two witness families exist, and both are searched:
     ///
     /// * LITERAL zero divisor — `zero_divisor_var` mints
-    ///   `_ay_zerodiv_{op}_{dividend}`. `div`/`mod`/`rem` keep separate names so
+    ///   `__ay_zerodiv_{op}_{dividend}`. `div`/`mod`/`rem` keep separate names so
     ///   the three stay independent (matching z3) (#div0).
     /// * SYMBOLIC divisor that turned out to be zero — the case the literal path
     ///   never sees, since it fires only on a syntactic `0`. The symbolic
@@ -101,7 +82,7 @@ impl Executor {
     /// FAIL CLOSED: a miss stays `Unknown`, costing completeness only.
     ///
     /// SOUNDNESS — why the match is on the operands' VALUES, not their term ids.
-    /// An O(1) `find_var` on `_ay_zerodiv_{op}_{args[0].index()}` is tempting and
+    /// An O(1) `find_var` on `__ay_zerodiv_{op}_{args[0].index()}` is tempting and
     /// is strictly worse on both counts:
     ///
     /// * It is LESS COMPLETE. The name encodes the REWRITTEN dividend, while the
@@ -125,9 +106,14 @@ impl Executor {
     /// this one is safe.
     fn zero_divisor_value(&self, model: &Model, op: &str, dividend: &BigRational) -> EvalValue {
         // A LITERAL zero divisor: `mod_div_elim::zero_divisor_var` replaced the
-        // term with `_ay_zerodiv_{op}_{dividend}`.
-        let literal =
-            self.zero_divisor_witness(model, &format!("_ay_zerodiv_{op}_"), false, dividend);
+        // term with `__ay_zerodiv_{op}_{dividend}`.
+        let literal_family = match op {
+            "div" => DivWitnessFamily::LiteralDiv,
+            "mod" => DivWitnessFamily::LiteralMod,
+            "rem" => DivWitnessFamily::LiteralRem,
+            _ => return EvalValue::Unknown,
+        };
+        let literal = self.zero_divisor_witness(model, literal_family, dividend);
         if !matches!(literal, EvalValue::Unknown) {
             return literal;
         }
@@ -135,70 +121,46 @@ impl Executor {
         // A SYMBOLIC divisor that turned out to be zero. `div` is the quotient
         // variable of the `x = q*y + r` constraint system, `mod` the remainder.
         //
-        // Two spellings are accepted because the symbolic-witness interning
-        // landed twice, independently, under different names: `_ay_symdivmod_`
-        // keys by `(op, kind, dividend, divisor)`, `_ay_symdiv_` by
-        // `(kind, dividend, divisor)` with `div`/`mod` sharing one `(q, r)`
-        // pair. Both denote the same unconstrained result variable and both are
-        // sound to read; accepting both keeps this evaluator correct whichever
-        // spelling `mod_div_elim` ends up minting, and the unused arm costs one
-        // failed `strip_prefix` per term. Drop the other once that pass settles.
-        let kind = if op == "div" { "q" } else { "r" };
-        for prefix in [
-            format!("_ay_symdivmod_{op}_{kind}_"),
-            format!("_ay_symdiv_{kind}_"),
-        ] {
-            let symbolic = self.zero_divisor_witness(model, &prefix, true, dividend);
-            if !matches!(symbolic, EvalValue::Unknown) {
-                return symbolic;
-            }
-        }
-        EvalValue::Unknown
+        // The symbolic producer mints exactly one reserved family keyed by
+        // `(kind, dividend, divisor)`, with `div`/`mod` sharing one `(q, r)`
+        // pair. Do not accept reader-only legacy spellings: without a matching
+        // producer they would widen the set of names treated as solver evidence.
+        let symbolic_family = if op == "div" {
+            DivWitnessFamily::SymbolicQuotient
+        } else {
+            DivWitnessFamily::SymbolicRemainder
+        };
+        self.zero_divisor_witness(model, symbolic_family, dividend)
     }
 
     /// Find the variable the elimination pass left standing for an
     /// under-specified `(op a 0)` in one witness family, and read back the value
-    /// the solve gave it. `keyed_by_divisor` says whether this family's names
-    /// encode the divisor as well as the dividend.
+    /// the solve gave it.
     ///
     /// See [`Self::zero_divisor_value`] for why matching is on the operands'
-    /// VALUES rather than their term ids. The scan is linear in the term store
-    /// and only runs on the zero-divisor path, which is rare; the per-term work
-    /// is a `strip_prefix` that almost always fails immediately.
+    /// VALUES rather than their term ids. Reserved-name discovery is performed
+    /// once per exact structural TermStore snapshot by
+    /// `div_witness_index_cache`; this lookup walks only the already-parsed
+    /// candidates in the requested family. No evaluated value is cached here,
+    /// so model mutation remains governed solely by the ordinary evaluation
+    /// memo's clear discipline.
     fn zero_divisor_witness(
         &self,
         model: &Model,
-        prefix: &str,
-        keyed_by_divisor: bool,
+        family: DivWitnessFamily,
         dividend: &BigRational,
     ) -> EvalValue {
         let want_dividend = EvalValue::Rational(dividend.clone());
-        for idx in 0..self.ctx.terms.len() {
-            let candidate = TermId::new(idx as u32);
-            let ay_core::term::TermData::Var(name, _) = self.ctx.terms.get(candidate) else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix(prefix) else {
-                continue;
-            };
-            let Some((dividend_idx, divisor_idx)) = parse_witness_operands(rest, keyed_by_divisor)
-            else {
-                continue;
-            };
-            if dividend_idx as usize >= self.ctx.terms.len() {
-                continue;
-            }
-            if self.evaluate_term(model, TermId::new(dividend_idx)) != want_dividend {
+        let index = self.div_witness_index_cache.index(&self.ctx.terms);
+        for candidate in index.candidates(family) {
+            if self.evaluate_term(model, candidate.dividend) != want_dividend {
                 continue;
             }
             // For the symbolic form the DIVISOR is part of the key, and it has
             // to be zero here as well — a witness for a different divisor is
             // constrained by `x = q*y + r` and carries a different value.
-            if let Some(v) = divisor_idx {
-                if v as usize >= self.ctx.terms.len() {
-                    continue;
-                }
-                match self.evaluate_term(model, TermId::new(v)) {
+            if let Some(divisor) = candidate.divisor {
+                match self.evaluate_term(model, divisor) {
                     EvalValue::Rational(d) if d.is_zero() => {}
                     _ => continue,
                 }
@@ -207,7 +169,7 @@ impl Executor {
             // this fail; it is here because the cost of being wrong is a
             // non-integer standing in for an integer division, which would be
             // confirmed as readily as a correct one.
-            let value = self.evaluate_term(model, candidate);
+            let value = self.evaluate_term(model, candidate.witness);
             if matches!(&value, EvalValue::Rational(v) if v.is_integer()) {
                 return value;
             }
@@ -384,7 +346,7 @@ impl Executor {
             //            = -(mod t1 t2)  when t2 < 0
             // Under-specified when t2 = 0 (Z3 #9140: kept distinct from `mod`),
             // so a zero divisor evaluates to Unknown rather than a pinned value.
-            // `rewrite_rem` DOES mint an `_ay_zerodiv_rem_*` witness, so the same
+            // `rewrite_rem` DOES mint an `__ay_zerodiv_rem_*` witness, so the same
             // readback would work here; it is deliberately not done, because
             // `rem` also deliberately declines the #div0 validation bypass so
             // that ordinary model validation keeps gating a symbolic

@@ -20,18 +20,22 @@
 //! CE-driven contradiction and a WRONG `unsat` shipped (z3: `sat`) — latent
 //! since the initial publish commit.
 //!
-//! The fix filters out every live assertion that mentions any CE variable
-//! (`CegqiInstantiator::ce_variables`), in the probe AND in the UF-graph pin
-//! roots. This only weakens the probe, so "probe still unsat => trust unsat"
-//! stays sound, and the flip to SAT still requires the per-lemma refutation
-//! certificate against the pre-instantiation snapshot ground core.
+//! The fix never treats the rewritten live assertion set as verdict authority.
+//! Rewriting under the CE hypothesis can both delete an authored constraint and
+//! leave a CE-variable-free residue, so even CE-variable filtering is
+//! insufficient. UNSAT is published only after a disposable verifier
+//! reconstructs and refutes the snapshot ground core plus provenance-tagged
+//! instances of unconditionally asserted universals. SAT separately requires a
+//! solved and validated model of that exact reconstructed ground core plus the
+//! per-universal refutation certificate.
 //!
 //! Contract pinned here, for the whole shape family (store equation +
 //! guarded entailed forall, AUFLIA routing without substantive arithmetic):
 //! - a satisfiable shape must NEVER answer `unsat` (sat or a fail-closed
 //!   unknown are both acceptable — completeness to z3's `sat` is a separate
 //!   follow-on);
-//! - the exists-dual decides `sat` (model gate 2 z3-validated);
+//! - the exists-dual is never reported `unsat` (it may fail closed to
+//!   `unknown` when no total model certificate is available);
 //! - wrong-fact twins and the mixed genuinely-unsat shape must STAY `unsat`.
 
 use ntest::timeout;
@@ -117,13 +121,13 @@ fn v04_le_guard_never_unsat() {
     );
 }
 
-/// The exists-dual DECIDES sat (the per-lemma refutation certificate against
-/// the pre-instantiation ground core flips it; model z3-validated per §4
-/// gate 2: conjoin-check sat, distinct-value probe unsat).
+/// The exists-dual is satisfiable. A total certificate may decide `sat`; a
+/// conservative `unknown` is also acceptable, but `unsat` is never sound.
 #[test]
 #[timeout(10000)]
-fn v05_exists_dual_decides_sat() {
-    let results = crate::common::solve_vec(
+fn v05_exists_dual_never_unsat() {
+    assert_never_unsat(
+        "v05_exists_dual",
         r#"
         (set-logic AUFLIA)
         (declare-fun a () (Array Int Int))
@@ -132,11 +136,6 @@ fn v05_exists_dual_decides_sat() {
         (assert (not (exists ((i Int)) (and (distinct i 3) (not (= (select b i) (select a i)))))))
         (check-sat)
     "#,
-    );
-    assert_eq!(
-        results,
-        vec!["sat"],
-        "exists-dual of the entailed forall must decide sat (z3: sat)"
     );
 }
 
@@ -436,5 +435,30 @@ fn adv5_symbolic_ground_contradiction_stays_unsat() {
         results,
         vec!["unsat"],
         "symbolic ground contradiction must stay unsat"
+    );
+}
+
+/// A valid universal in an implication antecedent is not itself a SAT
+/// certificate for the containing formula. CEGQI used to strip the complete
+/// implication, refute the universal's counterexample, and flip the empty
+/// ground remainder to `sat`, losing the contradictory consequent.
+#[test]
+#[timeout(10000)]
+fn nested_forall_cegqi_validity_never_certifies_whole_formula_sat() {
+    let results = crate::common::solve_vec(
+        r#"
+        (set-logic ALL)
+        (declare-const c Int)
+        (assert
+          (=> (forall ((x Int)) (=> (> x 0) (>= x 1)))
+              (and (= c 0) (= c 1))))
+        (check-sat)
+    "#,
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result == "unsat" || result == "unknown"),
+        "the unsatisfiable formula must never be certified sat: {results:?}"
     );
 }

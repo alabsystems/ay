@@ -1359,24 +1359,12 @@ pub(super) fn w4_trial_model_bools(
     assign: &HashMap<TermId, String>,
     bools: &HashMap<TermId, bool>,
 ) -> Model {
-    Model {
-        sat_model: Vec::new(),
-        term_to_var: HashMap::default(),
-        bool_overrides: bools.clone(),
-        euf_model: None,
-        array_model: None,
-        lra_model: None,
-        lia_model: None,
-        bv_model: None,
-        fp_model: None,
-        string_model: Some(ay_strings::StringModel {
-            values: assign.clone(),
-        }),
-        seq_model: None,
-        completed_values: HashMap::default(),
-        dt_ground: HashMap::default(),
-        dt_pins: HashMap::default(),
-    }
+    let mut model = Model::empty();
+    model.bool_overrides = bools.clone();
+    model.string_model = Some(ay_strings::StringModel {
+        values: assign.clone(),
+    });
+    model
 }
 
 fn w4_same(a: &HashMap<TermId, String>, b: &HashMap<TermId, String>) -> bool {

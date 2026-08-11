@@ -433,7 +433,7 @@ pub fn env_audit() -> EnvAudit {
         // first attempt.) The ledger stays exactly as strict as it was:
         // `the_ledger_does_not_invent_names` rightly forbids an entry for a name
         // this crate does not read, and this one genuinely belongs to ay-sys.
-        if k == ay_sys::govern::ARMED_ENV {
+        if k == ay_sys::govern::ARMED_ENV || k == ay_sys::govern::ROOT_PID_ENV {
             continue;
         }
         match KNOBS.iter().find(|kn| kn.name == k) {

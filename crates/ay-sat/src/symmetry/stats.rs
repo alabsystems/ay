@@ -13,11 +13,27 @@ pub(crate) enum SymmetrySkipReason {
     TooLarge,
     NoActiveClauses,
     NoPairs,
+    /// A route RAN its search and found nothing. Distinct from every reason
+    /// above, all of which mean the route never executed.
+    ///
+    /// Without this the two are indistinguishable in `--stats`, which is how
+    /// `AY_SAT_SIGNED_SYMMETRY` stayed inert long enough for a full-400 A/B to
+    /// "reject" a technique that was never running. A detector that reports
+    /// nothing must say whether it looked.
+    NoGenerators,
 }
 
 /// Root symmetry-preprocessing telemetry.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SymmetryStats {
+    /// One entry per route ATTEMPTED, in order: `(route, outcome)`.
+    ///
+    /// `last_skipped_reason` is a single slot overwritten by whichever route
+    /// runs last, so on a run that tries several routes it reports the last
+    /// one's outcome as the run's. That made every route's reachability
+    /// unverifiable — see the development design notes. A subsystem that tries N
+    /// strategies must report N outcomes.
+    pub(crate) routes: Vec<(&'static str, String)>,
     pub(crate) runs: u64,
     pub(crate) candidate_pairs: u64,
     pub(crate) pairs_detected: u64,
@@ -37,8 +53,10 @@ pub(crate) struct SymmetryStats {
 /// Main set (satsuma+Kissat solved 276/400 vs 238 for plain Kissat), so whether
 /// the pass ran — and if not, why it bailed — has to be visible from the CLI
 /// rather than only from an in-crate debugger.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymmetryReport {
+    /// One entry per route attempted: `(route, outcome)`. Append-only.
+    pub routes: Vec<(&'static str, String)>,
     /// Times the root pass was entered.
     pub runs: u64,
     /// Candidate variable pairs the refinement proposed.
@@ -69,6 +87,7 @@ impl SymmetrySkipReason {
             Self::TooLarge => "too-large",
             Self::NoActiveClauses => "no-active-clauses",
             Self::NoPairs => "no-pairs",
+            Self::NoGenerators => "ran-found-none",
         }
     }
 }
@@ -84,6 +103,7 @@ impl SymmetryStats {
             groups_over_budget: self.groups_over_budget,
             largest_group: self.largest_group,
             skipped: self.last_skipped_reason.map(SymmetrySkipReason::tag),
+            routes: self.routes.clone(),
         }
     }
 
@@ -94,5 +114,11 @@ impl SymmetryStats {
 
     pub(crate) fn skip(&mut self, reason: SymmetrySkipReason) {
         self.last_skipped_reason = Some(reason);
+    }
+
+    /// Record that `route` was attempted, with what came of it. Append-only, so
+    /// a later route cannot erase an earlier one's result.
+    pub(crate) fn record_route(&mut self, route: &'static str, outcome: impl Into<String>) {
+        self.routes.push((route, outcome.into()));
     }
 }

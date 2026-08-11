@@ -825,7 +825,7 @@ fn execute(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<Execution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("logic-registry timeout must be between 1ns and 3600 seconds".to_string());
     }
     let prepared = prepare_campaign(declarations)?;

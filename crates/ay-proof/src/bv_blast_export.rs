@@ -863,7 +863,7 @@ impl ReplayBudget<'_> {
 
     fn add_work(&mut self, units: usize) -> Result<(), BvBlastValidateError> {
         let units = u64::try_from(units).unwrap_or(u64::MAX);
-        self.work = self.work.checked_add(units).unwrap_or(u64::MAX);
+        self.work = self.work.saturating_add(units);
         if self.work > self.limits.max_work {
             return Err(BvBlastValidateError::ResourceLimit {
                 resource: "validation work",
@@ -1079,9 +1079,7 @@ impl BvBlastProof {
                 cl.lits.len(),
                 limits.max_clause_literals,
             )?;
-            original_literals = original_literals
-                .checked_add(cl.lits.len())
-                .unwrap_or(usize::MAX);
+            original_literals = original_literals.saturating_add(cl.lits.len());
             budget.count(
                 "original literals",
                 original_literals,
@@ -1148,9 +1146,7 @@ impl BvBlastProof {
         let mut derived_literals = 0_usize;
         for (i, step) in self.refutation.steps.iter().enumerate() {
             budget.deadline()?;
-            let expected_id = nclauses
-                .checked_add(u32::try_from(i).unwrap_or(u32::MAX))
-                .unwrap_or(u32::MAX);
+            let expected_id = nclauses.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
             if step.id != expected_id {
                 return Err(BvBlastValidateError::NonCanonicalResolutionStepId {
                     index: i,
@@ -1158,9 +1154,7 @@ impl BvBlastProof {
                     expected: expected_id,
                 });
             }
-            derived_literals = derived_literals
-                .checked_add(step.clause.len())
-                .unwrap_or(usize::MAX);
+            derived_literals = derived_literals.saturating_add(step.clause.len());
             budget.count(
                 "derived literals",
                 derived_literals,

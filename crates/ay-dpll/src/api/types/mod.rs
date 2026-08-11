@@ -169,6 +169,9 @@ pub use explanation::{
     CoreConstraintExplanation, ExplanationKind, ExplanationReport, ModelAssignmentExplanation,
     SatExplanation, UnknownExplanation, UnsatCoreSource, UnsatExplanation,
 };
+pub(crate) use handles::{
+    FrontendFuncDeclIdentity, FuncDeclIdentity, NativeDefinitionIdentity, TermArenaStamp,
+};
 pub use handles::{FuncDecl, Term};
 pub use incremental::{CoreEvolutionTracker, IncrementalCoreEvolution};
 pub use interpolant::{InterpolantResult, InterpolantStrength, PathInterpolantResult};
@@ -186,14 +189,15 @@ pub use model_blocking::{
 };
 pub use model_provenance::{AssignmentReason, ModelProvenance, VariableProvenance};
 pub use model_value::{FpSpecialKind, ModelValue};
+pub(crate) use native_replay::NativeReplayAdmissionToken;
 pub use native_replay::{
     NativeReplayArtifact, NativeReplayAssertion, NativeReplayCheckedReplaySummary,
     NativeReplayDeclaration, NativeReplayEvent, NativeReplayEventKind,
     NativeReplayEvidenceManifest, NativeReplayFunctionDeclaration, NativeReplayMetadata,
     NativeReplayModelSummary, NativeReplayProofSummary, NativeReplayResourceUsage,
     NativeReplaySolveSummary, NativeReplaySolverIdentity, NativeReplayStatistics,
-    NativeReplayTermNode, NativeReplayUnknownProgress, NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA,
-    NATIVE_REPLAY_SCHEMA,
+    NativeReplaySymbolIdentity, NativeReplaySymbolKind, NativeReplayTermNode,
+    NativeReplayUnknownProgress, NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA, NATIVE_REPLAY_SCHEMA,
 };
 pub use objective::ObjectiveValue;
 pub use results::{ConsumerAcceptanceError, SmtProofCertificate, SolveResult, VerifiedSolveResult};

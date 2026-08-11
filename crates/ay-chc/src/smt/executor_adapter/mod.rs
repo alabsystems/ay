@@ -160,14 +160,17 @@ pub(crate) fn smtlib_first_verdict_via_executor(
     }
 }
 
-/// A native strict-Alethe UNSAT certificate for one CHC replay obligation.
+/// A native strict UNSAT certificate plus bound Alethe diagnostic text for one
+/// CHC replay obligation.
 ///
 /// Produced by [`smtlib_strict_unsat_cert_via_executor`] on a proof-enabled
 /// `ay-dpll` `Solver`. Both fields are self-contained and require NO external
-/// process (no z3, no carcara): `strict_verdict` is AY's own in-process strict
-/// Alethe check (`export_last_unsat_artifact().strict_verdict`), and `bundle`
+/// process (no z3, no carcara): `strict_verdict` is AY's own in-process native
+/// proof-IR check (`export_last_unsat_artifact().strict_verdict`), and `bundle`
 /// is the portable proof that AY's own offline checker
 /// (`ay_dpll::api::re_check_bundle_strict`) re-validates with no solver run.
+/// `alethe` is hash-bound diagnostic text and may disclose an honest `hole`
+/// for a native inference absent from the pinned external calculus.
 pub(crate) struct StrictUnsatCert {
     /// Offline-recheckable proof bundle (re-checked by `re_check_bundle_strict`).
     pub bundle: ay_dpll::api::SerializableProofBundle,
@@ -177,13 +180,13 @@ pub(crate) struct StrictUnsatCert {
     pub strict_verdict: ay_dpll::api::StrictProofVerdict,
 }
 
-/// Discharge one UNSAT replay obligation with a NATIVE STRICT ALETHE self-check.
+/// Discharge one UNSAT replay obligation with AY's native strict proof check.
 ///
 /// This is the proof-emitting sibling of [`smtlib_first_verdict_via_executor`]:
 /// rather than merely returning a trusted `unsat`/`sat`/`unknown` verdict, it
 /// builds a proof-enabled `ay-dpll` [`Solver`](ay_dpll::api::Solver), executes
 /// the obligation, and — only when the obligation is genuinely `unsat` and a
-/// proof was produced — returns the strict Alethe certificate: an in-process
+/// proof was produced — returns the native strict certificate: an in-process
 /// [`StrictProofVerdict`](ay_dpll::api::StrictProofVerdict) plus the portable
 /// [`SerializableProofBundle`](ay_dpll::api::SerializableProofBundle) that AY's
 /// own offline checker can re-validate. Everything here is self-contained: no
@@ -228,7 +231,7 @@ pub(crate) fn smtlib_strict_unsat_cert_via_executor(
             // `parse_smtlib2` would then fail and `.ok()?` would swallow it as
             // a bare `None`, which every caller must read as "not strictly
             // discharged". The visible symptom was checked replay reporting
-            // "did not produce a native strict-Alethe UNSAT certificate;
+            // "did not produce a native strict UNSAT certificate;
             // staying metadata-only" for obligations that are perfectly
             // provable.
             //
@@ -246,7 +249,7 @@ pub(crate) fn smtlib_strict_unsat_cert_via_executor(
             let script = format!("(set-option :produce-proofs true)\n{body}");
             solver.parse_smtlib2(&script).ok()?;
 
-            let result = solver.check_sat();
+            let result = solver.check_sat_internal_query();
             if !result.is_unsat() {
                 tracing::debug!(
                     "executor_adapter: strict-unsat-cert obligation was not unsat; failing closed"
@@ -255,10 +258,11 @@ pub(crate) fn smtlib_strict_unsat_cert_via_executor(
             }
 
             // `export_last_unsat_artifact().strict_verdict` is AY's own
-            // in-process strict Alethe check; the bundle is the offline-
-            // recheckable twin. Both are required — a missing proof (e.g. the
-            // executor decided unsat on a path that produced no proof) fails
-            // closed.
+            // in-process native proof-IR check; the bundle is the offline-
+            // recheckable twin. The Alethe text is bound diagnostic output and
+            // can be honestly holey. All three are required — a missing proof
+            // (e.g. the executor decided unsat on a path that produced no
+            // proof) fails closed.
             let artifact = solver.export_last_unsat_artifact()?;
             let bundle = solver.export_last_unsat_bundle()?;
             Some(StrictUnsatCert {

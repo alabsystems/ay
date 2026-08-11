@@ -1250,9 +1250,20 @@ impl Executor {
         &self,
         proof: &Proof,
     ) -> Result<ProofQuality, ProofCheckError> {
+        if let Some(capability) = self.checked_finite_enum_capability_for_proof(proof) {
+            let assumptions: Vec<TermId> = capability.assumptions().collect();
+            return self.check_bounded_finite_enum_proof(
+                proof,
+                &assumptions,
+                &capability.datatype_decls,
+                &capability.selector_decls,
+            );
+        }
         let decls = self.datatype_decls_for_strict_proof();
         let selectors = self.ctor_selector_decls_for_strict_proof();
-        let problem = self.problem_assertions_for_strict_proof();
+        // A non-matching candidate must never inherit a narrow scope merely
+        // because the current stored proof has a finite-enum capability.
+        let problem = self.complete_problem_assertions_for_strict_proof();
         ay_proof::check_proof_strict_with_context(
             proof,
             &self.ctx.terms,
@@ -1313,11 +1324,17 @@ impl Executor {
     /// appear as `Assume` leaves. Solver-generated constraints are excluded.
     /// A SUPERSET is always safe here — extra terms can only make the freshness
     /// test stricter, never more permissive.
-    pub(crate) fn problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
+    pub(in crate::executor) fn complete_problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
         let mut problem = self.proof_export_scope_assertions();
+        // Membership through a set, not `Vec::contains` (#strict-proof-dedup).
+        // Both loops below dedup against `problem`, which on the DT families is
+        // thousands of assertions long, so the linear scan made this O(n^2) —
+        // and mandatory certification runs it on EVERY public UNSAT. Order is
+        // preserved exactly: the set only answers "already present".
+        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = problem.iter().copied().collect();
         if let Some(authored) = self.self_check_authored_assertions.as_ref() {
             for &assertion in authored {
-                if !problem.contains(&assertion) {
+                if seen.insert(assertion) {
                     problem.push(assertion);
                 }
             }
@@ -1329,11 +1346,23 @@ impl Executor {
         // `declare_pareto_front_exhaustion_extension`, which rebuilds its terms
         // from the executor's own objectives.
         for extension in self.declared_obligation_extension() {
-            if !problem.contains(&extension) {
+            if seen.insert(extension) {
                 problem.push(extension);
             }
         }
         problem
+    }
+
+    /// Premise scope for APIs that export the exact stored proof.
+    ///
+    /// Only the canonical, current finite-enum proof receives its selected
+    /// direct-root scope. Every other proof path retains the complete authored
+    /// scope assembled above.
+    pub(crate) fn problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
+        self.last_proof
+            .as_ref()
+            .and_then(|proof| self.finite_enum_scope_for_proof(proof))
+            .unwrap_or_else(|| self.complete_problem_assertions_for_strict_proof())
     }
 
     /// Constructor→selector registry for strict proof validation:
@@ -1504,7 +1533,7 @@ impl Executor {
     pub(in crate::executor) fn unsat_proof_self_certified(&self) -> bool {
         #[cfg(feature = "proof-checker")]
         {
-            let Some(proof) = self.last_proof.as_ref() else {
+            let Some(proof) = self.last_proof() else {
                 return false;
             };
             // Every step must be a real, checked derivation: no `Hole`

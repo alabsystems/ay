@@ -78,7 +78,7 @@ pub(crate) struct BCE {
 
 impl BCE {
     /// Create a new BCE engine for n variables
-    pub(crate) fn new(num_vars: usize) -> Self {
+    pub(crate) fn new(_num_vars: usize) -> Self {
         Self {
             // Sized on first use by the BCE entry point, which calls
             // `ensure_num_vars` before rebuilding. `OccList::new(n)` commits

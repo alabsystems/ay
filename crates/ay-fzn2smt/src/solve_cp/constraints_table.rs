@@ -13,6 +13,7 @@ use crate::error::Result;
 use ay_cp::propagator::Constraint;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::{interval_size_within, product_size_within};
 use super::CpContext;
 
 impl CpContext {
@@ -51,8 +52,7 @@ impl CpContext {
             } else {
                 let a = self.resolve_var(&c.args[0])?;
                 let (a_lb, a_ub) = self.get_var_bounds(a);
-                let domain_size = a_ub - a_lb + 1;
-                if domain_size <= 10_000 {
+                if interval_size_within(a_lb, a_ub, 10_000) {
                     let mut tuples = Vec::new();
                     for av in a_lb..=a_ub {
                         if let Some(q) = av.checked_div(k) {
@@ -72,9 +72,7 @@ impl CpContext {
             let b = self.resolve_var(&c.args[1])?;
             let (a_lb, a_ub) = self.get_var_bounds(a);
             let (b_lb, b_ub) = self.get_var_bounds(b);
-            let domain_size = (a_ub - a_lb + 1).saturating_mul(b_ub - b_lb + 1);
-
-            if domain_size <= 10_000 {
+            if product_size_within((a_lb, a_ub), (b_lb, b_ub), 10_000) {
                 let mut tuples = Vec::new();
                 for av in a_lb..=a_ub {
                     for bv in b_lb..=b_ub {
@@ -114,8 +112,7 @@ impl CpContext {
         if let Some(k) = b_const {
             let a = self.resolve_var(&c.args[0])?;
             let (a_lb, a_ub) = self.get_var_bounds(a);
-            let domain_size = a_ub - a_lb + 1;
-            if domain_size <= 10_000 {
+            if interval_size_within(a_lb, a_ub, 10_000) {
                 let mut tuples = Vec::new();
                 for av in a_lb..=a_ub {
                     if let Some(r) = av.checked_rem(k) {
@@ -134,9 +131,7 @@ impl CpContext {
             let b = self.resolve_var(&c.args[1])?;
             let (a_lb, a_ub) = self.get_var_bounds(a);
             let (b_lb, b_ub) = self.get_var_bounds(b);
-            let domain_size = (a_ub - a_lb + 1).saturating_mul(b_ub - b_lb + 1);
-
-            if domain_size <= 10_000 {
+            if product_size_within((a_lb, a_ub), (b_lb, b_ub), 10_000) {
                 let mut tuples = Vec::new();
                 for av in a_lb..=a_ub {
                     for bv in b_lb..=b_ub {
@@ -187,8 +182,7 @@ impl CpContext {
             } else if (2..=63).contains(&k) {
                 let a = self.resolve_var(&c.args[0])?;
                 let (a_lb, a_ub) = self.get_var_bounds(a);
-                let domain_size = a_ub - a_lb + 1;
-                if domain_size <= 10_000 {
+                if interval_size_within(a_lb, a_ub, 10_000) {
                     let k_u32 = k as u32;
                     let mut tuples = Vec::new();
                     for av in a_lb..=a_ub {
@@ -212,9 +206,7 @@ impl CpContext {
             let b = self.resolve_var(&c.args[1])?;
             let (a_lb, a_ub) = self.get_var_bounds(a);
             let (b_lb, b_ub) = self.get_var_bounds(b);
-            let domain_size = (a_ub - a_lb + 1).saturating_mul(b_ub - b_lb + 1);
-
-            if domain_size <= 10_000 {
+            if product_size_within((a_lb, a_ub), (b_lb, b_ub), 10_000) {
                 let mut tuples = Vec::new();
                 for av in a_lb..=a_ub {
                     for bv in b_lb..=b_ub {

@@ -444,8 +444,7 @@ pub unsafe extern "C" fn Z3_mk_lambda(
     for i in 0..num_decls as usize {
         // SAFETY: caller's contract guarantees `sorts`/`decl_names` point to
         // `num_decls` elements; count range-checked and null-checked above.
-        let sort_ptr = unsafe { *sorts.add(i) };
-        let sym_ptr = unsafe { *decl_names.add(i) };
+        let (sort_ptr, sym_ptr) = unsafe { (*sorts.add(i), *decl_names.add(i)) };
         if sort_ptr.is_null() || sym_ptr.is_null() {
             // SAFETY: `c` is the caller's context pointer; guard null-checks it.
             return unsafe {
@@ -458,8 +457,7 @@ pub unsafe extern "C" fn Z3_mk_lambda(
         }
         // SAFETY: pointers null-checked above; valid AY handles kept alive by the
         // owning context (single-threaded per context).
-        let sort = unsafe { (*sort_ptr).sort.clone() };
-        let name = unsafe { (*sym_ptr).semantic_name() };
+        let (sort, name) = unsafe { ((*sort_ptr).sort.clone(), (*sym_ptr).semantic_name()) };
         decl_data.push((sort, name));
     }
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.

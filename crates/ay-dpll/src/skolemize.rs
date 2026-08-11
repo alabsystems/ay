@@ -29,7 +29,8 @@ mod finite_domain;
 pub(crate) use finite_domain::{
     bounded_expansion_grounds_all_quantifiers, derived_bound_unlocks_expansion,
     expand_finite_domain_subterms, finite_domain_expand_with_instances,
-    set_bool_ground_instantiation_candidates, set_derived_consts,
+    scoped_bool_ground_instantiation_candidates, scoped_derived_consts,
+    scoped_standalone_finite_domain_replay,
 };
 // Production goes through `expand_finite_domain_subterms`; the single-term
 // entry point is exercised directly by the skolemize tests.

@@ -89,6 +89,41 @@ End
 }
 
 #[test]
+fn test_parse_lp_numeric_first_bounds_preserve_comparator_direction() {
+    let input = "\
+Minimize
+ x + y + z
+Bounds
+ 7 >= x
+ 9 = y
+ 5 >= z >= -2
+End
+";
+    let p = parse_lp(input).expect("parse");
+    let x = p.var_index("x").expect("x");
+    let y = p.var_index("y").expect("y");
+    let z = p.var_index("z").expect("z");
+    assert_eq!(p.variables[x].lower, 0.0);
+    assert_eq!(p.variables[x].upper, 7.0);
+    assert_eq!(p.variables[y].lower, 9.0);
+    assert_eq!(p.variables[y].upper, 9.0);
+    assert_eq!(p.variables[z].lower, -2.0);
+    assert_eq!(p.variables[z].upper, 5.0);
+}
+
+#[test]
+fn test_parse_lp_rejects_crossed_ranged_bound_comparators() {
+    let input = "\
+Minimize
+ x
+Bounds
+ 0 <= x >= 1
+End
+";
+    assert!(matches!(parse_lp(input), Err(LpError::Parse { .. })));
+}
+
+#[test]
 fn test_parse_lp_rejects_non_finite_numeric_tokens() {
     let input = "\
 Minimize
@@ -113,6 +148,49 @@ End
         parse_lp(input),
         Err(LpError::InvalidNumber { .. })
     ));
+}
+
+#[test]
+fn test_parse_lp_rejects_finite_objective_terms_whose_sum_overflows() {
+    let input = "\
+Minimize
+ 1e308 x + 1e308 x
+End
+";
+    assert!(matches!(parse_lp(input), Err(LpError::Parse { .. })));
+}
+
+#[test]
+fn test_parse_lp_rejects_finite_objective_constants_whose_sum_overflows() {
+    let input = "\
+Minimize
+ 1e308 + 1e308
+End
+";
+    assert!(matches!(parse_lp(input), Err(LpError::Parse { .. })));
+}
+
+#[test]
+fn test_parse_lp_normalizes_repeated_constraint_terms_and_rejects_overflow() {
+    let finite = "\
+Minimize
+ x
+Subject To
+ c: 1.5 x + 2.5 x <= 4
+End
+";
+    let problem = parse_lp(finite).expect("parse");
+    let x = problem.var_index("x").expect("x");
+    assert_eq!(problem.constraints[0].coeffs, vec![(x, 4.0)]);
+
+    let overflow = "\
+Minimize
+ x
+Subject To
+ c: 1e308 x + 1e308 x <= 1
+End
+";
+    assert!(matches!(parse_lp(overflow), Err(LpError::Parse { .. })));
 }
 
 #[test]

@@ -81,7 +81,9 @@ impl<'a> Lexer<'a> {
         if ch == b'\n' {
             self.line += 1;
             self.col = 1;
-        } else {
+        } else if ch & 0b1100_0000 != 0b1000_0000 {
+            // Count UTF-8 scalar values, not continuation bytes, so columns
+            // remain meaningful after the Unicode allowed in string literals.
             self.col += 1;
         }
         Some(ch)
@@ -117,6 +119,61 @@ impl<'a> Lexer<'a> {
         if negative {
             self.advance();
         }
+
+        // FlatZinc integer literals include lower-case hexadecimal and octal
+        // prefixes. Parse through i128 so -0x8000000000000000 can represent
+        // i64::MIN before the final checked conversion.
+        if self.peek() == Some(b'0') {
+            let prefix = self.input.get(self.pos + 1).copied();
+            let radix = match prefix {
+                Some(b'x') => Some(16),
+                Some(b'o') => Some(8),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                self.advance();
+                self.advance();
+                let digits_start = self.pos;
+                while self.peek().is_some_and(|ch| match radix {
+                    16 => ch.is_ascii_hexdigit(),
+                    8 => matches!(ch, b'0'..=b'7'),
+                    _ => false,
+                }) {
+                    self.advance();
+                }
+                let literal = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
+                    ParseError::InvalidInt {
+                        line,
+                        value: "invalid UTF-8 integer literal".to_string(),
+                    }
+                })?;
+                if self.pos == digits_start {
+                    return Err(ParseError::InvalidInt {
+                        line,
+                        value: literal.to_string(),
+                    });
+                }
+                let digits =
+                    std::str::from_utf8(&self.input[digits_start..self.pos]).map_err(|_| {
+                        ParseError::InvalidInt {
+                            line,
+                            value: literal.to_string(),
+                        }
+                    })?;
+                let magnitude =
+                    i128::from_str_radix(digits, radix).map_err(|_| ParseError::InvalidInt {
+                        line,
+                        value: literal.to_string(),
+                    })?;
+                let signed = if negative { -magnitude } else { magnitude };
+                let value = i64::try_from(signed).map_err(|_| ParseError::InvalidInt {
+                    line,
+                    value: literal.to_string(),
+                })?;
+                return Ok(Token::IntLit(value));
+            }
+        }
+
         while let Some(ch) = self.peek() {
             if ch.is_ascii_digit() {
                 self.advance();
@@ -125,9 +182,9 @@ impl<'a> Lexer<'a> {
             }
         }
         // Check for float: digits followed by '.' and more digits
-        let is_float = self.peek() == Some(b'.')
+        let has_fraction = self.peek() == Some(b'.')
             && self.input.get(self.pos + 1).is_some_and(u8::is_ascii_digit);
-        if is_float {
+        if has_fraction {
             self.advance(); // consume '.'
             while let Some(ch) = self.peek() {
                 if ch.is_ascii_digit() {
@@ -136,30 +193,45 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            // Scientific notation
-            if self.peek() == Some(b'e') || self.peek() == Some(b'E') {
+        }
+
+        // The exponent-only form (for example `3e8`) is a float too.
+        let has_exponent = self.peek() == Some(b'e') || self.peek() == Some(b'E');
+        if has_exponent {
+            self.advance();
+            if self.peek() == Some(b'+') || self.peek() == Some(b'-') {
                 self.advance();
-                if self.peek() == Some(b'+') || self.peek() == Some(b'-') {
-                    self.advance();
-                }
-                while let Some(ch) = self.peek() {
-                    if ch.is_ascii_digit() {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
             }
-            let s = std::str::from_utf8(&self.input[start..self.pos])
-                .expect("invariant: input is valid UTF-8");
+            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                self.advance();
+            }
+        }
+
+        if has_fraction || has_exponent {
+            let s = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
+                ParseError::InvalidFloat {
+                    line,
+                    value: "invalid UTF-8 float literal".to_string(),
+                }
+            })?;
             let val: f64 = s.parse().map_err(|_| ParseError::InvalidFloat {
                 line,
                 value: s.to_string(),
             })?;
+            if !val.is_finite() {
+                return Err(ParseError::InvalidFloat {
+                    line,
+                    value: s.to_string(),
+                });
+            }
             Ok(Token::FloatLit(val))
         } else {
-            let s = std::str::from_utf8(&self.input[start..self.pos])
-                .expect("invariant: input is valid UTF-8");
+            let s = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
+                ParseError::InvalidInt {
+                    line,
+                    value: "invalid UTF-8 integer literal".to_string(),
+                }
+            })?;
             let val: i64 = s.parse().map_err(|_| ParseError::InvalidInt {
                 line,
                 value: s.to_string(),
@@ -172,13 +244,31 @@ impl<'a> Lexer<'a> {
         self.advance(); // consume opening quote
         let mut s = String::new();
         loop {
+            let char_line = self.line;
+            let char_col = self.col;
             match self.advance() {
                 Some(b'"') => return Ok(Token::StringLit(s)),
+                Some(b'\n' | b'\r') => {
+                    return Err(ParseError::UnexpectedToken {
+                        line: char_line,
+                        col: char_col,
+                        expected: "escaped newline or closing quote".to_string(),
+                        found: "raw newline in string literal".to_string(),
+                    });
+                }
                 Some(b'\\') => match self.advance() {
                     Some(b'n') => s.push('\n'),
                     Some(b't') => s.push('\t'),
                     Some(b'\\') => s.push('\\'),
                     Some(b'"') => s.push('"'),
+                    Some(b'\n' | b'\r') => {
+                        return Err(ParseError::UnexpectedToken {
+                            line: char_line,
+                            col: char_col,
+                            expected: "escaped string character".to_string(),
+                            found: "newline after backslash".to_string(),
+                        });
+                    }
                     Some(c) if c.is_ascii() => {
                         s.push('\\');
                         s.push(char::from(c));
@@ -315,7 +405,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_ident_or_keyword(&mut self) -> Token {
+    fn read_ident_or_keyword(&mut self) -> Result<Token, ParseError> {
         let start = self.pos - 1; // first char already consumed
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == b'_' {
@@ -324,9 +414,15 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let word = std::str::from_utf8(&self.input[start..self.pos])
-            .expect("invariant: input is valid UTF-8");
-        match word {
+        let word = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
+            ParseError::UnexpectedToken {
+                line: self.line,
+                col: self.col,
+                expected: "valid UTF-8 identifier".to_string(),
+                found: "invalid UTF-8".to_string(),
+            }
+        })?;
+        Ok(match word {
             "array" => Token::Array,
             "bool" => Token::Bool,
             "constraint" => Token::Constraint,
@@ -344,7 +440,7 @@ impl<'a> Lexer<'a> {
             "true" => Token::True,
             "var" => Token::Var,
             _ => Token::Ident(word.to_string()),
-        }
+        })
     }
 
     fn located(&self, token: Token, line: usize, col: usize) -> Located {
@@ -382,7 +478,7 @@ impl<'a> Lexer<'a> {
         // Identifiers and keywords
         if ch.is_ascii_alphabetic() || ch == b'_' {
             self.advance();
-            let tok = self.read_ident_or_keyword();
+            let tok = self.read_ident_or_keyword()?;
             return Ok(self.located(tok, line, col));
         }
 

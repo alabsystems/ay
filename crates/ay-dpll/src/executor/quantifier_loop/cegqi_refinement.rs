@@ -17,6 +17,7 @@ use super::super::model::EvalValue;
 use super::super::Executor;
 use crate::cegqi::arith::ArithInstantiator;
 use crate::cegqi::CegqiInstantiator;
+use crate::ematching::{contains_quantifier, subst_vars};
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use crate::logic_detection::LogicCategory;
@@ -33,9 +34,9 @@ impl Executor {
     ///
     /// `snapshot` is the pre-instantiation assertion snapshot
     /// (`refinement_assertions` in the caller): it enables the quantified-CE
-    /// decider legs inside `disambiguate_cegqi_unsat` (their quantifier-coverage
-    /// / conjunctive-position gates need the snapshot; `None` disables them,
-    /// fail-soft).
+    /// decider legs inside `disambiguate_cegqi_unsat` (their quantifier-coverage,
+    /// conjunctive-position, and independent-UNSAT gates need the snapshot;
+    /// `None` disables them and fails closed to Unknown).
     #[allow(clippy::used_underscore_items)]
     pub(super) fn try_cegqi_arith_refinement(
         &mut self,
@@ -184,7 +185,7 @@ impl Executor {
             .flat_map(|(_, inst)| inst.ce_variables().values().copied())
             .collect();
 
-        for (_quant_id, inst) in cegqi_state {
+        for (quant_id, inst) in cegqi_state {
             if !inst.is_forall() {
                 continue;
             }
@@ -245,14 +246,88 @@ impl Executor {
             if let Some(ground_inst) =
                 inst._create_model_instantiation(&mut self.ctx.terms, &var_values)
             {
-                if seen_instantiations.insert(ground_inst) {
-                    self.ctx.assertions.push(ground_inst);
+                if seen_instantiations.insert(ground_inst)
+                    && self.append_cegqi_ground_instance(*quant_id, &var_values, ground_inst)
+                {
                     any_instantiation_added = true;
                 }
             }
         }
 
         any_instantiation_added
+    }
+
+    /// Append one CEGQI instance together with its semantic and proof
+    /// provenance.
+    ///
+    /// `setup_cegqi_for_unhandled` creates `cegqi_state` only for a `forall`
+    /// admitted by `entailed_forall_set`; consequently every exact ground
+    /// instance here is a consequence of the asserted problem.  Keep the term,
+    /// conflict-verification support tag, and strict `forall_inst` metadata at
+    /// one write-side chokepoint so no consumer has to infer provenance from a
+    /// live assertion's shape.
+    fn append_cegqi_ground_instance(
+        &mut self,
+        quantifier: TermId,
+        values: &HashMap<String, TermId>,
+        instance: TermId,
+    ) -> bool {
+        let (vars, body) = match self.ctx.terms.get(quantifier).clone() {
+            TermData::Forall(vars, body, _) => (vars, body),
+            _ => return false,
+        };
+        let binding = vars
+            .iter()
+            .map(|(name, sort)| {
+                values
+                    .get(name)
+                    .copied()
+                    .filter(|&value| self.ctx.terms.sort(value) == sort)
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(binding) = binding else {
+            return false;
+        };
+        let binder_values: HashMap<String, TermId> = vars
+            .iter()
+            .zip(&binding)
+            .map(|((name, _), &value)| (name.clone(), value))
+            .collect();
+        let expected = subst_vars(&mut self.ctx.terms, body, &binder_values);
+        if expected != instance || contains_quantifier(&self.ctx.terms, instance) {
+            return false;
+        }
+
+        // Public quantified solves require a strict proof.  Keep the exact
+        // simultaneous substitution as the solver-visible assertion in that
+        // mode: simplifying constructors can otherwise turn `(< 0 0)` into
+        // `false`, which is equivalent but is not a legal Alethe `forall_inst`
+        // conclusion.  Unsupported nested binders/lets fail closed.
+        let solver_instance = if self.produce_proofs_enabled() {
+            match self.exact_forall_instance(quantifier, &binding) {
+                Some(exact) => exact,
+                None => {
+                    self.quantified_proof_translation_incomplete = true;
+                    instance
+                }
+            }
+        } else {
+            instance
+        };
+        let record = crate::ematching::ForallInstantiationProvenance {
+            quantifier,
+            binding,
+            instance: solver_instance,
+        };
+        self.register_ematching_proof_provenance(std::slice::from_ref(&record));
+        let added = if self.ctx.assertions.contains(&solver_instance) {
+            false
+        } else {
+            self.ctx.assertions.push(solver_instance);
+            true
+        };
+        self.push_active_support_axiom(solver_instance);
+        added
     }
 
     /// Neighbor enumeration fallback for CEGQI: try instantiating with values
@@ -305,7 +380,7 @@ impl Executor {
                 }
                 let mut any_new = false;
 
-                for (_quant_id, inst) in cegqi_state {
+                for (quant_id, inst) in cegqi_state {
                     if !inst.is_forall() {
                         continue;
                     }
@@ -321,8 +396,13 @@ impl Executor {
                     if let Some(ground_inst) =
                         inst._create_model_instantiation(&mut self.ctx.terms, &var_values)
                     {
-                        if seen_instantiations.insert(ground_inst) {
-                            self.ctx.assertions.push(ground_inst);
+                        if seen_instantiations.insert(ground_inst)
+                            && self.append_cegqi_ground_instance(
+                                *quant_id,
+                                &var_values,
+                                ground_inst,
+                            )
+                        {
                             any_new = true;
                         }
                     }
@@ -496,6 +576,66 @@ fn term_mentions_any(terms: &TermStore, root: TermId, targets: &HashSet<TermId>)
 mod tests {
     use super::*;
     use ay_core::term::Symbol;
+    use ay_proof::ProofStep;
+
+    #[test]
+    fn cegqi_ground_instance_writer_records_positive_authorized_support() {
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("x", Sort::Int);
+        let p_x = exec.ctx.terms.mk_app(
+            Symbol::Named("cegqi_writer_p".to_string()),
+            vec![x],
+            Sort::Bool,
+        );
+        let forall = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], p_x);
+        exec.set_produce_proofs(true);
+        exec.ctx.assertions.push(forall);
+        exec.install_proof_source_provenance(&[forall]);
+        let zero = exec.ctx.terms.mk_int(0.into());
+        let p_zero = exec.ctx.terms.mk_app(
+            Symbol::Named("cegqi_writer_p".to_string()),
+            vec![zero],
+            Sort::Bool,
+        );
+        let mut values = HashMap::default();
+        values.insert("x".to_string(), zero);
+        let proof_steps_before = exec.proof_tracker.num_steps();
+
+        let one = exec.ctx.terms.mk_int(1.into());
+        let bogus = exec.ctx.terms.mk_app(
+            Symbol::Named("cegqi_writer_p".to_string()),
+            vec![one],
+            Sort::Bool,
+        );
+        assert!(
+            !exec.append_cegqi_ground_instance(forall, &values, bogus),
+            "a mismatched claimed instance must not receive authority"
+        );
+        assert_eq!(exec.ctx.assertions, vec![forall]);
+        assert!(exec.active_support_axioms.is_empty());
+        assert_eq!(exec.proof_tracker.num_steps(), proof_steps_before);
+
+        assert!(exec.append_cegqi_ground_instance(forall, &values, p_zero));
+
+        assert_eq!(exec.ctx.assertions, vec![forall, p_zero]);
+        assert_eq!(exec.active_support_axioms.len(), 1);
+        let support = exec.active_support_axioms[0];
+        assert_eq!(support.term, p_zero);
+        assert!(support.value, "CEGQI instances are positive consequences");
+        let proof = exec.proof_tracker.take_proof();
+        assert!(proof.steps.iter().any(|step| {
+            matches!(step, ProofStep::Resolution { clause, .. } if clause == &[p_zero])
+        }));
+        assert!(
+            !exec.append_cegqi_ground_instance(forall, &values, p_zero),
+            "the authority chokepoint must reject duplicate assertion writes"
+        );
+        assert_eq!(exec.ctx.assertions, vec![forall, p_zero]);
+        assert_eq!(exec.active_support_axioms.len(), 1);
+    }
 
     #[test]
     fn cegqi_unsupported_arith_guard_ignores_ground_mod_unrelated_to_ce_vars() {

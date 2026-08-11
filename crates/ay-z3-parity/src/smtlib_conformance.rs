@@ -3405,7 +3405,7 @@ fn execute_target_identity(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<IdentityExecution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("target-identity timeout must be between 1ns and 3600 seconds".to_string());
     }
     let subject_ay = contract
@@ -4389,7 +4389,7 @@ fn execute_z3_abi(
     timeout: Duration,
     required_envelope: Option<&str>,
 ) -> Result<AbiExecution, String> {
-    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+    if timeout.is_zero() || timeout > Duration::from_hours(1) {
         return Err("z3-abi-5.0 timeout must be between 1ns and 3600 seconds".to_string());
     }
     let ay_artifact = contract

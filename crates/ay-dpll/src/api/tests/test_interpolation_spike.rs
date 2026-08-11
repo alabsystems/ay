@@ -259,29 +259,29 @@ impl Partition {
         let mut a_vars: HashSet<TermId> = Default::default();
         let mut b_vars: HashSet<TermId> = Default::default();
         for t in a_terms {
-            a_ids.insert(t.0);
-            collect_atoms(solver, t.0, &mut a_atoms);
-            collect_var_ids(solver, t.0, &mut a_vars);
+            a_ids.insert(t.id());
+            collect_atoms(solver, t.id(), &mut a_atoms);
+            collect_var_ids(solver, t.id(), &mut a_vars);
         }
         for t in b_terms {
-            b_ids.insert(t.0);
-            collect_atoms(solver, t.0, &mut b_atoms);
-            collect_var_ids(solver, t.0, &mut b_vars);
+            b_ids.insert(t.id());
+            collect_atoms(solver, t.id(), &mut b_atoms);
+            collect_var_ids(solver, t.id(), &mut b_vars);
         }
         let shared_vars: HashSet<TermId> = a_vars.intersection(&b_vars).copied().collect();
 
         let mut b_unit_negs = Vec::new();
         for t in b_terms {
-            let (atom, negated) = atom_of(solver, t.0);
+            let (atom, negated) = atom_of(solver, t.id());
             // Unit B-assert (a literal at the top level).
             if b_atoms.contains(&atom) {
                 let mut vars: HashSet<TermId> = Default::default();
                 collect_var_ids(solver, atom, &mut vars);
                 if !vars.is_empty() && vars.iter().all(|v| shared_vars.contains(v)) {
                     let neg_text = if negated {
-                        solver.format_term(Term(atom))
+                        solver.format_term(solver.wrap_term(atom))
                     } else {
-                        format!("(not {})", solver.format_term(Term(atom)))
+                        format!("(not {})", solver.format_term(solver.wrap_term(atom)))
                     };
                     b_unit_negs.push((neg_text, vars.into_iter().collect()));
                 }
@@ -395,7 +395,7 @@ impl Itp {
         match self {
             Itp::Tru => "true".to_string(),
             Itp::Fls => "false".to_string(),
-            Itp::Lit(t) => solver.format_term(Term(*t)),
+            Itp::Lit(t) => solver.format_term(solver.wrap_term(*t)),
             Itp::Raw(s, _) => s.clone(),
             Itp::Or(xs) => {
                 let parts: Vec<String> = xs.iter().map(|x| x.text(solver)).collect();
@@ -716,7 +716,7 @@ impl<'a> Interpolator<'a> {
         let parts: Vec<String> = terms
             .iter()
             .map(|&(v, c)| {
-                let name = self.solver.format_term(Term(v));
+                let name = self.solver.format_term(self.solver.wrap_term(v));
                 if c == 1 {
                     name
                 } else {
@@ -777,7 +777,7 @@ impl<'a> Interpolator<'a> {
     fn clause_key(&self, clause: &[TermId]) -> String {
         let mut lits: Vec<String> = clause
             .iter()
-            .map(|&l| self.solver.format_term(Term(l)))
+            .map(|&l| self.solver.format_term(self.solver.wrap_term(l)))
             .collect();
         lits.sort();
         lits.join("|")
@@ -788,7 +788,10 @@ impl<'a> Interpolator<'a> {
         let mut neg_a_side = Vec::new();
         let mut neg_b_side = Vec::new();
         for &lit in clause {
-            let text = format!("(not {})", self.solver.format_term(Term(lit)));
+            let text = format!(
+                "(not {})",
+                self.solver.format_term(self.solver.wrap_term(lit))
+            );
             match self.lit_class(lit) {
                 Class::A | Class::Unknown => neg_a_side.push(text),
                 Class::B | Class::Ab => neg_b_side.push(text),
@@ -1042,7 +1045,7 @@ impl<'a> Interpolator<'a> {
                     format!(
                         "{:?}:{}",
                         self.lit_class(l),
-                        self.solver.format_term(Term(l))
+                        self.solver.format_term(self.solver.wrap_term(l))
                     )
                 })
                 .collect();
@@ -1076,7 +1079,7 @@ impl<'a> Interpolator<'a> {
                                     if self.verbose {
                                         eprintln!(
                                             "[itp] unknown pivot class: {}",
-                                            self.solver.format_term(Term(*pivot))
+                                            self.solver.format_term(self.solver.wrap_term(*pivot))
                                         );
                                     }
                                     None
@@ -1252,7 +1255,9 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
     if std::env::var("AY_SPIKE_DUMP").is_ok() {
         for (i, step) in proof.steps.iter().enumerate() {
             let desc = match step {
-                ProofStep::Assume(t) => format!("Assume {}", solver.format_term(Term(*t))),
+                ProofStep::Assume(t) => {
+                    format!("Assume {}", solver.format_term(solver.wrap_term(*t)))
+                }
                 ProofStep::Resolution { .. } => continue,
                 ProofStep::TheoryLemma {
                     kind,
@@ -1265,7 +1270,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
                     clause.len(),
                     clause
                         .iter()
-                        .map(|&l| solver.format_term(Term(l)))
+                        .map(|&l| solver.format_term(solver.wrap_term(l)))
                         .collect::<Vec<_>>()
                 ),
                 ProofStep::Step {
@@ -1283,7 +1288,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
                         clause.len(),
                         clause
                             .iter()
-                            .map(|&l| solver.format_term(Term(l)))
+                            .map(|&l| solver.format_term(solver.wrap_term(l)))
                             .collect::<Vec<_>>()
                     )
                 }
@@ -1355,7 +1360,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
         itp.vars(&solver, &mut itp_vars);
         let non_shared: Vec<String> = itp_vars
             .difference(&part.shared_vars)
-            .map(|v| solver.format_term(Term(*v)))
+            .map(|v| solver.format_term(solver.wrap_term(*v)))
             .collect();
         if !non_shared.is_empty() {
             eprintln!("[spike:{label}] REJECT: non-shared vars {non_shared:?}");
@@ -1385,7 +1390,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
         let mut shared_var_names: Vec<String> = part
             .shared_vars
             .iter()
-            .map(|v| solver.format_term(Term(*v)))
+            .map(|v| solver.format_term(solver.wrap_term(*v)))
             .collect();
         shared_var_names.sort();
 
@@ -1424,11 +1429,11 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
                 );
             }
             Some(res) => {
-                let tid = res.interpolant().0;
+                let tid = res.interpolant().id();
                 let mut vars: HashSet<TermId> = Default::default();
                 collect_var_ids(&solver, tid, &mut vars);
                 let non_shared = vars.difference(&part.shared_vars).count();
-                let i_text = solver.format_term(Term(tid));
+                let i_text = solver.format_term(solver.wrap_term(tid));
                 let ra = check_script(&build_script(
                     &part.decls,
                     &part.a_lines,
@@ -1584,11 +1589,11 @@ fn test_interpolation_builtin_repro_all_strengths_verify() {
                 cert_stats.attempted, cert_stats.verified, cert_stats.served
             ),
             Some(res) => {
-                let tid = res.interpolant().0;
+                let tid = res.interpolant().id();
                 let mut vars: HashSet<TermId> = Default::default();
                 collect_var_ids(&solver, tid, &mut vars);
                 let non_shared = vars.difference(&part.shared_vars).count();
-                let i_text = solver.format_term(Term(tid));
+                let i_text = solver.format_term(solver.wrap_term(tid));
                 let ra = check_script(&build_script(
                     &part.decls,
                     &part.a_lines,

@@ -119,6 +119,110 @@ fn test_gate_qf_dt_enum_cardinality_ite_distinct_three_terms_sat() {
     );
 }
 
+// --- 3b''. Finite-enum values reached through a UF APPLICATION (#dt-app-euf-class) ---
+//
+// An enum-datatype value that the model commits only as an EQUIVALENCE-CLASS
+// membership. `add_finite_enum_domain_coverage` asserts `(or (= (f a) c0) …)`,
+// the SAT layer picks a disjunct and EUF merges `(f a)` into that constructor's
+// class — but the class is named by a minted `@Enum!n` representative, so the
+// independent gate used to receive the value as `Uninterpreted("@Enum!0")`
+// while the same value reached as a leaf was `Datatype { ctor: "c0" }`. The
+// resulting "equality between incomparable model values" made the gate
+// CannotConfirm and the correct `sat` published as `unknown`.
+//
+// z3 5.0.0 differential (pinned oracle) for all three: sat, sat, unsat.
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_dt_enum_uf_application_class_value_sat() {
+    // Minimal repro. Over a 3-inhabitant enum, `f` may send `a` anywhere else,
+    // so this is plainly satisfiable — but the ONLY thing pinning `(f a)` to a
+    // value is its EUF class, which is exactly what the gate could not read.
+    assert_scope_results(
+        r#"
+        (set-logic QF_UFDT)
+        (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+        (declare-fun f (Enum) Enum)
+        (declare-const a Enum)
+        (assert (not (= a (f a))))
+        (check-sat)
+    "#,
+        &["sat"],
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_dt_enum_uf_application_class_value_is_read_not_guessed_sat() {
+    // NON-VACUITY / anti-guess. The adopted value must be the one the model's
+    // class actually holds: `(f a)` is pinned to `c1` and `a` to `c0`, so the
+    // gate can confirm the disequality ONLY by reading `c1`. Any producer that
+    // returned a FIXED constructor (e.g. "the datatype's first", the shape a
+    // canonical-default fallback would take) makes `(f a)` collide with `a`,
+    // `(not (= a (f a)))` evaluate to FALSE, and the verdict degrade to
+    // `unknown` — so this case fails on a gate that confirms without reading.
+    assert_scope_results(
+        r#"
+        (set-logic QF_UFDT)
+        (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+        (declare-fun f (Enum) Enum)
+        (declare-const a Enum)
+        (assert (= a c0))
+        (assert (= (f a) c1))
+        (assert (not (= a (f a))))
+        (check-sat)
+    "#,
+        &["sat"],
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_dt_enum_uf_application_class_value_still_refutes_unsat() {
+    // REJECTING DIRECTION. The same class-read must not become a licence to
+    // confirm: here the asserted equality puts `(f a)` in `a`'s own class while
+    // the disequality forbids it, so the only correct answer is `unsat`. A
+    // producer that adopted a value without the gate re-checking every
+    // assertion would publish this as `sat`.
+    assert_scope_results(
+        r#"
+        (set-logic QF_UFDT)
+        (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+        (declare-fun f (Enum) Enum)
+        (declare-const a Enum)
+        (assert (= (f a) a))
+        (assert (not (= a (f a))))
+        (check-sat)
+    "#,
+        &["unsat"],
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_dt_enum_distinct_constructors_never_share_a_class_unsat() {
+    // The invariant that keeps `dt_euf_class_constructor`'s two-constructor
+    // guard unreachable in a COHERENT model: distinct nullary constructors of
+    // one datatype denote distinct values, so an asserted equality between them
+    // is refuted rather than modelled. Pinned here because that guard is the
+    // gate's fail-closed answer if this invariant ever breaks — if this test
+    // ever goes `sat`, a class holding two constructors becomes reachable and
+    // the guard is what stops the gate confirming one of two contradictory
+    // values.
+    assert_scope_results(
+        r#"
+        (set-logic QF_UFDT)
+        (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+        (declare-fun f (Enum) Enum)
+        (declare-const a Enum)
+        (assert (= (f a) c0))
+        (assert (= c0 c1))
+        (check-sat)
+    "#,
+        &["unsat"],
+    );
+}
+
 // --- 3b'. Finite-enum cardinality (pigeonhole) beyond the old 96-node cap ---
 
 /// Build a QF_DT coloring-style script over a `k`-inhabitant enum with

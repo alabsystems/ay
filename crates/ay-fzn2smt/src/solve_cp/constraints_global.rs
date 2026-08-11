@@ -12,6 +12,7 @@ use ay_cp::propagator::Constraint;
 use ay_cp::variable::IntVarId;
 use ay_flatzinc_parser::ast::{ConstraintItem, Expr};
 
+use super::numeric::{positive_big_m, quadratic_global_work_supported};
 use super::{materialized_range_len, CpContext};
 
 impl CpContext {
@@ -71,7 +72,7 @@ impl CpContext {
                     let r1 = self.engine.new_bool_var(None);
                     self.var_bounds.insert(r1, (0, 1));
                     // r1 ↔ (x >= lo) → r1 ↔ (-x ≤ -lo)
-                    self.add_reif_le(&[-1], &[x], -*lo, r1);
+                    self.add_reif_le(&[-1], &[x], -*lo, r1, &c.id)?;
                     r1
                 };
                 let r2 = if *hi == i64::MAX {
@@ -80,7 +81,7 @@ impl CpContext {
                     let r2 = self.engine.new_bool_var(None);
                     self.var_bounds.insert(r2, (0, 1));
                     // r2 ↔ (x <= hi)
-                    self.add_reif_le(&[1], &[x], *hi, r2);
+                    self.add_reif_le(&[1], &[x], *hi, r2, &c.id)?;
                     r2
                 };
                 // r = r1 ∧ r2
@@ -140,7 +141,7 @@ impl CpContext {
                         for &val in &set_vals {
                             let bi = self.engine.new_bool_var(None);
                             self.var_bounds.insert(bi, (0, 1));
-                            self.add_reif_eq(&[1], &[x], val, bi);
+                            self.add_reif_eq(&[1], &[x], val, bi, &c.id)?;
                             indicators.push(bi);
                         }
                         // Forward: r ≥ b_i for each i (any b_i=1 → r=1)
@@ -321,6 +322,13 @@ impl CpContext {
         let r = self.resolve_var(&c.args[0])?;
         let xs = self.resolve_var_array(&c.args[1])?;
         let r_ub = self.get_var_bounds(r).1;
+        let big_ms = xs
+            .iter()
+            .map(|&xi| {
+                let xi_lb = self.get_var_bounds(xi).0;
+                positive_big_m(i128::from(r_ub) - i128::from(xi_lb), &c.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         for &xi in &xs {
             self.engine.add_constraint(Constraint::LinearGe {
@@ -331,11 +339,9 @@ impl CpContext {
         }
 
         let mut indicators = Vec::with_capacity(xs.len());
-        for &xi in &xs {
+        for (&xi, &m) in xs.iter().zip(&big_ms) {
             let d = self.engine.new_bool_var(None);
             self.var_bounds.insert(d, (0, 1));
-            let xi_lb = self.get_var_bounds(xi).0;
-            let m = (r_ub - xi_lb).max(1);
             // r <= xs[i] + M*(1-d_i): r - xs[i] + M*d_i ≤ M
             self.engine.add_constraint(Constraint::LinearLe {
                 coeffs: vec![1, -1, m],
@@ -371,6 +377,12 @@ impl CpContext {
                 dy: dy.len(),
             });
         }
+        if !quadratic_global_work_supported(x.len()) {
+            // Check before adding any part of the decomposition so rejection
+            // is atomic and cannot leave a partial encoding.
+            self.mark_unsupported(&c.id);
+            return Ok(());
+        }
         self.engine
             .add_constraint(Constraint::Diffn { x, y, dx, dy });
         Ok(())
@@ -386,6 +398,13 @@ impl CpContext {
         let r = self.resolve_var(&c.args[0])?;
         let xs = self.resolve_var_array(&c.args[1])?;
         let r_lb = self.get_var_bounds(r).0;
+        let big_ms = xs
+            .iter()
+            .map(|&xi| {
+                let xi_ub = self.get_var_bounds(xi).1;
+                positive_big_m(i128::from(xi_ub) - i128::from(r_lb), &c.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         for &xi in &xs {
             self.engine.add_constraint(Constraint::LinearLe {
@@ -396,11 +415,9 @@ impl CpContext {
         }
 
         let mut indicators = Vec::with_capacity(xs.len());
-        for &xi in &xs {
+        for (&xi, &m) in xs.iter().zip(&big_ms) {
             let d = self.engine.new_bool_var(None);
             self.var_bounds.insert(d, (0, 1));
-            let xi_ub = self.get_var_bounds(xi).1;
-            let m = (xi_ub - r_lb).max(1);
             // r >= xs[i] - M*(1-d_i): -r + xs[i] + M*d_i ≤ M
             self.engine.add_constraint(Constraint::LinearLe {
                 coeffs: vec![-1, 1, m],

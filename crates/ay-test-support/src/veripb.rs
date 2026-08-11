@@ -801,8 +801,7 @@ pub mod pin {
         let text = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .next_back()?
+            .rfind(|line| !line.trim().is_empty())?
             .split_whitespace()
             .next_back()
             .map(str::to_owned)

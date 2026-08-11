@@ -1259,7 +1259,7 @@ impl Search {
                 Op::Eq => {
                     cand.push(1);
                     cand.push(-1);
-                    for t in cand.drain(..).collect::<Vec<_>>() {
+                    for t in std::mem::take(&mut cand) {
                         self.add_update(x, t);
                     }
                     return;
@@ -1753,7 +1753,7 @@ impl Search {
             if self.unsat.is_empty() {
                 return true;
             }
-            if self.step % DEADLINE_POLL_STEPS == 0
+            if self.step.is_multiple_of(DEADLINE_POLL_STEPS)
                 && deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
             {
                 return false;
@@ -1836,10 +1836,10 @@ fn isqrt(d: i128) -> i128 {
         return d;
     }
     let mut x = d;
-    let mut y = (x + 1) / 2;
+    let mut y = i128::midpoint(x, 1);
     while y < x {
         x = y;
-        y = (x + d / x) / 2;
+        y = i128::midpoint(x, d / x);
     }
     x
 }
@@ -2120,6 +2120,13 @@ mod tests {
         assert_eq!(isqrt(26), 5);
         assert_eq!(isqrt(1_000_000), 1000);
         assert_eq!(isqrt(999_999), 999);
+
+        // The old `(x + d / x) / 2` update (and its `(x + 1) / 2`
+        // initializer) overflowed for this valid non-negative input. Check the
+        // defining floor-square-root inequalities without multiplying.
+        let root = isqrt(i128::MAX);
+        assert!(root <= i128::MAX / root);
+        assert!(root + 1 > i128::MAX / (root + 1));
     }
 
     #[test]

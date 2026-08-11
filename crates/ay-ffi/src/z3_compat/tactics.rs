@@ -259,8 +259,12 @@ unsafe fn combine_tactics(
     // `Z3_mk_tactic`/combinator call and kept alive in the context's
     // `tactic_handle_cache`. The Z3 C API is single-threaded per context, so this
     // shared read does not race. `as_ref` null-checks.
-    let first = unsafe { t1.as_ref() }.map(|h| h.tactic.clone());
-    let second = unsafe { t2.as_ref() }.map(|h| h.tactic.clone());
+    let (first, second) = unsafe {
+        (
+            t1.as_ref().map(|h| h.tactic.clone()),
+            t2.as_ref().map(|h| h.tactic.clone()),
+        )
+    };
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // function requires it to be a valid, non-aliased pointer (or null). `ffi_guard_ptr`
@@ -530,8 +534,12 @@ pub unsafe extern "C" fn Z3_tactic_when(c: Z3_context, p: Z3_probe, t: Z3_tactic
     // Pre-extract the probe and body outside the guard (raw-pointer derefs).
     // SAFETY: both handles, when non-null, are arena-owned by the context and
     // single-threaded per context; `as_ref` null-checks.
-    let probe = unsafe { p.as_ref() }.map(|h| h.probe.clone());
-    let body = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
+    let (probe, body) = unsafe {
+        (
+            p.as_ref().map(|h| h.probe.clone()),
+            t.as_ref().map(|h| h.tactic.clone()),
+        )
+    };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
@@ -567,9 +575,13 @@ pub unsafe extern "C" fn Z3_tactic_cond(
     // Pre-extract the probe and both branches outside the guard (raw derefs).
     // SAFETY: all handles, when non-null, are arena-owned and single-threaded per
     // context; `as_ref` null-checks.
-    let probe = unsafe { p.as_ref() }.map(|h| h.probe.clone());
-    let first = unsafe { t1.as_ref() }.map(|h| h.tactic.clone());
-    let second = unsafe { t2.as_ref() }.map(|h| h.tactic.clone());
+    let (probe, first, second) = unsafe {
+        (
+            p.as_ref().map(|h| h.probe.clone()),
+            t1.as_ref().map(|h| h.tactic.clone()),
+            t2.as_ref().map(|h| h.tactic.clone()),
+        )
+    };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
@@ -632,8 +644,12 @@ pub unsafe extern "C" fn Z3_tactic_par_and_then(
 ) -> Z3_tactic {
     // SAFETY: both handles, when non-null, are arena-owned and single-threaded
     // per context; `as_ref` null-checks.
-    let first = unsafe { t1.as_ref() }.map(|h| h.tactic.clone());
-    let second = unsafe { t2.as_ref() }.map(|h| h.tactic.clone());
+    let (first, second) = unsafe {
+        (
+            t1.as_ref().map(|h| h.tactic.clone()),
+            t2.as_ref().map(|h| h.tactic.clone()),
+        )
+    };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
@@ -698,7 +714,11 @@ pub unsafe extern "C" fn Z3_tactic_par_or(
             };
             // Fold left with or-else (first success wins), matching par-or's set.
             let mut it = operands.into_iter();
-            let first = it.next().expect("num > 0 checked");
+            let Some(first) = it.next() else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some("Z3_tactic_par_or: empty tactic array".to_string());
+                return ptr::null_mut();
+            };
             let combined = it.fold(first, Tactic::or_else);
             store_tactic(ctx, combined)
         })

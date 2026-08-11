@@ -229,11 +229,12 @@ fn de_morgan_user_bv_prefix_candidate_is_never_refuted() {
     );
 }
 
-/// The disposable premise probes must not register their fresh constants in
-/// the user executor. Repeated SAT checks exercise the same capability twice;
-/// neither visible model may contain the private qpf prefix.
+/// The satisfiable variant lacks a constructed/rechecked total UF model, so
+/// repeated checks must fail closed deterministically and model requests must
+/// remain unavailable. The disposable premise probes must also never register
+/// their fresh constants in user-visible state.
 #[test]
-fn repeated_sat_checks_do_not_leak_qpf_symbols() {
+fn repeated_failclosed_checks_do_not_leak_qpf_symbols() {
     let smt = r#"
         (set-logic UFBV)
         (set-option :produce-models true)
@@ -253,9 +254,15 @@ fn repeated_sat_checks_do_not_leak_qpf_symbols() {
     "#;
     let results = crate::common::solve_vec(smt);
     assert_eq!(
-        results.iter().filter(|r| r.as_str() == "sat").count(),
-        2,
-        "the satisfiable variant must remain stable across repeated checks; got {results:?}"
+        results,
+        [
+            "unknown",
+            "(error \"model is not available\")",
+            "unknown",
+            "(error \"model is not available\")",
+        ],
+        "the semantically satisfiable variant must fail closed until a total \
+         model certificate exists"
     );
     assert!(
         results.iter().all(|r| !r.contains("__ay_qpf")),

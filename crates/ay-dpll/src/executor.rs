@@ -78,6 +78,7 @@ const MAX_INTERLEAVED_EMATCHING_ROUNDS: usize = 4;
 /// the same sentinel: the optional name is unsat-core metadata, not syntax.
 pub(crate) const NATIVE_API_ASSERTION_PLACEHOLDER: &str = "__ay_api_assertion__";
 
+mod accessors;
 mod assumption_solving;
 mod bv_mbqi;
 mod check_sat;
@@ -87,6 +88,8 @@ mod core_minimize;
 mod diff_logic;
 pub(crate) mod dl_theory;
 mod dt_axioms;
+mod exact_exists_bounds;
+mod exact_forall_exists;
 pub(crate) mod ite_lift;
 pub(crate) mod lean_firewall;
 pub(crate) mod lemma_cache;
@@ -100,18 +103,20 @@ mod partition_rescue;
 mod proof;
 mod proof_array_ext;
 mod proof_euf_lemma;
-mod proof_farkas;
 mod proof_original_rebuild;
+mod proof_repair;
+use proof_repair::*;
 mod proof_resolution;
 mod proof_rewrite;
 mod proof_rewrite_division;
 mod proof_rewrite_terms;
 mod proof_surface_syntax;
-mod proof_trust_surgery;
 mod purify_bool_args;
 mod purify_int_uf_arith;
 mod qe_prepass;
+mod quantified_sat;
 mod quantifier_loop;
+mod query_authority;
 mod rewrite_const_array_reads;
 mod rm_domain;
 mod solve_deadline;
@@ -122,8 +127,11 @@ mod unsat_cert;
 use model::Model;
 // Re-export the SAT-emission witness token so the API boundary
 // (`api::types::results`) can name it while its constructor stays private to
-// the `sat_emit` module (mintable only inside `emit_sat_verdict`) (#sat-chokepoint).
+// the `sat_emit` module's two complete checked lanes (#sat-chokepoint).
 pub(crate) use model::sat_emit::SatCertificate;
+pub(in crate::executor) use query_authority::AuthoredPlainHardQueryPermit;
+pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
+pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
 pub(crate) use solve_deadline::SolveDeadlineCell;
 pub(crate) use unsat_cert::UnsatCertificate;
 
@@ -276,10 +284,29 @@ pub(crate) struct EmatchingProofRecord {
     pub(crate) instance: TermId,
 }
 
-/// SMT executor that coordinates frontend parsing with theory solving
+/// The clique behind a finite-enum pigeonhole refutation, with per-pair source
+/// provenance so the proof layer can emit real `Assume` steps.
+#[derive(Debug, Clone)]
+pub(crate) struct FiniteEnumPigeonholeWitness {
+    /// Constructor count of the sort (its exact carrier size).
+    pub(crate) k: usize,
+    /// `k + 1` pairwise-distinct terms of that sort.
+    pub(crate) members: Vec<TermId>,
+    /// Ordered member pair -> the authored assertion that supplied it.
+    pub(crate) edge_sources: HashMap<(TermId, TermId), TermId>,
+}
+
+/// SMT executor that coordinates frontend parsing with theory solving.
 pub struct Executor {
     /// Frontend context for elaboration
     pub(crate) ctx: Context,
+    /// Opaque identity of the currently active public decision attempt.
+    /// Rotated by `begin_public_solve` before preflight/elaboration so a permit
+    /// from an earlier, textually identical query can never become current.
+    pub(in crate::executor) query_authority_epoch: QueryAuthorityEpoch,
+    /// Origin canary for query-authority unit tests.
+    #[cfg(test)]
+    pub(in crate::executor) last_authored_query_authority_seen: bool,
     /// Strings NF-engine closure 5 (`AY_STR_NF=1`) bookkeeping: whether EVERY
     /// string lemma lowered into the SAT solver during the current solve was
     /// of a UNIVERSALLY VALID kind (exact extended-function reduction axioms
@@ -544,6 +571,19 @@ pub struct Executor {
     named_assert_rewrites: HashMap<TermId, TermId>,
     /// Last proof (for get-proof when UNSAT)
     last_proof: Option<Proof>,
+    /// The current UNSAT verdict was independently certified semantically, but
+    /// no proof was translated back to the authored problem scope.
+    ///
+    /// While set, proof reconstruction and every proof accessor must fail
+    /// closed. Rebuilding from the outer trace after a CEGQI consequence
+    /// re-solve could otherwise attach a CE-contaminated proof to a sound
+    /// verdict established from different premises.
+    last_unsat_proof_reconstruction_suppressed: bool,
+    /// This solve asserted at least one quantified consequence whose exact
+    /// authored-scope `forall_inst` derivation was not registered.  A raw UNSAT
+    /// may still be mathematically sound, but its trace is not publication
+    /// authority; result mapping must use the semantic-only proof firewall.
+    quantified_proof_translation_incomplete: bool,
     /// Last LRAT certificate serialized from the SAT clause trace.
     ///
     /// Populated opportunistically for UNSAT results when the clause trace is
@@ -676,9 +716,14 @@ pub struct Executor {
     counterexample_style: crate::CounterexampleStyle,
     /// Proof tracker for collecting proof steps during solving
     proof_tracker: crate::proof_tracker::ProofTracker,
-    /// Explicit proof-output request, separate from mandatory internal proof
-    /// tracking used to certify every public UNSAT verdict.
+    /// Explicit proof-output request, separate from source-selected internal
+    /// tracking for strict quantified-BV/self-check UNSAT certification.
     proof_output_requested: bool,
+    /// Whether proof production was requested as a required artifact rather
+    /// than enabled for the CLI's synthesized best-effort default.  This is
+    /// explicit policy state; a reconstruction budget must never silently
+    /// downgrade an API caller's `set_produce_proofs(true)` request.
+    proof_artifact_required: bool,
     /// Deterministic step budget for post-UNSAT SAT-proof reconstruction
     /// (RUP replay clause scans). `None` = unlimited (explicit `--proof`,
     /// `--strict-proofs`, `:produce-proofs` scripts). `Some(n)` = best-effort:
@@ -691,6 +736,19 @@ pub struct Executor {
     last_clause_trace: Option<ClauseTrace>,
     /// Last var_to_term mapping from Tseitin (for SAT proof reconstruction)
     last_var_to_term: Option<HashMap<u32, TermId>>,
+    /// Independently checked composition of exact SMT original-clause authority
+    /// with a bounded positive-RUP refutation for the current query epoch.
+    /// Witness for a finite-enum pigeonhole refutation (#dt-enum-pigeonhole).
+    ///
+    /// `add_finite_enum_pigeonhole_conflict` refutes by finding a `k+1` clique in
+    /// the disequality graph of a `k`-constructor all-nullary datatype sort, then
+    /// asserts bare `false`. Recording the clique here lets the proof layer
+    /// rebuild the ARGUMENT instead of publishing an uncheckable `[false]`.
+    last_finite_enum_pigeonhole: Option<FiniteEnumPigeonholeWitness>,
+    /// Sealed, query-bound authority for the exact canonical finite-enum proof
+    /// currently stored in `last_proof`.
+    last_checked_finite_enum_pigeonhole: Option<proof::CheckedFiniteEnumPigeonholeProof>,
+    last_checked_sat_refutation: Option<proof_resolution::CheckedSatRefutation>,
     /// Per-variable SAT trail provenance from last SAT result (#8153, #8307).
     /// Maps 0-based SAT variable index -> (decision_level, is_propagated, antecedent_var_indices).
     /// The `antecedent_var_indices` are the 0-based SAT variable indices of the
@@ -727,6 +785,15 @@ pub struct Executor {
     /// (#quantified-model-gate): its nested isolated confirm/refute solves
     /// must never recurse back into the gate (or any other emit-funnel gate).
     pub(crate) in_quantified_model_gate: bool,
+    /// Typed handoff from a definitive quantified-model check to the
+    /// immediately following compositional independent gate.
+    ///
+    /// Diagnostic statistics are never authority. This capability is bound
+    /// to the exact public-query epoch, frontend source/scope stamp, ordered
+    /// active roots, and sealed installed-model identity. Every solve/result
+    /// invalidation revokes it with the other quantified SAT grants.
+    pub(in crate::executor) quantified_model_confirmation:
+        Option<model::QuantifiedModelConfirmation>,
     /// DT-MBQI-Sat certificate state (M4): set whenever
     /// `try_dt_model_sat_certificate` grants this check-sat's `Sat`, whether at
     /// the bounded pre-solve re-sequencing probe or either post-solve result-
@@ -738,6 +805,10 @@ pub struct Executor {
     /// incomplete candidate. Ground assertions still pass through the strict
     /// pre-skip oracle before this flag matters. Cleared at check-sat entry.
     pub(crate) dt_cert_grant_active: bool,
+    /// Exact query/source/root scope paired with
+    /// [`Self::dt_cert_grant_active`]. The Boolean is only routing state; both
+    /// SAT gates require this opaque grant to be current.
+    dt_cert_query_grant: Option<QuantifiedSatAuthorityGrant>,
     /// Sibling of [`Self::dt_cert_grant_active`] for the FINITE-TABLE SAT
     /// certificate, set on the route where CEGQI has already classified the
     /// ground remainder `Sat`.
@@ -787,38 +858,28 @@ pub struct Executor {
     /// quantified evidence with its independent ground-assertion checks.
     /// Cleared at check-sat entry.
     pub(crate) mbqi_sat_cert_grant_active: bool,
-    /// Ground-term values from the explicitly constructed interpretation of
-    /// the active MBQI SAT certificate. The retained theory model can be
-    /// intentionally lossy for constrained UF heads; these pins make the
-    /// public model evaluator observe the exact values the certificate checked.
-    /// Cleared at check-sat entry together with the grant marker.
-    mbqi_sat_cert_pins: HashMap<TermId, model::EvalValue>,
+    /// Exact query/source/root scope paired with
+    /// [`Self::mbqi_sat_cert_grant_active`].
+    mbqi_sat_cert_query_grant: Option<QuantifiedSatAuthorityGrant>,
+    /// Linear, query/root/source/model-scoped authority for the CEGQI UF
+    /// re-completion theorem. Unlike the legacy Boolean certificate markers,
+    /// this value can only be constructed by the sealed per-group verifier and
+    /// becomes unusable when the query epoch, authored roots, declaration
+    /// identities, source scope, or installed completed-model identity changes.
+    /// Cleared at every solve/result invalidation boundary.
+    pub(in crate::executor) cegqi_uf_recompletion_grant:
+        Option<quantifier_loop::CegqiUfRecompletionGrant>,
     /// A finite-table certificate's outer witness, parked while later
     /// result-mapping probes run. Nested solves may overwrite `last_model` and
-    /// clear active pins; the outer mapper installs this witness only after all
-    /// such probes finish and the certificate is still the final Sat authority.
-    finite_table_cert_pending_witness: Option<(Model, HashMap<TermId, model::EvalValue>)>,
-    /// The MATERIALIZED WITNESS of a constant-interpretation certificate grant:
-    /// the interpretation `I` the certificate machine-checked, in the form
-    /// `(get-model)` can print and the model evaluator can read.
-    ///
-    /// A `Sat` must carry a model (`check_sat_internal`'s boundary
-    /// postcondition, #4642), and the certificate's model IS `I` — every head
-    /// it pinned interpreted as the CONSTANT function `λ ȳ. c_f`. Before this
-    /// field existed the certificate had no way to say that: the only route to
-    /// a function-valued model entry,
-    /// `try_register_native_adopted_macro_interp`, refuses any symbol that a
-    /// constraint mentions, which is exactly the symbol occurring in the
-    /// quantified axiom. So the certificate DECLINED whenever there was no
-    /// other model to carry the witness, and those problems published
-    /// `unknown`.
-    ///
-    /// Non-empty ONLY between a grant and the next check-sat entry, and only on
-    /// the route where the certificate is the sole source of a model
-    /// (`last_model` was `None` when it granted, so nothing here can overwrite
-    /// a theory model built by a real solve). Cleared alongside
-    /// [`Self::const_interp_cert_grant_active`].
-    const_interp_cert_witness: Vec<mbqi::ConstInterpWitnessEntry>,
+    /// its model-owned ground projection; the outer mapper installs this
+    /// witness only after all such probes finish and the certificate is still
+    /// the final Sat authority.
+    finite_table_cert_witness_state: Option<mbqi::FiniteTableWitnessState>,
+    /// Exact constant-interpretation witness parked until the public SAT
+    /// funnel. Certificate probes and restoration may replace `last_model` or
+    /// sidecar entries after the theorem was checked; publication reinstalls
+    /// this model/entry pair atomically before consulting the grant marker.
+    const_interp_cert_witness_state: Option<mbqi::ConstInterpWitnessState>,
     /// Deadline propagated from API-level timeout settings.
     ///
     /// LIVE shared cell (#quantifier-determinism): stop closures capture a
@@ -835,6 +896,10 @@ pub struct Executor {
     /// re-entries (alternation validation sub-solves) from compounding the
     /// extension.
     quantifier_deadline_backstop_installed: bool,
+    /// Deadline policy for this executor. Public solves use the ordinary
+    /// quantified backstop; accepting certification probes select `Exact` so a
+    /// caller's absolute deadline can only stop work, never be extended.
+    quantifier_deadline_policy: QuantifierDeadlinePolicy,
     /// #read-congruence-quantified-scope (#7956 tseitin regression): `true`
     /// from the moment the current check-sat's quantifier pipeline actually
     /// instantiates quantifiers (`process_quantifiers`, past its
@@ -1018,29 +1083,44 @@ pub struct Executor {
     /// discharged by a weaker route, so it is only ever true for an
     /// all-quantifiers-full-domain pass.
     bv_quantifier_full_domain_proof: bool,
+    /// Linear producer evidence paired with
+    /// [`Self::bv_quantifier_full_domain_proof`] until the result mapper consumes
+    /// it at the query-authority boundary. A raw routing bit cannot populate
+    /// this slot.
+    bv_quantifier_full_domain_pending_evidence: Option<bv_mbqi::CheckedBvFullDomainSatAuthority>,
+    /// Exact query/source/root scope paired with
+    /// [`Self::bv_quantifier_full_domain_proof`].
+    bv_quantifier_full_domain_query_grant: Option<QuantifiedSatAuthorityGrant>,
     /// When true, `solve_and_store_model_full` stores the SAT/theory model but
     /// skips SAT-preserving counterexample minimization until the caller
     /// restores the original assertion set. Used by standalone preprocessing
     /// lanes whose temporary reduced assertions are not the user-facing formula.
     defer_counterexample_minimization: bool,
-    /// True when `finalize_sat_model_validation` actually ran and passed on the
-    /// last solve call. Reset to `false` at the start of each `check_sat`.
-    /// Used by the API layer to accurately report `sat_model_validated` (#5903).
+    /// True when the last SAT witness passed ordinary final model validation or
+    /// the independently checked total-projection evidence lane. Reset to
+    /// `false` at the start of each `check_sat`. Used by the API layer to report
+    /// admitted model evidence accurately (#5903).
     last_model_validated: bool,
-    /// Unforgeable witness that the last emitted `Sat` passed the single
-    /// `emit_sat_verdict` funnel (strict + independent + authoritative gates).
-    /// Minted ONLY inside `emit_sat_verdict`; the API boundary consumes it via
-    /// `take_sat_certificate` to build a public `Sat` `VerifiedSolveResult`, so
-    /// no `Sat` can escape the boundary without the funnel (#sat-chokepoint).
+    /// Unforgeable witness that the last emitted `Sat` passed either the
+    /// ordinary validation funnel or the checked quantified-projection funnel.
+    /// Minted only inside those private chokepoints; the API boundary consumes
+    /// it via `take_sat_certificate` to build a public `Sat`
+    /// `VerifiedSolveResult`, so no `Sat` can escape without complete evidence
+    /// (#sat-chokepoint).
     last_sat_certificate: Option<SatCertificate>,
-    /// One-shot witness that the last provisional UNSAT passed the mandatory
-    /// strict-proof publication funnel for its exact authored query epoch.
+    /// One-shot witness that the last provisional UNSAT passed one complete
+    /// exact-query certification lane. The sealed kind preserves literal strict
+    /// proof acceptance, independently checked refutation/trust discharge, and
+    /// the narrow exact semantic theorem as distinct claims.
     last_unsat_certificate: Option<UnsatCertificate>,
+    /// Certification class consumed by the most recent SMT-LIB command
+    /// boundary. This is separate from the one-shot token so later diagnostics
+    /// cannot relabel an exact semantic certificate as a strict proof merely
+    /// because the admitted result is `Unsat`.
+    last_command_unsat_admission: Option<unsat_cert::CommandUnsatAdmission>,
     /// Frozen authored assertion and assumption authority for the active public
     /// decision. Solver-generated preprocessing terms never enter this epoch.
     unsat_query_epoch: Option<unsat_cert::UnsatQueryEpoch>,
-    /// Monotonic identity source for [`unsat_query_epoch`](Self::unsat_query_epoch).
-    next_unsat_query_epoch: u64,
     /// Phase 2 CEGAR (#dt-array-cegar): a select-congruence lemma that the model
     /// census / general select-congruence gate found the last SAT model to
     /// VIOLATE — `(=> (and (= A B) (= i j)) (= (select A i) (select B j)))` for
@@ -1148,6 +1228,13 @@ pub struct Executor {
     /// ~N²/2 assertions, so validation cost exploded to tens of seconds by
     /// N≈400 on instances whose solve took 0.1s.
     array_def_index: std::cell::RefCell<Option<model::ArrayDefIndexCache>>,
+    /// Exact-snapshot structural index of reserved integer div/mod witnesses.
+    ///
+    /// Zero-divisor evaluation remains keyed by independently evaluated
+    /// operand VALUES; this cache removes only the repeated whole-TermStore
+    /// discovery scan. Its opaque store stamp forces a rebuild after append,
+    /// rollback, clone, or wholesale context replacement.
+    div_witness_index_cache: model::DivWitnessIndexCache,
     /// Reverse index `array term -> select(array, _) terms`, extended lazily
     /// over the APPEND-ONLY term store: `(scanned_prefix_len, map)`. Existing
     /// `TermId`s are immutable, so extending the scan over `[scanned, len)` is
@@ -1285,23 +1372,35 @@ pub struct Executor {
     /// dropped once built, and validation runs unbudgeted — so this can cost a
     /// SAT the search had not yet found, and can never accept one.
     pub(crate) w4_work_deadline: Cell<Option<u64>>,
-    /// AUTHORED assertion window of the check-sat currently in flight, captured
-    /// in `check_sat_internal` BEFORE any in-place preprocessing pass runs
-    /// (#selfcert-authored).
+    /// AUTHORED assertion window of a self-checked check-sat currently in
+    /// flight, captured in `check_sat_internal` BEFORE any in-place
+    /// preprocessing pass runs (#selfcert-authored).
     ///
-    /// Only the fail-closed `--self-check` SAT gate reads this, and only to
-    /// certify the model against the formula the USER actually asserted. The
-    /// gate's ordinary denominator is `ctx.assertions` at validation time, which
-    /// under `--self-check` (proofs forced on) also carries solver-injected
-    /// theory axioms over fresh internal symbols (`__ay_*`).
+    /// The fail-closed `--self-check` SAT gate uses it to certify the model
+    /// against the formula the USER actually asserted. The gate's ordinary
+    /// denominator is `ctx.assertions` at validation time, which under
+    /// `--self-check` (proofs forced on) also carries solver-injected theory
+    /// axioms over fresh internal symbols (`__ay_*`).
     /// Those are skipped as `Internal` and counted "unverified", so a QF_AX
     /// model that satisfies every authored assertion was degraded to `unknown`.
     /// See `self_check_authored_model_certified`.
     ///
-    /// Saved/restored around the nested `check_sat_internal` re-entries (probe
-    /// and retry solves) so an inner solve's narrower window can never be used
-    /// to certify the outer verdict. `None` (no snapshot) fails closed.
+    /// Model completion and strict proof checking also consume this snapshot in
+    /// self-check mode. It therefore must not be repurposed as always-on model
+    /// gate state: doing so silently changes default-mode model construction.
+    /// Saved/restored around nested `check_sat_internal` re-entries (probe and
+    /// retry solves) so an inner solve's narrower window can never be used to
+    /// certify the outer verdict. `None` (no self-check snapshot) fails closed.
     self_check_authored_assertions: Option<Vec<TermId>>,
+    /// Exact pre-preprocessing assertion roots for the mandatory independent
+    /// model gate during the check-sat currently in flight.
+    ///
+    /// This is deliberately separate from `self_check_authored_assertions`.
+    /// The independent gate is mandatory in default mode too, but publishing
+    /// its roots must not opt default solving into self-check-only model
+    /// completion or proof behavior. Nested probe/retry solves save and restore
+    /// this slot so their narrower roots cannot authorize the outer verdict.
+    independent_gate_authored_assertions: Option<Vec<TermId>>,
     /// Temporary scope filter for array axiom generation in incremental mode (#6726).
     /// When `Some`, the fixpoint generators skip terms not reachable from current
     /// assertions. The `usize` is the TermStore length at fixpoint entry — terms
@@ -1647,6 +1746,28 @@ mod dl_theory_tests;
 #[path = "executor/dl_theory_rollback_tests.rs"]
 mod dl_theory_rollback_tests;
 
+/// Complete authority/publication contract for one command execution.
+///
+/// Text commands must certify UNSAT and consume SAT authority before formatting
+/// a definite result. The native optimization adapter instead transfers the
+/// still-linear SAT or UNSAT capability to `VerifiedSolveResult`, which consumes
+/// it at that boundary. Combining origin and publication in one closed enum
+/// makes the forbidden authored-but-unpublished pairing unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandExecutionBoundary {
+    GenericText,
+    AuthoredText,
+    NativeOptimization,
+}
+
+/// Whether a quantified solve may relax its nominal deadline into AY's later
+/// deterministic-work backstop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum QuantifierDeadlinePolicy {
+    RelaxToBackstop,
+    Exact,
+}
+
 impl Executor {
     /// Install the logic the way an API constructor does — see
     /// [`ay_frontend::elaborate::Context::set_initial_logic`]. It does NOT
@@ -1675,13 +1796,82 @@ impl Executor {
         // keeps its own guard (#6783); on an already-grown segment it finds
         // ample remaining stack and does not re-grow.
         stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
-            self.execute_stack_guarded(cmd)
+            self.execute_stack_guarded(cmd, CommandExecutionBoundary::GenericText)
+        })
+    }
+
+    /// Execute one command received directly from the audited SMT-LIB user
+    /// command stream.
+    ///
+    /// This differs from [`Self::execute`] only for a plain hard
+    /// [`Command::CheckSat`]: the authored entrypoint may mint a linear query
+    /// permit before solving. Library adapters, CHC, proof checkers, nested
+    /// solves, and [`Self::execute_all`] deliberately retain the generic method
+    /// and therefore cannot acquire authority from a command shape alone.
+    #[must_use = "command results must be checked — errors indicate parse/solve failures"]
+    pub fn execute_authored(&mut self, cmd: &Command) -> Result<Option<String>> {
+        stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
+            self.execute_stack_guarded(cmd, CommandExecutionBoundary::AuthoredText)
+        })
+    }
+
+    /// Run the generic `(check-sat)` dispatch for native optimization without
+    /// publishing a text verdict.
+    ///
+    /// The dispatch still owns all objective/parsed-soft routing and canonical
+    /// result installation, but deliberately leaves the exact SAT or UNSAT
+    /// capability for the native `VerifiedSolveResult` boundary to consume
+    /// exactly once. This is narrower than a general unpublished-command escape:
+    /// native callers cannot use it for authored hard-query authority or
+    /// arbitrary commands.
+    pub(crate) fn execute_native_optimization_check_sat(&mut self) -> Result<SolveResult> {
+        stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
+            self.execute_stack_guarded(
+                &Command::CheckSat,
+                CommandExecutionBoundary::NativeOptimization,
+            )?;
+            Ok(self.last_result.clone().unwrap_or(SolveResult::Unknown))
         })
     }
 
     /// Body of [`Executor::execute`] — only called through the stack guard
     /// above so its (large, low-opt) frame lands on the grown segment.
-    fn execute_stack_guarded(&mut self, cmd: &Command) -> Result<Option<String>> {
+    fn execute_stack_guarded(
+        &mut self,
+        cmd: &Command,
+        boundary: CommandExecutionBoundary,
+    ) -> Result<Option<String>> {
+        // `check_sat` installs/restores its own solve-phase deadline internally,
+        // but public UNSAT certification runs after that solve returns. Hold one
+        // absolute deadline across the complete command so certification and
+        // any nested trust re-confirmation consume the caller's ORIGINAL
+        // timeout rather than receiving a renewed timeout (or no deadline).
+        let publication_deadline = matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_))
+            .then(|| self.install_command_publication_deadline());
+        let result = self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
+        if let Some(previous_deadline) = publication_deadline {
+            self.restore_timeout_deadline_after_call(previous_deadline);
+        }
+        result
+    }
+
+    /// Command body entered with any decision-command publication deadline
+    /// already installed by [`Self::execute_stack_guarded`].
+    fn execute_stack_guarded_with_publication_deadline(
+        &mut self,
+        cmd: &Command,
+        boundary: CommandExecutionBoundary,
+    ) -> Result<Option<String>> {
+        if boundary == CommandExecutionBoundary::NativeOptimization
+            && !matches!(cmd, Command::CheckSat)
+        {
+            // Keep this before command processing or any solver call: if a
+            // future refactor misuses the narrow native boundary, it must not
+            // mint assumption/probe state and then rely on a caught panic for
+            // cleanup. Revoke every predecessor decision before failing.
+            self.begin_public_solve(false);
+            unreachable!("the native optimization boundary is sealed to plain check-sat");
+        }
         if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {
             // A new public decision query supersedes the preceding result even
             // when export preflight or command elaboration fails. Preserve only
@@ -1932,11 +2122,22 @@ impl Executor {
                     // Previously called check_sat_internal() directly, bypassing model
                     // validation — an escape hatch that violated the verification invariant.
                     // Part of #5787 (Phase 6).
-                    self.check_sat()?
+                    if boundary == CommandExecutionBoundary::AuthoredText {
+                        self.solve_authored_plain_hard_query(&[])?
+                    } else {
+                        self.check_sat()?
+                    }
                 } else {
                     self.optimize_check_sat()?
                 };
                 let sat_result = self.certify_unsat_for_publication(sat_result, &[]);
+                let sat_result = match boundary {
+                    CommandExecutionBoundary::GenericText
+                    | CommandExecutionBoundary::AuthoredText => {
+                        self.admit_command_solve_result(sat_result)
+                    }
+                    CommandExecutionBoundary::NativeOptimization => sat_result,
+                };
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
@@ -1971,6 +2172,15 @@ impl Executor {
                 }
                 let sat_result = self.check_sat_assuming_with_named_cores(&assumptions)?;
                 let sat_result = self.certify_unsat_for_publication(sat_result, &assumptions);
+                let sat_result = match boundary {
+                    CommandExecutionBoundary::GenericText
+                    | CommandExecutionBoundary::AuthoredText => {
+                        self.admit_command_solve_result(sat_result)
+                    }
+                    CommandExecutionBoundary::NativeOptimization => {
+                        unreachable!("the native optimization boundary was rejected before solve")
+                    }
+                };
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
@@ -2177,228 +2387,6 @@ impl Executor {
     pub(crate) fn last_diff_logic_decided_for_test(&self) -> bool {
         self.last_diff_logic_decided.get()
     }
-
-    /// Access the trail provenance data from the last SAT result (#8153, #8307).
-    pub(crate) fn last_trail_provenance(&self) -> Option<&HashMap<u32, (u32, bool, Vec<u32>)>> {
-        self.last_trail_provenance.as_ref()
-    }
-
-    /// Access the var-to-term mapping from the last Tseitin encoding (#8307).
-    ///
-    /// Maps 0-based SAT variable index to TermId. Used by `model_provenance()`
-    /// to convert reason clause variable indices back to `Term` handles.
-    pub(crate) fn last_var_to_term(&self) -> Option<&HashMap<u32, TermId>> {
-        self.last_var_to_term.as_ref()
-    }
-
-    /// Look up the SAT variable index for a term ID from the last model (#8153).
-    pub(crate) fn last_model_term_to_var(&self, term_id: TermId) -> Option<u32> {
-        self.last_model.as_ref()?.term_to_var.get(&term_id).copied()
-    }
-
-    /// Capture trail provenance from the persistent SAT solver (#8153, #8307).
-    ///
-    /// Called after check-sat returns SAT, when pipeline borrows are released.
-    /// Queries `incr_theory_state.persistent_sat` (or `lia_persistent_sat`)
-    /// for each variable in the model's `term_to_var` mapping.
-    ///
-    /// For propagated variables, also captures the reason clause's antecedent
-    /// variable indices so that `model_provenance()` can populate
-    /// `antecedent_terms` with real data instead of an empty vec.
-    pub(crate) fn capture_trail_provenance(&mut self) {
-        let model = match self.last_model.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-        let sat = self
-            .incr_theory_state
-            .as_ref()
-            .and_then(|s| s.persistent_sat.as_ref().or(s.lia_persistent_sat.as_ref()));
-        let sat = match sat {
-            Some(s) => s,
-            None => return,
-        };
-        let mut provenance = HashMap::default();
-        let sat_num_vars = sat.total_num_vars();
-        for (_, &var_idx) in &model.term_to_var {
-            // Optimization blocking constraints may introduce variables beyond
-            // the persistent SAT solver's variable count (#8515). Skip them to
-            // avoid out-of-bounds access in var_level/var_assignment_kind.
-            if (var_idx as usize) >= sat_num_vars {
-                continue;
-            }
-            let var = ay_sat::Variable::new(var_idx);
-            if let Some(level) = sat.var_level(var) {
-                let kind = sat.var_assignment_kind(var);
-                let is_propagated = kind == ay_sat::VarAssignmentKind::Propagated;
-                let antecedents = if is_propagated {
-                    sat.var_reason_variable_indices(var).unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                provenance.insert(var_idx, (level, is_propagated, antecedents));
-            }
-        }
-        self.last_trail_provenance = Some(provenance);
-    }
-
-    // DT axiom generation functions (dt_selector_axioms, dt_acyclicity_depth_axioms,
-    // dt_occurs_check_unsat_from_equalities) moved to executor/dt_axioms.rs.
-
-    /// Execute a sequence of commands
-    ///
-    /// Returns outputs for each command that produces output.
-    #[must_use = "command results must be checked — errors indicate parse/solve failures"]
-    pub fn execute_all(&mut self, commands: &[Command]) -> Result<Vec<String>> {
-        let mut outputs = Vec::new();
-        for cmd in commands {
-            if let Some(output) = self.execute(cmd)? {
-                outputs.push(output);
-            }
-        }
-        Ok(outputs)
-    }
-
-    // check_sat, check_sat_interruptible, check_sat_guarded, set_interrupt,
-    // set_timeout, set_solve_controls, clear_solve_controls, make_should_stop,
-    // should_abort_theory_loop, check_sat_internal, route_to_solver:
-    // moved to executor/check_sat.rs
-
-    /// Get the current logic
-    pub fn logic(&self) -> Option<&str> {
-        self.ctx.logic()
-    }
-
-    /// Get the number of assertions
-    pub fn assertion_count(&self) -> usize {
-        self.ctx.assertions.len()
-    }
-
-    /// Get the last check-sat result.
-    ///
-    /// Read-only accessor for the result of the last solve call. The result
-    /// was validated during solve (via `finalize_sat_model_validation()`).
-    /// This accessor does not bypass verification — it reads an already-validated value.
-    ///
-    /// `pub(crate)`: External consumers use `api::Solver::last_result()` or the
-    /// narrow `last_result_is_unsat()` predicate. Part of #5787 (Phase 6).
-    pub(crate) fn last_result(&self) -> Option<&SolveResult> {
-        self.last_result.as_ref()
-    }
-
-    /// Returns `true` if the last check-sat call returned UNSAT.
-    ///
-    /// Narrow predicate for callers that only need a boolean check
-    /// (e.g., proof file writing) without matching on `SolveResult` variants.
-    pub fn last_result_is_unsat(&self) -> bool {
-        self.last_result.as_ref().is_some_and(SolveResult::is_unsat)
-    }
-
-    /// Returns `true` if the last check-sat call returned SAT.
-    ///
-    /// Narrow predicate mirroring [`Self::last_result_is_unsat`]. Note that
-    /// assertion-stack mutations (`push`/`pop`/`assert`/`reset`) invalidate
-    /// the last result, after which all three `last_result_is_*` predicates
-    /// return `false`. Callers presenting the verdict to users (e.g.
-    /// `--explain`) must handle that no-result state explicitly instead of
-    /// defaulting to SAT.
-    pub fn last_result_is_sat(&self) -> bool {
-        self.last_result.as_ref().is_some_and(SolveResult::is_sat)
-    }
-
-    /// Returns `true` if the last check-sat call returned UNKNOWN.
-    pub fn last_result_is_unknown(&self) -> bool {
-        self.last_result
-            .as_ref()
-            .is_some_and(SolveResult::is_unknown)
-    }
-
-    /// Structured reason for the last Unknown result.
-    ///
-    /// Returns the reason why the solver returned Unknown, if available.
-    /// Returns `None` if the last result was not Unknown or if no reason was recorded.
-    #[must_use]
-    pub fn unknown_reason(&self) -> Option<UnknownReason> {
-        match self.last_result {
-            Some(SolveResult::Unknown) => self.last_unknown_reason,
-            _ => None,
-        }
-    }
-
-    /// True when `finalize_sat_model_validation` actually ran and passed
-    /// on the last solve call (#5903).
-    pub(crate) fn was_model_validated(&self) -> bool {
-        self.last_model_validated
-    }
-
-    /// Take the [`SatCertificate`](model::sat_emit::SatCertificate) minted by the
-    /// last `emit_sat_verdict` funnel run, if the last emitted verdict was `Sat`.
-    ///
-    /// The API boundary calls this to build a public `Sat` `VerifiedSolveResult`;
-    /// because the certificate can only be minted inside `emit_sat_verdict`, a
-    /// `Sat` that never went through the funnel yields `None` here and is
-    /// fail-closed to `Unknown` at the boundary (#sat-chokepoint).
-    pub(crate) fn take_sat_certificate(&mut self) -> Option<SatCertificate> {
-        self.last_sat_certificate.take()
-    }
-
-    /// Return the admitted MaxSMT accounting for the current SAT result.
-    ///
-    /// The violated indices were captured from the temporary relaxation
-    /// indicators before those internal symbols were removed. `None` means the
-    /// current result is not an admitted MaxSMT witness.
-    pub(crate) fn last_maxsmt_outcome(&self) -> Option<(u64, bool, &[usize])> {
-        Some((
-            self.last_soft_cost?,
-            self.last_soft_cost_optimal,
-            self.last_soft_violations.as_deref()?,
-        ))
-    }
-
-    /// Test-only hook for consumer-boundary model extraction canaries.
-    #[cfg(test)]
-    pub(crate) fn set_model_validated_for_testing(&mut self, validated: bool) {
-        self.last_model_validated = validated;
-    }
-
-    /// Get statistics from the last check-sat call
-    ///
-    /// Returns statistics about the solving process including:
-    /// - SAT-level stats: conflicts, decisions, propagations, restarts
-    /// - Theory-level stats: theory conflicts and propagations
-    /// - Problem size: variables, clauses, assertions
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use ay_dpll::Executor;
-    ///
-    /// let mut exec = Executor::new();
-    /// // ... setup and check_sat ...
-    /// let stats = exec.statistics();
-    /// println!("Conflicts: {}", stats.conflicts);
-    /// println!("Decisions: {}", stats.decisions);
-    /// ```
-    #[must_use]
-    pub fn statistics(&self) -> &Statistics {
-        &self.last_statistics
-    }
-
-    /// Alias for `statistics()` (backward compat with tests).
-    #[must_use]
-    pub fn get_statistics(&self) -> &Statistics {
-        &self.last_statistics
-    }
-
-    /// Return the reason for the last `Unknown` result, if any.
-    #[must_use]
-    pub fn get_reason_unknown(&self) -> Option<UnknownReason> {
-        self.last_unknown_reason
-    }
-
-    // produce_assignments_enabled, produce_unsat_cores_enabled, get_assignment,
-    // get_unsat_core, get_unsat_assumptions moved to executor/commands.rs
-    // get_proof and produce_proofs_enabled moved to executor/proof.rs
 }
 
 #[cfg(test)]

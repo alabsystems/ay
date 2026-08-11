@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 //
-//! Minimal hand-built proofs that isolate each suspected divergence between
-//! AY's INTERNAL proof checker and carcara 1.1.0.
+//! Minimal hand-built proofs that exercise historical and current differences
+//! between AY's internal proof representation and carcara 1.1.0.
 //!
 //! Each probe builds the proof IR directly, runs `check_proof` (non-strict, the
 //! gate behind `proof.rs`'s re-derivation) and `check_proof_strict` (the
@@ -42,6 +42,7 @@ fn main() {
     let na = t.mk_not(a);
     let nb = t.mk_not(b);
     let nc = t.mk_not(c);
+    let yes = t.mk_bool(true);
     let a_or_b = t.mk_app(Symbol::Named("or".into()), [a, b], Sort::Bool);
     let na_or_c = t.mk_app(Symbol::Named("or".into()), [na, c], Sort::Bool);
 
@@ -50,9 +51,8 @@ fn main() {
     //
     // IR: h0..h3 assumes; t0/t1 `or` clausification; then ONE n-ary
     // `Step { rule: Resolution, premises: [t0,h2,t1,h3], args: [pivot] }`.
-    // AY's chain path ignores `args` entirely; AY's PRINTER emits every arg
-    // verbatim, so the document carries one term where carcara wants 2 per
-    // link.
+    // The document carries one term where Alethe requires a pivot/polarity
+    // pair per link. Both checkers must reject it.
     {
         let mut p = Proof::new();
         p.add_step(ProofStep::Assume(a_or_b)); // 0 h0
@@ -79,7 +79,7 @@ fn main() {
         }); // 6
         verdicts(
             "A2 nary_onearg",
-            "carcara: expected 6 arguments, got 1 -> INVALID",
+            "AY/carcara: expected 6 arguments, got 1 -> INVALID",
             &p,
             &t,
         );
@@ -125,14 +125,14 @@ fn main() {
         }); // 8
         verdicts(
             "A3 binary_onearg",
-            "carcara: expected 2 arguments, got 1 -> INVALID",
+            "AY/carcara: expected 2 arguments, got 1 -> INVALID",
             &p,
             &t,
         );
     }
 
-    // A5: an n-ary chain whose DECLARED args name pivots in the wrong order.
-    // AY ignores them and re-infers; carcara follows them and fails.
+    // A5: an n-ary chain whose declared args name pivots in the wrong order.
+    // Both checkers must follow the metadata and reject the first link.
     {
         let mut p = Proof::new();
         p.add_step(ProofStep::Assume(a_or_b));
@@ -156,19 +156,19 @@ fn main() {
             clause: vec![],
             premises: vec![ProofId(4), ProofId(2), ProofId(5), ProofId(3)],
             // "c true a true b true": wrong pivot on the first link.
-            args: vec![c, a, b],
+            args: vec![c, yes, a, yes, b, yes],
         });
         verdicts(
             "A5 nary_wrong_pivots",
-            "carcara: pivot was not found in clause: 'c' -> INVALID",
+            "AY/carcara: pivot was not found in clause: 'c' -> INVALID",
             &p,
             &t,
         );
     }
 
     // ============================================================== PROBE B
-    // De Morgan complement matching: AY pairs `(and a b)` with
-    // `(or (not a) (not b))` as complementary resolution literals.
+    // De Morgan equivalents are not syntactically complementary resolution
+    // literals. Both checkers must reject these probes.
     {
         let mut t2 = TermStore::new();
         let a = t2.mk_var("a", Sort::Bool);
@@ -189,7 +189,7 @@ fn main() {
         }); // 2
         verdicts(
             "B1 demorgan_binary",
-            "carcara: pivot was not eliminated: '(and a b)' -> INVALID",
+            "AY/carcara: no complementary pivot -> INVALID",
             &p,
             &t2,
         );
@@ -207,7 +207,7 @@ fn main() {
         });
         verdicts(
             "B2 demorgan_nary",
-            "carcara: pivot was not eliminated -> INVALID",
+            "AY/carcara: no complementary pivot -> INVALID",
             &p3,
             &t2,
         );
@@ -225,7 +225,7 @@ fn main() {
         });
         verdicts(
             "B3 demorgan_permuted",
-            "greedy multiset match; sound but carcara-INVALID",
+            "AY/carcara: no complementary pivot -> INVALID",
             &p4,
             &t2,
         );
@@ -262,7 +262,7 @@ fn main() {
         let a = t3.mk_var("a", Sort::Bool);
         let b = t3.mk_var("b", Sort::Bool);
         let and_ab = t3.mk_app(Symbol::Named("and".into()), [a, b], Sort::Bool);
-        let n_and = t3.mk_not(and_ab);
+        let n_and = t3.mk_not_raw(and_ab);
         let na = t3.mk_not(a);
 
         // and_pos with index 0 concluding (cl (not (and a b)) a) -- correct.

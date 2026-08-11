@@ -14,8 +14,11 @@ impl Solver {
     /// Try to create an addition (a + b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_add(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("add", a)?;
+        let b_id = self.resolve_term("add", b)?;
         self.expect_same_arith_sort("add", a, b)?;
-        Ok(Term(self.terms_mut().mk_add(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_add(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an addition of multiple terms. Panics if sorts don't match.
@@ -26,14 +29,19 @@ impl Solver {
     /// Try to create an addition of multiple terms. All must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_add_many(&mut self, terms: &[Term]) -> Result<Term, SolverError> {
+        let ids = terms
+            .iter()
+            .copied()
+            .map(|term| self.resolve_term("add_many", term))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(&first) = terms.first() {
             self.expect_arith("add_many", first)?;
             for &t in &terms[1..] {
                 self.expect_same_arith_sort("add_many", first, t)?;
             }
         }
-        let ids: Vec<_> = terms.iter().map(|t| t.0).collect();
-        Ok(Term(self.terms_mut().mk_add(ids)))
+        let result = self.terms_mut().mk_add(ids);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a subtraction (a - b). Panics if sorts don't match.
@@ -44,8 +52,11 @@ impl Solver {
     /// Try to create a subtraction (a - b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_sub(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("sub", a)?;
+        let b_id = self.resolve_term("sub", b)?;
         self.expect_same_arith_sort("sub", a, b)?;
-        Ok(Term(self.terms_mut().mk_sub(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_sub(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a multiplication (a * b). Panics if sorts don't match.
@@ -56,8 +67,11 @@ impl Solver {
     /// Try to create a multiplication (a * b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_mul(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("mul", a)?;
+        let b_id = self.resolve_term("mul", b)?;
         self.expect_same_arith_sort("mul", a, b)?;
-        Ok(Term(self.terms_mut().mk_mul(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_mul(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a multiplication of multiple terms. Panics if sorts don't match.
@@ -68,14 +82,19 @@ impl Solver {
     /// Try to create a multiplication of multiple terms. All must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_mul_many(&mut self, terms: &[Term]) -> Result<Term, SolverError> {
+        let ids = terms
+            .iter()
+            .copied()
+            .map(|term| self.resolve_term("mul_many", term))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(&first) = terms.first() {
             self.expect_arith("mul_many", first)?;
             for &t in &terms[1..] {
                 self.expect_same_arith_sort("mul_many", first, t)?;
             }
         }
-        let ids: Vec<_> = terms.iter().map(|t| t.0).collect();
-        Ok(Term(self.terms_mut().mk_mul(ids)))
+        let result = self.terms_mut().mk_mul(ids);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a negation (-a). Panics if arg is not arithmetic.
@@ -86,8 +105,10 @@ impl Solver {
     /// Try to create a negation (-a). Arg must be Int or Real.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_neg(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("neg", a)?;
         self.expect_arith("neg", a)?;
-        Ok(Term(self.terms_mut().mk_neg(a.0)))
+        let result = self.terms_mut().mk_neg(a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a real division (a / b). Panics if args are not both Real.
@@ -98,8 +119,11 @@ impl Solver {
     /// Try to create a real division (a / b). Both args must be Real.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_div(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("div", a)?;
+        let b_id = self.resolve_term("div", b)?;
         self.expect_both_real("div", a, b)?;
-        Ok(Term(self.terms_mut().mk_div(a.0, b.0)))
+        let result = self.terms_mut().mk_div(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an integer division (a div b). Panics if args are not both Int.
@@ -110,8 +134,11 @@ impl Solver {
     /// Try to create an integer division (a div b). Both args must be Int.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_int_div(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("int_div", a)?;
+        let b_id = self.resolve_term("int_div", b)?;
         self.expect_both_int("int_div", a, b)?;
-        Ok(Term(self.terms_mut().mk_intdiv(a.0, b.0)))
+        let result = self.terms_mut().mk_intdiv(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a modulo operation (a mod b). Panics if args are not both Int.
@@ -122,8 +149,11 @@ impl Solver {
     /// Try to create a modulo operation (a mod b). Both args must be Int.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_modulo(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("modulo", a)?;
+        let b_id = self.resolve_term("modulo", b)?;
         self.expect_both_int("modulo", a, b)?;
-        Ok(Term(self.terms_mut().mk_mod(a.0, b.0)))
+        let result = self.terms_mut().mk_mod(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a floor division (a fdiv b). Panics if args are not both Int.
@@ -184,8 +214,10 @@ impl Solver {
     /// Try to create an absolute value (abs a). Arg must be Int or Real.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_abs(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("abs", a)?;
         self.expect_arith("abs", a)?;
-        Ok(Term(self.terms_mut().mk_abs(a.0)))
+        let result = self.terms_mut().mk_abs(a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create minimum of two values (min a b). Panics if sorts don't match.
@@ -196,8 +228,11 @@ impl Solver {
     /// Try to create minimum of two values. Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_min(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("min", a)?;
+        let b_id = self.resolve_term("min", b)?;
         self.expect_same_arith_sort("min", a, b)?;
-        Ok(Term(self.terms_mut().mk_min(a.0, b.0)))
+        let result = self.terms_mut().mk_min(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create maximum of two values (max a b). Panics if sorts don't match.
@@ -208,8 +243,11 @@ impl Solver {
     /// Try to create maximum of two values. Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_max(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("max", a)?;
+        let b_id = self.resolve_term("max", b)?;
         self.expect_same_arith_sort("max", a, b)?;
-        Ok(Term(self.terms_mut().mk_max(a.0, b.0)))
+        let result = self.terms_mut().mk_max(a_id, b_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create an exponentiation (a ^ b). Panics if sorts don't match.
@@ -220,12 +258,13 @@ impl Solver {
     /// Try to create an exponentiation (a ^ b). Both args must be same arithmetic sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_power(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("power", a)?;
+        let b_id = self.resolve_term("power", b)?;
         self.expect_same_arith_sort("power", a, b)?;
-        let sort = self.terms().sort(a.0).clone();
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("^"),
-            vec![a.0, b.0],
-            sort,
-        )))
+        let sort = self.terms().sort(a_id).clone();
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("^"), vec![a_id, b_id], sort);
+        Ok(self.wrap_term(result))
     }
 }

@@ -56,18 +56,17 @@ BOUNDS
 ENDATA
 ";
 
-/// `x >= 3` and `x <= 2` over one integer column: infeasible at the root, so
-/// the root Farkas lane produces one combination.
+/// `x >= 3` and `x <= 2` over one continuous column. Keeping this fixture
+/// continuous makes the test exercise the exact-LP Farkas lane instead of an
+/// earlier exact PB route, whose independently checkable artifact is a BDD.
 const INF: &str = "NAME          INF1
 ROWS
  N  COST
  G  R1
  L  R2
 COLUMNS
-    MARKER                 'MARKER'                 'INTORG'
     X         COST      1.0        R1        1.0
     X         R2        1.0
-    MARKER                 'MARKER'                 'INTEND'
 RHS
     RHS       R1        3.0        R2        2.0
 BOUNDS
@@ -1272,9 +1271,10 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
 #[test]
 fn milp_optimum_emits_the_witness_and_admits_the_missing_dual() {
     // THE HONESTY REQUIREMENT, end to end. An `Optimal` is TWO claims: the
-    // primal half is succinctly checkable and the dual half does not exist in
-    // this build. `Outcome::Optimal { cert: None }` cannot express that
-    // difference; the certificate must.
+    // primal half is succinctly checkable and the dual half has no exported
+    // independently checkable object in this build. `Outcome::Optimal {
+    // cert: None }` cannot distinguish a replay annotation from no dual-side
+    // evidence; the emitted claim must.
     let (ayc, out) = solve_and_emit(MILP);
     assert!(matches!(out, Outcome::Optimal { cert: None, .. }));
     let r = cert_io::check(&ayc, MILP);

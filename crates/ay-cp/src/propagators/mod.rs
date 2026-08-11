@@ -27,7 +27,7 @@
 //!   variable has a sparse domain (`domain_size < interval_span`); see
 //!   `engine/compile.rs`). Aux-var lifting for shifted AllDifferent (via
 //!   LinearLe channeling) remains unimplemented — see the `AC via aux-var
-//!   lifting is disabled` comment in `engine/compile.rs` / `engine/detect.rs`.
+//!   lifting is disabled` comment in `engine/compile.rs`.
 //! - `cumulative` — scheduling (time-table filtering)
 //! - `disjunctive` — edge-finding for non-overlapping tasks (Vilim 2008)
 //!

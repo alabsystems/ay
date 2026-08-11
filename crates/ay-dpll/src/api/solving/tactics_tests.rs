@@ -147,7 +147,7 @@ fn tactic_names_are_stable() {
 // ---------------------------------------------------------------------------
 
 /// A depth-0 root goal over `formulas`.
-fn root(formulas: Vec<ay_core::TermId>) -> Goal {
+fn root(formulas: Vec<TermId>) -> Goal {
     Goal::root(formulas)
 }
 
@@ -576,7 +576,7 @@ fn split_clause_disjunction_is_equisatisfiable_over_thirty_goals() {
         let base_sat = base.is_sat();
 
         // The actual number of disjuncts in the (first) surviving clause.
-        let ids: Vec<ay_core::TermId> = s.assertions().iter().map(|t| t.0).collect();
+        let ids: Vec<TermId> = s.assertions().iter().map(|t| t.id()).collect();
         let clause_len = ids
             .iter()
             .find_map(|&id| as_clause(s.terms_mut(), id).map(|d| d.len()))
@@ -597,7 +597,8 @@ fn split_clause_disjunction_is_equisatisfiable_over_thirty_goals() {
         for sub in &subgoals {
             s.try_reset_assertions().expect("reset");
             for &id in &sub.formulas {
-                s.try_assert_term(Term(id)).expect("assert subgoal formula");
+                s.try_assert_term(s.wrap_term(id))
+                    .expect("assert subgoal formula");
             }
             let r = s.check_sat();
             assert!(!r.is_unknown(), "seed {seed}: subgoal unknown");
@@ -867,9 +868,10 @@ fn tactic_solver_verdict_matches_baseline_on_nested_ands() {
 }
 
 #[test]
-fn tactic_solver_actually_flattens_the_goal_before_solving() {
-    // A single top-level (and (and a b) c) should become 3 separate assertions
-    // after the tactic runs (observable via the solver's assertion list).
+fn tactic_solver_validates_changed_goal_without_replacing_strict_source_roots() {
+    // Flattening changes a single top-level (and (and a b) c) into three roots.
+    // A public check still has exact-source proof authority, so the tactic runs
+    // detached and the original root capability remains the one being solved.
     let tactic = Tactic::flatten_and();
     let mut tsolver = tactic.solver(Logic::QfLia).expect("tactic solver");
     {
@@ -881,19 +883,25 @@ fn tactic_solver_actually_flattens_the_goal_before_solving() {
         let g = s.and(inner, c);
         s.assert_term(g);
     }
-    assert_eq!(
-        tsolver.assertions().len(),
-        1,
-        "before solving: one AND goal"
-    );
+    let source_roots = tsolver.assertions();
+    assert_eq!(source_roots.len(), 1, "before solving: one AND goal");
 
     let result = tsolver.check_sat();
-    assert!(result.is_sat());
-    // After check_sat ran the tactic, the goal was rewritten to 3 conjuncts.
+    assert!(
+        result.is_sat(),
+        "a successful changed tactic must not be downgraded to Unknown"
+    );
     assert_eq!(
-        tsolver.assertions().len(),
-        3,
-        "after tactic: AND flattened into 3 assertions"
+        tsolver.assertions(),
+        source_roots,
+        "without an equivalence certificate, strict solving must retain the exact source roots"
+    );
+    assert!(
+        tsolver
+            .inner
+            .executor
+            .last_check_saw_authored_query_authority(),
+        "a caller-visible tactic solve must enter through the authored query boundary"
     );
 }
 
@@ -911,7 +919,7 @@ fn tactic_qe_light_name_is_stable() {
 }
 
 /// Whether a top-level assertion is still a quantifier node.
-fn is_quantifier(s: &Solver, t: crate::api::Term) -> bool {
+fn is_quantifier(s: &Solver, t: Term) -> bool {
     use crate::api::TermKind;
     matches!(s.term_kind(t), TermKind::Forall | TermKind::Exists)
 }
@@ -943,14 +951,20 @@ fn assert_eliminable_unsat_exists(s: &mut Solver) {
 }
 
 #[test]
-fn tactic_qe_light_eliminates_quantifier_and_matches_baseline_sat() {
+fn tactic_qe_light_validates_detached_rewrite_and_matches_baseline_sat() {
     // Baseline: solve the quantified goal directly (quantified LIA decides it).
     let mut baseline = Solver::new(Logic::Lia);
     assert_eliminable_sat_exists(&mut baseline);
     let base = baseline.check_sat();
-    assert!(base.is_sat(), "baseline exists should be SAT");
+    assert!(
+        base.is_sat(),
+        "baseline exists should be SAT: reason={:?} detail={:?}",
+        baseline.unknown_reason(),
+        baseline.executor_error()
+    );
 
-    // Tactic path: qe-light rewrites the goal first.
+    // Tactic path: qe-light validates its rewrite against a detached goal, then
+    // the strict-source solver decides the untouched quantified assertion.
     let mut t = Tactic::qe_light()
         .solver(Logic::Lia)
         .expect("qe-light solver");
@@ -977,29 +991,31 @@ fn tactic_qe_light_eliminates_quantifier_and_matches_baseline_sat() {
     );
     assert!(res.is_sat());
 
-    // The quantifier is GONE: no remaining assertion is a quantifier node.
-    for a in t.assertions() {
-        assert!(
-            !is_quantifier(t.solver(), a),
-            "qe-light must remove the eliminable existential"
-        );
-    }
+    assert_eq!(
+        t.assertions(),
+        before,
+        "strict proof authority keeps the exact quantified source root"
+    );
+    assert!(is_quantifier(t.solver(), t.assertions()[0]));
 }
 
 #[test]
-fn tactic_qe_light_eliminates_quantifier_and_matches_baseline_unsat() {
+fn tactic_qe_light_validates_detached_rewrite_and_matches_baseline_unsat() {
     let mut baseline = Solver::new(Logic::Lia);
     assert_eliminable_unsat_exists(&mut baseline);
     let base = baseline.check_sat();
     assert!(
         base.is_unsat(),
-        "baseline empty-interval exists should be UNSAT"
+        "baseline empty-interval exists should be UNSAT: reason={:?} detail={:?}",
+        baseline.unknown_reason(),
+        baseline.executor_error()
     );
 
     let mut t = Tactic::qe_light()
         .solver(Logic::Lia)
         .expect("qe-light solver");
     assert_eliminable_unsat_exists(t.solver_mut());
+    let source_roots = t.assertions();
     let res = t.check_sat();
 
     assert!(!res.is_unknown());
@@ -1009,13 +1025,15 @@ fn tactic_qe_light_eliminates_quantifier_and_matches_baseline_unsat() {
         "qe-light UNSAT verdict must match baseline"
     );
     assert!(res.is_unsat());
+    assert!(res.has_unsat_emission_witness());
+    assert!(res.was_unsat_exact_semantically_verified());
+    assert!(
+        !res.was_unsat_strictly_verified(),
+        "the exact semantic theorem must not be mislabeled as strict proof-checker acceptance"
+    );
 
-    for a in t.assertions() {
-        assert!(
-            !is_quantifier(t.solver(), a),
-            "qe-light must remove the eliminable existential"
-        );
-    }
+    assert_eq!(t.assertions(), source_roots);
+    assert!(is_quantifier(t.solver(), t.assertions()[0]));
 }
 
 #[test]
@@ -1088,7 +1106,7 @@ impl NnfRng {
 
 /// Is `id` an atom (not a Boolean connective the NNF pass must eliminate / a
 /// node under which a negation may not sit)?
-fn nnf_is_atom(terms: &TermStore, id: ay_core::TermId) -> bool {
+fn nnf_is_atom(terms: &TermStore, id: TermId) -> bool {
     use ay_core::term::TermData;
     match terms.get(id) {
         TermData::App(sym, args) => match sym.name() {
@@ -1104,7 +1122,7 @@ fn nnf_is_atom(terms: &TermStore, id: ay_core::TermId) -> bool {
 }
 
 /// Is `id` in negation normal form?
-fn nnf_is_nnf(terms: &TermStore, id: ay_core::TermId) -> bool {
+fn nnf_is_nnf(terms: &TermStore, id: TermId) -> bool {
     use ay_core::term::TermData;
     match terms.get(id).clone() {
         TermData::Const(_) | TermData::Var(_, _) => true,
@@ -1124,16 +1142,16 @@ fn nnf_is_nnf(terms: &TermStore, id: ay_core::TermId) -> bool {
 
 /// Declare the shared atom pool: four Bool constants plus two non-Bool atoms
 /// (`x > 0`, `x = 3`) so the pass must both keep and negate genuine atoms.
-fn nnf_atoms(s: &mut Solver) -> Vec<ay_core::TermId> {
-    let a = s.declare_const("a", Sort::Bool).0;
-    let b = s.declare_const("b", Sort::Bool).0;
-    let c = s.declare_const("c", Sort::Bool).0;
-    let d = s.declare_const("d", Sort::Bool).0;
+fn nnf_atoms(s: &mut Solver) -> Vec<TermId> {
+    let a = s.declare_const("a", Sort::Bool).id();
+    let b = s.declare_const("b", Sort::Bool).id();
+    let c = s.declare_const("c", Sort::Bool).id();
+    let d = s.declare_const("d", Sort::Bool).id();
     let x = s.declare_const("x", Sort::Int);
     let zero = s.int_const(0);
     let three = s.int_const(3);
-    let gt = s.gt(x, zero).0;
-    let eqx = s.eq(x, three).0;
+    let gt = s.gt(x, zero).id();
+    let eqx = s.eq(x, three).id();
     vec![a, b, c, d, gt, eqx]
 }
 
@@ -1141,12 +1159,7 @@ fn nnf_atoms(s: &mut Solver) -> Vec<ay_core::TermId> {
 /// eliminates (`=>` via its or-form, `xor`, bool `=`, bool `ite`) plus
 /// `and`/`or` and *raw* negations (`mk_not_raw`, so the pass — not the builder —
 /// performs the De Morgan pushdown).
-fn nnf_gen(
-    terms: &mut TermStore,
-    atoms: &[ay_core::TermId],
-    rng: &mut NnfRng,
-    depth: usize,
-) -> ay_core::TermId {
+fn nnf_gen(terms: &mut TermStore, atoms: &[TermId], rng: &mut NnfRng, depth: usize) -> TermId {
     use ay_core::term::Symbol;
     if depth == 0 || rng.below(3) == 0 {
         return atoms[rng.below(atoms.len())];
@@ -1229,7 +1242,7 @@ fn nnf_is_equivalence_preserving_over_thirty_random_bool_formulas() {
             t.mk_or(vec![left, right])
         };
         s.try_reset_assertions().expect("reset");
-        s.try_assert_term(Term(diff)).expect("assert diff");
+        s.try_assert_term(s.wrap_term(diff)).expect("assert diff");
         let res = s.check_sat();
         if res.is_unknown() {
             unknowns += 1;
@@ -1365,7 +1378,7 @@ fn tseitin_cnf_is_equisatisfiable_over_random_formulas() {
         let base_sat = base.is_sat();
 
         // Produce the CNF of {F} with the pass, in the SAME term store.
-        let mut cnf = vec![f.0];
+        let mut cnf = vec![f.id()];
         let _changed = Tactic::TseitinCnf.apply(s.terms_mut(), &mut cnf);
         for &clause in &cnf {
             assert!(
@@ -1378,7 +1391,8 @@ fn tseitin_cnf_is_equisatisfiable_over_random_formulas() {
         // Solve the CNF directly (aux vars are free Boolean constants).
         s.try_reset_assertions().expect("reset");
         for &id in &cnf {
-            s.try_assert_term(Term(id)).expect("assert cnf clause");
+            s.try_assert_term(s.wrap_term(id))
+                .expect("assert cnf clause");
         }
         let cnf_res = s.check_sat();
         assert!(!cnf_res.is_unknown(), "seed {seed}: cnf unknown");
@@ -1406,12 +1420,12 @@ fn tseitin_cnf_is_equisatisfiable_over_random_formulas() {
 }
 
 // ---------------------------------------------------------------------------
-// bit-blast EQUISATISFIABILITY differential: solve QF_BV goals WITH the
-// bit-blast tactic (which actually rewrites the assertions to a pure-Boolean
-// goal and solves that) and WITHOUT it, and require identical SAT/UNSAT
-// verdicts. Because the tactic-solver replaces the goal with its blasted form
-// before check_sat, this is a genuine end-to-end equisatisfiability test of the
-// blasted Boolean goal against the original bit-vector goal.
+// bit-blast EQUISATISFIABILITY differential: apply the pass directly to QF_BV
+// goals elsewhere in this section, and compare tactic-solver verdicts against
+// untransformed baselines here. A strict tactic-solver executes the blast on a
+// detached term store and root vector, discards the Boolean circuit terms, and
+// solves the exact source goal until an equivalence certificate can authorize
+// changed roots.
 // ---------------------------------------------------------------------------
 
 /// Build QF_BV goal `which` (0..=7). Shapes 0..=3 are SAT, 4..=7 are UNSAT.
@@ -1492,8 +1506,8 @@ fn bit_blast_tactic_solver_verdict_matches_baseline_on_qf_bv() {
         build_bv_goal(&mut baseline, which);
         let base = baseline.check_sat();
 
-        // Tactic path: bit-blast rewrites the goal to a pure-Boolean goal and the
-        // solver decides THAT (verified equisatisfiable to the original here).
+        // Tactic path: bit-blast executes against a detached term store and root
+        // vector, then the solver decides the exact source goal.
         let mut tsolver = Tactic::BitBlast.solver(Logic::QfBv).expect("tactic solver");
         build_bv_goal(tsolver.solver_mut(), which);
         let tactic = tsolver.check_sat();
@@ -1516,17 +1530,82 @@ fn bit_blast_tactic_solver_verdict_matches_baseline_on_qf_bv() {
 }
 
 #[test]
-fn bit_blast_tactic_solver_actually_blasts_before_solving() {
-    // After the tactic runs, the goal must be pure Boolean (no BV-sorted term in
-    // the solver's assertions), demonstrating the blast really happened.
+fn bit_blast_tactic_solver_discards_detached_terms_and_keeps_source_roots() {
+    // Bit-blasting must execute in isolation: neither its newly-built Boolean
+    // circuit nor its changed roots may enter the live authored term universe.
     let mut tsolver = Tactic::BitBlast.solver(Logic::QfBv).expect("tactic solver");
     build_bv_goal(tsolver.solver_mut(), 0);
-    let _ = tsolver.check_sat();
-    for t in tsolver.assertions() {
-        assert!(
-            !matches!(tsolver.solver().term_sort(t), Sort::BitVec(_)),
-            "after bit-blast the goal must contain no BV-sorted assertion"
-        );
+    let source_roots = tsolver.assertions();
+    let source_ids: Vec<TermId> = source_roots.iter().map(|term| term.id()).collect();
+    let live_len = tsolver.solver().terms().len();
+    let live_stamp = tsolver.solver().terms().snapshot_stamp();
+
+    tsolver
+        .inner
+        .validate_tactic_on_detached_goal(&Tactic::BitBlast, &source_ids)
+        .expect("supported bit-blast validates on the detached store");
+
+    assert_eq!(tsolver.solver().terms().len(), live_len);
+    assert_eq!(tsolver.solver().terms().snapshot_stamp(), live_stamp);
+
+    let result = tsolver.check_sat();
+
+    assert!(!result.is_unknown());
+    assert_eq!(tsolver.assertions(), source_roots);
+    assert!(
+        tsolver
+            .inner
+            .executor
+            .last_check_saw_authored_query_authority(),
+        "the exact source solve must retain authored query authority"
+    );
+}
+
+#[test]
+fn detached_tactic_success_failure_and_repeat_leave_live_term_store_unchanged() {
+    let mut solver = Solver::new(Logic::QfUf);
+    let a = solver.declare_const("a", Sort::Bool);
+    let b = solver.declare_const("b", Sort::Bool);
+    let c = solver.declare_const("c", Sort::Bool);
+    let ab = solver.and(a, b);
+    let formula = solver.or(ab, c);
+    solver.assert_term(formula);
+    let roots: Vec<TermId> = solver.assertions().iter().map(|term| term.id()).collect();
+    let live_len = solver.terms().len();
+    let live_stamp = solver.terms().snapshot_stamp();
+
+    // Prove the fixture really builds scratch terms; otherwise an unchanged
+    // live store would not exercise the isolation boundary.
+    let mut witness_store = solver.terms().clone();
+    let mut witness_roots = roots.clone();
+    assert!(Tactic::TseitinCnf
+        .apply_or_fail(&mut witness_store, &mut witness_roots)
+        .expect("tseitin-cnf succeeds"));
+    assert!(witness_store.len() > live_len);
+
+    solver
+        .validate_tactic_on_detached_goal(&Tactic::TseitinCnf, &roots)
+        .expect("successful tactic validation");
+    assert_eq!(solver.terms().len(), live_len);
+    assert_eq!(solver.terms().snapshot_stamp(), live_stamp);
+
+    let failure_after_growth = Tactic::TseitinCnf.then(Tactic::Fail);
+    assert!(
+        solver
+            .validate_tactic_on_detached_goal(&failure_after_growth, &roots)
+            .is_err(),
+        "a failure after scratch construction must remain honest"
+    );
+    assert_eq!(solver.terms().len(), live_len);
+    assert_eq!(solver.terms().snapshot_stamp(), live_stamp);
+
+    let repeated = Tactic::TseitinCnf.repeat_up_to(2);
+    for _ in 0..2 {
+        solver
+            .validate_tactic_on_detached_goal(&repeated, &roots)
+            .expect("repeated detached validation");
+        assert_eq!(solver.terms().len(), live_len);
+        assert_eq!(solver.terms().snapshot_stamp(), live_stamp);
     }
 }
 
@@ -1552,6 +1631,103 @@ fn bit_blast_tactic_solver_honestly_fails_on_out_of_fragment() {
         "bit-blast on an out-of-fragment bvudiv goal must surface Unknown (honest \
          failure), not a fabricated sat/unsat verdict; got {:?}",
         res.result()
+    );
+}
+
+#[test]
+fn transformed_quantified_bv_tactic_query_solves_untouched_exact_source() {
+    let mut solver = Tactic::Nnf.solver(Logic::All).expect("tactic solver");
+    {
+        let s = solver.solver_mut();
+        let bv4 = Sort::bitvec(4);
+        let x = s.fresh_var("x", bv4.clone());
+        let f = s.declare_fun("f", std::slice::from_ref(&bv4), bv4.clone());
+        let fx = s.apply(&f, &[x]);
+        let reflexive = s.eq(fx, fx);
+        let quantified = s.forall(&[x], reflexive);
+        let p = s.declare_const("p", Sort::Bool);
+        let q = s.declare_const("q", Sort::Bool);
+        // Boolean equality is guaranteed to be rewritten by NNF into two
+        // clauses, so this fixture exercises a genuinely changed detached goal
+        // rather than relying on an already-normalized implication.
+        let equality = s.eq(p, q);
+        s.assert_term(quantified);
+        s.assert_term(equality);
+    }
+
+    let source_roots = solver.assertions();
+    let result = solver.check_sat();
+    assert!(
+        result.is_sat(),
+        "a successful changed tactic must no longer become Unknown"
+    );
+    assert_eq!(
+        solver.assertions(),
+        source_roots,
+        "the changed NNF roots have no equivalence certificate and must not replace the source"
+    );
+    assert!(
+        solver
+            .inner
+            .executor
+            .last_check_saw_authored_query_authority(),
+        "quantified SAT must receive exact authored-source authority"
+    );
+}
+
+#[test]
+fn unchanged_quantified_bv_tactic_query_never_downgrades_to_ordinary_unsat() {
+    let mut solver = Tactic::Skip.solver(Logic::All).expect("tactic solver");
+    {
+        let s = solver.solver_mut();
+        let bv4 = Sort::bitvec(4);
+        let x = s.fresh_var("x", bv4.clone());
+        let f = s.declare_fun("f", std::slice::from_ref(&bv4), bv4.clone());
+        let fx = s.apply(&f, &[x]);
+        let reflexive = s.eq(fx, fx);
+        let impossible = s.not(reflexive);
+        let quantified = s.forall(&[x], impossible);
+        s.assert_term(quantified);
+    }
+
+    let result = solver.check_sat();
+    assert!(
+        !result.is_sat(),
+        "the contradictory universal must never become SAT"
+    );
+    if result.is_unsat() {
+        assert!(result.was_unsat_strictly_verified());
+    } else {
+        assert!(result.is_unknown(), "strict proof gaps must fail closed");
+    }
+}
+
+#[test]
+fn strict_tactic_check_sat_assuming_preserves_exact_roots_and_assumption() {
+    let mut solver = Tactic::FlattenAnd
+        .solver(Logic::QfLia)
+        .expect("tactic solver");
+    let assumption = {
+        let s = solver.solver_mut();
+        let p = s.declare_const("p", Sort::Bool);
+        let q = s.declare_const("q", Sort::Bool);
+        let nested = s.and(p, q);
+        s.assert_term(nested);
+        s.not(p)
+    };
+    let source_roots = solver.assertions();
+
+    let result = solver.check_sat_assuming(&[assumption]);
+    assert!(
+        result.is_unsat(),
+        "the exact contradictory assumption must be included in the source query"
+    );
+    assert!(result.was_unsat_strictly_verified());
+    assert_eq!(solver.assertions(), source_roots);
+    assert_eq!(
+        solver.solver().unsat_assumptions(),
+        Some(vec![assumption]),
+        "detached tactic execution must not rewrite or replace caller assumptions"
     );
 }
 
@@ -1601,7 +1777,7 @@ fn css_apply_checked(s: &mut Solver, input: Vec<TermId>) -> (Vec<TermId>, bool) 
         t.mk_or(vec![left, right])
     };
     s.try_reset_assertions().expect("reset");
-    s.try_assert_term(Term(diff)).expect("assert diff");
+    s.try_assert_term(s.wrap_term(diff)).expect("assert diff");
     let res = s.check_sat();
     assert!(
         res.is_unsat(),
@@ -1630,9 +1806,9 @@ fn ctx_solver_simplify_name_is_stable() {
 fn ctx_solver_simplify_drops_redundant_literal() {
     // {(> x 3), (= x 5)} : (= x 5) proves (> x 3) redundant -> drop it.
     let mut s = Solver::new(Logic::QfLia);
-    let x = s.declare_const("x", Sort::Int).0;
-    let three = s.int_const(3).0;
-    let five = s.int_const(5).0;
+    let x = s.declare_const("x", Sort::Int).id();
+    let three = s.int_const(3).id();
+    let five = s.int_const(5).id();
     let gt = s.terms_mut().mk_app(
         ay_core::term::Symbol::named(">"),
         vec![x, three],
@@ -1652,9 +1828,9 @@ fn ctx_solver_simplify_drops_later_redundant_literal_order_insensitive() {
     // {(= x 5), (> x 3)} : AY is order-insensitive and drops the (later)
     // redundant (> x 3) too (z3 4.15.4 keeps it in this order; both equivalent).
     let mut s = Solver::new(Logic::QfLia);
-    let x = s.declare_const("x", Sort::Int).0;
-    let three = s.int_const(3).0;
-    let five = s.int_const(5).0;
+    let x = s.declare_const("x", Sort::Int).id();
+    let three = s.int_const(3).id();
+    let five = s.int_const(5).id();
     let eq = s
         .terms_mut()
         .mk_app(ay_core::term::Symbol::named("="), vec![x, five], Sort::Bool);
@@ -1673,9 +1849,9 @@ fn ctx_solver_simplify_drops_later_redundant_literal_order_insensitive() {
 fn ctx_solver_simplify_collapses_contradiction_to_false() {
     // {(= x 5), (< x 3)} : the context proves the goal UNSAT -> {false}.
     let mut s = Solver::new(Logic::QfLia);
-    let x = s.declare_const("x", Sort::Int).0;
-    let five = s.int_const(5).0;
-    let three = s.int_const(3).0;
+    let x = s.declare_const("x", Sort::Int).id();
+    let five = s.int_const(5).id();
+    let three = s.int_const(3).id();
     let eq = s
         .terms_mut()
         .mk_app(ay_core::term::Symbol::named("="), vec![x, five], Sort::Bool);
@@ -1698,8 +1874,8 @@ fn ctx_solver_simplify_collapses_contradiction_to_false() {
 fn ctx_solver_simplify_drops_bool_redundant_disjunction() {
     // {(or p q), p} : p proves (or p q) redundant -> {p}.
     let mut s = Solver::new(Logic::QfLia);
-    let p = s.declare_const("p", Sort::Bool).0;
-    let q = s.declare_const("q", Sort::Bool).0;
+    let p = s.declare_const("p", Sort::Bool).id();
+    let q = s.declare_const("q", Sort::Bool).id();
     let clause = s.terms_mut().mk_or(vec![p, q]);
 
     let (out, changed) = css_apply_checked(&mut s, vec![clause, p]);
@@ -1712,7 +1888,7 @@ fn ctx_solver_simplify_drops_valid_assertion_to_empty_goal() {
     // {(or p (not p))} : a valid assertion is redundant under the empty context
     // -> the empty goal (trivially SAT), matching z3.
     let mut s = Solver::new(Logic::QfLia);
-    let p = s.declare_const("p", Sort::Bool).0;
+    let p = s.declare_const("p", Sort::Bool).id();
     let np = s.terms_mut().mk_not_raw(p);
     let taut = s.terms_mut().mk_or(vec![p, np]);
 
@@ -1732,8 +1908,8 @@ fn ctx_solver_simplify_is_sound_identity_on_uninterpreted_goal() {
     // the out-of-fragment path never silently drops a needed constraint.
     use ay_core::term::Symbol;
     let mut s = Solver::new(Logic::QfUflia);
-    let x = s.declare_const("x", Sort::Int).0;
-    let zero = s.int_const(0).0;
+    let x = s.declare_const("x", Sort::Int).id();
+    let zero = s.int_const(0).id();
     let fx = s.terms_mut().mk_app(Symbol::named("f"), vec![x], Sort::Int);
     let atom = s
         .terms_mut()
@@ -1791,14 +1967,18 @@ fn ctx_solver_simplify_is_equivalence_preserving_over_forty_random_goals() {
         let mut s = Solver::new(Logic::QfLia);
         // Atom pool with deliberate implications (x=5 ⇒ x>3, x>0, …) so
         // redundancy/contradiction genuinely arise across assertions.
-        let x = s.declare_const("x", Sort::Int).0;
-        let y = s.declare_const("y", Sort::Int).0;
-        let p = s.declare_const("p", Sort::Bool).0;
-        let qb = s.declare_const("q", Sort::Bool).0;
+        let x = s.declare_const("x", Sort::Int).id();
+        let y = s.declare_const("y", Sort::Int).id();
+        let p = s.declare_const("p", Sort::Bool).id();
+        let qb = s.declare_const("q", Sort::Bool).id();
         let mk = |t: &mut TermStore, op: &str, a: TermId, b: TermId| {
             t.mk_app(ay_core::term::Symbol::named(op), vec![a, b], Sort::Bool)
         };
-        let (c0, c3, c5) = (s.int_const(0).0, s.int_const(3).0, s.int_const(5).0);
+        let (c0, c3, c5) = (
+            s.int_const(0).id(),
+            s.int_const(3).id(),
+            s.int_const(5).id(),
+        );
         let atoms = {
             let t = s.terms_mut();
             vec![
@@ -1842,10 +2022,14 @@ fn ctx_solver_simplify_verdict_matches_baseline_on_random_goals() {
         // Build the same random goal in two solvers (identical seeds ⇒ identical
         // goals, since `NnfRng` is deterministic).
         let build = |s: &mut Solver, rng: &mut NnfRng| {
-            let x = s.declare_const("x", Sort::Int).0;
-            let y = s.declare_const("y", Sort::Int).0;
-            let p = s.declare_const("p", Sort::Bool).0;
-            let (c0, c3, c5) = (s.int_const(0).0, s.int_const(3).0, s.int_const(5).0);
+            let x = s.declare_const("x", Sort::Int).id();
+            let y = s.declare_const("y", Sort::Int).id();
+            let p = s.declare_const("p", Sort::Bool).id();
+            let (c0, c3, c5) = (
+                s.int_const(0).id(),
+                s.int_const(3).id(),
+                s.int_const(5).id(),
+            );
             let mk = |t: &mut TermStore, op: &str, a: TermId, b: TermId| {
                 t.mk_app(ay_core::term::Symbol::named(op), vec![a, b], Sort::Bool)
             };
@@ -1863,7 +2047,7 @@ fn ctx_solver_simplify_verdict_matches_baseline_on_random_goals() {
             let count = 2 + rng.below(4);
             for _ in 0..count {
                 let a = css_gen_assertion(s.terms_mut(), &atoms, rng, 2);
-                s.assert_term(Term(a));
+                s.assert_term(s.wrap_term(a));
             }
         };
 
@@ -1889,9 +2073,19 @@ fn ctx_solver_simplify_verdict_matches_baseline_on_random_goals() {
 
 #[test]
 fn failing_tactic_check_retires_preceding_sat_witness() {
-    let mut solver = Tactic::Fail.solver(Logic::QfLia).expect("tactic solver");
-    let p = solver.solver_mut().declare_const("p", Sort::Bool);
-    solver.solver_mut().assert_term(p);
+    // The first branch allocates Tseitin scratch terms before the second branch
+    // fails. The whole composite must remain isolated from the live store.
+    let tactic = Tactic::TseitinCnf.then(Tactic::Fail);
+    let mut solver = tactic.solver(Logic::QfUf).expect("tactic solver");
+    {
+        let s = solver.solver_mut();
+        let a = s.declare_const("a", Sort::Bool);
+        let b = s.declare_const("b", Sort::Bool);
+        let c = s.declare_const("c", Sort::Bool);
+        let ab = s.and(a, b);
+        let formula = s.or(ab, c);
+        s.assert_term(formula);
+    }
 
     // Public access to the inner solver makes a preceding ordinary result a
     // supported state, not an artificial unit-test construction.
@@ -1899,16 +2093,26 @@ fn failing_tactic_check_retires_preceding_sat_witness() {
     assert!(preceding.is_sat());
     assert!(preceding.was_model_validated());
     assert!(solver.solver().model_for_consumer().is_some());
+    let source_roots = solver.assertions();
+    let live_len = solver.solver().terms().len();
+    let live_stamp = solver.solver().terms().snapshot_stamp();
 
     let failed = solver.check_sat();
 
     assert!(failed.is_unknown());
     assert_eq!(
         solver.solver().unknown_reason(),
-        Some(crate::UnknownReason::InternalError)
+        Some(UnknownReason::InternalError)
     );
     assert!(solver.solver().model().is_none());
     assert!(solver.solver().model_for_consumer().is_none());
+    assert_eq!(
+        solver.assertions(),
+        source_roots,
+        "an honest detached tactic failure must not mutate the source goal"
+    );
+    assert_eq!(solver.solver().terms().len(), live_len);
+    assert_eq!(solver.solver().terms().snapshot_stamp(), live_stamp);
     assert!(
         solver.inner.executor.last_result_is_unknown(),
         "the failed public query must replace the stale SAT result with registered Unknown"
@@ -1922,20 +2126,54 @@ fn failing_tactic_assuming_check_retires_witness_and_assumption_state() {
     solver.solver_mut().assert_term(p);
     assert!(solver.solver_mut().check_sat().is_sat());
     assert!(solver.solver().model_for_consumer().is_some());
+    let source_roots = solver.assertions();
 
     let failed = solver.check_sat_assuming(&[p]);
 
     assert!(failed.is_unknown());
     assert_eq!(
         solver.solver().unknown_reason(),
-        Some(crate::UnknownReason::InternalError)
+        Some(UnknownReason::InternalError)
     );
     assert!(solver.solver().model_for_consumer().is_none());
+    assert_eq!(solver.assertions(), source_roots);
     assert!(solver.inner.last_assumptions.is_none());
     assert!(
         solver.inner.executor.last_result_is_unknown(),
         "the failed public query must replace the stale SAT result with registered Unknown"
     );
+}
+
+#[test]
+fn invalid_foreign_tactic_assumption_retires_prior_query_before_preflight() {
+    let mut solver = Tactic::Skip.solver(Logic::QfLia).expect("tactic solver");
+    let p = solver.solver_mut().declare_const("p", Sort::Bool);
+    solver.solver_mut().assert_term(p);
+
+    let preceding = solver.check_sat_assuming(&[p]);
+    assert!(preceding.is_sat());
+    assert!(preceding.was_model_validated());
+    assert!(solver.inner.last_assumptions.is_some());
+    assert!(solver.solver().model_for_consumer().is_some());
+
+    let mut foreign = Solver::new(Logic::QfLia);
+    let foreign_term = foreign.declare_const("foreign", Sort::Bool);
+    let live_len = solver.solver().terms().len();
+    let live_stamp = solver.solver().terms().snapshot_stamp();
+
+    let rejected = solver.check_sat_assuming(&[foreign_term]);
+
+    assert!(rejected.is_unknown());
+    assert_eq!(
+        solver.solver().unknown_reason(),
+        Some(UnknownReason::Incomplete)
+    );
+    assert!(solver.solver().executor_error().is_some());
+    assert!(solver.inner.last_assumptions.is_none());
+    assert!(solver.solver().model_for_consumer().is_none());
+    assert!(solver.inner.executor.last_result_is_unknown());
+    assert_eq!(solver.solver().terms().len(), live_len);
+    assert_eq!(solver.solver().terms().snapshot_stamp(), live_stamp);
 }
 
 /// Every new transform-batch `ApplyTactic` maps to a distinct, non-`Skip`

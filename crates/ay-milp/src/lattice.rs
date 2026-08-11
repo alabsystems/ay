@@ -8622,17 +8622,17 @@ mod kernel_reform_tests {
     /// through 433 lib tests and a 40-instance corpus run. What caught it was a
     /// random-model campaign, and nothing else did.
     ///
-    /// So the same campaign runs here, against the shape production now really
-    /// admits, through the public entry, on default options. The in-suite run is
-    /// 400 seeds; `randomised_isolated_shape_matches_brute_force_full` is the
-    /// 2,600-seed version kept `#[ignore]`d for the size of its bill.
+    /// So the full 2,600-seed campaign runs here, against the shape production
+    /// now really admits, through the public entry, on default options. Keeping
+    /// the complete campaign active prevents the soundness evidence from
+    /// silently becoming an ignored test that normal verification never runs.
     ///
     /// The firing rate is asserted, not assumed. A campaign whose generator never
     /// reaches the reformulation proves nothing, and that failure mode is silent.
     #[test]
     fn randomised_isolated_shape_matches_brute_force() {
         let _env = solve_lock();
-        let c = isolated_shape_campaign(0..400);
+        let c = isolated_shape_campaign(0..2_600);
         println!(
             "isolated-shape campaign: {} generated, {} admitted by the shipped gate, \
              {} claimed by market-split, {} infeasible, {} verifying tree certificates, \
@@ -8645,8 +8645,8 @@ mod kernel_reform_tests {
             c.disagreements.len()
         );
         assert!(
-            c.admitted >= 200,
-            "the generator must actually reach the reformulation; admitted={}",
+            c.admitted >= 2_000,
+            "the generator must actually reach the reformulation at scale; admitted={}",
             c.admitted
         );
         assert!(
@@ -8819,38 +8819,6 @@ mod kernel_reform_tests {
         assert!(
             disagreements.is_empty(),
             "the shipped kernel path disagrees with enumeration on seeds {disagreements:?}"
-        );
-    }
-
-    /// The full 2,600-seed run of the campaign above. `#[ignore]`d only for its
-    /// wall-clock bill — it is the arm the soundness claim actually rests on and
-    /// is meant to be run whenever this lane is touched:
-    /// `cargo test --release -p ay-milp -- --ignored isolated_shape`.
-    #[test]
-    #[ignore = "full adversarial campaign; run explicitly when the kernel lane changes"]
-    fn randomised_isolated_shape_matches_brute_force_full() {
-        let _env = solve_lock();
-        let c = isolated_shape_campaign(0..2_600);
-        println!(
-            "isolated-shape campaign (FULL): {} generated, {} admitted by the shipped gate, \
-             {} claimed by market-split, {} infeasible, {} verifying tree certificates, \
-             {} disagreements",
-            c.generated,
-            c.admitted,
-            c.market_split,
-            c.infeasible,
-            c.verified_certs,
-            c.disagreements.len()
-        );
-        assert!(
-            c.admitted >= 2_000,
-            "the campaign must exercise at least 2,000 admitted models; admitted={}",
-            c.admitted
-        );
-        assert!(
-            c.disagreements.is_empty(),
-            "the shipped kernel path disagrees with brute force on seeds {:?}",
-            c.disagreements
         );
     }
 

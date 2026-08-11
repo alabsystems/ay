@@ -345,6 +345,33 @@ pub(crate) fn solve_vec(smt: &str) -> Vec<String> {
         .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
 }
 
+/// Execute an SMT-LIB command stream through the audited caller-authored
+/// boundary, matching the CLI rather than the generic internal adapter path.
+pub(crate) fn solve_authored_vec(smt: &str) -> Vec<String> {
+    solve_authored_with_self_check(smt, false)
+}
+
+/// Like [`solve_authored_vec`], with the CLI's fail-closed self-check mode.
+pub(crate) fn solve_authored_selfcheck_vec(smt: &str) -> Vec<String> {
+    solve_authored_with_self_check(smt, true)
+}
+
+fn solve_authored_with_self_check(smt: &str, self_check: bool) -> Vec<String> {
+    let commands = parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"));
+    let mut exec = Executor::new();
+    exec.set_self_check(self_check);
+    let mut output = Vec::new();
+    for command in &commands {
+        if let Some(line) = exec
+            .execute_authored(command)
+            .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
+        {
+            output.push(line);
+        }
+    }
+    output
+}
+
 /// Like [`solve_vec`], but with fail-closed self-certification (`--self-check`):
 /// `sat`/`unsat` are emitted ONLY when AY's own in-tree checker confirms them,
 /// and anything unverifiable degrades to `unknown`. Use this to pin behavior

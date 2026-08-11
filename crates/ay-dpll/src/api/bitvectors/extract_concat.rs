@@ -33,6 +33,7 @@ impl Solver {
     /// [`bvextract`]: Solver::bvextract
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvextract(&mut self, a: Term, high: u32, low: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvextract", a)?;
         if low > high {
             return Err(SolverError::InvalidArgument {
                 operation: "bvextract",
@@ -49,7 +50,8 @@ impl Solver {
         }
         // Note: low <= high < width guaranteed by checks above, so low < width implicitly
 
-        Ok(Term(self.terms_mut().mk_bvextract(high, low, a.0)))
+        let result = self.terms_mut().mk_bvextract(high, low, a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Concatenate two bitvectors (a is the high bits, b is the low bits)
@@ -74,6 +76,8 @@ impl Solver {
     /// [`bvconcat`]: Solver::bvconcat
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvconcat(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvconcat", a)?;
+        let b_id = self.resolve_term("bvconcat", b)?;
         let (a_w, b_w) = self.expect_bitvec_width2("bvconcat", a, b)?;
         let out_w = u64::from(a_w) + u64::from(b_w);
         if out_w > u64::from(u32::MAX) {
@@ -82,7 +86,8 @@ impl Solver {
                 message: format!("resulting bitvector width overflows u32: {a_w} + {b_w}"),
             });
         }
-        Ok(Term(self.terms_mut().mk_bvconcat(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvconcat(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Zero-extend a bitvector by n bits
@@ -107,6 +112,7 @@ impl Solver {
     /// [`bvzeroext`]: Solver::bvzeroext
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvzeroext(&mut self, a: Term, n: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvzeroext", a)?;
         let w = self.expect_bitvec_width("bvzeroext", a)?;
         let out_w = u64::from(w) + u64::from(n);
         if out_w > u64::from(u32::MAX) {
@@ -115,7 +121,8 @@ impl Solver {
                 message: format!("resulting bitvector width overflows u32: {w} + {n}"),
             });
         }
-        Ok(Term(self.terms_mut().mk_bvzero_extend(n, a.0)))
+        let result = self.terms_mut().mk_bvzero_extend(n, a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Sign-extend a bitvector by n bits
@@ -140,6 +147,7 @@ impl Solver {
     /// [`bvsignext`]: Solver::bvsignext
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvsignext(&mut self, a: Term, n: u32) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvsignext", a)?;
         let w = self.expect_bitvec_width("bvsignext", a)?;
         let out_w = u64::from(w) + u64::from(n);
         if out_w > u64::from(u32::MAX) {
@@ -148,6 +156,7 @@ impl Solver {
                 message: format!("resulting bitvector width overflows u32: {w} + {n}"),
             });
         }
-        Ok(Term(self.terms_mut().mk_bvsign_extend(n, a.0)))
+        let result = self.terms_mut().mk_bvsign_extend(n, a_id);
+        Ok(self.wrap_term(result))
     }
 }

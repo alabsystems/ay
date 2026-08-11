@@ -901,3 +901,33 @@ fn test_try_reset_assertions_preserves_declarations() {
         "x = 1 should be SAT after reset-assertions"
     );
 }
+
+#[test]
+fn solver_cache_token_tracks_handle_arena_generation() {
+    let mut solver = Solver::try_new(Logic::QfLia).expect("solver should construct");
+    let initial = solver.cache_token();
+    assert!(initial.is_current());
+
+    solver
+        .try_reset_assertions()
+        .expect("reset-assertions should preserve handles");
+    assert_eq!(solver.cache_token(), initial);
+    assert!(initial.is_current());
+
+    solver
+        .try_reset()
+        .expect("full reset should discard handles");
+    assert_ne!(solver.cache_token(), initial);
+    assert!(!initial.is_current());
+    assert!(solver.cache_token().is_current());
+    assert_ne!(
+        solver.cache_token(),
+        Solver::new(Logic::QfLia).cache_token()
+    );
+
+    let dropped = {
+        let temporary = Solver::new(Logic::QfLia);
+        temporary.cache_token()
+    };
+    assert!(!dropped.is_current());
+}

@@ -142,3 +142,80 @@ ENDATA
         Err(LpError::InvalidNumber { .. })
     ));
 }
+
+#[test]
+fn test_parse_mps_accumulates_continued_objective_entries() {
+    let input = "\
+NAME SUMOBJ
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    X1 OBJ 1.5 C1 1.0
+    X1 OBJ 2.5
+RHS
+    RHS C1 4.0
+ENDATA
+";
+    let p = parse_mps(input).expect("parse");
+    assert_eq!(p.variables[0].obj_coeff, 4.0);
+}
+
+#[test]
+fn test_parse_mps_rejects_finite_objective_entries_whose_sum_overflows() {
+    let input = "\
+NAME BIGOBJ
+ROWS
+ N OBJ
+COLUMNS
+    X1 OBJ 1e308
+    X1 OBJ 1e308
+ENDATA
+";
+    assert!(matches!(parse_mps(input), Err(LpError::Parse { .. })));
+}
+
+#[test]
+fn test_parse_mps_normalizes_repeated_constraint_entries_and_rejects_overflow() {
+    let finite = "\
+NAME SUMROW
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    X1 C1 1.5
+    X1 C1 2.5
+RHS
+    RHS C1 4
+ENDATA
+";
+    let problem = parse_mps(finite).expect("parse");
+    assert_eq!(problem.constraints[0].coeffs, vec![(0, 4.0)]);
+
+    let overflow = "\
+NAME BIGROW
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    X1 C1 1e308
+    X1 C1 1e308
+RHS
+    RHS C1 1
+ENDATA
+";
+    assert!(matches!(parse_mps(overflow), Err(LpError::Parse { .. })));
+}
+
+#[test]
+fn test_parse_mps_rejects_finite_ranges_whose_derived_bound_overflows() {
+    for (row_kind, rhs) in [("G", "1e308"), ("L", "-1e308"), ("E", "1e308")] {
+        let input = format!(
+            "NAME BIGRANGE\nROWS\n N OBJ\n {row_kind} C1\nCOLUMNS\n    X1 C1 1\nRHS\n    RHS C1 {rhs}\nRANGES\n    RNG C1 1e308\nENDATA\n"
+        );
+        assert!(
+            matches!(parse_mps(&input), Err(LpError::Parse { .. })),
+            "{row_kind} range overflow must be rejected"
+        );
+    }
+}

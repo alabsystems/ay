@@ -45,14 +45,13 @@
 fn assert_assuming_matches_plain(label: &str, plain: &str, assuming: &str) {
     let plain_verdict = crate::common::solve(plain);
     let plain_verdict = plain_verdict.trim();
-    if plain_verdict != "unsat" {
-        // The premise of the parity claim does not hold on this build; nothing
-        // to assert. Do not silently "pass" a vacuous case — say so.
-        panic!(
-            "{label}: PRECONDITION FAILED — plain check-sat must be `unsat` for the \
-             parity comparison to mean anything, got {plain_verdict:?}"
-        );
-    }
+    // The premise of the parity claim must hold; otherwise the comparison is
+    // vacuous and the test must fail explicitly.
+    assert_eq!(
+        plain_verdict, "unsat",
+        "{label}: PRECONDITION FAILED — plain check-sat must be `unsat` for the \
+         parity comparison to mean anything"
+    );
 
     let assuming_verdict = crate::common::solve(assuming);
     let assuming_verdict = assuming_verdict.trim();

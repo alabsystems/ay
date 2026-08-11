@@ -776,7 +776,9 @@ pub mod executor {
 /// ```
 pub mod allsat {
     pub use ay_allsat::{
-        AllSatConfig, AllSatIterator, AllSatOutcome, AllSatSolver, AllSatStats, Solution,
+        AllSatConfig, AllSatIncomplete, AllSatInputError, AllSatIterator, AllSatOutcome,
+        AllSatSolver, AllSatStats, EnumerationReport, Solution, SolutionIndexing,
+        SolutionLiteralError,
     };
 }
 

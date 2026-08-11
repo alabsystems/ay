@@ -460,8 +460,6 @@ impl DpwEnc {
                 top = s_j;
             }
         }
-        drop(tracked);
-
         let size = DpwSize {
             vars: tally.vars,
             clauses: tally.clauses,

@@ -27,6 +27,7 @@
 //! declarations supplied), strict mode fails closed — it never assumes
 //! distinctness by shape alone, which would be unsound.
 
+use ay_core::kani_compat::det_hash_set_with_capacity;
 use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
@@ -484,6 +485,154 @@ fn constructor_datatype<'a>(dt_decls: DatatypeDecls<'a>, ctor_name: &str) -> Opt
 /// `(constructor_name, [selector_name in field order])`.
 pub(crate) type SelectorDecls<'a> = &'a [(String, Vec<String>)];
 
+/// Validate a finite-enum pigeonhole lemma.
+///
+/// Clause shape: the COMPLETE graph of equalities over `m` distinct terms of one
+/// datatype sort whose `k` constructors are ALL NULLARY, with `m > k`:
+///
+/// ```text
+/// (cl (= t1 t2) (= t1 t3) ... (= t_{m-1} t_m))
+/// ```
+///
+/// Soundness: an all-nullary datatype's carrier is EXACTLY its `k` constructor
+/// constants, so any `m > k` terms of that sort must contain an equal pair and
+/// the disjunction holds in every model.
+///
+/// Everything the argument rests on is re-derived here from the declaration
+/// registry — the constructor COUNT and, critically, the NULLARITY that makes the
+/// carrier finite. The executor's claim is never taken on trust: a datatype with
+/// any non-nullary constructor has an infinite carrier and no pigeonhole, so a
+/// missing or non-empty selector entry fails closed.
+pub(crate) fn validate_datatype_enum_pigeonhole(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+    ctor_selectors: Option<SelectorDecls<'_>>,
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+
+    let literals = flatten_clause_literals(terms, clause);
+    if literals.is_empty() {
+        return Err(invalid(
+            "enum pigeonhole clause must be non-empty".to_string(),
+        ));
+    }
+
+    let mut values = det_hash_set_with_capacity(literals.len().saturating_add(1));
+    let mut pairs = det_hash_set_with_capacity(literals.len());
+    let mut sort_name: Option<String> = None;
+
+    for &literal in &literals {
+        let Some((lhs, rhs)) = syntactic_equality_sides(terms, literal) else {
+            return Err(invalid(
+                "enum pigeonhole literals must all be equalities".to_string(),
+            ));
+        };
+        if lhs == rhs {
+            return Err(invalid(
+                "enum pigeonhole literals must relate DISTINCT terms".to_string(),
+            ));
+        }
+        for value in [lhs, rhs] {
+            // Each member's sort is invariant across all its incident edges.
+            // Validate it only on first insertion; a complete graph repeats a
+            // member O(m) times, and rescanning a long datatype name at every
+            // edge made this otherwise-quadratic in the certificate size.
+            if !values.insert(value) {
+                continue;
+            }
+            let Sort::Uninterpreted(name) = terms.sort(value) else {
+                return Err(invalid(
+                    "enum pigeonhole applies only to a declared datatype sort".to_string(),
+                ));
+            };
+            match &sort_name {
+                None => sort_name = Some(name.clone()),
+                Some(seen) if seen == name => {}
+                Some(_) => {
+                    return Err(invalid(
+                        "enum pigeonhole literals must all share ONE datatype sort".to_string(),
+                    ));
+                }
+            }
+        }
+        let pair = if lhs.0 < rhs.0 {
+            (lhs, rhs)
+        } else {
+            (rhs, lhs)
+        };
+        if !pairs.insert(pair) {
+            return Err(invalid("enum pigeonhole clause repeats a pair".to_string()));
+        }
+    }
+
+    let Some(sort_name) = sort_name else {
+        return Err(invalid("enum pigeonhole clause has no sort".to_string()));
+    };
+    let Some((_, constructors)) = dt_decls.iter().find(|(dt, _)| dt == &sort_name) else {
+        return Err(invalid(format!(
+            "enum pigeonhole sort {sort_name} is not a declared datatype"
+        )));
+    };
+    let k = constructors.len();
+    if k == 0 {
+        return Err(invalid(format!(
+            "enum pigeonhole sort {sort_name} declares no constructors"
+        )));
+    }
+
+    // NULLARITY is what makes the carrier finite, so it is checked, not assumed.
+    let Some(selectors) = ctor_selectors else {
+        return Err(invalid(
+            "enum pigeonhole needs the constructor->selector registry to establish \
+             that every constructor is nullary"
+                .to_string(),
+        ));
+    };
+    for ctor in constructors {
+        match selectors.iter().find(|(name, _)| name == ctor) {
+            Some((_, fields)) if fields.is_empty() => {}
+            Some((_, _)) => {
+                return Err(invalid(format!(
+                    "enum pigeonhole requires an all-nullary datatype, but constructor \
+                     {ctor} of {sort_name} takes fields"
+                )));
+            }
+            None => {
+                return Err(invalid(format!(
+                    "constructor {ctor} of {sort_name} is absent from the selector \
+                     registry, so nullarity cannot be established"
+                )));
+            }
+        }
+    }
+
+    let m = values.len();
+    if m <= k {
+        return Err(invalid(format!(
+            "enum pigeonhole needs more terms than constructors, got {m} terms for \
+             {k} constructors of {sort_name}"
+        )));
+    }
+    let expected = m
+        .checked_mul(m.saturating_sub(1))
+        .map(|pairs| pairs / 2)
+        .ok_or_else(|| invalid("enum pigeonhole pair count overflowed".to_string()))?;
+    if literals.len() != expected {
+        return Err(invalid(format!(
+            "enum pigeonhole must be the COMPLETE graph on its {m} terms: expected \
+             {expected} literals, got {}",
+            literals.len()
+        )));
+    }
+
+    Ok(())
+}
+
 /// Recognize whether `clause` is a valid datatype selector-projection lemma
 /// under the given constructor→selector registry — i.e. whether
 /// [`validate_datatype_selector_project`] would accept it.
@@ -605,19 +754,24 @@ fn selector_field_index(
     selectors.iter().position(|s| s == sel_name)
 }
 
-/// Decode a positive equality `(= a b)` into `(a, b)`.
-fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+/// Decode the Boolean application shape `(= a b)` without comparing operand
+/// sorts. Callers that establish one common sort independently can use this to
+/// avoid repeating an arbitrarily long sort-name comparison at every edge.
+fn syntactic_equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     match terms.get(term) {
         TermData::App(Symbol::Named(name), args)
-            if name == "="
-                && args.len() == 2
-                && terms.sort(term) == &Sort::Bool
-                && terms.sort(args[0]) == terms.sort(args[1]) =>
+            if name == "=" && args.len() == 2 && terms.sort(term) == &Sort::Bool =>
         {
             Some((args[0], args[1]))
         }
         _ => None,
     }
+}
+
+/// Decode a sort-correct positive equality `(= a b)` into `(a, b)`.
+fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    let (lhs, rhs) = syntactic_equality_sides(terms, term)?;
+    (terms.sort(lhs) == terms.sort(rhs)).then_some((lhs, rhs))
 }
 
 /// Flatten a clause to its literals, unwrapping a single `(or ..)` literal.

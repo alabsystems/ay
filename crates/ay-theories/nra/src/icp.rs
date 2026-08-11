@@ -665,6 +665,14 @@ fn ladder_vector(vars: &[TermId], bx: &VarBox, k: usize) -> Option<Vec<(TermId, 
 
 type VarBox = crate::HashMap<TermId, Interval>;
 
+/// Immutable inputs shared by every node of one dyadic-grid DFS.
+struct GridSearch<'a> {
+    constraints: &'a [MultiConstraint],
+    vars: &'a [TermId],
+    order: &'a [TermId],
+    grid: &'a [BigRational],
+}
+
 /// Result of contracting a box against the constraint set.
 enum Contraction {
     /// Some constraint is infeasible over the box: the box contains no
@@ -2039,15 +2047,13 @@ impl NraSolver<'_> {
         let mut out = None;
         for level in 0..=GRID_MAX_LEVEL {
             let grid = dyadic_grid(level);
-            out = self.grid_dfs(
+            let search = GridSearch {
                 constraints,
                 vars,
-                &order,
-                0,
-                root.clone(),
+                order: &order,
                 grid,
-                &mut budget,
-            );
+            };
+            out = self.grid_dfs(&search, 0, root.clone(), &mut budget);
             if out.is_some() || budget == 0 {
                 break; // found, or no room for a finer grid
             }
@@ -2061,33 +2067,30 @@ impl NraSolver<'_> {
     /// recurse. `budget` is decremented per contracted node and stops the sweep.
     fn grid_dfs(
         &self,
-        constraints: &[MultiConstraint],
-        vars: &[TermId],
-        order: &[TermId],
+        search: &GridSearch<'_>,
         depth: usize,
         bx: VarBox,
-        grid: &[BigRational],
         budget: &mut usize,
     ) -> Option<Vec<(TermId, BigRational)>> {
-        if depth == order.len() {
+        if depth == search.order.len() {
             // Every variable is a point interval; assemble and verify EXACTLY.
-            let mut model = Vec::with_capacity(vars.len());
-            for &v in vars {
+            let mut model = Vec::with_capacity(search.vars.len());
+            for &v in search.vars {
                 model.push((v, bx.get(&v).and_then(interval_point)?.clone()));
             }
             return self.verify_model(&model).then_some(model);
         }
-        let v = order[depth];
+        let v = search.order[depth];
         let iv = bx.get(&v)?.clone();
         // Already collapsed by contraction: nothing to choose here.
         if interval_point(&iv).is_some() {
-            return self.grid_dfs(constraints, vars, order, depth + 1, bx, grid, budget);
+            return self.grid_dfs(search, depth + 1, bx, budget);
         }
         // Candidates: the interval's own simplest rational and midpoint first
         // (these carry the tight numeric-constant intervals — `pi` bounded to
         // `26353589/8388608` and friends — that no fixed grid contains), then
         // the grid values that lie inside.
-        let mut cands: Vec<BigRational> = Vec::with_capacity(grid.len() + 2);
+        let mut cands: Vec<BigRational> = Vec::with_capacity(search.grid.len() + 2);
         for c in [nice_point_in_open(&iv), interval_midpoint(&iv)]
             .into_iter()
             .flatten()
@@ -2096,7 +2099,7 @@ impl NraSolver<'_> {
                 cands.push(c);
             }
         }
-        for g in grid {
+        for g in search.grid {
             if interval_contains(&iv, g) && !cands.contains(g) {
                 cands.push(g.clone());
             }
@@ -2109,13 +2112,12 @@ impl NraSolver<'_> {
             let mut next = bx.clone();
             next.insert(v, Interval::point(c));
             if matches!(
-                contract_box(constraints, vars, &mut next),
+                contract_box(search.constraints, search.vars, &mut next),
                 Contraction::Refuted
             ) {
                 continue; // prefix PROVABLY infeasible — cut the whole subtree
             }
-            if let Some(m) = self.grid_dfs(constraints, vars, order, depth + 1, next, grid, budget)
-            {
+            if let Some(m) = self.grid_dfs(search, depth + 1, next, budget) {
                 return Some(m);
             }
         }
@@ -2911,7 +2913,7 @@ mod tests {
         use ay_core::TheorySolver;
         let mut terms = TermStore::new();
         let vs: Vec<TermId> = (0..=GRID_MAX_VARS)
-            .map(|i| terms.mk_var(&format!("v{i}"), Sort::Real))
+            .map(|i| terms.mk_var(format!("v{i}"), Sort::Real))
             .collect();
         let c1 = terms.mk_rational(rat(1));
         let prod = terms.mk_mul(vs.clone());

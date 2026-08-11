@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use crate::api::{
     DatatypeConstructor, DatatypeField, DatatypeSort, Logic, NativeReplayArtifact,
-    NativeReplayEventKind, NativeReplayMetadata, ProofAcceptanceMode, SolveResult, Solver,
-    SolverError, Sort, StrictProofVerdict, Term,
+    NativeReplayEventKind, NativeReplayMetadata, NativeReplaySolverIdentity,
+    NativeReplaySymbolKind, ProofAcceptanceMode, SolveResult, Solver, SolverError, Sort,
+    StrictProofVerdict, Term,
 };
-use ay_core::term::{Symbol, TermData};
+use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::TermId;
 
 fn assert_native_replay_rejected(artifact: &NativeReplayArtifact) {
@@ -35,6 +36,26 @@ fn boolean_unsat_native_replay_artifact() -> NativeReplayArtifact {
     solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details))
 }
 
+fn boolean_sat_native_replay_artifact() -> NativeReplayArtifact {
+    let mut solver = Solver::try_new(Logic::QfUf).expect("solver");
+    let p = solver.declare_const("native_replay_evidence_p", Sort::Bool);
+    solver.assert_term(p);
+    let details = solver.check_sat_with_details();
+    assert!(details.result.is_sat());
+    assert!(
+        details.result.was_model_validated() && details.verification.sat_model_validated,
+        "evidence test requires validated source SAT evidence"
+    );
+    solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details))
+}
+
+fn native_replay_evidence_identity(artifact: &NativeReplayArtifact) -> NativeReplaySolverIdentity {
+    NativeReplaySolverIdentity::current_for_engine(
+        artifact.selected_route.as_deref().unwrap_or("native-api"),
+    )
+    .with_solver_binary_sha256("ab".repeat(32))
+}
+
 #[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
@@ -46,6 +67,7 @@ fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
     assert!(replay.result.is_unsat());
     assert!(replay.verification_level.has_proof_checking());
     assert!(replay.verification.unsat_proof_available);
+    assert!(replay.verification.unsat_proof_strictly_verified);
     assert_eq!(replay.verification.unsat_proof_checker_failures, 0);
     assert!(replay.statistics.proof_complete);
     assert_eq!(replay.statistics.get_int("proof_trust"), Some(0));
@@ -353,7 +375,7 @@ fn native_replay_rejects_undeclared_internal_variable_identity() {
     let p_node = artifact
         .terms
         .iter_mut()
-        .find(|node| node.id == p.0)
+        .find(|node| node.id == p.id())
         .expect("replay closure contains p");
     let var_id = match &p_node.data {
         TermData::Var(_, var_id) => *var_id,
@@ -394,6 +416,51 @@ fn native_replay_rejects_ambiguous_or_mismatched_identity_tables() {
     duplicate_name.declarations[1].name = duplicate_name.declarations[0].name.clone();
     assert_native_replay_rejected(&duplicate_name);
 
+    let mut duplicate_core_name = artifact.clone();
+    duplicate_core_name.declarations[1].core_name =
+        duplicate_core_name.declarations[0].core_name.clone();
+    assert_native_replay_rejected(&duplicate_core_name);
+
+    let mut duplicate_identity_core = artifact.clone();
+    duplicate_identity_core.symbol_identities[1].core_name = duplicate_identity_core
+        .symbol_identities[0]
+        .core_name
+        .clone();
+    assert_native_replay_rejected(&duplicate_identity_core);
+
+    let mut wrong_identity_kind = artifact.clone();
+    wrong_identity_kind.symbol_identities[0].kind = NativeReplaySymbolKind::Theory;
+    assert_native_replay_rejected(&wrong_identity_kind);
+
+    let mut wrong_identity_range = artifact.clone();
+    wrong_identity_range.symbol_identities[0].engine_range = Sort::Bool;
+    assert_native_replay_rejected(&wrong_identity_range);
+
+    let mut wrong_identity_api_range = artifact.clone();
+    wrong_identity_api_range.symbol_identities[0].api_range = Sort::Char;
+    assert_native_replay_rejected(&wrong_identity_api_range);
+
+    let mut arbitrary_private_core = artifact.clone();
+    arbitrary_private_core.declarations[0].core_name = "replay_private_forged".to_string();
+    assert_native_replay_rejected(&arbitrary_private_core);
+
+    // An allocator-shaped spelling alone is not authority: this ordinary
+    // public name has no canonical-theory collision requiring a private core.
+    let mut forged_allocator_private_core = artifact.clone();
+    let declaration = &mut forged_allocator_private_core.declarations[0];
+    declaration.core_name = "__ay_overload_999999".to_string();
+    let declaration = declaration.clone();
+    let node = forged_allocator_private_core
+        .terms
+        .iter_mut()
+        .find(|node| node.id == declaration.term)
+        .expect("declared node");
+    let TermData::Var(name, _) = &mut node.data else {
+        unreachable!();
+    };
+    *name = declaration.core_name;
+    assert_native_replay_rejected(&forged_allocator_private_core);
+
     let mut mismatched_name = artifact.clone();
     let declaration = mismatched_name.declarations[0].clone();
     let node = mismatched_name
@@ -409,7 +476,7 @@ fn native_replay_rejects_ambiguous_or_mismatched_identity_tables() {
 
     let mut non_variable_target = artifact.clone();
     let declaration = &mut non_variable_target.declarations[0];
-    declaration.term = zero.0;
+    declaration.term = zero.id();
     assert_native_replay_rejected(&non_variable_target);
 
     let mut constructor_collision = artifact;
@@ -553,7 +620,7 @@ fn native_replay_authenticates_registered_uf_and_datatype_applications() {
     let TermData::App(_, args) = &mut uf_node.data else {
         unreachable!();
     };
-    args[0] = boolean.0;
+    args[0] = boolean.id();
     assert_native_replay_rejected(&wrong_uf_argument);
 
     let mut solver = Solver::try_new(Logic::All).expect("solver");
@@ -580,6 +647,89 @@ fn native_replay_authenticates_registered_uf_and_datatype_applications() {
         .expect("constructor application");
     constructor.sort = Sort::Bool;
     assert_native_replay_rejected(&artifact);
+}
+
+#[test]
+fn native_replay_preserves_builtin_colliding_uf_identity() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let left = solver.int_const(1);
+    let right = solver.int_const(2);
+    let user_equality = solver
+        .try_declare_fun("=", &[Sort::Int, Sort::Int], Sort::Bool)
+        .expect("declare user equality");
+    let application = solver
+        .try_apply(&user_equality, &[left, right])
+        .expect("apply user equality");
+    solver.try_assert_term(application).expect("assert user UF");
+
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    assert!(artifact
+        .function_declarations
+        .iter()
+        .any(|declaration| declaration.name == "="));
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(
+            &node.data,
+            TermData::App(Symbol::Named(name), args)
+                if name == user_equality.core_name() && name != "=" && args.len() == 2
+        )
+    }));
+    let _replayed = Solver::replay_native_replay_artifact(&artifact)
+        .expect("private native declaration identity must replay");
+}
+
+#[test]
+fn native_replay_rejects_legacy_canonical_core_hijack() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let user_equality = solver
+        .try_declare_fun("=", &[Sort::Int, Sort::Int], Sort::Bool)
+        .expect("declare user equality");
+    assert_ne!(user_equality.core_name(), "=");
+
+    // Construct the builtin application without constant folding so the
+    // artifact contains the raw canonical `=` head. The user UF is unused but
+    // legacy surface-based dependency capture retained its declaration.
+    let zero = solver.int_const(0);
+    let one = solver.int_const(1);
+    let builtin_equality_id = solver.terms_mut().mk_app(
+        Symbol::Named("=".to_string()),
+        vec![zero.id(), one.id()],
+        Sort::Bool,
+    );
+    let builtin_equality = solver.wrap_term(builtin_equality_id);
+    solver.try_assert_term(builtin_equality).expect("assert");
+    assert!(solver.check_sat().is_unsat());
+
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let declaration = artifact
+        .function_declarations
+        .iter()
+        .find(|declaration| declaration.name == "=")
+        .expect("legacy surface dependency retains declaration");
+    assert_ne!(declaration.core_name, "=");
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(&node.data, TermData::App(Symbol::Named(name), _) if name == "=")
+    }));
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("authenticated private UF must not capture builtin equality");
+    assert!(replay.result.result().is_unsat());
+
+    let mut legacy_json = artifact.to_json_value();
+    let object = legacy_json.as_object_mut().expect("artifact object");
+    object.remove("symbol_identities");
+    for declaration in object["function_declarations"]
+        .as_array_mut()
+        .expect("function declarations")
+    {
+        if declaration["name"].as_str() == Some("=") {
+            declaration
+                .as_object_mut()
+                .expect("function declaration")
+                .remove("core_name");
+        }
+    }
+    let legacy = NativeReplayArtifact::from_json_value(&legacy_json).expect("legacy artifact");
+    assert_native_replay_rejected(&legacy);
 }
 
 #[test]
@@ -642,7 +792,7 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let TermData::Ite(condition_id, _, _) = &mut ite_node.data else {
         unreachable!();
     };
-    *condition_id = integer.0;
+    *condition_id = integer.id();
     assert_native_replay_rejected(&bad_condition);
 
     let mut bad_not = artifact.clone();
@@ -654,21 +804,21 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let TermData::Not(inner) = &mut not_node.data else {
         unreachable!();
     };
-    *inner = integer.0;
+    *inner = integer.id();
     assert_native_replay_rejected(&bad_not);
 
     let mut repeated_let_binding = artifact.clone();
     let root = repeated_let_binding
         .terms
         .iter_mut()
-        .find(|node| node.id == assertion.0)
+        .find(|node| node.id == assertion.id())
         .expect("assertion root");
     root.data = TermData::Let(
         vec![
-            ("repeated".to_string(), zero.0),
-            ("repeated".to_string(), one.0),
+            ("repeated".to_string(), zero.id()),
+            ("repeated".to_string(), one.id()),
         ],
-        equality.0,
+        equality.id(),
     );
     assert_native_replay_rejected(&repeated_let_binding);
 
@@ -676,11 +826,11 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let root = valid_let
         .terms
         .iter_mut()
-        .find(|node| node.id == assertion.0)
+        .find(|node| node.id == assertion.id())
         .expect("assertion root");
     root.data = TermData::Let(
-        vec![("replay_structure_condition".to_string(), condition.0)],
-        negated.0,
+        vec![("replay_structure_condition".to_string(), condition.id())],
+        negated.id(),
     );
     let _ = Solver::replay_native_replay_artifact(&valid_let).expect("well-sorted let replay");
 
@@ -688,11 +838,11 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let root = mismatched_let_sort
         .terms
         .iter_mut()
-        .find(|node| node.id == assertion.0)
+        .find(|node| node.id == assertion.id())
         .expect("assertion root");
     root.data = TermData::Let(
-        vec![("replay_structure_condition".to_string(), integer.0)],
-        negated.0,
+        vec![("replay_structure_condition".to_string(), integer.id())],
+        negated.id(),
     );
     assert_native_replay_rejected(&mismatched_let_sort);
 
@@ -700,7 +850,7 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let zero_node = lying_sort
         .terms
         .iter_mut()
-        .find(|node| node.id == zero.0)
+        .find(|node| node.id == zero.id())
         .expect("zero constant");
     zero_node.sort = Sort::Bool;
     assert_native_replay_rejected(&lying_sort);
@@ -735,7 +885,7 @@ fn native_replay_rejects_malformed_structural_nodes_and_lying_sorts() {
     let TermData::Forall(_, body, _) = &mut quantifier.data else {
         unreachable!();
     };
-    *body = bound.0;
+    *body = bound.id();
     assert_native_replay_rejected(&non_boolean_body);
 }
 
@@ -773,7 +923,7 @@ fn native_replay_requires_each_trigger_to_contain_a_well_sorted_bound_variable()
     let TermData::Forall(_, _, triggers) = &mut quantifier.data else {
         unreachable!();
     };
-    triggers[0][0] = other_app.0;
+    triggers[0][0] = other_app.id();
     assert_native_replay_rejected(&unbound_trigger);
 }
 
@@ -781,7 +931,7 @@ fn native_replay_requires_each_trigger_to_contain_a_well_sorted_bound_variable()
 fn native_replay_binder_scan_respects_nested_same_name_shadowing() {
     let mut solver = Solver::try_new(Logic::All).expect("solver");
     let outer_var = solver.fresh_var("replay_shadowed", Sort::Int);
-    let outer_name = match solver.terms().get(outer_var.0) {
+    let outer_name = match solver.terms().get(outer_var.id()) {
         TermData::Var(name, _) => name.clone(),
         other => panic!("fresh variable should be a Var, got {other:?}"),
     };
@@ -791,11 +941,10 @@ fn native_replay_binder_scan_respects_nested_same_name_shadowing() {
     let inner = solver
         .terms_mut()
         .mk_forall(vec![(outer_name.clone(), Sort::Bool)], inner_var);
-    let outer = Term(
-        solver
-            .terms_mut()
-            .mk_forall(vec![(outer_name, Sort::Int)], inner),
-    );
+    let outer_id = solver
+        .terms_mut()
+        .mk_forall(vec![(outer_name, Sort::Int)], inner);
+    let outer = solver.wrap_term(outer_id);
     solver
         .try_assert_term(outer)
         .expect("nested quantifier assertion");
@@ -803,6 +952,150 @@ fn native_replay_binder_scan_respects_nested_same_name_shadowing() {
     let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
     let _ = Solver::replay_native_replay_artifact(&artifact)
         .expect("nested same-name binder should shadow the outer binder");
+}
+
+#[test]
+fn native_replay_alpha_renames_binders_that_spell_declaration_core_identities() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    // `div` is declarable through the native API, but must receive an
+    // allocator-private core identity because the public spelling is also a
+    // theory operator.
+    let declared = solver.declare_const("div", Sort::Int);
+    let bound = solver.fresh_var("replay_capture_bound", Sort::Int);
+    let zero = solver.int_const(0);
+    let body = solver.try_ge(bound, zero).expect("bound >= 0");
+    let quantified = solver.try_forall(&[bound], body).expect("forall");
+    let declared_eq_zero = solver.try_eq(declared, zero).expect("div = 0");
+    let assertion = solver
+        .try_and(quantified, declared_eq_zero)
+        .expect("retain declaration and quantifier");
+    solver.try_assert_term(assertion).expect("assert");
+
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let core_name = artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == declared.id())
+        .expect("div declaration")
+        .core_name
+        .clone();
+    assert!(core_name.starts_with("__ay_overload_"));
+
+    let mut quantified_capture = artifact.clone();
+    let quantifier = quantified_capture
+        .terms
+        .iter_mut()
+        .find(|node| node.id == quantified.id())
+        .expect("quantifier node");
+    let TermData::Forall(vars, _, _) = &mut quantifier.data else {
+        unreachable!();
+    };
+    vars[0].0.clone_from(&core_name);
+    let _ = Solver::replay_native_replay_artifact(&quantified_capture)
+        .expect("quantifier binder is alpha-renamed away from the live declaration core");
+
+    let mut let_capture = artifact;
+    let quantifier = let_capture
+        .terms
+        .iter_mut()
+        .find(|node| node.id == quantified.id())
+        .expect("quantifier node");
+    let TermData::Forall(_, quantified_body, _) = quantifier.data.clone() else {
+        unreachable!();
+    };
+    quantifier.data = TermData::Let(vec![(core_name, zero.id())], quantified_body);
+    let _ = Solver::replay_native_replay_artifact(&let_capture)
+        .expect("let binder is alpha-renamed away from the live declaration core");
+}
+
+#[test]
+fn native_replay_alpha_renames_binder_away_from_a_rebuilt_public_core_identity() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let declared = solver.declare_const("replay_rebuilt_capture", Sort::Int);
+    let bound = solver.fresh_var("replay_rebuilt_bound", Sort::Int);
+    let zero = solver.int_const(0);
+    // The source binder is intentionally unused. After the artifact's old
+    // private declaration core is remapped to the public replay core, changing
+    // the binder to that public name would capture this exact free declaration
+    // and turn a satisfiable formula into `forall x. x >= 0`.
+    let body = solver.try_ge(declared, zero).expect("declared >= 0");
+    let quantified = solver.try_forall(&[bound], body).expect("forall");
+    let declared_eq_zero = solver.try_eq(declared, zero).expect("declared = 0");
+    let assertion = solver
+        .try_and(quantified, declared_eq_zero)
+        .expect("retain declaration and quantifier");
+    solver.try_assert_term(assertion).expect("assert");
+
+    let mut artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let public_core = artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == declared.id())
+        .expect("ordinary declaration")
+        .core_name
+        .clone();
+    assert_eq!(public_core, "replay_rebuilt_capture");
+
+    // Model a valid artifact captured in a term store where this declaration
+    // was a later incarnation: its exported core is private, while replay in a
+    // fresh context rebuilds the same surface declaration at the public core.
+    let exported_private_core = "__ay_overload_999999".to_string();
+    let declaration = artifact
+        .declarations
+        .iter_mut()
+        .find(|declaration| declaration.term == declared.id())
+        .expect("ordinary declaration");
+    declaration.core_name.clone_from(&exported_private_core);
+    let declared_node = artifact
+        .terms
+        .iter_mut()
+        .find(|node| node.id == declared.id())
+        .expect("declared node");
+    let TermData::Var(name, _) = &mut declared_node.data else {
+        unreachable!();
+    };
+    name.clone_from(&exported_private_core);
+    let identity = artifact
+        .symbol_identities
+        .iter_mut()
+        .find(|identity| {
+            identity.surface_name == "replay_rebuilt_capture"
+                && identity.kind == NativeReplaySymbolKind::Uninterpreted
+                && identity.api_domain.is_empty()
+        })
+        .expect("ordinary identity row");
+    identity.core_name = exported_private_core;
+
+    let quantifier = artifact
+        .terms
+        .iter_mut()
+        .find(|node| node.id == quantified.id())
+        .expect("quantifier node");
+    let TermData::Forall(vars, _, _) = &mut quantifier.data else {
+        unreachable!();
+    };
+    vars[0].0 = public_core;
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("private-to-public declaration remap must not capture the binder");
+    assert!(
+        replay.result.is_sat(),
+        "the declaration remains free and fixed to zero; accidental capture would make forall x. x >= 0"
+    );
+}
+
+#[test]
+fn native_replay_preserves_a_declared_constant_used_as_a_bound_identity() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let bound = solver.declare_const("replay_declared_bound", Sort::Bool);
+    let quantified = solver.try_forall(&[bound], bound).expect("forall");
+    solver
+        .try_assert_term(quantified)
+        .expect("quantified assertion");
+
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let _ = Solver::replay_native_replay_artifact(&artifact).expect(
+        "the replay must contextually alpha-rename the captured declaration TermId instead of aliasing its live declaration",
+    );
 }
 
 #[test]
@@ -885,6 +1178,219 @@ fn native_replay_artifact_carries_checked_replay_proof_model_status() {
     let parsed =
         NativeReplayArtifact::from_json_str(&artifact.to_pretty_json()).expect("parse JSON");
     assert_eq!(parsed.checked_replay, artifact.checked_replay);
+}
+
+#[test]
+fn native_replay_evidence_requires_the_strict_typed_workflow() {
+    let artifact = boolean_sat_native_replay_artifact();
+    let identity = native_replay_evidence_identity(&artifact);
+
+    // Even a real replay result attached through the diagnostic convenience
+    // API cannot authorize compiler admission.
+    let diagnostic_replay = Solver::replay_native_replay_artifact(&artifact).expect("replay");
+    let diagnostic = artifact.clone().with_checked_replay(&diagnostic_replay);
+    let diagnostic_manifest = diagnostic.evidence_manifest_with_solver_identity(identity.clone());
+    assert!(!diagnostic_manifest.admitted());
+    assert!(diagnostic_manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("authoritative replay token is missing")));
+    let mut forged_diagnostic_manifest = diagnostic_manifest;
+    forged_diagnostic_manifest
+        .admission_rejection_reasons
+        .clear();
+    assert!(
+        !forged_diagnostic_manifest.admitted(),
+        "clearing public diagnostics must not mint admission authority"
+    );
+
+    let sealed = Solver::replay_native_replay_artifact_for_evidence(
+        artifact,
+        identity.clone(),
+        Duration::from_secs(5),
+    )
+    .expect("strict evidence replay");
+    assert_eq!(sealed.timeout_ms, Some(5_000));
+    let manifest = sealed.evidence_manifest();
+    assert!(
+        manifest.admitted(),
+        "typed evidence should admit: {:?}",
+        manifest.admission_rejection_reasons
+    );
+    assert_eq!(manifest.solver_identity, identity);
+    assert_eq!(manifest.checked_result, "checked-sat");
+
+    let mut mutated_body = manifest.clone();
+    mutated_body.checked_result = "checked-unsat".to_string();
+    assert!(
+        !mutated_body.admitted(),
+        "public manifest-body mutation must invalidate admission"
+    );
+    let mut mutated_digest = manifest;
+    mutated_digest.manifest_sha256 = "00".repeat(32);
+    assert!(
+        !mutated_digest.admitted(),
+        "public manifest digest mutation must invalidate admission"
+    );
+}
+
+#[test]
+fn native_replay_evidence_stale_details_and_json_summaries_are_non_authoritative() {
+    let artifact = boolean_sat_native_replay_artifact();
+    let identity = native_replay_evidence_identity(&artifact);
+
+    let mut unrelated_solver = Solver::try_new(Logic::QfUf).expect("unrelated solver");
+    let q = unrelated_solver.declare_const("unrelated_replay_q", Sort::Bool);
+    unrelated_solver.assert_term(q);
+    let unrelated_details = unrelated_solver.check_sat_with_details();
+    assert!(unrelated_details.result.is_sat());
+
+    let stale = artifact.clone().with_checked_replay(&unrelated_details);
+    assert!(!stale
+        .evidence_manifest_with_solver_identity(identity.clone())
+        .admitted());
+
+    let sealed = Solver::replay_native_replay_artifact_for_evidence(
+        artifact,
+        identity.clone(),
+        Duration::from_secs(5),
+    )
+    .expect("strict evidence replay");
+    let parsed = NativeReplayArtifact::from_json_str(&sealed.to_pretty_json())
+        .expect("parse diagnostic evidence JSON");
+    assert_eq!(parsed.checked_replay, sealed.checked_replay);
+    let parsed_manifest = parsed.evidence_manifest_with_solver_identity(identity);
+    assert!(!parsed_manifest.admitted());
+    assert!(parsed_manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("authoritative replay token is missing")));
+}
+
+#[test]
+fn native_replay_evidence_token_rejects_post_check_mutation() {
+    let artifact = boolean_sat_native_replay_artifact();
+    let identity = native_replay_evidence_identity(&artifact);
+    let sealed = Solver::replay_native_replay_artifact_for_evidence(
+        artifact,
+        identity,
+        Duration::from_secs(5),
+    )
+    .expect("strict evidence replay");
+
+    let mut metadata_mutation = sealed.clone();
+    metadata_mutation.metadata.notes = Some("changed after strict replay".to_string());
+    let metadata_manifest = metadata_mutation.evidence_manifest();
+    assert!(!metadata_manifest.admitted());
+    assert!(metadata_manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("full-artifact binding does not match")));
+
+    let mut summary_mutation = sealed;
+    summary_mutation
+        .checked_replay
+        .as_mut()
+        .expect("sealed summary")
+        .replay_model_status = "missing".to_string();
+    let summary_manifest = summary_mutation.evidence_manifest();
+    assert!(!summary_manifest.admitted());
+    assert!(summary_manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("checked-summary binding does not match")));
+}
+
+#[test]
+fn native_replay_evidence_rejects_noncurrent_solver_identity() {
+    let artifact = boolean_sat_native_replay_artifact();
+    let identity = native_replay_evidence_identity(&artifact);
+
+    let mut wrong_engine = identity.clone();
+    wrong_engine.engine.push_str(":forged");
+    assert!(matches!(
+        Solver::replay_native_replay_artifact_for_evidence(
+            artifact.clone(),
+            wrong_engine,
+            Duration::from_secs(5),
+        ),
+        Err(SolverError::InvalidArgument {
+            operation: "native_replay_for_evidence",
+            ..
+        })
+    ));
+
+    let mut wrong_revision = identity.clone();
+    wrong_revision.ay_revision.push_str("-stale");
+    assert!(Solver::replay_native_replay_artifact_for_evidence(
+        artifact.clone(),
+        wrong_revision,
+        Duration::from_secs(5),
+    )
+    .is_err());
+
+    let mut wrong_version = identity.clone();
+    wrong_version.ay_version.push_str("-stale");
+    assert!(Solver::replay_native_replay_artifact_for_evidence(
+        artifact.clone(),
+        wrong_version,
+        Duration::from_secs(5),
+    )
+    .is_err());
+
+    let mut malformed_hash = identity.clone();
+    malformed_hash.solver_binary_sha256 = Some("not-a-sha256".to_string());
+    assert!(Solver::replay_native_replay_artifact_for_evidence(
+        artifact.clone(),
+        malformed_hash,
+        Duration::from_secs(5),
+    )
+    .is_err());
+
+    let sealed = Solver::replay_native_replay_artifact_for_evidence(
+        artifact,
+        identity.clone(),
+        Duration::from_secs(5),
+    )
+    .expect("strict evidence replay");
+    let mut substituted_identity = identity;
+    substituted_identity.solver_binary_sha256 = Some("cd".repeat(32));
+    let manifest = sealed.evidence_manifest_with_solver_identity(substituted_identity);
+    assert!(!manifest.admitted());
+    assert!(manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("solver identity binding does not match")));
+}
+
+#[test]
+fn native_replay_evidence_rejects_legacy_identity_tables() {
+    let mut artifact = boolean_sat_native_replay_artifact();
+    let identity = native_replay_evidence_identity(&artifact);
+    artifact.symbol_identities.clear();
+
+    assert!(matches!(
+        Solver::replay_native_replay_artifact_for_evidence(
+            artifact.clone(),
+            identity.clone(),
+            Duration::from_secs(5),
+        ),
+        Err(SolverError::InvalidArgument {
+            operation: "native_replay_for_evidence",
+            ..
+        })
+    ));
+
+    // Legacy public-name replay remains available for diagnostics, but its
+    // caller-attached summary cannot be promoted to compiler authority.
+    let replay = Solver::replay_native_replay_artifact(&artifact).expect("diagnostic replay");
+    let diagnostic = artifact.with_checked_replay(&replay);
+    let manifest = diagnostic.evidence_manifest_with_solver_identity(identity);
+    assert!(!manifest.admitted());
+    assert!(manifest
+        .admission_rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("authenticated symbol identity table")));
 }
 
 #[test]
@@ -1132,6 +1638,210 @@ fn native_replay_preserves_datatype_semantics_in_memory_and_json() {
 }
 
 #[test]
+fn native_replay_remaps_interleaved_private_function_identities() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+
+    // All three declarations collide with canonical arithmetic operator
+    // spellings. The middle constant is unreachable and therefore sliced from
+    // the artifact, so the retained function receives a different allocator
+    // suffix in the replay context even though declaration order is preserved.
+    let div = solver.declare_const("div", Sort::Int);
+    let _unused_allocator_slot = solver.declare_const("abs", Sort::Int);
+    let modulo = solver
+        .try_declare_fun("mod", &[Sort::Int], Sort::Int)
+        .expect("declare colliding function");
+    let applied = solver.try_apply(&modulo, &[div]).expect("apply mod");
+
+    // Exercise identities embedded in higher-order array wrappers as well as
+    // an ordinary Named application head.
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let source = solver.declare_const("replay_private_source", array_sort.clone());
+    let as_array = solver.as_array(modulo.core_name(), array_sort.clone());
+    let mapped = solver.array_map(modulo.core_name(), &[source], array_sort);
+    // Select eagerly rewrites both wrappers to direct applications, so retain
+    // the wrapper nodes themselves through an array equality and its negation.
+    // This is propositionally UNSAT and therefore does not depend on the
+    // intentionally incomplete model validation for function-backed arrays.
+    // Keep the direct Named application rooted by a separate scalar assertion.
+    let wrappers_equal = solver.try_eq(as_array, mapped).expect("wrapper equality");
+    let wrappers_not_equal = solver
+        .try_not(wrappers_equal)
+        .expect("negated wrapper equality");
+    let zero = solver.int_const(0);
+    let applied_is_zero = solver.try_eq(applied, zero).expect("application value");
+    solver.try_assert_term(wrappers_equal).expect("assert");
+    solver.try_assert_term(wrappers_not_equal).expect("assert");
+    solver.try_assert_term(applied_is_zero).expect("assert");
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_unsat());
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let div_core = &artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "div")
+        .expect("div declaration")
+        .core_name;
+    let mod_declaration = artifact
+        .function_declarations
+        .iter()
+        .find(|declaration| declaration.name == "mod")
+        .expect("mod declaration");
+    assert!(artifact
+        .declarations
+        .iter()
+        .all(|declaration| declaration.name != "abs"));
+    assert!(div_core.starts_with("__ay_overload_"));
+    assert!(mod_declaration.core_name.starts_with("__ay_overload_"));
+    assert_ne!(div_core, &mod_declaration.core_name);
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(
+            &node.data,
+            TermData::App(Symbol::Named(name), _)
+                if name == &format!("as-array[{}]", mod_declaration.core_name)
+        )
+    }));
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(
+            &node.data,
+            TermData::App(Symbol::Named(name), _)
+                if name == &format!("map[{}]", mod_declaration.core_name)
+        )
+    }));
+
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("interleaved private function replay");
+    assert!(replay.result.result().is_unsat());
+    let replay_from_json = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("interleaved private function JSON replay");
+    assert!(replay_from_json.result.result().is_unsat());
+}
+
+#[test]
+fn native_replay_remaps_interleaved_private_datatype_member_identities() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+
+    // A constant and function intentionally use the same public spellings as
+    // later datatype constructors. Replaying the datatype first would make
+    // the earlier overloads impossible to reconstruct, so declaration-event
+    // order is semantic here, independently of allocator suffix remapping.
+    let modulo_value = solver.declare_const("mod", Sort::Int);
+    let absolute = solver
+        .try_declare_fun("abs", &[Sort::Bool], Sort::Int)
+        .expect("declare member-surface overload");
+    let operation = DatatypeSort::new(
+        "ReplayPrivateOperation",
+        vec![
+            DatatypeConstructor::unit("mod"),
+            DatatypeConstructor::new("abs", vec![DatatypeField::new("min", Sort::Int)]),
+        ],
+    );
+    solver
+        .try_declare_datatype(&operation)
+        .expect("declare colliding datatype");
+    let unit = solver.datatype_constructor(&operation, "mod", &[]);
+    let boxed = solver.datatype_constructor(&operation, "abs", &[modulo_value]);
+    let selected = solver.datatype_selector("min", boxed, Sort::Int);
+    let unit_is_mod = solver.datatype_tester("mod", unit);
+    let boxed_is_abs = solver.datatype_tester("abs", boxed);
+    let selected_is_value = solver.try_eq(selected, modulo_value).expect("selector law");
+    let true_value = solver.bool_const(true);
+    let absolute_true = solver
+        .try_apply(&absolute, &[true_value])
+        .expect("apply member-surface overload");
+    let zero = solver.int_const(0);
+    let absolute_true_is_zero = solver.try_eq(absolute_true, zero).expect("overload value");
+    let unit_is_not_mod = solver.try_not(unit_is_mod).expect("negated tester law");
+    let boxed_is_not_abs = solver.try_not(boxed_is_abs).expect("negated tester law");
+    let selected_is_not_value = solver
+        .try_not(selected_is_value)
+        .expect("negated selector law");
+    solver
+        .try_assert_term(absolute_true_is_zero)
+        .expect("assert");
+    solver.try_assert_term(unit_is_not_mod).expect("assert");
+    solver.try_assert_term(boxed_is_not_abs).expect("assert");
+    solver
+        .try_assert_term(selected_is_not_value)
+        .expect("assert");
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_unsat());
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let constant_core = &artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "mod")
+        .expect("constant overload")
+        .core_name;
+    let function_core = &artifact
+        .function_declarations
+        .iter()
+        .find(|declaration| declaration.name == "abs")
+        .expect("function overload")
+        .core_name;
+    let datatype_rows: Vec<_> = artifact
+        .symbol_identities
+        .iter()
+        .filter(|identity| identity.datatype_surface.as_deref() == Some("ReplayPrivateOperation"))
+        .collect();
+    assert_eq!(datatype_rows.len(), 5);
+    assert!(datatype_rows.iter().all(|identity| {
+        identity.core_name.starts_with("__ay_overload_")
+            || identity.core_name.starts_with("is-__ay_overload_")
+    }));
+    let constructor_mod = datatype_rows
+        .iter()
+        .find(|identity| {
+            identity.surface_name == "mod"
+                && identity.kind == NativeReplaySymbolKind::DatatypeConstructor
+        })
+        .expect("mod constructor identity");
+    let constructor_abs = datatype_rows
+        .iter()
+        .find(|identity| {
+            identity.surface_name == "abs"
+                && identity.kind == NativeReplaySymbolKind::DatatypeConstructor
+        })
+        .expect("abs constructor identity");
+    assert_ne!(constant_core, &constructor_mod.core_name);
+    assert_ne!(function_core, &constructor_abs.core_name);
+    assert!(artifact.terms.iter().any(|node| {
+        node.is_datatype_constructor
+            && matches!(
+                &node.data,
+                TermData::Var(name, _) if name.starts_with("__ay_overload_")
+            )
+    }));
+
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("interleaved private datatype replay");
+    assert!(replay.result.result().is_unsat());
+    let replay_from_json = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("interleaved private datatype JSON replay");
+    assert!(replay_from_json.result.result().is_unsat());
+
+    let mut unmapped_private_carrier = artifact.clone();
+    let scalar = unmapped_private_carrier
+        .terms
+        .iter_mut()
+        .find(|node| matches!(&node.data, TermData::Const(Constant::Int(_))))
+        .expect("integer constant node");
+    scalar.sort = Sort::Uninterpreted("__ay_datatype_sort_999998".to_string());
+    assert_native_replay_rejected(&unmapped_private_carrier);
+
+    let mut forged_carrier = artifact;
+    for identity in &mut forged_carrier.symbol_identities {
+        if identity.datatype_surface.as_deref() == Some("ReplayPrivateOperation") {
+            identity.datatype_core = Some("__ay_datatype_sort_999999".to_string());
+        }
+    }
+    assert_native_replay_rejected(&forged_carrier);
+}
+
+#[test]
 fn native_replay_exports_only_active_term_dependencies() {
     let mut solver = Solver::try_new(Logic::QfLia).expect("solver");
     let active = solver.declare_const("active", Sort::Int);
@@ -1146,12 +1856,12 @@ fn native_replay_exports_only_active_term_dependencies() {
     let details = solver.check_sat_with_details();
     let artifact =
         solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
-    assert!(artifact.terms.iter().all(|node| node.id != dead.0));
-    assert!(artifact.terms.iter().all(|node| node.id != dead_sum.0));
+    assert!(artifact.terms.iter().all(|node| node.id != dead.id()));
+    assert!(artifact.terms.iter().all(|node| node.id != dead_sum.id()));
     assert!(artifact
         .declarations
         .iter()
-        .all(|declaration| declaration.term != dead.0));
+        .all(|declaration| declaration.term != dead.id()));
 
     let replay = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
         .expect("dependency-sliced JSON replay");
@@ -1188,13 +1898,13 @@ fn native_replay_distinguishes_fresh_vars_shadowing_nullary_constructors() {
     let shadow_node = artifact
         .terms
         .iter()
-        .find(|node| node.id == shadow.0)
+        .find(|node| node.id == shadow.id())
         .expect("shadow node");
     assert!(!shadow_node.is_datatype_constructor);
     let red_node = artifact
         .terms
         .iter()
-        .find(|node| node.id == red.0)
+        .find(|node| node.id == red.id())
         .expect("constructor node");
     assert!(red_node.is_datatype_constructor);
 
@@ -1207,6 +1917,88 @@ fn native_replay_distinguishes_fresh_vars_shadowing_nullary_constructors() {
         replay.unknown_reason,
         replay.executor_error
     );
+
+    // A flag-false free variable is not allowed to reuse the live constructor
+    // core spelling. The datatype engines key constructors by that identity;
+    // accepting this mutation would silently turn the fresh value into Red.
+    let mut collision = artifact;
+    let shadow_core = collision
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == shadow.id())
+        .expect("shadow declaration")
+        .core_name
+        .clone();
+    let constructor_core = collision
+        .symbol_identities
+        .iter()
+        .find(|identity| {
+            identity.surface_name == "ShadowRed"
+                && identity.kind == NativeReplaySymbolKind::DatatypeConstructor
+        })
+        .expect("constructor identity")
+        .core_name
+        .clone();
+    collision
+        .declarations
+        .retain(|declaration| declaration.term != shadow.id());
+    collision.events.retain(|event| {
+        !matches!(
+            &event.kind,
+            NativeReplayEventKind::DeclareConst { term, .. } if *term == shadow.id()
+        )
+    });
+    collision.symbol_identities.retain(|identity| {
+        !(identity.kind == NativeReplaySymbolKind::Uninterpreted
+            && identity.core_name == shadow_core)
+    });
+    let shadow_node = collision
+        .terms
+        .iter_mut()
+        .find(|node| node.id == shadow.id())
+        .expect("shadow node");
+    let TermData::Var(name, _) = &mut shadow_node.data else {
+        unreachable!();
+    };
+    name.clone_from(&constructor_core);
+    assert!(!shadow_node.is_datatype_constructor);
+    assert_native_replay_rejected(&collision);
+}
+
+#[test]
+fn native_replay_rejects_forged_constructor_flag_targeting_an_ordinary_constant() {
+    let mut solver = Solver::try_new(Logic::QfUf).expect("solver");
+    let declared = solver.declare_const("replay_not_a_constructor", Sort::Bool);
+    let fresh = solver.fresh_var("replay_independent_fresh", Sort::Bool);
+    let distinct = solver
+        .try_eq(declared, fresh)
+        .and_then(|equal| solver.try_not(equal))
+        .expect("declared != fresh");
+    solver.try_assert_term(distinct).expect("assert");
+    let details = solver.check_sat_with_details();
+    assert!(details.result.is_sat());
+
+    let mut artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let declared_core = artifact
+        .declarations
+        .iter()
+        .find(|declaration| declaration.term == declared.id())
+        .expect("declared constant")
+        .core_name
+        .clone();
+    let fresh_node = artifact
+        .terms
+        .iter_mut()
+        .find(|node| node.id == fresh.id())
+        .expect("fresh node");
+    let TermData::Var(name, _) = &mut fresh_node.data else {
+        panic!("fresh term must be a Var");
+    };
+    *name = declared_core;
+    fresh_node.is_datatype_constructor = true;
+
+    assert_native_replay_rejected(&artifact);
 }
 
 #[test]

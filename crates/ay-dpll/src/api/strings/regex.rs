@@ -29,12 +29,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_to_re(&mut self, s: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.to_re", s)?;
         self.expect_string("str.to_re", s)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.to_re"),
-            vec![s.0],
-            Sort::RegLan,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("str.to_re"), vec![s_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Test string membership in a regex (`str.in_re`), returning Bool.
@@ -52,13 +52,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if sorts are wrong.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_str_in_re(&mut self, s: Term, re: Term) -> Result<Term, SolverError> {
+        let s_id = self.resolve_term("str.in_re", s)?;
+        let re_id = self.resolve_term("str.in_re", re)?;
         self.expect_string("str.in_re", s)?;
         self.expect_reglan("str.in_re", re)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("str.in_re"),
-            vec![s.0, re.0],
-            Sort::Bool,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("str.in_re"), vec![s_id, re_id], Sort::Bool);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the Kleene star of a regex (`re.*`), returning RegLan.
@@ -76,12 +77,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_star(&mut self, re: Term) -> Result<Term, SolverError> {
+        let re_id = self.resolve_term("re.*", re)?;
         self.expect_reglan("re.*", re)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.*"),
-            vec![re.0],
-            Sort::RegLan,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.*"), vec![re_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the Kleene plus of a regex (`re.+`), returning RegLan.
@@ -99,12 +100,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_plus(&mut self, re: Term) -> Result<Term, SolverError> {
+        let re_id = self.resolve_term("re.+", re)?;
         self.expect_reglan("re.+", re)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.+"),
-            vec![re.0],
-            Sort::RegLan,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.+"), vec![re_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the union of two regexes (`re.union`), returning RegLan.
@@ -122,13 +123,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_union(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("re.union", a)?;
+        let b_id = self.resolve_term("re.union", b)?;
         self.expect_reglan("re.union", a)?;
         self.expect_reglan("re.union", b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.union"),
-            vec![a.0, b.0],
-            Sort::RegLan,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("re.union"), vec![a_id, b_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the concatenation of two regexes (`re.++`), returning RegLan.
@@ -146,13 +148,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_concat(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("re.++", a)?;
+        let b_id = self.resolve_term("re.++", b)?;
         self.expect_reglan("re.++", a)?;
         self.expect_reglan("re.++", b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.++"),
-            vec![a.0, b.0],
-            Sort::RegLan,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("re.++"), vec![a_id, b_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the optional regex (`re.opt`, matches the empty string or the
@@ -171,12 +174,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_opt(&mut self, re: Term) -> Result<Term, SolverError> {
+        let re_id = self.resolve_term("re.opt", re)?;
         self.expect_reglan("re.opt", re)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.opt"),
-            vec![re.0],
-            Sort::RegLan,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.opt"), vec![re_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the complement regex (`re.comp`, matches every string the
@@ -195,12 +198,12 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_comp(&mut self, re: Term) -> Result<Term, SolverError> {
+        let re_id = self.resolve_term("re.comp", re)?;
         self.expect_reglan("re.comp", re)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.comp"),
-            vec![re.0],
-            Sort::RegLan,
-        )))
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.comp"), vec![re_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the intersection of two regexes (`re.inter`), returning RegLan.
@@ -218,13 +221,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_inter(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("re.inter", a)?;
+        let b_id = self.resolve_term("re.inter", b)?;
         self.expect_reglan("re.inter", a)?;
         self.expect_reglan("re.inter", b)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.inter"),
-            vec![a.0, b.0],
-            Sort::RegLan,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("re.inter"), vec![a_id, b_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the range regex (`re.range`) over two single-character strings,
@@ -243,13 +247,14 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if either argument is not `String`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_range(&mut self, lo: Term, hi: Term) -> Result<Term, SolverError> {
+        let lo_id = self.resolve_term("re.range", lo)?;
+        let hi_id = self.resolve_term("re.range", hi)?;
         self.expect_string("re.range", lo)?;
         self.expect_string("re.range", hi)?;
-        Ok(Term(self.terms_mut().mk_app(
-            Symbol::named("re.range"),
-            vec![lo.0, hi.0],
-            Sort::RegLan,
-        )))
+        let result =
+            self.terms_mut()
+                .mk_app(Symbol::named("re.range"), vec![lo_id, hi_id], Sort::RegLan);
+        Ok(self.wrap_term(result))
     }
 
     /// Create the bounded-repetition regex (`(_ re.loop lo hi) re`), matching
@@ -269,35 +274,37 @@ impl Solver {
     /// Returns [`SolverError::SortMismatch`] if the argument is not `RegLan`.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_re_loop(&mut self, re: Term, lo: u32, hi: u32) -> Result<Term, SolverError> {
+        let re_id = self.resolve_term("re.loop", re)?;
         self.expect_reglan("re.loop", re)?;
-        Ok(Term(self.terms_mut().mk_app(
+        let result = self.terms_mut().mk_app(
             Symbol::indexed("re.loop", vec![lo, hi]),
-            vec![re.0],
+            vec![re_id],
             Sort::RegLan,
-        )))
+        );
+        Ok(self.wrap_term(result))
     }
 
     /// Create the empty-language regex (`re.none`), returning RegLan.
     pub fn re_none(&mut self) -> Term {
-        Term(
-            self.terms_mut()
-                .mk_app(Symbol::named("re.none"), vec![], Sort::RegLan),
-        )
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.none"), vec![], Sort::RegLan);
+        self.wrap_term(result)
     }
 
     /// Create the universal-language regex (`re.all`), returning RegLan.
     pub fn re_all(&mut self) -> Term {
-        Term(
-            self.terms_mut()
-                .mk_app(Symbol::named("re.all"), vec![], Sort::RegLan),
-        )
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.all"), vec![], Sort::RegLan);
+        self.wrap_term(result)
     }
 
     /// Create the any-single-character regex (`re.allchar`), returning RegLan.
     pub fn re_allchar(&mut self) -> Term {
-        Term(
-            self.terms_mut()
-                .mk_app(Symbol::named("re.allchar"), vec![], Sort::RegLan),
-        )
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named("re.allchar"), vec![], Sort::RegLan);
+        self.wrap_term(result)
     }
 }

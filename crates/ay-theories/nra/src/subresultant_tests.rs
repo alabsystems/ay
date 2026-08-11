@@ -367,7 +367,8 @@ fn prs_refuses_equal_degrees_and_psc_chain_falls_back() {
     // Res(a2x^2+a1x+a0, b2x^2+b1x+b0)
     //   = (a2 b0 - a0 b2)^2 - (a2 b1 - a1 b2)(a1 b0 - a0 b1)
     // f: a2=3,a1=2,a0=1 ; g: b2=1,b1=-1,b0=2
-    let expect = (3 * 2 - 1 * 1i64).pow(2) - (3 * -1 - 2 * 1) * (2 * 2 - 1 * -1);
+    let (a2, a1, a0, b2, b1, b0) = (3i64, 2, 1, 1, -1, 2);
+    let expect = (a2 * b0 - a0 * b2).pow(2) - (a2 * b1 - a1 * b2) * (a1 * b0 - a0 * b1);
     assert_eq!(resultant(&f, &g), Some(zi(expect)));
 }
 
@@ -424,7 +425,7 @@ fn randomized_prs_versus_spec_with_forced_gaps() {
         let dn = 1 + (rng.next_u64() % (dm as u64 - 1)) as usize; // 1..=dm-1
         let mut fc: Vec<BigInt> = (0..=dm)
             .map(|_| {
-                if rng.next_u64() % 2 == 0 {
+                if rng.next_u64().is_multiple_of(2) {
                     zi(0)
                 } else {
                     zi(rng.next_i64(3))
@@ -433,7 +434,7 @@ fn randomized_prs_versus_spec_with_forced_gaps() {
             .collect();
         let mut gc: Vec<BigInt> = (0..=dn)
             .map(|_| {
-                if rng.next_u64() % 2 == 0 {
+                if rng.next_u64().is_multiple_of(2) {
                     zi(0)
                 } else {
                     zi(rng.next_i64(3))

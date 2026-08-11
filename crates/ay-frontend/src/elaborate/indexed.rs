@@ -86,9 +86,10 @@ impl Context {
                     _ => None,
                 };
                 let is_sole_ctor = dt_name.as_deref().is_some_and(|dt| {
-                    self.datatypes
-                        .get(dt)
-                        .is_some_and(|ctors| ctors.len() == 1 && ctors[0] == *ctor_name)
+                    self.datatypes.get(dt).is_some_and(|ctors| {
+                        ctors.len() == 1
+                            && self.dt_surface_name(&ctors[0]).unwrap_or(&ctors[0]) == ctor_name
+                    })
                 });
                 if is_sole_ctor {
                     return Ok(self.terms.true_term());
@@ -287,7 +288,10 @@ impl Context {
                 let mut owner: Option<(String, Vec<(String, Sort)>)> = None;
                 for c in &ctor_names {
                     if let Some(fields) = self.constructor_selector_info(c) {
-                        if fields.iter().any(|(fname, _)| fname == sel) {
+                        if fields
+                            .iter()
+                            .any(|(fname, _)| self.dt_surface_name(fname).unwrap_or(fname) == sel)
+                        {
                             owner = Some((c.clone(), fields.to_vec()));
                             break;
                         }
@@ -303,7 +307,7 @@ impl Context {
                 let value_sort = self.terms.sort(value).clone();
                 let sel_sort = fields
                     .iter()
-                    .find(|(f, _)| f == sel)
+                    .find(|(f, _)| self.dt_surface_name(f).unwrap_or(f) == sel)
                     .map(|(_, s)| s.clone());
                 if sel_sort.as_ref() != Some(&value_sort) {
                     return Err(ElaborateError::SortMismatch {
@@ -315,7 +319,7 @@ impl Context {
                 // field is taken from `record` via its selector.
                 let mut field_args: Vec<TermId> = Vec::with_capacity(fields.len());
                 for (fname, fsort) in &fields {
-                    if fname == sel {
+                    if self.dt_surface_name(fname).unwrap_or(fname) == sel {
                         field_args.push(value);
                     } else {
                         field_args.push(self.terms.mk_app(
@@ -848,7 +852,7 @@ impl Context {
                 return Ok(existing);
             }
         }
-        let surface = surface_sort(sort).ok_or_else(|| {
+        let surface = self.surface_sort(sort).ok_or_else(|| {
             ElaborateError::Unsupported(format!(
                 "special relation (_ {kind} {id}) over sort {sort} is not supported"
             ))
@@ -860,18 +864,20 @@ impl Context {
         self.track_scoped_symbol(&pred);
         self.symbols.insert(
             pred.clone(),
-            SymbolInfo {
-                term: None,
-                sort: Sort::Bool,
-                arg_sorts: vec![sort.clone(), sort.clone()],
-                public_sort: super::PublicSort::Core(Sort::Bool),
-                public_arg_sorts: vec![
-                    super::PublicSort::from_engine(&sort),
-                    super::PublicSort::from_engine(&sort),
+            SymbolInfo::fresh(
+                None,
+                Sort::Bool,
+                vec![sort.clone(), sort.clone()],
+                super::PublicSort::Core(Sort::Bool),
+                vec![
+                    super::PublicSort::from_engine(sort),
+                    super::PublicSort::from_engine(sort),
                 ],
-                internal_name: None,
-            },
+                None,
+                super::DeclarationKind::SolverInternal,
+            ),
         );
+        self.advance_source_revision();
         // Assert the property axioms through the surface path so `assertions` and
         // `assertions_parsed` stay aligned and the axioms are push/pop-scoped
         // exactly like the predicate symbol.
@@ -1029,26 +1035,6 @@ fn integerize_pb_parameters(
         .fold(BigInt::from(1), |product, value| product * value.denom());
     let scaled = |value: &BigRational| value.numer() * (&scale / value.denom());
     (coefficients.iter().map(scaled).collect(), scaled(bound))
-}
-
-/// Map an elaborated argument sort back to the surface sort that round-trips
-/// through `elaborate_sort`, for the sorts a special relation can range over.
-///
-/// Returns `None` (fail-closed) for sorts without a faithful one-liner surface
-/// form here — the caller then rejects the special relation as unsupported
-/// rather than mis-encoding it. Covers the scalar sorts plus the declared
-/// uninterpreted/datatype sorts that name themselves (Verus's `Height` is a
-/// declared sort, so it lands in the `Uninterpreted`/`Datatype` arm).
-fn surface_sort(sort: &Sort) -> Option<CmdSort> {
-    Some(match sort {
-        Sort::Bool => CmdSort::Simple("Bool".to_string()),
-        Sort::Int => CmdSort::Simple("Int".to_string()),
-        Sort::Real => CmdSort::Simple("Real".to_string()),
-        Sort::String => CmdSort::Simple("String".to_string()),
-        Sort::Uninterpreted(name) => CmdSort::Simple(name.clone()),
-        Sort::Datatype(dt) => CmdSort::Simple(dt.name.clone()),
-        _ => return None,
-    })
 }
 
 /// The property axioms for special relation `kind` over predicate `pred`

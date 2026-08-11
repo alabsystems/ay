@@ -458,7 +458,10 @@ fn main() {
 /// gigabytes not). Decompressing through the system `gzip` keeps the engine crate free of
 /// a compression dependency for the sake of a measurement example.
 fn read_maybe_gz(path: &str) -> std::io::Result<String> {
-    if !path.ends_with(".gz") {
+    if !path
+        .get(path.len().saturating_sub(3)..)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(".gz"))
+    {
         return std::fs::read_to_string(path);
     }
     let out = std::process::Command::new("gzip")

@@ -12,6 +12,13 @@ fn test_linear_creation() {
 }
 
 #[test]
+fn minimum_i128_divided_by_negative_one_clamps_exactly() {
+    let value = ExactInteger::Small(i128::MIN);
+    assert_eq!(value.exact_quotient_i64(-1), None);
+    assert_eq!(value.linear_bound(-1), i64::MAX);
+}
+
+#[test]
 fn test_linear_detects_infeasible() {
     let mut trail = IntegerTrail::new();
     let x = trail.register(10, 20); // min contribution: 10

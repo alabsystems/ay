@@ -10,10 +10,12 @@ use ay_cp::variable::IntVarId;
 use ay_cp::Domain;
 use ay_flatzinc_parser::ast::{ConstraintItem, Expr};
 
-use super::CpContext;
+use super::numeric::{encoding_i64, linear_encoding_overflow};
+use super::{validate_constraint_arity, CpContext};
 
 impl CpContext {
     pub(super) fn translate_constraint(&mut self, c: &ConstraintItem) -> Result<()> {
+        validate_constraint_arity(c)?;
         match c.id.as_str() {
             "int_eq" | "int_ne" | "int_lt" | "int_le" | "int_gt" | "int_ge" | "bool_lt"
             | "bool_le" | "bool_gt" | "bool_ge" => {
@@ -216,7 +218,7 @@ impl CpContext {
                     rhs: 0,
                 });
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "integer comparison")),
         }
         Ok(())
     }
@@ -224,6 +226,7 @@ impl CpContext {
     fn translate_int_linear(&mut self, c: &ConstraintItem) -> Result<()> {
         let mut coeffs = self.resolve_const_int_array(&c.args[0])?;
         let mut vars = self.resolve_var_array(&c.args[1])?;
+        self.validate_linear_array_lengths(c, coeffs.len(), vars.len())?;
         // RHS can be a constant or a variable. If variable, move to LHS with coeff -1.
         let rhs = if let Some(k) = self.eval_const_int(&c.args[2]) {
             k
@@ -242,9 +245,31 @@ impl CpContext {
                 self.engine
                     .add_constraint(Constraint::LinearLe { coeffs, vars, rhs });
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "integer linear")),
         }
         Ok(())
+    }
+
+    /// Validate the parallel arrays used by every FlatZinc linear constraint.
+    ///
+    /// ay-cp deliberately asserts this invariant in its low-level propagator
+    /// constructors. FlatZinc is untrusted input, so translators must turn a
+    /// violation into a typed parse/translation error instead of a panic (or
+    /// silently truncating through `zip`).
+    pub(super) fn validate_linear_array_lengths(
+        &self,
+        c: &ConstraintItem,
+        coefficients: usize,
+        variables: usize,
+    ) -> Result<()> {
+        if coefficients == variables {
+            return Ok(());
+        }
+        Err(Fzn2smtError::LinearArrayLengthMismatch {
+            constraint: c.id.clone(),
+            coefficients,
+            variables,
+        })
     }
 
     fn translate_int_arithmetic(&mut self, c: &ConstraintItem) -> Result<()> {
@@ -281,7 +306,7 @@ impl CpContext {
                     rhs: 0,
                 });
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "integer arithmetic")),
         }
         Ok(())
     }
@@ -310,7 +335,7 @@ impl CpContext {
             "bool_and" => self.translate_bool_and(c)?,
             "bool_or" => self.translate_bool_or(c)?,
             "bool_clause" => self.translate_bool_clause(c)?,
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "boolean")),
         }
         Ok(())
     }
@@ -393,7 +418,7 @@ impl CpContext {
         // In {0,1}: sum(pos) - sum(neg) >= 1 - L
         let pos = self.resolve_var_array(&c.args[0])?;
         let neg = self.resolve_var_array(&c.args[1])?;
-        let neg_len = neg.len() as i64;
+        let neg_len = i64::try_from(neg.len()).map_err(|_| linear_encoding_overflow(&c.id))?;
         let mut coeffs = vec![1i64; pos.len()];
         coeffs.extend(vec![-1i64; neg.len()]);
         let mut vars = pos;
@@ -401,7 +426,7 @@ impl CpContext {
         self.engine.add_constraint(Constraint::LinearGe {
             coeffs,
             vars,
-            rhs: 1 - neg_len,
+            rhs: encoding_i64(1 - i128::from(neg_len), &c.id)?,
         });
         Ok(())
     }
@@ -409,7 +434,7 @@ impl CpContext {
     fn translate_array_boolean(&mut self, c: &ConstraintItem) -> Result<()> {
         let bools = self.resolve_var_array(&c.args[0])?;
         let result = self.resolve_var(&c.args[1])?;
-        let n = bools.len() as i64;
+        let n = i64::try_from(bools.len()).map_err(|_| linear_encoding_overflow(&c.id))?;
 
         match c.id.as_str() {
             "array_bool_and" => {
@@ -450,7 +475,7 @@ impl CpContext {
                     rhs: 0,
                 });
             }
-            _ => unreachable!(),
+            _ => return Err(invalid_constraint_route(c, "array boolean")),
         }
         Ok(())
     }
@@ -468,7 +493,7 @@ impl CpContext {
         }
         // ay-cp Element is zero-indexed; named FlatZinc arrays retain their
         // declared lower bound, while inline literals start at one.
-        let n = array.len() as i64;
+        let n = i64::try_from(array.len()).map_err(|_| linear_encoding_overflow(&c.id))?;
         let index_0 = self.engine.new_int_var(Domain::new(0, n - 1), None);
         self.engine.add_constraint(Constraint::LinearEq {
             coeffs: vec![1, -1],
@@ -689,4 +714,11 @@ fn fixed_array_slot_key(name: &str, index: i64) -> String {
 
 fn is_array_access(expr: &Expr) -> bool {
     matches!(expr, Expr::ArrayAccess(_, _))
+}
+
+fn invalid_constraint_route(c: &ConstraintItem, translator: &'static str) -> Fzn2smtError {
+    Fzn2smtError::InvalidConstraintRoute {
+        constraint: c.id.clone(),
+        translator,
+    }
 }

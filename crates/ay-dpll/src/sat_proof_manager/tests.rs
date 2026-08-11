@@ -4,7 +4,7 @@
 
 use super::derivation::SatClauseVersion;
 use super::*;
-use ay_core::{Sort, TermStore};
+use ay_core::{Sort, Symbol, TermStore};
 use ay_sat::{ClauseTrace, Literal, Variable};
 
 fn setup_test_terms() -> (TermStore, HashMap<u32, TermId>, HashMap<TermId, TermId>) {
@@ -578,7 +578,7 @@ fn test_add_original_clause_step_preserves_nested_or_literal() {
     let Some(ProofStep::Assume(or_term)) = proof.get_step(premises[0]) else {
         panic!("expected Or premise to be an assumption");
     };
-    let TermData::App(ay_core::Symbol::Named(name), children) = terms.get(*or_term) else {
+    let TermData::App(Symbol::Named(name), children) = terms.get(*or_term) else {
         panic!("expected assumed term to be an or application");
     };
     assert_eq!(name, "or");
@@ -679,7 +679,7 @@ fn test_add_original_clause_step_preserves_duplicate_literal() {
     let Some(ProofStep::Assume(or_term)) = proof.get_step(premises[0]) else {
         panic!("expected Or premise to be an assumption");
     };
-    let TermData::App(ay_core::Symbol::Named(name), children) = terms.get(*or_term) else {
+    let TermData::App(Symbol::Named(name), children) = terms.get(*or_term) else {
         panic!("expected assumed term to be an or application");
     };
     assert_eq!(name, "or");
@@ -955,6 +955,395 @@ fn test_add_original_clause_step_or_neg_puts_source_first() {
         panic!("expected or_neg tautology step");
     };
     assert_eq!(emitted_clause, &vec![or_term, not_d0]);
+}
+
+#[test]
+fn exact_original_fragment_binds_indexed_clausification_by_id() {
+    use ay_core::ClausificationProof;
+
+    let (mut terms, mut var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let source = terms.mk_and(vec![p, q]);
+    var_to_term.insert(2, source);
+
+    let annotations = vec![Some(ClausificationProof {
+        rule: AletheRule::AndPos(0),
+        source_term: source,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(
+        1,
+        vec![
+            Literal::positive(Variable::new(0)),
+            Literal::negative(Variable::new(2)),
+        ],
+        true,
+    );
+
+    let fragment = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_clausification_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[])
+            .expect("the indexed annotation proves this exact clause")
+    };
+
+    let binding = fragment.bindings.get(&1).expect("binding for ID 1");
+    assert_eq!(binding.proof_id, ProofId(0));
+    assert_eq!(fragment.proof.len(), 1);
+    let Some(ProofStep::Step {
+        rule: AletheRule::AndPos(0),
+        clause,
+        premises,
+        ..
+    }) = fragment.proof.get_step(binding.proof_id)
+    else {
+        panic!("expected an exact and_pos step");
+    };
+    assert!(premises.is_empty());
+    assert_eq!(binding.clause, SatProofManager::normalize_clause(clause));
+}
+
+#[test]
+fn exact_original_fragment_charges_full_clausification_source_before_clone() {
+    use ay_core::ClausificationProof;
+
+    let (mut terms, mut var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    // Build the raw repeated-edge form deliberately: `mk_and` canonicalizes
+    // duplicate operands, while this regression targets the proof builder's
+    // cost of cloning the untrusted source application payload.
+    let source = terms.mk_app(Symbol::named("and"), vec![p; 4096], Sort::Bool);
+    var_to_term.insert(2, source);
+    let annotations = vec![Some(ClausificationProof {
+        rule: AletheRule::AndPos(0),
+        source_term: source,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(
+        1,
+        vec![
+            Literal::positive(Variable::new(0)),
+            Literal::negative(Variable::new(2)),
+        ],
+        true,
+    );
+
+    let mut consumed_work = 0usize;
+    let mut progress = |work: usize, _bytes: usize| {
+        let actual = consumed_work.checked_add(work).ok_or(
+            ResolutionValidationError::AccountingOverflow {
+                resource: ResolutionValidationResource::Work,
+            },
+        )?;
+        if actual > 1000 {
+            return Err(ResolutionValidationError::LimitExceeded {
+                resource: ResolutionValidationResource::Work,
+                limit: 1000,
+                actual: actual as u128,
+            });
+        }
+        consumed_work = actual;
+        Ok(())
+    };
+    let error = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_clausification_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment_metered(&trace, &[], &mut progress)
+            .expect_err("a huge hidden source cannot bypass the aggregate work limit")
+    };
+
+    assert!(matches!(
+        error,
+        ExactOriginalProofError::Resource(ResolutionValidationError::LimitExceeded {
+            resource: ResolutionValidationResource::Work,
+            limit: 1000,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn exact_original_fragment_precharges_term_store_interning_growth() {
+    use ay_core::ClausificationProof;
+
+    let mut terms = TermStore::new();
+    let false_term = terms.mk_bool(false);
+    assert!(terms.find_interned(&TermData::Not(false_term)).is_none());
+    let baseline = terms.true_memory_bytes();
+    let mut var_to_term = HashMap::default();
+    var_to_term.insert(0, false_term);
+    let annotations = vec![Some(ClausificationProof {
+        rule: AletheRule::False,
+        source_term: false_term,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::negative(Variable::new(0))], true);
+
+    let mut byte_charges = Vec::new();
+    let mut progress = |work: usize, bytes: usize| {
+        byte_charges.push((work, bytes));
+        Ok(())
+    };
+    let fragment = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_clausification_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment_metered(&trace, &[], &mut progress)
+            .expect("the false clausification unit has exact authority")
+    };
+
+    assert_eq!(fragment.binding_count(), 1);
+    assert!(terms.true_memory_bytes() > baseline);
+    assert!(byte_charges
+        .iter()
+        .any(|&(work, bytes)| { work == 1 && bytes >= baseline + 2 * EXACT_NEW_NOT_BYTES }));
+}
+
+#[test]
+fn exact_original_fragment_keeps_distinct_ids_for_duplicate_authored_units() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
+    trace.add_clause(2, vec![Literal::positive(Variable::new(0))], true);
+
+    let fragment = SatProofManager::new(&var_to_term, &mut terms)
+        .build_exact_original_proof_fragment(&trace, &[p])
+        .expect("each authored unit has exact authority");
+    let first = fragment.bindings.get(&1).expect("binding for ID 1");
+    let second = fragment.bindings.get(&2).expect("binding for ID 2");
+
+    assert_ne!(first.proof_id, second.proof_id);
+    assert_eq!(first.clause, second.clause);
+    assert_eq!(fragment.proof.len(), 2);
+    assert!(matches!(
+        fragment.proof.get_step(first.proof_id),
+        Some(ProofStep::Assume(term)) if *term == p
+    ));
+    assert!(matches!(
+        fragment.proof.get_step(second.proof_id),
+        Some(ProofStep::Assume(term)) if *term == p
+    ));
+}
+
+#[test]
+fn exact_original_fragment_rejects_stale_indexed_clausification() {
+    use ay_core::ClausificationProof;
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let stale_source = terms.mk_ite(p, p, q);
+    let annotations = vec![Some(ClausificationProof {
+        rule: AletheRule::IteNeg1,
+        source_term: stale_source,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
+
+    let error = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_clausification_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[p])
+            .expect_err("a stale annotation must not fall back to Assume")
+    };
+
+    assert_eq!(
+        error,
+        ExactOriginalProofError::InvalidClausificationAnnotation {
+            clause_id: 1,
+            clause: vec![p],
+        }
+    );
+}
+
+#[test]
+fn exact_original_fragment_rejects_stale_indexed_theory_annotation() {
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let annotations = vec![Some(TheoryLemmaProof {
+        clause: vec![p, q],
+        kind: TheoryLemmaKind::Generic,
+        farkas: None,
+        lia: None,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
+
+    let error = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_original_clause_theory_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[p])
+            .expect_err("content from another theory annotation is not authority")
+    };
+
+    assert_eq!(
+        error,
+        ExactOriginalProofError::InvalidTheoryAnnotation {
+            clause_id: 1,
+            clause: vec![p],
+        }
+    );
+}
+
+#[test]
+fn exact_original_fragment_rejects_unannotated_generated_clause() {
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let mut content_annotations = HashMap::default();
+    content_annotations.insert(
+        vec![q],
+        TheoryLemmaProof {
+            clause: vec![q],
+            kind: TheoryLemmaKind::Generic,
+            farkas: None,
+            lia: None,
+        },
+    );
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(1))], true);
+
+    let error = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_theory_lemma_proofs(&content_annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[p])
+            .expect_err("content-keyed fallback is not exact identity authority")
+    };
+
+    assert_eq!(
+        error,
+        ExactOriginalProofError::UnauthenticatedOriginalClause {
+            clause_id: 1,
+            clause: vec![q],
+        }
+    );
+}
+
+#[test]
+fn exact_original_fragment_preserves_generic_for_strict_checker() {
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let annotations = vec![Some(TheoryLemmaProof {
+        clause: vec![p],
+        kind: TheoryLemmaKind::Generic,
+        farkas: None,
+        lia: None,
+    })];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
+
+    let fragment = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_original_clause_theory_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[])
+            .expect("identity authentication leaves semantic checking downstream")
+    };
+    let binding = fragment.bindings.get(&1).expect("binding for ID 1");
+
+    assert!(matches!(
+        fragment.proof.get_step(binding.proof_id),
+        Some(ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::Generic,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn exact_original_fragment_rejects_unmapped_variable() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(7, vec![Literal::positive(Variable::new(9))], true);
+
+    let error = SatProofManager::new(&var_to_term, &mut terms)
+        .build_exact_original_proof_fragment(&trace, &[])
+        .expect_err("every literal must have an exact SMT term mapping");
+
+    assert_eq!(
+        error,
+        ExactOriginalProofError::UnmappedVariable {
+            clause_id: 7,
+            variable: 9,
+        }
+    );
+}
+
+#[test]
+fn exact_original_fragment_rejects_stale_mapped_term_without_panicking() {
+    let mut terms = TermStore::new();
+    let mut var_to_term = HashMap::default();
+    let stale = TermId(10_000);
+    var_to_term.insert(0, stale);
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
+
+    let error = SatProofManager::new(&var_to_term, &mut terms)
+        .build_exact_original_proof_fragment(&trace, &[stale])
+        .expect_err("a stale SAT-to-term mapping must fail closed");
+    assert_eq!(
+        error,
+        ExactOriginalProofError::StaleMappedTerm {
+            clause_id: 1,
+            variable: 0,
+            term: stale,
+        }
+    );
+}
+
+#[test]
+fn exact_original_fragment_rejects_duplicate_original_id() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let q = var_to_term[&1];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(4, vec![Literal::positive(Variable::new(0))], true);
+    trace.add_clause(4, vec![Literal::positive(Variable::new(1))], true);
+
+    let error = SatProofManager::new(&var_to_term, &mut terms)
+        .build_exact_original_proof_fragment(&trace, &[p, q])
+        .expect_err("one stable trace ID cannot authenticate two originals");
+
+    assert_eq!(
+        error,
+        ExactOriginalProofError::DuplicateClauseId { clause_id: 4 }
+    );
+}
+
+#[test]
+fn exact_original_fragment_rejects_zero_id_and_empty_original() {
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let mut zero_trace = ClauseTrace::new();
+    zero_trace.add_clause(0, vec![Literal::positive(Variable::new(0))], true);
+    assert_eq!(
+        SatProofManager::new(&var_to_term, &mut terms)
+            .build_exact_original_proof_fragment(&zero_trace, &[])
+            .expect_err("zero is not a stable clause identity"),
+        ExactOriginalProofError::ZeroClauseId
+    );
+
+    let mut empty_trace = ClauseTrace::new();
+    empty_trace.add_clause(3, Vec::new(), true);
+    assert_eq!(
+        SatProofManager::new(&var_to_term, &mut terms)
+            .build_exact_original_proof_fragment(&empty_trace, &[])
+            .expect_err("this minimum fragment does not authenticate empty originals"),
+        ExactOriginalProofError::EmptyOriginalClause { clause_id: 3 }
+    );
 }
 
 #[test]

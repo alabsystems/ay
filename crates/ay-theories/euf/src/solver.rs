@@ -920,7 +920,6 @@ pub(crate) const CONG_UNDO_MIN_FUNC_APPS: usize = 16384;
 /// Neither setting is right for both workloads, and a pop-count threshold is
 /// just a third magic number. Comparing the accrued costs needs no constant and
 /// adapts per solve.
-
 /// #euf-inc-diseq-undo size gate. Borrowed `CONG_UNDO_MIN_FUNC_APPS` (16384)
 /// until it was measured independently, and the two turn out NOT to behave the
 /// same way. For the disequality index the incremental path is not merely

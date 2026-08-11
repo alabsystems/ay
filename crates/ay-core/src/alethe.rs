@@ -235,11 +235,14 @@ pub const CHECKABLE_ALETHE_RULES: [&str; 183] = [
 /// whereas an invented rule name is indistinguishable from a typo and voids
 /// the entire certificate.
 ///
-/// This is an EMISSION concern only. AY's soundness gates read the proof IR,
-/// not the printed text: `terminal_trust::TerminalTrustReport` already counts
-/// `AletheRule::Hole` (`hole_rule_on_path`) exactly as it counts
-/// `AletheRule::Trust` (`trust_rule_on_path`) — `is_trust_free()` requires
-/// both to be zero. Renaming on the wire therefore cannot loosen acceptance.
+/// This is an EMISSION concern only. AY's publication soundness gates validate
+/// the proof IR, not the printed name. Direct `AletheRule::Hole`/`Trust` steps
+/// are counted by `terminal_trust::TerminalTrustReport`. A natively checked
+/// theory kind may also map to a wire `hole` when the pinned external calculus
+/// lacks that inference; in that case the native strict verdict remains valid,
+/// while artifact disclosure and `restricted_rule_subset` report that the Alethe text
+/// is only a holey diagnostic skeleton. Neither case can become an externally
+/// `valid` certificate by renaming the wire rule.
 pub const UNPROVED_STEP_RULE: &str = "hole";
 
 /// Internal rule names that are SPELLED differently by the checker.
@@ -735,6 +738,7 @@ mod wire_name_tests {
         for name in [
             "trust",
             "dt_project",
+            "dt_enum_pigeonhole",
             "all_simplify",
             "arith_simplify",
             "array_ext_diff_intro",
@@ -799,6 +803,19 @@ mod wire_name_tests {
             TheoryLemmaKind::DatatypeDistinct.alethe_wire_rule(),
             "dt_clash"
         );
+
+        // Finite-enum exhaustiveness is checked only by AY's native strict
+        // checker. The pinned external Alethe calculus has no equivalent rule,
+        // so the wire format must disclose the gap as a hole.
+        assert_eq!(
+            TheoryLemmaKind::DatatypeEnumPigeonhole.alethe_rule(),
+            "dt_enum_pigeonhole"
+        );
+        assert_eq!(
+            TheoryLemmaKind::DatatypeEnumPigeonhole.alethe_wire_rule(),
+            "hole"
+        );
+        assert!(!is_checkable_alethe_rule("dt_enum_pigeonhole"));
 
         // A theory lemma that DOES have a real Alethe rule keeps it.
         assert_eq!(TheoryLemmaKind::LraFarkas.alethe_wire_rule(), "la_generic");

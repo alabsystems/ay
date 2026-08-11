@@ -78,20 +78,23 @@ mod pattern_helpers;
 mod persistent;
 mod substitution;
 pub(crate) use ground_terms::{
-    collect_bool_uf_arg_terms, collect_ground_terms_by_sort, enumerative_instantiation,
+    collect_bool_uf_arg_terms, collect_ground_terms_by_sort, contains_fixed_interpreted_arithmetic,
+    enumerative_instantiation,
 };
 use matching::{match_multi_trigger, match_pattern};
 #[cfg(test)]
 use pattern::extract_patterns;
 pub(crate) use pattern::EqualityClasses;
-use pattern::{extract_patterns_with_fallback, EMatchArg, EMatchPattern, TermIndex};
+use pattern::{extract_patterns_with_fallback, TermIndex};
+#[cfg(test)]
+use pattern::{EMatchArg, EMatchPattern};
 #[cfg(test)]
 use pattern_helpers::pattern_covered_vars;
 pub(crate) use persistent::PersistentMatchState;
 #[cfg(test)]
 use substitution::collect_free_var_names;
 use substitution::instantiate_body;
-pub(crate) use substitution::{mk_app_simplified, subst_vars};
+pub(crate) use substitution::{mk_app_simplified, subst_vars, subst_vars_exact_qf};
 
 /// Configuration for E-matching instantiation limits.
 ///
@@ -879,12 +882,17 @@ pub(crate) fn perform_ematching_with_generations(
                     let cost = tracker.instantiation_cost(&binding, quantifier_weight);
 
                     if cost > config.lazy_threshold {
-                        // M0': blocked (skipped at the cost gate). Counted where the
-                        // branch physically is — before the seen memo — mirroring
-                        // that high-cost bindings never enter the memo.
+                        // A cost-blocked binding is an incomplete E-matching
+                        // campaign, even when a cheaper binding for the same
+                        // quantifier was accepted. Mark the limit so every SAT
+                        // mapping fails closed; per-quantifier "matched once"
+                        // is not coverage of the skipped ground application.
+                        reached_limit = true;
+                        // M0': count the skip where it physically occurs,
+                        // before the seen memo (high-cost bindings never enter
+                        // that memo).
                         demand.record_blocked(quant, head_sym);
-                        continue; // Cost too high - skip (HEAD does NOT mark this
-                                  // quantifier instantiated, so neither do we).
+                        continue;
                     }
 
                     // LI-5: a binding with cost <= lazy_threshold marks the
@@ -1088,9 +1096,9 @@ pub(crate) fn perform_ematching_with_generations(
         .collect();
     let has_uninstantiated = !uninstantiated_quantifiers.is_empty();
 
-    // M0': a round that broke early on a budget/deadline (max_total /
-    // max_per_quantifier / should_stop) sets `reached_limit`. Record it as one
-    // budget-break round; merged additively across the round loop.
+    // M0': a round that was incomplete because of a budget/deadline or a
+    // cost-blocked binding sets `reached_limit`. Record it as one budget-break
+    // round; merged additively across the round loop.
     demand.budget_break_rounds = u64::from(reached_limit);
 
     EMatchingResult {
@@ -1232,6 +1240,7 @@ fn set_subterm_generations(
 /// has a ground occurrence (the matcher walks the whole pattern structurally,
 /// and a missing nested symbol makes the match fail just as surely as a missing
 /// top symbol).
+#[cfg(test)]
 fn collect_pattern_required_symbols(pattern: &EMatchPattern, out: &mut HashSet<String>) {
     out.insert(pattern.symbol.name().to_string());
     for arg in &pattern.args {
@@ -1241,9 +1250,8 @@ fn collect_pattern_required_symbols(pattern: &EMatchPattern, out: &mut HashSet<S
     }
 }
 
-/// Decide whether a *triggered* universal quantifier has NO possible trigger
-/// instantiation against the ground terms in `assertions` — i.e. E-matching is
-/// vacuously complete for it because not a single trigger group can ever fire.
+/// Test-only diagnostic: decide whether a *triggered* universal quantifier has
+/// no possible trigger instantiation against the ground terms in `assertions`.
 ///
 /// A multi-trigger GROUP can fire only if EVERY pattern in the group can match
 /// some ground term, and a pattern `S(..)` can only match a ground term whose
@@ -1253,21 +1261,13 @@ fn collect_pattern_required_symbols(pattern: &EMatchPattern, out: &mut HashSet<S
 /// E-match-complete* iff it has at least one trigger group and EVERY group is
 /// dead.
 ///
-/// SOUNDNESS: this returns `true` ONLY when the quantifier's triggers reference
-/// at least one UNINTERPRETED function symbol that occurs in NO ground term of
-/// the problem. Such a quantifier contributes zero instances under trigger-based
-/// instantiation, and — because the never-grounded symbol is uninterpreted with
-/// respect to the ground constraints — any ground model extends to a model of
-/// the quantifier by interpreting that symbol freely. INTERPRETED/theory symbols
-/// (`+`, `select`, `bvadd`, `seq.nth`, …) are DELIBERATELY EXCLUDED from the
-/// death test: they have a fixed meaning and cannot be reinterpreted freely, so
-/// their absence from the ground index does NOT prove vacuity — a pattern such
-/// as `f(+ x 1)` can still coincide with a ground `f 0` via theory reasoning
-/// (`x := -1`), and certifying it vacuous is the P0 patterned-forall wrong-sat.
-/// The caller uses this only to keep a ground **Sat** as Sat (never to
-/// manufacture an Unsat); see the call site. A quantifier with NO triggers
-/// (auto/CEGQI-handled) returns `false` here so the existing handling is
-/// unchanged.
+/// This is not a semantic SAT predicate. A dead trigger proves only that the
+/// trigger-based engine emits no instance; the quantified body may still be
+/// contradictory at every binder value. INTERPRETED/theory symbols (`+`,
+/// `select`, `bvadd`, `seq.nth`, …) are deliberately excluded even from this
+/// structural diagnostic because matching can coincide through theory
+/// reasoning. A quantifier with no user trigger returns `false`.
+#[cfg(test)]
 pub(crate) fn quantifier_has_no_possible_trigger_match(
     terms: &TermStore,
     quantifier: TermId,

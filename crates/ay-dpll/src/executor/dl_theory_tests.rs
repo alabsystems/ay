@@ -399,8 +399,7 @@ fn run(script: &str) -> Vec<String> {
 fn last_verdict(script: &str) -> String {
     run(script)
         .into_iter()
-        .filter(|o| matches!(o.trim(), "sat" | "unsat" | "unknown"))
-        .next_back()
+        .rfind(|o| matches!(o.trim(), "sat" | "unsat" | "unknown"))
         .expect("a check-sat verdict")
         .trim()
         .to_string()

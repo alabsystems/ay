@@ -218,8 +218,12 @@ unsafe fn apply_tactic_to_goal_impl(
     // Pre-extract the tactic and the goal's formulas outside the guard
     // (raw-pointer derefs). SAFETY: both handles, when non-null, are arena-owned
     // by the context and single-threaded per context; `as_ref` null-checks.
-    let tactic = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
-    let formulas: Option<Vec<Z3_ast>> = unsafe { g.as_ref() }.map(|h| h.formulas.clone());
+    let (tactic, formulas): (Option<_>, Option<Vec<Z3_ast>>) = unsafe {
+        (
+            t.as_ref().map(|h| h.tactic.clone()),
+            g.as_ref().map(|h| h.formulas.clone()),
+        )
+    };
 
     // SAFETY: `c` is the caller-supplied context pointer; `ffi_guard_ptr` handles
     // the null case and catches panics.

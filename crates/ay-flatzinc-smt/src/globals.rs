@@ -9,128 +9,183 @@ use crate::error::TranslateError;
 use crate::globals_count;
 use crate::globals_extra;
 use crate::globals_regular;
-use crate::translate::{Context, SmtInt};
+use crate::translate::{ensure_quadratic_work, materialized_range_len, Context, SmtInt};
 
 /// Translate a global FlatZinc constraint. Returns Ok(true) if handled.
 pub(crate) fn translate_global(
     ctx: &mut Context,
     c: &ConstraintItem,
 ) -> Result<bool, TranslateError> {
-    let handled = match c.id.as_str() {
-        "fzn_all_different_int" | "alldifferent" | "all_different_int" => {
+    let Some(expected) = global_arity(&c.id) else {
+        return Ok(false);
+    };
+    if c.args.len() != expected {
+        return Err(TranslateError::WrongArgCount {
+            name: c.id.clone(),
+            expected,
+            got: c.args.len(),
+        });
+    }
+
+    match c.id.as_str() {
+        "fzn_all_different_int" | "alldifferent" | "alldifferent_int" | "all_different_int" => {
             alldifferent(ctx, &c.args)?;
-            true
         }
         "fzn_table_int" | "table_int" => {
             table_int(ctx, &c.args)?;
-            true
         }
         "fzn_count_eq" | "count_eq" => {
             globals_count::count_eq(ctx, &c.args)?;
-            true
         }
         "fzn_count_neq" | "count_neq" => {
             globals_count::count_neq(ctx, &c.args)?;
-            true
         }
         "fzn_count_lt" | "count_lt" => {
             globals_count::count_lt(ctx, &c.args)?;
-            true
         }
         "fzn_count_gt" | "count_gt" => {
             globals_count::count_gt(ctx, &c.args)?;
-            true
         }
         "fzn_count_leq" | "count_leq" => {
             globals_count::count_leq(ctx, &c.args)?;
-            true
         }
         "fzn_count_geq" | "count_geq" => {
             globals_count::count_geq(ctx, &c.args)?;
-            true
         }
         "fzn_among" | "among" => {
             globals_count::among(ctx, &c.args)?;
-            true
         }
-        "fzn_value_precede_int"
-        | "value_precede_int"
-        | "fzn_value_precede_chain_int"
-        | "value_precede_chain_int" => {
+        "fzn_value_precede_int" | "value_precede_int" => {
             globals_extra::value_precede_int(ctx, &c.args)?;
-            true
+        }
+        "fzn_value_precede_chain_int" | "value_precede_chain_int" => {
+            globals_extra::value_precede_chain_int(ctx, &c.args)?;
         }
         "fzn_circuit" | "circuit" => {
             circuit(ctx, &c.args)?;
-            true
         }
         "fzn_cumulative" | "cumulative" => {
             cumulative(ctx, &c.args)?;
-            true
         }
         "fzn_inverse" | "inverse" => {
             inverse(ctx, &c.args)?;
-            true
         }
         "fzn_diffn" | "diffn" => {
             diffn(ctx, &c.args)?;
-            true
         }
         "fzn_regular" | "regular" => {
             globals_regular::regular(ctx, &c.args)?;
-            true
         }
         "fzn_global_cardinality" | "global_cardinality" => {
             globals_extra::global_cardinality(ctx, &c.args, false)?;
-            true
         }
         "fzn_global_cardinality_closed" | "global_cardinality_closed" => {
             globals_extra::global_cardinality(ctx, &c.args, true)?;
-            true
         }
         "fzn_increasing_int" | "increasing_int" => {
             globals_extra::increasing_int(ctx, &c.args)?;
-            true
         }
         "fzn_decreasing_int" | "decreasing_int" => {
             globals_extra::decreasing_int(ctx, &c.args)?;
-            true
         }
         "fzn_member_int" | "member_int" => {
             globals_extra::member_int(ctx, &c.args)?;
-            true
         }
         "fzn_member_bool" | "member_bool" => {
             globals_extra::member_bool(ctx, &c.args)?;
-            true
         }
         "fzn_nvalue" | "nvalue" => {
             globals_extra::nvalue(ctx, &c.args)?;
-            true
         }
         "fzn_lex_less_int" | "lex_less_int" => {
             globals_extra::lex_compare_int(ctx, &c.args, true)?;
-            true
         }
         "fzn_lex_lesseq_int" | "lex_lesseq_int" => {
             globals_extra::lex_compare_int(ctx, &c.args, false)?;
-            true
         }
         "fzn_bin_packing_load" | "bin_packing_load" => {
             globals_extra::bin_packing_load(ctx, &c.args)?;
-            true
         }
         "fzn_subcircuit" | "subcircuit" => {
             globals_extra::subcircuit(ctx, &c.args)?;
-            true
         }
-        "fzn_disjunctive" | "disjunctive" | "fzn_disjunctive_strict" | "disjunctive_strict" => {
-            globals_extra::disjunctive(ctx, &c.args)?;
-            true
+        "fzn_disjunctive" | "disjunctive" => {
+            globals_extra::disjunctive(
+                ctx,
+                &c.args,
+                globals_extra::DisjunctiveMode::ZeroDurationPermitted,
+            )?;
         }
-        _ => false,
-    };
-    Ok(handled)
+        "fzn_disjunctive_strict" | "disjunctive_strict" => {
+            globals_extra::disjunctive(ctx, &c.args, globals_extra::DisjunctiveMode::Strict)?;
+        }
+        // `global_arity` recognizes exactly the aliases above. Keep this
+        // defensive fallback non-panicking if the tables ever drift.
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn global_arity(name: &str) -> Option<usize> {
+    match name {
+        "fzn_all_different_int"
+        | "alldifferent"
+        | "alldifferent_int"
+        | "all_different_int"
+        | "fzn_circuit"
+        | "circuit"
+        | "fzn_increasing_int"
+        | "increasing_int"
+        | "fzn_decreasing_int"
+        | "decreasing_int"
+        | "fzn_subcircuit"
+        | "subcircuit" => Some(1),
+        "fzn_table_int"
+        | "table_int"
+        | "fzn_inverse"
+        | "inverse"
+        | "fzn_value_precede_chain_int"
+        | "value_precede_chain_int"
+        | "fzn_member_int"
+        | "member_int"
+        | "fzn_member_bool"
+        | "member_bool"
+        | "fzn_nvalue"
+        | "nvalue"
+        | "fzn_lex_less_int"
+        | "lex_less_int"
+        | "fzn_lex_lesseq_int"
+        | "lex_lesseq_int"
+        | "fzn_disjunctive"
+        | "disjunctive"
+        | "fzn_disjunctive_strict"
+        | "disjunctive_strict" => Some(2),
+        "fzn_count_eq"
+        | "count_eq"
+        | "fzn_count_neq"
+        | "count_neq"
+        | "fzn_count_lt"
+        | "count_lt"
+        | "fzn_count_gt"
+        | "count_gt"
+        | "fzn_count_leq"
+        | "count_leq"
+        | "fzn_count_geq"
+        | "count_geq"
+        | "fzn_among"
+        | "among"
+        | "fzn_value_precede_int"
+        | "value_precede_int"
+        | "fzn_global_cardinality"
+        | "global_cardinality"
+        | "fzn_global_cardinality_closed"
+        | "global_cardinality_closed"
+        | "fzn_bin_packing_load"
+        | "bin_packing_load" => Some(3),
+        "fzn_cumulative" | "cumulative" | "fzn_diffn" | "diffn" => Some(4),
+        "fzn_regular" | "regular" => Some(6),
+        _ => None,
+    }
 }
 
 /// Pairwise-inequality encoding: `∧_{i<j} (≠ x[i] x[j])`
@@ -141,6 +196,7 @@ fn alldifferent(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> 
         return Ok(());
     }
     let vars = ctx.expr_to_smt_array(&args[0])?;
+    ensure_quadratic_work("all_different", vars.len(), vars.len(), 1)?;
     for i in 0..vars.len() {
         for j in (i + 1)..vars.len() {
             ctx.emit_fmt(format_args!("(assert (not (= {} {})))", vars[i], vars[j]));
@@ -206,26 +262,39 @@ fn table_int(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
 /// Circuit constraint: successor array forms a single Hamiltonian circuit.
 ///
 /// args: [succ_array] where succ[i] = j means node i connects to node j.
-/// Uses 1-based indexing (FlatZinc convention).
+/// The successor values use the array's declared index set.
 ///
 /// Encoding:
 /// 1. alldifferent(succ) — successor values form a permutation
 /// 2. No self-loops: succ[i] ≠ i for all i
-/// 3. MTZ subtour elimination with auxiliary order variables u[2..n]:
-///    - 2 ≤ u[i] ≤ n for i ∈ {2..n}
-///    - (succ[i] = j) ⇒ (u[j] ≥ u[i] + 1) for j ∈ {2..n}
-///    - u[1] = 1 implicitly (used as constant in implications)
+/// 3. MTZ subtour elimination, anchored at the first declared index.
 fn circuit(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
-    if args.is_empty() {
-        return Ok(());
+    if args.len() != 1 {
+        return Err(TranslateError::WrongArgCount {
+            name: "circuit".into(),
+            expected: 1,
+            got: args.len(),
+        });
     }
-    let vars = ctx.expr_to_smt_array(&args[0])?;
+    let (lo, hi, vars) = ctx.expr_to_smt_indexed_array(&args[0])?;
     let n = vars.len();
-    if n <= 1 {
+    validate_indexed_array_cardinality("circuit", lo, hi, n)?;
+    // Pairwise distinctness plus the edge/rank implications are both
+    // quadratic. Two work items per matrix cell is a conservative bound.
+    ensure_quadratic_work("circuit", n, n, 2)?;
+
+    emit_index_range_guards(ctx, &vars, lo, hi);
+
+    if n == 0 {
         return Ok(());
     }
 
-    emit_one_based_index_range_guards(ctx, &vars, n);
+    // A one-node Hamiltonian circuit is its self-loop. The general encoding
+    // bans self-loops because that is only correct once there are two nodes.
+    if n == 1 {
+        ctx.emit_fmt(format_args!("(assert (= {} {}))", vars[0], SmtInt(lo)));
+        return Ok(());
+    }
 
     let aux_id = ctx.next_aux_id();
 
@@ -236,13 +305,9 @@ fn circuit(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
         }
     }
 
-    // 2. No self-loops: succ[i] != i (1-indexed)
-    for (i, var) in vars.iter().enumerate() {
-        ctx.emit_fmt(format_args!(
-            "(assert (not (= {} {})))",
-            var,
-            SmtInt(i as i64 + 1)
-        ));
+    // 2. No self-loops.
+    for (node, var) in (lo..=hi).zip(&vars) {
+        ctx.emit_fmt(format_args!("(assert (not (= {} {})))", var, SmtInt(node)));
     }
 
     // 3. MTZ subtour elimination
@@ -258,7 +323,9 @@ fn circuit(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
         ));
     }
 
-    // For each successor edge: if succ[i] = j (j >= 2), then u[j] >= u[i] + 1
+    // For each successor edge: if succ[i] targets a non-root node j, then
+    // u[j] >= u[i] + 1. Auxiliary names use positions, while successor
+    // values use the declared FlatZinc indices.
     for (i, var) in vars.iter().enumerate() {
         let u_i = if i == 0 {
             "1".to_string() // u[1] = 1 (start node)
@@ -266,13 +333,13 @@ fn circuit(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
             format!("_circ{}_{}", aux_id, i + 1)
         };
         for j_idx in 1..n {
-            // j_idx maps to node j_idx+1 (nodes 2..n)
-            let node_j = j_idx + 1;
-            let u_j = format!("_circ{aux_id}_{node_j}");
+            let node_position = j_idx + 1;
+            let node_value = lo + j_idx as i64;
+            let u_j = format!("_circ{aux_id}_{node_position}");
             ctx.emit_fmt(format_args!(
                 "(assert (=> (= {} {}) (>= {} (+ {} 1))))",
                 var,
-                SmtInt(node_j as i64),
+                SmtInt(node_value),
                 u_j,
                 u_i
             ));
@@ -316,6 +383,9 @@ fn cumulative(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
             "cumulative: array length mismatch".into(),
         ));
     }
+    // Each task pair creates one declaration and two implications; include
+    // the per-event load assertion in the fourth work item.
+    ensure_quadratic_work("cumulative", n, n, 4)?;
 
     let aux_id = ctx.next_aux_id();
 
@@ -369,22 +439,31 @@ fn inverse(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
             got: args.len(),
         });
     }
-    let f_vars = ctx.expr_to_smt_array(&args[0])?;
-    let g_vars = ctx.expr_to_smt_array(&args[1])?;
+    let (f_lo, f_hi, f_vars) = ctx.expr_to_smt_indexed_array(&args[0])?;
+    let (g_lo, g_hi, g_vars) = ctx.expr_to_smt_indexed_array(&args[1])?;
+    validate_indexed_array_cardinality("inverse first array", f_lo, f_hi, f_vars.len())?;
+    validate_indexed_array_cardinality("inverse second array", g_lo, g_hi, g_vars.len())?;
+    if f_vars.len() != g_vars.len() {
+        return Err(TranslateError::UnsupportedType(format!(
+            "inverse: array cardinality mismatch ({} and {})",
+            f_vars.len(),
+            g_vars.len()
+        )));
+    }
+    ensure_quadratic_work("inverse", f_vars.len(), g_vars.len(), 2)?;
 
-    emit_one_based_index_range_guards(ctx, &f_vars, g_vars.len());
-    emit_one_based_index_range_guards(ctx, &g_vars, f_vars.len());
+    // f is indexed by the first range and contains indices into g; g is
+    // indexed by the second range and contains indices into f.
+    emit_index_range_guards(ctx, &f_vars, g_lo, g_hi);
+    emit_index_range_guards(ctx, &g_vars, f_lo, f_hi);
 
-    // For each (i, j): (f[i] = j+1) => (g[j] = i+1) and vice versa
-    for (i_idx, f_var) in f_vars.iter().enumerate() {
-        for (j_idx, g_var) in g_vars.iter().enumerate() {
-            let i_val = SmtInt(i_idx as i64 + 1);
-            let j_val = SmtInt(j_idx as i64 + 1);
-            // Forward: f[i+1] = j+1 => g[j+1] = i+1
+    for (i_val, f_var) in (f_lo..=f_hi).zip(&f_vars) {
+        for (j_val, g_var) in (g_lo..=g_hi).zip(&g_vars) {
+            let i_val = SmtInt(i_val);
+            let j_val = SmtInt(j_val);
             ctx.emit_fmt(format_args!(
                 "(assert (=> (= {f_var} {j_val}) (= {g_var} {i_val})))"
             ));
-            // Backward: g[j+1] = i+1 => f[i+1] = j+1
             ctx.emit_fmt(format_args!(
                 "(assert (=> (= {g_var} {i_val}) (= {f_var} {j_val})))"
             ));
@@ -393,14 +472,30 @@ fn inverse(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     Ok(())
 }
 
-fn emit_one_based_index_range_guards(ctx: &mut Context, vars: &[String], upper: usize) {
+pub(crate) fn validate_indexed_array_cardinality(
+    name: &str,
+    lo: i64,
+    hi: i64,
+    actual: usize,
+) -> Result<(), TranslateError> {
+    let expected = materialized_range_len(lo, hi, name)?;
+    if actual != expected {
+        return Err(TranslateError::UnsupportedType(format!(
+            "{name}: declared index range {lo}..{hi} has cardinality {expected}, but the array contains {actual} values"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_index_range_guards(ctx: &mut Context, vars: &[String], lo: i64, hi: i64) {
     for var in vars {
-        if upper == 0 {
+        if hi < lo {
             ctx.emit("(assert false)");
         } else {
-            let upper = SmtInt(upper as i64);
             ctx.emit_fmt(format_args!(
-                "(assert (and (>= {var} 1) (<= {var} {upper})))"
+                "(assert (and (>= {var} {}) (<= {var} {})))",
+                SmtInt(lo),
+                SmtInt(hi)
             ));
         }
     }
@@ -431,6 +526,7 @@ fn diffn(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
             "diffn: array length mismatch".into(),
         ));
     }
+    ensure_quadratic_work("diffn", n, n, 1)?;
 
     for i in 0..n {
         for j in (i + 1)..n {

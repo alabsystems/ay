@@ -419,7 +419,7 @@ struct ModDivElimState {
     introduced_unconstrained_div_mod: bool,
     /// True if THIS elimination call minted (or re-interned) at least one
     /// literal-zero-divisor var via [`Self::zero_divisor_var`]. The set of
-    /// `_ay_zerodiv_*` vars in the (append-only) store can only change in a
+    /// `__ay_zerodiv_*` vars in the (append-only) store can only change in a
     /// call that sets this flag, so `emit_zero_divisor_congruence` can skip
     /// its whole-store scan whenever the flag is false: every same-op pair it
     /// would find was already emitted by the most recent var-creating call
@@ -618,7 +618,7 @@ impl ModDivElimState {
     /// For a non-zero divisor, `rem(x, y) = (mod x y)` when `y > 0` and
     /// `-(mod x y)` when `y < 0`. For a zero divisor it is under-specified and,
     /// per Z3 #9140, DISTINCT from `(mod x 0)`, so it gets its own deterministic
-    /// unconstrained var (`_ay_zerodiv_rem_*`) kept consistent across equal
+    /// unconstrained var (`__ay_zerodiv_rem_*`) kept consistent across equal
     /// dividends by [`Self::emit_zero_divisor_congruence`].
     ///
     /// SOUNDNESS / WHY THIS EXISTS: this is exactly the semantics ay's constant
@@ -680,7 +680,7 @@ impl ModDivElimState {
     /// independent (also matching z3) (#div0).
     fn zero_divisor_var(&mut self, terms: &mut TermStore, op: &str, dividend: TermId) -> TermId {
         self.created_zero_divisor = true;
-        let name = format!("_ay_zerodiv_{op}_{}", dividend.index());
+        let name = format!("__ay_zerodiv_{op}_{}", dividend.index());
         terms.mk_var(name, Sort::Int)
     }
 
@@ -728,7 +728,11 @@ impl ModDivElimState {
         dividend: TermId,
         divisor: TermId,
     ) -> TermId {
-        let name = format!("_ay_symdiv_{kind}_{}_{}", dividend.index(), divisor.index());
+        let name = format!(
+            "__ay_symdiv_{kind}_{}_{}",
+            dividend.index(),
+            divisor.index()
+        );
         terms.mk_var(name, Sort::Int)
     }
 
@@ -766,7 +770,7 @@ impl ModDivElimState {
     /// one. Scanning the whole store (not just this call's state) is required
     /// because the two halves of `(and (> (mod -2 0) 0) … (> y (mod y 0)) …)` are
     /// often eliminated in SEPARATE calls; the vars intern by the name
-    /// `_ay_zerodiv_{op}_{dividend_index}` and persist in the append-only store,
+    /// `__ay_zerodiv_{op}_{dividend_index}` and persist in the append-only store,
     /// so a global scan recovers the operator and dividend of every one created.
     /// Deterministically ordered and deduplicated by `(is_mod, var)`.
     fn collect_zero_divisor_vars(terms: &TermStore) -> Vec<(DivModOp, TermId, TermId)> {
@@ -774,7 +778,7 @@ impl ModDivElimState {
         for idx in 0..terms.len() {
             let t = TermId::new(idx as u32);
             if let TermData::Var(name, _) = terms.get(t) {
-                let Some(rest) = name.strip_prefix("_ay_zerodiv_") else {
+                let Some(rest) = name.strip_prefix("__ay_zerodiv_") else {
                     continue;
                 };
                 let (op, idx_str) = if let Some(s) = rest.strip_prefix("mod_") {
@@ -880,8 +884,8 @@ impl ModDivElimState {
     /// Both spellings denote the same function application `op(value, 0)` whenever
     /// `value(d) = value(x)` and `value(y) = 0`, so they must give equal results.
     /// The per-term var replacement keeps these in two SEPARATE classes
-    /// (`zero_divisor_var` → `_ay_zerodiv_*` for the literal-0 path,
-    /// `symbolic_divmod_var` → `_ay_symdiv_*` for the symbolic path), so neither
+    /// (`zero_divisor_var` → `__ay_zerodiv_*` for the literal-0 path,
+    /// `symbolic_divmod_var` → `__ay_symdiv_*` for the symbolic path), so neither
     /// `emit_zero_divisor_congruence` nor `emit_symbolic_divisor_congruence`
     /// ever pairs them. Without this link a
     /// model can assign `(div x 0)` and `(div (* x x) x)` different values when

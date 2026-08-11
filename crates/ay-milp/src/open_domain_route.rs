@@ -166,7 +166,7 @@ impl BoundedBackend for AyBoundedBackend {
             crate::hybrid_integer_lift::try_solve_certified_interruptible(
                 model,
                 Some(deadline),
-                || should_stop(),
+                &mut *should_stop,
             )
             .map(map_certified_integer_lift_decision)
         }?;
@@ -441,22 +441,9 @@ fn verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
     .is_ok()
 }
 
-/// Try the production route with an optional exact incumbent produced by an
-/// AY native/heuristic path.  The values are never trusted: the original model
-/// checks them exactly before they can influence a cap.
-///
-/// Supplying `None` is equivalent to [`try_solve`].  The optional form lets a
-/// caller feed a later native incumbent to models whose open rows are not
-/// monotone-projectable (notably the mixed open-domain class) without changing
-/// this route's soundness boundary.
-pub(crate) fn try_solve_with_incumbent(
-    model: &Model,
-    ay_incumbent: Option<&[BigRational]>,
-    outer_deadline: Option<Instant>,
-) -> Option<OpenDomainRouteDecision> {
-    try_solve_with_incumbent_interruptible(model, ay_incumbent, outer_deadline, || false)
-}
-
+/// Try the production route with an optional exact incumbent and cooperative
+/// cancellation. Incumbent values are independently checked against the
+/// original model before they can influence an objective cap.
 pub(crate) fn try_solve_with_incumbent_interruptible<F>(
     model: &Model,
     ay_incumbent: Option<&[BigRational]>,
@@ -499,7 +486,8 @@ where
         }
     }
 
-    let projection = MonotoneProjection::try_build(model, Some(deadline), || should_stop()).ok()?;
+    let projection =
+        MonotoneProjection::try_build(model, Some(deadline), &mut *should_stop).ok()?;
     if stopped(deadline, should_stop) {
         return None;
     }
@@ -513,7 +501,7 @@ where
             // This implication is feasibility-preserving, unlike objective
             // capping.  Rebuild the entire projection before promotion.
             projection
-                .revalidate(model, Some(deadline), || should_stop())
+                .revalidate(model, Some(deadline), &mut *should_stop)
                 .then_some(OpenDomainRouteDecision::Infeasible)
         }
         BoundedDecision::CertifiedSingleRowInfeasible { certificate } => {
@@ -552,7 +540,7 @@ where
         }
         BoundedDecision::Feasible { model_values, .. } => {
             let incumbent =
-                projection.checked_lift(model, &model_values, Some(deadline), || should_stop())?;
+                projection.checked_lift(model, &model_values, Some(deadline), &mut *should_stop)?;
             if stopped(deadline, should_stop) {
                 return None;
             }
@@ -583,7 +571,7 @@ where
     B: BoundedBackend,
 {
     let plan =
-        ObjectiveCapPlan::try_build(model, incumbent, Some(deadline), || should_stop()).ok()?;
+        ObjectiveCapPlan::try_build(model, incumbent, Some(deadline), &mut *should_stop).ok()?;
     if stopped(deadline, should_stop) {
         return None;
     }
@@ -601,7 +589,7 @@ where
             let checked_value = plan.checked_original_point(model, &model_values)?;
             if checked_value != value
                 || !at_least_as_good(model.sense(), &checked_value, &incumbent_value)
-                || !plan.revalidate(model, Some(deadline), || should_stop())
+                || !plan.revalidate(model, Some(deadline), &mut *should_stop)
                 || stopped(deadline, should_stop)
             {
                 return None;

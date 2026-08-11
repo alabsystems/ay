@@ -102,8 +102,8 @@ fn maxsmt_recertifies_reinstalled_optimal_witness_in_hard_scope() {
         "the restored optimal witness needs fresh hard-scope validation evidence"
     );
     assert!(
-        exec.take_sat_certificate().is_some(),
-        "the public MaxSMT SAT must mint a certificate after restoring and validating its optimum"
+        exec.take_sat_certificate().is_none(),
+        "text publication must consume the MaxSMT SAT certificate exactly once"
     );
     assert_eq!(
         exec.ctx.assertions.len(),
@@ -1002,7 +1002,7 @@ fn maxsmt_check_sat_assuming_rejects_parsed_softs_and_retires_state() {
     .unwrap();
     assert_eq!(exec.execute_all(&setup).unwrap(), vec!["sat"]);
     assert!(exec.last_model.is_some());
-    assert!(exec.last_sat_certificate.is_some());
+    assert!(exec.last_sat_certificate.is_none());
     assert_eq!(exec.last_soft_cost, Some(0));
 
     let assuming = parse("(check-sat-assuming (a))").unwrap();

@@ -42,8 +42,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use ay_core::term::TermEntryStamp;
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
 
+use super::types::TermArenaStamp;
 use super::{Solver, Term};
 
 /// Hard cap on the number of distinct applications expanded in one round.
@@ -108,6 +110,12 @@ pub fn rec_def_name_conflates_with_builtin(name: &str) -> bool {
 /// consumers are the expansion routines in this module.
 #[derive(Debug, Clone)]
 pub struct RecFunDef {
+    /// Exact solver incarnation and term-entry births that own `params` and
+    /// `body`. A numeric `TermId` can alias an unrelated entry in another
+    /// solver, after full reset, or after speculative suffix rollback, so no
+    /// expansion consumer may inspect the raw ids before authenticating this
+    /// capability.
+    authority: RecFunDefAuthority,
     /// Parameter terms (distinct `Var`s), one per parameter.
     params: Vec<TermId>,
     /// Term-level sorts of the parameters, index-aligned with `params`.
@@ -127,6 +135,24 @@ pub struct RecFunDef {
     /// is not a distinct `Var`): substitution could capture, so the definition
     /// is registered for residual fail-close detection only.
     expandable: bool,
+}
+
+/// Private ownership proof for every raw term id retained by [`RecFunDef`].
+///
+/// Entry stamps are process-wide non-reused birth identities. Together with
+/// the solver arena they distinguish equal numeric ids across solvers, full
+/// resets, and same-arena speculative rollback/reuse.
+#[derive(Clone)]
+struct RecFunDefAuthority {
+    arena: TermArenaStamp,
+    param_entries: Vec<TermEntryStamp>,
+    body_entry: TermEntryStamp,
+}
+
+impl std::fmt::Debug for RecFunDefAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecFunDefAuthority(<opaque>)")
+    }
 }
 
 impl RecFunDef {
@@ -413,6 +439,35 @@ fn scan_round(
 }
 
 impl Solver {
+    /// Authenticate every raw term retained by a caller-supplied definition
+    /// map before any consumer indexes the term store with those ids.
+    fn validate_rec_fun_defs(
+        &self,
+        defs: &HashMap<String, RecFunDef>,
+    ) -> Result<(), RecExpandError> {
+        for (name, def) in defs {
+            let authority = &def.authority;
+            if authority.arena != self.term_arena {
+                return Err(RecExpandError::UnsupportedShape(format!(
+                    "recursive definition {name} belongs to a different solver incarnation"
+                )));
+            }
+            let params_are_current = authority.param_entries.len() == def.params.len()
+                && def
+                    .params
+                    .iter()
+                    .zip(&authority.param_entries)
+                    .all(|(&id, &entry)| self.terms().entry_stamp(id) == Some(entry));
+            let body_is_current = self.terms().entry_stamp(def.body) == Some(authority.body_entry);
+            if !params_are_current || !body_is_current {
+                return Err(RecExpandError::UnsupportedShape(format!(
+                    "recursive definition {name} names a discarded or recycled term entry"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Build a [`RecFunDef`] for registration, computing every capture-relevant
     /// name set against this solver's term store.
     ///
@@ -421,16 +476,35 @@ impl Solver {
     /// `expandable = false`, so uses of it are DETECTED at expansion time (and
     /// fail closed) without ever being mis-substituted.
     #[must_use]
+    #[allow(clippy::panic)]
     pub fn make_rec_fun_def(&self, params: &[Term], body: Term) -> RecFunDef {
+        let param_ids = self
+            .resolve_terms("make_rec_fun_def", params)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let body_id = self
+            .resolve_term("make_rec_fun_def", body)
+            .unwrap_or_else(|error| panic!("{error}"));
         let store = self.terms();
-        let mut param_ids = Vec::with_capacity(params.len());
+        let authority = RecFunDefAuthority {
+            arena: self.term_arena,
+            param_entries: param_ids
+                .iter()
+                .map(|&param_id| {
+                    store.entry_stamp(param_id).unwrap_or_else(|| {
+                        panic!("authenticated recursive parameter {param_id} is not live")
+                    })
+                })
+                .collect(),
+            body_entry: store
+                .entry_stamp(body_id)
+                .unwrap_or_else(|| panic!("authenticated recursive body {body_id} is not live")),
+        };
         let mut param_sorts = Vec::with_capacity(params.len());
         let mut param_names: HashSet<String> = HashSet::new();
         let mut params_are_distinct_vars = true;
-        for &p in params {
-            param_ids.push(p.0);
-            param_sorts.push(store.sort(p.0).clone());
-            match store.get(p.0) {
+        for &param_id in &param_ids {
+            param_sorts.push(store.sort(param_id).clone());
+            match store.get(param_id) {
                 TermData::Var(name, _) => {
                     if !param_names.insert(name.clone()) {
                         params_are_distinct_vars = false;
@@ -439,7 +513,7 @@ impl Solver {
                 _ => params_are_distinct_vars = false,
             }
         }
-        let body_scan = collect_var_and_binder_names(store, body.0);
+        let body_scan = collect_var_and_binder_names(store, body_id);
         // An incomplete body scan means the capture-risk sets may miss names:
         // never expand such a definition (fail closed at every use instead).
         let expandable = params_are_distinct_vars
@@ -452,10 +526,11 @@ impl Solver {
             .collect();
         capture_risk_names.extend(body_scan.binder_names.iter().cloned());
         RecFunDef {
+            authority,
             params: param_ids,
             param_sorts,
-            body: body.0,
-            body_sort: store.sort(body.0).clone(),
+            body: body_id,
+            body_sort: store.sort(body_id).clone(),
             body_binder_names: body_scan.binder_names,
             capture_risk_names,
             expandable,
@@ -468,12 +543,17 @@ impl Solver {
     /// that FAIL CLOSED on any mention (fixedpoint queries, Optimize SAT).
     #[must_use]
     pub fn contains_rec_fun_apps(&self, roots: &[Term], defs: &HashMap<String, RecFunDef>) -> bool {
+        if self.validate_rec_fun_defs(defs).is_err() {
+            return true;
+        }
+        let Ok(mut stack) = self.resolve_terms("contains_rec_fun_apps", roots) else {
+            return true;
+        };
         if defs.is_empty() {
             return false;
         }
         let store = self.terms();
         let mut visited: HashSet<TermId> = HashSet::new();
-        let mut stack: Vec<TermId> = roots.iter().map(|t| t.0).collect();
         while let Some(id) = stack.pop() {
             if !visited.insert(id) {
                 continue;
@@ -526,12 +606,14 @@ impl Solver {
     /// unknown future `TermData` variant likewise reports `true`.
     #[must_use]
     pub fn terms_mention_names(&self, roots: &[Term], names: &HashSet<String>) -> bool {
+        let Ok(mut stack) = self.resolve_terms("terms_mention_names", roots) else {
+            return true;
+        };
         if names.is_empty() {
             return false;
         }
         let store = self.terms();
         let mut visited: HashSet<TermId> = HashSet::new();
-        let mut stack: Vec<TermId> = roots.iter().map(|t| t.0).collect();
         while let Some(id) = stack.pop() {
             if !visited.insert(id) {
                 continue;
@@ -588,6 +670,12 @@ impl Solver {
         defs: &HashMap<String, RecFunDef>,
         targets: &HashSet<String>,
     ) -> HashSet<String> {
+        if self.validate_rec_fun_defs(defs).is_err() {
+            // Every defined name is conservatively tainted. Consumers of this
+            // helper fail closed on membership, so an invalid capability can
+            // never hide a path to an undefined recursive declaration.
+            return defs.keys().cloned().collect();
+        }
         if defs.is_empty() || targets.is_empty() {
             return HashSet::new();
         }
@@ -685,8 +773,12 @@ impl Solver {
         work_budget: usize,
         deadline: Option<Instant>,
     ) -> Result<Vec<Term>, RecExpandError> {
+        self.validate_rec_fun_defs(defs)?;
+        let mut current = self
+            .resolve_terms("expand_rec_defs", roots)
+            .map_err(|error| RecExpandError::UnsupportedShape(error.to_string()))?;
         if defs.is_empty() {
-            return Ok(roots.to_vec());
+            return Ok(current.into_iter().map(|id| self.wrap_term(id)).collect());
         }
         // Builtin-conflation belt (defense in depth behind the registration
         // guard): a registered definition of a name AY matches structurally as
@@ -717,7 +809,6 @@ impl Solver {
             }
         }
 
-        let mut current: Vec<TermId> = roots.iter().map(|t| t.0).collect();
         let mut work: usize = 0;
         let mut rounds: usize = 0;
         loop {
@@ -731,7 +822,7 @@ impl Solver {
             }
             if scan.frontier.is_empty() {
                 // The Ok contract: defined by exactly this clean scan.
-                return Ok(current.into_iter().map(Term).collect());
+                return Ok(current.into_iter().map(|id| self.wrap_term(id)).collect());
             }
             if rounds >= max_rounds {
                 return Err(RecExpandError::DepthExceeded(max_rounds));
@@ -869,6 +960,112 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert("fact".to_string(), def);
         (defs, fact)
+    }
+
+    #[test]
+    fn foreign_recursive_definition_capability_fails_closed_at_every_map_consumer() {
+        let mut source = solver();
+        let source_body = source.int_const(7);
+        let mut defs = HashMap::new();
+        defs.insert(
+            "foreign_def".to_string(),
+            source.make_rec_fun_def(&[], source_body),
+        );
+
+        let mut destination = solver();
+        let local_same_slot = destination.int_const(7);
+        assert_eq!(source_body.to_raw(), local_same_slot.to_raw());
+
+        let error = destination
+            .try_expand_rec_defs(&[local_same_slot], &defs, ROUNDS, BUDGET, None)
+            .expect_err("a definition from another solver must not be expanded");
+        assert!(matches!(error, RecExpandError::UnsupportedShape(_)));
+        assert!(
+            destination.contains_rec_fun_apps(&[local_same_slot], &defs),
+            "the mention predicate must fail closed on foreign definitions"
+        );
+        let tainted = destination.rec_def_names_reaching(&defs, &HashSet::new());
+        assert_eq!(tainted, HashSet::from(["foreign_def".to_string()]));
+    }
+
+    #[test]
+    fn reset_rejects_definition_even_when_body_numeric_id_is_reused() {
+        let mut s = solver();
+        let old_body = s.int_const(7);
+        let mut defs = HashMap::new();
+        defs.insert("stale_def".to_string(), s.make_rec_fun_def(&[], old_body));
+
+        s.try_reset().expect("full reset");
+        let replacement = s.int_const(8);
+        assert_eq!(old_body.to_raw(), replacement.to_raw());
+
+        let error = s
+            .try_expand_rec_defs(&[replacement], &defs, ROUNDS, BUDGET, None)
+            .expect_err("a pre-reset definition must not authenticate after id reuse");
+        assert!(matches!(error, RecExpandError::UnsupportedShape(_)));
+    }
+
+    #[test]
+    fn entry_birth_stamps_reject_recycled_parameter_and_body_slots() {
+        let mut s = solver();
+
+        // Keep the body below the first checkpoint so only the parameter slot
+        // is recycled. The arena remains unchanged across TermStore rollback,
+        // so this specifically exercises the parameter entry-birth stamp.
+        let stable_body = s.int_const(7);
+        let param_checkpoint = s.terms().rollback_checkpoint();
+        let stale_param = s.fresh_var("stale_param", Sort::Int);
+        let mut stale_param_defs = HashMap::new();
+        stale_param_defs.insert(
+            "stale_param_def".to_string(),
+            s.make_rec_fun_def(&[stale_param], stable_body),
+        );
+        s.terms_mut().rollback_to(param_checkpoint);
+        let replacement_param = s.fresh_var("replacement_param", Sort::Int);
+        assert_eq!(stale_param.to_raw(), replacement_param.to_raw());
+        let error = s
+            .try_expand_rec_defs(&[stable_body], &stale_param_defs, ROUNDS, BUDGET, None)
+            .expect_err("a recycled parameter slot must not authenticate");
+        assert!(matches!(error, RecExpandError::UnsupportedShape(_)));
+
+        // Repeat with a zero-arity definition so only the body entry-birth
+        // stamp can reject the recycled slot.
+        let body_checkpoint = s.terms().rollback_checkpoint();
+        let stale_body = s.int_const(9);
+        let mut stale_body_defs = HashMap::new();
+        stale_body_defs.insert(
+            "stale_body_def".to_string(),
+            s.make_rec_fun_def(&[], stale_body),
+        );
+        s.terms_mut().rollback_to(body_checkpoint);
+        let replacement_body = s.int_const(10);
+        assert_eq!(stale_body.to_raw(), replacement_body.to_raw());
+        let error = s
+            .try_expand_rec_defs(&[replacement_body], &stale_body_defs, ROUNDS, BUDGET, None)
+            .expect_err("a recycled body slot must not authenticate");
+        assert!(matches!(error, RecExpandError::UnsupportedShape(_)));
+    }
+
+    #[test]
+    fn empty_definition_fast_path_still_authenticates_and_rewraps_roots() {
+        let mut first = solver();
+        let foreign = first.int_const(11);
+        let mut second = solver();
+        let local = second.int_const(11);
+        assert_eq!(foreign.to_raw(), local.to_raw());
+        let defs = HashMap::new();
+
+        for invalid in [foreign, Term::from_raw(local.to_raw())] {
+            let error = second
+                .try_expand_rec_defs(&[invalid], &defs, ROUNDS, BUDGET, None)
+                .expect_err("empty definitions must not bypass root authentication");
+            assert!(matches!(error, RecExpandError::UnsupportedShape(_)));
+        }
+
+        let expanded = second
+            .try_expand_rec_defs(&[local], &defs, ROUNDS, BUDGET, None)
+            .expect("a live root with no definitions is an authenticated identity");
+        assert_eq!(expanded, vec![local]);
     }
 
     #[test]
@@ -1051,10 +1248,10 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert("c".to_string(), def);
 
-        let app_shape = Term(
-            s.terms_mut()
-                .mk_app(Symbol::named("c"), Vec::new(), Sort::Int),
-        );
+        let app_shape_id = s
+            .terms_mut()
+            .mk_app(Symbol::named("c"), Vec::new(), Sort::Int);
+        let app_shape = s.wrap_term(app_shape_id);
         let out = s
             .try_expand_rec_defs(&[app_shape, var_shape], &defs, ROUNDS, BUDGET, None)
             .expect("0-ary def must expand");
@@ -1100,10 +1297,10 @@ mod tests {
         // Raw two-argument application of the 1-ary defined name.
         let a = s.declare_const("a", Sort::Int);
         let b = s.declare_const("b", Sort::Int);
-        let bad = Term(
-            s.terms_mut()
-                .mk_app(Symbol::named("f"), vec![a.0, b.0], Sort::Int),
-        );
+        let bad_id = s
+            .terms_mut()
+            .mk_app(Symbol::named("f"), vec![a.id(), b.id()], Sort::Int);
+        let bad = s.wrap_term(bad_id);
         let err = s
             .try_expand_rec_defs(&[bad], &defs, ROUNDS, BUDGET, None)
             .expect_err("arity mismatch must fail closed");
@@ -1122,10 +1319,10 @@ mod tests {
 
         // Raw application with a Real argument against the Int parameter.
         let r = s.declare_const("r", Sort::Real);
-        let bad = Term(
-            s.terms_mut()
-                .mk_app(Symbol::named("f"), vec![r.0], Sort::Int),
-        );
+        let bad_id = s
+            .terms_mut()
+            .mk_app(Symbol::named("f"), vec![r.id()], Sort::Int);
+        let bad = s.wrap_term(bad_id);
         let err = s
             .try_expand_rec_defs(&[bad], &defs, ROUNDS, BUDGET, None)
             .expect_err("argument sort mismatch must fail closed");

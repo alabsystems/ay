@@ -159,7 +159,7 @@ fn finite_table_cert_grants_free_constant_bound() {
 /// must satisfy both simultaneously.
 #[test]
 fn finite_table_cert_grants_shared_symbol_two_foralls() {
-    let verdict = solve_one(
+    let commands = parse(
         r#"
         (set-logic UFLIA)
         (declare-fun f (Int) Int)
@@ -169,9 +169,138 @@ fn finite_table_cert_grants_shared_symbol_two_foralls() {
         (assert (= (f 2) 3))
         (assert (= (g 2) 0))
         (check-sat)
+        (get-value ((f 2) (f 99) (g 2) (g 99)))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs.first().map(String::as_str), Some("sat"));
+    assert_eq!(
+        outputs.get(1).map(String::as_str),
+        Some("(((f 2) 3) ((f 99) 0) ((g 2) 0) ((g 99) 0))")
+    );
+    assert!(
+        exec.finite_table_cert_grant_active,
+        "the shared interpretation must be carried by exact table authority"
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
+        Some(1),
+        "this regression must exercise exact-root certification after demand search parks a successor instance"
+    );
+}
+
+/// A conflicting ground sibling must never be hidden by separately grantable
+/// universal subsets. The query may be refuted before reaching the all-roots
+/// producer; either route must refuse SAT.
+#[test]
+fn finite_table_cert_shared_symbol_ground_conflict_never_sat() {
+    let verdict = solve_one(
+        r#"
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (declare-fun g (Int) Int)
+        (assert (forall ((x Int)) (>= (f x) 0)))
+        (assert (forall ((y Int)) (>= (+ (f y) (g y)) 0)))
+        (assert (= (f 2) (- 1)))
+        (assert (= (g 2) 0))
+        (check-sat)
     "#,
     );
-    assert_eq!(verdict, "sat");
+    assert_ne!(verdict, "sat");
+}
+
+/// Direct assumption solving captures the same immutable base snapshot as
+/// plain check-sat and appends the active literal to the exact public root
+/// vector used by the rescue and final postflight.
+#[test]
+fn finite_table_cert_assumption_is_in_public_rescue_root_window() {
+    let commands = parse(
+        r#"
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (declare-fun g (Int) Int)
+        (declare-const enabled Bool)
+        (assert (forall ((x Int)) (>= (f x) 0)))
+        (assert (forall ((y Int)) (>= (+ (f y) (g y)) 0)))
+        (assert (= (f 2) 3))
+        (assert (= (g 2) 0))
+        (check-sat-assuming (enabled))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs.first().map(String::as_str), Some("sat"));
+    assert_eq!(
+        exec.statistics()
+            .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
+        Some(1),
+        "the direct-assumption route must reach the exact public-root rescue"
+    );
+}
+
+/// Plain check-sat's named-core redirect solves through assumptions internally,
+/// but its affine table model stays Pending until the outer plain SAT funnel
+/// consumes it. A second emission would treat Installed transport as stale and
+/// lose this satisfiable query to Unknown.
+#[test]
+fn finite_table_cert_named_core_redirect_emits_pending_model_once() {
+    let commands = parse(
+        r#"
+        (set-option :produce-unsat-cores true)
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (declare-fun g (Int) Int)
+        (assert (forall ((x Int)) (>= (f x) 0)))
+        (assert (forall ((y Int)) (>= (+ (f y) (g y)) 0)))
+        (assert (= (f 2) 3))
+        (assert (! (= (g 2) 0) :named g_pin))
+        (check-sat)
+        (get-value ((f 2) (f 99) (g 2) (g 99)))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+
+    assert_eq!(outputs.first().map(String::as_str), Some("sat"));
+    assert_eq!(
+        outputs.get(1).map(String::as_str),
+        Some("(((f 2) 3) ((f 99) 0) ((g 2) 0) ((g 99) 0))")
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
+        Some(1),
+        "the named-core redirect must leave exact-root transport for one outer emission"
+    );
+}
+
+/// Temporary and named-core assumptions are part of the exact public root
+/// vector. A theorem for the base assertions cannot be retargeted around the
+/// contradictory active literal.
+#[test]
+fn finite_table_cert_assumption_conflict_never_sat() {
+    let verdict = solve_one(
+        r#"
+        (set-option :produce-unsat-cores true)
+        (set-logic UFLIA)
+        (declare-fun f (Int) Int)
+        (declare-fun g (Int) Int)
+        (declare-const bad Bool)
+        (assert (forall ((x Int)) (>= (f x) 0)))
+        (assert (forall ((y Int)) (>= (+ (f y) (g y)) 0)))
+        (assert (= (g 2) 0))
+        (assert (! (=> bad (= (f 2) (- 1))) :named conflict_when_bad))
+        (check-sat-assuming (bad))
+    "#,
+    );
+    assert_ne!(verdict, "sat");
 }
 
 /// Bool-codomain table symbol with a pinned false point (sort-mismatch
@@ -328,14 +457,15 @@ fn finite_table_cert_fail_closed_residual_mentions_x() {
 }
 
 /// Nested quantifier (adversarial item): outside CAP-1's single-binder
-/// class. Since the (#p2-nested-forall) binder-merge prepass flattens the
-/// tower to `∀x,y. f(x)+g(y) >= 0` and the (#p2-default-row) multi-binder
-/// default-row certificate covers it, this now decides `sat` (matching z3;
-/// verified with AY_DEBUG_CERT: the grant is `CERT/default-row`, NOT the
-/// finite-table certificate, whose single-binder gate is unchanged). The
-/// model is real: `f = ite(x=0,1,d_f)`, `g = ite(y=0,1,d_g)` with
-/// `d_f = d_g = 0` passes the z3 re-assert gate. `unsat` remains plain
-/// wrong.
+/// class. The (#p2-nested-forall) binder-merge prepass flattens the solver
+/// view to `∀x,y. f(x)+g(y) >= 0`; at publication the (#p2-default-row)
+/// certificate peels the exact authored tower read-only and checks that same
+/// multi-binder obligation without changing its root identity. This now
+/// decides `sat` (matching z3; verified with AY_DEBUG_CERT: the grant is
+/// `CERT/default-row`, NOT the finite-table certificate, whose single-binder
+/// gate is unchanged). The model is real: `f = ite(x=0,1,d_f)`,
+/// `g = ite(y=0,1,d_g)` with `d_f = d_g = 0` passes the z3 re-assert gate.
+/// `unsat` remains plain wrong.
 #[test]
 fn finite_table_cert_fail_closed_nested_quantifier() {
     let verdict = solve_one(
@@ -363,7 +493,7 @@ fn finite_table_cert_fail_closed_nested_quantifier() {
 ///
 /// The `sat` this now reports comes from a DIFFERENT sound lane: the CEGQI
 /// UF-graph model-pin certificate (#cegqi-mdef v2, b517b967) reached through
-/// `disambiguate_cegqi_unsat_ext` — per-universal refutation of the
+/// `disambiguate_cegqi_unsat` — per-universal refutation of the
 /// de-skolemized counterexample `G0 ∧ pins ∧ ¬(f(c+1) >= 0)` with fresh `c`,
 /// where the pins encode the completed graph-else-default interpretation of
 /// `f`. The fresh-constant rule is argument-shape-agnostic (congruence
@@ -493,6 +623,43 @@ fn finite_table_cert_refuses_interpreted_abs() {
     "#,
     );
     assert_ne!(verdict, "sat", "interpreted abs treated as free table UF");
+}
+
+/// A theory function must never acquire an invented finite-table
+/// interpretation.  This was a concrete wrong-SAT vector: the one-binder
+/// scanner could mistake `rem` for a free UF and choose the constant-zero
+/// default, even though `rem 2 3 = 2` in integer arithmetic.
+#[test]
+fn finite_table_cert_never_reinterprets_rem() {
+    let verdict = solve_one(
+        r#"
+        (set-logic UFLIA)
+        (assert (forall ((y Int)) (= (rem 2 y) 0)))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        verdict, "unsat",
+        "interpreted rem was not solved with its arithmetic semantics"
+    );
+}
+
+/// The n-ary default-row lane had the same authority flaw as the
+/// single-binder finite-table lane.  Exact positive declaration binding must
+/// reject `rem` before either certificate can synthesize a table for it.
+#[test]
+fn default_row_cert_never_reinterprets_rem() {
+    let verdict = solve_one(
+        r#"
+        (set-logic UFLIA)
+        (assert (forall ((x Int) (y Int)) (= (rem x y) 0)))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        verdict, "unsat",
+        "interpreted rem was not solved with its arithmetic semantics"
+    );
 }
 
 /// Non-Int/Bool/Real sort in the body (sort-mismatch adversarial item): an

@@ -2,12 +2,15 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Soundness self-check for Cooper quantifier elimination.
+//! Bounded differential check for Cooper quantifier elimination candidates.
 //!
-//! The contract is: never return a wrong elimination. Every successful
-//! `eliminate_exists` result is run through [`equivalence_self_check`] before it
-//! is handed back; if the check is not fully satisfied the result is discarded
-//! and the caller keeps the original quantified formula (fail-closed).
+//! Every successful `eliminate_exists` candidate is exercised here before it
+//! is handed back; any observed disagreement discards the candidate. This is a
+//! useful deterministic bug detector, but it is deliberately **not** verdict
+//! authority: the free-variable battery is finite and therefore cannot prove a
+//! universally quantified equivalence. A public decision path must keep the
+//! exact quantified source or obtain a separate symbolic proof that covers all
+//! free-variable valuations.
 //!
 //! # What we check
 //!
@@ -26,10 +29,10 @@
 //! 3. **Agree.** `O[σ]` must equal `(∃x.φ[σ])`. Any disagreement fails the
 //!    check.
 //!
-//! This is precisely the practical equivalent of the
-//! `O ≡ ∃x.φ` requirement: direction `∃x.φ ⇒ O` AND `O ⇒ ∃x.φ` are both
-//! covered, since we compare both truth values on each sampled assignment and
-//! the bounded x-search is a *complete* decision procedure for `∃x.φ[σ]`.
+//! Both directions are checked for each sampled assignment. The bounded
+//! x-search is complete for the resulting one-variable formula **after** a
+//! particular free-variable assignment `σ` is fixed; the finite battery does
+//! not establish the outer `forall σ` obligation.
 //!
 //! The battery mixes deterministic boundary points (all-zero, ±1, ±small) with
 //! seeded pseudo-random assignments, so the check is reproducible.
@@ -72,7 +75,8 @@ const SEARCH_WINDOW_CAP: i64 = 1 << 16;
 /// Verify `result ≡ ∃x.φ` on a battery of ground assignments to the free
 /// variables. Returns `true` only if every case agrees and every `O[σ]`
 /// evaluated to a definite boolean. Any inconclusive case returns `false`
-/// (fail-closed).
+/// for this bounded candidate check. Passing is not a proof of equivalence over
+/// every free-variable valuation.
 pub(super) fn equivalence_self_check(
     terms: &TermStore,
     literals: &[TermId],

@@ -9,8 +9,9 @@ use crate::command::{Command, Term as ParsedTerm};
 use ay_core::{Sort, TermId};
 
 use super::{
-    is_reserved_symbol, CommandResult, Context, ElaborateError, Objective, ObjectiveDirection,
-    OptionValue, Result, ScopeFrame, SoftAssertion, SymbolInfo,
+    is_canonical_theory_operator_identity, is_reserved_symbol, CommandResult, Context,
+    ElaborateError, Objective, ObjectiveDirection, OptionValue, Result, ScopeFrame, SoftAssertion,
+    SymbolInfo,
 };
 
 /// Builtin sort names supplied by enabled SMT theories.
@@ -34,6 +35,14 @@ const BUILTIN_THEORY_SORT_NAMES: &[&str] = &[
 /// context's empty-frame storage.
 const MAX_INCREMENTAL_SCOPE_DEPTH: usize = 1 << 16;
 
+#[derive(Clone, Copy)]
+enum SortSurfaceMode {
+    /// Reparsable source syntax for a currently live declaration.
+    Source,
+    /// Exact/fail-visible spelling when declaration epochs would collapse.
+    ExternalOutput,
+}
+
 pub(super) fn is_builtin_theory_sort(name: &str) -> bool {
     BUILTIN_THEORY_SORT_NAMES.contains(&name)
 }
@@ -55,7 +64,7 @@ impl Context {
         }
         if self.sort_defs.contains_key(name)
             || self.parametric_sort_defs.contains_key(name)
-            || self.datatypes.contains_key(name)
+            || self.live_datatype_carriers.contains(name)
             || self.parametric_datatypes.contains_key(name)
             || self.sort_parameters.contains(name)
         {
@@ -149,6 +158,7 @@ impl Context {
             authored_assertion_count: self.authored_assertions.len(),
             polymorphic_declarations: Vec::new(),
         });
+        self.advance_source_revision();
     }
 
     /// Pop a scope. Returns `true` on success, `false` on underflow (no scopes).
@@ -193,19 +203,16 @@ impl Context {
                 self.named_terms.remove(&name);
             }
             // Remove datatypes defined in this scope
-            for name in frame.datatypes {
-                self.datatypes.remove(&name);
-                self.monomorphic_datatype_decs.remove(&name);
-                // Parametric instance metadata is keyed by the same mangled name.
-                self.parametric_instance_args.remove(&name);
+            for (internal, surface) in frame.datatypes {
+                self.live_datatype_carriers.remove(&internal);
+                self.monomorphic_datatype_decs.remove(&surface);
             }
             // Remove constructors defined in this scope
-            for name in frame.constructors {
-                self.constructors.remove(&name);
-                self.ctor_selectors.remove(&name);
-                self.ctor_selector_info.remove(&name);
-                self.nullary_ctor_terms.remove(&name);
-            }
+            //
+            // Exact constructor/selector/nullary metadata is intentionally
+            // sticky with the term store. Surface symbol bindings were restored
+            // above, and `live_datatype_carriers` gates source visibility.
+            let _ = frame.constructors;
             // Remove sort definitions defined in this scope (both monomorphic
             // synonyms and parameterized templates are tracked here; removing an
             // absent key from either map is a harmless no-op).
@@ -222,6 +229,24 @@ impl Context {
             // Remove parametric datatype templates defined in this scope.
             for name in frame.parametric_datatypes {
                 self.parametric_datatypes.remove(&name);
+                if let Some(template_id) = self.parametric_datatype_ids.remove(&name) {
+                    let owned_carriers: Vec<String> = self
+                        .parametric_instance_args
+                        .iter()
+                        .filter(|(_, (owner, _, _))| owner == &template_id)
+                        .map(|(carrier, _)| carrier.clone())
+                        .collect();
+                    for carrier in owned_carriers {
+                        self.live_datatype_carriers.remove(&carrier);
+                        for identity in self.datatype_member_identities_for_carrier(&carrier) {
+                            let surface = self
+                                .dt_surface_name(&identity)
+                                .unwrap_or(identity.as_str())
+                                .to_string();
+                            self.remove_live_symbol_identity(&surface, &identity);
+                        }
+                    }
+                }
             }
             self.polymorphic_assertions
                 .truncate(frame.polymorphic_assertion_count);
@@ -235,6 +260,7 @@ impl Context {
                         .any(|name| name == &declaration.name)
                 });
             }
+            self.advance_source_revision();
             true
         } else {
             false
@@ -259,10 +285,67 @@ impl Context {
     /// without requiring a scope frame. Only intended for internal `__ay_*`
     /// symbols the solver created itself.
     pub fn remove_symbols(&mut self, names: &[String]) {
+        let mut changed = false;
         for name in names {
-            self.symbols.remove(name);
-            self.overloaded_symbols.remove(name);
-            self.internal_symbols.remove(name);
+            changed |= self.symbols.remove(name).is_some();
+            changed |= self.overloaded_symbols.remove(name).is_some();
+            changed |= self.internal_symbols.remove(name);
+        }
+        if changed {
+            self.advance_source_revision();
+        }
+    }
+
+    /// Remove one exact declaration from the live symbol table and every
+    /// surviving scope snapshot while preserving unrelated overloads. Sticky
+    /// declaration metadata is intentionally untouched.
+    fn remove_live_symbol_identity(&mut self, surface: &str, identity: &str) {
+        let matches_identity =
+            |info: &SymbolInfo| info.internal_name.as_deref().unwrap_or(surface) == identity;
+        let mut bindings = if let Some(overloads) = self.overloaded_symbols.remove(surface) {
+            self.symbols.remove(surface);
+            overloads
+        } else {
+            self.symbols.remove(surface).into_iter().collect()
+        };
+        bindings.retain(|info| !matches_identity(info));
+        match bindings.len() {
+            0 => {}
+            1 => {
+                if let Some(info) = bindings.pop() {
+                    self.symbols.insert(surface.to_string(), info);
+                }
+            }
+            _ => {
+                if let Some(info) = bindings.last().cloned() {
+                    self.symbols.insert(surface.to_string(), info);
+                }
+                self.overloaded_symbols
+                    .insert(surface.to_string(), bindings);
+            }
+        }
+
+        for frame in &mut self.scopes {
+            let Some(state) = frame.symbols.get_mut(surface) else {
+                continue;
+            };
+            let mut snapshot = state
+                .overloads
+                .take()
+                .unwrap_or_else(|| state.primary.take().into_iter().collect());
+            snapshot.retain(|info| !matches_identity(info));
+            match snapshot.len() {
+                0 => {
+                    state.primary = None;
+                }
+                1 => {
+                    state.primary = snapshot.pop();
+                }
+                _ => {
+                    state.primary = snapshot.last().cloned();
+                    state.overloads = Some(snapshot);
+                }
+            }
         }
     }
 
@@ -374,7 +457,10 @@ impl Context {
         let Some(info) = self.symbols.get(name) else {
             return false;
         };
-        if info.arg_sorts.len() != params.len()
+        if info.declaration_kind() != super::DeclarationKind::Uninterpreted
+            || info.internal_name.is_some()
+            || self.internal_symbols.contains(name)
+            || info.arg_sorts.len() != params.len()
             || info
                 .arg_sorts
                 .iter()
@@ -384,8 +470,12 @@ impl Context {
         {
             return false;
         }
+        let declaration_id = info.declaration_id().clone();
         self.adopted_macro_interps
             .insert(name.to_string(), (params.to_vec(), body));
+        self.adopted_macro_declaration_ids
+            .insert(name.to_string(), declaration_id);
+        self.advance_source_revision();
         true
     }
 
@@ -546,7 +636,11 @@ impl Context {
             return None;
         }
         let info = self.symbols.get(&fname)?;
-        if info.arg_sorts.len() != pvars.len() {
+        if info.declaration_kind() != super::DeclarationKind::Uninterpreted
+            || info.internal_name.is_some()
+            || self.internal_symbols.contains(&fname)
+            || info.arg_sorts.len() != pvars.len()
+        {
             return None;
         }
         // A pre-adoption raw occurrence of `f` in any existing constraint
@@ -557,6 +651,7 @@ impl Context {
         }
         let ret_sort = info.sort.clone();
         let arg_sorts = info.arg_sorts.clone();
+        let declaration_id = info.declaration_id().clone();
         // Binder sorts must equal the declared argument sorts exactly.
         let mut params: Vec<(String, Sort)> = Vec::with_capacity(pvars.len());
         for ((vname, vsort), decl) in pvars.iter().zip(arg_sorts.iter()) {
@@ -617,12 +712,19 @@ impl Context {
             .insert(fname.clone(), (params, ret_sort, parsed_rhs));
         self.adopted_macro_interps
             .insert(fname.clone(), (evars, def_body));
+        self.adopted_macro_declaration_ids
+            .insert(fname.clone(), declaration_id);
+        self.advance_source_revision();
         Some(fname)
     }
 
     fn rollback_adopted_macro(&mut self, name: &str) {
         self.fun_defs.remove(name);
-        self.adopted_macro_interps.remove(name);
+        let removed = self.adopted_macro_interps.remove(name).is_some();
+        self.adopted_macro_declaration_ids.remove(name);
+        if removed {
+            self.advance_source_revision();
+        }
     }
 
     #[cfg(test)]
@@ -655,21 +757,53 @@ impl Context {
     /// This is used by the native Rust API to register constants created
     /// via `mk_var` so they appear in models.
     pub fn register_symbol(&mut self, name: String, term: TermId, sort: Sort) {
+        self.register_symbol_with_internal_name(name, term, sort, None);
+    }
+
+    fn register_symbol_with_internal_name(
+        &mut self,
+        name: String,
+        term: TermId,
+        sort: Sort,
+        internal_name: Option<String>,
+    ) {
         let public_sort = super::PublicSort::from_engine(&sort);
-        let info = SymbolInfo {
-            term: Some(term),
+        let info = SymbolInfo::fresh(
+            Some(term),
             sort,
-            arg_sorts: vec![],
+            vec![],
             public_sort,
-            public_arg_sorts: vec![],
-            internal_name: None,
-        };
+            vec![],
+            internal_name,
+            super::DeclarationKind::Uninterpreted,
+        );
         if self.global_declarations_enabled() {
             self.propagate_global_symbol_replacement_to_snapshots(&name, &info);
         } else {
             self.track_scoped_symbol(&name);
         }
         self.symbols.insert(name, info);
+        self.advance_source_revision();
+    }
+
+    /// Create and register one native-API constant as a global declaration.
+    ///
+    /// The caller-visible `name` remains the symbol-table/model/replay key. The
+    /// term DAG receives the same collision-safe core identity recorded in
+    /// [`SymbolInfo::internal_name`], so a legal map-target spelling such as
+    /// `div` cannot become a non-theory owner of the canonical theory identity.
+    /// Keeping allocation and registration together prevents a caller from
+    /// constructing a term whose spelling disagrees with its declaration
+    /// metadata.
+    #[doc(hidden)]
+    pub fn register_native_global_constant(&mut self, name: String, sort: Sort) -> TermId {
+        self.with_native_global_declaration_tracking(|ctx| {
+            let internal_name = ctx.ordinary_source_binding_internal_name(&name);
+            let core_name = internal_name.as_deref().unwrap_or(&name).to_string();
+            let term = ctx.terms.mk_fresh_named_var(&core_name, sort.clone());
+            ctx.register_symbol_with_internal_name(name, term, sort, internal_name);
+            term
+        })
     }
 
     /// Register a native constant independently of the current SMT-LIB
@@ -766,6 +900,46 @@ impl Context {
                 && info.arg_sorts == arg_sorts
                 && info.sort == ret_sort
         };
+        // Resolve the target before the exact-re-registration fast path. A
+        // canonical theory spelling is never a compatibility identity that an
+        // alias may create from nothing: doing so would put an ordinary
+        // `DeclarationKind::Uninterpreted` owner at `and`, `=`, `div`, ... and
+        // make its core applications structurally indistinguishable from the
+        // builtin. Such an identity is admissible only when this is genuinely
+        // an alias of one exact, live theory declaration at the requested
+        // signature (notably a declaration-activated collection operator).
+        let first_target = {
+            let mut targets = self
+                .symbol_iter()
+                .filter(|(surface, info)| {
+                    self.symbol_identity_name(surface, info) == internal_name
+                        && info.arg_sorts == arg_sorts
+                        && info.sort == ret_sort
+                })
+                .map(|(_, info)| info);
+            let first_target = targets.next().cloned();
+            if let Some(first_target) = first_target.as_ref() {
+                if targets.any(|target| target.declaration_id() != first_target.declaration_id()) {
+                    return Err(ElaborateError::Unsupported(format!(
+                        "native alias '{surface_name}' targets ambiguous declaration '{internal_name}'"
+                    )));
+                }
+            }
+            first_target
+        };
+        if is_canonical_theory_operator_identity(&internal_name)
+            && !first_target.as_ref().is_some_and(|target| {
+                target.declaration_kind() == super::DeclarationKind::Theory
+                    && self.effective_declaration_kind(target.declaration_id())
+                        == Some(super::DeclarationKind::Theory)
+            })
+        {
+            return Err(ElaborateError::Unsupported(format!(
+                "native alias '{surface_name}' cannot claim canonical theory identity \
+                 '{internal_name}' without one exact live theory declaration at the requested \
+                 signature"
+            )));
+        }
         // Exact re-registration is an identity operation, including for a
         // trusted alias of a datatype member. Check it before the collision
         // gates: after first registration, metadata intentionally classifies a
@@ -788,6 +962,9 @@ impl Context {
                     primary.public_arg_sorts = public_arg_sorts;
                     primary.public_sort = public_sort;
                 }
+                if changed {
+                    self.advance_source_revision();
+                }
                 return Ok(changed);
             }
             return Ok(false);
@@ -802,6 +979,9 @@ impl Context {
                     info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort;
                 info.public_arg_sorts = public_arg_sorts;
                 info.public_sort = public_sort;
+                if changed {
+                    self.advance_source_revision();
+                }
                 return Ok(changed);
             }
             return Ok(false);
@@ -835,18 +1015,36 @@ impl Context {
         if self.is_datatype_member_name(&surface_name) {
             return Err(ElaborateError::DatatypeMemberCollision(surface_name));
         }
+        // Prefer sharing the exact declaration identity when the native target
+        // is already registered. The low-level frontend API historically also
+        // accepts a trusted PRIVATE identity before its separate native handle
+        // is registered; that compatibility case receives a fresh identity and
+        // remains ineligible for projection authority because aliases are never
+        // ordinary primary bindings. Canonical absent-target identities were
+        // rejected above.
         self.track_internal_surface(internal_name.clone(), surface_name.clone());
-        self.register_overloadable_symbol(
-            surface_name,
-            SymbolInfo {
-                term: None,
-                sort: ret_sort,
+        let info = if let Some(target) = first_target.as_ref() {
+            SymbolInfo::alias_of(
+                None,
+                ret_sort,
                 arg_sorts,
                 public_sort,
                 public_arg_sorts,
-                internal_name: Some(internal_name),
-            },
-        );
+                Some(internal_name),
+                target,
+            )
+        } else {
+            SymbolInfo::fresh(
+                None,
+                ret_sort,
+                arg_sorts,
+                public_sort,
+                public_arg_sorts,
+                Some(internal_name),
+                super::DeclarationKind::Uninterpreted,
+            )
+        };
+        self.register_overloadable_symbol(surface_name, info);
         Ok(true)
     }
 
@@ -901,6 +1099,7 @@ impl Context {
         }
 
         self.symbols.insert(name.clone(), info);
+        self.advance_source_revision();
     }
 
     fn propagate_global_symbol_replacement_to_snapshots(&mut self, name: &str, info: &SymbolInfo) {
@@ -943,14 +1142,53 @@ impl Context {
         }
     }
 
-    /// Allocate a private core identity for an incoming ordinary declaration
-    /// when its surface name is already occupied. The first declaration keeps
-    /// the surface identity for compatibility; every later overload is
-    /// disjoint even when only its result sort differs.
-    pub(super) fn ordinary_declaration_internal_name(&mut self, name: &str) -> Option<String> {
-        if !self.symbols.contains_key(name) && !self.overloaded_symbols.contains_key(name) {
+    /// Allocate a core identity for an incoming ordinary source binding — a
+    /// declaration or a problem-level definition.
+    ///
+    /// The identity is private when the surface name is already occupied, was
+    /// used by a binding that has since left scope, or is also a builtin
+    /// map-target spelling. Ordinary first bindings in this term store keep the
+    /// surface identity for compatibility; builtin-colliding bindings and every
+    /// later incarnation are disjoint even when only their result sort differs.
+    /// Definitions remain surface-keyed in `fun_defs`; this identity belongs to
+    /// their exact signature metadata and to recursive applications built while
+    /// their bodies are being validated.
+    pub(super) fn ordinary_source_binding_internal_name(&mut self, name: &str) -> Option<String> {
+        let can_use_surface_identity = !super::declaration_requires_private_core_identity(name)
+            && self.declaration_core_identity_is_available(name);
+        if can_use_surface_identity {
+            self.reserve_declaration_core_identity(name);
             return None;
         }
+
+        let candidate = self.fresh_private_declaration_core_identity();
+        self.track_internal_surface(candidate.clone(), name.to_string());
+        Some(candidate)
+    }
+
+    /// Whether a core spelling has never denoted a declaration in this term
+    /// store and is not occupied by a live declaration. The sticky history is
+    /// load-bearing: scope pop removes live symbol metadata but retained terms
+    /// continue to carry their original core spellings.
+    pub(super) fn declaration_core_identity_is_available(&self, name: &str) -> bool {
+        !self.declaration_core_identities_used.contains(name)
+            && !self.symbols.contains_key(name)
+            && !self.overloaded_symbols.contains_key(name)
+            && !self.constructors.contains_key(name)
+            && !self.dt_internal_surface.contains_key(name)
+    }
+
+    /// Reserve an exact declaration core spelling for the lifetime of this
+    /// term store. This reservation is intentionally not scoped.
+    pub(super) fn reserve_declaration_core_identity(&mut self, name: &str) {
+        self.declaration_core_identities_used
+            .insert(name.to_string());
+    }
+
+    /// Mint and reserve a private declaration core spelling. Ordinary
+    /// overloads and datatype members share this source so their private
+    /// identities cannot collide with each other.
+    pub(super) fn fresh_private_declaration_core_identity(&mut self) -> String {
         loop {
             let candidate = format!(
                 "{}overload_{}",
@@ -958,14 +1196,200 @@ impl Context {
                 self.next_overload_identity
             );
             self.next_overload_identity = self.next_overload_identity.wrapping_add(1);
-            let already_used = self.symbols.contains_key(&candidate)
-                || self.overloaded_symbols.contains_key(&candidate)
-                || self.dt_internal_surface.contains_key(&candidate);
-            if !already_used {
-                self.track_internal_surface(candidate.clone(), name.to_string());
-                return Some(candidate);
+            if self.declaration_core_identity_is_available(&candidate) {
+                self.reserve_declaration_core_identity(&candidate);
+                return candidate;
             }
         }
+    }
+
+    /// Allocate one nominal sort core for this term-store lifetime. The first
+    /// declaration may retain its preferred spelling; any later incarnation or
+    /// structurally distinct parametric instance that proposes the same text
+    /// receives a private identity.
+    pub(super) fn allocate_nominal_sort_identity(
+        &mut self,
+        preferred: &str,
+        surface: &str,
+    ) -> String {
+        let identity = if !self.sort_core_identities_used.contains(preferred)
+            && !self.nominal_sort_surfaces.contains_key(preferred)
+            && !self.datatypes.contains_key(preferred)
+            && !self.sort_defs.contains_key(preferred)
+            && !self
+                .sort_defs
+                .values()
+                .any(|sort| matches!(sort, Sort::Uninterpreted(name) if name == preferred))
+        {
+            preferred.to_string()
+        } else {
+            loop {
+                let candidate = format!(
+                    "{}datatype_sort_{}",
+                    super::INTERNAL_SYMBOL_PREFIX,
+                    self.next_sort_identity
+                );
+                self.next_sort_identity = self.next_sort_identity.wrapping_add(1);
+                if !self.sort_core_identities_used.contains(&candidate)
+                    && !self.nominal_sort_surfaces.contains_key(&candidate)
+                    && !self.datatypes.contains_key(&candidate)
+                    && !self.sort_defs.contains_key(&candidate)
+                    && !self
+                        .sort_defs
+                        .values()
+                        .any(|sort| matches!(sort, Sort::Uninterpreted(name) if name == &candidate))
+                {
+                    break candidate;
+                }
+            }
+        };
+        self.sort_core_identities_used.insert(identity.clone());
+        self.nominal_sort_surfaces.insert(
+            identity.clone(),
+            super::NominalSortSurface::Simple(surface.to_string()),
+        );
+        identity
+    }
+
+    /// Replace the allocator's simple diagnostic surface with the full applied
+    /// datatype sort. This remains sticky even after scope exit.
+    pub(super) fn record_parametric_sort_surface(
+        &mut self,
+        internal: &str,
+        display: String,
+        template: &str,
+        arguments: &[Sort],
+    ) {
+        self.nominal_sort_surfaces.insert(
+            internal.to_string(),
+            super::NominalSortSurface::ParametricDatatype {
+                display,
+                template: template.to_string(),
+                arguments: arguments.to_vec(),
+            },
+        );
+    }
+
+    /// Resolve a live public sort name to its exact engine sort.
+    pub fn sort_definition(&self, surface: &str) -> Option<&Sort> {
+        self.sort_defs.get(surface)
+    }
+
+    /// User-facing/preferred spelling of a private nominal sort core.
+    pub fn sort_surface_name<'a>(&'a self, internal: &'a str) -> &'a str {
+        match self.nominal_sort_surfaces.get(internal) {
+            Some(super::NominalSortSurface::Simple(surface)) => surface,
+            Some(super::NominalSortSurface::ParametricDatatype { display, .. }) => display,
+            None => internal,
+        }
+    }
+
+    /// Convert an exact engine sort back to source syntax. This path is used by
+    /// internal re-elaboration and therefore keeps the live source spelling;
+    /// external formatting applies declaration-epoch disambiguation separately.
+    pub fn surface_sort(&self, sort: &Sort) -> Option<crate::command::Sort> {
+        self.surface_sort_with_mode(sort, SortSurfaceMode::Source)
+    }
+
+    fn surface_sort_with_mode(
+        &self,
+        sort: &Sort,
+        mode: SortSurfaceMode,
+    ) -> Option<crate::command::Sort> {
+        use crate::command::{Index, Sort as ParsedSort};
+
+        Some(match sort {
+            Sort::Bool => ParsedSort::Simple("Bool".to_string()),
+            Sort::Int => ParsedSort::Simple("Int".to_string()),
+            Sort::Real => ParsedSort::Simple("Real".to_string()),
+            Sort::String => ParsedSort::Simple("String".to_string()),
+            Sort::RegLan => ParsedSort::Simple("RegLan".to_string()),
+            Sort::BitVec(bit_vector) => ParsedSort::Indexed(
+                "BitVec".to_string(),
+                vec![Index::Numeral(bit_vector.width.to_string())],
+            ),
+            Sort::FloatingPoint(exponent, significand) => ParsedSort::Indexed(
+                "FloatingPoint".to_string(),
+                vec![
+                    Index::Numeral(exponent.to_string()),
+                    Index::Numeral(significand.to_string()),
+                ],
+            ),
+            Sort::Array(array) => ParsedSort::Parameterized(
+                "Array".to_string(),
+                vec![
+                    self.surface_sort_with_mode(&array.index_sort, mode)?,
+                    self.surface_sort_with_mode(&array.element_sort, mode)?,
+                ],
+            ),
+            Sort::Seq(element) => ParsedSort::Parameterized(
+                "Seq".to_string(),
+                vec![self.surface_sort_with_mode(element, mode)?],
+            ),
+            Sort::Uninterpreted(internal)
+                if matches!(mode, SortSurfaceMode::ExternalOutput)
+                    && self.nominal_sort_surface_is_ambiguous(internal) =>
+            {
+                ParsedSort::Simple(internal.clone())
+            }
+            Sort::Uninterpreted(internal) => match self.nominal_sort_surfaces.get(internal) {
+                Some(super::NominalSortSurface::Simple(surface)) => {
+                    ParsedSort::Simple(surface.clone())
+                }
+                Some(super::NominalSortSurface::ParametricDatatype {
+                    template,
+                    arguments,
+                    ..
+                }) => ParsedSort::Parameterized(
+                    template.clone(),
+                    arguments
+                        .iter()
+                        .map(|argument| self.surface_sort_with_mode(argument, mode))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+                None => ParsedSort::Simple(internal.clone()),
+            },
+            Sort::Datatype(datatype) => ParsedSort::Simple(datatype.name.clone()),
+            Sort::Char => ParsedSort::Simple("Char".to_string()),
+            Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => ParsedSort::Simple(name.clone()),
+            _ => return None,
+        })
+    }
+
+    /// SMT-LIB rendering of [`Self::surface_sort`]. This is the external
+    /// formatting boundary for exact engine sorts owned by this context.
+    pub fn format_sort_surface(&self, sort: &Sort) -> Option<String> {
+        use crate::command::{Index, Sort as ParsedSort};
+
+        fn render(sort: &ParsedSort) -> Option<String> {
+            let quote = ay_core::quote_symbol;
+            Some(match sort {
+                ParsedSort::Simple(name) => quote(name),
+                ParsedSort::Parameterized(name, arguments) => {
+                    let arguments = arguments.iter().map(render).collect::<Option<Vec<_>>>()?;
+                    if arguments.is_empty() {
+                        format!("({})", quote(name))
+                    } else {
+                        format!("({} {})", quote(name), arguments.join(" "))
+                    }
+                }
+                ParsedSort::Indexed(name, indices) => {
+                    let indices = indices
+                        .iter()
+                        .map(|index| match index {
+                            Index::Numeral(value)
+                            | Index::Decimal(value)
+                            | Index::Hexadecimal(value)
+                            | Index::Binary(value) => Some(value.clone()),
+                            Index::Symbol(value) => Some(quote(value)),
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    format!("(_ {} {})", quote(name), indices.join(" "))
+                }
+            })
+        }
+
+        render(&self.surface_sort_with_mode(sort, SortSurfaceMode::ExternalOutput)?)
     }
 
     /// The internal symbol name to use when BUILDING an application of `name`
@@ -1230,7 +1654,7 @@ impl Context {
         match cmd {
             Command::SetLogic(logic) => {
                 self.validate_logic_sort_parameter_conflicts(logic)?;
-                self.logic = Some(logic.clone());
+                self.set_logic(logic.clone());
                 // This one came from the command stream, so a LATER one in the
                 // same stream is z3's "already been set" error.
                 self.logic_set_by_command = true;
@@ -1555,11 +1979,13 @@ impl Context {
                     self.fun_defs.remove(name.as_str());
                 }
                 self.adopted_macro_interps.clear();
+                self.adopted_macro_declaration_ids.clear();
                 self.polymorphic_assertions
                     .retain(|assertion| assertion.persistent_definition);
                 self.authored_assertions.clear();
                 self.materialized_polymorphic_assertions = 0;
                 self.polymorphic_instantiation_complete = true;
+                self.advance_source_revision();
                 Ok(None)
             }
             // Declare/define sort are stored but don't produce output
@@ -1582,17 +2008,23 @@ impl Context {
                         "non-zero-arity declare-sort '{name}' (arity {arity})"
                     )));
                 }
-                // Store as uninterpreted sort
-                let sort = Sort::Uninterpreted(name.clone());
+                // Store a nominal identity that is never reused while terms
+                // from this context may survive a later scope pop.
+                let identity = self.allocate_nominal_sort_identity(name, name);
+                let sort = Sort::Uninterpreted(identity);
                 self.sort_defs.insert(name.clone(), sort.clone());
-                self.public_sort_defs
-                    .insert(name.clone(), super::PublicSort::Core(sort));
+                self.public_sort_defs.insert(
+                    name.clone(),
+                    super::PublicSort::Core(Sort::Uninterpreted(name.clone())),
+                );
                 self.track_scoped_sort_def(name.clone());
+                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             Command::DeclareSortParameter(name) => {
                 self.declare_sort_parameter(name)?;
+                self.advance_source_revision();
                 Ok(None)
             }
             Command::DefineSort(name, params, sort) => {
@@ -1622,6 +2054,7 @@ impl Context {
                         .insert(name.clone(), (params.clone(), sort.clone()));
                 }
                 self.track_scoped_sort_def(name.clone());
+                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -1630,6 +2063,7 @@ impl Context {
                     return Err(ElaborateError::ReservedSymbol(name.clone()));
                 }
                 self.declare_datatype(name, datatype_dec)?;
+                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -1641,6 +2075,7 @@ impl Context {
                     return Err(ElaborateError::ReservedSymbol(sort_dec.name.clone()));
                 }
                 self.declare_datatypes(sort_decs, datatype_decs)?;
+                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -1801,6 +2236,29 @@ impl Context {
             .map(|(name, ctors)| (name.as_str(), ctors.as_slice()))
     }
 
+    /// Iterate only datatype carriers currently visible through source-level
+    /// declarations. Solver/proof consumers must use [`Self::datatype_iter`]
+    /// instead so retained old terms keep their exact semantics after `pop`.
+    pub fn live_datatype_iter(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.datatypes.iter().filter_map(|(name, constructors)| {
+            self.live_datatype_carriers
+                .contains(name)
+                .then_some((name.as_str(), constructors.as_slice()))
+        })
+    }
+
+    /// Whether an exact datatype carrier is currently source-visible.
+    pub fn is_live_datatype_carrier(&self, name: &str) -> bool {
+        self.live_datatype_carriers.contains(name)
+    }
+
+    /// Whether `name` is a concrete instance of a parametric datatype
+    /// template. Internal-to-surface member mappings are not a valid proxy:
+    /// scoped monomorphic reincarnations also receive private member cores.
+    pub fn is_parametric_datatype_instance(&self, name: &str) -> bool {
+        self.parametric_instance_args.contains_key(name)
+    }
+
     /// Check if a symbol name is a datatype constructor
     ///
     /// Returns Some((dt_name, ctor_name)) if the symbol is a constructor,
@@ -1851,11 +2309,23 @@ impl Context {
     /// exactly the ascription's own resolution rule — and only fall back to the
     /// bare entry when the name is not overloaded at all.
     pub(super) fn nullary_ctor_term_in(&self, dt_name: &str, ctor_name: &str) -> Option<TermId> {
+        if self
+            .constructors
+            .get(ctor_name)
+            .is_some_and(|(carrier, _)| carrier == dt_name)
+        {
+            if let Some(term) = self.nullary_ctor_terms.get(ctor_name) {
+                return Some(*term);
+            }
+        }
         let wanted = Sort::Uninterpreted(dt_name.to_string());
-        let candidates = self.symbol_candidates(ctor_name)?;
-        let mut matches = candidates
-            .iter()
-            .filter(|info| info.arg_sorts.is_empty() && info.sort == wanted);
+        let surface_name = self.dt_surface_name(ctor_name).unwrap_or(ctor_name);
+        let candidates = self.symbol_candidates(surface_name)?;
+        let mut matches = candidates.iter().filter(|info| {
+            info.arg_sorts.is_empty()
+                && info.sort == wanted
+                && self.symbol_identity_name(surface_name, info) == ctor_name
+        });
         let first = matches.next()?;
         // Two nullary constructors of the SAME datatype cannot share a name, so
         // an ambiguity here means the tables are inconsistent: decline rather

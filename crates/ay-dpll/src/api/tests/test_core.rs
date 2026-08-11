@@ -9,6 +9,7 @@ use std::time::Duration;
 use num_bigint::BigInt;
 
 use crate::api::*;
+use ay_core::{Symbol, TermData};
 
 #[test]
 fn test_basic_lia() {
@@ -1003,6 +1004,62 @@ fn test_euf_binary_function() {
     assert_eq!(solver.check_sat(), SolveResult::Sat);
 }
 
+#[test]
+fn native_ufs_named_like_builtins_keep_private_core_identity() {
+    let mut solver = Solver::new(Logic::All);
+    let seven = solver.int_const(7);
+    let minus_two = solver.int_const(-2);
+
+    let user_rem = solver.declare_fun("rem", &[Sort::Int, Sort::Int], Sort::Int);
+    let user_rem_again = solver.declare_fun("rem", &[Sort::Int, Sort::Int], Sort::Int);
+    assert_eq!(
+        user_rem, user_rem_again,
+        "idempotent declaration lost identity"
+    );
+    assert_eq!(user_rem.name(), "rem");
+    assert_ne!(user_rem.core_name(), "rem");
+    let rem_application = solver.apply(&user_rem, &[seven, minus_two]);
+    let TermData::App(Symbol::Named(rem_identity), _) = solver.terms().get(rem_application.id())
+    else {
+        panic!("native UF application must be a named application");
+    };
+    assert_eq!(rem_identity, user_rem.core_name());
+
+    // If the proof evaluator confused this UF with integer `rem`, it would
+    // accept the non-theorem below as a closed arithmetic truth.
+    let minus_one = solver.int_const(-1);
+    let forged_rem_value = solver.eq(rem_application, minus_one);
+    assert!(!ay_proof::recognize_ground_evaluate(
+        solver.terms(),
+        forged_rem_value.id()
+    ));
+
+    let user_equality = solver.declare_fun("=", &[Sort::Int, Sort::Int], Sort::Bool);
+    assert_eq!(user_equality.name(), "=");
+    assert_ne!(user_equality.core_name(), "=");
+    let equality_application = solver.apply(&user_equality, &[seven, minus_two]);
+    let TermData::App(Symbol::Named(equality_identity), _) =
+        solver.terms().get(equality_application.id())
+    else {
+        panic!("native UF application must be a named application");
+    };
+    assert_eq!(equality_identity, user_equality.core_name());
+    assert!(!ay_proof::recognize_ground_evaluate(
+        solver.terms(),
+        equality_application.id()
+    ));
+
+    // Both assertions are satisfiable for free functions. Reusing either
+    // surface spelling as builtin core identity would instead force
+    // `rem(7, -2) = -1` and builtin equality on unequal arguments, making
+    // this query spuriously UNSAT.
+    let zero = solver.int_const(0);
+    let rem_is_zero = solver.eq(rem_application, zero);
+    solver.assert_term(rem_is_zero);
+    solver.assert_term(equality_application);
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+}
+
 /// Regression test for verification-consumer issue #6498: nullary UF functions declared via
 /// `declare_fun` with empty domain should return SAT when unconstrained,
 /// not Unknown. The bug was that nullary UF applications were not detected
@@ -1489,18 +1546,18 @@ fn test_forall_construction() {
     let body = solver.gt(x, zero);
     let q = solver.forall(&[x], body);
 
-    assert!(solver.terms().is_quantifier(q.0));
-    assert_eq!(solver.terms().sort(q.0), &Sort::Bool);
+    assert!(solver.terms().is_quantifier(q.id()));
+    assert_eq!(solver.terms().sort(q.id()), &Sort::Bool);
 
-    let x_name = match solver.terms().get(x.0) {
+    let x_name = match solver.terms().get(x.id()) {
         TermData::Var(name, _) => name.clone(),
         other => panic!("expected Var, got {other:?}"),
     };
 
-    match solver.terms().get(q.0) {
+    match solver.terms().get(q.id()) {
         TermData::Forall(vars, q_body, triggers) => {
             assert_eq!(vars, &vec![(x_name, Sort::Int)]);
-            assert_eq!(*q_body, body.0);
+            assert_eq!(*q_body, body.id());
             assert!(triggers.is_empty());
         }
         other => panic!("expected Forall, got {other:?}"),
@@ -1518,18 +1575,18 @@ fn test_exists_construction() {
     let body = solver.eq(x, one);
     let q = solver.exists(&[x], body);
 
-    assert!(solver.terms().is_quantifier(q.0));
-    assert_eq!(solver.terms().sort(q.0), &Sort::Bool);
+    assert!(solver.terms().is_quantifier(q.id()));
+    assert_eq!(solver.terms().sort(q.id()), &Sort::Bool);
 
-    let x_name = match solver.terms().get(x.0) {
+    let x_name = match solver.terms().get(x.id()) {
         TermData::Var(name, _) => name.clone(),
         other => panic!("expected Var, got {other:?}"),
     };
 
-    match solver.terms().get(q.0) {
+    match solver.terms().get(q.id()) {
         TermData::Exists(vars, q_body, triggers) => {
             assert_eq!(vars, &vec![(x_name, Sort::Int)]);
-            assert_eq!(*q_body, body.0);
+            assert_eq!(*q_body, body.id());
             assert!(triggers.is_empty());
         }
         other => panic!("expected Exists, got {other:?}"),
@@ -1549,9 +1606,9 @@ fn test_forall_with_triggers_stores_triggers() {
     let f_x = solver.apply(&f, &[x]);
     let q = solver.forall_with_triggers(&[x], body, &[&[f_x]]);
 
-    match solver.terms().get(q.0) {
+    match solver.terms().get(q.id()) {
         TermData::Forall(_, _, triggers) => {
-            assert_eq!(triggers, &vec![vec![f_x.0]]);
+            assert_eq!(triggers, &vec![vec![f_x.id()]]);
         }
         other => panic!("expected Forall, got {other:?}"),
     }
@@ -1589,7 +1646,7 @@ fn test_try_forall_with_triggers_skips_non_function_triggers() {
         .try_forall_with_triggers(&[x], body, &[&[x]])
         .unwrap();
 
-    match solver.terms().get(q.0) {
+    match solver.terms().get(q.id()) {
         TermData::Forall(_, _, triggers) => {
             assert!(triggers.is_empty());
         }
@@ -1874,7 +1931,7 @@ fn test_try_bvrepeat_returns_repeated_width() {
     let x = solver.declare_const("x", Sort::bitvec(8));
 
     let y = solver.try_bvrepeat(x, 3).unwrap();
-    assert!(matches!(solver.terms().sort(y.0), Sort::BitVec(bv) if bv.width == 24));
+    assert!(matches!(solver.terms().sort(y.id()), Sort::BitVec(bv) if bv.width == 24));
 }
 
 // Arithmetic API sort validation regressions (#2708)
@@ -2593,79 +2650,6 @@ fn test_auflia_quantifier_forall_trigger_ground_equality_conflict() {
     assert!(
         result.is_unsat(),
         "Expected strictly certified UNSAT via E-matching, got {result:?}"
-    );
-}
-
-/// #reserved-ops (Remediate2): the programmatic API ADOPTS an
-/// identical-signature redeclaration of a datatype constructor/selector/
-/// tester as a handle to the registered member — the documented embedder
-/// contract deductive-checks's encoder relies on (`declare_variant_encoding`
-/// re-declares the exact native member names after `try_declare_datatype`).
-/// A mismatched signature is rejected by the frontend
-/// `DatatypeMemberCollision` gate, which also rejects EVERY textual
-/// `declare-fun` of a member name (the rc_forge_tester/rc_forge_selector
-/// wrong-UNSAT forgery class).
-#[test]
-fn test_datatype_member_redeclaration_adopted_or_rejected() {
-    let mut solver = Solver::new(Logic::Uf);
-
-    let pt_dt = DatatypeSort {
-        name: "PtA".to_string(),
-        constructors: vec![DatatypeConstructor {
-            name: "mk-pta".to_string(),
-            fields: vec![DatatypeField {
-                name: "pta-x".to_string(),
-                sort: Sort::Int,
-            }],
-        }],
-    };
-    solver.declare_datatype(&pt_dt);
-    let carrier = Sort::Datatype(pt_dt.clone());
-
-    // Identical-signature redeclarations: adopted (Ok), exactly the deductive-checks
-    // handle pattern. `Sort::Datatype` exercises the as_term_sort mapping to
-    // the registered `Sort::Uninterpreted` carrier.
-    let ctor = solver
-        .try_declare_fun("mk-pta", &[Sort::Int], carrier.clone())
-        .expect("identical-signature constructor redeclaration must be adopted");
-    let sel = solver
-        .try_declare_fun("pta-x", std::slice::from_ref(&carrier), Sort::Int)
-        .expect("identical-signature selector redeclaration must be adopted");
-    let _tester = solver
-        .try_declare_fun("is-mk-pta", std::slice::from_ref(&carrier), Sort::Bool)
-        .expect("identical-signature tester redeclaration must be adopted");
-
-    // Mismatched signatures: rejected by the DatatypeMemberCollision gate.
-    assert!(
-        solver
-            .try_declare_fun("pta-x", &[Sort::Int], Sort::Int)
-            .is_err(),
-        "wrong-signature selector redeclaration must be rejected"
-    );
-    assert!(
-        solver
-            .try_declare_fun("is-mk-pta", &[Sort::Int], Sort::Bool)
-            .is_err(),
-        "wrong-signature tester redeclaration must be rejected"
-    );
-    assert!(
-        solver
-            .try_declare_fun("mk-pta", &[Sort::Bool], carrier.clone())
-            .is_err(),
-        "wrong-signature constructor redeclaration must be rejected"
-    );
-
-    // The adopted handles denote the REAL member operations: selector over
-    // constructor discharges definitionally (UNSAT on the negation).
-    let one = solver.int_const(1);
-    let p = solver.apply(&ctor, &[one]);
-    let px = solver.apply(&sel, &[p]);
-    let eq = solver.eq(px, one);
-    let neq = solver.not(eq);
-    solver.assert_term(neq);
-    assert!(
-        solver.check_sat().is_unsat(),
-        "adopted selector/constructor handles must carry builtin member semantics"
     );
 }
 

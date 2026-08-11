@@ -7,6 +7,163 @@
 use super::tests::encode_diagonal_constraints;
 use super::*;
 use crate::domain::Domain;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[test]
+fn test_incremental_constraints_reject_missing_order_literals() {
+    let mut engine = CpSatEngine::new();
+    let x = engine.new_int_var(Domain::new(0, 2), Some("x"));
+
+    for error in [
+        engine.try_add_upper_bound(x, 1).unwrap_err(),
+        engine.try_add_lower_bound(x, 1).unwrap_err(),
+        engine.try_block_assignment(&[(x, 1)]).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            IncrementalEncodingError::MissingOrderLiteral { variable, .. } if variable == x
+        ));
+    }
+
+    // Failed operations are atomic and leave the original model feasible.
+    assert!(matches!(engine.solve(), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn external_interrupt_handle_remains_connected_to_engine_timers() {
+    let mut engine = CpSatEngine::new();
+    let external = Arc::new(AtomicBool::new(false));
+    engine.set_interrupt(Arc::clone(&external));
+    assert!(Arc::ptr_eq(&engine.interrupt, &external));
+
+    engine.set_timeout(Duration::ZERO);
+    let wait_until = Instant::now() + Duration::from_secs(1);
+    while !external.load(Ordering::Acquire) && Instant::now() < wait_until {
+        std::thread::yield_now();
+    }
+    assert!(
+        external.load(Ordering::Acquire),
+        "engine timeout must signal the installed external handle"
+    );
+
+    engine.clear_interrupt();
+    assert!(!external.load(Ordering::Acquire));
+}
+
+#[test]
+fn test_block_assignment_rejects_value_outside_domain() {
+    let mut engine = CpSatEngine::new();
+    let x = engine.new_int_var(Domain::new(0, 2), Some("x"));
+
+    let error = engine.try_block_assignment(&[(x, 3)]).unwrap_err();
+    assert!(matches!(
+        error,
+        IncrementalEncodingError::AssignmentValueOutsideDomain {
+            variable,
+            value: 3,
+            lb: 0,
+            ub: 2,
+        } if variable == x
+    ));
+}
+
+#[test]
+fn test_block_assignment_rejects_duplicate_variable() {
+    let mut engine = CpSatEngine::new();
+    let x = engine.new_int_var(Domain::new(0, 1), Some("x"));
+
+    for assignment in [[(x, 0), (x, 0)], [(x, 0), (x, 1)]] {
+        let error = engine.try_block_assignment(&assignment).unwrap_err();
+        assert!(matches!(
+            error,
+            IncrementalEncodingError::DuplicateAssignmentVariable { variable }
+                if variable == x
+        ));
+    }
+    assert!(matches!(engine.solve(), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn test_empty_and_fixed_assignments_add_contradiction() {
+    let mut empty_projection = CpSatEngine::new();
+    empty_projection.try_block_assignment(&[]).unwrap();
+    assert!(matches!(empty_projection.solve(), CpSolveResult::Unsat));
+
+    let mut fixed_projection = CpSatEngine::new();
+    let x = fixed_projection.new_int_var(Domain::singleton(7), Some("x"));
+    assert!(matches!(fixed_projection.solve(), CpSolveResult::Sat(_)));
+    fixed_projection.try_block_assignment(&[(x, 7)]).unwrap();
+    assert!(matches!(fixed_projection.solve(), CpSolveResult::Unsat));
+}
+
+#[test]
+fn test_bounds_outside_domain_add_contradiction() {
+    let mut upper = CpSatEngine::new();
+    let x = upper.new_int_var(Domain::new(0, 2), Some("x"));
+    upper.try_add_upper_bound(x, -100).unwrap();
+    assert_eq!(upper.probe_bound_feasible(x, 2, true, None), Some(false));
+    assert!(upper.try_pre_compile().is_ok());
+    assert!(matches!(upper.solve(), CpSolveResult::Unsat));
+
+    let mut lower = CpSatEngine::new();
+    let x = lower.new_int_var(Domain::new(0, 2), Some("x"));
+    lower.try_add_lower_bound(x, 100).unwrap();
+    assert!(matches!(lower.solve(), CpSolveResult::Unsat));
+}
+
+#[test]
+fn test_endpoint_bounds_are_tautologies_without_preallocation() {
+    let mut engine = CpSatEngine::new();
+    let near_min = engine.new_int_var(Domain::new(i64::MIN, i64::MIN + 1), Some("near_min"));
+    let near_max = engine.new_int_var(Domain::new(i64::MAX - 1, i64::MAX), Some("near_max"));
+
+    engine.try_add_lower_bound(near_min, i64::MIN).unwrap();
+    engine.try_add_upper_bound(near_min, i64::MAX).unwrap();
+    engine.try_add_lower_bound(near_max, i64::MIN).unwrap();
+    engine.try_add_upper_bound(near_max, i64::MAX).unwrap();
+
+    assert!(matches!(engine.solve(), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn test_probe_bound_classifies_missing_outside_and_tautological_bounds() {
+    let mut missing = CpSatEngine::new();
+    let x = missing.new_int_var(Domain::new(0, 2), Some("x"));
+    assert_eq!(missing.probe_bound_feasible(x, 1, true, None), None);
+    assert_eq!(missing.probe_bound_feasible(x, 1, false, None), None);
+    assert_eq!(missing.probe_bound_feasible(x, -1, true, None), Some(false));
+    assert_eq!(missing.probe_bound_feasible(x, 3, false, None), Some(false));
+
+    let mut endpoints = CpSatEngine::new();
+    let x = endpoints.new_int_var(Domain::new(-1, 1), Some("x"));
+    endpoints.pre_compile();
+    assert_eq!(
+        endpoints.probe_bound_feasible(x, i64::MAX, true, None),
+        Some(true)
+    );
+    assert_eq!(
+        endpoints.probe_bound_feasible(x, i64::MIN, false, None),
+        Some(true)
+    );
+}
+
+#[test]
+fn test_binary_probe_handles_objective_endpoints() {
+    let mut minimize = CpSatEngine::new();
+    let x = minimize.new_int_var(Domain::singleton(i64::MIN), Some("x"));
+    assert_eq!(
+        minimize.binary_probe_lower_bound(x, i64::MIN, true, 1, Duration::from_millis(1),),
+        i64::MIN
+    );
+
+    let mut maximize = CpSatEngine::new();
+    let x = maximize.new_int_var(Domain::singleton(i64::MAX), Some("x"));
+    assert_eq!(
+        maximize.binary_probe_lower_bound(x, i64::MAX, false, 1, Duration::from_millis(1),),
+        i64::MAX
+    );
+}
 
 /// Verify that incremental optimization via add_upper_bound finds optimal.
 /// Uses an explicit objective variable bounded via SAT-level constraints.

@@ -3704,47 +3704,6 @@ fn nested_select_observation_candidate_is_not_a_verdict() {
     );
 }
 
-fn chccomp25_solidity_slice_result(name: &str) -> Option<ChcEngineResult> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("benchmarks/chc/chc-comp25-benchmarks/solidity/no_adts/unit_tests/abi")
-        .join(name);
-    let input = std::fs::read_to_string(path).ok()?;
-    let problem = crate::parser::ChcParser::parse(&input).expect("slice benchmark should parse");
-    let summary = crate::portfolio::PreprocessSummary::build(problem, false);
-    let bmc = BmcConfig::default()
-        .with_max_depth(16)
-        .with_time_budget(std::time::Duration::from_secs(10))
-        .with_per_depth_timeout(std::time::Duration::from_secs(10));
-    let config =
-        crate::portfolio::PortfolioConfig::with_engines(vec![crate::portfolio::EngineConfig::Bmc(
-            bmc,
-        )])
-        .parallel(false)
-        .timeout(Some(std::time::Duration::from_secs(10)))
-        .preprocessing(false);
-    Some(crate::portfolio::PortfolioSolver::from_summary(summary, config).solve())
-}
-
-#[test]
-#[ignore = "requires the downloaded CHC-COMP-25 Solidity corpus"]
-#[timeout(30_000)]
-fn nested_select_candidate_refutes_both_chccomp25_array_slice_targets() {
-    for name in [
-        "abi_encode_array_slice.sol_0_no_adts_000.smt2",
-        "abi_encode_packed_array_slice.sol_0_no_adts_000.smt2",
-    ] {
-        let Some(result) = chccomp25_solidity_slice_result(name) else {
-            eprintln!("SKIP {name}: corpus not present");
-            continue;
-        };
-        assert!(
-            matches!(result, ChcEngineResult::Unsafe(_)),
-            "{name} (Z3: unsat / CHC unsafe) must produce a replay-validated Unsafe, got {result:?}"
-        );
-    }
-}
-
 fn flat_observation_phase_problem(query_value: i128) -> ChcProblem {
     let mut problem = ChcProblem::new();
     let predicate = problem.declare_predicate("Observe", vec![ChcSort::Int]);

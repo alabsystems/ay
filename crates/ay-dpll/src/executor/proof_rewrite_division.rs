@@ -617,7 +617,12 @@ impl Executor {
                     unreachable!("find_and_path returned a non-and path segment");
                 };
                 let child = args[pos as usize];
-                let not_parent = terms.mk_not(current_term);
+                // Resolution is syntactic: use an explicit `not` node around
+                // the exact conjunction carried by the assumption. `mk_not`
+                // pushes negation through `and`, producing its De Morgan dual;
+                // that is Boolean-equivalent but is not a resolution
+                // complement without a separate derivation.
+                let not_parent = terms.mk_not_raw(current_term);
                 let and_pos_id = new_proof.add_rule_step(
                     AletheRule::AndPos(pos),
                     vec![not_parent, child],
@@ -899,7 +904,7 @@ impl Executor {
                 TermData::Var(name, _)
                     if name.starts_with("_mod_") || name.starts_with("_div_") =>
                 {
-                    return true
+                    return true;
                 }
                 TermData::Const(_) => {}
                 TermData::Not(inner) => stack.push(*inner),

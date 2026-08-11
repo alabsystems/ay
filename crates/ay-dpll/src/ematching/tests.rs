@@ -559,6 +559,18 @@ fn test_generation_tracking_prevents_deep_chains() {
         !result.deferred.is_empty(),
         "Expected some deferred instantiations"
     );
+
+    // Generations 10-15 have cost above the lazy threshold. Even though the
+    // same quantifier also had cheap accepted bindings, skipping these points
+    // makes the campaign incomplete and must block every final SAT mapping.
+    assert!(
+        result.demand.blocked > 0,
+        "Expected high-generation bindings to be cost-blocked"
+    );
+    assert!(
+        result.reached_limit,
+        "a cost-blocked binding must mark E-matching incomplete"
+    );
 }
 
 #[test]

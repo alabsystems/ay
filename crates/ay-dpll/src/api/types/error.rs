@@ -57,6 +57,17 @@ pub enum SolverError {
         /// Actual sorts received
         got: Vec<Sort>,
     },
+    /// A term handle is unauthenticated, belongs to another solver/reset
+    /// incarnation, names a discarded suffix entry, or lies outside the store.
+    #[error(
+        "invalid term handle in {operation}: Term({term}) does not name its original entry in this solver incarnation"
+    )]
+    InvalidTermHandle {
+        /// Name of the operation that rejected the handle.
+        operation: &'static str,
+        /// Numeric diagnostic payload; not sufficient identity by itself.
+        term: u32,
+    },
     /// API-level invalid argument (e.g., bvextract range errors)
     #[error("invalid argument to {operation}: {message}")]
     InvalidArgument {

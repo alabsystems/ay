@@ -6,6 +6,7 @@
 
 use ay_core::term::TermData;
 use ay_core::{DatatypeSort, Sort, TermId};
+use ay_frontend::PublicSort;
 
 /// Schema identifier for native API replay artifacts.
 pub const NATIVE_REPLAY_SCHEMA: &str = "ay.native-replay.v1";
@@ -23,7 +24,9 @@ pub struct NativeReplaySolverIdentity {
     pub ay_revision: String,
     /// AY crate version used to produce the replay artifact.
     pub ay_version: String,
-    /// Optional SHA-256 of the executable or owning solver package.
+    /// Optional backend-measured SHA-256 claim for the executable or owning
+    /// solver package. Native replay binds and validates the spelling of this
+    /// claim; it does not itself read or measure the backend executable.
     pub solver_binary_sha256: Option<String>,
 }
 
@@ -53,6 +56,14 @@ pub struct NativeReplayMetadata {
 pub struct NativeReplayDeclaration {
     /// User-facing symbol name.
     pub name: String,
+    /// Exact core variable identity in the exported term DAG.
+    ///
+    /// This can differ from [`Self::name`] when the frontend must protect a
+    /// builtin or previously used spelling with an allocator-private identity.
+    /// Replay reconstructs the declaration from the public name, then
+    /// authenticates the reconstructed core identity against live frontend
+    /// metadata; the allocator suffix itself is intentionally not stable.
+    pub core_name: String,
     /// Term id in the original solver term store.
     pub term: TermId,
     /// Declared sort.
@@ -65,10 +76,61 @@ pub struct NativeReplayDeclaration {
 pub struct NativeReplayFunctionDeclaration {
     /// User-facing function symbol.
     pub name: String,
+    /// Exact core application identity in the exported term DAG.
+    pub core_name: String,
     /// Domain sorts.
     pub domain: Vec<Sort>,
     /// Range sort.
     pub range: Sort,
+}
+
+/// Closed semantic class for an authenticated replay symbol identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NativeReplaySymbolKind {
+    /// Ordinary free constant or uninterpreted function.
+    Uninterpreted,
+    /// Declaration-activated theory function.
+    Theory,
+    /// Datatype constructor.
+    DatatypeConstructor,
+    /// Datatype selector.
+    DatatypeSelector,
+    /// Datatype tester.
+    DatatypeTester,
+}
+
+/// Authenticated bridge from an exported core spelling to a stable declaration.
+///
+/// Replay never treats `core_name` as authority by itself. It reconstructs the
+/// declaration from its stable surface/public data, proves the exact live
+/// engine signature and kind, and only then maps this old core spelling to the
+/// freshly allocated core identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NativeReplaySymbolIdentity {
+    /// Stable user-facing declaration name.
+    pub surface_name: String,
+    /// Exact core identity used by the exported term DAG.
+    pub core_name: String,
+    /// Exact native API argument sorts before frontend lowering.
+    pub api_domain: Vec<Sort>,
+    /// Exact native API result sort before frontend lowering.
+    pub api_range: Sort,
+    /// Public argument sorts retained by the frontend.
+    pub public_domain: Vec<PublicSort>,
+    /// Public result sort retained by the frontend.
+    pub public_range: PublicSort,
+    /// Exact engine argument sorts in the exported context.
+    pub engine_domain: Vec<Sort>,
+    /// Exact engine result sort in the exported context.
+    pub engine_range: Sort,
+    /// Positive declaration semantics.
+    pub kind: NativeReplaySymbolKind,
+    /// Public datatype carrier owning a datatype member.
+    pub datatype_surface: Option<String>,
+    /// Exact exported engine carrier owning a datatype member.
+    pub datatype_core: Option<String>,
 }
 
 /// A top-level assertion in the active solver context.
@@ -189,6 +251,9 @@ pub struct NativeReplayProofSummary {
     pub clause_count: u64,
     /// Whether proof statistics claim completeness.
     pub complete: bool,
+    /// Whether the exact replayed UNSAT query consumed a strict
+    /// checker-accepted publication certificate.
+    pub strictly_verified: bool,
     /// Number of internal proof-checker failures.
     pub checker_failures: u64,
     /// Number of proof trust fallback steps, when proof quality was available.
@@ -332,6 +397,21 @@ pub struct NativeReplayCheckedReplaySummary {
     pub replay_executor_error: Option<String>,
 }
 
+/// In-memory authority minted only by the strict native replay workflow.
+///
+/// This token is deliberately crate-private and is never represented in the
+/// diagnostic JSON schema.  Its digests bind the exact post-replay artifact,
+/// checked summary, execution options, problem, and current solver identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeReplayAdmissionToken {
+    pub(crate) solver_identity: NativeReplaySolverIdentity,
+    pub(crate) solver_identity_sha256: String,
+    pub(crate) problem_sha256: String,
+    pub(crate) options_sha256: String,
+    pub(crate) checked_summary_sha256: String,
+    pub(crate) replay_artifact_sha256: String,
+}
+
 /// Content-addressed evidence manifest for native API replay artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -368,6 +448,12 @@ pub struct NativeReplayEvidenceManifest {
     pub admission_rejection_reasons: Vec<String>,
     /// SHA-256 of the manifest body excluding this field.
     pub manifest_sha256: String,
+    /// Private in-memory seal over an authority-bearing manifest body.
+    ///
+    /// This is deliberately absent from manifest JSON. It prevents callers
+    /// from manufacturing admission by mutating the public diagnostic fields
+    /// after manifest construction.
+    pub(crate) admission_seal_sha256: Option<String>,
 }
 
 /// Complete native API reducer/replay artifact.
@@ -398,6 +484,8 @@ pub struct NativeReplayArtifact {
     pub declarations: Vec<NativeReplayDeclaration>,
     /// Declared functions.
     pub function_declarations: Vec<NativeReplayFunctionDeclaration>,
+    /// Authenticated declaration/core identity bridges used by replay.
+    pub symbol_identities: Vec<NativeReplaySymbolIdentity>,
     /// Active assertions in assertion order.
     pub assertions: Vec<NativeReplayAssertion>,
     /// Complete native term DAG.
@@ -406,6 +494,10 @@ pub struct NativeReplayArtifact {
     pub solve: Option<NativeReplaySolveSummary>,
     /// Checked replay comparison captured after replaying this artifact.
     pub checked_replay: Option<NativeReplayCheckedReplaySummary>,
+    /// Non-serialized authority from the strict in-process replay workflow.
+    ///
+    /// Diagnostic summaries and parsed JSON never populate this field.
+    pub(crate) admission_token: Option<NativeReplayAdmissionToken>,
     /// Panic payload when capture used a panic-safe boundary.
     pub panic_payload: Option<String>,
     /// Unsupported atom or route diagnostics, when known.

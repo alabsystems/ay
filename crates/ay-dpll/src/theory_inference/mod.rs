@@ -138,6 +138,21 @@ pub(crate) fn infer_theory_lemma_kind_from_clause_terms_and_farkas(
         return TheoryLemmaKind::StringGroundEval;
     }
 
+    // Exact FP evaluation (#fp-ground-cert): the QF_FP / QF_BVFP families whose
+    // refutation is "this CLOSED floating-point formula is false", after the
+    // clause's own `(not (= v ground))` literals are substituted in. The
+    // checker re-decides it with an INDEPENDENT correctly-rounded exact
+    // integer/rational IEEE-754 kernel — which is what `FpClassification`
+    // lacks, since it excludes all FP arithmetic — so `fp.add`/`fp.mul`/
+    // `fp.fma`/`fp.sqrt`/`to_fp` conflicts stop exporting as `trust`.
+    // Recognition is the checker's own decision
+    // (`ay_proof::recognize_fp_ground_eval`), so classifier and validator
+    // cannot drift, and `FpClassification` keeps priority on the identities it
+    // already covers (see `fp_ground_eval_applies`).
+    if fp_ground_eval_applies(terms, clause) {
+        return TheoryLemmaKind::FpGroundEval;
+    }
+
     // Symbolic regex intersection-emptiness (#regex-cert): the automatark
     // family refutes `x ∈ R₁ ∧ … ∧ x ∈ Rₖ` on a SYMBOLIC `x`, which the ground
     // evaluator above cannot touch. Classify into the strict-checkable
@@ -293,6 +308,38 @@ fn infer_regex_intersect_empty_lemma(
 ) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
     ay_proof::recognize_regex_intersect_empty(terms, clause)
         .then(|| (TheoryLemmaKind::RegexIntersectEmpty, clause.to_vec()))
+}
+
+/// Classify a clause as the strict-checkable exact-IEEE-754 kind
+/// `FpGroundEval` when the checker's own correctly-rounded kernel proves the
+/// clause valid — after substituting the ground bindings the clause itself
+/// carries, and over every assignment of whatever variables remain. Delegating
+/// to `ay_proof::recognize_fp_ground_eval` keeps the classifier and the strict
+/// validator from drifting.
+fn infer_fp_ground_eval_lemma(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    fp_ground_eval_applies(terms, clause).then(|| (TheoryLemmaKind::FpGroundEval, clause.to_vec()))
+}
+
+/// Whether the exact IEEE-754 evaluator should CLAIM this clause.
+///
+/// `FpClassification` keeps priority on the sign/class/comparison identities it
+/// already validates. Those two kinds overlap — an `(= (fp.abs (fp.abs x))
+/// (fp.abs x))` identity over a narrow format is decidable by both — and the
+/// older kind is the one downstream artifacts key on (the Lean firewall emitter
+/// matches `K::FpClassification`, so silently re-labelling those clauses would
+/// drop a proof artifact without any test asserting the verdict changed).
+/// `FpGroundEval` therefore covers exactly what `FpClassification` REFUSES: the
+/// arithmetic and conversion fragment it has no evaluator for.
+///
+/// The cheap-first order matters: the exact evaluator's own hygiene gate
+/// rejects a non-FP clause immediately, so the classification recognizer only
+/// runs on the handful of clauses that already passed.
+fn fp_ground_eval_applies(terms: &TermStore, clause: &[TermId]) -> bool {
+    ay_proof::recognize_fp_ground_eval(terms, clause)
+        && !ay_proof::recognize_fp_classification(terms, clause)
 }
 
 /// Infer the proof kind for a theory conflict that will be materialized as an
@@ -919,10 +966,210 @@ pub(crate) fn minimize_conflict_with_levels(
 
     original_len - clause.len()
 }
+
+/// Run the single-theory classifier chain over a whole conflict.
+///
+/// Extracted so the same chain can be applied to a SUB-conflict during
+/// combined-theory decomposition (#combined-theory-decompose).
+fn classify_whole_conflict(
+    terms: &TermStore,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    euf::infer_euf_lemma(terms, negations, conflict)
+        .or_else(|| infer_arith_farkas(terms, conflict, clause))
+        .or_else(|| infer_array_lemma(terms, clause))
+        .or_else(|| infer_string_ground_eval_lemma(terms, clause))
+        .or_else(|| infer_regex_intersect_empty_lemma(terms, clause))
+        .or_else(|| infer_fp_ground_eval_lemma(terms, clause))
+        .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
+}
+
+/// How many literals the core search may drop from a mixed conflict.
+///
+/// The mixed conflicts observed in practice carry a small number of foreign
+/// literals (sampled shapes: a datatype-tester core plus one or two equalities,
+/// a set/array core plus a select). Three covers those while keeping the search
+/// small; the attempt cap below is the real bound.
+const DECOMPOSE_MAX_DROPPED: usize = 3;
+
+/// Hard cap on classifier invocations per conflict, so a wide conflict cannot
+/// turn proof production into a combinatorial search.
+const DECOMPOSE_MAX_ATTEMPTS: usize = 512;
+
+/// Find a single-theory core inside a mixed conflict (#combined-theory-decompose).
+///
+/// Returns `(kind, core_clause, full_clause)` where `core_clause` is the
+/// classifier's own ordering of the core literals and `full_clause` is the
+/// complete blocking clause with `core_clause` as a PREFIX — the exact shape
+/// `weakening` requires (`ay-proof` `validate_weakening`: the premise clause
+/// must be a prefix of the result).
+///
+/// Soundness: the emitted core lemma is checked by its own kind's validator, and
+/// weakening a valid clause by appending literals preserves validity. The full
+/// clause is literal-for-literal the same SET the caller would have emitted as
+/// `Generic`, so nothing downstream sees a different fact — only a checkable
+/// justification for it.
+fn classifiable_core_decomposition(
+    terms: &TermStore,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>)> {
+    // `clause[i]` is the blocking literal for `conflict[i]`
+    // (`build_blocking_clause_terms` maps them positionally).
+    if conflict.len() != clause.len() || conflict.len() < 2 {
+        return None;
+    }
+
+    let mut attempts = 0usize;
+    let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
+
+    // Prefer the LARGEST core: dropping fewer literals keeps more of the
+    // conflict inside the checked lemma.
+    for dropped in 1..=max_dropped {
+        let mut drop_idx = (0..dropped).collect::<Vec<usize>>();
+        loop {
+            if attempts >= DECOMPOSE_MAX_ATTEMPTS {
+                return None;
+            }
+            attempts += 1;
+
+            let keep: Vec<usize> = (0..conflict.len())
+                .filter(|i| !drop_idx.contains(i))
+                .collect();
+            let sub_conflict: Vec<TheoryLit> = keep.iter().map(|&i| conflict[i]).collect();
+            let sub_clause: Vec<TermId> = keep.iter().map(|&i| clause[i]).collect();
+
+            if let Some((kind, core_clause)) =
+                classify_whole_conflict(terms, negations, &sub_conflict, &sub_clause)
+            {
+                // The classifier may reorder its literals; the core must stay a
+                // prefix, so rebuild the full clause as core ++ dropped.
+                let core_set: HashSet<TermId> = core_clause.iter().copied().collect();
+                if core_set.len() == core_clause.len() {
+                    let mut full_clause = core_clause.clone();
+                    for &lit in clause {
+                        if !core_set.contains(&lit) {
+                            full_clause.push(lit);
+                        }
+                    }
+                    // Only accept when the weakened clause still covers the
+                    // original blocking clause exactly. A malformed candidate
+                    // must not abort the bounded search: a later subset can
+                    // still expose an unambiguous core.
+                    let full_set: HashSet<TermId> = full_clause.iter().copied().collect();
+                    let orig_set: HashSet<TermId> = clause.iter().copied().collect();
+                    if full_set == orig_set {
+                        return Some((kind, core_clause, full_clause));
+                    }
+                }
+            }
+
+            // Next combination of dropped indices (lexicographic). Exhausting
+            // this cardinality continues the outer loop so cores that require
+            // dropping two or three foreign literals are still considered.
+            if !advance_combination(&mut drop_idx, conflict.len()) {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn advance_combination(indices: &mut [usize], universe_len: usize) -> bool {
+    let selected = indices.len();
+    for position in (0..selected).rev() {
+        let Some(max_index) = universe_len.checked_sub(selected - position) else {
+            return false;
+        };
+        if indices[position] < max_index {
+            indices[position] += 1;
+            for later in position + 1..selected {
+                indices[later] = indices[later - 1] + 1;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use num_bigint::BigInt;
+
+    #[test]
+    fn combined_theory_core_search_advances_to_two_dropped_literals() {
+        use num_rational::BigRational;
+
+        let mut terms = TermStore::new();
+        let foreign_a = terms.mk_var("foreign_a", Sort::Bool);
+        let foreign_b = terms.mk_var("foreign_b", Sort::Bool);
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+        let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
+        let le_zero = terms.mk_le(x, zero);
+        let ge_one = terms.mk_ge(x, one);
+        let conflict = vec![
+            TheoryLit::new(foreign_a, true),
+            TheoryLit::new(foreign_b, true),
+            TheoryLit::new(le_zero, true),
+            TheoryLit::new(ge_one, true),
+        ];
+        let mut negations = HashMap::default();
+        for literal in &conflict {
+            negations.insert(literal.term, terms.mk_not(literal.term));
+        }
+        let clause = build_blocking_clause_terms(&negations, &conflict)
+            .expect("every conflict literal has a negation");
+
+        let (kind, core, weakened) =
+            classifiable_core_decomposition(&terms, &negations, &conflict, &clause)
+                .expect("dropping both foreign literals exposes the arithmetic core");
+
+        assert_eq!(kind, TheoryLemmaKind::LraFarkas);
+        assert_eq!(core.len(), 2);
+        assert_eq!(weakened.len(), clause.len());
+    }
+
+    #[test]
+    fn ambiguous_duplicate_core_does_not_abort_later_candidates() {
+        use num_rational::BigRational;
+
+        let mut terms = TermStore::new();
+        let foreign = terms.mk_var("foreign", Sort::Bool);
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+        let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
+        let le_zero = terms.mk_le(x, zero);
+        let ge_one = terms.mk_ge(x, one);
+        // Dropping `foreign` first exposes a classifiable but duplicate core.
+        // The search must reject that candidate and continue until it also
+        // drops one copy of `le_zero`.
+        let conflict = vec![
+            TheoryLit::new(foreign, true),
+            TheoryLit::new(le_zero, true),
+            TheoryLit::new(ge_one, true),
+            TheoryLit::new(le_zero, true),
+        ];
+        let mut negations = HashMap::default();
+        for literal in &conflict {
+            negations
+                .entry(literal.term)
+                .or_insert_with(|| terms.mk_not(literal.term));
+        }
+        let clause = build_blocking_clause_terms(&negations, &conflict)
+            .expect("every conflict literal has a negation");
+
+        let (kind, core, _) =
+            classifiable_core_decomposition(&terms, &negations, &conflict, &clause)
+                .expect("a later unambiguous arithmetic core remains available");
+
+        assert_eq!(kind, TheoryLemmaKind::LraFarkas);
+        assert_eq!(core.len(), 2);
+    }
 
     #[test]
     fn test_infer_theory_lemma_kind_from_clause_terms_and_farkas_strict_int_bounds() {
@@ -1321,130 +1568,4 @@ mod tests {
         assert_eq!(removed, 0);
         assert_eq!(clause.len(), 6);
     }
-}
-
-/// Run the single-theory classifier chain over a whole conflict.
-///
-/// Extracted so the same chain can be applied to a SUB-conflict during
-/// combined-theory decomposition (#combined-theory-decompose).
-fn classify_whole_conflict(
-    terms: &TermStore,
-    negations: &HashMap<TermId, TermId>,
-    conflict: &[TheoryLit],
-    clause: &[TermId],
-) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
-    euf::infer_euf_lemma(terms, negations, conflict)
-        .or_else(|| infer_arith_farkas(terms, conflict, clause))
-        .or_else(|| infer_array_lemma(terms, clause))
-        .or_else(|| infer_string_ground_eval_lemma(terms, clause))
-        .or_else(|| infer_regex_intersect_empty_lemma(terms, clause))
-        .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
-}
-
-/// How many literals the core search may drop from a mixed conflict.
-///
-/// The mixed conflicts observed in practice carry a small number of foreign
-/// literals (sampled shapes: a datatype-tester core plus one or two equalities,
-/// a set/array core plus a select). Three covers those while keeping the search
-/// small; the attempt cap below is the real bound.
-const DECOMPOSE_MAX_DROPPED: usize = 3;
-
-/// Hard cap on classifier invocations per conflict, so a wide conflict cannot
-/// turn proof production into a combinatorial search.
-const DECOMPOSE_MAX_ATTEMPTS: usize = 512;
-
-/// Find a single-theory core inside a mixed conflict (#combined-theory-decompose).
-///
-/// Returns `(kind, core_clause, full_clause)` where `core_clause` is the
-/// classifier's own ordering of the core literals and `full_clause` is the
-/// complete blocking clause with `core_clause` as a PREFIX — the exact shape
-/// `weakening` requires (`ay-proof` `validate_weakening`: the premise clause
-/// must be a prefix of the result).
-///
-/// Soundness: the emitted core lemma is checked by its own kind's validator, and
-/// weakening a valid clause by appending literals preserves validity. The full
-/// clause is literal-for-literal the same SET the caller would have emitted as
-/// `Generic`, so nothing downstream sees a different fact — only a checkable
-/// justification for it.
-fn classifiable_core_decomposition(
-    terms: &TermStore,
-    negations: &HashMap<TermId, TermId>,
-    conflict: &[TheoryLit],
-    clause: &[TermId],
-) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>)> {
-    // `clause[i]` is the blocking literal for `conflict[i]`
-    // (`build_blocking_clause_terms` maps them positionally).
-    if conflict.len() != clause.len() || conflict.len() < 2 {
-        return None;
-    }
-
-    let mut attempts = 0usize;
-    let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
-
-    // Prefer the LARGEST core: dropping fewer literals keeps more of the
-    // conflict inside the checked lemma.
-    for dropped in 1..=max_dropped {
-        let mut drop_idx = (0..dropped).collect::<Vec<usize>>();
-        loop {
-            if attempts >= DECOMPOSE_MAX_ATTEMPTS {
-                return None;
-            }
-            attempts += 1;
-
-            let keep: Vec<usize> = (0..conflict.len())
-                .filter(|i| !drop_idx.contains(i))
-                .collect();
-            let sub_conflict: Vec<TheoryLit> = keep.iter().map(|&i| conflict[i]).collect();
-            let sub_clause: Vec<TermId> = keep.iter().map(|&i| clause[i]).collect();
-
-            if let Some((kind, core_clause)) =
-                classify_whole_conflict(terms, negations, &sub_conflict, &sub_clause)
-            {
-                // The classifier may reorder its literals; the core must stay a
-                // prefix, so rebuild the full clause as core ++ dropped.
-                let core_set: HashSet<TermId> = core_clause.iter().copied().collect();
-                if core_set.len() != core_clause.len() {
-                    // Duplicate literals would make the prefix check ambiguous.
-                    return None;
-                }
-                let mut full_clause = core_clause.clone();
-                for &lit in clause {
-                    if !core_set.contains(&lit) {
-                        full_clause.push(lit);
-                    }
-                }
-                // Only accept when the weakened clause still covers the original
-                // blocking clause exactly; otherwise the caller's fact changed.
-                let full_set: HashSet<TermId> = full_clause.iter().copied().collect();
-                let orig_set: HashSet<TermId> = clause.iter().copied().collect();
-                if full_set != orig_set {
-                    return None;
-                }
-                return Some((kind, core_clause, full_clause));
-            }
-
-            // Next combination of dropped indices (lexicographic).
-            let mut pos = dropped;
-            loop {
-                if pos == 0 {
-                    break;
-                }
-                pos -= 1;
-                if drop_idx[pos] < conflict.len() - (dropped - pos) {
-                    drop_idx[pos] += 1;
-                    for later in pos + 1..dropped {
-                        drop_idx[later] = drop_idx[later - 1] + 1;
-                    }
-                    break;
-                }
-                if pos == 0 {
-                    return None;
-                }
-            }
-            if drop_idx[0] > conflict.len() - dropped {
-                break;
-            }
-        }
-    }
-    None
 }

@@ -1763,7 +1763,7 @@ fn test_parse_simple_value_beyond_i128() {
 /// (`118630ef6`). Callers must therefore hand construction the script's own
 /// logic and strip the command; when they did not, `parse_smtlib2` failed and
 /// the error was swallowed into a bare `None`, surfacing as checked replay
-/// reporting "did not produce a native strict-Alethe UNSAT certificate".
+/// reporting "did not produce a native strict UNSAT certificate".
 #[test]
 fn split_leading_set_logic_takes_the_declared_logic_and_removes_the_command() {
     use ay_dpll::api::Logic;

@@ -78,18 +78,23 @@ use crate::variable::IntVarId;
 pub struct AllDifferentBounds {
     vars: Vec<IntVarId>,
     // Per-variable workspace
-    ws_lb: Vec<i64>,
-    ws_ub_excl: Vec<i64>, // ub + 1 (half-open, matching Choco convention)
+    ws_lb: Vec<i128>,
+    ws_ub_excl: Vec<i128>, // ub + 1 (half-open, matching Choco convention)
     ws_minrank: Vec<usize>,
     ws_maxrank: Vec<usize>,
     ws_minsorted: Vec<usize>,
     ws_maxsorted: Vec<usize>,
     // Per-bounds workspace (capacity: 2*n + 2)
-    ws_bounds: Vec<i64>,
+    ws_bounds: Vec<i128>,
     ws_t: Vec<usize>, // tree / union-find parent
-    ws_d: Vec<i64>,   // capacity diffs
+    ws_d: Vec<i128>,  // capacity diffs
     ws_h: Vec<usize>, // Hall interval links
     nb_bounds: usize,
+}
+
+enum HallExplanation {
+    Propagation(Vec<Literal>),
+    Conflict(Vec<Literal>),
 }
 
 impl AllDifferentBounds {
@@ -124,8 +129,8 @@ impl AllDifferentBounds {
         // Read current bounds from trail
         for i in 0..n {
             let var = self.vars[i];
-            self.ws_lb[i] = trail.lb(var);
-            self.ws_ub_excl[i] = trail.ub(var) + 1; // half-open
+            self.ws_lb[i] = i128::from(trail.lb(var));
+            self.ws_ub_excl[i] = i128::from(trail.ub(var)) + 1; // half-open
         }
 
         // Reset sort indices
@@ -260,8 +265,15 @@ impl AllDifferentBounds {
                 let current_lb = self.ws_lb[var_idx];
 
                 if hall_max > current_lb {
-                    if let Some(clause) = self.explain_lower_prop(var_idx, hall_max, w, encoder) {
-                        clauses.push(clause);
+                    if let Some(explanation) =
+                        self.explain_lower_prop(var_idx, hall_max, w, encoder)
+                    {
+                        match explanation {
+                            HallExplanation::Propagation(clause) => clauses.push(clause),
+                            HallExplanation::Conflict(clause) => {
+                                return PropagationResult::Conflict(clause);
+                            }
+                        }
                     }
                 }
 
@@ -335,8 +347,15 @@ impl AllDifferentBounds {
                 let current_ub_excl = self.ws_ub_excl[var_idx];
 
                 if hall_min < current_ub_excl {
-                    if let Some(clause) = self.explain_upper_prop(var_idx, hall_min, w, encoder) {
-                        clauses.push(clause);
+                    if let Some(explanation) =
+                        self.explain_upper_prop(var_idx, hall_min, w, encoder)
+                    {
+                        match explanation {
+                            HallExplanation::Propagation(clause) => clauses.push(clause),
+                            HallExplanation::Conflict(clause) => {
+                                return PropagationResult::Conflict(clause);
+                            }
+                        }
                     }
                 }
 
@@ -367,8 +386,10 @@ impl AllDifferentBounds {
     fn explain_conflict(&self, encoder: &IntegerEncoder) -> Option<Vec<Literal>> {
         let mut reasons = Vec::new();
         for (i, &var) in self.vars.iter().enumerate() {
-            reasons.push(encoder.lookup_ge(var, self.ws_lb[i])?);
-            reasons.push(encoder.lookup_le(var, self.ws_ub_excl[i] - 1)?);
+            let lb = i64::try_from(self.ws_lb[i]).ok()?;
+            let ub = i64::try_from(self.ws_ub_excl[i] - 1).ok()?;
+            reasons.push(encoder.lookup_ge(var, lb)?);
+            reasons.push(encoder.lookup_le(var, ub)?);
         }
         Some(Explanation::new(reasons).into_conflict_clause())
     }
@@ -384,25 +405,35 @@ impl AllDifferentBounds {
     fn explain_lower_prop(
         &self,
         var_idx: usize,
-        hall_max: i64,
+        hall_max: i128,
         _w: usize,
         encoder: &IntegerEncoder,
-    ) -> Option<Vec<Literal>> {
+    ) -> Option<HallExplanation> {
         let var = self.vars[var_idx];
-        let conclusion = encoder.lookup_ge(var, hall_max)?;
         let mut reasons = Vec::new();
         for (i, &v) in self.vars.iter().enumerate() {
             if i == var_idx {
                 continue;
             }
             if self.ws_ub_excl[i] <= hall_max {
-                reasons.push(encoder.lookup_ge(v, self.ws_lb[i])?);
-                reasons.push(encoder.lookup_le(v, self.ws_ub_excl[i] - 1)?);
+                let lb = i64::try_from(self.ws_lb[i]).ok()?;
+                let ub = i64::try_from(self.ws_ub_excl[i] - 1).ok()?;
+                reasons.push(encoder.lookup_ge(v, lb)?);
+                reasons.push(encoder.lookup_le(v, ub)?);
             }
         }
         // Outsider's current lb: soundness after backtracking (#5986).
-        reasons.push(encoder.lookup_ge(var, self.ws_lb[var_idx])?);
-        Some(Explanation::new(reasons).into_clause(conclusion))
+        let current_lb = i64::try_from(self.ws_lb[var_idx]).ok()?;
+        reasons.push(encoder.lookup_ge(var, current_lb)?);
+        let explanation = Explanation::new(reasons);
+        match i64::try_from(hall_max) {
+            Ok(new_lb) => Some(HallExplanation::Propagation(
+                explanation.into_clause(encoder.lookup_ge(var, new_lb)?),
+            )),
+            Err(_) => Some(HallExplanation::Conflict(
+                explanation.into_conflict_clause(),
+            )),
+        }
     }
 
     /// Generate explanation for an upper bound reduction.
@@ -411,25 +442,35 @@ impl AllDifferentBounds {
     fn explain_upper_prop(
         &self,
         var_idx: usize,
-        hall_min: i64,
+        hall_min: i128,
         _w: usize,
         encoder: &IntegerEncoder,
-    ) -> Option<Vec<Literal>> {
+    ) -> Option<HallExplanation> {
         let var = self.vars[var_idx];
-        let conclusion = encoder.lookup_le(var, hall_min - 1)?;
         let mut reasons = Vec::new();
         for (i, &v) in self.vars.iter().enumerate() {
             if i == var_idx {
                 continue;
             }
             if self.ws_lb[i] >= hall_min {
-                reasons.push(encoder.lookup_ge(v, self.ws_lb[i])?);
-                reasons.push(encoder.lookup_le(v, self.ws_ub_excl[i] - 1)?);
+                let lb = i64::try_from(self.ws_lb[i]).ok()?;
+                let ub = i64::try_from(self.ws_ub_excl[i] - 1).ok()?;
+                reasons.push(encoder.lookup_ge(v, lb)?);
+                reasons.push(encoder.lookup_le(v, ub)?);
             }
         }
         // Outsider's current ub: soundness after backtracking (#5986).
-        reasons.push(encoder.lookup_le(var, self.ws_ub_excl[var_idx] - 1)?);
-        Some(Explanation::new(reasons).into_clause(conclusion))
+        let current_ub = i64::try_from(self.ws_ub_excl[var_idx] - 1).ok()?;
+        reasons.push(encoder.lookup_le(var, current_ub)?);
+        let explanation = Explanation::new(reasons);
+        match i64::try_from(hall_min - 1) {
+            Ok(new_ub) => Some(HallExplanation::Propagation(
+                explanation.into_clause(encoder.lookup_le(var, new_ub)?),
+            )),
+            Err(_) => Some(HallExplanation::Conflict(
+                explanation.into_conflict_clause(),
+            )),
+        }
     }
 }
 

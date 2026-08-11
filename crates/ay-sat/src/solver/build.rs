@@ -77,7 +77,7 @@ impl Solver {
                                                                     // and nothing here runs without the env var.
         if std::env::var_os("AY_SAT_MEM_PROBE").is_some() {
             let mut last = ay_sys::current_footprint_bytes();
-            let mut step = |label: &str, live: &mut usize| {
+            let step = |label: &str, live: &mut usize| {
                 let now = ay_sys::current_footprint_bytes();
                 let delta = now.saturating_sub(*live);
                 eprintln!(

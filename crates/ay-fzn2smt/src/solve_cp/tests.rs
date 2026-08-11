@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use ay_cp::engine::CpSolveResult;
 use ay_cp::variable::IntVarId;
 
+use crate::error::Fzn2smtError;
+
 use super::CpContext;
 
 pub(super) fn parse_and_solve(fzn: &str) -> CpSolveResult {
@@ -21,6 +23,17 @@ pub(super) fn parse_and_solve(fzn: &str) -> CpSolveResult {
         ctx.unsupported
     );
     ctx.engine.solve()
+}
+
+#[test]
+fn auxiliary_bounds_come_from_engine_not_translation_cache() {
+    let mut ctx = CpContext::new();
+    let auxiliary = ctx
+        .engine
+        .new_int_var(ay_cp::Domain::new(2_000_001, 2_000_003), None);
+
+    assert!(!ctx.var_bounds.contains_key(&auxiliary));
+    assert_eq!(ctx.get_var_bounds(auxiliary), (2_000_001, 2_000_003));
 }
 
 /// Capture stdout from cmd_solve_cp for assertion testing.
@@ -51,6 +64,9 @@ pub(super) fn solve_cp_output(fzn: &str, all_solutions: bool) -> String {
             )
             .expect("specialist failed")
             {
+                if ctx.engine.try_pre_compile().is_err() {
+                    return "=====UNKNOWN=====\n".to_string();
+                }
                 super::solve_satisfaction(&mut ctx, all_solutions, None, &mut out)
                     .expect("solve failed");
             }
@@ -99,7 +115,7 @@ fn invalid_parallel_worker_counts_are_rejected() {
         assert!(
             matches!(
                 err,
-                crate::error::Fzn2smtError::InvalidWorkerCount {
+                Fzn2smtError::InvalidWorkerCount {
                     requested: actual,
                     maximum
                 } if actual == requested && maximum == super::PORTFOLIO_WORKERS.len()
@@ -107,6 +123,143 @@ fn invalid_parallel_worker_counts_are_rejected() {
             "{err}"
         );
     }
+}
+
+#[test]
+fn oversized_timeout_is_rejected_before_cp_solving() {
+    let model = ay_flatzinc_parser::parse_flatzinc("solve satisfy;\n").expect("parse failed");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let error = super::cmd_solve_cp_with_writers(
+        &model,
+        Some(u64::MAX),
+        false,
+        1,
+        Some(&[]),
+        &mut out,
+        &mut err,
+    )
+    .expect_err("oversized timeout must be rejected");
+
+    assert!(matches!(
+        error,
+        Fzn2smtError::InvalidTimeout {
+            timeout_ms: u64::MAX
+        }
+    ));
+    assert!(out.is_empty(), "solver must not emit a verdict: {out:?}");
+}
+
+#[test]
+fn stale_empty_unsupported_precheck_fails_closed_on_every_solve_path() {
+    for (solve, parallel_workers) in [
+        ("solve satisfy;", 1),
+        ("solve satisfy;", 2),
+        ("solve minimize x;", 1),
+    ] {
+        let fzn = format!("var 0..1: x;\nconstraint unsupported_for_test(x);\n{solve}\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let stale_precheck: &[String] = &[];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        super::cmd_solve_cp_with_writers(
+            &model,
+            None,
+            false,
+            parallel_workers,
+            Some(stale_precheck),
+            &mut out,
+            &mut err,
+        )
+        .expect("unsupported models must produce a fail-closed verdict");
+
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8 output"),
+            "=====UNKNOWN=====\n",
+            "solve={solve}, workers={parallel_workers}"
+        );
+    }
+}
+
+#[test]
+fn parallel_portfolio_cancels_and_joins_every_losing_worker() {
+    let model = ay_flatzinc_parser::parse_flatzinc(
+        "var 1..1: x :: output_var;\nconstraint int_eq(x, 1);\nsolve satisfy;\n",
+    )
+    .expect("parse failed");
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(2))
+        .expect("short test deadline must be representable");
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+
+    super::solve_satisfaction_parallel_with_activity(
+        &model,
+        Some(deadline),
+        super::PORTFOLIO_WORKERS.len(),
+        &mut out,
+        Some(std::sync::Arc::clone(&active)),
+        super::PortfolioWorkerBehavior::WaitForCancellationAfterFirst,
+    )
+    .expect("portfolio solve must succeed");
+
+    assert!(
+        String::from_utf8(out)
+            .expect("UTF-8 output")
+            .contains("=========="),
+        "the first definitive result must be preserved"
+    );
+    assert_eq!(
+        active.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "no portfolio worker may outlive the solve call"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "losing workers must observe cancellation rather than run to completion"
+    );
+}
+
+#[test]
+fn portfolio_result_selection_never_masks_worker_failures_as_unknown() {
+    let unknown = || super::SolveCpReport {
+        status: super::SolveCpStatus::Unknown,
+        stdout: b"=====UNKNOWN=====\n".to_vec(),
+    };
+
+    let mut out = Vec::new();
+    let panic_error = super::emit_portfolio_result(None, true, None, Some(unknown()), &mut out)
+        .expect_err("worker panic must outrank UNKNOWN");
+    assert!(panic_error.to_string().contains("worker panicked"));
+    assert!(out.is_empty());
+
+    let mut out = Vec::new();
+    let typed_error = super::emit_portfolio_result(
+        None,
+        false,
+        Some(Fzn2smtError::Message("worker error".to_string())),
+        Some(unknown()),
+        &mut out,
+    )
+    .expect_err("typed worker error must outrank UNKNOWN");
+    assert_eq!(typed_error.to_string(), "worker error");
+    assert!(out.is_empty());
+
+    let mut out = Vec::new();
+    super::emit_portfolio_result(
+        Some(super::SolveCpReport {
+            status: super::SolveCpStatus::Sat,
+            stdout: b"==========\n".to_vec(),
+        }),
+        true,
+        Some(Fzn2smtError::Message("losing worker error".to_string())),
+        Some(unknown()),
+        &mut out,
+    )
+    .expect("a definitive verdict must be preserved");
+    assert_eq!(out, b"==========\n");
 }
 
 #[test]
@@ -536,12 +689,305 @@ fn malformed_array_parameter_element_is_an_error_not_zero() {
 }
 
 #[test]
+fn malformed_constraint_arity_is_a_typed_error() {
+    for (constraint, expected_text, actual) in [
+        ("constraint int_eq(1);", "2", 1),
+        ("constraint int_eq(1, 1, 1);", "2", 3),
+        ("constraint bool_xor(true);", "2 or 3", 1),
+        (
+            "constraint bool_xor(true, false, true, false);",
+            "2 or 3",
+            4,
+        ),
+    ] {
+        let fzn = format!("{constraint}\nsolve satisfy;\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let err = super::unsupported_constraints(&model)
+            .expect_err("known constraints with invalid arity must be rejected");
+        assert!(
+            matches!(
+                &err,
+                Fzn2smtError::InvalidConstraintArity {
+                    expected,
+                    actual: found,
+                    ..
+                } if expected == expected_text && *found == actual
+            ),
+            "unexpected error for {constraint}: {err}"
+        );
+    }
+}
+
+#[test]
+fn mismatched_linear_arrays_are_typed_errors() {
+    for constraint in [
+        "int_lin_eq([1, 2], [x], 0)",
+        "int_lin_ne([1, 2], [x], 0)",
+        "int_lin_eq_reif([1, 2], [x], 0, r)",
+        "int_lin_ne_reif([1, 2], [x], 0, r)",
+        "int_lin_eq_imp([1, 2], [x], 0, r)",
+        "int_lin_ne_imp([1, 2], [x], 0, r)",
+    ] {
+        let fzn = format!("var 0..1: x;\nvar bool: r;\nconstraint {constraint};\nsolve satisfy;\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let err = super::unsupported_constraints(&model)
+            .expect_err("parallel linear arrays of different lengths must be rejected");
+        assert!(
+            matches!(
+                err,
+                Fzn2smtError::LinearArrayLengthMismatch {
+                    coefficients: 2,
+                    variables: 1,
+                    ..
+                }
+            ),
+            "unexpected error for {constraint}: {err}"
+        );
+    }
+}
+
+#[test]
 fn oversized_set_domain_is_rejected_before_materialization() {
     let fzn = "var set of -9223372036854775808..9223372036854775807: s;\nsolve satisfy;\n";
     let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
     let err =
         super::unsupported_constraints(&model).expect_err("oversized set domain must be rejected");
     assert!(err.to_string().contains("exceeding"), "{err}");
+}
+
+#[test]
+fn invalid_integer_domains_are_typed_errors_not_constructor_panics() {
+    for declaration in [
+        "var {}: x;",
+        "var 2..1: x;",
+        "var {-9223372036854775808, 9223372036854775807}: x;",
+    ] {
+        let fzn = format!("{declaration}\nsolve satisfy;\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let error = super::unsupported_constraints(&model)
+            .expect_err("invalid integer domain must be rejected");
+        assert!(
+            matches!(error, Fzn2smtError::InvalidCpIntegerDomain { .. }),
+            "unexpected error for {declaration}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unbounded_direct_cp_domains_are_rejected_without_finite_defaults() {
+    for declaration in [
+        "var int: x;",
+        "var set of int: x;",
+        "array [1..1] of var int: x;",
+        "array [1..1] of var set of int: x;",
+    ] {
+        let fzn = format!("{declaration}\nsolve satisfy;\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let error = super::unsupported_constraints(&model)
+            .expect_err("unbounded direct-CP domain must be rejected");
+        assert!(
+            matches!(error, Fzn2smtError::UnsupportedExpression(_)),
+            "unexpected error for {declaration}: {error}"
+        );
+    }
+}
+
+#[test]
+fn initialized_unbounded_array_view_uses_referenced_finite_bounds() {
+    let fzn = "\
+        var 7..7: x;\n\
+        array [1..1] of var int: xs = [x];\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Sat(_)));
+}
+
+#[test]
+fn scalar_initializers_preserve_the_declared_domain() {
+    let outside_constant = "\
+        var 1..1: x = 2;\n\
+        solve satisfy;\n";
+    assert!(matches!(
+        parse_and_solve(outside_constant),
+        CpSolveResult::Unsat
+    ));
+
+    let incompatible_alias = "\
+        var 1..1: a;\n\
+        var 2..2: b = a;\n\
+        solve satisfy;\n";
+    assert!(matches!(
+        parse_and_solve(incompatible_alias),
+        CpSolveResult::Unsat
+    ));
+}
+
+#[test]
+fn bounded_array_element_domains_constrain_referenced_variables() {
+    let ranged = "\
+        var 0..2: x;\n\
+        array [1..1] of var 1..1: xs = [x];\n\
+        constraint int_eq(x, 2);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(ranged), CpSolveResult::Unsat));
+
+    let sparse = "\
+        var 1..3: x;\n\
+        array [1..1] of var {1, 3}: xs = [x];\n\
+        constraint int_eq(x, 2);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(sparse), CpSolveResult::Unsat));
+}
+
+#[test]
+fn bounded_uninitialized_integer_array_is_materialized_and_constrained() {
+    let fzn = "\
+        array [1..2] of var 0..1: xs :: output_array([1..2]);\n\
+        constraint int_eq(xs[1], 1);\n\
+        constraint int_eq(xs[2], 0);\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fzn, false);
+    assert!(
+        output.contains("xs = array1d(1..2, [1, 0]);"),
+        "declared array elements must be real bounded CP variables: {output}"
+    );
+}
+
+#[test]
+fn materialized_integer_array_slot_participates_in_element_constraints() {
+    let fzn = "\
+        array [1..3] of var 1..3: xs;\n\
+        var 2..2: idx;\n\
+        var 2..2: val;\n\
+        constraint int_eq(xs[1], 1);\n\
+        constraint int_eq(xs[3], 3);\n\
+        constraint array_var_int_element(idx, xs, val);\n\
+        constraint int_eq(xs[2], 1);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Unsat));
+}
+
+#[test]
+fn bounded_uninitialized_set_array_is_materialized_for_output() {
+    let fzn = "\
+        array [1..2] of var set of 1..2: sets :: output_array([1..2]);\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fzn, false);
+    assert!(
+        output.contains("sets = array1d(1..2, [") && !output.contains("array1d(1..2, []);"),
+        "declared set-array elements must not disappear from output: {output}"
+    );
+}
+
+#[test]
+fn output_array_annotation_must_match_the_declared_one_dimensional_range() {
+    for annotation in ["output_array([0..1])", "output_array([1..1, 1..2])"] {
+        let fzn = format!("array [1..2] of var 0..1: xs :: {annotation};\nsolve satisfy;\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        let error = super::unsupported_constraints(&model)
+            .expect_err("malformed output metadata must be rejected");
+        assert!(
+            matches!(error, Fzn2smtError::UnsupportedExpression(_)),
+            "unexpected error for {annotation}: {error}"
+        );
+    }
+}
+
+#[test]
+fn aliased_output_views_are_blocked_once_during_all_solutions() {
+    let fzn = "\
+        var 0..1: x :: output_var;\n\
+        array [1..1] of var int: xs :: output_array([1..1]) = [x];\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fzn, true);
+    assert_eq!(
+        output.matches("x = ").count(),
+        2,
+        "the two assignments of x must each be emitted once: {output}"
+    );
+    assert!(
+        output.contains("=========="),
+        "deduplicated blockers must exhaust enumeration: {output}"
+    );
+}
+
+#[test]
+fn explicit_set_universes_preserve_gaps_and_empty_sets() {
+    let gap = "\
+        var set of {1, 3}: s;\n\
+        var 2..2: two;\n\
+        constraint set_in(two, s);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(gap), CpSolveResult::Unsat));
+
+    let empty = "\
+        var set of {}: s;\n\
+        constraint set_card(s, 1);\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(empty), CpSolveResult::Unsat));
+}
+
+#[test]
+fn scalar_set_initializers_fix_membership_and_reject_out_of_universe_values() {
+    let fixed = "\
+        var set of 1..3: source = {1, 3};\n\
+        var set of 1..3: alias :: output_var = source;\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fixed, false);
+    assert!(
+        output.contains("alias = {1, 3};"),
+        "constant and alias set initializers must be channelled: {output}"
+    );
+
+    let outside = "\
+        var set of 1..2: s = {3};\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(outside), CpSolveResult::Unsat));
+}
+
+#[test]
+fn unsupported_float_declarations_are_rejected_instead_of_disappearing() {
+    for fzn in [
+        "var float: x :: output_var = 1.0;\nsolve satisfy;\n",
+        "array [1..1] of var float: xs :: output_array([1..1]) = [1.0];\nsolve satisfy;\n",
+    ] {
+        let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+        let error = super::unsupported_constraints(&model)
+            .expect_err("unsupported float declarations must fail closed");
+        assert!(
+            matches!(error, Fzn2smtError::UnsupportedExpression(_)),
+            "unexpected float declaration error: {error}"
+        );
+    }
+
+    // The current text parser does not accept float-range variable syntax,
+    // but the public AST can still carry these variants into the CP lane.
+    for ty in [
+        ay_flatzinc_parser::ast::FznType::FloatRange(0.0, 1.0),
+        ay_flatzinc_parser::ast::FznType::ArrayOf {
+            index: ay_flatzinc_parser::ast::IndexSet::Range(1, 1),
+            elem: Box::new(ay_flatzinc_parser::ast::FznType::FloatRange(0.0, 1.0)),
+        },
+    ] {
+        let mut ctx = CpContext::new();
+        let declaration = ay_flatzinc_parser::ast::VarDecl {
+            ty,
+            id: "unsupported_float_range".to_string(),
+            value: None,
+            annotations: Vec::new(),
+        };
+        assert!(matches!(
+            ctx.create_variable(&declaration),
+            Err(Fzn2smtError::UnsupportedExpression(_))
+        ));
+    }
+}
+
+#[test]
+fn oversized_dense_order_encoding_returns_unknown_before_allocation() {
+    let fzn = "\
+        var 0..2000000: x;\n\
+        solve satisfy;\n";
+    assert!(matches!(parse_and_solve(fzn), CpSolveResult::Unknown));
 }
 
 #[test]
@@ -761,12 +1207,72 @@ fn test_dzn_output() {
     ctx.build_model(&model).expect("build failed");
     match ctx.engine.solve() {
         CpSolveResult::Sat(assignment) => {
-            let dzn = ctx.format_solution(&assignment);
+            let dzn = ctx.format_solution(&assignment).expect("format failed");
             assert!(dzn.contains("x = 3;"), "dzn: {dzn}");
             assert!(dzn.contains("y = 1;"), "dzn: {dzn}");
         }
         other => panic!("expected Sat, got {other:?}"),
     }
+}
+
+#[test]
+fn test_dzn_output_rejects_missing_assignment_value() {
+    let fzn = "\
+        var 1..4: x :: output_var;\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let mut ctx = CpContext::new();
+    ctx.build_model(&model).expect("build failed");
+
+    let error = ctx.format_solution(&[]).unwrap_err();
+    assert!(matches!(
+        error,
+        Fzn2smtError::MissingOutputAssignment { ref output } if output == "x"
+    ));
+}
+
+#[test]
+fn test_dzn_set_output_rejects_missing_indicator_and_unknown_set() {
+    let fzn = "\
+        var set of 1..2: s :: output_var;\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let mut ctx = CpContext::new();
+    ctx.build_model(&model).expect("build failed");
+
+    let error = ctx.format_solution(&[]).unwrap_err();
+    assert!(matches!(
+        error,
+        Fzn2smtError::MissingOutputAssignment { ref output } if output == "s"
+    ));
+
+    ctx.set_var_map.clear();
+    let error = ctx.format_solution(&[]).unwrap_err();
+    assert!(matches!(
+        error,
+        Fzn2smtError::UnknownOutputSetVariable { ref name } if name == "s"
+    ));
+}
+
+#[test]
+fn test_empty_output_arrays_are_rendered() {
+    let int_array = "\
+        array [1..0] of var 1..2: xs :: output_array([1..0]) = [];\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(int_array, false);
+    assert!(
+        output.contains("xs = array1d(1..0, []);"),
+        "output: {output}"
+    );
+
+    let set_array = "\
+        array [1..0] of var set of 1..2: sets :: output_array([1..0]) = [];\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(set_array, false);
+    assert!(
+        output.contains("sets = array1d(1..0, []);"),
+        "output: {output}"
+    );
 }
 
 #[test]
@@ -953,6 +1459,37 @@ fn test_all_solutions_enumerate() {
     assert!(output.contains("x = 1;"), "missing x=1, output:\n{output}");
     assert!(output.contains("x = 2;"), "missing x=2, output:\n{output}");
     assert!(output.contains("x = 3;"), "missing x=3, output:\n{output}");
+}
+
+#[test]
+fn test_all_solutions_fixed_or_empty_projection_terminates() {
+    let fixed = "\
+        var 1..1: x :: output_var;\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fixed, true);
+    assert_eq!(output.matches("----------").count(), 1, "output: {output}");
+    assert!(output.contains("=========="), "output: {output}");
+
+    let no_outputs = "solve satisfy;\n";
+    let output = solve_cp_output(no_outputs, true);
+    assert_eq!(output.matches("----------").count(), 1, "output: {output}");
+    assert!(output.contains("=========="), "output: {output}");
+}
+
+#[test]
+fn test_all_solutions_enumerates_scalar_set_projection() {
+    let fzn = "\
+        var set of 1..2: s :: output_var;\n\
+        solve satisfy;\n";
+    let output = solve_cp_output(fzn, true);
+    assert_eq!(output.matches("----------").count(), 4, "output: {output}");
+    for value in ["{}", "{1}", "{2}", "{1, 2}"] {
+        assert!(
+            output.contains(&format!("s = {value};")),
+            "missing s = {value}; in output: {output}"
+        );
+    }
+    assert!(output.contains("=========="), "output: {output}");
 }
 
 #[test]

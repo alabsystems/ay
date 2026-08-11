@@ -12,43 +12,49 @@ use ay_cp::propagator::Constraint;
 use ay_cp::Domain;
 use ay_flatzinc_parser::ast::ConstraintItem;
 
+use super::numeric::{encoding_i64, linear_encoding_overflow, quadratic_global_work_supported};
 use super::CpContext;
 
 impl CpContext {
-    /// circuit(x): x[1..n] forms a Hamiltonian cycle (1-indexed successors).
+    /// `circuit(x)`: the entries of `x` form a Hamiltonian cycle over the
+    /// array's declared index set, and each entry is its node's successor.
     ///
-    /// Decomposition using O(n) Element-based MTZ subtour elimination:
+    /// Decomposition using O(n) Element-based MTZ subtour constraints. Each
+    /// `Element` owns an O(n) array, so translation work/storage is guarded as
+    /// O(n²) before any decomposition constraints are added:
     /// 1. AllDifferent(x) — successor is a permutation
-    /// 2. No self-loops: x[i] != i+1 for all i
-    /// 3. Position variables u[k] for nodes 2..n, domain {2..n}
-    ///    (node 1 has implicit position 1)
+    /// 2. No self-loops: `x[i] != i` for every array index `i`
+    /// 3. Position variables for all nodes after the first, domain {2..n}
+    ///    (the first node has implicit position 1)
     /// 4. For each non-root node i: pos(succ(i)) >= pos(i) + 1 when succ(i) != root
     ///    Encoded via Element constraint on an extended position array.
     pub(super) fn translate_circuit(&mut self, c: &ConstraintItem) -> Result<()> {
-        let vars = self.resolve_var_array(&c.args[0])?;
+        // A circuit's successor values range over the array's declared index
+        // set. Named arrays may be zero-based (or use another lower bound),
+        // while inline array literals use FlatZinc's builtin 1..len index set.
+        // Deriving this from successor variable bounds is unsound: ordinary
+        // constraints may have tightened every successor's lower bound without
+        // changing the nodes in the circuit.
+        let (lo, declared_hi, vars) = self.resolve_var_array_with_bounds(&c.args[0])?;
         let n = vars.len();
 
-        if n <= 1 {
+        if n == 0 {
+            return Ok(());
+        }
+        if !quadratic_global_work_supported(n) {
+            self.mark_unsupported(&c.id);
             return Ok(());
         }
 
-        let n_i64 = n as i64;
+        let n_i64 = i64::try_from(n).map_err(|_| linear_encoding_overflow(&c.id))?;
 
-        // fzn_circuit is emitted under either a 1-based (values 1..n) or 0-based
-        // (values 0..n-1) node convention depending on the model — e.g. MZC-2025
-        // `is` produces `[v1..v5, 0]` (0-based, node n's successor is literal 0),
-        // which the old hardcoded 1-based `[1,n]` bound rejected as spurious UNSAT.
-        // Infer the node-id base `lo` from the smallest successor lower bound; the
-        // n node-ids are then the consecutive range `[lo, lo+n-1]` and node at
-        // position i (0-based) has self-value `lo + i`. Imposing this range is
-        // sound (a circuit's successors must lie in the node set) and still proves
-        // out-of-range successors UNSAT.
-        let lo = vars
-            .iter()
-            .map(|&v| self.get_var_bounds(v).0)
-            .min()
-            .unwrap();
-        let hi = lo + n_i64 - 1;
+        let hi = encoding_i64(i128::from(lo) + i128::from(n_i64) - 1, &c.id)?;
+        if hi != declared_hi {
+            return Err(Fzn2smtError::UnsupportedExpression(format!(
+                "{}: array index range {lo}..{declared_hi} does not match {n} elements",
+                c.id
+            )));
+        }
 
         for &var in &vars {
             self.engine.add_constraint(Constraint::LinearGe {
@@ -67,9 +73,21 @@ impl CpContext {
         self.engine
             .add_constraint(Constraint::AllDifferent(vars.clone()));
 
+        if n == 1 {
+            // The sole node's successor must be itself. The previous early
+            // return left the variable unconstrained and admitted non-circuits.
+            self.engine.add_constraint(Constraint::LinearEq {
+                coeffs: vec![1],
+                vars,
+                rhs: lo,
+            });
+            return Ok(());
+        }
+
         // 2. No self-loops: vars[i] != (lo + i) for all i
         for (i, &var) in vars.iter().enumerate() {
-            let self_val = self.get_const_var(lo + i as i64);
+            let self_value = encoding_i64(i128::from(lo) + i as i128, &c.id)?;
+            let self_val = self.get_const_var(self_value);
             self.engine
                 .add_constraint(Constraint::AllDifferent(vec![var, self_val]));
         }
@@ -79,7 +97,7 @@ impl CpContext {
             return Ok(());
         }
 
-        self.encode_mtz_subtour_elimination(&vars, n, lo)
+        self.encode_mtz_subtour_elimination(&vars, n, lo, &c.id)
     }
 
     /// MTZ subtour elimination encoding.
@@ -91,16 +109,19 @@ impl CpContext {
         vars: &[ay_cp::variable::IntVarId],
         n: usize,
         lo: i64,
+        context: &str,
     ) -> Result<()> {
-        let n_i64 = n as i64;
-        let hi = lo + n_i64 - 1;
+        let n_i64 = i64::try_from(n).map_err(|_| linear_encoding_overflow(context))?;
+        let hi = encoding_i64(i128::from(lo) + i128::from(n_i64) - 1, context)?;
+        let after_lo = encoding_i64(i128::from(lo) + 1, context)?;
 
-        // Position variables: u[k] for nodes 2..n (1-based), domain {2..n}
+        // Position variables for every node after the first, domain {2..n}.
         let u: Vec<_> = (0..(n - 1))
             .map(|_| self.engine.new_int_var(Domain::new(2, n_i64), None))
             .collect();
 
-        // Extended position array: u_ext[0] = 1 (root), u_ext[k] = u[k-1] for k=1..n-1
+        // Extended position array: u_ext[0] = 1 (the first-indexed root),
+        // u_ext[k] = u[k-1] for k=1..n-1.
         let root_pos = self.get_const_var(1);
         let mut u_ext = vec![root_pos];
         u_ext.extend_from_slice(&u);
@@ -130,6 +151,7 @@ impl CpContext {
             //    root_flag=1 → vars[k+1] <= lo: vars[k+1] + (n-1)*root_flag <= hi
             //    root_flag=0 → vars[k+1] >= lo+1: vars[k+1] + root_flag >= lo+1
             let root_flag = self.engine.new_bool_var(None);
+            self.var_bounds.insert(root_flag, (0, 1));
             self.engine.add_constraint(Constraint::LinearLe {
                 coeffs: vec![1, n_i64 - 1],
                 vars: vec![vars[k + 1], root_flag],
@@ -138,7 +160,7 @@ impl CpContext {
             self.engine.add_constraint(Constraint::LinearGe {
                 coeffs: vec![1, 1],
                 vars: vec![vars[k + 1], root_flag],
-                rhs: lo + 1,
+                rhs: after_lo,
             });
 
             // d. u[k] - pos_succ - M*root_flag <= -1
@@ -153,19 +175,62 @@ impl CpContext {
         Ok(())
     }
 
-    /// inverse(x, y): x[y[i]] = i and y[x[i]] = i for all i (1-based).
+    /// `inverse(x, y)`: `x[i] = j` iff `y[j] = i` for indices `i` of
+    /// `x` and `j` of `y`.
     ///
-    /// Decomposition: AllDifferent on both arrays + Element channeling.
-    /// For each i: y[x[i] - 1] = i+1 (using 0-indexed Element + 1-based values).
+    /// Decomposition: range constraints and AllDifferent on both arrays, plus
+    /// `Element` channeling from each entry of `x` into `y`. Named arrays retain
+    /// their declared index sets; inline arrays use FlatZinc's builtin 1..len
+    /// index set.
     pub(super) fn translate_inverse(&mut self, c: &ConstraintItem) -> Result<()> {
-        let x = self.resolve_var_array(&c.args[0])?;
-        let y = self.resolve_var_array(&c.args[1])?;
+        let (x_lo, x_hi, x) = self.resolve_var_array_with_bounds(&c.args[0])?;
+        let (y_lo, y_hi, y) = self.resolve_var_array_with_bounds(&c.args[1])?;
         let n = x.len();
 
         if y.len() != n {
             return Err(Fzn2smtError::InverseArrayLengthMismatch {
                 left: n,
                 right: y.len(),
+            });
+        }
+        if !quadratic_global_work_supported(n) {
+            self.mark_unsupported(&c.id);
+            return Ok(());
+        }
+
+        let n_i64 = i64::try_from(n).map_err(|_| linear_encoding_overflow(&c.id))?;
+        let expected_x_hi = encoding_i64(i128::from(x_lo) + i128::from(n_i64) - 1, &c.id)?;
+        let expected_y_hi = encoding_i64(i128::from(y_lo) + i128::from(n_i64) - 1, &c.id)?;
+        if x_hi != expected_x_hi || y_hi != expected_y_hi {
+            return Err(Fzn2smtError::UnsupportedExpression(format!(
+                "{}: inverse array index ranges {x_lo}..{x_hi} and {y_lo}..{y_hi} do not match their {n} elements",
+                c.id
+            )));
+        }
+
+        // Values of x are indices of y, while values of y are indices of x.
+        for &xi in &x {
+            self.engine.add_constraint(Constraint::LinearGe {
+                coeffs: vec![1],
+                vars: vec![xi],
+                rhs: y_lo,
+            });
+            self.engine.add_constraint(Constraint::LinearLe {
+                coeffs: vec![1],
+                vars: vec![xi],
+                rhs: y_hi,
+            });
+        }
+        for &yi in &y {
+            self.engine.add_constraint(Constraint::LinearGe {
+                coeffs: vec![1],
+                vars: vec![yi],
+                rhs: x_lo,
+            });
+            self.engine.add_constraint(Constraint::LinearLe {
+                coeffs: vec![1],
+                vars: vec![yi],
+                rhs: x_hi,
             });
         }
 
@@ -175,17 +240,17 @@ impl CpContext {
         self.engine
             .add_constraint(Constraint::AllDifferent(y.clone()));
 
-        // Channeling: for each i, y[x[i]-1] = i+1
-        let n_i64 = n as i64;
-        for (i, &xi) in x.iter().enumerate() {
+        // Channeling: for each i in index_set(x), y[x[i]] = i. Element uses
+        // zero-based positions, hence subtract y's declared lower bound.
+        for (offset, &xi) in x.iter().enumerate() {
             let idx = self.engine.new_int_var(Domain::new(0, n_i64 - 1), None);
-            // idx = x[i] - 1
             self.engine.add_constraint(Constraint::LinearEq {
                 coeffs: vec![1, -1],
                 vars: vec![xi, idx],
-                rhs: 1,
+                rhs: y_lo,
             });
-            let result_val = self.get_const_var((i + 1) as i64);
+            let result_value = encoding_i64(i128::from(x_lo) + offset as i128, &c.id)?;
+            let result_val = self.get_const_var(result_value);
             self.engine.add_constraint(Constraint::Element {
                 index: idx,
                 array: y.clone(),

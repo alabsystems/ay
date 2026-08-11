@@ -7654,7 +7654,7 @@ fn conflict_capped_assumption_solve_never_reports_a_bogus_core() {
 
     for n in 3..=5usize {
         // x[p][h] == p * n + h + 1
-        let var = |p: usize, h: usize| ((p * n + h + 1) as u32);
+        let var = |p: usize, h: usize| (p * n + h + 1) as u32;
         let mut constraints = Vec::new();
         // Every pigeon sits in some hole.
         for p in 0..n {

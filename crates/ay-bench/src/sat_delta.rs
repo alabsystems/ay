@@ -762,11 +762,18 @@ fn collect_named_cnf(
         if !name.contains(needle) {
             continue;
         }
-        if name.ends_with(".cnf") || name.ends_with(".dimacs") {
+        let mut suffixes = name.rsplit('.');
+        let outer_extension = suffixes.next().unwrap_or_default();
+        if outer_extension.eq_ignore_ascii_case("cnf")
+            || outer_extension.eq_ignore_ascii_case("dimacs")
+        {
             plain.push(path);
-        } else if name.ends_with(".cnf.xz")
-            || name.ends_with(".cnf.gz")
-            || name.ends_with(".cnf.bz2")
+        } else if (outer_extension.eq_ignore_ascii_case("xz")
+            || outer_extension.eq_ignore_ascii_case("gz")
+            || outer_extension.eq_ignore_ascii_case("bz2"))
+            && suffixes
+                .next()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cnf"))
         {
             compressed.push(path);
         }
@@ -985,19 +992,20 @@ fn prepare_input(
             reason: format!("benchmark path has no filename: {}", path.display()),
         });
     };
-    if name.ends_with(".xz") || name.ends_with(".gz") || name.ends_with(".bz2") {
-        let output_name = name
-            .trim_end_matches(".xz")
-            .trim_end_matches(".gz")
-            .trim_end_matches(".bz2");
-        let output = case_dir.join(output_name);
-        let tool = if name.ends_with(".xz") {
+    let compression = name.rsplit_once('.').and_then(|(output_name, extension)| {
+        let tool = if extension.eq_ignore_ascii_case("xz") {
             "xz"
-        } else if name.ends_with(".gz") {
+        } else if extension.eq_ignore_ascii_case("gz") {
             "gzip"
-        } else {
+        } else if extension.eq_ignore_ascii_case("bz2") {
             "bzip2"
+        } else {
+            return None;
         };
+        Some((output_name, tool))
+    });
+    if let Some((output_name, tool)) = compression {
+        let output = case_dir.join(output_name);
         let output_file = File::create(&output)
             .with_bench_context(|| format!("creating decompressed input {}", output.display()))?;
         let mut command = resources.external_command(tool);
@@ -2197,7 +2205,7 @@ fn write_markdown(path: &Path, report: &SatDeltaReport) -> Result<()> {
     )?;
     writeln!(file, "AY env note: {}", report.ay_env_note)?;
     if let Some(version) = &report.runner.version {
-        writeln!(file, "Runner version: `{}`", version)?;
+        writeln!(file, "Runner version: `{version}`")?;
     }
     if let Some(checker) = &report.proof_checker {
         writeln!(file, "Proof checker: `{checker}`")?;
@@ -2207,7 +2215,7 @@ fn write_markdown(path: &Path, report: &SatDeltaReport) -> Result<()> {
         writeln!(file, "## Evidence Warnings")?;
         writeln!(file)?;
         for warning in &report.evidence_warnings {
-            writeln!(file, "- {}", warning)?;
+            writeln!(file, "- {warning}")?;
         }
     }
     writeln!(file)?;
@@ -2441,7 +2449,7 @@ fn write_markdown(path: &Path, report: &SatDeltaReport) -> Result<()> {
 fn markdown_optional(value: &Option<String>) -> String {
     value
         .as_ref()
-        .map_or_else(|| "-".to_string(), |value| format!("`{}`", value))
+        .map_or_else(|| "-".to_string(), |value| format!("`{value}`"))
 }
 
 fn display_optional_bool(value: Option<bool>) -> String {
@@ -2468,7 +2476,7 @@ fn binary_provenance(
             .as_ref()
             .and_then(|_| sha256_file(&resolved).ok())
             .unwrap_or_else(|| "unavailable".to_string()),
-        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+        size_bytes: metadata.as_ref().map(|metadata| metadata.len()),
         mtime_epoch: metadata
             .as_ref()
             .and_then(|meta| meta.modified().ok())
@@ -2642,7 +2650,7 @@ fn solver_version(
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_bench_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
@@ -2825,6 +2833,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(found, plain);
+    }
+
+    #[test]
+    fn hard_tail_discovery_accepts_mixed_case_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compressed = tmp.path().join("case_clique_n2_k10.CNF.GZ");
+        fs::write(&compressed, b"compressed").unwrap();
+
+        let found = find_named_cnf(tmp.path(), "clique_n2_k10")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found, compressed);
     }
 
     #[test]
@@ -3435,6 +3456,10 @@ c after
         target_os = "haiku",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the fixture is a shell script whose ${...} forms are parameter expansion"
+    )]
     fn sat_delta_report_records_ay_model_and_proof_statuses() {
         let tmp = tempfile::tempdir().unwrap();
         let sat = tmp.path().join("sat.cnf");
@@ -3693,6 +3718,10 @@ printf '{"mode":"dimacs-sat","result":"unknown","wall_time_ms":1100}\n' >&2
         target_os = "haiku",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the fixture is a shell script whose ${...} forms are parameter expansion"
+    )]
     fn sat_delta_keeps_ay_env_and_stats_flag_off_reference_solvers() {
         let tmp = tempfile::tempdir().unwrap();
         let cnf = tmp.path().join("sat.cnf");

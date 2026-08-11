@@ -1255,12 +1255,12 @@ fn trace_enabled() -> bool {
 /// optimality is judged, so it can change the PATH but never the admitted verdict.
 ///
 /// THREE MODES, because "path only" is not the same as "free". `AY_MILP_EAGER_PERTURB`:
-///   * `0`   — never (the `wide_tall` gate and a caller's own `lp.eager_perturb` still apply).
-///   * unset — ARMED (the default): a COLD solve of an LP whose cold, unperturbed walk has
-///             ALREADY come back `Stopped` at least once. See `eager_perturb_applies`.
-///   * `1` / `all` — every solve. This is the blanket default that shipped 2026-07-20
-///             (`d82673540`) and it is the downstream optimization consumer's documented lever for the 540-binary diff-net root
-///             LP (the development design notes).
+/// * `0`   — never (the `wide_tall` gate and a caller's own `lp.eager_perturb` still apply).
+/// * unset — ARMED (the default): a COLD solve of an LP whose cold, unperturbed walk has
+///   ALREADY come back `Stopped` at least once. See `eager_perturb_applies`.
+/// * `1` / `all` — every solve. This is the blanket default that shipped 2026-07-20
+///   (`d82673540`) and it is the downstream optimization consumer's documented lever for the 540-binary diff-net root
+///   LP (the development design notes).
 ///
 /// WHY THE BLANKET DEFAULT WAS RETIRED. Its own commit message asked for exactly this pass:
 /// "Large MIPLIB-scale general instances are not checked into the repo; recommend a confirming
@@ -11323,7 +11323,7 @@ mod warm_solve_mode_tests {
             leaf_model.fix_col(col, 1.0);
         }
         let certified =
-            crate::certify::certify_bounded(&leaf_model, &lp, &completed, &lower, &upper)
+            crate::certify::certify_bounded_by(&leaf_model, &lp, &completed, &lower, &upper, None)
                 .expect("the continuation basis must be exactly optimal");
         assert_eq!(
             certified.value,

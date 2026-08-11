@@ -53,8 +53,11 @@ impl Solver {
     /// `Z3_is_ground` FFI entry point.
     #[must_use]
     pub fn is_ground(&self, t: Term) -> bool {
+        let Ok(id) = self.resolve_term("is_ground", t) else {
+            return false;
+        };
         let mut cache: HashMap<TermId, bool> = HashMap::default();
-        self.is_ground_rec(t.0, &mut cache)
+        self.is_ground_rec(id, &mut cache)
     }
 
     fn is_ground_rec(&self, id: TermId, cache: &mut HashMap<TermId, bool>) -> bool {
@@ -103,21 +106,24 @@ impl Solver {
     /// returned unchanged. Backs the Z3-compat `Z3_substitute_vars` FFI entry.
     #[must_use]
     pub fn substitute_vars(&mut self, term: Term, to: &[Term]) -> Term {
+        let term_id = self.require_term("substitute_vars", term);
+        let replacement_ids = self.require_terms("substitute_vars", to);
         if to.is_empty() {
             return term;
         }
         let mut from_ids: Vec<TermId> = Vec::with_capacity(to.len());
         let mut to_ids: Vec<TermId> = Vec::with_capacity(to.len());
-        for (i, replacement) in to.iter().enumerate() {
+        for (i, &replacement_id) in replacement_ids.iter().enumerate() {
             if let Some(var_id) = self.terms().lookup(&format!("__db{i}")) {
                 from_ids.push(var_id);
-                to_ids.push(replacement.0);
+                to_ids.push(replacement_id);
             }
         }
         if from_ids.is_empty() {
             return term;
         }
-        Term(self.terms_mut().substitute(term.0, &from_ids, &to_ids))
+        let result = self.terms_mut().substitute(term_id, &from_ids, &to_ids);
+        self.wrap_term(result)
     }
 
     /// Resolve the de Bruijn-encoded bound variables of an n-ary binder body
@@ -144,6 +150,8 @@ impl Solver {
     /// returned unchanged.
     #[must_use]
     pub fn bind_de_bruijn(&mut self, vars: &[Term], body: Term) -> Term {
+        let var_ids = self.require_terms("bind_de_bruijn", vars);
+        let body_id = self.require_term("bind_de_bruijn", body);
         let n = vars.len();
         if n == 0 {
             return body;
@@ -151,7 +159,7 @@ impl Solver {
         // Collect the distinct `__db{k}` vars occurring in `body`.
         let mut seen: HashMap<TermId, ()> = HashMap::default();
         let mut occ: Vec<(usize, TermId)> = Vec::new();
-        self.collect_db_vars(body.0, &mut seen, &mut occ);
+        self.collect_db_vars(body_id, &mut seen, &mut occ);
         if occ.is_empty() {
             return body;
         }
@@ -160,14 +168,15 @@ impl Solver {
         for (k, id) in occ {
             from_ids.push(id);
             if k < n {
-                to_ids.push(vars[n - 1 - k].0);
+                to_ids.push(var_ids[n - 1 - k]);
             } else {
                 let sort = self.terms().sort(id).clone();
                 let shifted = self.declare_const(&format!("__db{}", k - n), sort);
-                to_ids.push(shifted.0);
+                to_ids.push(shifted.id());
             }
         }
-        Term(self.terms_mut().substitute(body.0, &from_ids, &to_ids))
+        let result = self.terms_mut().substitute(body_id, &from_ids, &to_ids);
+        self.wrap_term(result)
     }
 
     /// Collect the distinct `__db{k}` positional vars occurring in `term`
@@ -232,17 +241,32 @@ impl Solver {
     /// Z3-compat `Z3_substitute_funs` FFI entry point.
     #[must_use]
     pub fn substitute_funs(&mut self, term: Term, from: &[FuncDecl], to: &[Term]) -> Term {
+        let term_id = self.require_term("substitute_funs", term);
+        let template_ids = self.require_terms("substitute_funs", to);
         let n = from.len().min(to.len());
         if n == 0 {
             return term;
         }
-        // name -> (template term, arity)
+        // Exact core identity -> (template term, arity). Authenticated
+        // declaration handles must still denote their live declaration;
+        // synthetic handles may select true operators, but never acquire
+        // authority merely because their spelling matches a user declaration.
         let mut fun_map: HashMap<String, (TermId, usize)> = HashMap::default();
         for i in 0..n {
-            fun_map.insert(from[i].name.clone(), (to[i].0, from[i].domain.len()));
+            let declaration_is_current =
+                from[i].identity.is_some() && self.function_handle_is_current(&from[i]);
+            let synthetic_operator_is_safe = from[i].identity.is_none()
+                && !self.core_name_requires_authenticated_handle(&from[i].core_name);
+            if declaration_is_current || synthetic_operator_is_safe {
+                fun_map.insert(
+                    from[i].core_name.clone(),
+                    (template_ids[i], from[i].domain.len()),
+                );
+            }
         }
         let mut cache: HashMap<TermId, TermId> = HashMap::default();
-        Term(self.subst_funs_rec(term.0, &fun_map, &mut cache))
+        let result = self.subst_funs_rec(term_id, &fun_map, &mut cache);
+        self.wrap_term(result)
     }
 
     fn subst_funs_rec(
@@ -262,8 +286,9 @@ impl Solver {
                     .iter()
                     .map(|&arg| self.subst_funs_rec(arg, fun_map, cache))
                     .collect();
-                // If this application matches one of the `from` decls (by name
-                // and arity), inline its template with the rewritten actuals.
+                // If this application matches one of the `from` decls (by exact
+                // core identity and arity), inline its template with the
+                // rewritten actuals.
                 let matched = match &symbol {
                     Symbol::Named(name) => fun_map
                         .get(name)
@@ -374,7 +399,7 @@ impl Solver {
     /// index the store. It does not inspect the term or mutate solver state.
     #[must_use]
     pub fn is_valid_term(&self, term: Term) -> bool {
-        term.0.index() < self.terms().len()
+        self.resolve_term("is_valid_term", term).is_ok()
     }
 
     /// Check that occurrences captured by a preserved named binder retain the
@@ -479,26 +504,10 @@ impl Solver {
     /// from the corresponding original child sort.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_update_term(&mut self, term: Term, args: &[Term]) -> Result<Term, SolverError> {
-        let term_count = self.terms().len();
-        if term.0.index() >= term_count {
-            return Err(SolverError::InvalidArgument {
-                operation: "update_term",
-                message: format!("source term handle {} is out of range", term.to_raw()),
-            });
-        }
-        for (position, replacement) in args.iter().enumerate() {
-            if replacement.0.index() >= term_count {
-                return Err(SolverError::InvalidArgument {
-                    operation: "update_term",
-                    message: format!(
-                        "replacement handle {} at position {position} is out of range",
-                        replacement.to_raw()
-                    ),
-                });
-            }
-        }
+        let term_id = self.resolve_term("update_term", term)?;
+        let ids = self.resolve_terms("update_term", args)?;
 
-        let data = self.terms().get(term.0).clone();
+        let data = self.terms().get(term_id).clone();
         let old_children: Vec<TermId> = match &data {
             TermData::Var(_, _) | TermData::Const(_) => Vec::new(),
             TermData::App(_, old_args) => old_args.clone(),
@@ -530,9 +539,9 @@ impl Solver {
                 ),
             });
         }
-        for (&old_child, replacement) in old_children.iter().zip(args) {
+        for (&old_child, &replacement_id) in old_children.iter().zip(&ids) {
             let expected_sort = self.terms().sort(old_child);
-            let actual_sort = self.terms().sort(replacement.0);
+            let actual_sort = self.terms().sort(replacement_id);
             if actual_sort != expected_sort {
                 return Err(SolverError::SortMismatch {
                     operation: "update_term",
@@ -542,7 +551,6 @@ impl Solver {
             }
         }
 
-        let ids: Vec<TermId> = args.iter().map(|replacement| replacement.0).collect();
         let mut binder_work = 0usize;
         match &data {
             TermData::Let(bindings, _) => {
@@ -577,8 +585,9 @@ impl Solver {
                 if ids == old_args {
                     term
                 } else {
-                    let sort = self.terms().sort(term.0).clone();
-                    Term(self.terms_mut().mk_app(symbol, ids, sort))
+                    let sort = self.terms().sort(term_id).clone();
+                    let result = self.terms_mut().mk_app(symbol, ids, sort);
+                    self.wrap_term(result)
                 }
             }
             TermData::Not(_) => self.try_not(args[0])?,
@@ -591,16 +600,21 @@ impl Solver {
                     .collect();
                 // The child-count check guarantees one trailing body ID.
                 let body = ids[bindings.len()];
-                Term(self.terms_mut().mk_let(new_bindings, body))
+                let result = self.terms_mut().mk_let(new_bindings, body);
+                self.wrap_term(result)
             }
-            TermData::Forall(vars, _, triggers) => Term(
-                self.terms_mut()
-                    .mk_forall_with_triggers(vars, ids[0], triggers),
-            ),
-            TermData::Exists(vars, _, triggers) => Term(
-                self.terms_mut()
-                    .mk_exists_with_triggers(vars, ids[0], triggers),
-            ),
+            TermData::Forall(vars, _, triggers) => {
+                let result = self
+                    .terms_mut()
+                    .mk_forall_with_triggers(vars, ids[0], triggers);
+                self.wrap_term(result)
+            }
+            TermData::Exists(vars, _, triggers) => {
+                let result = self
+                    .terms_mut()
+                    .mk_exists_with_triggers(vars, ids[0], triggers);
+                self.wrap_term(result)
+            }
             // Future node kinds remain fail-closed even if the validation and
             // rebuild matches are changed independently.
             _ => {
@@ -627,7 +641,9 @@ impl Solver {
     /// default. Backs `Z3_mk_array_default`.
     #[must_use]
     pub fn array_default(&mut self, array: Term) -> Term {
-        Term(self.terms_mut().mk_array_default(array.0))
+        let array_id = self.require_term("array_default", array);
+        let result = self.terms_mut().mk_array_default(array_id);
+        self.wrap_term(result)
     }
 
     /// Build `(as-array f)` for the unary function named `func_name` with the
@@ -635,7 +651,8 @@ impl Solver {
     /// Exposes `TermArena::mk_as_array`. Backs `Z3_mk_as_array`.
     #[must_use]
     pub fn as_array(&mut self, func_name: &str, array_sort: Sort) -> Term {
-        Term(self.terms_mut().mk_as_array(func_name, array_sort))
+        let result = self.terms_mut().mk_as_array(func_name, array_sort);
+        self.wrap_term(result)
     }
 
     /// Build the single-variable lambda array `(lambda ((x T)) body)` with
@@ -645,7 +662,10 @@ impl Solver {
     /// / `Z3_mk_lambda_const`.
     #[must_use]
     pub fn lambda_array(&mut self, var: Term, body: Term) -> Term {
-        Term(self.terms_mut().mk_lambda_array(var.0, body.0))
+        let var_id = self.require_term("lambda_array", var);
+        let body_id = self.require_term("lambda_array", body);
+        let result = self.terms_mut().mk_lambda_array(var_id, body_id);
+        self.wrap_term(result)
     }
 
     /// Build `((_ map f) a0 .. a{n-1})` — pointwise application of the function
@@ -657,11 +677,11 @@ impl Solver {
     /// `_complement`/`_difference` = `map not`).
     #[must_use]
     pub fn array_map(&mut self, func_name: &str, arrays: &[Term], result_sort: Sort) -> Term {
-        let array_ids: Vec<TermId> = arrays.iter().map(|t| t.0).collect();
-        Term(
-            self.terms_mut()
-                .mk_array_map(func_name, array_ids, result_sort),
-        )
+        let array_ids = self.require_terms("array_map", arrays);
+        let result = self
+            .terms_mut()
+            .mk_array_map(func_name, array_ids, result_sort);
+        self.wrap_term(result)
     }
 
     // =========================================================================
@@ -674,11 +694,11 @@ impl Solver {
     /// term is sound regardless of whether the executor can DECIDE it (an
     /// undecided theory atom yields `unknown`, never a wrong answer).
     fn named_builtin_app(&mut self, token: &str, args: Vec<Term>, result_sort: Sort) -> Term {
-        let arg_ids: Vec<TermId> = args.iter().map(|t| t.0).collect();
-        Term(
-            self.terms_mut()
-                .mk_app(Symbol::named(token), arg_ids, result_sort),
-        )
+        let arg_ids = self.require_terms("named_builtin_app", &args);
+        let result = self
+            .terms_mut()
+            .mk_app(Symbol::named(token), arg_ids, result_sort);
+        self.wrap_term(result)
     }
 
     /// Set-cardinality predicate `(set.has_size s k)` → Bool: holds iff the
@@ -823,13 +843,14 @@ impl Solver {
     /// Backs the Z3-compat `Z3_qe_lite` FFI entry point.
     #[must_use]
     pub fn qe_lite(&mut self, body: Term, vars: &[Term]) -> Term {
-        let mut current = body.0;
-        for &var in vars {
+        let mut current = self.require_term("qe_lite", body);
+        let var_ids = self.require_terms("qe_lite", vars);
+        for var_id in var_ids {
             // Only a genuine (unfolded) Var node can be a bound variable.
-            let TermData::Var(name, _) = self.terms().get(var.0).clone() else {
+            let TermData::Var(name, _) = self.terms().get(var_id).clone() else {
                 continue;
             };
-            let sort = self.terms().sort(var.0).clone();
+            let sort = self.terms().sort(var_id).clone();
             // QeLight (Cooper) eliminates exactly one Int-sorted existential.
             if sort != Sort::Int {
                 continue;
@@ -851,6 +872,6 @@ impl Solver {
                 current = rewritten;
             }
         }
-        Term(current)
+        self.wrap_term(current)
     }
 }

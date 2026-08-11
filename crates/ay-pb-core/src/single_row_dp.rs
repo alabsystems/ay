@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::mem::size_of;
 
 use num_bigint::BigInt;
 
@@ -899,7 +900,7 @@ impl Problem {
             .checked_add(CHECKPOINT_INTERVAL + 5)
             .ok_or(SingleRowDpDecline::MemoryLimit)?;
         let bitset_bytes = words
-            .checked_mul(std::mem::size_of::<u64>())
+            .checked_mul(size_of::<u64>())
             .and_then(|bytes| bytes.checked_mul(live_bitsets))
             .ok_or(SingleRowDpDecline::MemoryLimit)?;
         let assignment_bytes = self.num_vars;
@@ -951,13 +952,13 @@ impl Problem {
             .ok_or(SingleRowDpDecline::MemoryLimit)?;
         let choice_words = bit_words(choice_bits)?;
         let reachable_bytes = bit_words(states)?
-            .checked_mul(std::mem::size_of::<u64>())
+            .checked_mul(size_of::<u64>())
             .ok_or(SingleRowDpDecline::MemoryLimit)?;
         let choice_bytes = choice_words
-            .checked_mul(std::mem::size_of::<u64>())
+            .checked_mul(size_of::<u64>())
             .ok_or(SingleRowDpDecline::MemoryLimit)?;
         let live_bytes = states
-            .checked_mul(std::mem::size_of::<i128>())
+            .checked_mul(size_of::<i128>())
             .and_then(|bytes| bytes.checked_add(reachable_bytes))
             .and_then(|bytes| bytes.checked_add(choice_bytes))
             .and_then(|bytes| bytes.checked_add(self.num_vars))
@@ -1254,7 +1255,7 @@ fn validate_untrusted_certificate_shape(
         let total_words = total_words.ok_or(SingleRowDpDecline::MemoryLimit)?;
         let checkpoint_bytes = u64::try_from(total_words)
             .unwrap_or(u64::MAX)
-            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .checked_mul(size_of::<u64>() as u64)
             .and_then(|bytes| {
                 bytes.checked_add(
                     u64::try_from(checkpoints.len())
@@ -1307,7 +1308,7 @@ fn certificate_resource_requirements(
         .checked_add(1)
         .ok_or(SingleRowDpDecline::MemoryLimit)?;
     let bitset_bytes = words
-        .checked_mul(std::mem::size_of::<u64>())
+        .checked_mul(size_of::<u64>())
         .and_then(|bytes| bytes.checked_mul(bitset_count))
         .ok_or(SingleRowDpDecline::MemoryLimit)?;
     let canonical_entries = problem
@@ -1720,7 +1721,7 @@ fn gcd_usize(mut a: usize, mut b: usize) -> usize {
 }
 
 fn div_ceil_nonnegative(value: usize, divisor: usize) -> usize {
-    value / divisor + usize::from(value % divisor != 0)
+    value / divisor + usize::from(!value.is_multiple_of(divisor))
 }
 
 #[cfg(test)]

@@ -28,8 +28,10 @@ impl Solver {
     /// [`bvnot`]: Solver::bvnot
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvnot(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvnot", a)?;
         self.expect_bitvec_width("bvnot", a)?;
-        Ok(Term(self.terms_mut().mk_bvnot(a.0)))
+        let result = self.terms_mut().mk_bvnot(a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector arithmetic negation (two's complement)
@@ -52,8 +54,10 @@ impl Solver {
     /// [`bvneg`]: Solver::bvneg
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvneg(&mut self, a: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvneg", a)?;
         self.expect_bitvec_width("bvneg", a)?;
-        Ok(Term(self.terms_mut().mk_bvneg(a.0)))
+        let result = self.terms_mut().mk_bvneg(a_id);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise AND
@@ -77,8 +81,11 @@ impl Solver {
     /// [`bvand`]: Solver::bvand
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvand(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvand", a)?;
+        let b_id = self.resolve_term("bvand", b)?;
         self.expect_same_bitvec_width("bvand", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvand(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvand(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise OR
@@ -102,8 +109,11 @@ impl Solver {
     /// [`bvor`]: Solver::bvor
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvor(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvor", a)?;
+        let b_id = self.resolve_term("bvor", b)?;
         self.expect_same_bitvec_width("bvor", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvor(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvor(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise XOR
@@ -127,8 +137,11 @@ impl Solver {
     /// [`bvxor`]: Solver::bvxor
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvxor(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvxor", a)?;
+        let b_id = self.resolve_term("bvxor", b)?;
         self.expect_same_bitvec_width("bvxor", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvxor(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvxor(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise NAND
@@ -156,8 +169,11 @@ impl Solver {
     /// [`bvnand`]: Solver::bvnand
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvnand(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvnand", a)?;
+        let b_id = self.resolve_term("bvnand", b)?;
         self.expect_same_bitvec_width("bvnand", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvnand(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvnand(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise NOR
@@ -185,8 +201,11 @@ impl Solver {
     /// [`bvnor`]: Solver::bvnor
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvnor(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvnor", a)?;
+        let b_id = self.resolve_term("bvnor", b)?;
         self.expect_same_bitvec_width("bvnor", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvnor(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvnor(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 
     /// Create a bitvector bitwise XNOR
@@ -214,7 +233,10 @@ impl Solver {
     /// [`bvxnor`]: Solver::bvxnor
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_bvxnor(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        let a_id = self.resolve_term("bvxnor", a)?;
+        let b_id = self.resolve_term("bvxnor", b)?;
         self.expect_same_bitvec_width("bvxnor", a, b)?;
-        Ok(Term(self.terms_mut().mk_bvxnor(vec![a.0, b.0])))
+        let result = self.terms_mut().mk_bvxnor(vec![a_id, b_id]);
+        Ok(self.wrap_term(result))
     }
 }
