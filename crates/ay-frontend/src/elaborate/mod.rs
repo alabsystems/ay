@@ -29,6 +29,172 @@ pub use provenance::{
 /// User declarations with this prefix are rejected.
 pub(crate) const INTERNAL_SYMBOL_PREFIX: &str = "__ay_";
 
+/// Which layer MINTS names in an AY-internal namespace (see
+/// [`INTERNAL_NAMESPACES`]). Recorded per row so the table says WHY a shape is
+/// dangerous, rather than leaving that to a comment somewhere else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InternalNamespaceMinter {
+    /// Minted by the core elaborator as a PRIVATE core identity
+    /// (`fresh_private_declaration_core_identity`,
+    /// `allocate_nominal_sort_identity`). Never a declared surface name.
+    CoreElaborator,
+    /// Minted AND structurally matched by the core term layer itself
+    /// (`TermStore::mk_array_map` / `TermStore::get_array_map`). It is built by
+    /// interning a `TermData::App` directly, never by declaring a symbol.
+    CoreTermLayer,
+    /// Minted by the in-process embedder/adapter API — AY's Z3 C surface
+    /// (`ay-ffi`) allocates `!ay.*` engine witnesses (`!ay.array-ext!<n>`,
+    /// `!ay.z3-func!<n>`, …) and DECLARES them through the native
+    /// `Solver::declare_const`/`try_declare_fun` API.
+    EmbedderApi,
+}
+
+/// Which declaration routes refuse a namespace.
+///
+/// This is a SEPARATE axis from [`InternalNamespaceMinter`], deliberately. Who
+/// mints a shape says how dangerous it is; which routes refuse it is also a
+/// statement about which callers AY trusts, and the two do not always coincide
+/// (see `map[...]`, whose row documents the difference and the residual hole it
+/// leaves).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InternalNamespaceScope {
+    /// Refused on EVERY declaration route, including the in-process native
+    /// `Solver` API and the C surface.
+    EveryRoute,
+    /// Refused to untrusted SMT-LIB SOURCE TEXT and to the C API, but NOT to
+    /// the in-process native `Solver` API. Reserved for shapes whose native
+    /// registration is an existing, exercised embedder contract.
+    SourceTextAndCApi,
+}
+
+/// One AY-internal name namespace: a `prefix`/`suffix` shape that some AY layer
+/// mints or structurally matches, and which therefore must not be capturable by
+/// a user declaration.
+#[derive(Clone, Copy, Debug)]
+pub struct InternalNamespace {
+    /// Required leading text of a name in this namespace.
+    pub prefix: &'static str,
+    /// Required trailing text (empty when the namespace is prefix-only).
+    pub suffix: &'static str,
+    /// The layer that mints names here.
+    pub minter: InternalNamespaceMinter,
+    /// Which declaration routes refuse this namespace.
+    pub scope: InternalNamespaceScope,
+    /// Human-readable reason, quoted verbatim in the rejection message.
+    pub rationale: &'static str,
+}
+
+/// Every AY-internal name namespace, in ONE place.
+///
+/// SOUNDNESS: each of these shapes is minted or structurally matched by an AY
+/// layer, so an ordinary user symbol that happens to have the shape is silently
+/// conflated with the internal object.
+///
+/// * `map[<f>]` — `TermStore::get_array_map` treats ANY `App` named `map[<f>]`
+///   as the array map of `<f>` and licenses the rewrite
+///   `select(map[f](a..), i) → f(select(a, i)..)`. A user function declared
+///   `|map[f]|` therefore acquires map semantics: MEASURED wrong verdict
+///   (pinned z3 5.0.0 `sat`, AY `unsat`) for
+///   `(declare-fun |map[f]| ((Array Int Int)) (Array Int Int))` asserted
+///   against `(distinct (select b 0) (f (select a 0)))` — a false PROVE, the
+///   cardinal soundness failure. The shape is RE-DERIVED from the matcher
+///   (`starts_with("map[") && ends_with(']')`), not guessed, so a name like
+///   `map[f` that the matcher does NOT capture stays declarable.
+/// * `__ay_` — the elaborator's private core identities. A user declaration of
+///   one aliases whichever internal binding already owns that spelling.
+/// * `!ay.` — engine witnesses minted by the Z3 C surface. `Z3_mk_ext` mints
+///   `!ay.array-ext!<n>` and axiomatizes it with
+///   `a != b => select(a,k) != select(b,k)`; because
+///   `Solver::try_declare_const` is idempotent at an identical sort, SMT-LIB
+///   text that declared `|!ay.array-ext!0|` first would have that axiom
+///   attached to ITS constant — an over-constraint, i.e. a sat→unsat channel.
+///
+/// SCOPE — `map[...]` is refused to SOURCE TEXT and to the C API, not to the
+/// in-process native `Solver` API. That is where the measured false PROVE
+/// lived, and the native route already has an exercised contract for
+/// registering internal-looking names as ordinary uninterpreted functions
+/// (`ay-dpll` `native_replay_prefers_registered_internal_looking_function_names`
+/// declares `map[replay_user]` through `Solver::try_declare_fun` and requires
+/// the replay path to honor the registration). The residual native-route hole
+/// is REAL and deliberately left open here: a native caller that declares
+/// `map[g]` at an ARRAY rank still hands `get_array_map` a term to claim.
+/// Closing it needs the native declaration gate to become rank-aware (the
+/// existing contract is only sound because that fixture's rank is
+/// `(Int) -> Bool`, which can never be a `select` argument), which is a
+/// separate change to `Solver::try_declare_fun`.
+///
+/// This table is the SINGLE SOURCE OF TRUTH shared by the core elaborator's
+/// declaration gates and `ay-ffi`'s `reserved_name_error`; the FFI predicate
+/// delegates here rather than re-spelling the shapes, so the two paths cannot
+/// drift apart (regression-tested by
+/// `test_ffi_and_core_internal_namespace_gates_agree` in `ay-ffi` and by
+/// `test_internal_namespace_table_covers_every_ffi_minted_identity` here).
+pub const INTERNAL_NAMESPACES: &[InternalNamespace] = &[
+    InternalNamespace {
+        prefix: INTERNAL_SYMBOL_PREFIX,
+        suffix: "",
+        minter: InternalNamespaceMinter::CoreElaborator,
+        scope: InternalNamespaceScope::EveryRoute,
+        rationale: "'__ay_*' names are the elaborator's private core identities",
+    },
+    InternalNamespace {
+        prefix: "map[",
+        suffix: "]",
+        minter: InternalNamespaceMinter::CoreTermLayer,
+        scope: InternalNamespaceScope::SourceTextAndCApi,
+        rationale: "names of the form 'map[...]' denote the internal array-map \
+                    operator and would silently change the formula's meaning",
+    },
+    InternalNamespace {
+        prefix: "!ay.",
+        suffix: "",
+        minter: InternalNamespaceMinter::EmbedderApi,
+        scope: InternalNamespaceScope::SourceTextAndCApi,
+        rationale: "'!ay.*' names are internal engine witnesses",
+    },
+];
+
+/// The internal namespace `name` falls into, if any (see
+/// [`INTERNAL_NAMESPACES`]).
+///
+/// A name is in a namespace when it carries BOTH the prefix and the suffix and
+/// is long enough to carry them disjointly — the same test the matcher that
+/// owns the namespace performs.
+#[must_use]
+pub fn internal_namespace_of(name: &str) -> Option<&'static InternalNamespace> {
+    INTERNAL_NAMESPACES.iter().find(|namespace| {
+        name.len() >= namespace.prefix.len() + namespace.suffix.len()
+            && name.starts_with(namespace.prefix)
+            && name.ends_with(namespace.suffix)
+    })
+}
+
+/// Whether `name` lies in ANY AY-internal namespace. This is the predicate the
+/// untrusted SMT-LIB source-text route and `ay-ffi`'s C-API name gate share.
+#[must_use]
+pub fn is_internal_namespace_name(name: &str) -> bool {
+    internal_namespace_of(name).is_some()
+}
+
+/// Whether `name` lies in an internal namespace that NO declaration route may
+/// mint (`InternalNamespaceScope::EveryRoute`). This is the part of the
+/// internal-namespace gate that also binds the native/programmatic API.
+fn is_undeclarable_internal_namespace_name(name: &str) -> bool {
+    internal_namespace_of(name)
+        .is_some_and(|namespace| namespace.scope == InternalNamespaceScope::EveryRoute)
+}
+
+/// Why `name` was refused, for [`ElaborateError::ReservedSymbol`]'s message.
+/// Names the ACTUAL namespace rather than always blaming the `__ay_` prefix, so
+/// a user hitting the `map[...]` or `!ay.*` gate is told what they collided
+/// with.
+fn reserved_symbol_reason(name: &str) -> &'static str {
+    internal_namespace_of(name).map_or(
+        "builtin theory-operator name AY matches structurally",
+        |namespace| namespace.rationale,
+    )
+}
+
 /// Builtin theory-operator names that AY's term layer and theory solvers
 /// recognize STRUCTURALLY, by name, on `App(Symbol::Named(name), ..)` — i.e.
 /// independently of any `declare-fun`. Because `TermData` has no dedicated
@@ -448,19 +614,43 @@ pub(crate) fn declaration_activated_signature_ok(
     }
 }
 
-/// Check if a symbol name is reserved: it uses the internal `__ay_` prefix, it
-/// is a builtin theory-operator name AY matches structurally (see
-/// [`RESERVED_OP_NAMES`]), or it is a declaration-activated collection
-/// predicate (see [`is_declaration_activated_op_name`]). Reserved names cannot
-/// be `declare`d/`define`d by user input; doing so is rejected with
+/// Check if a symbol name is reserved on EVERY declaration route, including the
+/// programmatic/native `Solver` API: it lies in an AY-internal namespace that no
+/// declaration may mint (`__ay_*`, `map[...]` — see
+/// [`is_undeclarable_internal_namespace_name`]), it is a builtin
+/// theory-operator name AY matches structurally (see [`RESERVED_OP_NAMES`]), or
+/// it is a declaration-activated collection predicate (see
+/// [`is_declaration_activated_op_name`]). Reserved names cannot be
+/// `declare`d/`define`d; doing so is rejected with
 /// [`ElaborateError::ReservedSymbol`]. Sole exception: `declare_fun` admits a
 /// declaration-activated name at its native collection signature — the
 /// documented activation route for the native collection solvers (it
 /// special-cases BEFORE this check; see `Context::declare_fun`).
+///
+/// The `InternalNamespaceScope::SourceTextAndCApi` namespaces (`!ay.*`,
+/// `map[...]`) are deliberately NOT here: the in-process native API declares
+/// `!ay.*` witnesses through this very entry point, and registering
+/// internal-looking function names natively is an existing exercised contract.
+/// Both are refused on the untrusted SMT-LIB source-text route and by the C
+/// surface — see [`is_source_reserved_symbol`] and `ay-ffi`'s
+/// `reserved_name_error`.
 pub fn is_reserved_symbol(name: &str) -> bool {
-    name.starts_with(INTERNAL_SYMBOL_PREFIX)
+    is_undeclarable_internal_namespace_name(name)
         || is_reserved_op_name(name)
         || is_declaration_activated_op_name(name)
+}
+
+/// Check if a symbol name is reserved against UNTRUSTED SMT-LIB SOURCE TEXT.
+///
+/// This is [`is_reserved_symbol`] widened with every remaining AY-internal
+/// namespace, including the embedder-minted `!ay.*` witnesses. Source text has
+/// no minting authority over any internal namespace, so the union applies;
+/// only the in-process native API (`Solver::declare_const`,
+/// `Solver::try_declare_fun`, used by AY's own Z3 C surface) keeps the narrower
+/// [`is_reserved_symbol`] gate.
+#[must_use]
+pub fn is_source_reserved_symbol(name: &str) -> bool {
+    is_reserved_symbol(name) || is_internal_namespace_name(name)
 }
 
 /// Error during elaboration
@@ -494,13 +684,15 @@ pub enum ElaborateError {
     /// Unsupported feature
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// Reserved symbol: either the internal `__ay_` prefix or a builtin
-    /// theory-operator name that AY matches structurally (see
-    /// [`RESERVED_OP_NAMES`]). Declaring such a name would silently conflate the
-    /// forged symbol with the builtin operator, so it is rejected.
+    /// Reserved symbol: either a name in an AY-internal namespace (see
+    /// [`INTERNAL_NAMESPACES`]) or a builtin theory-operator name that AY
+    /// matches structurally (see [`RESERVED_OP_NAMES`]). Declaring such a name
+    /// would silently conflate the forged symbol with the internal object or
+    /// builtin operator, so it is rejected.
     #[error(
-        "symbol '{0}' is reserved (internal '{INTERNAL_SYMBOL_PREFIX}' prefix or builtin \
-         theory-operator name) and cannot be declared"
+        "symbol '{}' is reserved ({}) and cannot be declared",
+        .0,
+        reserved_symbol_reason(.0)
     )]
     ReservedSymbol(String),
     /// Declaration of a symbol whose name is a registered datatype
@@ -2065,6 +2257,36 @@ impl Context {
                     .or_else(|| self.get_option(OPTION_GLOBAL_DECLS)),
                 Some(OptionValue::Bool(true))
             )
+    }
+
+    /// The reserved-name gate for a declaration arriving on THIS route.
+    ///
+    /// `native_global_declaration` is set exactly while a declaration comes
+    /// from the in-process native API (`Context::execute_native_global_
+    /// declaration`, i.e. `Solver::try_declare_fun`/`try_declare_datatype` and
+    /// the `register_native_global_*` helpers) — the route AY's own Z3 C
+    /// surface uses to mint its `!ay.*` engine witnesses. That route therefore
+    /// keeps the narrower [`is_reserved_symbol`] gate. Every other caller is
+    /// untrusted SMT-LIB source text, which has minting authority over no
+    /// internal namespace at all and gets the full
+    /// [`is_source_reserved_symbol`] union.
+    ///
+    /// Both predicates are derived from the single [`INTERNAL_NAMESPACES`]
+    /// table, so widening or narrowing a namespace updates both routes and the
+    /// FFI's own gate together.
+    ///
+    /// This gate is UNCONDITIONAL on the active logic: `set-logic` selects which
+    /// theories are available, never which names AY itself mints, and every
+    /// reserved theory-operator spelling is matched structurally by name+arity
+    /// with no sort check. Narrowing it per-logic would need every surface-name
+    /// interception path to first defer to a declared symbol; only `const` does
+    /// (see `EXCLUDED_DECLARABLE_OP_NAMES`), so the rest stay refused.
+    pub(crate) fn is_reserved_symbol_on_this_route(&self, name: &str) -> bool {
+        if self.native_global_declaration {
+            is_reserved_symbol(name)
+        } else {
+            is_source_reserved_symbol(name)
+        }
     }
 
     /// Capture a symbol name's state before its first mutation in the current

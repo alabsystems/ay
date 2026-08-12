@@ -62,6 +62,11 @@ impl Executor {
             executor.last_model = None;
             executor.last_model_validated = false;
             executor.last_unknown_reason = Some(UnknownReason::Incomplete);
+            executor.record_unknown_diagnostic(
+                UnknownReason::Incomplete,
+                "FP `fp.to_real` two-phase lane found a `sat` for a RELAXATION of the input \
+                 (uninterpreted structure it could not encode), so only `unsat` transfers",
+            );
             Ok(SolveResult::Unknown)
         };
 

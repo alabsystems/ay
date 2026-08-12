@@ -8,10 +8,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use crate::command;
 use ay_core::Sort;
 
-use super::{
-    is_canonical_theory_operator_identity, is_reserved_symbol, Context, ElaborateError, Result,
-    SymbolInfo,
-};
+use super::{is_canonical_theory_operator_identity, Context, ElaborateError, Result, SymbolInfo};
 
 /// Mangle a parametric-datatype instantiation `(Name A1 .. An)` into a unique,
 /// deterministic sort name used as `Sort::Uninterpreted(<mangled>)`.
@@ -470,18 +467,22 @@ impl Context {
     }
 
     /// Validate that a datatype declaration uses no reserved symbols.
-    fn validate_datatype_names(name: Option<&str>, dec: &command::DatatypeDec) -> Result<()> {
+    fn validate_datatype_names(
+        &self,
+        name: Option<&str>,
+        dec: &command::DatatypeDec,
+    ) -> Result<()> {
         if let Some(name) = name {
-            if is_reserved_symbol(name) {
+            if self.is_reserved_symbol_on_this_route(name) {
                 return Err(ElaborateError::ReservedSymbol(name.to_string()));
             }
         }
         for ctor in &dec.constructors {
-            if is_reserved_symbol(&ctor.name) {
+            if self.is_reserved_symbol_on_this_route(&ctor.name) {
                 return Err(ElaborateError::ReservedSymbol(ctor.name.clone()));
             }
             for sel in &ctor.selectors {
-                if is_reserved_symbol(&sel.name) {
+                if self.is_reserved_symbol_on_this_route(&sel.name) {
                     return Err(ElaborateError::ReservedSymbol(sel.name.clone()));
                 }
             }
@@ -542,7 +543,7 @@ impl Context {
         datatype_dec: &command::DatatypeDec,
     ) -> Result<()> {
         // Validate datatype name and all constructor/selector names
-        Self::validate_datatype_names(Some(name), datatype_dec)?;
+        self.validate_datatype_names(Some(name), datatype_dec)?;
         self.reject_finite_set_datatype_fields(datatype_dec)?;
         // IDEMPOTENT re-declaration: adopt an EXACTLY-identical datatype
         // re-declaration as a no-op, mirroring `try_declare_fun`'s adopt-identical
@@ -650,7 +651,7 @@ impl Context {
         // Validate all names before making any changes
         let mut group_sort_names: HashSet<String> = HashSet::default();
         for sort_dec in sort_decs {
-            if is_reserved_symbol(&sort_dec.name) {
+            if self.is_reserved_symbol_on_this_route(&sort_dec.name) {
                 return Err(ElaborateError::ReservedSymbol(sort_dec.name.clone()));
             }
             if !group_sort_names.insert(sort_dec.name.clone()) {
@@ -663,7 +664,7 @@ impl Context {
             self.check_datatype_sort_redeclaration(&sort_dec.name)?;
         }
         for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
-            Self::validate_datatype_names(None, datatype_dec)?;
+            self.validate_datatype_names(None, datatype_dec)?;
             self.reject_finite_set_datatype_fields(datatype_dec)?;
             if sort_dec.arity == 0 && !datatype_dec.type_params.is_empty() {
                 return Err(ElaborateError::Unsupported(format!(

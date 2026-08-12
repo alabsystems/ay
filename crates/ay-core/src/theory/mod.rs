@@ -58,6 +58,27 @@ pub trait TheorySolver {
     /// that don't implement bound propagation).
     fn register_atom(&mut self, _atom: TermId) {}
 
+    /// Inform the theory of the set of terms that currently have a SAT
+    /// variable, keyed by term id (`term_to_var` maps every Boolean atom the
+    /// DPLL solver can assign to its variable). A pure-EUF solver uses this to
+    /// restrict negative-congruence propagation to equalities that are actually
+    /// SAT atoms: when EUF has no sibling theory, a propagation on an equality
+    /// with no SAT variable is inert (the DPLL layer has no variable to receive
+    /// it and drops it), so scanning those equalities is pure wasted work.
+    ///
+    /// SCOPE (soundness): only sound where the filtered propagation index feeds
+    /// the SAT boundary alone. A combiner may install it only after proving that
+    /// its cross-theory interface does not consume this index. The current
+    /// callers are standalone EUF and the array-free UF+LIA combiner; array
+    /// combiners deliberately keep the full index because their interface uses
+    /// non-SAT-atom index disequalities.
+    ///
+    /// Passing a superset of the assignable atoms is always safe within that
+    /// scope — the callee only ever *removes* provably-inert candidates. Called
+    /// once per (re)created theory instance, BEFORE the first `propagate()`.
+    /// The default implementation does nothing. (#euf-atom-filter)
+    fn set_sat_atom_terms(&mut self, _term_to_var: &crate::kani_compat::DetHashMap<TermId, u32>) {}
+
     /// Assert a literal to the theory solver.
     fn assert_literal(&mut self, literal: TermId, value: bool);
 

@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::os::raw::c_uint;
 use std::path::Path;
 use std::process::Command;
 
@@ -35,8 +36,15 @@ pub(crate) type DelContextFn = unsafe extern "C" fn(Z3Ptr);
 /// commands. The returned string is owned by the context, so callers MUST
 /// copy it before deleting the context.
 pub(crate) type EvalFn = unsafe extern "C" fn(Z3Ptr, *const c_char) -> *const c_char;
+/// `Z3_set_error_handler(Z3_context, Z3_error_handler)` — a null handler asks
+/// libz3 to record errors on the context instead of terminating the process.
+pub(crate) type ErrorHandlerFn = unsafe extern "C" fn(Z3Ptr, c_uint);
+pub(crate) type SetErrorHandlerFn = unsafe extern "C" fn(Z3Ptr, Option<ErrorHandlerFn>);
+/// `Z3_error_code Z3_get_error_code(Z3_context)` — returns `Z3_OK` (zero)
+/// after a successful evaluation and a non-zero code after a parser/API error.
+pub(crate) type GetErrorCodeFn = unsafe extern "C" fn(Z3Ptr) -> c_uint;
 
-/// The five raw C entry points needed to run a script through one solver.
+/// The seven raw C entry points needed to run a script through one solver.
 ///
 /// Every field is a bare function pointer (an address inside the loaded
 /// library), which is `Send`, so the whole struct can be moved into a worker
@@ -49,6 +57,8 @@ pub(crate) struct SolverApi {
     pub(crate) del_config: DelConfigFn,
     pub(crate) del_context: DelContextFn,
     pub(crate) eval: EvalFn,
+    pub(crate) set_error_handler: SetErrorHandlerFn,
+    pub(crate) get_error_code: GetErrorCodeFn,
 }
 
 /// `dlopen(path, RTLD_NOW | RTLD_LOCAL)`.
@@ -77,7 +87,7 @@ pub(crate) fn open_local(path: &Path) -> Result<Library, String> {
     unsafe { Library::new(path).map_err(|e| format!("LoadLibrary {}: {e}", path.display())) }
 }
 
-/// Resolve the five script-evaluation entry points from an already-open
+/// Resolve the seven script-evaluation entry points from an already-open
 /// library. Copies each function pointer out of the borrowing `Symbol`; this
 /// is sound as long as `lib` outlives the returned [`SolverApi`].
 pub(crate) fn load_api(lib: &Library) -> Result<SolverApi, String> {
@@ -94,12 +104,18 @@ pub(crate) fn load_api(lib: &Library) -> Result<SolverApi, String> {
         let del_config = get_fn(b"Z3_del_config\0")?;
         let del_context = get_fn(b"Z3_del_context\0")?;
         let eval = get_fn(b"Z3_eval_smtlib2_string\0")?;
+        let set_error_handler = get_fn(b"Z3_set_error_handler\0")?;
+        let get_error_code = get_fn(b"Z3_get_error_code\0")?;
         Ok(SolverApi {
             mk_config: std::mem::transmute::<*const c_void, MkConfigFn>(mk_config),
             mk_context: std::mem::transmute::<*const c_void, MkContextFn>(mk_context),
             del_config: std::mem::transmute::<*const c_void, DelConfigFn>(del_config),
             del_context: std::mem::transmute::<*const c_void, DelContextFn>(del_context),
             eval: std::mem::transmute::<*const c_void, EvalFn>(eval),
+            set_error_handler: std::mem::transmute::<*const c_void, SetErrorHandlerFn>(
+                set_error_handler,
+            ),
+            get_error_code: std::mem::transmute::<*const c_void, GetErrorCodeFn>(get_error_code),
         })
     }
 }

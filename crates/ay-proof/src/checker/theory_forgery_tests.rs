@@ -350,12 +350,13 @@ fn test_bv_bitblast_proof_producer_rejects_unsupported_wide_operator() {
 }
 
 #[test]
-fn test_bv_bitblast_proof_producer_rejects_width_above_sixty_four() {
+fn test_bv_bitblast_proof_producer_rejects_width_above_internal_ceiling() {
+    let width = bv_bitblast::MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH + 1;
     let mut terms = TermStore::new();
-    let bv = terms.mk_var("bv", Sort::bitvec(65));
+    let bv = terms.mk_var("bv", Sort::bitvec(width));
     let eq = terms.mk_app(ay_core::Symbol::named("="), vec![bv, bv], Sort::Bool);
     validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
-        .expect_err("width 65 is outside the bounded proof-producing fragment");
+        .expect_err("width above the internal ceiling is outside the proof-producing fragment");
 }
 
 #[test]
@@ -1500,6 +1501,35 @@ fn test_forged_lia_divisibility_cannot_drive_strict_checker_to_unsat() {
     let err = validate_step(&terms, &mut derived, ProofId(0), &step, true, None).expect_err(
         "forged LIA Divisibility lemma over a non-tautological clause must be rejected",
     );
+    assert!(
+        matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
+        "expected InvalidTheoryLemma, got {err:?}"
+    );
+}
+
+#[test]
+fn test_forged_lia_bounds_gap_cannot_certify_satisfiable_integer_interval() {
+    // 0 <= x AND x < 1 has the integer model x=0. A BoundsGap annotation with
+    // no Farkas certificate must not turn that adjacent, NON-empty rounded
+    // interval into a theory tautology.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let lower = terms.mk_le(zero, x);
+    let upper = terms.mk_lt(x, one);
+    let not_lower = terms.mk_not(lower);
+    let not_upper = terms.mk_not(upper);
+    let step = ProofStep::TheoryLemma {
+        theory: "test".to_string(),
+        clause: vec![not_lower, not_upper],
+        farkas: None,
+        kind: TheoryLemmaKind::LiaGeneric,
+        lia: Some(LiaAnnotation::BoundsGap),
+    };
+    let mut derived = Vec::new();
+    let err = validate_step(&terms, &mut derived, ProofId(0), &step, true, None)
+        .expect_err("forged BoundsGap over satisfiable adjacent integer bounds must be rejected");
     assert!(
         matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
         "expected InvalidTheoryLemma, got {err:?}"

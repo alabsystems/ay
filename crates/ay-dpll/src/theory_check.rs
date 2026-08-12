@@ -304,12 +304,17 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 TheoryCheck::NeedStringLemma(lemma)
             }
             TheoryResult::NeedLemmas(lemmas) => {
+                // #trust->0 C1.iii: route through the classifier funnel (with
+                // the polarity-before-routing contract) instead of recording
+                // bare Generic/trust with a wrong-polarity fallback (site 16).
                 if let Some((ref mut tracker, negations)) = tracking {
                     for lemma in &lemmas {
-                        let terms = self
-                            .theory_clause_to_terms(&lemma.clause, negations)
-                            .unwrap_or_else(|| lemma.clause.iter().map(|lit| lit.term).collect());
-                        let _ = tracker.add_theory_lemma(terms);
+                        let _ = theory_inference::record_materialized_lemma_clause(
+                            tracker,
+                            self.terms,
+                            negations,
+                            &lemma.clause,
+                        );
                     }
                 }
                 self.emit_theory_check_event(

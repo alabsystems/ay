@@ -84,10 +84,12 @@ pub use bv_blast_export::{
 };
 pub use bv_blast_lean::render_bv_blast_proof_lean;
 pub use bv_blast_solver::{
-    export_bv_blast_proof_expr, export_bv_blast_proof_solved, BvExpr, BvExprExportError,
-    BvSolvedExportError, SolvedObligation,
+    export_bv_blast_proof_expr, export_bv_blast_proof_expr_bounded, export_bv_blast_proof_solved,
+    BvExpr, BvExprExportError, BvExprProofBudget, BvExprProofBudgetError, BvSolvedExportError,
+    SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
+pub use checker::recognize_euf_congruent;
 pub use checker::recognize_ground_evaluate;
 pub use checker::recognize_ite_same;
 pub use checker::recognize_nra_interval_unsat;
@@ -106,10 +108,13 @@ pub use checker::{
     authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
     recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
     AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
-    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+    MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
 pub use checker::{
     authenticate_bv_lia_unsat_query, AuthenticatedBvLiaUnsatQuery, BvLiaUnsatAuthenticationError,
+    MAX_BV_LIA_QUERY_ROOTS, MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
+    MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA,
 };
 pub use checker::{
     check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,

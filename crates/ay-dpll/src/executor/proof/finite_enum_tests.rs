@@ -15,7 +15,7 @@ fn bounded_pair_and_cell_caps_cover_exact_boundary() {
     assert_eq!(Executor::bounded_pair_count(255, 256), Some(32_640));
     assert_eq!(Executor::bounded_pair_count(256, 257), None);
     assert_eq!(32_640usize * 4 + 3, 130_563);
-    assert!(130_563 <= MAX_PROOF_CELLS);
+    const { assert!(130_563 <= MAX_PROOF_CELLS) };
 }
 
 #[test]

@@ -360,7 +360,9 @@ impl Solver {
         self.install_and_apply_sat_whole_loop_guard_at_solver_start();
 
         // Initialize streaming UNSAT core bitmap (#8250).
-        let num_originals = self.cold.next_original_clause_id.saturating_sub(1);
+        // Issued-original max, not next_original_clause_id - 1: the latter
+        // jumps past derived IDs (b93692341 follow-up).
+        let num_originals = self.cold.issued_original_clause_id_max;
         if num_originals > 0 {
             self.cold.streaming_core_num_originals = num_originals;
             // Reuse existing allocation if capacity suffices, otherwise allocate.

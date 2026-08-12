@@ -8,6 +8,7 @@ use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -107,6 +108,64 @@ const QF_AUFLIA_COMPOSED_ROW2_ROOT_UNSAT: &str = r#"
   (not
     (=> (not (= i j))
         (= (select (store a i v) j) (select a j)))))
+(check-sat)
+"#;
+
+// Carcara 1.1.0 has no `store_permutation` rule (probed: `unknown rule`), so
+// AY's n-ary store-commutativity lemma used to export as an unchecked `hole`.
+// It is now DERIVED from the rules carcara does implement: `arrays_ext`
+// supplies the extensionality witness, the four cases on that witness reduce
+// through `arrays_row` / `arrays_idx` / `cong` / `trans`, and the carried index
+// disequality kills the case where the witness is both indices at once.
+const QF_AUFLIA_STORE_PERMUTATION_UNSAT: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-fun a () (Array Int Int))
+(declare-fun i () Int)
+(declare-fun j () Int)
+(declare-fun v () Int)
+(declare-fun w () Int)
+(assert (not (= i j)))
+(assert (not (= (store (store a i v) j w) (store (store a j w) i v))))
+(check-sat)
+"#;
+
+// The same schema at chain length three: the permutation is factored into
+// ADJACENT transpositions, so this one additionally exercises lifting a
+// transposition back out through an untouched outer store with `cong` and
+// composing three of them with `trans`.
+const QF_AUFLIA_STORE_PERMUTATION_CHAIN3_UNSAT: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-fun a () (Array Int Int))
+(declare-fun i1 () Int)
+(declare-fun i2 () Int)
+(declare-fun i3 () Int)
+(declare-fun v1 () Int)
+(declare-fun v2 () Int)
+(declare-fun v3 () Int)
+(assert (not (= i1 i2)))
+(assert (not (= i1 i3)))
+(assert (not (= i2 i3)))
+(assert
+  (not (= (store (store (store a i1 v1) i2 v2) i3 v3)
+          (store (store (store a i3 v3) i2 v2) i1 v1))))
+(check-sat)
+"#;
+
+// A store chain that mentions a user symbol literally named `x`. The
+// transposition derivation inlines the printed chains into the scope of the
+// `arrays_ext` witness's `choice` binder — also literally `x` — so lowering
+// this chain would CAPTURE the user symbol and publish a document that claims
+// a different term than the checker constructs (carcara-`invalid`). The
+// lowering must decline and keep the honest `hole` instead.
+const QF_AUFLIA_STORE_PERMUTATION_BINDER_COLLISION_UNSAT: &str = r#"
+(set-logic QF_AUFLIA)
+(declare-fun a () (Array Int Int))
+(declare-fun i () Int)
+(declare-fun j () Int)
+(declare-fun x () Int)
+(declare-fun w () Int)
+(assert (not (= i j)))
+(assert (not (= (store (store a i x) j w) (store (store a j w) i x))))
 (check-sat)
 "#;
 
@@ -850,6 +909,87 @@ fn test_carcara_trust_free_composed_authored_roots() {
     }
 }
 
+/// Store-commutativity has NO counterpart rule in the pinned checker, so the
+/// lemma is lowered as a derivation over the array rules carcara does have.
+/// Both chain lengths must come back trust-free `valid`, not `holey`.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_array_store_permutation() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+
+    for (label, problem) in [
+        (
+            "trust_free_qf_auflia_store_permutation",
+            QF_AUFLIA_STORE_PERMUTATION_UNSAT,
+        ),
+        (
+            "trust_free_qf_auflia_store_permutation_chain3",
+            QF_AUFLIA_STORE_PERMUTATION_CHAIN3_UNSAT,
+        ),
+    ] {
+        let proof = solve_unsat_and_get_proof(problem, label);
+        assert!(
+            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+            "{label}: store-permutation proof must not contain unchecked rules:\n{proof}"
+        );
+        // The unknown internal name must never reach the wire either.
+        assert!(!proof.contains("store_permutation"), "{label}:\n{proof}");
+        for rule in [":rule arrays_ext", ":rule arrays_row", ":rule arrays_idx"] {
+            assert!(proof.contains(rule), "{label}: missing {rule}:\n{proof}");
+        }
+        assert!(
+            run_carcara_trust_free(&carcara, label, problem, &proof),
+            "{label}: store-permutation proof must be trust-free verifiable by carcara"
+        );
+    }
+}
+
+/// REGRESSION: a store chain mentioning a user symbol literally named `x`
+/// collides with the `arrays_ext` witness's `choice` binder. The lowering
+/// must DECLINE — the document stays an honest `hole` and carcara checks it
+/// as `holey`, never `invalid` — while a chain that does not mention `x`
+/// keeps the full derivation and the trust-free `valid` verdict.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_store_permutation_binder_collision_stays_holey() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+
+    let label = "store_permutation_binder_collision";
+    let problem = QF_AUFLIA_STORE_PERMUTATION_BINDER_COLLISION_UNSAT;
+    let proof = solve_unsat_and_get_proof(problem, label);
+    assert!(
+        proof.contains(":rule hole"),
+        "{label}: the colliding chain must keep the honest hole:\n{proof}"
+    );
+    // No witness may be built over the colliding chain at all: any
+    // `(choice ((x ...)` in this document would capture the clause's own `x`.
+    assert!(
+        !proof.contains("(choice ((x "),
+        "{label}: no witness may capture the user symbol x:\n{proof}"
+    );
+    assert!(
+        run_carcara(&carcara, label, problem, &proof),
+        "{label}: the honest hole must leave the document checkable (holey), never invalid"
+    );
+
+    // Control: the SAME schema over symbols that do not collide with the
+    // binder keeps the derivation and stays trust-free `valid`.
+    let control = "store_permutation_binder_collision_control";
+    let proof = solve_unsat_and_get_proof(QF_AUFLIA_STORE_PERMUTATION_UNSAT, control);
+    assert!(
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "{control}: the non-colliding chain must keep the derivation:\n{proof}"
+    );
+    assert!(
+        run_carcara_trust_free(&carcara, control, QF_AUFLIA_STORE_PERMUTATION_UNSAT, &proof),
+        "{control}: the non-colliding chain must stay trust-free valid"
+    );
+}
+
 /// The exact QF_ABV regression must remain self-contained: the authored nested
 /// concat and binary `distinct` are bridged explicitly, while the closed
 /// constant folds use Carcara's checked `evaluate` rule.
@@ -881,6 +1021,230 @@ fn test_carcara_trust_free_qf_abv_pinned_concat_substitution() {
         run_carcara_trust_free(&carcara, label, QF_ABV_PINNED_CONCAT_UNSAT, &proof),
         "QF_ABV pinned-concat proof must be verified by Carcara without allowed trust"
     );
+}
+
+/// The problem scope a bit-vector identity refutation is checked against.
+///
+/// MEASURED, PRE-EXISTING, AND UNRELATED TO THE BIT-BLAST LOWERING: an
+/// authored `(assert (not (= (bvand x x) x)))` folds away entirely at
+/// elaboration, so `collect_surface_term_overrides` attaches the source
+/// spelling `"(bvand x x)"` to the term the fold produced — the plain variable
+/// `x`. `promote_bv_identity_collapse` then faithfully REBUILDS the raw
+/// `(bvand x x)` node, and printing it re-spells both of its `x` children
+/// through that override, so the exported `assume` reads
+/// `(not (= (bvand (bvand x x) (bvand x x)) (bvand x x)))`. Carcara rejects
+/// that against the source file — on trunk too, where the lemma is a `hole`:
+/// the whole document was already `invalid` for this reason before any
+/// bit-blasting was wired.
+///
+/// Replaying AY's own printed assumptions as the problem scope isolates the
+/// claim under test (is the DERIVATION externally re-derivable?) from that
+/// separate printer defect. It cannot hide anything: every non-`assume` step
+/// still has to check, and the assumptions are taken verbatim from the proof
+/// AY published. This mirrors `QF_LIA_MOD_ASSUMING_CARCARA_SCOPE` and
+/// `QF_DT_FINITE_ENUM_PIGEONHOLE_CARCARA_SCOPE` above. When the override
+/// defect is fixed this scope becomes byte-identical to the source problem and
+/// the test keeps passing unchanged.
+fn published_assumption_scope(declarations: &str, proof: &str) -> String {
+    let assertions =
+        extract_assume_terms(proof)
+            .into_iter()
+            .fold(String::new(), |mut assertions, term| {
+                writeln!(assertions, "(assert {term})").expect("writing to a String cannot fail");
+                assertions
+            });
+    format!("(set-logic QF_BV)\n{declarations}{assertions}(check-sat)\n")
+}
+
+/// AY has ONE coarse `bv_bitblast` theory-lemma kind where Carcara has a
+/// fine-grained `bitblast_*` suite; the two are not interchangeable, because
+/// every Carcara `bitblast_*` rule concludes `(= <word-level term> (@bbterm
+/// ...))` while an AY BV lemma is a word-level tautology. The bit-wise
+/// idempotency identity IS exactly reconstructible from that suite, so it must
+/// export as a real per-operator derivation rather than the honest `hole` it
+/// used to print.
+#[test]
+#[timeout(120_000)]
+fn test_carcara_trust_free_qf_bv_idempotent_gate_bitblast() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    for (label, operator, blast_rule, simplify_rule) in [
+        (
+            "trust_free_qf_bv_bvand_idempotent",
+            "bvand",
+            ":rule bitblast_and",
+            ":rule and_simplify",
+        ),
+        (
+            "trust_free_qf_bv_bvor_idempotent",
+            "bvor",
+            ":rule bitblast_or",
+            ":rule or_simplify",
+        ),
+    ] {
+        let problem = format!(
+            "(set-logic QF_BV)\n\
+             (declare-const x (_ BitVec 8))\n\
+             (assert (not (= ({operator} x x) x)))\n\
+             (check-sat)\n"
+        );
+        let proof = solve_unsat_and_get_proof(&problem, label);
+        assert!(
+            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+            "{label}: bit-blast identity proof must not contain unchecked rules:\n{proof}"
+        );
+        assert!(
+            !proof.contains(":rule bv_bitblast"),
+            "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+        );
+        for expected in [blast_rule, ":rule bitblast_var", simplify_rule] {
+            assert!(
+                proof.contains(expected),
+                "{label}: identity must be derived through Carcara's per-operator \
+                 bit-blasting, missing {expected}:\n{proof}"
+            );
+        }
+        let scope = published_assumption_scope("(declare-const x (_ BitVec 8))\n", &proof);
+        assert!(
+            run_carcara_trust_free(&carcara, label, &scope, &proof),
+            "{label}: per-operator bit-blast derivation must be verified by Carcara \
+             without allowed trust"
+        );
+    }
+}
+
+/// The NESTED per-operator case. A Carcara `bitblast_*` rule relates exactly
+/// ONE word-level operator to a `@bbterm`, so `(bvnot (bvnot x)) = x` has to
+/// be blasted bottom-up: `bitblast_not`, `cong`, `bitblast_not` again.
+#[test]
+#[timeout(120_000)]
+fn test_carcara_trust_free_qf_bv_double_negation_bitblast() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "trust_free_qf_bv_double_negation";
+    let problem = "(set-logic QF_BV)\n\
+                   (declare-const x (_ BitVec 8))\n\
+                   (assert (not (= (bvnot (bvnot x)) x)))\n\
+                   (check-sat)\n";
+    let proof = solve_unsat_and_get_proof(problem, label);
+    assert!(
+        !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+        "{label}: double-negation proof must not contain unchecked rules:\n{proof}"
+    );
+    assert!(
+        !proof.contains(":rule bv_bitblast"),
+        "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+    );
+    for expected in [
+        ":rule bitblast_not",
+        ":rule bitblast_var",
+        ":rule not_simplify",
+    ] {
+        assert!(
+            proof.contains(expected),
+            "{label}: missing {expected} in the nested bit-blast derivation:\n{proof}"
+        );
+    }
+    let scope = published_assumption_scope("(declare-const x (_ BitVec 8))\n", &proof);
+    assert!(
+        run_carcara_trust_free(&carcara, label, &scope, &proof),
+        "{label}: nested bit-blast derivation must be verified by Carcara without \
+         allowed trust"
+    );
+}
+
+/// NEGATIVE regression for the per-operator bit-blast lowering.
+///
+/// `(bvxor x x) = #x00` is a bit-vector identity AY certifies natively and
+/// Carcara CAN bit-blast the operator (`bitblast_xor`), but the bit-level
+/// residue is `(xor p p) = false` and no rule in the pinned build discharges
+/// that in one step (`bool_simplify`, `evaluate`, `aci_simp`, `equiv_simplify`
+/// and `not_simplify` were all measured to leave the term unchanged). So the
+/// lowering MUST decline: the step stays an honest `hole` and the document
+/// stays structurally checkable, rather than becoming `invalid` under a rule
+/// name whose inference this is not.
+#[test]
+#[timeout(120_000)]
+fn test_carcara_bvxor_self_cancellation_remains_an_honest_hole() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "bvxor_self_cancellation_honest_hole";
+    let problem = "(set-logic QF_BV)\n\
+                   (declare-const x (_ BitVec 8))\n\
+                   (assert (not (= (bvxor x x) #x00)))\n\
+                   (check-sat)\n";
+    let proof = solve_unsat_and_get_proof(problem, label);
+    assert!(
+        !proof.contains(":rule bitblast_"),
+        "{label}: the per-operator lowering must not fire on an identity whose \
+         bit-level residue Carcara cannot discharge:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule hole"),
+        "{label}: the uncovered identity must stay an honest hole:\n{proof}"
+    );
+    let scope = published_assumption_scope("(declare-const x (_ BitVec 8))\n", &proof);
+    assert!(
+        run_carcara(&carcara, label, &scope, &proof),
+        "{label}: an honest hole must leave the rest of the document checkable, \
+         never make it invalid"
+    );
+}
+
+/// The endpoint lane pins one opaque term to two different bit-vector
+/// CONSTANTS and closes it with a `bv_bitblast` unit lemma. Carcara cannot
+/// re-derive AY's bit-blasting, but `(= #x05 #x06)` is a GROUND term its own
+/// `evaluate` reduces to `false`, so this lemma exports checked instead of as
+/// a hole. Both arms of the lane are covered: the QF_ABV array read and the
+/// QF_BV term (`bvudiv`) that is deliberately held opaque.
+#[test]
+#[timeout(120_000)]
+fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let cases = [
+        (
+            "trust_free_qf_abv_shared_endpoint_constant_mismatch",
+            "(set-logic QF_ABV)\n\
+             (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\n\
+             (declare-const i (_ BitVec 8))\n\
+             (assert (= (select a i) #x05))\n\
+             (assert (= (select a i) #x06))\n\
+             (check-sat)\n",
+        ),
+        (
+            "trust_free_qf_bv_opaque_udiv_endpoint_mismatch",
+            "(set-logic QF_BV)\n\
+             (declare-const x (_ BitVec 8))\n\
+             (assert (= (bvudiv x #x03) #x02))\n\
+             (assert (= (bvudiv x #x03) #x03))\n\
+             (check-sat)\n",
+        ),
+    ];
+    for (label, problem) in cases {
+        let proof = solve_unsat_and_get_proof(problem, label);
+        assert!(
+            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+            "{label}: constant-endpoint proof must not contain unchecked rules:\n{proof}"
+        );
+        assert!(
+            !proof.contains(":rule bv_bitblast"),
+            "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+        );
+        assert!(
+            proof.contains(":rule evaluate"),
+            "{label}: the constant mismatch must be certified by evaluate:\n{proof}"
+        );
+        assert!(
+            run_carcara_trust_free(&carcara, label, problem, &proof),
+            "{label}: constant-endpoint proof must be verified by Carcara without \
+             allowed trust"
+        );
+    }
 }
 
 /// The `ay z3-audit` canonical QF_UF transitivity fixture must export a
@@ -1644,4 +2008,91 @@ fn test_carcara_external_normalized_assume_deduplicated_conjunct() {
         return;
     };
     verify_alethe_with_carcara(&carcara, "normalized_assume_dedup", problem, proof.as_str());
+}
+
+// ============================================================================
+// Ground bitvector disequality: `hole` -> checked `evaluate` derivation
+// ============================================================================
+
+/// Real benchmark rows whose ONLY unchecked step was the ground bitvector
+/// disequality `(cl (not (= #b… #b…)))`.
+///
+/// AY closes every "two constants forced equal" refutation by chaining the
+/// problem's own equalities with `eq_transitive` down to `(cl (= C1 C2))` and
+/// resolving against its negation. The negation is a closed fact, but no
+/// carcara rule CONCLUDES `(cl (not (= t u)))` — `evaluate` proves only a
+/// POSITIVE unit `(= term value)` — so it used to print as `hole` and made
+/// otherwise-complete documents `holey`. It is now spelled out as
+/// `evaluate` + `equiv1` + `false` + `resolution`, all of which this carcara
+/// build implements, and these documents check as `valid`.
+const GROUND_BV_DISEQUALITY_BENCHMARKS: &[&str] = &[
+    "benchmarks/smt/QF_ABV/csplit_repro_unsat.smt2",
+    "benchmarks/smt/QF_ABV/csplit_repro_store_chain_unsat.smt2",
+    "benchmarks/smt/QF_BV/puzzle_03.smt2",
+    "benchmarks/smt/QF_BV/puzzle_12.smt2",
+];
+
+#[test]
+#[cfg_attr(debug_assertions, timeout(600_000))]
+#[cfg_attr(not(debug_assertions), timeout(240_000))]
+fn test_carcara_ground_bv_disequality_is_checked_not_holey() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    for relative_path in GROUND_BV_DISEQUALITY_BENCHMARKS {
+        let label = relative_path
+            .rsplit('/')
+            .next()
+            .expect("benchmark file name");
+        let problem: String = benchmark_content(relative_path)
+            .lines()
+            .filter(|line| line.trim() != "(exit)")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let proof = solve_unsat_and_get_proof(&problem, label);
+        assert!(
+            !proof.contains(":rule hole"),
+            "{label}: the ground bitvector disequality must not print as a hole:\n{proof}"
+        );
+        assert!(
+            proof.contains(":rule evaluate"),
+            "{label}: expected the `evaluate` lowering in the proof:\n{proof}"
+        );
+        assert!(
+            run_carcara_trust_free(&carcara, label, &problem, &proof),
+            "{label}: proof must be externally VALID, not merely holey"
+        );
+    }
+}
+
+/// The lowering is shape-gated, not blanket: an `evaluate` step may only ever
+/// carry a closed constant equality, and a document that still needs a genuine
+/// theory inference must keep its honest `hole` and report `holey` — never
+/// `invalid`, and never a rule name AY cannot back.
+#[test]
+#[cfg_attr(debug_assertions, timeout(300_000))]
+#[cfg_attr(not(debug_assertions), timeout(120_000))]
+fn test_carcara_symbolic_bv_conflict_keeps_its_honest_hole() {
+    let problem = r#"
+(set-logic QF_BV)
+(declare-fun v0 () (_ BitVec 8))
+(declare-fun v1 () (_ BitVec 8))
+(assert (= (bvand v0 v1) #x0f))
+(assert (= (bvor v0 v1) #x00))
+(check-sat)
+"#;
+    let proof = solve_unsat_and_get_proof(problem, "symbolic_bv_conflict");
+    for line in proof.lines() {
+        assert!(
+            !line.contains(":rule evaluate") || line.contains("(cl (= (= #"),
+            "an `evaluate` step was emitted for a non-ground clause: {line}"
+        );
+    }
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    assert!(
+        run_carcara(&carcara, "symbolic_bv_conflict", problem, &proof),
+        "a proof with honest holes must still be structurally accepted"
+    );
 }

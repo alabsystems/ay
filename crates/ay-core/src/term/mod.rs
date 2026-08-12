@@ -30,6 +30,7 @@ mod cardinality;
 mod compact;
 mod expand_select_store;
 mod ite_lifting;
+mod memory;
 mod preprocess;
 mod subst;
 mod value;
@@ -1001,88 +1002,6 @@ impl TermStore {
     pub fn reset_process_memory_limit_for_testing() {
         ay_sys::force_process_memory_exceeded_for_testing(false);
         ay_sys::set_process_memory_limit(0);
-    }
-
-    /// Per-instance term memory usage in bytes (approximate).
-    ///
-    /// Unlike `global_term_bytes()`, this counts only terms interned by THIS
-    /// `TermStore` instance. Use this for per-solver memory budgets that must
-    /// not interfere with other concurrent solver instances (#6563).
-    pub fn instance_term_bytes(&self) -> usize {
-        self.instance_term_bytes
-    }
-
-    /// Accurate memory footprint of THIS `TermStore` instance (bytes).
-    ///
-    /// Unlike `instance_term_bytes()`, which incrementally tracks per-element
-    /// allocations and can undercount by up to 2x (missing Vec spare capacity,
-    /// HashMap table overhead, and BTreeMap node overhead), this method
-    /// queries actual container capacities to compute a more precise estimate.
-    ///
-    /// Components:
-    /// 1. `terms` Vec: `capacity * size_of::<TermEntry>()` (includes spare slots)
-    /// 2. `hash_cons` map table: `allocation_size()` on hashbrown, or estimated
-    ///    node overhead on BTreeMap (Kani mode)
-    /// 3. `hash_cons` bucket Vecs: sum of `capacity * size_of::<TermId>()`
-    /// 4. `names` map table: `allocation_size()` or BTreeMap node estimate
-    /// 5. `heap_data_bytes`: accumulated TermData heap (String, Vec, BigInt)
-    ///    plus names HashMap string key heap — tracked incrementally since
-    ///    querying individual term heap sizes would require a full scan.
-    ///
-    /// This is O(hash_cons.len()) due to the bucket capacity scan, so use it
-    /// for periodic budget checks (e.g., once per conflict) rather than on
-    /// every propagation.
-    pub fn true_memory_bytes(&self) -> usize {
-        use std::mem::size_of;
-
-        // 1. terms Vec heap allocation
-        let terms_heap = self.terms.capacity() * size_of::<TermEntry>();
-
-        // 2. hash_cons map table overhead
-        #[cfg(not(kani))]
-        let hash_cons_table = self.hash_cons.allocation_size();
-        #[cfg(kani)]
-        let hash_cons_table = {
-            // BTreeMap: estimate ~64 bytes per node (key + value + 2 pointers + metadata)
-            self.hash_cons.len() * 64
-        };
-
-        // 3. hash_cons bucket Vec heap: each bucket is a Vec<TermId>
-        let hash_cons_buckets = self.bucket_capacity_bytes;
-
-        // 4. names map table overhead
-        #[cfg(not(kani))]
-        let names_table = self.names.allocation_size();
-        #[cfg(kani)]
-        let names_table = self.names.len() * 64;
-
-        // 5. heap_data_bytes: accumulated TermData heap + names key strings
-        terms_heap + hash_cons_table + hash_cons_buckets + names_table + self.heap_data_bytes
-    }
-
-    /// Check if THIS instance has exceeded a given memory budget.
-    ///
-    /// Uses a cached `true_memory_bytes()` for accurate capacity-based
-    /// accounting (#8600). The cache is refreshed when `instance_term_bytes`
-    /// grows by more than `TRUE_MEMORY_RECOMPUTE_DELTA` (64 KiB) since the
-    /// last computation, balancing accuracy against the O(hash_cons.len())
-    /// scan cost in the DPLL(T) hot loop.
-    ///
-    /// The previous implementation used `instance_term_bytes` directly,
-    /// which undercounted by missing Vec spare capacity and HashMap table
-    /// overhead, allowing actual RSS to reach 2-3x the reported value
-    /// before the limit triggered.
-    pub fn instance_memory_exceeded(&self, limit: usize) -> bool {
-        let cached_at = self.true_memory_cache_at.get();
-        let delta = self.instance_term_bytes.saturating_sub(cached_at);
-        if delta >= TRUE_MEMORY_RECOMPUTE_DELTA || self.true_memory_cache.get() == 0 {
-            let fresh = self.true_memory_bytes();
-            self.true_memory_cache.set(fresh);
-            self.true_memory_cache_at.set(self.instance_term_bytes);
-            fresh > limit
-        } else {
-            self.true_memory_cache.get() > limit
-        }
     }
 
     /// Get the TermId for true

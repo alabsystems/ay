@@ -5,32 +5,17 @@
 //! Certified re-derivation of EUF congruence/substitution-chain trust
 //! lemmas (#C2, the SEQ/NEQ SMT-COMP finite-model families).
 //!
-//! The lazy EUF engine exports its theory lemmas as `:rule trust` leaves of
-//! two shapes:
-//!
-//! - **bare**: `(cl E ¬e1 .. ¬ek [extras])` — the hypothesis equalities
-//!   `e1..ek` entail the conclusion `E` by congruence closure, where `E` is
-//!   either a positive equality or a `¬P(a..) ∨ P(b..)` predicate-transfer
-//!   pair; `extras` are conflict-clause literals the entailment never used.
-//! - **or-wrapped**: `(cl (or E ¬e1 .. ¬ek [extras]))` — the same lemma as a
-//!   single or-term unit (also produced as a mid-proof `assume` of a
-//!   preprocessor-derived tautology).
+//! Lazy EUF trust leaves are either bare clauses
+//! `(cl E ¬e1 .. ¬ek [extras])` or the same clause wrapped as one `or` unit.
+//! The equalities entail positive equality or predicate-transfer conclusion
+//! `E`; `extras` are conflict literals that the entailment did not use.
 //!
 //! The planner runs a small proof-forest congruence closure (union-find with
 //! explanation, Nieuwenhuis–Oliveras style) over the hypothesis equalities,
-//! finds the entailed conclusion, and precomputes a complete derivation
-//! recipe out of the Alethe EUF toolkit:
-//!
-//! - `eq_congruent` — per-argument congruence tautologies (trivial `a = a`
-//!   argument pairs discharged by `eq_reflexive`),
-//! - `eq_transitive` — explanation-path chains (simple paths, so the strict
-//!   checker's no-redundant-premise rule holds; ≥ 2 edges, carcara's
-//!   minimum),
-//! - `eq_congruent_pred` — the predicate-transfer conclusion,
-//! - `resolution`/`contraction` to compose them, and
-//! - `weakening` to append the unused extras of a bare lemma so the
-//!   replacement step carries EXACTLY the original clause (as a multiset —
-//!   both checkers treat resolution clauses order-insensitively).
+//! then emits `eq_congruent`/`eq_reflexive`, simple `eq_transitive` paths,
+//! `eq_congruent_pred`, resolution/contraction, and explicit weakening for
+//! unused extras. The replacement reproduces the original clause as a
+//! multiset, matching both checkers' resolution semantics.
 //!
 //! Every emitted step is one of those independently re-validated rules;
 //! planning is fail-closed (any unrecognized literal, non-entailed
@@ -751,14 +736,25 @@ impl Executor {
         });
         rebuilt.named_steps = remapped_named;
 
+        // Array-extensionality claims are conservative-extension lemmas, not
+        // EUF tautologies. Authenticate them only on the validation clone so
+        // this local gate can see the complete derivation without mutating the
+        // real proof before later array surgery has finished. The final array
+        // pass installs the same provenance-checked promotion for real.
+        let mut validation = rebuilt.clone();
+        self.promote_array_extensionality_axioms(&mut validation);
         if self
-            .check_proof_strict_derivation_with_datatypes(&rebuilt)
+            .check_proof_strict_derivation_with_datatypes(&validation)
             .is_ok()
         {
             *proof = rebuilt;
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proof_euf_lemma_ext_tests.rs"]
+mod ext_tests;
 
 #[cfg(test)]
 mod tests {

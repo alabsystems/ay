@@ -2423,6 +2423,84 @@ fn clause_trace_late_theory_axiom_does_not_reuse_derived_id() {
     );
 }
 
+/// Follow-up to b93692341: the late-original allocator jumps
+/// `next_original_clause_id` past live derived IDs, so a derived ID can sit
+/// inside `1..=num_originals`. The streaming UNSAT core must classify by the
+/// per-ID original marker, not by range membership — a derived clause used as
+/// a level-0 reason must NOT appear in the reported original core.
+#[test]
+fn streaming_core_excludes_derived_id_below_late_original() {
+    let u = Literal::positive(Variable(0));
+    let w = Literal::positive(Variable(1));
+    let d = Literal::positive(Variable(2));
+    let e = Literal::positive(Variable(3));
+
+    let mut solver = Solver::new(4);
+    solver.add_clause(vec![u]); // original ID 1
+    solver.add_clause(vec![u.negated(), w]); // original ID 2
+    solver.add_clause(vec![w.negated(), d]); // original ID 3
+
+    // Derived clause (resolvent of IDs 2 and 3) mints a derived ID from
+    // next_clause_id. During level-0 propagation of u it fires in u's watch
+    // pass and becomes d's reason, so it enters the streaming-core walk.
+    let learned = solver.add_learned_clause(vec![u.negated(), d], 1, &[2, 3]);
+    let derived_id = solver.clause_id(learned);
+    assert_eq!(derived_id, 4, "derived ID must follow the three originals");
+
+    // Late originals: the allocator jumps their IDs past the derived ID,
+    // leaving the derived ID inside the 1..=num_originals range.
+    let t1 = solver
+        .add_theory_lemma(vec![d.negated(), e])
+        .expect("non-unit theory axiom");
+    let t2 = solver
+        .add_theory_lemma(vec![d.negated(), e.negated()])
+        .expect("non-unit theory axiom");
+    let late1 = solver.clause_id(t1);
+    let late2 = solver.clause_id(t2);
+    assert!(
+        derived_id < late1 && late1 < late2,
+        "late originals must take fresh IDs past derived ID {derived_id}, got {late1}/{late2}"
+    );
+
+    // The per-ID classification must already tell the interleaved derived ID
+    // apart from the originals surrounding it.
+    for id in [1, 2, 3, late1, late2] {
+        assert!(
+            solver.is_original_clause_id(id),
+            "ID {id} was issued to an original clause"
+        );
+    }
+    assert!(
+        !solver.is_original_clause_id(derived_id),
+        "derived ID {derived_id} must not be classified as original"
+    );
+
+    // u forces w and d at level 0, then the two late originals force e and
+    // conflict: UNSAT with the derived clause as a level-0 reason.
+    match solver.solve().into_inner() {
+        SatResult::Unsat(cert) => {
+            assert!(
+                cert.has_streaming_core(),
+                "level-0 UNSAT with originals must produce a streaming core"
+            );
+            let core = cert.minimal_core();
+            assert!(!core.is_empty(), "streaming core must be non-empty");
+            assert!(
+                !core.contains(&derived_id),
+                "derived clause ID {derived_id} classified as original core member: {core:?}"
+            );
+            let originals = [1, 2, 3, late1, late2];
+            for &id in &core {
+                assert!(
+                    originals.contains(&id),
+                    "core ID {id} is not an original clause ID: {core:?}"
+                );
+            }
+        }
+        other => panic!("expected UNSAT, got sat={:?}", other.is_sat()),
+    }
+}
+
 #[test]
 fn test_add_clause_reusing_buffer() {
     use crate::proof::ProofOutput;

@@ -767,7 +767,7 @@ impl Solver {
                 } else {
                     0
                 };
-                if cid > 0 && cid <= num_originals {
+                if cid > 0 && cid <= num_originals && self.is_original_clause_id(cid) {
                     ids_to_mark.push(cid);
                     // Only need first falsified original clause.
                     break;
@@ -794,7 +794,10 @@ impl Solver {
                 } else {
                     0
                 };
-                if reason_id > 0 && reason_id <= num_originals {
+                if reason_id > 0
+                    && reason_id <= num_originals
+                    && self.is_original_clause_id(reason_id)
+                {
                     ids_to_mark.push(reason_id);
                 }
             }
@@ -802,14 +805,14 @@ impl Solver {
             // Check signed unit proof IDs (for clauses whose arena reference was cleared).
             let lit = self.trail[i];
             if let Some(pid) = self.visible_unit_proof_id_for_lit(lit) {
-                if pid > 0 && pid <= num_originals {
+                if pid > 0 && pid <= num_originals && self.is_original_clause_id(pid) {
                     ids_to_mark.push(pid);
                 }
             }
 
             // Check signed level0_proof_id fallback.
             if let Some(pid) = self.level0_var_proof_id_for_lit(lit) {
-                if pid > 0 && pid <= num_originals {
+                if pid > 0 && pid <= num_originals && self.is_original_clause_id(pid) {
                     ids_to_mark.push(pid);
                 }
             }

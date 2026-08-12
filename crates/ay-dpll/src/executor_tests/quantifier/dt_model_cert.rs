@@ -219,7 +219,7 @@ fn dt_cert_subprocess_worker() {
         .cloned()
         .unwrap_or_default()
         .replace('\n', "\\n");
-    println!("{}{}", SUBPROCESS_RESULT_PREFIX, result);
+    println!("{SUBPROCESS_RESULT_PREFIX}{result}");
 }
 
 #[test]

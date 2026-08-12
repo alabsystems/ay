@@ -283,6 +283,21 @@ pub(crate) fn validate_euf_congruent(
     Ok(())
 }
 
+/// Recognize the exact EUF congruence clause shape `validate_euf_congruent`
+/// accepts (#trust->0 C1.ii): `(not (= a1 b1)) .. (not (= an bn))
+/// (= (f a1..an) (f b1..bn))` with one premise per argument position, also in
+/// the packed single-literal `(or …)` form.
+///
+/// Recognition IS the strict validator run on the clause — classifier and
+/// checker cannot drift, and a clause is only classified `EufCongruent` when
+/// strict checking is guaranteed to accept it (fail-closed: any shape the
+/// validator rejects, e.g. Ackermann instances whose identical argument pairs
+/// were dropped at emission, stays unrecognized).
+#[must_use]
+pub fn recognize_euf_congruent(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_euf_congruent(terms, ProofId(0), clause).is_ok()
+}
+
 /// Validate an EUF congruent predicate lemma.
 ///
 /// Clause structure: `(not (= a1 b1)) ... (not (= an bn)) (not (p a1..an)) (p b1..bn)`

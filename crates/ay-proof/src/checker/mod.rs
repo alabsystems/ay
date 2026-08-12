@@ -5,8 +5,9 @@
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod array_axiom;
 pub(crate) use array_axiom::{
-    array_row_chain_printer_terms, array_select_store_printer_terms, ArrayRowChainPrinterTerms,
-    ArraySelectStorePrinterTerms, RowChainEnd, RowChainPath,
+    array_row_chain_printer_terms, array_select_store_printer_terms,
+    array_store_permutation_printer_terms, ArrayRowChainPrinterTerms, ArraySelectStorePrinterTerms,
+    RowChainEnd, RowChainPath,
 };
 pub use array_axiom::{
     recognize_array_extensionality, recognize_array_extensionality_chain,
@@ -18,15 +19,18 @@ mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
 mod bv_lia_query;
-pub(crate) use bv_bitblast::validate_proof_producing_bv_budget;
+pub(crate) use bv_bitblast::validate_expensive_bv_budget;
 pub use bv_bitblast::{
     authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
     recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
     AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
-    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
+    MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
 pub use bv_lia_query::{
     authenticate_bv_lia_unsat_query, AuthenticatedBvLiaUnsatQuery, BvLiaUnsatAuthenticationError,
+    MAX_BV_LIA_QUERY_ROOTS, MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
+    MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA,
 };
 mod clausification;
 mod datatype_axiom;
@@ -35,9 +39,11 @@ pub use datatype_axiom::{
     recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
 };
 mod euf;
+pub use euf::recognize_euf_congruent;
 mod euf_step_rules;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
+mod nia_linear_ideal;
 mod nra_interval;
 mod nra_poly;
 mod nra_univariate;
@@ -337,7 +343,7 @@ pub fn check_proof_collecting_trust_with_context(
         return Err(ProofCheckError::EmptyProof);
     }
 
-    validate_proof_producing_bv_budget(proof, terms)?;
+    validate_expensive_bv_budget(proof, terms)?;
 
     if let Some(assertions) = problem_assertions {
         validate_problem_assumptions(proof, terms, assertions)?;
@@ -672,6 +678,15 @@ fn validate_theory_lemma(
                     }
                 })?;
             }
+            TheoryLemmaKind::BvLiaTautology => {
+                bv_lia_query::validate_bv_lia_tautology(
+                    terms,
+                    step_id,
+                    clause,
+                    farkas.is_some(),
+                    lia_ann.is_some(),
+                )?;
+            }
             // BV bit-blast lemmas: bounded semantic validation (#8820).
             //
             // The previous checker accepted any non-empty clause, which let a
@@ -796,6 +811,20 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::SubsetElementInstance => {
                 subset_axiom::validate_subset_element_instance(terms, step_id, clause)?;
+            }
+            // Transitivity of one collection subset predicate: the chain is
+            // re-derived from the clause, so a triple that does not connect is
+            // refused. See subset_axiom.rs.
+            TheoryLemmaKind::SubsetTransitive => {
+                subset_axiom::validate_subset_transitive(terms, step_id, clause)?;
+            }
+            // One subset atom DECIDED EXACTLY on ground carriers, under the
+            // clause's own ground bindings. This is a full semantic decision
+            // rather than a schema check: an unrecognized carrier, an unbound
+            // operand the decision needs, or a polarity the pointwise decision
+            // contradicts all fail closed. See subset_axiom.rs.
+            TheoryLemmaKind::SubsetGroundEval => {
+                subset_axiom::validate_subset_ground_eval(terms, step_id, clause)?;
             }
             // Skolemized extensionality: NOT a tautology, so shape alone can
             // never license it. Accepted only against the whole-proof
@@ -987,6 +1016,22 @@ fn validate_theory_lemma(
                 }
             },
             other => {
+                // Before falling back to deferral/rejection, try to VALIDATE the
+                // lemma outright: an arithmetic conflict whose refutation is a
+                // linear combination of equalities over the monomial basis is
+                // fully checkable here, and that is the dominant `Generic` shape
+                // (loop-invariant consecution, where the nonlinear monomials
+                // cancel). This only ever ACCEPTS what the checker reconstructs
+                // itself — the lemma carries no payload to forge — and any other
+                // outcome falls through to the pre-existing fail-closed handling
+                // below, so nothing that used to be rejected becomes trusted.
+                if other.is_trust()
+                    && nia_linear_ideal::validate_linear_ideal_refutation(terms, step_id, clause)
+                        .is_ok()
+                {
+                    derived_clauses.push(Some(clause.to_vec()));
+                    return Ok(());
+                }
                 // A trust-kind (`Generic`) theory lemma has no dedicated strict
                 // validator (e.g. an integer-arithmetic lemma over an `ite` whose
                 // proof is not Farkas-pure, so `validate_lia_generic` never sees
@@ -1298,3 +1343,14 @@ fn premise_clause(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// DRIFT-PROOF name-authority lint: every operator spelling a strict validator
+// keys on must be one `ay-frontend` guarantees denotes the native theory
+// operator. See the module docs for the bug class it kills.
+#[cfg(test)]
+#[path = "name_authority_tests.rs"]
+mod name_authority_tests;
+
+#[cfg(test)]
+#[path = "bv_expensive_budget_tests.rs"]
+mod expensive_bv_budget_tests;

@@ -18,7 +18,9 @@
 //! Resource exhaustion, allocation failure, interrupt, timeout, or failure to
 //! reach a fixpoint all fail open to the ordinary string pipeline.  Proof mode
 //! also bypasses the pass: until these deductions have proof reconstruction,
-//! they must not originate an uncertified `Unsat` result.
+//! they must not originate an uncertified `Unsat` result.  Competition
+//! shedding bypasses it too (#proof-capability B2): the pass has never run
+//! under public publication and stays dormant until individually vetted.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol, TermData, TermId};
@@ -463,6 +465,18 @@ impl Executor {
     ) -> Result<Option<SolveResult>> {
         // Re-entrant witness solves must run the ordinary pipeline.  Proof and
         // self-check modes also bypass this non-proof-producing refutation.
+        //
+        // #proof-capability B2 (dormant-lane audit): the proof bail below used
+        // to read `self.produce_proofs_enabled()`, which is always true on the
+        // certified public path — this refutation lane is DEAD there today.
+        // Competition shedding disarms the tracker and would have activated
+        // it for the first time under public publication, with no certificate
+        // net behind the `Unsat` it originates. `!unvetted_no_proof_lane_allowed()`
+        // keeps it exactly as dead under shedding and is byte-identical to
+        // `produce_proofs_enabled()` in every non-competition configuration.
+        // The strict-proofs and self-check bails are retained verbatim even
+        // though shedding-precedence also covers them: they must keep bailing
+        // when competition mode is off and the tracker is off (nested solves).
         let strict_proofs_requested = matches!(
             self.ctx.get_option("check-proofs-strict"),
             Some(OptionValue::Bool(true))
@@ -471,7 +485,7 @@ impl Executor {
             return Ok(Some(SolveResult::Unknown));
         }
         if self.pivot_enum_depth != 0
-            || self.produce_proofs_enabled()
+            || !self.unvetted_no_proof_lane_allowed()
             || strict_proofs_requested
             || self.self_check()
         {

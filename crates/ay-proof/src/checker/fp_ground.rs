@@ -947,7 +947,7 @@ fn collect_bindings(terms: &TermStore, clause: &[TermId]) -> HashMap<TermId, Ter
         let TermData::App(symbol, args) = terms.get(*inner) else {
             continue;
         };
-        if symbol.name() != "=" || args.len() != 2 {
+        if !matches!(symbol, Symbol::Named(name) if name == "=") || args.len() != 2 {
             continue;
         }
         let (left, right) = (args[0], args[1]);
@@ -1273,44 +1273,57 @@ impl<'a> Evaluator<'a> {
         local: &mut HashMap<TermId, Option<Val>>,
         depth: usize,
     ) -> Option<Val> {
-        let name = symbol.name();
         let next = depth + 1;
+
+        // ---- FP nullary literals `(_ +zero eb sb)` etc. ----
+        //
+        // The INDEXED form only, with indices that agree with the recorded FP
+        // sort. `ay-frontend` classifies these five names `IndexedOnly`: the
+        // `(_ …)` form is theory syntax no declaration can produce, but the
+        // BARE `Symbol::Named("NaN")` spelling remains an ordinary declarable
+        // identity, so keying on `sym.name()` alone would give IEEE semantics
+        // to whatever the problem declared. Re-deriving the indexed shape here
+        // keeps the check local instead of resting on the frontend minting
+        // declared nullary symbols as `TermData::Var`.
+        if let Symbol::Indexed(literal, indices) = symbol {
+            if args.is_empty()
+                && matches!(literal.as_str(), "+zero" | "-zero" | "+oo" | "-oo" | "NaN")
+            {
+                let Sort::FloatingPoint(eb, sb) = self.terms.sort(term) else {
+                    return None;
+                };
+                let (eb, sb) = (*eb, *sb);
+                if indices.as_slice() != [eb, sb] {
+                    return None;
+                }
+                return Some(Val::Fp(match literal.as_str() {
+                    "+zero" => Fp::zero(false, eb, sb)?,
+                    "-zero" => Fp::zero(true, eb, sb)?,
+                    "+oo" => Fp::infinity(false, eb, sb)?,
+                    "-oo" => Fp::infinity(true, eb, sb)?,
+                    _ => Fp::nan(eb, sb)?,
+                }));
+            }
+            // ---- indexed conversions ----
+            if matches!(literal.as_str(), "to_fp" | "to_fp_unsigned") {
+                return self.eval_to_fp(term, literal, indices, args, assignment, local, next);
+            }
+
+            // No other indexed identifier has semantics in this evaluator. In
+            // particular, `(_ fp.add ...)` and `(_ RNE ...)` are not aliases
+            // for their named builtins.
+            return None;
+        }
+
+        let Symbol::Named(name) = symbol else {
+            return None;
+        };
+        let name = name.as_str();
 
         // ---- rounding-mode literals ----
         if args.is_empty() {
             if let Some(rounding_mode) = Rm::from_name(name) {
                 return Some(Val::Rm(rounding_mode));
-            }
-        }
-
-        // ---- FP nullary literals `(_ +zero eb sb)` etc. ----
-        if args.is_empty() && matches!(name, "+zero" | "-zero" | "+oo" | "-oo" | "NaN") {
-            let Sort::FloatingPoint(eb, sb) = self.terms.sort(term) else {
-                return None;
-            };
-            let (eb, sb) = (*eb, *sb);
-            return Some(Val::Fp(match name {
-                "+zero" => Fp::zero(false, eb, sb)?,
-                "-zero" => Fp::zero(true, eb, sb)?,
-                "+oo" => Fp::infinity(false, eb, sb)?,
-                "-oo" => Fp::infinity(true, eb, sb)?,
-                _ => Fp::nan(eb, sb)?,
-            }));
-        }
-
-        // ---- indexed conversions ----
-        if let Symbol::Indexed(indexed_name, indices) = symbol {
-            if matches!(indexed_name.as_str(), "to_fp" | "to_fp_unsigned") {
-                let indices = indices.clone();
-                return self.eval_to_fp(
-                    term,
-                    indexed_name,
-                    &indices,
-                    args,
-                    assignment,
-                    local,
-                    next,
-                );
             }
         }
 

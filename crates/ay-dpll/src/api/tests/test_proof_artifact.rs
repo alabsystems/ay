@@ -534,15 +534,72 @@ fn bundle_export_rechecks_datatype_array_extensionality() {
          introductions={introductions:#?}; assumes={assume_debug:#?}",
     );
 
+    assert!(matches!(
+        solver
+            .executor
+            .try_export_last_proof_alethe_for_problem_scope(),
+        Some(Err(
+            ay_proof::AlethePrintError::UnsupportedArrayExtensionality { .. }
+        ))
+    ));
+
+    let (strict_checks_before, strict_steps_before) =
+        solver.executor.strict_check_counters_for_test();
+    let proof_steps = proof.steps.len() as u64;
     let artifact = solver
         .export_last_unsat_artifact()
         .expect("artifact must be present after UNSAT");
+    assert_eq!(
+        solver.executor.strict_check_counters_for_test().0 - strict_checks_before,
+        1,
+        "artifact fallback must reuse its boundary strict verdict"
+    );
+    assert_eq!(
+        solver.executor.strict_check_counters_for_test().1 - strict_steps_before,
+        proof_steps,
+        "artifact fallback must walk the native proof exactly once"
+    );
+    assert_eq!(artifact.alethe.matches(":rule hole").count(), 1);
+    assert_eq!(
+        artifact
+            .alethe
+            .matches("(define-fun __ay_ext_diff!")
+            .count(),
+        1
+    );
+    assert!(
+        !artifact.alethe.contains(":rule arrays_ext")
+            && !artifact.alethe.contains(":rule extensionality")
+            && !artifact.alethe.contains(":rule array_ext_diff_intro"),
+        "{}",
+        artifact.alethe
+    );
+    let final_step = artifact
+        .alethe
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("(step "))
+        .expect("diagnostic must retain its closing proof step");
+    assert!(
+        final_step.contains("(cl)") && final_step.contains(":rule resolution"),
+        "final proof step is not the expected empty-clause resolution: {final_step}\n{}",
+        artifact.alethe,
+    );
     assert!(
         matches!(&artifact.strict_verdict, StrictProofVerdict::Verified(quality)
             if quality.is_complete()),
         "array-extensionality proof must be strict-verified: {:?}\n{}",
         artifact.strict_verdict,
         artifact.alethe,
+    );
+    assert_eq!(
+        artifact.quality.hole_count, 0,
+        "native proof quality must not inherit the presentation-only hole"
+    );
+    assert!(!artifact.restricted_rule_subset);
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::RestrictedRuleSubset),
+        Err(ProofAcceptanceError::NotRestrictedRuleSubset)
     );
 
     let bundle = solver
@@ -916,6 +973,75 @@ fn conjunctive_lia_unsat_proof_is_strict_verified() {
         "proof must have zero trust/hole steps: {} \n{}",
         artifact.quality,
         artifact.alethe,
+    );
+}
+
+/// TrustVC's open-spec u16 obligation pins a wide bitvector before using its
+/// mathematical `bv2nat` value.  The bounded semantic proof lane must propagate
+/// that exact source pin before sizing the finite domain, then publish an
+/// internally replayable (honestly holey on the bv2nat-incapable Alethe wire)
+/// certificate.  A satisfiable boundary near-miss must remain SAT.
+#[test]
+fn pinned_u16_bv2nat_refutation_is_native_strict_and_sat_near_miss_stays_sat() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver.set_produce_unsat_cores(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const result (_ BitVec 16))
+            (declare-const x (_ BitVec 16))
+            (assert (= x #x9c40))
+            (assert (= x result))
+            (assert (<= (* (bv2nat x) 2) 65535))
+            "#,
+        )
+        .expect("parse pinned u16 mathematical-arithmetic obligation");
+
+    assert!(solver.check_sat().is_unsat());
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("native strict bv2nat certificate must be present");
+    assert!(
+        matches!(&artifact.strict_verdict, StrictProofVerdict::Verified(quality) if quality.is_complete()),
+        "pinned bv2nat proof must pass native strict replay: {:?}\n{}",
+        artifact.strict_verdict,
+        artifact.alethe,
+    );
+    assert!(artifact.quality.is_complete(), "{}", artifact.quality);
+    assert!(
+        artifact.alethe.contains(":rule hole"),
+        "the unsupported external bv2nat rule must remain an honest hole: {}",
+        artifact.alethe,
+    );
+    assert!(!artifact.restricted_rule_subset);
+    let proof = solver
+        .last_proof()
+        .expect("UNSAT publishes its native proof");
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::BvLiaTautology,
+            ..
+        }
+    )));
+
+    #[allow(deprecated)]
+    let mut near_miss = Solver::new(Logic::All);
+    near_miss.set_produce_proofs(true);
+    near_miss
+        .parse_smtlib2(
+            r#"
+            (declare-const x (_ BitVec 16))
+            (assert (= x #x9c40))
+            (assert (<= (* (bv2nat x) 2) 80000))
+            "#,
+        )
+        .expect("parse satisfiable pinned u16 boundary");
+    assert!(
+        near_miss.check_sat().is_sat(),
+        "x=40000 witnesses the exact mathematical boundary"
     );
 }
 
@@ -3289,4 +3415,43 @@ fn qfs_regex_length_lower_bound_unsat_proof_is_strict_verified() {
         solver.unknown_reason(),
     );
     assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::RegexLengthLowerBound);
+}
+
+/// Best-effort proof collection is a diagnostic surface, not an authority
+/// demand. The mandatory UNSAT-certification funnel may publish this genuine
+/// nonlinear refutation while retaining the trust-bearing proof so consumers
+/// can verify that their own strict-trust policy still rejects that artifact.
+/// An explicit artifact request remains covered separately by the fail-closed
+/// proof-required tests above.
+#[test]
+fn best_effort_api_retains_trust_bearing_proof_without_overriding_certified_unsat() {
+    let mut solver = Solver::try_new(Logic::QfNia).expect("QF_NIA solver");
+    solver.set_best_effort_produce_proofs(1_000_000);
+
+    let x = solver.declare_const("best_effort_nia_x", Sort::Int);
+    let x_sq = solver.try_mul(x, x).expect("x * x");
+    let two = solver.int_const(2);
+    let eq = solver.try_eq(x_sq, two).expect("x * x = 2");
+    solver.assert_term(eq);
+
+    let verdict = solver.check_sat_with_details();
+    assert!(
+        verdict.result.result().is_unsat(),
+        "the independently certified nonlinear refutation must publish as UNSAT; got {:?}",
+        verdict.result.result()
+    );
+    let quality = solver
+        .last_proof_quality()
+        .expect("best-effort collection must retain this diagnostic proof");
+    assert!(
+        !quality.is_complete(),
+        "fixture drift: expected a trust-bearing diagnostic proof, got {quality:?}"
+    );
+    assert!(
+        solver
+            .last_strict_proof_quality()
+            .expect("retained proof must expose a strict verdict")
+            .is_err(),
+        "strict checking must still reject the trust-bearing diagnostic proof"
+    );
 }

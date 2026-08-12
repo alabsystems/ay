@@ -156,6 +156,13 @@ const REFRESH_EVERY: usize = 200;
 /// LP would stall through ~17k degenerate Dantzig pivots and never anti-cycle.
 /// Bounds work, never soundness.
 const STALL_BEFORE_BLAND: usize = 8000;
+/// Devex reference-framework reset threshold. Once the largest weight exceeds
+/// this, the framework is re-anchored at the current basis (all weights back to
+/// 1). Forrest–Goldfarb's own recommendation; without it the weights drift up
+/// monotonically, the ratios they encode stop reflecting the current basis, and
+/// pricing degenerates back toward (a badly scaled) Dantzig on long runs.
+/// Bounds work, never soundness.
+const DEVEX_RESET: f64 = 1e6;
 /// Internal wall-clock budget for one simplex solve. On timeout we return the best
 /// dual found so far (sound via NS), never `None`. The external `should_stop` is the
 /// real deadline in the solver; this is a backstop so a single solve cannot run away
@@ -1069,6 +1076,134 @@ enum LoopExit {
     Stopped,
 }
 
+/// One basic variable's blocking data for the ratio test: how far the entering
+/// variable can move before row slot `row`'s basic variable hits the bound that
+/// blocks it. Built once per iteration by [`Simplex::collect_blocks`] and read by
+/// both ratio-test rules.
+#[derive(Clone, Copy)]
+struct Block {
+    /// Row slot whose basic variable blocks.
+    row: usize,
+    /// Step at which the basic variable reaches its blocking bound exactly.
+    t_exact: f64,
+    /// Step at which it reaches that bound RELAXED outward by the Harris
+    /// tolerance. Always `>= t_exact`.
+    t_relax: f64,
+    /// `|alpha_row|` — the pivot magnitude if this row is chosen.
+    piv_mag: f64,
+    /// Which bound the leaving variable lands on.
+    to_upper: bool,
+}
+
+/// Outcome of [`harris_select`].
+#[derive(Clone, Copy)]
+struct HarrisChoice {
+    /// Step length to take along the entering direction. Always `>= 0`, and
+    /// never more than `col_span`.
+    step: f64,
+    /// Chosen leaving row and the bound it lands on, or `None` for a bound flip
+    /// of the entering variable.
+    leave: Option<(usize, bool)>,
+}
+
+/// HARRIS TWO-PASS RATIO TEST (Harris 1973; Gill–Murray–Saunders–Wright 1989
+/// tolerance expansion), over the [`Block`]s of one iteration.
+///
+/// PASS 1 computes `t_max`, the largest step for which every basic variable stays
+/// within the Harris tolerance of its bound — a RELAXED limit, so `t_max` is
+/// always `>= min_i t_exact_i`, capped by the entering variable's own span.
+///
+/// PASS 2 takes, among the rows whose TRUE ratio is within that relaxed limit,
+/// the one with the largest `|alpha_i|`, and steps by exactly that row's true
+/// ratio. Two things fall out. The pivot element is the largest available rather
+/// than whatever the strict argmin happened to be, which keeps the eta reciprocal
+/// `1/piv` small and the product-form inverse well conditioned. And — the point
+/// on degenerate covering LPs — when several rows tie at ratio 0 the strict rule
+/// is forced into a zero-length step, while this rule may instead step to a
+/// strictly larger ratio (still `<= t_max`) whose row simply has a bigger pivot,
+/// leaving the degenerate vertex rather than spinning on it.
+///
+/// The price is that rows other than the chosen one can finish up to the Harris
+/// tolerance outside their bound. That is bounded by construction (it is baked
+/// into `t_relax`), the caller sizes the tolerance below `feas_tol`, and the
+/// periodic exact `recompute_xb` re-anchors the values. It is advisory in any
+/// case: NS re-derives a sound bound from the clamped dual whatever this returns.
+///
+/// PASS 2 always finds a row when any block exists: the row attaining the `t_max`
+/// minimum has `t_exact <= t_relax = t_max`, so it qualifies. A `None` leave is
+/// therefore returned only when the entering variable's own opposite bound is the
+/// binding limit — a genuine bound flip.
+fn harris_select(blocks: &[Block], col_span: f64) -> HarrisChoice {
+    let flip = HarrisChoice {
+        step: col_span,
+        leave: None,
+    };
+    // PASS 1: the relaxed limit.
+    let mut t_max = col_span.max(0.0);
+    for block in blocks {
+        t_max = t_max.min(block.t_relax);
+    }
+    // PASS 2: largest pivot among the rows whose TRUE ratio fits under it.
+    let mut best: Option<&Block> = None;
+    for block in blocks {
+        if block.t_exact <= t_max && best.is_none_or(|b| block.piv_mag > b.piv_mag) {
+            best = Some(block);
+        }
+    }
+    let Some(best) = best else {
+        return flip; // no row blocks first: flip the entering variable.
+    };
+    // A step past the entering variable's own opposite bound is a bound flip, not
+    // a pivot: never move further than `col_span`.
+    if best.t_exact >= col_span {
+        return flip;
+    }
+    HarrisChoice {
+        step: best.t_exact,
+        leave: Some((best.row, best.to_upper)),
+    }
+}
+
+/// Per-phase effort counters for one [`Simplex::simplex_loop`] call. Purely
+/// diagnostic: nothing in the bound path reads these, but regressions assert on
+/// them so a pricing/ratio-test change that silently stops making progress is
+/// visible as a number rather than a wall-clock feeling.
+#[derive(Clone, Copy, Default)]
+struct PhaseStats {
+    /// Loop iterations executed.
+    iters: usize,
+    /// Iterations in which a basis change actually happened (as opposed to a
+    /// bound flip or a rejected near-singular pivot).
+    pivots: usize,
+    /// Iterations priced by Bland's anti-cycling rule instead of Devex.
+    bland_iters: usize,
+    /// Basis-changing pivots whose step length was (numerically) zero — the
+    /// degeneracy signal this solver's covering LPs are dominated by.
+    degenerate_pivots: usize,
+}
+
+/// Both phases' exits and effort, from [`Simplex::run_instrumented`].
+#[derive(Clone, Copy)]
+struct RunStats {
+    phase1: LoopExit,
+    phase2: LoopExit,
+    /// Phase-I / Phase-II effort. Read only by the regressions that assert on
+    /// pricing and crash quality (`covering_crash_is_immediately_feasible_...`),
+    /// which is the point: they turn "the simplex got slower" into a test
+    /// failure rather than a wall-clock feeling.
+    #[cfg_attr(not(test), allow(dead_code))]
+    stats1: PhaseStats,
+    #[cfg_attr(not(test), allow(dead_code))]
+    stats2: PhaseStats,
+}
+
+impl RunStats {
+    /// The advisory convergence signal: BOTH phases reached their own optimum.
+    fn converged(&self) -> bool {
+        self.phase1 == LoopExit::Optimal && self.phase2 == LoopExit::Optimal
+    }
+}
+
 /// Variable bound kind for a non-basic column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtBound {
@@ -1151,6 +1286,54 @@ struct Simplex {
     eta_nnz_cap: usize,
 }
 
+/// Decides whether structural column `j` should be crashed at its UPPER bound
+/// rather than its lower bound, by evaluating the one move `x_j: lower -> upper`
+/// against the all-at-lower starting point.
+///
+/// Every structural lower bound is 0 here, so the all-lower point has zero row
+/// activity and row `r` is short by exactly `max(0, b_r)`. Moving `x_j` to its
+/// upper bound changes row `r`'s activity by `a_rj * span`, `span = upper_j -
+/// lower_j`:
+///
+/// * `gain`  = `sum_r min(max(0, b_r), max(0, a_rj * span))` — violation actually
+///   removed (capped per row: overshooting a satisfied row buys nothing);
+/// * `harm`  = `sum_r max(0, -a_rj * span)` — violation the move can create in
+///   rows whose activity it *lowers* (conservative: charged in full even where
+///   the row has slack).
+///
+/// Crash at upper iff `gain > harm` and the span is finite and positive. For a
+/// covering row set (`a_rj > 0`, `b_r > 0`) this is `gain > 0 = harm` for every
+/// column, so `x = 1` — immediately feasible. For a packing row set (`a_rj < 0`
+/// after `>=` normalization) it is `0 = gain < harm`, so nothing moves and the
+/// classic all-lower crash is reproduced byte for byte. Mixed models get the
+/// per-column decision, and Phase I repairs whatever the estimate got wrong —
+/// this only ever changes the starting point, never what the LP is.
+fn crash_at_upper(
+    j: usize,
+    col_ptr: &[usize],
+    col_idx: &[usize],
+    col_val: &[f64],
+    rhs: &[f64],
+    lower: f64,
+    upper: f64,
+) -> bool {
+    let span = upper - lower;
+    if !span.is_finite() || span <= 0.0 {
+        return false;
+    }
+    let mut gain = 0.0f64;
+    let mut harm = 0.0f64;
+    for p in col_ptr[j]..col_ptr[j + 1] {
+        let delta = col_val[p] * span;
+        if delta > 0.0 {
+            gain += delta.min(rhs[col_idx[p]].max(0.0));
+        } else {
+            harm -= delta;
+        }
+    }
+    gain.is_finite() && harm.is_finite() && gain > harm
+}
+
 impl Simplex {
     fn new(model: &LpF64, n: usize, m: usize, cols: usize) -> Self {
         let mut scale = 1.0f64;
@@ -1213,8 +1396,18 @@ impl Simplex {
         for (i, &b) in basis.iter().enumerate() {
             basic_row[b] = Some(i);
         }
-        // All non-basic columns start at their lower bound (0).
-        let at = vec![AtBound::Lower; cols];
+        // --- Crash the NON-BASIC structural columns at the bound that makes the
+        // rows less violated (see `crash_at_upper`). Surpluses stay at their
+        // lower bound 0. On a covering LP (all `a_rj > 0`, `b_r > 0`) every
+        // structural crashes at UPPER, which satisfies every row outright and
+        // makes Phase I terminate at its first feasibility check instead of
+        // grinding tens of thousands of degenerate pivots up from `x = 0`. ---
+        let mut at = vec![AtBound::Lower; cols];
+        for (j, slot) in at[..n].iter_mut().enumerate() {
+            if crash_at_upper(j, &col_ptr, &col_idx, &col_val, &rhs, lower[j], upper[j]) {
+                *slot = AtBound::Upper;
+            }
+        }
 
         Self {
             n,
@@ -1342,20 +1535,30 @@ impl Simplex {
     }
 
     /// BTRAN of `self.y` (a row vector initially `c_B` by row slot) into `y^T
-    /// B^{-1}` IN PLACE: applies each eta in REVERSE order, then `B_0^{-1} = -I`.
-    /// One eta's row action sets `y[p] = diag*y[p] + sum_{i != p} eta[i]*y[i]`.
-    /// Operates on the `self.y` field directly (indexing rather than a borrowed
-    /// slice) so it composes with the per-iteration pricing without borrow clashes.
+    /// B^{-1}` IN PLACE. The field is moved out for the call and put straight
+    /// back, so `btran_slice` can take `&self` without aliasing it.
     fn btran_y(&mut self) {
+        let mut y = std::mem::take(&mut self.y);
+        self.btran_slice(&mut y);
+        self.y = y;
+    }
+
+    /// Replaces `v` (a length-`m` row vector indexed by row slot) with
+    /// `v^T B^{-1}`: applies each eta in REVERSE order, then `B_0^{-1} = -I`.
+    /// One eta's row action sets `v[p] = diag*v[p] + sum_{i != p} eta[i]*v[i]`.
+    /// Used for the pricing dual (`v = c_B`) and for the Devex pivot row
+    /// (`v = e_r`, giving `rho = e_r^T B^{-1}`, whose dot with column `M_j` is
+    /// `alpha_rj`).
+    fn btran_slice(&self, v: &mut [f64]) {
         for idx in (0..self.etas.len()).rev() {
             let e = &self.etas[idx];
-            let mut acc = e.diag * self.y[e.p];
+            let mut acc = e.diag * v[e.p];
             for &(i, val) in &e.vec {
-                acc += val * self.y[i];
+                acc += val * v[i];
             }
-            self.y[e.p] = acc;
+            v[e.p] = acc;
         }
-        for zi in self.y.iter_mut() {
+        for zi in v.iter_mut() {
             *zi = -*zi; // B_0^{-1} = -I (applied last for the row product).
         }
     }
@@ -1554,17 +1757,35 @@ impl Simplex {
         limits: SimplexLimits,
         target: Option<f64>,
     ) -> bool {
+        self.run_instrumented(should_stop, limits, target)
+            .converged()
+    }
+
+    /// [`Simplex::run`] plus the per-phase exit reasons and iteration counts.
+    /// The counts are advisory diagnostics (regression assertions on simplex
+    /// effort); the `converged` signal is exactly [`Simplex::run`]'s.
+    fn run_instrumented(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+        limits: SimplexLimits,
+        target: Option<f64>,
+    ) -> RunStats {
         // PHASE I: minimize the total bound infeasibility of the basic variables
-        // (the surplus crash basis is infeasible whenever some `b_r > 0`).
+        // (the crash basis is infeasible whenever a row is short at its crash point).
         self.recompute_xb();
-        let phase1 = self.simplex_loop(true, should_stop, limits, None);
+        let (phase1, stats1) = self.simplex_loop(true, should_stop, limits, None);
         // PHASE II: minimize the true objective `c·x`. If Phase I left residual
         // infeasibility (rare; degenerate / numerically hard, or a timeout), Phase II
         // still produces a point + duals; NS stays sound because it clamps `y` and
         // never trusts the primal.
         self.recompute_xb();
-        let phase2 = self.simplex_loop(false, should_stop, limits, target);
-        phase1 == LoopExit::Optimal && phase2 == LoopExit::Optimal
+        let (phase2, stats2) = self.simplex_loop(false, should_stop, limits, target);
+        RunStats {
+            phase1,
+            phase2,
+            stats1,
+            stats2,
+        }
     }
 
     /// Effective objective cost of a column under the current phase. Phase II uses
@@ -1594,7 +1815,7 @@ impl Simplex {
         should_stop: &dyn Fn() -> bool,
         limits: SimplexLimits,
         target: Option<f64>,
-    ) -> LoopExit {
+    ) -> (LoopExit, PhaseStats) {
         let cost_tol = self.cost_tol();
         let pivot_tol = self.pivot_tol();
         let feas_tol = self.feas_tol();
@@ -1604,16 +1825,55 @@ impl Simplex {
         let mut alpha = vec![0.0f64; self.m]; // FTRAN'd entering column (dense store).
         let mut alpha_nz: Vec<usize> = Vec::with_capacity(64); // its non-zero rows.
         let mut marked = vec![false; self.m]; // dedup flags for sparse FTRAN gather.
+        let mut stats = PhaseStats::default();
+        // DEVEX reference framework: `devex[j]` is the running approximation of
+        // column `j`'s squared steepest-edge norm. Every phase starts a FRESH
+        // framework (all weights 1 = the current basis is the reference), because
+        // the two phases price against completely different cost vectors.
+        let mut devex = vec![1.0f64; self.cols];
+        let mut devex_max = 1.0f64;
+        let mut rho = vec![0.0f64; self.m]; // pivot row `e_r^T B^{-1}` (Devex update).
+        let mut blocks: Vec<Block> = Vec::with_capacity(64); // ratio-test candidates.
+
+        // Harris tolerance expansion: how far a basic variable may be pushed past
+        // its bound to buy a longer step / bigger pivot.
+        //
+        // DISABLED (0), and the reason is measured. The expansion bounds each row's
+        // displacement PER ITERATION, but nothing ever pushes a drifted basic
+        // variable back inside its bounds — `recompute_xb` re-derives
+        // `x_B = B^-1 (b - N x_N)` faithfully, so if the basis genuinely has
+        // out-of-bound basics it REPRODUCES them rather than re-anchoring them (an
+        // earlier comment here claimed the opposite; it was wrong). Phase II's
+        // optimality test checks reduced costs, not feasibility, so the loop then
+        // terminates `Optimal` at a point OUTSIDE the polytope with a
+        // correspondingly non-optimal dual — i.e. `converged = true` on a wrong
+        // answer, which is the one thing that flag must never do, because it gates
+        // whether the certified tier trusts the dual at all.
+        //
+        // Measured on the oracle corpus: drift reached 8.1e-4 against a delta of
+        // 2.5e-5 — 32x, i.e. accumulated — giving `converged=true` with the
+        // objective 0.514 low on `degen_star_n200_m900`. Scaling the tolerance
+        // showed the error is monotone in it (x0 and x0.01 -> 6.8e-6; x1 -> 5.1e-1).
+        // Zeroing it makes the corpus clean AND faster (44.3s vs 45.8s) and cuts
+        // iterations on the target family (domset_467 1728 -> 1639).
+        //
+        // A textbook Harris pairs the expansion with bound shifting or a
+        // feasibility cleanup. Neither exists here; add one before re-enabling.
+        // `harris_select` and the largest-pivot tie-break stay — at delta 0 the
+        // tie-break simply applies to exact ties.
+        let harris_delta = 0.0f64;
+        let _ = feas_tol;
 
         let iteration_cap = limits.iterations_per_phase.min(MAX_SIMPLEX_ITERS);
         for iter in 0..iteration_cap {
+            stats.iters = iter + 1;
             if iter % 64 == 0
                 && (should_stop()
                     || limits
                         .deadline
                         .is_some_and(|deadline| std::time::Instant::now() >= deadline))
             {
-                return LoopExit::Stopped; // partial solve; still NS-valid.
+                return (LoopExit::Stopped, stats); // partial solve; still NS-valid.
             }
             // Refactor on the fixed pivot cadence, OR early when the eta-file's fill
             // crosses the nnz cap — but in the latter case require a handful of pivots
@@ -1650,7 +1910,7 @@ impl Simplex {
                     }
                 }
                 if obj <= feas_tol {
-                    return LoopExit::Optimal; // bound-feasible: Phase I complete.
+                    return (LoopExit::Optimal, stats); // bound-feasible: Phase I complete.
                 }
             } else {
                 for i in 0..self.m {
@@ -1658,6 +1918,23 @@ impl Simplex {
                     self.cb[i] = self.cost[b];
                     if b < self.n {
                         obj += self.cost[b] * self.xb_val[i];
+                    }
+                }
+                // NON-basic structurals contribute `cost_j * bound_j` to `c·x` too.
+                // Omitting them (as this loop once did) is harmless only while
+                // every non-basic structural rests at 0; with `crash_at_upper`
+                // seeding the basis, a covering LP starts with most structurals
+                // non-basic at their UPPER bound, so the omitted mass is most of
+                // the objective
+                // and it MOVES (each bound flip changes it). The stall detector then
+                // sees an objective that does not improve, engages Bland's rule
+                // within ~m iterations and never leaves it — measured as 43.6k of
+                // 44.1k Phase-II iterations priced by Bland. Counting the non-basic
+                // mass costs one O(n) sweep, strictly cheaper than the pricing sweep
+                // already in this loop.
+                for j in 0..self.n {
+                    if self.basic_row[j].is_none() {
+                        obj += self.cost[j] * self.nonbasic_value(j);
                     }
                 }
             }
@@ -1679,6 +1956,9 @@ impl Simplex {
                     bland = true; // switch to Bland's rule to break cycles.
                 }
             }
+            if bland {
+                stats.bland_iters += 1;
+            }
 
             // Dual `y = c_B^T B^{-1}` (BTRAN over `cb`).
             self.y.copy_from_slice(&self.cb);
@@ -1693,7 +1973,7 @@ impl Simplex {
             if !phase1 && iter & 31 == 0 {
                 if let Some(t) = target {
                     if self.quick_ns_bound() >= t {
-                        return LoopExit::Stopped;
+                        return (LoopExit::Stopped, stats);
                     }
                 }
             }
@@ -1718,7 +1998,13 @@ impl Simplex {
                     entering = Some((j, dir));
                     break; // Bland: first eligible index.
                 }
-                let score = rc.abs();
+                // DEVEX (Forrest-Goldfarb 1992): score `rc^2 / w_j`, where `w_j`
+                // approximates the squared norm of column `j` in the current
+                // basis's reference framework. Dantzig's raw `|rc|` is the
+                // special case `w_j == 1` forever, and it is the classic worst
+                // choice on a degenerate LP: it happily enters a column with a
+                // big reduced cost whose step length is zero, over and over.
+                let score = rc * rc / devex[j];
                 if score > best_score {
                     best_score = score;
                     entering = Some((j, dir));
@@ -1735,9 +2021,9 @@ impl Simplex {
                 // fail closed on infeasible primals (it declines to the exact
                 // tier) instead of reporting a vacuous converged floor.
                 return if phase1 {
-                    LoopExit::Stopped
+                    (LoopExit::Stopped, stats)
                 } else {
-                    LoopExit::Optimal
+                    (LoopExit::Optimal, stats)
                 };
             };
 
@@ -1751,73 +2037,46 @@ impl Simplex {
             //     bound it violates; we let it travel only to the violated bound so
             //     infeasibility never increases. ---
             let col_span = self.upper[col] - self.lower[col]; // may be +inf.
+            self.collect_blocks(
+                &alpha,
+                &alpha_nz,
+                dir,
+                phase1,
+                pivot_tol,
+                feas_tol,
+                harris_delta,
+                &mut blocks,
+            );
             let mut min_t = col_span; // bound flip of the entering var itself.
             let mut leave_row: Option<usize> = None;
             let mut leave_to_upper = false;
-            // Pivot magnitude of the currently-chosen leaving row. Among ratio-test
-            // ties we keep the LARGEST pivot (numerically stable): a bigger |pivot|
-            // gives a smaller eta reciprocal `1/piv`, damping product-form blow-up
-            // on degenerate covering LPs. Advisory — see `consider_leave`.
-            let mut best_piv = 0.0f64;
 
-            for &i in &alpha_nz {
-                let a = alpha[i];
-                if a.abs() <= pivot_tol {
-                    continue;
+            if bland {
+                // Bland's anti-cycling rule owns BOTH halves of the pivot choice:
+                // its finite-termination proof needs the exact min-ratio test with
+                // the smallest-index tie-break, so the Harris relaxation is
+                // deliberately not applied here. `best_piv` is the tie-break state
+                // of `consider_leave` and lives only for this loop.
+                let mut best_piv = 0.0f64;
+                for block in &blocks {
+                    self.consider_leave(
+                        block.t_exact,
+                        block.row,
+                        block.to_upper,
+                        true,
+                        block.piv_mag,
+                        &mut min_t,
+                        &mut best_piv,
+                        &mut leave_row,
+                        &mut leave_to_upper,
+                    );
                 }
-                let bvar = self.basis[i];
-                let cur = self.xb_val[i];
-                // d(xb_i)/dt = -a * dir.
-                let slope = -a * dir;
-                if slope > pivot_tol {
-                    // Basic var increasing: blocked by its upper bound. If it is
-                    // currently below its lower bound (Phase-I infeasible), it may
-                    // first reach the lower bound — treat that as the block so we
-                    // do not jump past feasibility.
-                    let target = if phase1 && cur < self.lower[bvar] - feas_tol {
-                        self.lower[bvar]
-                    } else {
-                        self.upper[bvar]
-                    };
-                    if target.is_finite() {
-                        let t = ((target - cur) / slope).max(0.0);
-                        let want_upper = !(phase1 && cur < self.lower[bvar] - feas_tol);
-                        self.consider_leave(
-                            t,
-                            i,
-                            want_upper,
-                            bland,
-                            a.abs(),
-                            &mut min_t,
-                            &mut best_piv,
-                            &mut leave_row,
-                            &mut leave_to_upper,
-                        );
-                    }
-                } else if slope < -pivot_tol {
-                    // Basic var decreasing: blocked by its lower bound. If currently
-                    // above its upper bound (Phase-I infeasible), the upper bound is
-                    // the first block.
-                    let target = if phase1 && cur > self.upper[bvar] + feas_tol {
-                        self.upper[bvar]
-                    } else {
-                        self.lower[bvar]
-                    };
-                    if target.is_finite() {
-                        let t = ((target - cur) / slope).max(0.0);
-                        let want_upper = phase1 && cur > self.upper[bvar] + feas_tol;
-                        self.consider_leave(
-                            t,
-                            i,
-                            want_upper,
-                            bland,
-                            a.abs(),
-                            &mut min_t,
-                            &mut best_piv,
-                            &mut leave_row,
-                            &mut leave_to_upper,
-                        );
-                    }
+            } else {
+                let choice = harris_select(&blocks, col_span);
+                min_t = choice.step;
+                if let Some((row, to_upper)) = choice.leave {
+                    leave_row = Some(row);
+                    leave_to_upper = to_upper;
                 }
             }
 
@@ -1825,7 +2084,7 @@ impl Simplex {
                 // Unbounded movement (no basic var blocks and the entering var has
                 // no finite opposite bound). Cannot happen with the [0,1] box on
                 // structurals and surpluses bounded below; guard anyway and stop.
-                return LoopExit::Stopped;
+                return (LoopExit::Stopped, stats);
             }
 
             // --- Apply the step: move the entering variable by `dir * min_t`,
@@ -1895,6 +2154,19 @@ impl Simplex {
                         self.basic_row[col] = Some(prow);
                         // The pivot row's basic value is now the entering variable's.
                         self.xb_val[prow] = entering_value;
+                        stats.pivots += 1;
+                        if step == 0.0 {
+                            stats.degenerate_pivots += 1;
+                        }
+                        self.devex_update(
+                            &mut devex,
+                            &mut devex_max,
+                            &mut rho,
+                            col,
+                            leaving,
+                            prow,
+                            piv,
+                        );
                     }
                 }
             }
@@ -1905,7 +2177,161 @@ impl Simplex {
                 alpha[i] = 0.0;
             }
         }
-        LoopExit::Stopped // iteration cap.
+        (LoopExit::Stopped, stats) // iteration cap.
+    }
+
+    /// Fills `blocks` with one [`Block`] per row slot that limits the entering
+    /// variable's movement in direction `dir`, given the FTRAN'd entering column
+    /// `alpha` (non-zeros listed in `alpha_nz`).
+    ///
+    /// A basic variable moves at `d(xb_i)/dt = -alpha_i * dir`. Increasing, it is
+    /// blocked by its upper bound; decreasing, by its lower bound. In Phase I a
+    /// variable that is currently OUTSIDE its box is instead blocked by the bound
+    /// it violates, so a step can never carry it further out — that is what keeps
+    /// the Phase-I objective monotone.
+    ///
+    /// `delta` is the Harris expansion: `t_relax` is the step at which the basic
+    /// variable would reach its blocking bound displaced OUTWARD by `delta`, so
+    /// `t_relax >= t_exact` term by term. Callers that do not want the relaxation
+    /// simply ignore `t_relax`.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_blocks(
+        &self,
+        alpha: &[f64],
+        alpha_nz: &[usize],
+        dir: f64,
+        phase1: bool,
+        pivot_tol: f64,
+        feas_tol: f64,
+        delta: f64,
+        blocks: &mut Vec<Block>,
+    ) {
+        blocks.clear();
+        for &i in alpha_nz {
+            let a = alpha[i];
+            if a.abs() <= pivot_tol {
+                continue;
+            }
+            let bvar = self.basis[i];
+            let cur = self.xb_val[i];
+            let slope = -a * dir; // d(xb_i)/dt.
+            let (bound, to_upper) = if slope > pivot_tol {
+                // Increasing: normally blocked by the upper bound, but a Phase-I
+                // variable below its lower bound is blocked at that lower bound.
+                if phase1 && cur < self.lower[bvar] - feas_tol {
+                    (self.lower[bvar], false)
+                } else {
+                    (self.upper[bvar], true)
+                }
+            } else if slope < -pivot_tol {
+                // Decreasing: normally the lower bound; a Phase-I variable above
+                // its upper bound is blocked at that upper bound.
+                if phase1 && cur > self.upper[bvar] + feas_tol {
+                    (self.upper[bvar], true)
+                } else {
+                    (self.lower[bvar], false)
+                }
+            } else {
+                continue;
+            };
+            if !bound.is_finite() {
+                continue; // no block from this row in this direction.
+            }
+            // The relaxed bound sits `delta` beyond the true one along the motion.
+            let relaxed = if slope > 0.0 {
+                bound + delta
+            } else {
+                bound - delta
+            };
+            blocks.push(Block {
+                row: i,
+                t_exact: ((bound - cur) / slope).max(0.0),
+                t_relax: ((relaxed - cur) / slope).max(0.0),
+                piv_mag: a.abs(),
+                to_upper,
+            });
+        }
+    }
+
+    /// Devex (Forrest–Goldfarb 1992) reference-framework weight update after a
+    /// basis-changing pivot of entering column `q` on row slot `r`, whose OLD
+    /// pivot element was `piv = alpha_rq = e_r^T B_old^{-1} M_q`.
+    ///
+    /// The update needs the whole PIVOT ROW `alpha_rj = e_r^T B^{-1} M_j`. We get
+    /// it from one BTRAN of the unit vector `e_r` into `rho`, then a sparse dot
+    /// `rho · M_j` per non-basic column — the same `O(m + nnz)` order as the
+    /// pricing sweep, so an iteration costs roughly twice as much and (measured)
+    /// buys far more than 2x fewer iterations.
+    ///
+    /// **Which basis `rho` belongs to.** This runs AFTER the pivot's eta is
+    /// appended, so `rho = e_r^T B_new^{-1}`. Row `r` of that eta is `(1/piv)
+    /// e_r^T`, hence `rho = (1/piv) · e_r^T B_old^{-1}` and therefore
+    /// `rho · M_j = alpha_rj / piv = alpha_rj / alpha_rq` — precisely the ratio
+    /// the textbook update wants, with the division already done. So `ratio`
+    /// below is `alpha_rj / alpha_rq` directly, no rescaling needed.
+    ///
+    /// Weights are only ever raised (`max`), the leaving column's is floored at 1,
+    /// and the framework is reset to all-ones once `max_j w_j` exceeds
+    /// [`DEVEX_RESET`] — without the reset the approximation degrades badly over a
+    /// long run, and the weights can drift toward overflow. Advisory throughout:
+    /// pricing choice changes the path, never the LP.
+    #[allow(clippy::too_many_arguments)]
+    fn devex_update(
+        &self,
+        devex: &mut [f64],
+        devex_max: &mut f64,
+        rho: &mut [f64],
+        q: usize,
+        leaving: usize,
+        r: usize,
+        piv: f64,
+    ) {
+        let w_q = devex[q];
+        let usable = w_q.is_finite() && w_q > 0.0 && piv.is_finite() && piv != 0.0;
+        if !usable {
+            // Cannot form a meaningful update: restart the reference framework.
+            devex.fill(1.0);
+            *devex_max = 1.0;
+            return;
+        }
+        rho.fill(0.0);
+        rho[r] = 1.0;
+        self.btran_slice(rho);
+
+        for j in 0..self.cols {
+            if j == q || self.basic_row[j].is_some() {
+                continue;
+            }
+            // `ratio` = alpha_rj / alpha_rq (see the doc comment): rho already
+            // carries the 1/piv factor.
+            let ratio = if j < self.n {
+                let mut dot = 0.0f64;
+                for p in self.col_ptr[j]..self.col_ptr[j + 1] {
+                    dot += rho[self.col_idx[p]] * self.col_val[p];
+                }
+                dot
+            } else {
+                -rho[j - self.n] // surplus column M_{n+s} = -e_s.
+            };
+            let candidate = ratio * ratio * w_q;
+            if candidate > devex[j] && candidate.is_finite() {
+                devex[j] = candidate;
+                *devex_max = devex_max.max(candidate);
+            }
+        }
+        // The leaving variable becomes non-basic and needs a weight of its own.
+        let w_leaving = (w_q / (piv * piv)).max(1.0);
+        devex[leaving] = if w_leaving.is_finite() {
+            w_leaving
+        } else {
+            1.0
+        };
+        *devex_max = devex_max.max(devex[leaving]);
+
+        if *devex_max > DEVEX_RESET {
+            devex.fill(1.0);
+            *devex_max = 1.0;
+        }
     }
 
     /// Reduced cost of column `j` under the current phase: `col_cost(j) - y · M_j`,
@@ -2673,5 +3099,754 @@ mod tests {
         for pair in high_point.chunks_exact(2) {
             assert!(pair.iter().sum::<f64>() >= 1.0 - 1e-7);
         }
+    }
+
+    /// Twenty-four random small box LPs `min c.x s.t. Ax >= b, 0 <= x <= 1`,
+    /// each paired with its EXACT optimum computed by an independent reference:
+    /// a Python vertex enumerator over `fractions.Fraction` that solves every
+    /// square subsystem of tight rows / free variables exactly and takes the
+    /// feasible minimum (an LP optimum is always attained at such a point, so
+    /// the enumeration is exhaustive, not a heuristic). The optima below are that
+    /// reference's output, transcribed — nothing here is self-referential, so a
+    /// pricing or ratio-test bug that moved the optimum shows up as a mismatch
+    /// against arithmetic this solver did not perform.
+    ///
+    /// The simplex must both CONVERGE and land on that optimum, and its own dual
+    /// must certify it (zero duality gap), on every fixture.
+    fn exact_reference_lps() -> Vec<(usize, Vec<f64>, Vec<(Vec<(usize, f64)>, f64)>, f64)> {
+        vec![
+            (
+                2,
+                vec![1.0, -2.0],
+                vec![(vec![(0, -1.0), (1, 1.0)], -2.0)],
+                -2.0 / 1.0,
+            ),
+            (
+                4,
+                vec![5.0, 0.0, -4.0, -1.0],
+                vec![
+                    (vec![(3, -1.0)], -2.0),
+                    (vec![(0, 4.0), (1, 3.0), (2, 4.0), (3, 3.0)], 3.0),
+                    (vec![(0, -1.0), (1, -1.0), (2, -1.0)], -2.0),
+                ],
+                -5.0 / 1.0,
+            ),
+            (
+                3,
+                vec![3.0, 6.0, -4.0],
+                vec![
+                    (vec![(1, -1.0), (2, -3.0)], 0.0),
+                    (vec![(0, -3.0), (1, -3.0), (2, 3.0)], -3.0),
+                ],
+                0.0 / 1.0,
+            ),
+            (
+                4,
+                vec![-3.0, 4.0, 3.0, -2.0],
+                vec![(vec![(0, 4.0), (1, -3.0), (2, -2.0), (3, 1.0)], 1.0)],
+                -5.0 / 1.0,
+            ),
+            (2, vec![-2.0, 5.0], vec![(vec![(0, 2.0)], 2.0)], -2.0 / 1.0),
+            (
+                4,
+                vec![1.0, -1.0, 1.0, -1.0],
+                vec![(vec![(0, 1.0), (1, -3.0), (2, -2.0)], -3.0)],
+                -2.0 / 1.0,
+            ),
+            (
+                3,
+                vec![0.0, -3.0, 2.0],
+                vec![
+                    (vec![(1, 3.0), (2, 2.0)], 2.0),
+                    (vec![(0, -1.0), (1, 2.0), (2, -3.0)], -1.0),
+                    (vec![(1, -2.0), (2, 3.0)], -2.0),
+                ],
+                -3.0 / 1.0,
+            ),
+            (
+                2,
+                vec![2.0, 3.0],
+                vec![
+                    (vec![(0, 2.0), (1, 4.0)], -1.0),
+                    (vec![(0, 3.0), (1, 4.0)], -1.0),
+                    (vec![(0, 3.0), (1, 4.0)], 0.0),
+                    (vec![(0, 4.0), (1, 2.0)], 4.0),
+                ],
+                2.0 / 1.0,
+            ),
+            (
+                2,
+                vec![-1.0, -3.0],
+                vec![
+                    (vec![(1, 1.0)], 1.0),
+                    (vec![(0, -2.0), (1, 4.0)], -2.0),
+                    (vec![(0, 2.0), (1, 1.0)], 1.0),
+                    (vec![(0, -1.0), (1, 2.0)], 2.0),
+                ],
+                -3.0 / 1.0,
+            ),
+            (
+                3,
+                vec![5.0, 5.0, 2.0],
+                vec![
+                    (vec![(0, -3.0), (1, 2.0), (2, 3.0)], -1.0),
+                    (vec![(0, 2.0)], 2.0),
+                    (vec![(1, 1.0)], 0.0),
+                    (vec![(0, 1.0)], -2.0),
+                ],
+                19.0 / 3.0,
+            ),
+            (
+                2,
+                vec![6.0, 0.0],
+                vec![
+                    (vec![(0, 2.0)], 2.0),
+                    (vec![(0, 1.0)], -1.0),
+                    (vec![(1, -2.0)], -1.0),
+                    (vec![(0, -3.0), (1, 3.0)], -3.0),
+                ],
+                6.0 / 1.0,
+            ),
+            (
+                4,
+                vec![-3.0, -4.0, 2.0, 4.0],
+                vec![(vec![(1, 1.0), (2, 1.0), (3, -1.0)], -1.0)],
+                -7.0 / 1.0,
+            ),
+            (
+                3,
+                vec![2.0, 5.0, 3.0],
+                vec![
+                    (vec![(2, -1.0)], -3.0),
+                    (vec![(1, 3.0), (2, -2.0)], 2.0),
+                    (vec![(0, 2.0), (1, 4.0), (2, 1.0)], 4.0),
+                ],
+                14.0 / 3.0,
+            ),
+            (
+                4,
+                vec![-2.0, 3.0, 6.0, 3.0],
+                vec![
+                    (vec![(1, -1.0), (2, 4.0)], 1.0),
+                    (vec![(0, 4.0), (3, -1.0)], 3.0),
+                    (vec![(0, -2.0), (1, -2.0), (3, -1.0)], -3.0),
+                ],
+                -1.0 / 2.0,
+            ),
+            (
+                4,
+                vec![3.0, 5.0, -4.0, 1.0],
+                vec![(vec![(0, 4.0), (3, -3.0)], -2.0)],
+                -4.0 / 1.0,
+            ),
+            (
+                4,
+                vec![5.0, 0.0, 5.0, -2.0],
+                vec![
+                    (vec![(2, 3.0), (3, -3.0)], 2.0),
+                    (vec![(1, 4.0), (2, 2.0), (3, -2.0)], 1.0),
+                    (vec![(1, -3.0), (2, 4.0), (3, -3.0)], -2.0),
+                ],
+                10.0 / 3.0,
+            ),
+            (
+                3,
+                vec![-2.0, 1.0, 5.0],
+                vec![
+                    (vec![(0, 2.0), (1, -3.0), (2, 3.0)], 1.0),
+                    (vec![(0, 2.0), (1, -3.0), (2, -2.0)], -2.0),
+                    (vec![(0, 3.0), (1, -3.0)], -2.0),
+                ],
+                -2.0 / 1.0,
+            ),
+            (
+                4,
+                vec![-3.0, 2.0, 4.0, -4.0],
+                vec![
+                    (vec![(1, 2.0), (2, 1.0)], 0.0),
+                    (vec![(0, -2.0), (2, -2.0), (3, 1.0)], 0.0),
+                ],
+                -11.0 / 2.0,
+            ),
+            (2, vec![2.0, 5.0], vec![(vec![(0, -2.0)], -3.0)], 0.0 / 1.0),
+            (
+                4,
+                vec![4.0, -1.0, -3.0, 2.0],
+                vec![
+                    (vec![(0, 2.0), (2, 1.0), (3, 3.0)], 0.0),
+                    (vec![(1, -3.0)], -3.0),
+                ],
+                -4.0 / 1.0,
+            ),
+            (
+                3,
+                vec![5.0, 0.0, 4.0],
+                vec![(vec![(1, 2.0), (2, 2.0)], -1.0), (vec![(1, 4.0)], 0.0)],
+                0.0 / 1.0,
+            ),
+            (
+                4,
+                vec![6.0, -4.0, 1.0, -4.0],
+                vec![(vec![(0, 1.0)], -2.0)],
+                -8.0 / 1.0,
+            ),
+            (
+                3,
+                vec![-2.0, 1.0, 3.0],
+                vec![
+                    (vec![(0, 2.0)], 1.0),
+                    (vec![(0, -3.0), (1, 2.0), (2, 4.0)], 2.0),
+                    (vec![(1, 1.0)], -1.0),
+                    (vec![(0, -3.0), (1, 4.0), (2, -3.0)], -2.0),
+                ],
+                9.0 / 8.0,
+            ),
+            (
+                2,
+                vec![-1.0, 4.0],
+                vec![
+                    (vec![(0, 3.0), (1, -3.0)], -1.0),
+                    (vec![(0, 1.0), (1, 1.0)], 2.0),
+                ],
+                3.0 / 1.0,
+            ),
+        ]
+    }
+
+    #[test]
+    fn simplex_optimum_matches_independent_exact_reference() {
+        for (case, (n, c, rows, expected)) in exact_reference_lps().into_iter().enumerate() {
+            let (dual, primal, converged) = approx_dual_for_box_lp_with_iteration_budget(
+                n,
+                c.clone(),
+                rows.clone(),
+                20_000,
+                &never_stop,
+            )
+            .unwrap_or_else(|| panic!("case {case}: model declined"));
+            assert!(converged, "case {case}: simplex did not converge");
+            assert_eq!(primal.len(), n, "case {case}: primal shape");
+            assert_eq!(dual.len(), rows.len(), "case {case}: dual shape");
+
+            // Primal feasibility of the returned point.
+            for (r, (coeffs, b)) in rows.iter().enumerate() {
+                let activity: f64 = coeffs.iter().map(|&(v, a)| a * primal[v]).sum();
+                assert!(
+                    activity >= b - 1e-6,
+                    "case {case}: row {r} violated by {}",
+                    b - activity
+                );
+            }
+            for (v, &x) in primal.iter().enumerate() {
+                assert!(
+                    (-1e-9..=1.0 + 1e-9).contains(&x),
+                    "case {case}: x[{v}] = {x} outside the box"
+                );
+            }
+
+            // The optimum itself, against the independent reference.
+            let objective: f64 = c.iter().zip(&primal).map(|(cj, x)| cj * x).sum();
+            assert!(
+                (objective - expected).abs() <= 1e-6,
+                "case {case}: simplex optimum {objective} != exact reference {expected}"
+            );
+            // NEGATIVE CONTROL (runs on every case): the comparison above has to
+            // be tight enough to REJECT a wrong optimum, or it proves nothing.
+            // A full unit off must fail it.
+            assert!(
+                (objective - (expected + 1.0)).abs() > 1e-6,
+                "case {case}: tolerance so loose it would accept expected+1"
+            );
+
+            // The dual returned for the same solve must certify that optimum by
+            // weak duality: `b.y + sum_j min(0, c_j - (A^T y)_j)` is a valid lower
+            // bound for ANY `y >= 0`, and equals `c.x` exactly at an optimal pair.
+            let y = clamp_dual(&dual);
+            let mut ns: f64 = rows.iter().zip(&y).map(|((_, b), yr)| yr * b).sum();
+            let mut aty = vec![0.0f64; n];
+            for ((coeffs, _), yr) in rows.iter().zip(&y) {
+                for &(v, a) in coeffs {
+                    aty[v] += yr * a;
+                }
+            }
+            for v in 0..n {
+                ns += (c[v] - aty[v]).min(0.0);
+            }
+            assert!(
+                ns <= objective + 1e-6,
+                "case {case}: NS dual {ns} above the primal {objective} — weak duality broken"
+            );
+            assert!(
+                ns >= expected - 1e-6,
+                "case {case}: dual {ns} does not certify the exact optimum {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn devex_weights_stay_positive_and_finite() {
+        // A small covering model so `Simplex::new` builds a real CSC / basis.
+        let objective = PbObjective {
+            terms: (1..=4).map(|v| term(1, lit(v))).collect(),
+        };
+        let constraints = vec![
+            ge(vec![term(1, lit(1)), term(1, lit(2))], 1),
+            ge(vec![term(1, lit(2)), term(1, lit(3))], 1),
+            ge(vec![term(1, lit(3)), term(1, lit(4))], 1),
+        ];
+        let model = LpF64::build(&objective, &constraints, 4).expect("model");
+        let (n, m) = (model.n, model.rows.len());
+        let simplex = Simplex::new(&model, n, m, n + m);
+
+        // Adversarial inputs: a near-singular pivot, an already-huge incumbent
+        // weight, and a leaving column that would otherwise inherit a subnormal.
+        let cases: [(f64, f64); 6] = [
+            (1.0, 1.0),
+            (1e-12, 1.0),
+            (-1e-12, 1e5),
+            (1e12, 1.0),
+            (-1.0, 1e300),
+            (f64::MIN_POSITIVE, 1e6),
+        ];
+        for (piv, w_q) in cases {
+            let mut devex = vec![1.0f64; simplex.cols];
+            let mut devex_max = 1.0f64;
+            let mut rho = vec![0.0f64; m];
+            devex[0] = w_q;
+            simplex.devex_update(&mut devex, &mut devex_max, &mut rho, 0, n, 0, piv);
+            for (j, &w) in devex.iter().enumerate() {
+                assert!(
+                    w.is_finite() && w > 0.0,
+                    "piv={piv} w_q={w_q}: weight[{j}] = {w} is not positive and finite"
+                );
+                // Devex's own invariant, and the one with teeth: weights start at
+                // 1 in the reference framework, every update only raises them
+                // (`max`), the leaving column's is explicitly floored at 1, and a
+                // reset returns them to 1 — so `w >= 1` always. It matters because
+                // the score is `rc^2 / w`: a weight that slipped below 1 (a huge
+                // pivot gives `w_q / piv^2 -> 0` without the floor) would inflate
+                // that column's score without limit and hijack pricing.
+                assert!(
+                    w >= 1.0,
+                    "piv={piv} w_q={w_q}: weight[{j}] = {w} fell below the Devex floor of 1"
+                );
+            }
+            assert!(
+                devex_max.is_finite() && devex_max > 0.0,
+                "piv={piv} w_q={w_q}: devex_max = {devex_max}"
+            );
+            assert!(
+                devex_max <= DEVEX_RESET,
+                "piv={piv} w_q={w_q}: devex_max = {devex_max} exceeds the reset threshold, \
+                 so the reference framework was not re-anchored"
+            );
+            // A weight of 0 or a NaN would make the Devex score `rc^2 / w`
+            // infinite or NaN and hand pricing to an arbitrary column; the score
+            // must stay a usable finite number.
+            for &w in &devex {
+                let score = 4.0f64 / w;
+                assert!(score.is_finite(), "score {score} from weight {w}");
+            }
+        }
+
+        // NEGATIVE CONTROL: the assertions above are only meaningful if a weight
+        // that is NOT positive-and-finite would actually trip them. Confirm the
+        // predicate rejects the three ways that can happen.
+        for bad in [0.0f64, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                !(bad.is_finite() && bad > 0.0),
+                "the positivity/finiteness check would have accepted {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn harris_pass_two_always_picks_a_valid_pivot() {
+        let mut rng = Rng(0x5eed_1234_9abc_def0);
+        let mut saw_pivot = 0usize;
+        let mut saw_flip = 0usize;
+        let mut saw_longer_than_strict = 0usize;
+        for _ in 0..4000 {
+            // Random blocks, deliberately including exact ties at ratio 0 (the
+            // degenerate case this rule exists for) and a mix of spans.
+            let count = 1 + (rng.next() % 6) as usize;
+            let delta = 1e-7;
+            let mut blocks = Vec::with_capacity(count);
+            for row in 0..count {
+                let t_exact = match rng.next() % 3 {
+                    0 => 0.0,
+                    1 => (rng.next() % 1000) as f64 * 1e-9,
+                    _ => (rng.next() % 100) as f64 * 0.01,
+                };
+                let piv_mag = 1e-6 + (rng.next() % 10_000) as f64 * 1e-3;
+                blocks.push(Block {
+                    row,
+                    t_exact,
+                    // `collect_blocks` guarantees `t_relax >= t_exact`; the
+                    // expansion size scales with 1/|slope|, modelled here as
+                    // `delta / piv_mag`.
+                    t_relax: t_exact + delta / piv_mag,
+                    piv_mag,
+                    to_upper: rng.next().is_multiple_of(2),
+                });
+            }
+            let col_span = match rng.next() % 4 {
+                0 => f64::INFINITY,
+                1 => 1.0,
+                2 => 0.0,
+                _ => (rng.next() % 200) as f64 * 0.01,
+            };
+            let choice = harris_select(&blocks, col_span);
+
+            assert!(
+                choice.step.is_finite() || col_span.is_infinite(),
+                "step {} must be finite whenever the span is",
+                choice.step
+            );
+            assert!(choice.step >= 0.0, "negative step {}", choice.step);
+            assert!(
+                choice.step <= col_span,
+                "step {} overshoots the entering variable's span {col_span}",
+                choice.step
+            );
+
+            // The relaxed limit that pass 1 computed.
+            let mut t_max = col_span.max(0.0);
+            for b in &blocks {
+                t_max = t_max.min(b.t_relax);
+            }
+            match choice.leave {
+                Some((row, to_upper)) => {
+                    saw_pivot += 1;
+                    let picked = blocks
+                        .iter()
+                        .find(|b| b.row == row)
+                        .expect("chosen row must be one of the blocks");
+                    assert_eq!(picked.to_upper, to_upper, "bound side must match the block");
+                    // VALID PIVOT, part 1: a real, non-negligible pivot element.
+                    assert!(
+                        picked.piv_mag > 0.0 && picked.piv_mag.is_finite(),
+                        "chosen pivot magnitude {} is unusable",
+                        picked.piv_mag
+                    );
+                    // VALID PIVOT, part 2: its true ratio is inside the relaxed
+                    // limit, so no basic variable is pushed further than the
+                    // Harris tolerance past its bound.
+                    assert!(
+                        picked.t_exact <= t_max,
+                        "chosen ratio {} exceeds the relaxed limit {t_max}",
+                        picked.t_exact
+                    );
+                    // VALID PIVOT, part 3: it is the LARGEST pivot among the rows
+                    // that qualify — that is the whole point of pass 2.
+                    for b in &blocks {
+                        if b.t_exact <= t_max {
+                            assert!(
+                                b.piv_mag <= picked.piv_mag,
+                                "row {} qualifies with a bigger pivot {} than the chosen {}",
+                                b.row,
+                                b.piv_mag,
+                                picked.piv_mag
+                            );
+                        }
+                    }
+                    assert!(
+                        (choice.step - picked.t_exact).abs() <= f64::EPSILON,
+                        "step must be the chosen row's true ratio"
+                    );
+                    let strict = blocks
+                        .iter()
+                        .fold(f64::INFINITY, |acc, b| acc.min(b.t_exact));
+                    if choice.step > strict {
+                        saw_longer_than_strict += 1;
+                    }
+                }
+                None => {
+                    saw_flip += 1;
+                    assert_eq!(
+                        choice.step, col_span,
+                        "a bound flip must step exactly the entering variable's span"
+                    );
+                    // A flip is only legitimate when no row blocks earlier.
+                    for b in &blocks {
+                        assert!(
+                            b.t_exact >= col_span || b.t_exact > t_max,
+                            "row {} blocks at {} before the span {col_span}, so this \
+                             should have been a pivot",
+                            b.row,
+                            b.t_exact
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_pivot > 0 && saw_flip > 0,
+            "both outcomes must be exercised"
+        );
+        assert!(
+            saw_longer_than_strict > 0,
+            "the Harris expansion never took a step longer than the strict \
+             min-ratio rule would have, so it cannot be escaping degeneracy"
+        );
+
+        // NEGATIVE CONTROL: a hand-built case where the strict min-ratio rule is
+        // forced to a zero-length step (row 0 ties at 0) but Harris must NOT be:
+        // row 1's true ratio is inside row 0's relaxed limit and its pivot is
+        // larger. If pass 2 ever regressed to strict min-ratio, this fails.
+        let blocks = vec![
+            Block {
+                row: 0,
+                t_exact: 0.0,
+                t_relax: 1e-3,
+                piv_mag: 1.0,
+                to_upper: true,
+            },
+            Block {
+                row: 1,
+                t_exact: 5e-4,
+                t_relax: 1.5e-3,
+                piv_mag: 9.0,
+                to_upper: false,
+            },
+        ];
+        let choice = harris_select(&blocks, f64::INFINITY);
+        assert_eq!(choice.leave.map(|(r, _)| r), Some(1));
+        assert!(
+            choice.step > 0.0,
+            "Harris must escape the degenerate zero step"
+        );
+        // ... and the control's control: with NO expansion (t_relax == t_exact)
+        // the same data must fall back to the zero-length step on row 0.
+        let strict = vec![
+            Block {
+                row: 0,
+                t_exact: 0.0,
+                t_relax: 0.0,
+                piv_mag: 1.0,
+                to_upper: true,
+            },
+            Block {
+                row: 1,
+                t_exact: 5e-4,
+                t_relax: 5e-4,
+                piv_mag: 9.0,
+                to_upper: false,
+            },
+        ];
+        let choice = harris_select(&strict, f64::INFINITY);
+        assert_eq!(choice.leave.map(|(r, _)| r), Some(0));
+        assert_eq!(choice.step, 0.0);
+    }
+
+    #[test]
+    fn covering_crash_is_immediately_feasible_and_phase_two_converges() {
+        // A random unicost covering LP in the shape of the domset family that
+        // motivated this work: every coefficient positive, every rhs positive, so
+        // `x = 1` satisfies every row. The crash must recognise that and hand
+        // Phase I a feasible point, and Phase II must then reach its own optimum.
+        let mut rng = Rng(0xfeed_face_0000_0001);
+        let n = 120usize;
+        let mut rows: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
+        for r in 0..n {
+            let mut coeffs = vec![(r, 30.0)];
+            for _ in 0..6 {
+                let v = (rng.next() % n as u64) as usize;
+                if v != r && !coeffs.iter().any(|&(u, _)| u == v) {
+                    coeffs.push((v, 1.0 + (rng.next() % 19) as f64));
+                }
+            }
+            coeffs.sort_unstable_by_key(|&(v, _)| v);
+            rows.push((coeffs, 30.0));
+        }
+        let c = vec![1.0f64; n];
+        let model = LpF64 {
+            n,
+            c: c.clone(),
+            offset: 0.0,
+            rows: rows
+                .iter()
+                .map(|(coeffs, b)| RowF64 {
+                    coeffs: coeffs.clone(),
+                    b: *b,
+                })
+                .collect(),
+        };
+        let m = model.rows.len();
+        let mut simplex = Simplex::new(&model, n, m, n + m);
+        // Every structural must crash at UPPER on an all-positive covering LP.
+        assert!(
+            (0..n).all(|j| simplex.at[j] == AtBound::Upper),
+            "covering columns must crash at their upper bound"
+        );
+        let stats = simplex.run_instrumented(&never_stop, SimplexLimits::iterations(20_000), None);
+        assert_eq!(
+            stats.stats1.iters, 1,
+            "Phase I must find the crash point already feasible and exit at its \
+             first feasibility check, not pivot toward feasibility"
+        );
+        assert!(
+            stats.phase1 == LoopExit::Optimal,
+            "Phase I must reach Optimal"
+        );
+        assert!(
+            stats.phase2 == LoopExit::Optimal,
+            "Phase II must reach Optimal on a degenerate covering LP"
+        );
+        assert!(stats.converged());
+        assert_eq!(
+            stats.stats2.bland_iters, 0,
+            "Devex must keep Bland's anti-cycling fallback from engaging at all"
+        );
+        // PRICING QUALITY, not just termination. Measured on this fixture:
+        // Devex reaches the optimum in 294 Phase-II iterations, Dantzig
+        // (`score = |rc|`) needs 421 for the same optimum. The ceiling sits
+        // between them, so reverting pricing to Dantzig — or any future change
+        // that costs as much as that revert does — fails here rather than
+        // silently slowing every LP bound in the solver.
+        assert!(
+            stats.stats2.iters <= 350,
+            "Phase II took {} iterations; Devex pricing reaches this optimum in \
+             294 and Dantzig needs 421, so this is a pricing regression",
+            stats.stats2.iters
+        );
+
+        // Zero duality gap: the point returned really is the LP optimum.
+        let result = simplex.extract(&model);
+        let objective: f64 = c.iter().zip(&result.primal).map(|(cj, x)| cj * x).sum();
+        let y = clamp_dual(&result.dual);
+        let mut ns: f64 = rows.iter().zip(&y).map(|((_, b), yr)| yr * b).sum();
+        let mut aty = vec![0.0f64; n];
+        for ((coeffs, _), yr) in rows.iter().zip(&y) {
+            for &(v, a) in coeffs {
+                aty[v] += yr * a;
+            }
+        }
+        for v in 0..n {
+            ns += (c[v] - aty[v]).min(0.0);
+        }
+        assert!(
+            (objective - ns).abs() <= 1e-6 * (1.0 + objective.abs()),
+            "duality gap {} between primal {objective} and dual {ns}",
+            objective - ns
+        );
+
+        // NEGATIVE CONTROL: the same rule must NOT fire on a packing LP, where
+        // `x = 1` is maximally infeasible. `-x_i - x_j >= -1` has only negative
+        // coefficients, so `crash_at_upper` must decline every column and
+        // reproduce the classic all-lower crash.
+        let packing: Vec<(Vec<(usize, f64)>, f64)> = (0..8)
+            .map(|i| (vec![(i, -1.0), ((i + 1) % 9, -1.0)], -1.0))
+            .collect();
+        let packing_model = LpF64 {
+            n: 9,
+            c: vec![-1.0; 9],
+            offset: 0.0,
+            rows: packing
+                .iter()
+                .map(|(coeffs, b)| RowF64 {
+                    coeffs: coeffs.clone(),
+                    b: *b,
+                })
+                .collect(),
+        };
+        let pm = packing_model.rows.len();
+        let packing_simplex = Simplex::new(&packing_model, 9, pm, 9 + pm);
+        assert!(
+            (0..9).all(|j| packing_simplex.at[j] == AtBound::Lower),
+            "packing columns must keep the classic all-lower crash"
+        );
+    }
+
+    #[test]
+    fn devex_pivot_row_is_the_ratio_the_update_needs() {
+        // The subtle step in `devex_update` is WHICH basis its `rho` belongs to.
+        // It runs after the pivot's eta is appended and after `basis[prow] = col`,
+        // so `rho = e_r^T B^{-1}` for the NEW basis, and the update relies on
+        // `rho . M_j` already being `alpha_rj / alpha_rq` rather than `alpha_rj`.
+        //
+        // That claim is exactly the defining identity of `B^{-1}`: `e_r^T B^{-1} B
+        // = e_r^T`, and column `s` of `B` is `M_{basis[s]}`. So for every row slot
+        // `r`, `rho . M_{basis[r]} == 1` and `rho . M_{basis[s]} == 0` for `s != r`.
+        // At the moment `devex_update` runs, `basis[prow]` IS the entering column
+        // `q`, so `rho . M_q == 1` and the ratio needs no rescaling. Check the
+        // identity on a real basis reached by a real solve.
+        let mut rng = Rng(0x0d15_ea5e_1234_5678);
+        let n = 24usize;
+        let rows: Vec<(Vec<(usize, f64)>, f64)> = (0..n)
+            .map(|r| {
+                let mut coeffs = vec![(r, 4.0)];
+                for _ in 0..3 {
+                    let v = (rng.next() % n as u64) as usize;
+                    if v != r && !coeffs.iter().any(|&(u, _)| u == v) {
+                        coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
+                    }
+                }
+                coeffs.sort_unstable_by_key(|&(v, _)| v);
+                (coeffs, 4.0)
+            })
+            .collect();
+        let model = LpF64 {
+            n,
+            c: (0..n).map(|j| 1.0 + (j % 3) as f64).collect(),
+            offset: 0.0,
+            rows: rows
+                .iter()
+                .map(|(coeffs, b)| RowF64 {
+                    coeffs: coeffs.clone(),
+                    b: *b,
+                })
+                .collect(),
+        };
+        let m = model.rows.len();
+        let mut simplex = Simplex::new(&model, n, m, n + m);
+        assert!(simplex.run(&never_stop, SimplexLimits::iterations(20_000), None));
+
+        // `M_j` for a structural is its CSC column; for surplus `n+s` it is `-e_s`.
+        let dot = |rho: &[f64], j: usize| -> f64 {
+            if j < n {
+                rows.iter()
+                    .enumerate()
+                    .map(|(r, (coeffs, _))| {
+                        coeffs
+                            .iter()
+                            .filter(|&&(v, _)| v == j)
+                            .map(|&(_, a)| rho[r] * a)
+                            .sum::<f64>()
+                    })
+                    .sum()
+            } else {
+                -rho[j - n]
+            }
+        };
+        let mut rho = vec![0.0f64; m];
+        for r in 0..m {
+            rho.fill(0.0);
+            rho[r] = 1.0;
+            simplex.btran_slice(&mut rho);
+            for s in 0..m {
+                let want = if s == r { 1.0 } else { 0.0 };
+                let got = dot(&rho, simplex.basis[s]);
+                assert!(
+                    (got - want).abs() <= 1e-7,
+                    "e_{r}^T B^-1 M_basis[{s}] = {got}, expected {want}: the pivot \
+                     row `rho` does not belong to the basis `devex_update` assumes"
+                );
+            }
+        }
+
+        // NEGATIVE CONTROL: the identity is specific to the CURRENT basis, so
+        // dotting against a column that is NOT basic in row `r` must not give 1 —
+        // otherwise the assertion above would pass for any `rho` whatsoever.
+        rho.fill(0.0);
+        rho[0] = 1.0;
+        simplex.btran_slice(&mut rho);
+        let nonbasic = (0..n + m)
+            .find(|&j| simplex.basic_row[j].is_none())
+            .expect("some column is non-basic at an optimum");
+        assert!(
+            (dot(&rho, nonbasic) - 1.0).abs() > 1e-7,
+            "a non-basic column also dotted to 1, so the identity check is vacuous"
+        );
     }
 }

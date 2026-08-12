@@ -49,7 +49,8 @@ impl Executor {
     }
 
     /// Rebuild a small rational-linear contradiction from exact public-query
-    /// roots, including `check-sat-assuming` literals.
+    /// roots, including `check-sat-assuming` literals and positive conjuncts
+    /// projected from those roots.
     ///
     /// Combined-theory preprocessing can replace an authored linking equality
     /// with `true`, or introduce Euclidean `div` identities, before the SAT
@@ -82,75 +83,438 @@ impl Executor {
                     .all(|&arg| matches!(terms.sort(arg), Sort::Int | Sort::Real))
         }
 
-        let authored = self.exact_concrete_authored_scope();
-        let linear_roots: Vec<TermId> = authored
-            .iter()
-            .copied()
-            .filter(|&root| is_numeric_literal(&self.ctx.terms, root))
-            .collect();
-        if linear_roots.len() < 2 || linear_roots.len() > MAX_LINEAR_ROOTS {
-            return;
+        #[derive(Clone)]
+        struct OwnedLinearRoot {
+            root: TermId,
+            term: TermId,
+            path: Vec<u32>,
         }
 
-        let limit = 1_u64 << linear_roots.len();
-        for cardinality in 2..=MAX_FARKAS_ROOTS.min(linear_roots.len()) {
-            for mask in 1_u64..limit {
-                if mask.count_ones() as usize != cardinality {
-                    continue;
+        /// Collect only leaves reached through a POSITIVE conjunction.  A
+        /// nested disjunction, negation, or implication remains one opaque
+        /// leaf: projecting through any of those connectives would not be a
+        /// consequence of the authored root.
+        fn collect_owned_leaves(
+            terms: &TermStore,
+            root: TermId,
+            term: TermId,
+            path: &mut Vec<u32>,
+            out: &mut Vec<OwnedLinearRoot>,
+        ) {
+            if let TermData::App(Symbol::Named(name), args) = terms.get(term) {
+                if name == "and" {
+                    for (position, &child) in args.iter().enumerate() {
+                        path.push(position as u32);
+                        collect_owned_leaves(terms, root, child, path, out);
+                        path.pop();
+                    }
+                    return;
                 }
-                let selected: Vec<TermId> = linear_roots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, &root)| ((mask & (1_u64 << index)) != 0).then_some(root))
-                    .collect();
-                let blocking_clause: Vec<TermId> = selected
-                    .iter()
-                    .map(|&root| self.ctx.terms.mk_not_raw(root))
-                    .collect();
-                let mut farkas = None;
-                let mut inferred = TheoryLemmaKind::Generic;
-                if !super::super::proof_farkas::try_lra_farkas_reconstruction(
-                    &self.ctx.terms,
-                    &blocking_clause,
-                    &mut farkas,
-                    &mut inferred,
-                ) {
-                    continue;
+            }
+            out.push(OwnedLinearRoot {
+                root,
+                term,
+                path: path.clone(),
+            });
+        }
+
+        /// Assume the exact public root and derive the selected conjunct with
+        /// checked Alethe `and_pos` plus resolution steps.  An empty path is a
+        /// top-level authored assertion and needs no projection.
+        fn append_owned_leaf(
+            terms: &mut TermStore,
+            candidate: &mut Proof,
+            owned: &OwnedLinearRoot,
+        ) -> Option<ProofId> {
+            let mut current = candidate.add_assume(owned.root, None);
+            let mut current_term = owned.root;
+            for &position in &owned.path {
+                let TermData::App(Symbol::Named(name), args) = terms.get(current_term) else {
+                    return None;
+                };
+                if name != "and" {
+                    return None;
                 }
-                let Some(farkas) = farkas else {
+                let child = *args.get(position as usize)?;
+                let projection = candidate.add_rule_step(
+                    AletheRule::AndPos(position),
+                    vec![terms.mk_not_raw(current_term), child],
+                    Vec::new(),
+                    vec![current_term],
+                );
+                current = candidate.add_resolution(vec![child], current_term, projection, current);
+                current_term = child;
+            }
+            (current_term == owned.term).then_some(current)
+        }
+
+        let authored = self.exact_concrete_authored_scope();
+        let mut owned_leaves = Vec::new();
+        for &root in &authored {
+            collect_owned_leaves(
+                &self.ctx.terms,
+                root,
+                root,
+                &mut Vec::new(),
+                &mut owned_leaves,
+            );
+        }
+        let linear_roots: Vec<OwnedLinearRoot> = owned_leaves
+            .iter()
+            .filter(|owned| is_numeric_literal(&self.ctx.terms, owned.term))
+            .cloned()
+            .collect();
+        if (2..=MAX_LINEAR_ROOTS).contains(&linear_roots.len()) {
+            let limit = 1_u64 << linear_roots.len();
+            for cardinality in 2..=MAX_FARKAS_ROOTS.min(linear_roots.len()) {
+                for mask in 1_u64..limit {
+                    if mask.count_ones() as usize != cardinality {
+                        continue;
+                    }
+                    let selected: Vec<OwnedLinearRoot> = linear_roots
+                        .iter()
+                        .enumerate()
+                        .filter(|&(index, _)| (mask & (1_u64 << index)) != 0)
+                        .map(|(_, root)| root.clone())
+                        .collect();
+                    let blocking_clause: Vec<TermId> = selected
+                        .iter()
+                        .map(|root| self.ctx.terms.mk_not_raw(root.term))
+                        .collect();
+                    let mut farkas = None;
+                    let mut inferred = TheoryLemmaKind::Generic;
+                    if !super::super::proof_farkas::try_lra_farkas_reconstruction(
+                        &self.ctx.terms,
+                        &blocking_clause,
+                        &mut farkas,
+                        &mut inferred,
+                    ) {
+                        continue;
+                    }
+                    let Some(farkas) = farkas else {
+                        continue;
+                    };
+
+                    // A rational Farkas certificate is strict-checkable for both
+                    // Int and Real roots. Do not inherit a heuristic integer kind:
+                    // that would require a separate LiaAnnotation and obscure the
+                    // exact certificate we just reconstructed.
+                    let mut candidate = Proof::new();
+                    let Some(premise_ids) = selected
+                        .iter()
+                        .map(|owned| append_owned_leaf(&mut self.ctx.terms, &mut candidate, owned))
+                        .collect::<Option<Vec<ProofId>>>()
+                    else {
+                        continue;
+                    };
+                    let mut current = candidate.add_step(ProofStep::TheoryLemma {
+                        theory: "LRA".to_string(),
+                        clause: blocking_clause.clone(),
+                        farkas: Some(farkas),
+                        kind: TheoryLemmaKind::LraFarkas,
+                        lia: None,
+                    });
+                    let mut residual = blocking_clause;
+                    let mut failed = false;
+                    for (root, &premise) in selected.iter().zip(premise_ids.iter()) {
+                        let complement = self.ctx.terms.mk_not_raw(root.term);
+                        let Some(position) = residual.iter().position(|&lit| lit == complement)
+                        else {
+                            failed = true;
+                            break;
+                        };
+                        let _ = residual.remove(position);
+                        current =
+                            candidate.add_resolution(residual.clone(), root.term, current, premise);
+                    }
+                    if failed || !residual.is_empty() {
+                        continue;
+                    }
+                    if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
+                        .is_ok()
+                        && Self::proof_derives_empty_clause(&candidate)
+                        && self.check_proof_strict_with_datatypes(&candidate).is_ok()
+                    {
+                        *proof = candidate;
+                        return;
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct ArithmeticFact {
+            term: TermId,
+            unit: ProofId,
+        }
+
+        /// Derive `not target` from a bounded subset of already-projected
+        /// numeric facts.  The producer does not decide validity: it asks the
+        /// rational Farkas reconstructor first, then the strict checker's exact
+        /// integer-gap recognizer.  A miss leaves the branch unsupported.
+        fn derive_numeric_negation(
+            terms: &mut TermStore,
+            candidate: &mut Proof,
+            facts: &[ArithmeticFact],
+            target: TermId,
+        ) -> Option<ProofId> {
+            const MAX_SUPPORT: usize = 6;
+            if facts.len() > MAX_LINEAR_ROOTS {
+                return None;
+            }
+            let target_complement = terms.mk_not_raw(target);
+            let limit = 1_u64 << facts.len();
+            for cardinality in 0..=MAX_SUPPORT.min(facts.len()) {
+                for mask in 0_u64..limit {
+                    if mask.count_ones() as usize != cardinality {
+                        continue;
+                    }
+                    let selected: Vec<ArithmeticFact> = facts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, fact)| {
+                            ((mask & (1_u64 << index)) != 0 && fact.term != target).then_some(*fact)
+                        })
+                        .collect();
+                    if selected.len() != cardinality {
+                        continue;
+                    }
+                    let mut clause: Vec<TermId> = selected
+                        .iter()
+                        .map(|fact| terms.mk_not_raw(fact.term))
+                        .collect();
+                    clause.push(target_complement);
+
+                    let mut farkas = None;
+                    let mut inferred = TheoryLemmaKind::Generic;
+                    let rational = super::super::proof_farkas::try_lra_farkas_reconstruction(
+                        terms,
+                        &clause,
+                        &mut farkas,
+                        &mut inferred,
+                    );
+                    // The LRA engine can simplify a ground affine conflict
+                    // (e.g. `m <= m - 1`) before surfacing coefficients. Try
+                    // the smallest deterministic candidate, but grant it no
+                    // authority: the exact Farkas checker must replay it over
+                    // the final blocking clause before it can be emitted.
+                    let direct_farkas =
+                        FarkasAnnotation::new(vec![
+                            num_rational::Rational64::from(1);
+                            clause.len()
+                        ]);
+                    let checked_direct =
+                        super::super::proof_farkas_validation::certificate_valid_for_blocking_clause(
+                            terms,
+                            &clause,
+                            &direct_farkas,
+                        );
+                    let checked_farkas = if rational {
+                        farkas
+                    } else if checked_direct {
+                        Some(direct_farkas)
+                    } else {
+                        None
+                    };
+                    let mut current = if let Some(farkas) = checked_farkas {
+                        candidate.add_step(ProofStep::TheoryLemma {
+                            theory: "LRA".to_string(),
+                            clause: clause.clone(),
+                            farkas: Some(farkas),
+                            kind: TheoryLemmaKind::LraFarkas,
+                            lia: None,
+                        })
+                    } else if ay_core::proof_validation::recognize_lia_bounds_gap(terms, &clause) {
+                        candidate.add_step(ProofStep::TheoryLemma {
+                            theory: "LIA".to_string(),
+                            clause: clause.clone(),
+                            farkas: None,
+                            kind: TheoryLemmaKind::LiaGeneric,
+                            lia: Some(ay_core::LiaAnnotation::BoundsGap),
+                        })
+                    } else if ay_core::proof_validation::recognize_lia_divisibility(terms, &clause)
+                    {
+                        candidate.add_step(ProofStep::TheoryLemma {
+                            theory: "LIA".to_string(),
+                            clause: clause.clone(),
+                            // The Divisibility validator re-derives the exact
+                            // integer gap and intentionally ignores this wire
+                            // compatibility vector.
+                            farkas: Some(FarkasAnnotation::new(vec![
+                                num_rational::Rational64::from(
+                                    1
+                                );
+                                clause.len()
+                            ])),
+                            kind: TheoryLemmaKind::LiaGeneric,
+                            lia: Some(ay_core::LiaAnnotation::Divisibility),
+                        })
+                    } else {
+                        continue;
+                    };
+
+                    let mut residual = clause;
+                    let mut failed = false;
+                    for fact in &selected {
+                        let blocker = terms.mk_not_raw(fact.term);
+                        let Some(position) = residual.iter().position(|&lit| lit == blocker) else {
+                            failed = true;
+                            break;
+                        };
+                        let _ = residual.remove(position);
+                        current = candidate.add_resolution(
+                            residual.clone(),
+                            fact.term,
+                            current,
+                            fact.unit,
+                        );
+                    }
+                    if !failed && residual == [target_complement] {
+                        return Some(current);
+                    }
+                }
+            }
+            None
+        }
+
+        /// Recursively falsify a bounded Boolean formula. Arithmetic leaves are
+        /// discharged by `derive_numeric_negation`; `and` needs one false
+        /// child, while `or` needs all children false. Every connective step is
+        /// an independently checked Alethe tautology.
+        fn derive_boolean_negation(
+            terms: &mut TermStore,
+            candidate: &mut Proof,
+            facts: &[ArithmeticFact],
+            target: TermId,
+            work: &mut usize,
+            depth: usize,
+        ) -> Option<ProofId> {
+            const MAX_BOOLEAN_WORK: usize = 64;
+            const MAX_BOOLEAN_DEPTH: usize = 12;
+            *work += 1;
+            if *work > MAX_BOOLEAN_WORK || depth > MAX_BOOLEAN_DEPTH {
+                return None;
+            }
+            if is_numeric_literal(terms, target) {
+                return derive_numeric_negation(terms, candidate, facts, target);
+            }
+            let TermData::App(Symbol::Named(operator), children) = terms.get(target).clone() else {
+                return None;
+            };
+            match operator.as_str() {
+                "and" => {
+                    for (position, child) in children.into_iter().enumerate() {
+                        let Some(child_negation) = derive_boolean_negation(
+                            terms,
+                            candidate,
+                            facts,
+                            child,
+                            work,
+                            depth + 1,
+                        ) else {
+                            continue;
+                        };
+                        let target_complement = terms.mk_not_raw(target);
+                        let projection = candidate.add_rule_step(
+                            AletheRule::AndPos(position as u32),
+                            vec![target_complement, child],
+                            Vec::new(),
+                            vec![target],
+                        );
+                        return Some(candidate.add_resolution(
+                            vec![target_complement],
+                            child,
+                            projection,
+                            child_negation,
+                        ));
+                    }
+                    None
+                }
+                "or" => {
+                    let target_complement = terms.mk_not_raw(target);
+                    let mut clause = Vec::with_capacity(children.len() + 1);
+                    clause.push(target_complement);
+                    clause.extend(children.iter().copied());
+                    let mut current = candidate.add_rule_step(
+                        AletheRule::OrPos(0),
+                        clause.clone(),
+                        Vec::new(),
+                        vec![target],
+                    );
+                    let mut residual = clause;
+                    for child in children {
+                        let child_negation = derive_boolean_negation(
+                            terms,
+                            candidate,
+                            facts,
+                            child,
+                            work,
+                            depth + 1,
+                        )?;
+                        let position = residual.iter().position(|&lit| lit == child)?;
+                        let _ = residual.remove(position);
+                        current = candidate.add_resolution(
+                            residual.clone(),
+                            child,
+                            current,
+                            child_negation,
+                        );
+                    }
+                    (residual == [target_complement]).then_some(current)
+                }
+                _ => None,
+            }
+        }
+
+        // TrustVC's recursive-decrease obligations are authored as a positive
+        // conjunction containing a disjunction of failed lexicographic cases.
+        // The SAT engine can decide that formula, but its compact conflict does
+        // not retain a strict certificate. Rebuild the small Boolean/arithmetic
+        // tree from exact source roots instead of blessing that Generic leaf.
+        if linear_roots.len() <= MAX_LINEAR_ROOTS {
+            let boolean_targets: Vec<OwnedLinearRoot> = owned_leaves
+                .iter()
+                .filter(|owned| {
+                    matches!(
+                        self.ctx.terms.get(owned.term),
+                        TermData::App(Symbol::Named(name), _) if name == "and" || name == "or"
+                    )
+                })
+                .cloned()
+                .collect();
+            for target in &boolean_targets {
+                let mut candidate = Proof::new();
+                let Some(facts) = linear_roots
+                    .iter()
+                    .map(|owned| {
+                        append_owned_leaf(&mut self.ctx.terms, &mut candidate, owned).map(|unit| {
+                            ArithmeticFact {
+                                term: owned.term,
+                                unit,
+                            }
+                        })
+                    })
+                    .collect::<Option<Vec<ArithmeticFact>>>()
+                else {
                     continue;
                 };
-
-                // A rational Farkas certificate is strict-checkable for both
-                // Int and Real roots. Do not inherit a heuristic integer kind:
-                // that would require a separate LiaAnnotation and obscure the
-                // exact certificate we just reconstructed.
-                let mut candidate = Proof::new();
-                let premise_ids: Vec<ProofId> = selected
-                    .iter()
-                    .map(|&root| candidate.add_assume(root, None))
-                    .collect();
-                let mut current = candidate.add_step(ProofStep::TheoryLemma {
-                    theory: "LRA".to_string(),
-                    clause: blocking_clause.clone(),
-                    farkas: Some(farkas),
-                    kind: TheoryLemmaKind::LraFarkas,
-                    lia: None,
-                });
-                let mut residual = blocking_clause;
-                let mut failed = false;
-                for (&root, &premise) in selected.iter().zip(premise_ids.iter()) {
-                    let complement = self.ctx.terms.mk_not_raw(root);
-                    let Some(position) = residual.iter().position(|&lit| lit == complement) else {
-                        failed = true;
-                        break;
-                    };
-                    let _ = residual.remove(position);
-                    current = candidate.add_resolution(residual.clone(), root, current, premise);
-                }
-                if failed || !residual.is_empty() {
+                let Some(target_unit) =
+                    append_owned_leaf(&mut self.ctx.terms, &mut candidate, target)
+                else {
                     continue;
-                }
+                };
+                let mut work = 0;
+                let Some(target_negation) = derive_boolean_negation(
+                    &mut self.ctx.terms,
+                    &mut candidate,
+                    &facts,
+                    target.term,
+                    &mut work,
+                    0,
+                ) else {
+                    continue;
+                };
+                candidate.add_resolution(Vec::new(), target.term, target_unit, target_negation);
                 if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
                     .is_ok()
                     && Self::proof_derives_empty_clause(&candidate)

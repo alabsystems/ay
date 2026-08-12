@@ -37,6 +37,16 @@ fn one_pivot_refutation() -> (ResolutionDag, Vec<Clause>) {
     (dag, clauses)
 }
 
+fn bounded_rup_limits() -> RupExpansionLimits {
+    RupExpansionLimits {
+        max_steps: 16,
+        max_literals: 1024,
+        max_work: 4096,
+        max_bytes: 1024 * 1024,
+        deadline: Instant::now() + Duration::from_secs(1),
+    }
+}
+
 #[test]
 fn rup_expansion_rejects_resolution_step_cap_before_emission() {
     let (dag, clauses) = one_pivot_refutation();
@@ -45,7 +55,7 @@ fn rup_expansion_rejects_resolution_step_cap_before_emission() {
         &clauses,
         Some(RupExpansionLimits {
             max_steps: 0,
-            deadline: Instant::now() + Duration::from_secs(1),
+            ..bounded_rup_limits()
         }),
     )
     .expect_err("a zero-step cap must reject the first required resolution");
@@ -66,8 +76,8 @@ fn rup_expansion_rejects_an_already_expired_deadline() {
         &dag,
         &clauses,
         Some(RupExpansionLimits {
-            max_steps: usize::MAX,
             deadline: Instant::now(),
+            ..bounded_rup_limits()
         }),
     )
     .expect_err("an already-expired absolute deadline must fail closed");
@@ -76,6 +86,164 @@ fn rup_expansion_rejects_an_already_expired_deadline() {
         BvSolvedExportError::ResourceLimit {
             resource: "RUP expansion deadline",
             ..
+        }
+    ));
+}
+
+#[test]
+fn rup_expansion_rejects_literal_cap_before_copy() {
+    let (dag, clauses) = one_pivot_refutation();
+    let error = expand_dag_to_resolution(
+        &dag,
+        &clauses,
+        Some(RupExpansionLimits {
+            max_literals: 1,
+            ..bounded_rup_limits()
+        }),
+    )
+    .expect_err("the second original literal must exceed a one-literal budget");
+    assert!(matches!(
+        error,
+        BvSolvedExportError::ResourceLimit {
+            resource: "expanded literals",
+            limit: 1,
+            actual: 2,
+        }
+    ));
+}
+
+#[test]
+fn rup_expansion_rejects_work_cap_before_traversal() {
+    let (dag, clauses) = one_pivot_refutation();
+    let error = expand_dag_to_resolution(
+        &dag,
+        &clauses,
+        Some(RupExpansionLimits {
+            max_work: 0,
+            ..bounded_rup_limits()
+        }),
+    )
+    .expect_err("the first bounded traversal unit must exceed zero work");
+    assert!(matches!(
+        error,
+        BvSolvedExportError::ResourceLimit {
+            resource: "RUP expansion work",
+            limit: 0,
+            actual: 1,
+        }
+    ));
+}
+
+#[test]
+fn rup_expansion_rejects_byte_cap_before_reserve() {
+    let (dag, clauses) = one_pivot_refutation();
+    let error = expand_dag_to_resolution(
+        &dag,
+        &clauses,
+        Some(RupExpansionLimits {
+            max_bytes: 0,
+            ..bounded_rup_limits()
+        }),
+    )
+    .expect_err("the first bounded store reserve must exceed zero bytes");
+    assert!(matches!(
+        error,
+        BvSolvedExportError::ResourceLimit {
+            resource: "RUP expansion bytes",
+            limit: 0,
+            actual,
+        } if actual > 0
+    ));
+}
+
+#[test]
+fn bounded_and_compatibility_rup_expansion_match() {
+    let (dag, clauses) = one_pivot_refutation();
+    let compatibility =
+        expand_dag_to_resolution(&dag, &clauses, None).expect("compatibility expansion succeeds");
+    let bounded = expand_dag_to_resolution(&dag, &clauses, Some(bounded_rup_limits()))
+        .expect("bounded expansion succeeds");
+    assert_eq!(bounded, compatibility);
+}
+
+#[test]
+fn bounded_resolution_resource_failures_map_to_typed_limits() {
+    let limits = ResolutionProofLimits {
+        max_codec_bytes: 123,
+        ..ResolutionProofLimits::default()
+    };
+    assert!(matches!(
+        map_bounded_resolution_error(
+            ResolutionProofError::AccountingOverflow {
+                resource: ResolutionProofResource::CodecBytes,
+            },
+            &limits,
+        ),
+        BvExprExportError::ResourceLimit {
+            resource: "resolution codec bytes",
+            limit: 123,
+            actual: usize::MAX,
+        }
+    ));
+    assert!(matches!(
+        map_bounded_resolution_error(
+            ResolutionProofError::AllocationFailed {
+                resource: ResolutionProofResource::CodecBytes,
+            },
+            &limits,
+        ),
+        BvExprExportError::ResourceLimit {
+            resource: "resolution codec bytes",
+            limit: 123,
+            actual: 124,
+        }
+    ));
+}
+
+#[test]
+fn bounded_replay_and_solver_unknown_resources_map_to_typed_limits() {
+    let mut limits = ResolutionProofLimits {
+        max_conflicts: Some(77),
+        ..ResolutionProofLimits::default()
+    };
+    limits.validation.max_bytes = 456;
+    assert!(matches!(
+        map_bounded_resolution_error(
+            ResolutionProofError::Validation(ResolutionValidationError::AllocationFailed {
+                resource: ResolutionValidationResource::AssignmentScratch,
+            }),
+            &limits,
+        ),
+        BvExprExportError::ResourceLimit {
+            resource: "resolution replay assignment scratch",
+            limit: 456,
+            actual: 457,
+        }
+    ));
+    assert!(matches!(
+        map_bounded_resolution_error(
+            ResolutionProofError::SolverUnknown {
+                reason: Some(SatUnknownReason::ResourceBudget),
+            },
+            &limits,
+        ),
+        BvExprExportError::ResourceLimit {
+            resource: "resolution solver resource budget",
+            limit: 0,
+            actual: 1,
+        }
+    ));
+    assert!(matches!(
+        map_bounded_resolution_error(
+            ResolutionProofError::SolverUnknown {
+                reason: Some(SatUnknownReason::DeadlineExceeded),
+            },
+            &limits,
+        ),
+        BvExprExportError::ResourceLimit {
+            resource: "resolution proof deadline",
+            limit: 0,
+            actual: 1,
         }
     ));
 }

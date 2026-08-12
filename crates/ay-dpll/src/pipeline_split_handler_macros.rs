@@ -435,6 +435,7 @@ macro_rules! pipeline_build_eager_extension {
                 &$local_term_to_var,
                 &$active_theory_atoms,
                 &$active_theory_atom_set,
+                Some(&$self.ctx.terms),
                 &mut $cached,
             )
         } else if _pbe_axioms_pre_injected {

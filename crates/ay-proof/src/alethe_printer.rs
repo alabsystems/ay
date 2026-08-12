@@ -6,6 +6,9 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+#[cfg(test)]
+#[path = "alethe_printer_ground_eval_tests.rs"]
+mod ground_eval_tests;
 #[path = "alethe_printer_resolution_args.rs"]
 mod resolution_args;
 mod surface_and_pos;
@@ -973,9 +976,26 @@ impl<'a> AlethePrinter<'a> {
     fn navigate_and_pos_gate(&self, id: ProofId, root: &str, ak_str: &str) -> Option<String> {
         let nesting = PrintedNesting::build(root, "and", PRINTED_NESTING_NODE_BUDGET)?;
         if nesting.is_flat() {
-            // Flat print with a mismatching index: there is no other shape to
-            // try, so do not guess.
-            return None;
+            // Flat print with a mismatching index: the internal conjunct
+            // vector is TermId-sorted while the surface prints the authored
+            // operand order, so the wire index can differ even when `Ak` IS a
+            // printed operand. Re-slot to the printed position when that
+            // spelling occurs exactly once — the emitted projection is exact
+            // by construction (operand `j` of the printed source is
+            // byte-identical to `Ak`). Absent or duplicated spellings stay a
+            // decline: do not guess.
+            let operands = &nesting.operands[0];
+            let mut positions = operands
+                .iter()
+                .enumerate()
+                .filter(|(_, operand)| *operand == ak_str);
+            let (index, _) = positions.next()?;
+            if positions.next().is_some() {
+                return None;
+            }
+            return Some(format!(
+                "(step {id} (cl (not {root}) {ak_str}) :rule and_pos :args ({index}))"
+            ));
         }
         self.charge(root.len() as u64);
         if self.work_budget_exhausted() {
@@ -2142,6 +2162,36 @@ impl<'a> AlethePrinter<'a> {
         farkas: Option<&ay_core::FarkasAnnotation>,
         kind: &ay_core::TheoryLemmaKind,
     ) -> Result<String, AlethePrintError> {
+        // AY's wide BV checker proves binary `bvand` commutativity by building
+        // and replaying a bit-blast/LRAT refutation from this exact live term.
+        // Alethe has no monolithic `bv_bitblast` rule, but it does have the
+        // independently checked `aci_simp` primitive for this same equality.
+        // Lower only the exact printed operand-swap shape; every other internal
+        // BvBitBlast lemma keeps the honest `hole` wire fallback below.
+        if matches!(kind, ay_core::TheoryLemmaKind::BvBitBlast) {
+            if let Some(text) = self.format_binary_bvand_aci_simp(id, clause) {
+                return Ok(text);
+            }
+        }
+        // The two bit-vector lemma families whose clauses are exactly
+        // reconstructible from Carcara's own primitives. Both gates re-derive
+        // the shape from the clause itself, so they are equally valid for the
+        // gate-annotated kind, whose clause space is a SUBSET of the plain
+        // one. Everything else keeps the honest `hole` fallback below.
+        if matches!(
+            kind,
+            ay_core::TheoryLemmaKind::BvBitBlast | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
+        ) {
+            if let Some(text) = self.format_bv_constant_disequality(id, clause) {
+                return Ok(text);
+            }
+            if let Some(text) = self.format_bv_idempotent_gate_bitblast(id, clause) {
+                return Ok(text);
+            }
+            if let Some(text) = self.format_bv_double_negation_bitblast(id, clause) {
+                return Ok(text);
+            }
+        }
         // Lower the internal conservative-extension certificate to Carcara's
         // `arrays_ext` shape (fresh witness rendered as the exact epsilon
         // term). Anything outside that exactly-reconstructible subset still
@@ -2160,6 +2210,16 @@ impl<'a> AlethePrinter<'a> {
         // name rather than emit anything the derivation cannot justify.
         if matches!(kind, ay_core::TheoryLemmaKind::ArrayRowChain) {
             if let Some(text) = self.format_array_row_chain(id, clause) {
+                return Ok(text);
+            }
+        }
+        // Lower an internally checked n-ary store PERMUTATION to Carcara's
+        // `arrays_ext`/`arrays_row`/`arrays_idx`/`cong`/`trans`. `None` means
+        // the clause is outside the exactly-reconstructible subset: fall
+        // through to the honest `hole` wire rather than emit a derivation the
+        // printed clause does not license.
+        if matches!(kind, ay_core::TheoryLemmaKind::ArrayStorePermutation) {
+            if let Some(text) = self.format_array_store_permutation(id, clause) {
                 return Ok(text);
             }
         }
@@ -2301,7 +2361,618 @@ impl<'a> AlethePrinter<'a> {
         // Theory-lemma steps are printed without premises, so promotion to a
         // real boolean-constant axiom is available here.
         let wire = Self::wire_rule_for_printed_step(kind.alethe_wire_rule(), &clause_str, true);
+        // ... and a name the checker only accepts WITH premises/`:args` is not
+        // an option here either, because the step below carries neither. The
+        // lowerings above this point that DO print premises (`bitblast_*`
+        // sequences, the ground-eval derivations) have already returned.
+        let wire = Self::wire_rule_for_bare_step(wire);
+        if wire == ay_core::UNPROVED_STEP_RULE {
+            if let Some(text) = Self::lower_ground_bv_disequality(id, &clause_str) {
+                return Ok(text);
+            }
+        }
         Ok(format!("(step {id} {clause_str} :rule {wire})"))
+    }
+
+    /// Decode the printed spelling of a CLOSED SMT-LIB bitvector constant into
+    /// `(bits_per_digit, case-folded digits)`.
+    ///
+    /// Only the two literal spellings `#b…` and `#x…` are recognized, and that
+    /// restriction is the whole soundness argument of
+    /// [`Self::lower_ground_bv_disequality`]: for these two spellings the digit
+    /// COUNT determines the sort (`4 * n` / `1 * n` bits) and the digits
+    /// determine the value, so two literals of the same radix with the same
+    /// digit count but different case-folded digits are necessarily two
+    /// DIFFERENT constants of the SAME bitvector sort. The `(_ bvN W)`
+    /// spelling is deliberately not accepted — deciding disequality there
+    /// needs arbitrary-precision numeric parsing — and keeps its honest `hole`.
+    fn printed_bv_literal(s: &str) -> Option<(u32, String)> {
+        if let Some(digits) = s.strip_prefix("#b") {
+            if digits.is_empty() || !digits.bytes().all(|b| b == b'0' || b == b'1') {
+                return None;
+            }
+            return Some((1, digits.to_string()));
+        }
+        let digits = s.strip_prefix("#x")?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some((4, digits.to_ascii_lowercase()))
+    }
+
+    /// Lower a premise-free unit `(cl (not (= C1 C2)))` over two DISTINCT
+    /// closed bitvector constants to a derivation the external checker
+    /// re-derives itself, instead of printing it as a `hole`.
+    ///
+    /// AY reaches this clause on every "two constants forced equal" conflict:
+    /// `eq_transitive` chains the problem's own equalities down to
+    /// `(cl (= #b11111010 #b10011101))` and the refutation is closed by
+    /// resolving against its negation. The negation is a ground fact, but no
+    /// carcara rule CONCLUDES `(cl (not (= t u)))` — `evaluate`
+    /// (`checker/rules/extras.rs`) asserts `assert_clause_len(conclusion, 1)`
+    /// and then `match_term_err!((= term value) = &conclusion[0])`, i.e. it
+    /// only ever proves a POSITIVE unit equality between a term and its
+    /// constant-folded value. Emitting `:rule evaluate` on the negated unit is
+    /// rejected outright ("term '(not (= …))' is of the wrong form, expected
+    /// '(= term value)'"), so a bare rename would have turned `holey` into
+    /// `invalid`. The inference is instead spelled out in four steps that are
+    /// each an instance of a rule this build implements:
+    ///
+    /// ```text
+    /// (step t.ev (cl (= (= C1 C2) false))    :rule evaluate)
+    /// (step t.q  (cl (not (= C1 C2)) false)  :rule equiv1 :premises (t.ev))
+    /// (step t.f  (cl (not false))            :rule false)
+    /// (step t    (cl (not (= C1 C2)))        :rule resolution :premises (t.q t.f))
+    /// ```
+    ///
+    /// * `evaluate` folds `(= C1 C2)` with `eval_op(Operator::Equals, ..)`,
+    ///   which is `Value::Bool(args[0] == args[1])` over `Value::BitVec(value,
+    ///   width)`. The gate below guarantees the two operands are same-sort,
+    ///   different-value bitvector constants, so the fold is exactly `false`.
+    /// * `equiv1` takes the premise `(= φ₁ φ₂)` to the 2-literal clause
+    ///   `(cl (not φ₁) φ₂)` — literally this shape.
+    /// * `false` proves exactly `(cl (not false))` and nothing else.
+    /// * the closing `resolution` reproduces the ORIGINAL printed clause under
+    ///   the ORIGINAL step id, so every downstream `:premises` reference and
+    ///   AY's own proof IR are untouched.
+    ///
+    /// The gate reads the PRINTED clause, never the term IR, for the same
+    /// reason [`Self::wire_rule_for_printed_step`] does: a problem-scope
+    /// surface override can re-spell an internally-constant literal, and the
+    /// checker only ever sees the printed text. Everything else — a variable
+    /// operand, a `(_ bvN W)` spelling, two constants that are EQUAL (which is
+    /// not a theorem at all), an Int/Real/String disequality (where distinct
+    /// printed spellings such as `1.0` / `1.00` may denote the same value), a
+    /// non-unit clause — returns `None` and keeps the honest `hole`.
+    fn lower_ground_bv_disequality(id: ProofId, clause_str: &str) -> Option<String> {
+        let inner = clause_str.strip_prefix("(cl ")?.strip_suffix(')')?;
+        let literals = split_sexpr_tokens(inner)?;
+        let [literal] = literals.as_slice() else {
+            return None;
+        };
+        let negated = split_application(literal, "not")?;
+        let [equality] = negated.as_slice() else {
+            return None;
+        };
+        let operands = split_application(equality, "=")?;
+        let [lhs, rhs] = operands.as_slice() else {
+            return None;
+        };
+        let (lhs_radix, lhs_digits) = Self::printed_bv_literal(lhs)?;
+        let (rhs_radix, rhs_digits) = Self::printed_bv_literal(rhs)?;
+        // Same radix AND same digit count => same bitvector sort (carcara
+        // would reject an ill-sorted `=` anyway). Different case-folded digits
+        // => different values, so `(= C1 C2)` folds to `false`.
+        if lhs_radix != rhs_radix || lhs_digits.len() != rhs_digits.len() {
+            return None;
+        }
+        if lhs_digits == rhs_digits {
+            return None;
+        }
+        Some(format!(
+            "(step {id}.ev (cl (= {equality} false)) :rule evaluate)\n\
+             (step {id}.q (cl {literal} false) :rule equiv1 :premises ({id}.ev))\n\
+             (step {id}.f (cl (not false)) :rule false)\n\
+             (step {id} {clause_str} :rule resolution :premises ({id}.q {id}.f))"
+        ))
+    }
+
+    /// Demote a wire rule the pinned checker rejects on the premise/argument
+    /// COUNT, for a step printed with neither.
+    ///
+    /// [`ay_core::is_checkable_alethe_rule`] only asks whether the checker
+    /// knows the NAME. That is the right question for a step that supplies
+    /// what the rule needs; it is the wrong question for the bare
+    /// `(step id (cl …) :rule R)` a theory lemma prints, because a rule like
+    /// `string_decompose` (1 premise, 1 arg), `re_inter` (2 premises) or
+    /// `concat_unify` (2 premises, 1 arg) is refused on the count before the
+    /// checker looks at the clause at all. Measured on carcara 1.1.0
+    /// `[git master 9a352ee]`, the bare form answers
+    /// `checking failed on step 't0' with rule 'string_decompose': expected 1
+    /// premises, got 0` and the document is `invalid`; the same step under
+    /// `hole` is `holey`.
+    ///
+    /// `TheoryLemmaKind::StringContentAxiom` is the kind this actually
+    /// affects: it maps to `string_decompose`, a real carcara rule name, so
+    /// `wire_rule_name` passed it straight through and AY published a step no
+    /// checker run could ever accept. `hole` is the honest rendering — and it
+    /// costs nothing in AY's own soundness gates, which read the proof IR and
+    /// re-validate the kind through `checker::string_axiom` regardless of what
+    /// is printed.
+    ///
+    /// This never rescues a false certificate: it only ever replaces a name
+    /// that is guaranteed to be rejected. A rule the checker could accept bare
+    /// is not in the set and passes through unchanged.
+    fn wire_rule_for_bare_step(wire: &str) -> &str {
+        if ay_core::alethe_rule_requires_premises_or_args(wire) {
+            ay_core::UNPROVED_STEP_RULE
+        } else {
+            wire
+        }
+    }
+
+    /// Render one exact `bvand(a,b) = bvand(b,a)` unit as Alethe `aci_simp`.
+    fn format_binary_bvand_aci_simp(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let [equality] = clause else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*equality) else {
+            return None;
+        };
+        if eq != "=" || equality_args.len() != 2 {
+            return None;
+        }
+        let (left, right) = (equality_args[0], equality_args[1]);
+        let (
+            TermData::App(Symbol::Named(left_op), left_args),
+            TermData::App(Symbol::Named(right_op), right_args),
+        ) = (self.terms.get(left), self.terms.get(right))
+        else {
+            return None;
+        };
+        if left_op != "bvand"
+            || right_op != "bvand"
+            || left_args.len() != 2
+            || right_args.as_slice() != [left_args[1], left_args[0]]
+            || self.terms.sort(left) != self.terms.sort(right)
+            || !matches!(self.terms.sort(left), Sort::BitVec(_))
+        {
+            return None;
+        }
+
+        // Surface overrides can re-spell an internally checked term. Gate the
+        // lowering on the bytes the external checker will actually parse.
+        let printed_left = self.format_term(left);
+        let printed_right = self.format_term(right);
+        let [left_a, left_b] =
+            <[String; 2]>::try_from(split_application(&printed_left, "bvand")?).ok()?;
+        let [right_a, right_b] =
+            <[String; 2]>::try_from(split_application(&printed_right, "bvand")?).ok()?;
+        if left_a != right_b || left_b != right_a {
+            return None;
+        }
+        Some(format!(
+            "(step {id} (cl (= {printed_left} {printed_right})) :rule aci_simp)"
+        ))
+    }
+
+    /// Lower "these two bit-vector CONSTANTS differ" to Carcara's `evaluate`.
+    ///
+    /// SUBSET ARGUMENT. `endpoint_refutation_for` (`executor/proof/
+    /// authored_linear.rs`) is the producer that reaches this shape: it emits
+    /// [`ay_core::TheoryLemmaKind::BvBitBlast`] on the UNIT clause
+    /// `(cl (not (= c d)))` only after `is_bitvec_constant` accepted BOTH
+    /// endpoints and `recognize_bv_bitblast` re-derived the disequality. This
+    /// printer trusts none of that: it re-decodes the clause here and declines
+    /// unless it is a one-literal negated `=` over two `Constant::BitVec`
+    /// terms of one width with different values.
+    ///
+    /// Carcara's `evaluate` (`checker/rules/rare.rs`) accepts `(cl (= t v))`
+    /// exactly when its own ground evaluator reduces `t` to `v`. On
+    /// `(= (= c d) false)` that evaluator does nothing but compare two
+    /// bit-vector literals — no bit-vector OPERATOR semantics are involved, so
+    /// there is no room for AY's and Carcara's evaluators to disagree. The
+    /// clause set this lowering can emit is therefore a strict subset of the
+    /// clauses `evaluate` re-derives. `equiv_pos2`/`false`/`resolution` carry
+    /// `(= c d) <-> false` to the printed unit `(not (= c d))` and are
+    /// premise-checked by Carcara like any other step.
+    ///
+    /// NEGATIVE DIRECTION. A clause AY may legitimately carry under this kind
+    /// but that is NOT an instance — `(cl (not (= (bvadd x #x01) #x05)))`,
+    /// `(cl (= (bvand x x) x))`, a two-literal clause, or a pair of EQUAL
+    /// constants — fails one of the decodes and keeps the honest `hole`.
+    fn format_bv_constant_disequality(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let [literal] = clause else {
+            return None;
+        };
+        let TermData::Not(equality) = self.terms.get(*literal) else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*equality) else {
+            return None;
+        };
+        if eq != "=" || equality_args.len() != 2 {
+            return None;
+        }
+        let (left, right) = (equality_args[0], equality_args[1]);
+        let (
+            TermData::Const(Constant::BitVec {
+                value: left_value,
+                width: left_width,
+            }),
+            TermData::Const(Constant::BitVec {
+                value: right_value,
+                width: right_width,
+            }),
+        ) = (self.terms.get(left), self.terms.get(right))
+        else {
+            return None;
+        };
+        if left_width != right_width || left_value == right_value {
+            return None;
+        }
+
+        // Gate on the BYTES the external checker parses, not on the term IR: a
+        // problem-scope surface override can re-spell either side, and only a
+        // printed pair that is still two DIFFERENT bit-vector literals of one
+        // width is an `evaluate` instance.
+        let printed_left = self.format_term(left);
+        let printed_right = self.format_term(right);
+        let (surface_left, surface_left_width) = parse_printed_bitvec_literal(&printed_left)?;
+        let (surface_right, surface_right_width) = parse_printed_bitvec_literal(&printed_right)?;
+        if surface_left_width != surface_right_width || surface_left == surface_right {
+            return None;
+        }
+        let equality_text = format!("(= {printed_left} {printed_right})");
+        let printed_literal = self.format_term(*literal);
+        if printed_literal != format!("(not {equality_text})") {
+            return None;
+        }
+
+        Some(format!(
+            "(step {id}.ev (cl (= {equality_text} false)) :rule evaluate)\n\
+             (step {id}.eq (cl (not (= {equality_text} false)) (not {equality_text}) false) :rule equiv_pos2)\n\
+             (step {id}.f (cl (not false)) :rule false)\n\
+             (step {id}.r (cl (not {equality_text}) false) :rule resolution :premises ({id}.ev {id}.eq))\n\
+             (step {id} (cl {printed_literal}) :rule resolution :premises ({id}.r {id}.f))"
+        ))
+    }
+
+    /// Widest bit-vector this printer will expand into per-bit Alethe steps.
+    ///
+    /// The expansion is linear in the width (one `@bit_of` pair and one
+    /// `*_simplify` step per bit, plus one `cong` premise each), so it needs a
+    /// cap. 64 matches `checker::bv_bitblast`'s `MAX_EVALUATED_BV_WIDTH`
+    /// (`u64::BITS`) and the widths its bit-blast/LRAT lane is regression-
+    /// covered for, so the cap bounds the emitted document without truncating
+    /// the range AY routinely certifies. A wider lemma keeps the honest `hole`.
+    const MAX_BITBLAST_LOWERING_WIDTH: u32 = 64;
+
+    /// `(bvand t t)` / `(bvor t t)` -> the Alethe surface operator name, the
+    /// Carcara bit-blasting rule for it, the Boolean connective that rule
+    /// builds each bit from, the simplification rule that discharges that
+    /// connective's idempotency, and the repeated operand.
+    ///
+    /// Every name is spelled out rather than derived from the operator: the
+    /// bit-blast rule suffix and the bit connective coincide for `bvand`/`bvor`
+    /// but not in general (`bitblast_xnor` builds `=` bits), so deriving one
+    /// from the other would be a trap for the next operator added here.
+    fn decode_idempotent_bv_gate(
+        terms: &TermStore,
+        term: TermId,
+    ) -> Option<IdempotentBvGate<'static>> {
+        let TermData::App(Symbol::Named(op), args) = terms.get(term) else {
+            return None;
+        };
+        let [first, second] = args.as_slice() else {
+            return None;
+        };
+        if first != second {
+            return None;
+        }
+        match op.as_str() {
+            "bvand" => Some(("bvand", "bitblast_and", "and", "and_simplify", *first)),
+            "bvor" => Some(("bvor", "bitblast_or", "or", "or_simplify", *first)),
+            _ => None,
+        }
+    }
+
+    /// Lower the bit-wise idempotency identity `(bvand t t) = t` /
+    /// `(bvor t t) = t` to Carcara's PER-OPERATOR bit-blasting rules.
+    ///
+    /// AY has one coarse `bv_bitblast` kind where Carcara has a fine-grained
+    /// `bitblast_*` suite, and the two are not interchangeable in general:
+    /// every `bitblast_*` rule concludes `(= <word-level term> (@bbterm b0 ..
+    /// bn))`, i.e. it relates a bit-vector term to an EXPLICIT list of Boolean
+    /// bit terms, while an AY `BvBitBlast` clause is a word-level tautology
+    /// with no `@bbterm` in it. So the coarse kind cannot be renamed onto a
+    /// per-operator rule; it has to be DERIVED as a sequence of them.
+    ///
+    /// SUBSET ARGUMENT, rule by rule, for the shape this function accepts:
+    ///
+    /// * `bitblast_and` / `bitblast_or` (`checker/rules/bitvectors.rs`) match
+    ///   `(= (bvand ...) res)` / `(= (bvor ...) res)` and require `res` to be
+    ///   `(@bbterm ...)` whose i-th argument is `(and x_i y_i)` / `(or x_i
+    ///   y_i)` for `x_i`, `y_i` the i-th bits of the two operands. Because
+    ///   this function only fires when BOTH operands are the SAME term `t`,
+    ///   `x_i` and `y_i` are both `((_ @bit_of i) t)` — exactly what is
+    ///   printed.
+    /// * `bitblast_var` requires only that the left side is bit-vector-sorted
+    ///   and the right side is the `@bbterm` of its `@bit_of` projections; `t`
+    ///   is bit-vector-sorted by construction. It does NOT require `t` to be a
+    ///   variable, so an opaque compound operand is still in the subset.
+    /// * `and_simplify` / `or_simplify` reduce a repeated conjunct/disjunct,
+    ///   so `(and b b) = b` and `(or b b) = b` are in their domain.
+    /// * `cong`, `trans` and `symm` are premise-checked congruence closure.
+    ///
+    /// Every step is therefore one Carcara re-derives from the printed text
+    /// alone. Nothing here asserts the identity — Carcara proves it.
+    ///
+    /// NEGATIVE DIRECTION. `(= (bvand x y) x)` (distinct operands),
+    /// `(= (bvor x x) y)` (right side is not the operand), `(= (bvxor x x)
+    /// #x00)` (a different operator, whose bit-blasting needs `(xor b b) =
+    /// false` and NO Carcara rule proves that in one step), a non-unit clause,
+    /// and any surface override that breaks the printed operand identity all
+    /// return `None` and keep the honest `hole`.
+    fn format_bv_idempotent_gate_bitblast(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let [equality] = clause else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*equality) else {
+            return None;
+        };
+        if eq != "=" || equality_args.len() != 2 {
+            return None;
+        }
+        let (left, right) = (equality_args[0], equality_args[1]);
+        // Exactly one side is the idempotent application and the other side is
+        // its repeated operand. `reversed` records the printed orientation so
+        // the final step reproduces the clause byte-for-byte.
+        let (decoded, reversed) = match Self::decode_idempotent_bv_gate(self.terms, left) {
+            Some(decoded) if decoded.4 == right => (decoded, false),
+            _ => match Self::decode_idempotent_bv_gate(self.terms, right) {
+                Some(decoded) if decoded.4 == left => (decoded, true),
+                _ => return None,
+            },
+        };
+        let (operator, blast_rule, connective, simplify_rule, operand) = decoded;
+        let application = if reversed { right } else { left };
+        let Sort::BitVec(bits) = self.terms.sort(application) else {
+            return None;
+        };
+        let width = bits.width;
+        if width == 0 || width > Self::MAX_BITBLAST_LOWERING_WIDTH {
+            return None;
+        }
+
+        // Gate on the printed bytes: a surface override may re-spell either
+        // side, and the derivation is only sound while the printed operands of
+        // the gate are the SAME text as the printed other side of the equality.
+        let printed_application = self.format_term(application);
+        let printed_operand = self.format_term(operand);
+        let printed_equality = self.format_term(*equality);
+        let oriented_equality = if reversed {
+            format!("(= {printed_operand} {printed_application})")
+        } else {
+            format!("(= {printed_application} {printed_operand})")
+        };
+        if printed_equality != oriented_equality {
+            return None;
+        }
+        let [surface_first, surface_second] =
+            <[String; 2]>::try_from(split_application(&printed_application, operator)?).ok()?;
+        if surface_first != surface_second || surface_first != printed_operand {
+            return None;
+        }
+
+        let operand_bits: Vec<String> = (0..width)
+            .map(|index| format!("((_ @bit_of {index}) {printed_operand})"))
+            .collect();
+        let gate_bits: Vec<String> = operand_bits
+            .iter()
+            .map(|bit| format!("({connective} {bit} {bit})"))
+            .collect();
+        let blasted_gate = format!("(@bbterm {})", gate_bits.join(" "));
+        let blasted_operand = format!("(@bbterm {})", operand_bits.join(" "));
+
+        let mut output = format!(
+            "(step {id}.bb (cl (= {printed_application} {blasted_gate})) :rule {blast_rule})\n\
+             (step {id}.var (cl (= {printed_operand} {blasted_operand})) :rule bitblast_var)"
+        );
+        for (index, (gate_bit, operand_bit)) in
+            gate_bits.iter().zip(operand_bits.iter()).enumerate()
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id}.b{index} (cl (= {gate_bit} {operand_bit})) :rule {simplify_rule})"
+                ),
+            );
+        }
+        let bit_premises: Vec<String> = (0..width).map(|index| format!("{id}.b{index}")).collect();
+        let forward_equality = format!("(= {printed_application} {printed_operand})");
+        let _ = std::fmt::Write::write_fmt(
+            &mut output,
+            format_args!(
+                "\n(step {id}.cong (cl (= {blasted_gate} {blasted_operand})) :rule cong :premises ({}))\n\
+                 (step {id}.lhs (cl (= {printed_application} {blasted_operand})) :rule trans :premises ({id}.bb {id}.cong))\n\
+                 (step {id}.rhs (cl (= {blasted_operand} {printed_operand})) :rule symm :premises ({id}.var))",
+                bit_premises.join(" ")
+            ),
+        );
+        if reversed {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id}.fwd (cl {forward_equality}) :rule trans :premises ({id}.lhs {id}.rhs))\n\
+                     (step {id} (cl {oriented_equality}) :rule symm :premises ({id}.fwd))"
+                ),
+            );
+        } else {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id} (cl {forward_equality}) :rule trans :premises ({id}.lhs {id}.rhs))"
+                ),
+            );
+        }
+        Some(output)
+    }
+
+    /// `(bvnot t)` -> `t`.
+    fn decode_bvnot(terms: &TermStore, term: TermId) -> Option<TermId> {
+        let TermData::App(Symbol::Named(op), args) = terms.get(term) else {
+            return None;
+        };
+        let [only] = args.as_slice() else {
+            return None;
+        };
+        (op == "bvnot").then_some(*only)
+    }
+
+    /// Lower the double-negation identity `(bvnot (bvnot t)) = t` to Carcara's
+    /// per-operator bit-blasting.
+    ///
+    /// This is the NESTED case of the same technique as
+    /// [`Self::format_bv_idempotent_gate_bitblast`]: a `bitblast_*` rule can
+    /// only relate ONE word-level operator to a `@bbterm`, so an operator
+    /// applied to an operator is blasted bottom-up and bridged with `cong`.
+    ///
+    /// SUBSET ARGUMENT. Carcara's `bitblast_not` (`checker/rules/
+    /// bitvectors.rs`) matches `(= (bvnot x) res)` and requires `res` to be the
+    /// `@bbterm` whose i-th argument is `(not x_i)`, where `x_i` is the i-th
+    /// bit of `x` — its own `@bbterm` argument when `x` is one, and
+    /// `((_ @bit_of i) x)` otherwise. Both uses here are exactly that:
+    ///
+    /// * on the inner `(bvnot t)`, `t` is not a `@bbterm`, so the bits are the
+    ///   printed `((_ @bit_of i) t)`;
+    /// * on the rewritten outer `(bvnot (@bbterm (not t_i) ...))`, the argument
+    ///   IS a `@bbterm`, so Carcara reuses its arguments and the expected
+    ///   result is `(@bbterm (not (not t_i)) ...)` — again exactly what is
+    ///   printed.
+    ///
+    /// `not_simplify` reduces a double negation, so `(= (not (not p)) p)` is in
+    /// its domain; `bitblast_var`, `cong`, `trans` and `symm` are as in the
+    /// idempotency lowering. Carcara re-derives every step from the printed
+    /// text.
+    ///
+    /// NEGATIVE DIRECTION. A single `(bvnot t) = t'` (not a double negation),
+    /// `(bvnot (bvnot t)) = u` for `u` other than `t`, a mixed nest such as
+    /// `(bvnot (bvneg t)) = t`, a non-unit clause, an over-cap width, and any
+    /// surface override that breaks the printed nesting all return `None` and
+    /// keep the honest `hole`.
+    fn format_bv_double_negation_bitblast(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let [equality] = clause else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*equality) else {
+            return None;
+        };
+        if eq != "=" || equality_args.len() != 2 {
+            return None;
+        }
+        let (left, right) = (equality_args[0], equality_args[1]);
+        let double = |term: TermId| {
+            Self::decode_bvnot(self.terms, term)
+                .and_then(|inner| Self::decode_bvnot(self.terms, inner))
+        };
+        let reversed = match double(left) {
+            Some(operand) if operand == right => false,
+            _ => match double(right) {
+                Some(operand) if operand == left => true,
+                _ => return None,
+            },
+        };
+        let (outer, operand) = if reversed {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let inner = Self::decode_bvnot(self.terms, outer)?;
+        let Sort::BitVec(bits) = self.terms.sort(outer) else {
+            return None;
+        };
+        let width = bits.width;
+        if width == 0 || width > Self::MAX_BITBLAST_LOWERING_WIDTH {
+            return None;
+        }
+
+        // Gate on the printed bytes, exactly as the idempotency lane does.
+        let printed_outer = self.format_term(outer);
+        let printed_inner = self.format_term(inner);
+        let printed_operand = self.format_term(operand);
+        let printed_equality = self.format_term(*equality);
+        let oriented_equality = if reversed {
+            format!("(= {printed_operand} {printed_outer})")
+        } else {
+            format!("(= {printed_outer} {printed_operand})")
+        };
+        if printed_equality != oriented_equality {
+            return None;
+        }
+        let [outer_argument] =
+            <[String; 1]>::try_from(split_application(&printed_outer, "bvnot")?).ok()?;
+        let [inner_argument] =
+            <[String; 1]>::try_from(split_application(&printed_inner, "bvnot")?).ok()?;
+        if outer_argument != printed_inner || inner_argument != printed_operand {
+            return None;
+        }
+
+        let operand_bits: Vec<String> = (0..width)
+            .map(|index| format!("((_ @bit_of {index}) {printed_operand})"))
+            .collect();
+        let once: Vec<String> = operand_bits
+            .iter()
+            .map(|bit| format!("(not {bit})"))
+            .collect();
+        let twice: Vec<String> = once.iter().map(|bit| format!("(not {bit})")).collect();
+        let blasted_inner = format!("(@bbterm {})", once.join(" "));
+        let blasted_outer = format!("(@bbterm {})", twice.join(" "));
+        let blasted_operand = format!("(@bbterm {})", operand_bits.join(" "));
+
+        let mut output = format!(
+            "(step {id}.in (cl (= {printed_inner} {blasted_inner})) :rule bitblast_not)\n\
+             (step {id}.lift (cl (= {printed_outer} (bvnot {blasted_inner}))) :rule cong :premises ({id}.in))\n\
+             (step {id}.out (cl (= (bvnot {blasted_inner}) {blasted_outer})) :rule bitblast_not)"
+        );
+        for (index, (double_bit, operand_bit)) in twice.iter().zip(operand_bits.iter()).enumerate()
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id}.b{index} (cl (= {double_bit} {operand_bit})) :rule not_simplify)"
+                ),
+            );
+        }
+        let bit_premises: Vec<String> = (0..width).map(|index| format!("{id}.b{index}")).collect();
+        let forward_equality = format!("(= {printed_outer} {printed_operand})");
+        let _ = std::fmt::Write::write_fmt(
+            &mut output,
+            format_args!(
+                "\n(step {id}.cong (cl (= {blasted_outer} {blasted_operand})) :rule cong :premises ({}))\n\
+                 (step {id}.var (cl (= {printed_operand} {blasted_operand})) :rule bitblast_var)\n\
+                 (step {id}.rhs (cl (= {blasted_operand} {printed_operand})) :rule symm :premises ({id}.var))",
+                bit_premises.join(" ")
+            ),
+        );
+        let chain = format!("{id}.lift {id}.out {id}.cong {id}.rhs");
+        if reversed {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id}.fwd (cl {forward_equality}) :rule trans :premises ({chain}))\n\
+                     (step {id} (cl {oriented_equality}) :rule symm :premises ({id}.fwd))"
+                ),
+            );
+        } else {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id} (cl {forward_equality}) :rule trans :premises ({chain}))"
+                ),
+            );
+        }
+        Some(output)
     }
 
     /// Alethe's `true` rule proves exactly this clause and nothing else.
@@ -2466,6 +3137,395 @@ impl<'a> AlethePrinter<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Lower AY's internally checked n-ary STORE-PERMUTATION lemma to the
+    /// array rules the pinned Carcara dialect actually implements.
+    ///
+    /// Carcara has no `store_permutation` rule (probed: `unknown rule`), so
+    /// this is a DERIVATION, not a rename. Two store chains that write the same
+    /// `(index, value)` multiset over one base differ only by a permutation of
+    /// pairwise-distinct indices, and every permutation factors into ADJACENT
+    /// transpositions. Each transposition
+    /// `store(store(X,i,v),j,w) = store(store(X,j,w),i,v)` is proved on its own
+    /// by refutation: assume the two arrays differ, take Carcara's `arrays_ext`
+    /// witness `E`, and case-split on `E`. Both readings agree when `E` misses
+    /// both indices (two `arrays_row` reductions to `select(X,E)`), when `E` is
+    /// the outer index (both sides read `w`), and when `E` is the inner index
+    /// (both sides read `v`); the fourth case makes `i = j`, which the clause's
+    /// own index-disequality literal refutes. `cong` lifts each transposition
+    /// through the untouched outer stores and `trans` composes them.
+    ///
+    /// Returns `None` — an honest `hole` — whenever the printed clause is not
+    /// exactly the schema this derivation proves. Every term used below is
+    /// re-read from the clause and re-checked against its PRINTED spelling, so
+    /// a surface override that moves an index, a value, the base array or an
+    /// equality orientation refuses instead of publishing a derivation of
+    /// something else.
+    fn format_array_store_permutation(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let shape = crate::checker::array_store_permutation_printer_terms(self.terms, clause)?;
+
+        // Capture guard: the derivation inlines the printed chains into the
+        // scope of the `arrays_ext` witness's `choice` binder, which is
+        // literally `x`, so a free `x` of any sort inside either chain would
+        // be captured by it — the document would claim a different term than
+        // the one the checker constructs. Decline, exactly as the witness
+        // installation lane above declines, and keep the honest hole.
+        if term_mentions_symbol(self.terms, shape.left_array, EXT_CHOICE_BINDER)
+            || term_mentions_symbol(self.terms, shape.right_array, EXT_CHOICE_BINDER)
+        {
+            return None;
+        }
+
+        // ---- printed surfaces, re-checked against the clause -------------
+        let literals: Vec<String> = clause.iter().map(|&lit| self.format_term(lit)).collect();
+        // A repeated literal would make the `not_not` discharge chain resolve
+        // two occurrences on one pivot; refuse rather than mis-shape the clause.
+        let unique: HashSet<&String> = literals.iter().collect();
+        if unique.len() != literals.len() {
+            return None;
+        }
+
+        let base = self.format_term(shape.base);
+        let printed_entries = |entries: &[(TermId, TermId)]| -> Vec<(String, String)> {
+            entries
+                .iter()
+                .map(|&(index, value)| (self.format_term(index), self.format_term(value)))
+                .collect()
+        };
+        let left = printed_entries(&shape.left);
+        let right = printed_entries(&shape.right);
+
+        // Distinct index TERMS must stay distinct once printed: the schema's
+        // soundness rests on it, and a surface override could collapse two.
+        let distinct: HashSet<&String> = left.iter().map(|(index, _)| index).collect();
+        if distinct.len() != left.len() {
+            return None;
+        }
+
+        let left_text = store_chain_text(&base, &left);
+        let right_text = store_chain_text(&base, &right);
+        if self.format_term(shape.left_array) != left_text
+            || self.format_term(shape.right_array) != right_text
+            || literals[shape.row_position] != format!("(= {left_text} {right_text})")
+        {
+            return None;
+        }
+
+        // Each index-equality literal must print as the exact pair it carries,
+        // in the orientation the clause spells. `diseq` maps an unordered index
+        // pair to (assumption id, printed lhs, printed rhs).
+        let mut diseq: HashMap<(String, String), (String, String, String)> = HashMap::default();
+        for &(_, position, lhs, rhs) in &shape.index_equalities {
+            let (lhs, rhs) = (self.format_term(lhs), self.format_term(rhs));
+            if literals[position] != format!("(= {lhs} {rhs})") {
+                return None;
+            }
+            let key = if lhs <= rhs {
+                (lhs.clone(), rhs.clone())
+            } else {
+                (rhs.clone(), lhs.clone())
+            };
+            diseq.insert(key, (format!("{id}.a{position}"), lhs, rhs));
+        }
+
+        let index_sort = shape.index_sort.to_string();
+
+        // ---- the adjacent-transposition schedule -------------------------
+        // An IDENTITY "permutation" needs no transposition at all, so there is
+        // nothing for this derivation to compose; it stays an honest hole
+        // rather than falling off the end of an empty schedule.
+        let swaps = adjacent_transposition_schedule(&left, &right)?;
+        if swaps.is_empty() {
+            return None;
+        }
+
+        let mut out = String::new();
+        // `subproof` appends `false` whenever the discharged block ends in the
+        // empty clause; this is the step that strips it back off.
+        out.push_str(&format!("(step {id}.nf (cl (not false)) :rule false)\n"));
+        out.push_str(&format!("(anchor :step {id}.sp0)\n"));
+        for (position, literal) in literals.iter().enumerate() {
+            out.push_str(&format!("(assume {id}.a{position} (not {literal}))\n"));
+        }
+
+        let mut current = left.clone();
+        let mut segments: Vec<(String, String, String)> = Vec::new();
+        for (nth, &at) in swaps.iter().enumerate() {
+            let rest = store_chain_text(&base, &current[at + 2..]);
+            let outer = current[at].clone();
+            let inner = current[at + 1].clone();
+            let key = if outer.0 <= inner.0 {
+                (outer.0.clone(), inner.0.clone())
+            } else {
+                (inner.0.clone(), outer.0.clone())
+            };
+            let (premise, diseq_lhs, diseq_rhs) = diseq.get(&key)?.clone();
+            let tag = format!("{id}.k{nth}");
+            let (mut before, mut after) = self.write_store_transposition(
+                &mut out,
+                &tag,
+                &rest,
+                &outer,
+                &inner,
+                &index_sort,
+                &premise,
+                (&diseq_lhs, &diseq_rhs),
+                id,
+            )?;
+            // Lift the two-store equality back out through the untouched outer
+            // stores, innermost first.
+            let mut lifted = tag.clone();
+            for depth in (0..at).rev() {
+                let (index, value) = &current[depth];
+                let next_before = format!("(store {before} {index} {value})");
+                let next_after = format!("(store {after} {index} {value})");
+                let step = format!("{tag}.l{depth}");
+                out.push_str(&format!(
+                    "(step {step} (cl (= {next_before} {next_after})) \
+                     :rule cong :premises ({lifted}))\n"
+                ));
+                lifted = step;
+                before = next_before;
+                after = next_after;
+            }
+            segments.push((lifted, before, after));
+            current.swap(at, at + 1);
+        }
+        if current != right {
+            return None;
+        }
+
+        // ---- compose the transpositions ----------------------------------
+        let mut chain_step = segments[0].0.clone();
+        let mut chain_end = segments[0].2.clone();
+        for (nth, (step, _, after)) in segments.iter().enumerate().skip(1) {
+            let composed = format!("{id}.tr{nth}");
+            out.push_str(&format!(
+                "(step {composed} (cl (= {left_text} {after})) \
+                 :rule trans :premises ({chain_step} {step}))\n"
+            ));
+            chain_step = composed;
+            chain_end = after.clone();
+        }
+        if chain_end != right_text || segments[0].1 != left_text {
+            return None;
+        }
+
+        // ---- discharge the whole clause ----------------------------------
+        out.push_str(&format!(
+            "(step {id}.bot (cl) :rule resolution :premises ({id}.a{} {chain_step}))\n",
+            shape.row_position
+        ));
+        let doubled: Vec<String> = literals
+            .iter()
+            .map(|literal| format!("(not (not {literal}))"))
+            .collect();
+        let discharge: Vec<String> = (0..literals.len())
+            .map(|position| format!("{id}.a{position}"))
+            .collect();
+        out.push_str(&format!(
+            "(step {id}.sp0 (cl {} false) :rule subproof :discharge ({}))\n",
+            doubled.join(" "),
+            discharge.join(" ")
+        ));
+        out.push_str(&format!(
+            "(step {id}.sp (cl {}) :rule resolution :premises ({id}.sp0 {id}.nf))\n",
+            doubled.join(" ")
+        ));
+        for (position, literal) in literals.iter().enumerate() {
+            out.push_str(&format!(
+                "(step {id}.d{position} (cl (not {}) {literal}) :rule not_not)\n",
+                doubled[position]
+            ));
+        }
+        let mut previous = format!("{id}.sp");
+        for position in 0..literals.len() {
+            let mut resolvent: Vec<&str> =
+                doubled[position + 1..].iter().map(String::as_str).collect();
+            resolvent.extend(literals[..=position].iter().map(String::as_str));
+            let step = if position + 1 == literals.len() {
+                id.to_string()
+            } else {
+                format!("{id}.c{position}")
+            };
+            out.push_str(&format!(
+                "(step {step} (cl {}) :rule resolution :premises ({previous} {id}.d{position}))\n",
+                resolvent.join(" ")
+            ));
+            previous = step;
+        }
+        // The emitted conclusion must be the clause the caller printed, byte
+        // for byte; anything else is a derivation of a different claim.
+        if previous != id.to_string()
+            || self.format_clause(clause) != format!("(cl {})", literals.join(" "))
+        {
+            return None;
+        }
+        out.pop();
+        Some(out)
+    }
+
+    /// Emit one adjacent transposition
+    /// `store(store(X,ii,vi),jo,wo) = store(store(X,jo,wo),ii,vi)` as a
+    /// self-contained subproof concluding `(cl (= before after))` under step
+    /// name `tag`.
+    ///
+    /// `premise` names a unit step whose term is `(not (= dl dr))` with
+    /// `{dl, dr} == {ii, jo}`; that disequality is what rules out the case
+    /// where Carcara's extensionality witness equals both indices at once.
+    /// `id` names the enclosing lemma step, whose `{id}.nf` step strips the
+    /// `false` literal `subproof` appends to every discharged refutation.
+    #[allow(clippy::too_many_arguments)]
+    fn write_store_transposition(
+        &self,
+        out: &mut String,
+        tag: &str,
+        rest: &str,
+        outer: &(String, String),
+        inner: &(String, String),
+        index_sort: &str,
+        premise: &str,
+        diseq: (&str, &str),
+        id: ProofId,
+    ) -> Option<(String, String)> {
+        let (jo, wo) = (&outer.0, &outer.1);
+        let (ii, vi) = (&inner.0, &inner.1);
+        let before = format!("(store (store {rest} {ii} {vi}) {jo} {wo})");
+        let after = format!("(store (store {rest} {jo} {wo}) {ii} {vi})");
+        // `before` minus its outer store (index `jo`), and likewise for `after`.
+        let inner_left = format!("(store {rest} {ii} {vi})");
+        let inner_right = format!("(store {rest} {jo} {wo})");
+        // The exact epsilon term Carcara's `arrays_ext` constructs for this
+        // array pair. It must match byte for byte: the rule compares with
+        // `assert_polyeq`, which does not quotient by alpha-renaming.
+        let binder = EXT_CHOICE_BINDER;
+        let witness = format!(
+            "(choice (({binder} {index_sort})) (or (= {before} {after}) \
+             (not (= (select {before} {binder}) (select {after} {binder})))))"
+        );
+        let selected = format!("(= (select {before} {witness}) (select {after} {witness}))");
+        let eq_outer = format!("(= {jo} {witness})");
+        let eq_inner = format!("(= {ii} {witness})");
+        let not_outer = format!("(not {eq_outer})");
+        let not_inner = format!("(not {eq_inner})");
+        let nf = format!("{id}.nf");
+
+        out.push_str(&format!("(anchor :step {tag}.sp0)\n"));
+        out.push_str(&format!(
+            "(assume {tag}.h (not (= {before} {after})))\n\
+             (step {tag}.ext (cl (not {selected})) :rule arrays_ext :premises ({tag}.h))\n"
+        ));
+
+        // (a) the witness misses both indices: both chains reduce to the base.
+        out.push_str(&format!(
+            "(anchor :step {tag}.nn0)\n\
+             (assume {tag}.nn.j {not_outer})\n\
+             (assume {tag}.nn.i {not_inner})\n\
+             (step {tag}.nn.1 (cl (= (select {before} {witness}) (select {inner_left} {witness}))) :rule arrays_row :premises ({tag}.nn.j))\n\
+             (step {tag}.nn.2 (cl (= (select {inner_left} {witness}) (select {rest} {witness}))) :rule arrays_row :premises ({tag}.nn.i))\n\
+             (step {tag}.nn.3 (cl (= (select {before} {witness}) (select {rest} {witness}))) :rule trans :premises ({tag}.nn.1 {tag}.nn.2))\n\
+             (step {tag}.nn.4 (cl (= (select {after} {witness}) (select {inner_right} {witness}))) :rule arrays_row :premises ({tag}.nn.i))\n\
+             (step {tag}.nn.5 (cl (= (select {inner_right} {witness}) (select {rest} {witness}))) :rule arrays_row :premises ({tag}.nn.j))\n\
+             (step {tag}.nn.6 (cl (= (select {after} {witness}) (select {rest} {witness}))) :rule trans :premises ({tag}.nn.4 {tag}.nn.5))\n\
+             (step {tag}.nn.7 (cl (= (select {rest} {witness}) (select {after} {witness}))) :rule symm :premises ({tag}.nn.6))\n\
+             (step {tag}.nn.8 (cl {selected}) :rule trans :premises ({tag}.nn.3 {tag}.nn.7))\n\
+             (step {tag}.nn.9 (cl) :rule resolution :premises ({tag}.ext {tag}.nn.8))\n\
+             (step {tag}.nn0 (cl (not {not_outer}) (not {not_inner}) false) :rule subproof :discharge ({tag}.nn.j {tag}.nn.i))\n\
+             (step {tag}.nn1 (cl (not {not_outer}) (not {not_inner})) :rule resolution :premises ({tag}.nn0 {nf}))\n\
+             (step {tag}.na (cl (not (not {not_outer})) {eq_outer}) :rule not_not)\n\
+             (step {tag}.nb (cl (not (not {not_inner})) {eq_inner}) :rule not_not)\n\
+             (step {tag}.nn2 (cl (not {not_inner}) {eq_outer}) :rule resolution :premises ({tag}.nn1 {tag}.na))\n\
+             (step {tag}.nnR (cl {eq_outer} {eq_inner}) :rule resolution :premises ({tag}.nn2 {tag}.nb))\n"
+        ));
+
+        // (b) the witness IS the outer index: both chains read the outer value.
+        out.push_str(&format!(
+            "(anchor :step {tag}.pj0)\n\
+             (assume {tag}.pj.j {eq_outer})\n\
+             (assume {tag}.pj.i {not_inner})\n\
+             (step {tag}.pj.1 (cl (= (select {before} {jo}) {wo})) :rule arrays_idx)\n\
+             (step {tag}.pj.2 (cl (= (select {before} {jo}) (select {before} {witness}))) :rule cong :premises ({tag}.pj.j))\n\
+             (step {tag}.pj.3 (cl (= (select {before} {witness}) (select {before} {jo}))) :rule symm :premises ({tag}.pj.2))\n\
+             (step {tag}.pj.4 (cl (= (select {before} {witness}) {wo})) :rule trans :premises ({tag}.pj.3 {tag}.pj.1))\n\
+             (step {tag}.pj.5 (cl (= (select {after} {witness}) (select {inner_right} {witness}))) :rule arrays_row :premises ({tag}.pj.i))\n\
+             (step {tag}.pj.6 (cl (= (select {inner_right} {jo}) {wo})) :rule arrays_idx)\n\
+             (step {tag}.pj.7 (cl (= (select {inner_right} {jo}) (select {inner_right} {witness}))) :rule cong :premises ({tag}.pj.j))\n\
+             (step {tag}.pj.8 (cl (= (select {inner_right} {witness}) (select {inner_right} {jo}))) :rule symm :premises ({tag}.pj.7))\n\
+             (step {tag}.pj.9 (cl (= (select {inner_right} {witness}) {wo})) :rule trans :premises ({tag}.pj.8 {tag}.pj.6))\n\
+             (step {tag}.pj.10 (cl (= (select {after} {witness}) {wo})) :rule trans :premises ({tag}.pj.5 {tag}.pj.9))\n\
+             (step {tag}.pj.11 (cl (= {wo} (select {after} {witness}))) :rule symm :premises ({tag}.pj.10))\n\
+             (step {tag}.pj.12 (cl {selected}) :rule trans :premises ({tag}.pj.4 {tag}.pj.11))\n\
+             (step {tag}.pj.13 (cl) :rule resolution :premises ({tag}.ext {tag}.pj.12))\n\
+             (step {tag}.pj0 (cl (not {eq_outer}) (not {not_inner}) false) :rule subproof :discharge ({tag}.pj.j {tag}.pj.i))\n\
+             (step {tag}.pj1 (cl (not {eq_outer}) (not {not_inner})) :rule resolution :premises ({tag}.pj0 {nf}))\n\
+             (step {tag}.pjR (cl (not {eq_outer}) {eq_inner}) :rule resolution :premises ({tag}.pj1 {tag}.nb))\n"
+        ));
+
+        // (c) the witness IS the inner index: both chains read the inner value.
+        out.push_str(&format!(
+            "(anchor :step {tag}.pi0)\n\
+             (assume {tag}.pi.i {eq_inner})\n\
+             (assume {tag}.pi.j {not_outer})\n\
+             (step {tag}.pi.1 (cl (= (select {before} {witness}) (select {inner_left} {witness}))) :rule arrays_row :premises ({tag}.pi.j))\n\
+             (step {tag}.pi.2 (cl (= (select {inner_left} {ii}) {vi})) :rule arrays_idx)\n\
+             (step {tag}.pi.3 (cl (= (select {inner_left} {ii}) (select {inner_left} {witness}))) :rule cong :premises ({tag}.pi.i))\n\
+             (step {tag}.pi.4 (cl (= (select {inner_left} {witness}) (select {inner_left} {ii}))) :rule symm :premises ({tag}.pi.3))\n\
+             (step {tag}.pi.5 (cl (= (select {inner_left} {witness}) {vi})) :rule trans :premises ({tag}.pi.4 {tag}.pi.2))\n\
+             (step {tag}.pi.6 (cl (= (select {before} {witness}) {vi})) :rule trans :premises ({tag}.pi.1 {tag}.pi.5))\n\
+             (step {tag}.pi.7 (cl (= (select {after} {ii}) {vi})) :rule arrays_idx)\n\
+             (step {tag}.pi.8 (cl (= (select {after} {ii}) (select {after} {witness}))) :rule cong :premises ({tag}.pi.i))\n\
+             (step {tag}.pi.9 (cl (= {vi} (select {after} {ii}))) :rule symm :premises ({tag}.pi.7))\n\
+             (step {tag}.pi.10 (cl (= {vi} (select {after} {witness}))) :rule trans :premises ({tag}.pi.9 {tag}.pi.8))\n\
+             (step {tag}.pi.11 (cl {selected}) :rule trans :premises ({tag}.pi.6 {tag}.pi.10))\n\
+             (step {tag}.pi.12 (cl) :rule resolution :premises ({tag}.ext {tag}.pi.11))\n\
+             (step {tag}.pi0 (cl (not {eq_inner}) (not {not_outer}) false) :rule subproof :discharge ({tag}.pi.i {tag}.pi.j))\n\
+             (step {tag}.pi1 (cl (not {eq_inner}) (not {not_outer})) :rule resolution :premises ({tag}.pi0 {nf}))\n\
+             (step {tag}.piR (cl (not {eq_inner}) {eq_outer}) :rule resolution :premises ({tag}.pi1 {tag}.na))\n"
+        ));
+
+        // (d) the witness is BOTH indices at once: refuted by the clause's own
+        //     index disequality, in the exact orientation that literal spells.
+        // `pp.i` assumes `(= ii witness)` and `pp.j` assumes `(= jo witness)`;
+        // flipping one of them and chaining reproduces either spelling of the
+        // index equality, and the premise refutes exactly the one it carries.
+        let (contradiction, chained, flipped, flipped_conclusion) = match diseq {
+            (lhs, rhs) if (lhs, rhs) == (ii.as_str(), jo.as_str()) => (
+                format!("(= {ii} {jo})"),
+                format!("{tag}.pp.i"),
+                format!("{tag}.pp.j"),
+                format!("(= {witness} {jo})"),
+            ),
+            (lhs, rhs) if (lhs, rhs) == (jo.as_str(), ii.as_str()) => (
+                format!("(= {jo} {ii})"),
+                format!("{tag}.pp.j"),
+                format!("{tag}.pp.i"),
+                format!("(= {witness} {ii})"),
+            ),
+            _ => return None,
+        };
+        out.push_str(&format!(
+            "(anchor :step {tag}.pp0)\n\
+             (assume {tag}.pp.i {eq_inner})\n\
+             (assume {tag}.pp.j {eq_outer})\n\
+             (step {tag}.pp.1 (cl {flipped_conclusion}) :rule symm :premises ({flipped}))\n\
+             (step {tag}.pp.2 (cl {contradiction}) :rule trans :premises ({chained} {tag}.pp.1))\n\
+             (step {tag}.pp.3 (cl) :rule resolution :premises ({premise} {tag}.pp.2))\n\
+             (step {tag}.pp0 (cl (not {eq_inner}) (not {eq_outer}) false) :rule subproof :discharge ({tag}.pp.i {tag}.pp.j))\n\
+             (step {tag}.ppR (cl (not {eq_inner}) (not {eq_outer})) :rule resolution :premises ({tag}.pp0 {nf}))\n"
+        ));
+
+        // The four cases are exhaustive, so the refutation closes.
+        out.push_str(&format!(
+            "(step {tag}.r1 (cl {eq_inner}) :rule resolution :premises ({tag}.nnR {tag}.pjR))\n\
+             (step {tag}.r2 (cl (not {eq_inner})) :rule resolution :premises ({tag}.piR {tag}.ppR))\n\
+             (step {tag}.bot (cl) :rule resolution :premises ({tag}.r1 {tag}.r2))\n\
+             (step {tag}.sp0 (cl (not (not (= {before} {after}))) false) :rule subproof :discharge ({tag}.h))\n\
+             (step {tag}.sp (cl (not (not (= {before} {after})))) :rule resolution :premises ({tag}.sp0 {nf}))\n\
+             (step {tag}.nn3 (cl (not (not (not (= {before} {after})))) (= {before} {after})) :rule not_not)\n\
+             (step {tag} (cl (= {before} {after})) :rule resolution :premises ({tag}.sp {tag}.nn3))\n"
+        ));
+        Some((before, after))
     }
 
     /// Lower AY's internally checked ROW1/ROW2 lemmas to the array rules
@@ -3767,6 +4827,16 @@ impl<'a> AlethePrinter<'a> {
         // an instance of it (see `wire_rule_for_printed_step`).
         let wire =
             Self::wire_rule_for_printed_step(rule.wire_name(), &clause_str, premises.is_empty());
+        // Same last-chance lowering the theory-lemma path gets: a premise-free
+        // ground bitvector disequality is re-derivable by the checker itself
+        // (`evaluate` + `equiv1` + `false` + `resolution`). Premise-carrying
+        // steps are excluded because the replacement re-derives the clause
+        // from nothing and would silently drop those premises.
+        if wire == ay_core::UNPROVED_STEP_RULE && premises.is_empty() && args.is_empty() {
+            if let Some(text) = Self::lower_ground_bv_disequality(id, &clause_str) {
+                return Ok(text);
+            }
+        }
         let mut result = format!("(step {id} {clause_str} :rule {wire}");
         if !premises.is_empty() {
             let premises_str: Vec<String> = premises.iter().map(ToString::to_string).collect();
@@ -5522,6 +6592,41 @@ const PRINTED_NESTING_NODE_BUDGET: usize = 4096;
 /// it could otherwise be made to collide with a different body on purpose.
 const CHOICE_BINDER_NORMAL_FORM: &str = "|ay!choice-binder|";
 
+/// Render the printed `store` chain `entries` (OUTERMOST-FIRST) over `base`.
+fn store_chain_text(base: &str, entries: &[(String, String)]) -> String {
+    let mut text = base.to_string();
+    for (index, value) in entries.iter().rev() {
+        text = format!("(store {text} {index} {value})");
+    }
+    text
+}
+
+/// Positions of the ADJACENT transpositions that turn `left` into `right`.
+///
+/// Returns `None` when the two lists are not permutations of each other, which
+/// keeps the caller fail-closed instead of emitting a partial rearrangement.
+/// Each returned position `p` swaps entries `p` and `p + 1` of the list as it
+/// stands after all earlier swaps, so the caller can replay the schedule and
+/// name the intermediate chains.
+fn adjacent_transposition_schedule(
+    left: &[(String, String)],
+    right: &[(String, String)],
+) -> Option<Vec<usize>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut current: Vec<(String, String)> = left.to_vec();
+    let mut swaps = Vec::new();
+    for (target, wanted) in right.iter().enumerate() {
+        let found = (target..current.len()).find(|&at| &current[at] == wanted)?;
+        for at in (target..found).rev() {
+            swaps.push(at);
+            current.swap(at, at + 1);
+        }
+    }
+    (current == right).then_some(swaps)
+}
+
 /// Whether `needle` occurs anywhere inside `haystack` (inclusive).
 fn term_mentions(terms: &TermStore, haystack: TermId, needle: TermId) -> bool {
     walk_subterms(terms, haystack, &mut |term, _| term == needle)
@@ -5531,7 +6636,11 @@ fn term_mentions(terms: &TermStore, haystack: TermId, needle: TermId) -> bool {
 fn term_mentions_symbol(terms: &TermStore, haystack: TermId, name: &str) -> bool {
     walk_subterms(terms, haystack, &mut |_, data| match data {
         TermData::Var(symbol, _) => symbol == name,
-        TermData::App(Symbol::Named(symbol), args) => args.is_empty() && symbol == name,
+        // An application HEAD wearing the binder's name is a mention too: the
+        // printed `(name arg…)` is a parse error inside `(choice ((name S)) …)`,
+        // so treating it as clean would regress the document from `holey` to
+        // `invalid`. Declining is fail-closed — the step stays an honest hole.
+        TermData::App(Symbol::Named(symbol), _) => symbol == name,
         TermData::Forall(bindings, _, _) | TermData::Exists(bindings, _, _) => {
             bindings.iter().any(|(binder, _)| binder == name)
         }
@@ -5751,6 +6860,51 @@ fn split_not_and(s: &str) -> Option<Vec<String>> {
     split_not_and_full(s).map(|(_, conjuncts)| conjuncts)
 }
 
+/// Parse a PRINTED SMT-LIB bit-vector literal into `(value, width)`.
+///
+/// Accepts the three surface spellings a problem file may legitimately use for
+/// a bit-vector constant: `#b<bits>`, `#x<hex digits>` and `(_ bv<value>
+/// <width>)`. Everything else — a variable, an application, a literal whose
+/// value does not fit its declared width — returns `None`, so a caller gating
+/// a lowering on this can never mistake a non-constant for a constant.
+fn parse_printed_bitvec_literal(text: &str) -> Option<(num_bigint::BigUint, u32)> {
+    let text = text.trim();
+    if let Some(digits) = text.strip_prefix("#b") {
+        if digits.is_empty() || !digits.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
+            return None;
+        }
+        let width = u32::try_from(digits.len()).ok()?;
+        return Some((
+            num_bigint::BigUint::parse_bytes(digits.as_bytes(), 2)?,
+            width,
+        ));
+    }
+    if let Some(digits) = text.strip_prefix("#x") {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let width = u32::try_from(digits.len()).ok()?.checked_mul(4)?;
+        return Some((
+            num_bigint::BigUint::parse_bytes(digits.as_bytes(), 16)?,
+            width,
+        ));
+    }
+    let mut tokens = text
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .split_whitespace();
+    if tokens.next()? != "_" {
+        return None;
+    }
+    let digits = tokens.next()?.strip_prefix("bv")?;
+    let width: u32 = tokens.next()?.parse().ok()?;
+    if tokens.next().is_some() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = num_bigint::BigUint::parse_bytes(digits.as_bytes(), 10)?;
+    (value.bits() <= u64::from(width)).then_some((value, width))
+}
+
 /// Split a rendered application string `(op A1 ... An)` into its top-level
 /// argument strings by balanced-token scanning. Returns `None` when `s` is
 /// not an application of `op`.
@@ -5767,6 +6921,12 @@ fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
 fn split_sexpr_tokens(inner: &str) -> Option<Vec<String>> {
     split_smt_terms(inner)
 }
+
+/// A decoded bit-wise-idempotent bit-vector gate: the SMT-LIB operator, the
+/// Carcara bit-blasting rule for it, the Boolean connective that rule builds
+/// each bit from, the simplification rule discharging that connective's
+/// idempotency, and the repeated operand.
+type IdempotentBvGate<'n> = (&'n str, &'n str, &'n str, &'n str, TermId);
 
 /// One `let` level of a printed surface term: its bindings and its body.
 type PrintedLetLevel = (Vec<(String, String)>, String);

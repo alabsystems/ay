@@ -28,6 +28,27 @@
 //! a term is non-ground, uses an operator this evaluator does not implement,
 //! is under-specified by SMT-LIB (`(div x 0)`), or the work budget runs out.
 //! `None` propagates to a rejected lemma, never to an accepted one.
+//!
+//! NAME AUTHORITY. This evaluator recognizes an operator by its SPELLING, so
+//! every spelling it interprets must be one `ay-frontend` GUARANTEES denotes
+//! the native operator — a member of `RESERVED_OP_NAMES` (undeclarable) or of
+//! the `MapTarget`/`DeclarationActivated` rows of
+//! `EXCLUDED_DECLARABLE_OP_NAMES`, i.e. exactly
+//! `ay_frontend::is_canonical_theory_operator_identity`. A spelling outside
+//! that set is an ordinary user symbol: `(declare-fun <spelling> …)` succeeds
+//! and the declaration keeps that exact surface name in the core term DAG, so
+//! interpreting it here would certify a "ground tautology" about a function the
+//! problem left uninterpreted.
+//!
+//! Four invented dotted spellings — `str.to.code`, `str.from.code`,
+//! `str.from.int`, `str.is.digit` — were accepted here as aliases and were
+//! exactly that hole. They are in NEITHER frontend table, no elaborator arm
+//! produces them, and z3 5.0.0 rejects them ("unknown constant str.to.code"),
+//! so the only way such an application can exist is a user declaration. They
+//! are gone. The genuine SMT-LIB 2.5 dotted aliases this evaluator still
+//! accepts (`str.to.int`, `str.to.re`, `str.in.re`) ARE reserved, so they stay.
+//! `checker/name_authority_tests.rs` re-derives this condition mechanically
+//! from these sources at test time and fails on any new unowned spelling.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet};
 use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId, TermStore};
@@ -456,7 +477,14 @@ impl<'a> GroundEval<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn eval_app(&mut self, sym: &Symbol, args: &[TermId]) -> Option<Val> {
-        let name = sym.name();
+        // Every operation evaluated here is a plain SMT-LIB symbol. An indexed
+        // identifier with the same spelling is a different identity and must
+        // not inherit the named builtin's semantics. Indexed regex repetition
+        // is handled separately by `re_match_uncached` below.
+        let Symbol::Named(name) = sym else {
+            return None;
+        };
+        let name = name.as_str();
         match (name, args.len()) {
             // ---- Boolean connectives ----
             ("and", _) if !args.is_empty() => {
@@ -745,7 +773,7 @@ impl<'a> GroundEval<'a> {
                 out.extend_from_slice(&s[pos..]);
                 Some(Val::Str(out))
             }
-            ("str.to_code" | "str.to.code", 1) => {
+            ("str.to_code", 1) => {
                 let s = self.eval_string(args[0])?;
                 if s.len() != 1 {
                     return Some(Val::Int(BigInt::from(-1i8)));
@@ -765,7 +793,7 @@ impl<'a> GroundEval<'a> {
                 }
                 Some(Val::Int(BigInt::from(s[0] as u32)))
             }
-            ("str.from_code" | "str.from.code", 1) => {
+            ("str.from_code", 1) => {
                 let n = self.eval_int(args[0])?;
                 let Some(n) = n.to_u32() else {
                     return Some(Val::Str(Vec::new()));
@@ -799,7 +827,7 @@ impl<'a> GroundEval<'a> {
                 let digits: String = s.iter().collect();
                 Some(Val::Int(digits.parse::<BigInt>().ok()?))
             }
-            ("str.from_int" | "str.from.int", 1) => {
+            ("str.from_int", 1) => {
                 let n = self.eval_int(args[0])?;
                 if n.is_negative() {
                     return Some(Val::Str(Vec::new()));
@@ -819,7 +847,7 @@ impl<'a> GroundEval<'a> {
                 self.reserve_string_chars(chars)?;
                 Some(Val::Str(digits.chars().collect()))
             }
-            ("str.is_digit" | "str.is.digit", 1) => {
+            ("str.is_digit", 1) => {
                 let s = self.eval_string(args[0])?;
                 self.spend_work(1)?;
                 Some(Val::Bool(s.len() == 1 && s[0].is_ascii_digit()))
@@ -879,7 +907,31 @@ impl<'a> GroundEval<'a> {
         };
         let sym = sym.clone();
         let args = args.clone();
-        let name = sym.name();
+
+        // `re.^` and `re.loop` are the only indexed regex constructors this
+        // checker implements. Do not let any other indexed identifier inherit
+        // the semantics of a same-spelled named constructor.
+        if let Symbol::Indexed(name, indices) = &sym {
+            return match (name.as_str(), args.len()) {
+                ("re.loop", 1) => {
+                    let [lo, hi] = indices.as_slice() else {
+                        return None;
+                    };
+                    self.re_loop(r, args[0], u64::from(*lo), u64::from(*hi), i, j)
+                }
+                ("re.^", 1) => {
+                    let [n] = indices.as_slice() else {
+                        return None;
+                    };
+                    self.re_loop(r, args[0], u64::from(*n), u64::from(*n), i, j)
+                }
+                _ => None,
+            };
+        }
+        let Symbol::Named(name) = &sym else {
+            return None;
+        };
+        let name = name.as_str();
         match (name, args.len()) {
             ("re.none", 0) => Some(false),
             ("re.all", 0) => Some(true),
@@ -947,24 +999,6 @@ impl<'a> GroundEval<'a> {
                     }
                 }
                 Some(true)
-            }
-            ("re.loop", 1) => {
-                let Symbol::Indexed(_, indices) = &sym else {
-                    return None;
-                };
-                let [lo, hi] = indices[..] else {
-                    return None;
-                };
-                self.re_loop(r, args[0], u64::from(lo), u64::from(hi), i, j)
-            }
-            ("re.^", 1) => {
-                let Symbol::Indexed(_, indices) = &sym else {
-                    return None;
-                };
-                let [n] = indices[..] else {
-                    return None;
-                };
-                self.re_loop(r, args[0], u64::from(n), u64::from(n), i, j)
             }
             _ => None,
         }

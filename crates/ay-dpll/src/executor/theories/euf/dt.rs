@@ -10,7 +10,7 @@ use crate::preprocess::PreprocessingPass;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
-use ay_core::{Sort, TermId, TheoryLit, TheorySolver};
+use ay_core::{Sort, TermId, TheoryLemmaKind, TheoryLit, TheorySolver};
 use ay_dt::DtSolver;
 
 /// Budget for post-`Sat` model-e-graph recheck lemma rounds per
@@ -253,6 +253,67 @@ impl DtLazyAttemptState {
 }
 
 impl Executor {
+    /// Record injected DT axioms as proof-tracker theory lemmas, upgrading
+    /// `Generic` to a strict-checkable typed kind exactly when the checker's
+    /// OWN recognizer accepts the recorded clause (#trust-count→0, C1.iv).
+    ///
+    /// Each probe calls an `ay_proof` recognizer that IS the strict validator
+    /// (`validate_*(..).is_ok()`; checker/datatype_axiom.rs), fed the SAME
+    /// registries the mint-time strict check receives
+    /// (`datatype_decls_for_strict_proof` /
+    /// `ctor_selector_decls_for_strict_proof`), so a lemma is tagged only when
+    /// strict mode will independently re-validate that exact clause —
+    /// classifier and checker cannot drift (the `promote_datatype_distinct_lemmas`
+    /// / `push_array_axiom_assertion_site` precedent). Everything the
+    /// recognizers decline — the constructor/exhaustiveness families without
+    /// validators, the array∘DT bridge implications, guarded acyclicity
+    /// clauses, depth axioms — is recorded `Generic` exactly as before, so the
+    /// change is provably decline-only with respect to publication: no shape
+    /// the validator rejects is ever tagged.
+    ///
+    /// The recorded lemma is the unit clause `[axiom]` where the axiom may be
+    /// an `or`/`=>` term; the DT validators or-flatten internally
+    /// (`flatten_clause_literals`), so probing the exact recorded clause
+    /// performs the same flattened comparison the euf.rs precedent makes
+    /// explicitly — and guarantees the probe sees precisely what the checker
+    /// will later validate.
+    fn record_dt_axiom_theory_lemmas(&mut self, axioms: &[TermId]) {
+        let dt_decls = self.datatype_decls_for_strict_proof();
+        let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+        for &axiom in axioms {
+            let clause = [axiom];
+            // Family (A) selector projection `sel_i(C(a..)) = a_i`.
+            if ay_proof::recognize_datatype_selector_project(
+                &self.ctx.terms,
+                &clause,
+                &ctor_selectors,
+            ) {
+                let _ = self.proof_tracker.add_theory_lemma_with_kind(
+                    vec![axiom],
+                    TheoryLemmaKind::DatatypeSelectorProject,
+                );
+            // Families (B)/(B') tester evaluation `is-C(C(..))` /
+            // `(not (is-C' (C ..)))` (the `= true/false` forms fold to these at
+            // `mk_eq`), plus whatever else the tester validator itself accepts
+            // (complete tester exhaustiveness, nullary-sibling form). The
+            // `_with_selectors` variant matches the checker dispatch exactly:
+            // `check_proof_strict_with_datatypes` always supplies both
+            // registries (checker/mod.rs `DatatypeTesterEval` arm).
+            } else if ay_proof::recognize_datatype_tester_eval_with_selectors(
+                &self.ctx.terms,
+                &clause,
+                &dt_decls,
+                &ctor_selectors,
+            ) {
+                let _ = self
+                    .proof_tracker
+                    .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::DatatypeTesterEval);
+            } else {
+                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+            }
+        }
+    }
+
     /// Solve using DT (datatypes) theory for QF_DT logic.
     ///
     /// Implements DPLL(T) with datatype theory solver. The solver handles:
@@ -376,9 +437,7 @@ impl Executor {
         // cannot cause a false-UNSAT.
         extra_axioms.extend(self.dt_guarded_acyclicity_guard_units(&assertions_snapshot, &[]));
         if self.produce_proofs_enabled() {
-            for &axiom in &extra_axioms {
-                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
-            }
+            self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
         // Pre-collect datatype registration data to avoid borrowing self.ctx
@@ -914,9 +973,7 @@ impl Executor {
         }
 
         if self.produce_proofs_enabled() {
-            for &axiom in &extra_axioms {
-                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
-            }
+            self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
         let base_len = self.ctx.assertions.len();
@@ -992,9 +1049,7 @@ impl Executor {
         extra_axioms.extend(self.dt_store_value_injectivity_axioms(&base_assertions));
 
         if self.produce_proofs_enabled() {
-            for &axiom in &extra_axioms {
-                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
-            }
+            self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
         let base_len = self.ctx.assertions.len();
@@ -2683,5 +2738,126 @@ mod rollback_artifact_tests {
             .expect("clamped lane cannot fail");
 
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod dt_axiom_attribution_tests {
+    use ay_core::ProofStep;
+    use ay_frontend::parse;
+
+    use super::*;
+
+    /// C1.iv retag pass: `record_dt_axiom_theory_lemmas` must tag exactly the
+    /// shapes the ay-proof validators accept (selector projection ->
+    /// `DatatypeSelectorProject`, tester evaluation/exhaustiveness ->
+    /// `DatatypeTesterEval`) and keep every declined shape `Generic` —
+    /// classifier equals validator, decline-only.
+    #[test]
+    fn dt_axiom_recording_tags_validator_accepted_families_only() {
+        let mut exec = Executor::new();
+        let commands = parse(
+            r#"
+            (set-logic QF_DT)
+            (declare-datatype Pair ((mk (first Int) (second Int)) (unit)))
+            (declare-const p Pair)
+            "#,
+        )
+        .expect("datatype declarations parse");
+        exec.execute_all(&commands).expect("declarations execute");
+        exec.proof_tracker.enable();
+
+        let p = exec.ctx.terms.lookup("p").expect("p is declared");
+        let pair_sort = exec.ctx.terms.sort(p).clone();
+        let one = exec.ctx.terms.mk_int(1.into());
+        let two = exec.ctx.terms.mk_int(2.into());
+        let mk_pair = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("mk"), vec![one, two], pair_sort);
+
+        // Family (A): `(= (first (mk 1 2)) 1)` -> DatatypeSelectorProject.
+        let first_app = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("first"), vec![mk_pair], Sort::Int);
+        let selector_axiom = exec.ctx.terms.mk_eq(first_app, one);
+
+        // Family (B) positive: `(is-mk (mk 1 2))` (the emitted `= .. true`
+        // folds to this at mk_eq) -> DatatypeTesterEval.
+        let tester_pos = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-mk"), vec![mk_pair], Sort::Bool);
+
+        // Family (B) negative: `(not (is-unit (mk 1 2)))` -> DatatypeTesterEval.
+        let tester_unit =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("is-unit"), vec![mk_pair], Sort::Bool);
+        let tester_neg = exec.ctx.terms.mk_not(tester_unit);
+
+        // Family (D): complete tester exhaustiveness over one subject —
+        // accepted by the tester validator's exhaustiveness branch.
+        let is_mk_p = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-mk"), vec![p], Sort::Bool);
+        let is_unit_p = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-unit"), vec![p], Sort::Bool);
+        let exhaustive = exec.ctx.terms.mk_or(vec![is_mk_p, is_unit_p]);
+
+        // No validator accepts this (acyclicity-disjunct/bridge residue
+        // stand-in): `(not (= p (mk 1 2)))` must stay Generic.
+        let p_eq_ctor = exec.ctx.terms.mk_eq(p, mk_pair);
+        let generic_residue = exec.ctx.terms.mk_not(p_eq_ctor);
+
+        let axioms = [
+            selector_axiom,
+            tester_pos,
+            tester_neg,
+            exhaustive,
+            generic_residue,
+        ];
+        exec.record_dt_axiom_theory_lemmas(&axioms);
+        let proof = exec.proof_tracker.take_proof();
+
+        let expected = [
+            (selector_axiom, TheoryLemmaKind::DatatypeSelectorProject),
+            (tester_pos, TheoryLemmaKind::DatatypeTesterEval),
+            (tester_neg, TheoryLemmaKind::DatatypeTesterEval),
+            (exhaustive, TheoryLemmaKind::DatatypeTesterEval),
+            (generic_residue, TheoryLemmaKind::Generic),
+        ];
+        assert_eq!(proof.steps.len(), expected.len());
+        for (step, (axiom, expected_kind)) in proof.steps.iter().zip(expected) {
+            match step {
+                ProofStep::TheoryLemma { kind, clause, .. } => {
+                    assert_eq!(clause, &vec![axiom]);
+                    assert_eq!(*kind, expected_kind, "wrong kind for clause {clause:?}");
+                }
+                other => panic!("expected theory lemma, got {other:?}"),
+            }
+        }
+
+        // Classifier == validator: every typed step must re-validate against
+        // the SAME registries the mint-time strict check receives.
+        let decls = exec.datatype_decls_for_strict_proof();
+        let selectors = exec.ctor_selector_decls_for_strict_proof();
+        assert!(ay_proof::recognize_datatype_selector_project(
+            &exec.ctx.terms,
+            &[selector_axiom],
+            &selectors,
+        ));
+        for tester in [tester_pos, tester_neg, exhaustive] {
+            assert!(ay_proof::recognize_datatype_tester_eval_with_selectors(
+                &exec.ctx.terms,
+                &[tester],
+                &decls,
+                &selectors,
+            ));
+        }
     }
 }

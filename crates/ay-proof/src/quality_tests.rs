@@ -313,7 +313,11 @@ fn test_metered_premise_authentication_debits_private_bv_replay_budget() {
         None,
         &[],
         &mut |work, bytes| {
-            if work >= 50_000_000 || bytes >= 128 * 1024 * 1024 {
+            if work
+                == usize::try_from(crate::MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA)
+                    .expect("published work fits usize")
+                && bytes == crate::MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA
+            {
                 saw_private_budget = true;
                 false
             } else {
@@ -446,7 +450,7 @@ fn test_string_ground_meter_covers_decoding_clones_and_tables() {
         .expect("small string payload products should fit usize");
     let table_overhead = crate::checker::STRING_EVAL_WORK_LIMIT * 96;
     let char_allocation = crate::checker::STRING_CHAR_ALLOCATION_LIMIT * size_of::<char>();
-    let numeric_allocation = (crate::checker::STRING_NUMERIC_BIT_ALLOCATION_LIMIT + 7) / 8;
+    let numeric_allocation = crate::checker::STRING_NUMERIC_BIT_ALLOCATION_LIMIT.div_ceil(8);
     let private_work = crate::checker::STRING_EVAL_WORK_LIMIT
         + crate::checker::STRING_CHAR_ALLOCATION_LIMIT
         + crate::checker::STRING_NUMERIC_WORK_LIMIT;
@@ -500,7 +504,7 @@ fn test_ext_diff_meter_multiplies_reachable_payload_per_binding() {
 
     let (work, bytes) = ext_diff_registry_charge(&proof, &terms, payload)
         .expect("small checked products should fit usize");
-    assert!(work >= 2 * payload.work + 1);
+    assert!(work > 2 * payload.work);
     assert!(bytes >= 2 * payload.bytes);
 }
 

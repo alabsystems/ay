@@ -500,6 +500,34 @@ fn accepts_the_ground_add_identity_and_rejects_its_negation() {
 }
 
 #[test]
+fn indexed_named_fp_builtins_fail_closed() {
+    let mut terms = TermStore::new();
+    let rne = rounding_mode(&mut terms, "RNE");
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let indexed_add = terms.mk_app(
+        Symbol::indexed("fp.add", vec![0]),
+        vec![rne, zero, zero],
+        fp_sort(F32),
+    );
+    let forged_add = predicate(&mut terms, "fp.eq", vec![indexed_add, zero]);
+    assert!(!recognize_fp_ground_eval(&terms, &[forged_add]));
+    validate_fp_ground_eval(&terms, ProofId(0), &[forged_add])
+        .expect_err("an indexed identifier named `fp.add` is not the named FP builtin");
+
+    // Binding extraction is also identity-sensitive. Treating `(_ = 0)` as
+    // core equality would substitute `x := +zero` and incorrectly make the
+    // first literal below true without evaluating the forged second literal.
+    let x = terms.mk_var("indexed_equality_x", fp_sort(F32));
+    let is_zero = predicate(&mut terms, "fp.isZero", vec![x]);
+    let indexed_equality = terms.mk_app(Symbol::indexed("=", vec![0]), vec![x, zero], Sort::Bool);
+    let not_indexed_equality = terms.mk_not(indexed_equality);
+    let forged_binding = [is_zero, not_indexed_equality];
+    assert!(!recognize_fp_ground_eval(&terms, &forged_binding));
+    validate_fp_ground_eval(&terms, ProofId(0), &forged_binding)
+        .expect_err("an indexed identifier named `=` must not authorize an FP binding");
+}
+
+#[test]
 fn accepts_infinity_times_zero_is_nan_and_rejects_the_near_miss() {
     let mut terms = TermStore::new();
     let rne = rounding_mode(&mut terms, "RNE");
@@ -755,4 +783,49 @@ fn real_to_fp_conversions_respect_the_rounding_mode() {
     let x_is_toward_zero = predicate(&mut terms, "=", vec![x, toward_zero]);
     let falsifiable = vec![terms.mk_not(x_is_toward_zero), terms.mk_not(x_is_nearest)];
     assert!(!recognize_fp_ground_eval(&terms, &falsifiable));
+}
+
+/// A BARE-named FP special literal must never be evaluated as the IEEE
+/// constant, and an indexed one whose indices disagree with its sort must not
+/// either.
+///
+/// `ay-frontend` classifies `+zero`/`-zero`/`+oo`/`-oo`/`NaN` `IndexedOnly`:
+/// only `(_ NaN eb sb)` is theory syntax, while the BARE spelling stays an
+/// ordinary user-declarable identity
+/// (`declaration_requires_private_core_identity` leaves it alone, so a
+/// declaration keeps that exact surface name in the core term DAG). Matching on
+/// `sym.name()` alone would therefore hand IEEE semantics to a declared symbol.
+/// This validator destructures `Symbol::Indexed` and pins the indices to the
+/// recorded `Sort::FloatingPoint`, so the check is LOCAL rather than resting on
+/// the frontend minting declared nullary symbols as `TermData::Var`.
+#[test]
+fn bare_named_fp_special_literals_are_not_ieee_constants() {
+    // Control: the genuine indexed literal still certifies `(fp.isNaN NaN)`.
+    let mut terms = TermStore::new();
+    let nan = fp_literal(&mut terms, "NaN", F32);
+    let claim = predicate(&mut terms, "fp.isNaN", vec![nan]);
+    validate_fp_ground_eval(&terms, ProofId(0), &[claim])
+        .expect("the indexed `(_ NaN 8 24)` literal must still evaluate");
+
+    // A BARE `NaN` of the same sort is an ordinary symbol, so nothing about it
+    // is ground and the lemma must fail closed.
+    let mut terms = TermStore::new();
+    let bare = terms.mk_app(Symbol::named("NaN"), vec![], fp_sort(F32));
+    let claim = predicate(&mut terms, "fp.isNaN", vec![bare]);
+    validate_fp_ground_eval(&terms, ProofId(0), &[claim]).expect_err(
+        "a bare `NaN` application is a user-declarable symbol, not the IEEE \
+         quiet NaN; certifying `(fp.isNaN NaN)` about it would be a wrong `unsat`",
+    );
+
+    // An indexed literal whose indices disagree with its recorded format is a
+    // malformed lookalike and must also fail closed.
+    let mut terms = TermStore::new();
+    let mismatched = terms.mk_app(
+        Symbol::indexed("+zero", vec![F16.0, F16.1]),
+        vec![],
+        fp_sort(F32),
+    );
+    let claim = predicate(&mut terms, "fp.isZero", vec![mismatched]);
+    validate_fp_ground_eval(&terms, ProofId(0), &[claim])
+        .expect_err("indexed FP-literal widths must agree with the term's sort");
 }

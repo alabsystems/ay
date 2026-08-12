@@ -183,6 +183,29 @@ fn test_detect_logic_bv_no_array() {
 }
 
 #[test]
+fn test_detect_logic_array_bv_mixed_with_int_uses_content_routing() {
+    let vars = vec![
+        ChcVar::new(
+            "heap",
+            ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::BitVec(8))),
+        ),
+        ChcVar::new("index", ChcSort::Int),
+    ];
+    let expr = ChcExpr::Bool(true);
+    assert_eq!(detect_logic(&vars, &expr), "ALL");
+}
+
+#[test]
+fn test_detect_logic_bv_mixed_with_real_uses_content_routing() {
+    let vars = vec![
+        ChcVar::new("bits", ChcSort::BitVec(32)),
+        ChcVar::new("real", ChcSort::Real),
+    ];
+    let expr = ChcExpr::Bool(true);
+    assert_eq!(detect_logic(&vars, &expr), "ALL");
+}
+
+#[test]
 fn test_detect_logic_default_int_only() {
     // Int without arrays — falls through to default QF_AUFLIA.
     let vars = vec![ChcVar::new("x", ChcSort::Int)];
@@ -279,6 +302,33 @@ fn test_detect_logic_nested_datatype_selector_bv() {
     let vars = vec![ChcVar::new("w", wrapper)];
     let expr = ChcExpr::Bool(true);
     assert_eq!(detect_logic(&vars, &expr), "_DT_AUFBV");
+}
+
+#[test]
+fn test_detect_logic_datatype_bv_mixed_with_arithmetic_uses_content_routing() {
+    let carrier = ChcSort::Datatype {
+        name: "BvCarrier".to_string(),
+        constructors: Arc::new(vec![ChcDtConstructor {
+            name: "mk-bv-carrier".to_string(),
+            selectors: vec![ChcDtSelector {
+                name: "payload".to_string(),
+                sort: ChcSort::BitVec(32),
+            }],
+        }]),
+    };
+    let expr = ChcExpr::Bool(true);
+
+    let int_vars = vec![
+        ChcVar::new("carrier", carrier.clone()),
+        ChcVar::new("arithmetic", ChcSort::Int),
+    ];
+    assert_eq!(detect_logic(&int_vars, &expr), "QF_AUFBVLIA");
+
+    let real_vars = vec![
+        ChcVar::new("carrier", carrier),
+        ChcVar::new("arithmetic", ChcSort::Real),
+    ];
+    assert_eq!(detect_logic(&real_vars, &expr), "QF_AUFBVLIRA");
 }
 
 #[test]

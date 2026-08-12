@@ -8923,6 +8923,9 @@ impl Executor {
                 }
             }
         }
+        // B2 audit: pure proof bookkeeping (provenance registration only;
+        // the assertion rewrite above already happened either way) — safe to
+        // skip when the tracker is off, including under competition shedding.
         if !self.produce_proofs_enabled() || forall_provenance.is_empty() {
             return;
         }
@@ -10758,9 +10761,11 @@ mod rebuild_tests {
             .expect("outer sentinel pin can be model-bound");
         exec.last_model = Some(outer_model);
         exec.last_model_validated = true;
-        let mut validation_stats = crate::executor::model::ValidationStats::default();
-        validation_stats.checked = 7;
-        validation_stats.total = 11;
+        let validation_stats = crate::executor::model::ValidationStats {
+            checked: 7,
+            total: 11,
+            ..Default::default()
+        };
         exec.last_validation_stats = Some(validation_stats);
         exec.dt_theory_model = Some(ay_dt::DtModel::default());
         exec.dt_validation_wants_egraph = true;
@@ -10969,9 +10974,11 @@ mod rebuild_tests {
             |executor, installed| {
                 assert!(installed.is_current(executor));
                 executor.last_model_validated = true;
-                let mut validation_stats = crate::executor::model::ValidationStats::default();
-                validation_stats.checked = 101;
-                validation_stats.total = 101;
+                let validation_stats = crate::executor::model::ValidationStats {
+                    checked: 101,
+                    total: 101,
+                    ..Default::default()
+                };
                 executor.last_validation_stats = Some(validation_stats);
                 executor.recorded_var_substitutions.clear();
                 executor.model_validation_delegated_assertions.clear();

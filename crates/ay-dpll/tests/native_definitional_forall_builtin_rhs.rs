@@ -58,9 +58,7 @@ fn literal_argument_call(
     // asserts `add(2, 5)`) before the spec function's defining axiom reaches the
     // solver.
     let prebuilt = build_call_first.then(|| {
-        let call = solver
-            .try_apply(&add, &[two.clone(), five.clone()])
-            .expect("apply add");
+        let call = solver.try_apply(&add, &[two, five]).expect("apply add");
         let r = solver.try_declare_const("r", bv32.clone()).expect("r");
         let body = solver.eq(r, call);
         solver.try_assert_term(body).expect("assert body");
@@ -68,15 +66,13 @@ fn literal_argument_call(
 
     let a = solver.try_fresh_var("a", bv32.clone()).expect("a");
     let b = solver.try_fresh_var("b", bv32.clone()).expect("b");
-    let head = solver
-        .try_apply(&add, &[a.clone(), b.clone()])
-        .expect("apply head");
+    let head = solver.try_apply(&add, &[a, b]).expect("apply head");
     let rhs = if reversed_rhs {
-        solver.bvadd(b.clone(), a.clone())
+        solver.bvadd(b, a)
     } else {
-        solver.bvadd(a.clone(), b.clone())
+        solver.bvadd(a, b)
     };
-    let definition_body = solver.eq(head.clone(), rhs);
+    let definition_body = solver.eq(head, rhs);
     let definition = solver
         .try_forall_with_triggers(&[a, b], definition_body, &[&[head][..]])
         .expect("forall");
@@ -198,12 +194,8 @@ fn two_user_declared_heads_stay_ambiguous_and_are_not_adopted() {
 
     let a = solver.try_fresh_var("a", bv32.clone()).expect("a");
     let b = solver.try_fresh_var("b", bv32.clone()).expect("b");
-    let lhs = solver
-        .try_apply(&f, &[a.clone(), b.clone()])
-        .expect("f app");
-    let rhs = solver
-        .try_apply(&g, &[a.clone(), b.clone()])
-        .expect("g app");
+    let lhs = solver.try_apply(&f, &[a, b]).expect("f app");
+    let rhs = solver.try_apply(&g, &[a, b]).expect("g app");
     let body = solver.eq(lhs, rhs);
     let definition = solver.try_forall(&[a, b], body).expect("forall");
     solver.try_assert_term(definition).expect("assert");
@@ -242,8 +234,8 @@ fn prebuilt_call_on_a_variable_argument_refuses_adoption() {
     solver.try_assert_term(body).expect("assert body");
 
     let v = solver.try_fresh_var("v", bv32.clone()).expect("v");
-    let head = solver.try_apply(&sq, &[v.clone()]).expect("head");
-    let rhs = solver.bvmul(v.clone(), v.clone());
+    let head = solver.try_apply(&sq, &[v]).expect("head");
+    let rhs = solver.bvmul(v, v);
     let definition_body = solver.eq(head, rhs);
     let definition = solver.try_forall(&[v], definition_body).expect("forall");
     let before = solver.assertions().len();
@@ -278,8 +270,8 @@ fn same_definition_without_a_prebuilt_call_is_adopted() {
         .expect("declare sq");
 
     let v = solver.try_fresh_var("v", bv32.clone()).expect("v");
-    let head = solver.try_apply(&sq, &[v.clone()]).expect("head");
-    let rhs = solver.bvmul(v.clone(), v.clone());
+    let head = solver.try_apply(&sq, &[v]).expect("head");
+    let rhs = solver.bvmul(v, v);
     let definition_body = solver.eq(head, rhs);
     let definition = solver.try_forall(&[v], definition_body).expect("forall");
     solver

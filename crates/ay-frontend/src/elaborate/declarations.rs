@@ -6,7 +6,7 @@ use crate::command::{self, Term as ParsedTerm};
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, Symbol, TermId};
 
-use super::{is_reserved_symbol, Context, ElaborateError, Result, SymbolInfo};
+use super::{Context, ElaborateError, Result, SymbolInfo};
 
 /// Render a parsed sort as SMT-LIB surface syntax. This deliberately retains
 /// aliases and user spelling: a qualification exported into an Alethe document
@@ -111,7 +111,7 @@ impl Context {
             )));
         }
         self.reject_redefinition(IntroKind::Declare, name, &[], sort)?;
-        if is_reserved_symbol(name) {
+        if self.is_reserved_symbol_on_this_route(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         // #reserved-ops dynamic gate: a datatype member name would be
@@ -408,7 +408,7 @@ impl Context {
         // reached the native subset rule and answered a definitive `unsat` via
         // ground-identity reflexivity on a forged symbol.
         let declaration_activated = super::is_declaration_activated_op_name(name);
-        if !declaration_activated && is_reserved_symbol(name) {
+        if !declaration_activated && self.is_reserved_symbol_on_this_route(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         // #reserved-ops dynamic gate: a datatype member name would be
@@ -526,7 +526,7 @@ impl Context {
             return None;
         }
         // Names with dedicated gates keep their specific errors — don't pre-empt.
-        if is_reserved_symbol(name)
+        if self.is_reserved_symbol_on_this_route(name)
             || self.is_datatype_member_name(name)
             || super::is_declaration_activated_op_name(name)
         {
@@ -601,7 +601,7 @@ impl Context {
     ) -> Result<()> {
         let parsed_arg_sorts: Vec<_> = params.iter().map(|(_, sort)| sort.clone()).collect();
         self.reject_redefinition(IntroKind::Macro, name, &parsed_arg_sorts, ret_sort)?;
-        if is_reserved_symbol(name) {
+        if self.is_reserved_symbol_on_this_route(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         // #reserved-ops dynamic gate (see `declare_fun`).
@@ -671,7 +671,7 @@ impl Context {
     ) -> Result<()> {
         let parsed_arg_sorts: Vec<_> = params.iter().map(|(_, sort)| sort.clone()).collect();
         self.reject_redefinition(IntroKind::Recursive, name, &parsed_arg_sorts, ret_sort)?;
-        if is_reserved_symbol(name) {
+        if self.is_reserved_symbol_on_this_route(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         // #reserved-ops dynamic gate (see `declare_fun`).
@@ -776,7 +776,7 @@ impl Context {
                     "define-funs-rec contains duplicate function name '{name}'"
                 )));
             }
-            if is_reserved_symbol(name) {
+            if self.is_reserved_symbol_on_this_route(name) {
                 return Err(ElaborateError::ReservedSymbol(name.clone()));
             }
             // #reserved-ops dynamic gate (see `declare_fun`).

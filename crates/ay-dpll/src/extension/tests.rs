@@ -2825,13 +2825,13 @@ fn dispatch_table_cached_data_round_trip() {
     // Extract cached data (dispatch table is rebuilt each iteration, not cached).
     let mut cached = ext.take_cached_data();
 
-    // Rebuild extension from cached data.
     let ext2 = TheoryExtension::new_with_cached_data(
         &mut theory,
         &var_to_term,
         &term_to_var,
         &theory_atoms,
         &theory_atom_set,
+        None, // no TermStore needed for this test
         &mut cached,
     );
     assert!(

@@ -440,8 +440,8 @@ pub fn check_proof_strict_with_datatypes_and_selectors(
 /// Every step is checked by the same implementation used by
 /// [`check_proof_strict_with_context`]: unverified `trust`/`hole` and generic
 /// rules are rejected, supported theory lemmas are checked semantically,
-/// datatype and selector declarations are honored, proof-producing BV budgets
-/// are enforced, and every `assume` must belong to `problem_assertions` (or a
+/// datatype and selector declarations are honored, expensive BV budgets are
+/// enforced, and every `assume` must belong to `problem_assertions` (or a
 /// nested conjunct of one).
 ///
 /// Unlike [`check_proof_strict_with_context`], this function deliberately does
@@ -1919,12 +1919,19 @@ fn validate_strict_steps_with_context(
     let (bv_classifier_work, bv_classifier_bytes) =
         proof_producing_bv_classifier_charge(proof, payload_stats)?;
     charge_progress(progress, bv_classifier_work, bv_classifier_bytes)?;
-    let bv_charge = crate::checker::validate_proof_producing_bv_budget(proof, terms)?;
-    // A proof-producing BV lemma enters a checker with its own large private
-    // replay limits. Debit those published maxima against the caller's ONE
-    // aggregate envelope before entering it; otherwise each lemma silently
-    // acquires a fresh 50M-work/128MiB allowance.
-    charge_progress(progress, bv_charge.work, bv_charge.bytes)?;
+    // The aggregate budget preflight performs a separate whole-proof census:
+    // it classifies tagged bit-blast lemmas and counts BV/LIA lemmas. Debit
+    // that second linear scan before it runs.
+    charge_progress(progress, proof.steps.len(), 0)?;
+    let expensive_bv_charge = crate::checker::validate_expensive_bv_budget(proof, terms)?;
+    // Proof-producing BV and BV/LIA lemmas enter checkers with large private
+    // limits. Debit the exact per-kind published maxima against the caller's
+    // ONE aggregate envelope before entering either replay path.
+    charge_progress(
+        progress,
+        expensive_bv_charge.work,
+        expensive_bv_charge.bytes,
+    )?;
     charge_progress(progress, 0, 0)?;
 
     if let Some(assertions) = problem_assertions {

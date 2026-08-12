@@ -1440,6 +1440,13 @@ pub(crate) struct GateCache {
 }
 
 impl GateCache {
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.entries.try_reserve(additional)
+    }
+
     pub(crate) fn get(&self, kind: BitLemmaKind, ins: &[u32]) -> Option<u32> {
         self.entries.get(&(kind, ins.to_vec())).copied()
     }

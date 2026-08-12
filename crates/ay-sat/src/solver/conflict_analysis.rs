@@ -1145,14 +1145,9 @@ impl Solver {
         Some(self.finalize_conflict_analysis(uip, lrat_level0_vars))
     }
 
-    /// Mark a clause as participating in the proof for streaming UNSAT core (#8250).
-    ///
-    /// If the clause is an original input clause (ID <= num_originals), sets
-    /// the corresponding bit in the streaming core bitmap. Called during conflict
-    /// analysis for each antecedent clause (conflict clause and reason clauses).
-    ///
-    /// Cost: one comparison + one conditional bitmap write. No-op when streaming
-    /// core is not initialized (SAT-only solving without original clauses).
+    /// Mark an antecedent only when its bounded ID was issued to an original.
+    /// Late-original allocation can leave derived IDs in `1..=num_originals`,
+    /// so range membership alone is insufficient for a streaming core.
     #[inline(always)]
     pub(super) fn mark_streaming_core(&mut self, clause_ref: ClauseRef) {
         let num_originals = self.cold.streaming_core_num_originals;
@@ -1160,7 +1155,7 @@ impl Solver {
             return;
         }
         let id = self.clause_id(clause_ref);
-        if id > 0 && id <= num_originals {
+        if id > 0 && id <= num_originals && self.is_original_clause_id(id) {
             if let Some(ref mut bitmap) = self.cold.streaming_core {
                 // clause IDs are 1-based, bitmap is 0-based
                 bitmap[(id - 1) as usize] = true;

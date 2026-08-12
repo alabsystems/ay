@@ -41,12 +41,14 @@ pub use command::{
     SUPPORTED_TACTIC_NAMES,
 };
 pub use elaborate::{
-    is_canonical_theory_operator_identity, is_reserved_op_name, is_reserved_symbol,
-    AuthoredAssertionRef, CheckedProjectionBinding, CheckedProjectionBindings, CommandResult,
-    Context, DeclarationId, DeclarationKind, ElaborateError, FiniteSetOp, FiniteSetTermMetadata,
-    FiniteSetTypingMode, IntroKind, Objective, ObjectiveDirection, OptionValue,
-    ProjectionBindingRejection, ProjectionBindingRequest, PublicAssertionMetadata, PublicSort,
-    PublicSymbolSignature, PublicTermMetadata, SoftAssertion, SourceContextStamp, SymbolInfo,
+    internal_namespace_of, is_canonical_theory_operator_identity, is_internal_namespace_name,
+    is_reserved_op_name, is_reserved_symbol, is_source_reserved_symbol, AuthoredAssertionRef,
+    CheckedProjectionBinding, CheckedProjectionBindings, CommandResult, Context, DeclarationId,
+    DeclarationKind, ElaborateError, FiniteSetOp, FiniteSetTermMetadata, FiniteSetTypingMode,
+    InternalNamespace, InternalNamespaceMinter, InternalNamespaceScope, IntroKind, Objective,
+    ObjectiveDirection, OptionValue, ProjectionBindingRejection, ProjectionBindingRequest,
+    PublicAssertionMetadata, PublicSort, PublicSymbolSignature, PublicTermMetadata, SoftAssertion,
+    SourceContextStamp, SymbolInfo, INTERNAL_NAMESPACES,
 };
 pub use parser::{parse, CommandStream, CommandStreamItem};
 pub use sexp::{ParseError, SExpr};

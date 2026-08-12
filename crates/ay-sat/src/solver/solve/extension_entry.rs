@@ -428,7 +428,9 @@ impl Solver {
         self.cold.original_clause_boundary = self.arena.len();
 
         // Streaming UNSAT core bitmap (#8250).
-        let num_originals = self.cold.next_original_clause_id.saturating_sub(1);
+        // Issued-original max, not next_original_clause_id - 1: the latter
+        // jumps past derived IDs (b93692341 follow-up).
+        let num_originals = self.cold.issued_original_clause_id_max;
         if num_originals > 0 {
             self.cold.streaming_core_num_originals = num_originals;
             if let Some(ref mut bitmap) = self.cold.streaming_core {
@@ -876,7 +878,9 @@ impl Solver {
         self.cold.original_clause_boundary = self.arena.len();
 
         // Initialize streaming UNSAT core bitmap (#8250).
-        let num_originals = self.cold.next_original_clause_id.saturating_sub(1);
+        // Issued-original max, not next_original_clause_id - 1: the latter
+        // jumps past derived IDs (b93692341 follow-up).
+        let num_originals = self.cold.issued_original_clause_id_max;
         if num_originals > 0 {
             self.cold.streaming_core_num_originals = num_originals;
             if let Some(ref mut bitmap) = self.cold.streaming_core {

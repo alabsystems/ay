@@ -110,6 +110,9 @@ impl Solver {
                     if self.cold.next_clause_id <= axiom_id {
                         self.cold.next_clause_id = axiom_id + 1;
                     }
+                    // The axiom occupies an original-space LRAT ID; record it
+                    // so streaming-core snapshots keep covering it.
+                    self.record_issued_original_clause_id(axiom_id);
                 }
             }
             self.cold.scope_selector_axiom_ids.push(axiom_id);

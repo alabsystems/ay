@@ -12,6 +12,7 @@
 mod bitblast;
 mod blocking;
 mod congruence;
+mod flatten_reads;
 mod forward_error;
 mod pin_reals;
 mod rm_expand;
@@ -23,6 +24,7 @@ mod to_real;
 mod to_real_rewrite;
 mod to_real_solve;
 
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{CnfClause, Tseitin};
 use ay_fp::FpSolver;
 use ay_sat::{SatResult, Solver as SatSolver};
@@ -180,6 +182,11 @@ impl Executor {
             // unsound. Fail closed, as this path always has.
             tracing::warn!("FP encoding has unresolvable ITE condition — returning Unknown");
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.record_unknown_diagnostic(
+                UnknownReason::Incomplete,
+                "FP base encoding left an `ite` condition unresolved (not an FP predicate and not \
+                 linkable through the Tseitin map), so a `sat` over it would be unsound",
+            );
             return Ok(SolveResult::Unknown);
         }
         if fp_solver.has_encoding_gap() {
@@ -286,6 +293,13 @@ impl Executor {
                 "FP path could not encode all uninterpreted structure — degrading sat to unknown"
             );
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.record_unknown_diagnostic(
+                UnknownReason::Incomplete,
+                "FP lane found a `sat` for a RELAXATION of the input: uninterpreted structure \
+                 (a declared function, or an array read the lane could not eliminate) has \
+                 congruence clauses missing, so the model is not a model of the input. The \
+                 relaxation keeps `unsat` valid; only `sat` degrades",
+            );
             return Ok(SolveResult::Unknown);
         }
 
@@ -393,6 +407,23 @@ impl Executor {
             return Ok(SolveResult::unsat());
         }
 
+        // Constant-index array-read elimination (`flatten_reads`). Runs FIRST,
+        // because the read-over-write expansion below is provably INERT on the
+        // population this targets: with zero `store`s
+        // `expand_select_store_all_adaptive` is the identity, so the
+        // `expanded_assertions == self.ctx.assertions` guard sends the file
+        // straight to `solve_bvfp` with the array reads still present — which is
+        // exactly why nothing fires today.
+        //
+        // ADDITIVE BY CONSTRUCTION: on `Unknown` the original assertions are
+        // restored and the untouched legacy path below runs, so this can only
+        // convert an `unknown` into `sat`/`unsat`, never the reverse.
+        let flatten_note = match self.try_flatten_constant_index_reads()? {
+            FlattenOutcome::Decided(result) => return Ok(result),
+            FlattenOutcome::Abstained(reason) => Some(reason.detail()),
+            FlattenOutcome::Undecided => None,
+        };
+
         let num_stores = self.count_array_stores_in_assertions();
         let expanded_assertions = self
             .ctx
@@ -401,13 +432,180 @@ impl Executor {
         if expanded_assertions.contains(&false_term) {
             return Ok(SolveResult::unsat());
         }
-        if expanded_assertions == self.ctx.assertions {
-            return self.solve_bvfp();
-        }
+        let result = if expanded_assertions == self.ctx.assertions {
+            self.solve_bvfp()
+        } else {
+            let original_assertions =
+                std::mem::replace(&mut self.ctx.assertions, expanded_assertions);
+            let result = self.solve_bvfp();
+            self.ctx.assertions = original_assertions;
+            result
+        };
 
-        let original_assertions = std::mem::replace(&mut self.ctx.assertions, expanded_assertions);
-        let result = self.solve_bvfp();
-        self.ctx.assertions = original_assertions;
+        // Abstention telemetry: attribute the `unknown` to the specific side
+        // condition that stopped the read elimination, instead of letting the
+        // whole population land in the "no specific reason recorded" bucket.
+        // Only ever refines an `unknown`'s DETAIL — never a verdict, and never a
+        // reason more specific than `Incomplete`.
+        if let (Some(note), Ok(SolveResult::Unknown)) = (flatten_note, &result) {
+            if matches!(
+                self.last_unknown_reason,
+                None | Some(UnknownReason::Incomplete) | Some(UnknownReason::Unknown)
+            ) {
+                self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                self.record_unknown_diagnostic(UnknownReason::Incomplete, note);
+            }
+        }
         result
+    }
+
+    /// Constant-index array-read elimination for the ABVFP lane — see the
+    /// `flatten_reads` module docs for the equisatisfiability argument and the
+    /// side conditions that make it an equivalence rather than a relaxation.
+    ///
+    /// Disable with `AY_ABVFP_FLATTEN=0` (default ON; the pass is additive —
+    /// see `FlattenOutcome::Undecided`).
+    fn try_flatten_constant_index_reads(&mut self) -> Result<FlattenOutcome> {
+        if !flatten_reads_enabled() {
+            return Ok(FlattenOutcome::Abstained(
+                flatten_reads::FlattenAbstain::NoArrays,
+            ));
+        }
+        let assertions = self.ctx.assertions.clone();
+        // Deliberately NO `abstained: <reason>` statistic here. `solve_abvfp` can
+        // run more than once per `check-sat` (the symbol-disjoint partition
+        // rescue re-solves components), and a per-call status string would report
+        // whichever call happened to run LAST while `unknown.detail` reports the
+        // one that produced the verdict — two stats disagreeing about the same
+        // solve. The abstention cause is carried on the verdict itself, through
+        // the `unknown.detail` channel that §3c2 of the 2026-07-26 hand-off
+        // established as the reliable one.
+        let plan = match flatten_reads::plan(&mut self.ctx.terms, &assertions) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(FlattenOutcome::Abstained(reason)),
+        };
+        self.last_statistics
+            .set_string("abvfp_flatten.status", "fired");
+        self.last_statistics
+            .set_int("abvfp_flatten.cells", plan.cells.len() as u64);
+
+        let saved = std::mem::replace(&mut self.ctx.assertions, plan.assertions);
+        let result = self.solve_bvfp();
+        self.ctx.assertions = saved;
+
+        match result {
+            Ok(SolveResult::Unsat(core)) => {
+                self.last_unknown_reason = None;
+                Ok(FlattenOutcome::Decided(SolveResult::Unsat(core)))
+            }
+            Ok(SolveResult::Sat) => {
+                // Reconstitute each array from its eliminated cells so the
+                // published witness names the ORIGINAL array symbol, and so the
+                // downstream validators and the independent model-check gate can
+                // evaluate `(select A k)` against the SAME values the flattened
+                // solve committed to. Fails closed: if any cell value is missing
+                // the model is dropped and the verdict falls through to the
+                // legacy path rather than shipping a witness that does not pin
+                // the array.
+                if self.attach_flattened_array_model(&plan.cells) {
+                    self.last_unknown_reason = None;
+                    Ok(FlattenOutcome::Decided(SolveResult::Sat))
+                } else {
+                    self.last_model = None;
+                    self.last_model_validated = false;
+                    self.last_statistics
+                        .set_string("abvfp_flatten.status", "fired: array model incomplete");
+                    Ok(FlattenOutcome::Undecided)
+                }
+            }
+            // Unknown from the flattened solve: drop its model (the array reads
+            // were substituted away, so it does not pin them) and fall through
+            // to the untouched legacy path. This is what makes the pass additive.
+            Ok(_) => {
+                self.last_model = None;
+                self.last_model_validated = false;
+                Ok(FlattenOutcome::Undecided)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build an [`ay_arrays::ArrayModel`] for the flattened arrays from the
+    /// cell constants' bitvector values, and attach it to the stored model.
+    ///
+    /// Returns `false` (fail closed) when any cell has no value in the model.
+    fn attach_flattened_array_model(&mut self, cells: &[flatten_reads::FlatCell]) -> bool {
+        use ay_core::Sort;
+
+        let Some(model) = self.last_model.as_ref() else {
+            return false;
+        };
+        let Some(bv) = model.bv_model.as_ref() else {
+            return false;
+        };
+        let mut interps: HashMap<ay_core::TermId, ay_arrays::ArrayInterpretation> =
+            HashMap::default();
+        for cell in cells {
+            let Sort::Array(arr) = self.ctx.terms.sort(cell.array).clone() else {
+                return false;
+            };
+            let (Sort::BitVec(idx_bv), Sort::BitVec(elem_bv)) =
+                (&arr.index_sort, &arr.element_sort)
+            else {
+                return false;
+            };
+            let Some(value) = bv.values.get(&cell.fresh) else {
+                return false;
+            };
+            let entry =
+                interps
+                    .entry(cell.array)
+                    .or_insert_with(|| ay_arrays::ArrayInterpretation {
+                        index_sort: Some(arr.index_sort.clone()),
+                        element_sort: Some(arr.element_sort.clone()),
+                        // A cell the formula never reads is unconstrained; any
+                        // total extension witnesses the original (see the
+                        // backward direction in the module docs).
+                        default: Some(crate::executor_format::format_bitvec(
+                            &num_bigint::BigInt::from(0u32),
+                            elem_bv.width,
+                        )),
+                        ..Default::default()
+                    });
+            entry.stores.push((
+                crate::executor_format::format_bitvec(&cell.index_value, idx_bv.width),
+                crate::executor_format::format_bitvec(value, elem_bv.width),
+            ));
+        }
+        let Some(model) = self.last_model.as_mut() else {
+            return false;
+        };
+        model.array_model = Some(ay_arrays::ArrayModel {
+            array_values: interps,
+            read_conflicted: HashSet::default(),
+        });
+        true
+    }
+}
+
+/// Outcome of the constant-index read-elimination pre-pass.
+enum FlattenOutcome {
+    /// The rewrite fired and produced a verdict to publish.
+    Decided(SolveResult),
+    /// The side conditions did not hold; nothing was attempted.
+    Abstained(flatten_reads::FlattenAbstain),
+    /// The rewrite fired but did not decide; the caller must run the legacy
+    /// path on the untouched original assertions.
+    Undecided,
+}
+
+/// Is the constant-index read elimination enabled? Default ON; `=0` disables.
+fn flatten_reads_enabled() -> bool {
+    match std::env::var("AY_ABVFP_FLATTEN") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
     }
 }

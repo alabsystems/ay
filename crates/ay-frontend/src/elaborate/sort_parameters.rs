@@ -21,8 +21,7 @@ use crate::command::{
 use crate::sexp::SExpr;
 
 use super::{
-    is_reserved_symbol, Context, ElaborateError, PolymorphicAssertion, PolymorphicDeclaration,
-    PublicSort, Result,
+    Context, ElaborateError, PolymorphicAssertion, PolymorphicDeclaration, PublicSort, Result,
 };
 
 /// Bound the eager Cartesian product.  Exceeding it is an honest incomplete
@@ -309,7 +308,7 @@ impl Context {
                 "internal polymorphic declaration without a sort parameter".to_string(),
             ));
         }
-        if is_reserved_symbol(name) {
+        if self.is_reserved_symbol_on_this_route(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
         if self.is_datatype_member_name(name) {

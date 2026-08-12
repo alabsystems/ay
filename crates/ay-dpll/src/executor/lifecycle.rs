@@ -398,8 +398,42 @@ impl Executor {
         // authored scope is finalized. `--no-proof` and `:produce-proofs false`
         // still suppress user-facing artifacts, but cannot disable the soundness
         // certificate required to publish `unsat`.
-        self.proof_tracker.enable();
-        self.ctx.set_retain_parsed_assertions(true);
+        //
+        // Competition mode (#proof-capability B1) is the sole, explicit opt-out
+        // of that invariant: with no proof demand in scope the tracker is left
+        // DISABLED so search pays no recording cost. PRECEDENCE, not conflict —
+        // `--proof`/`set_produce_proofs(true)`, in-script `(set-option
+        // :produce-proofs true)`, `(set-option :check-proofs-strict true)`, and
+        // self-check mode each defeat shedding and restore the certified lanes
+        // for this and later solves (`competition_shedding_active`). The
+        // explicit `disable()` (rather than merely skipping `enable()`) makes
+        // re-shedding after `(set-option :produce-proofs false)` deterministic.
+        // Publication is untouched: an UNSAT that cannot mint a certificate
+        // still fail-closes to `unknown`.
+        if self.competition_shedding_active() {
+            self.proof_tracker.disable();
+        } else {
+            self.proof_tracker.enable();
+        }
+        // #boolarg-orphan: drop the previous query's orphan->twin map.
+        //
+        // The field doc says a proxy from an earlier check-sat "can never be
+        // read back" because every purification REPLACES the map. That holds
+        // only while `purify_bool_args` actually runs on every solve — a later
+        // query routed past the pass would inherit the previous query's entries
+        // and could resolve an application through a twin THIS solve never
+        // pinned. Clearing per public solve is what makes that doc claim true
+        // rather than nearly true: an unrun pass now leaves an EMPTY map, which
+        // fails closed to today's behaviour, instead of a stale one.
+        self.bool_arg_orphan_index.clear();
+        // Retention re-arm is gated exactly like the tracker: a shedding
+        // competition session keeps whatever retention state the CLI/API chose
+        // (the CLI turns it off at session start), while any proof demand —
+        // including an in-script `:produce-proofs true` — re-arms it here for
+        // proof surface-syntax alignment.
+        if !self.competition_shedding_active() {
+            self.ctx.set_retain_parsed_assertions(true);
+        }
         let authored_assertions = self.ctx.assertions.clone();
         let pareto_state = if preserve_pareto_enumeration {
             self.pareto_state.take()
@@ -417,6 +451,16 @@ impl Executor {
         // optimization/probe solves then inherit those roots rather than
         // recapturing their generated working set as authored input.
         self.install_proof_source_provenance(&authored_assertions);
+        // #proof-capability B1 mis-plumbing canary: a competition-mode
+        // executor with no proof demand must leave this public solve with the
+        // tracker OFF — if a future edit re-enables it unconditionally above
+        // (or in a helper called from here), the shedding silently dies and
+        // every competition run pays the certified-mode proof cycle again.
+        debug_assert!(
+            !self.competition_shedding_active() || !self.proof_tracker.is_enabled(),
+            "competition-mode executor with no proof demand must have the proof \
+             tracker disabled after begin_public_solve"
+        );
     }
 
     /// Bind public UNSAT/proof authority to the frontend's final query roots.
@@ -494,6 +538,7 @@ impl Executor {
             last_authored_query_authority_seen: false,
             // No string lemma lowered yet — vacuously all-valid.
             string_lemma_kinds_all_valid: true,
+            bool_arg_orphan_index: ay_core::kani_compat::DetHashMap::default(),
             qfax_budget_multiplier: 1,
             qfax_refinement_clause: None,
             last_rejected_array_assertion: None,
@@ -529,6 +574,8 @@ impl Executor {
             last_proof: None,
             last_unsat_proof_reconstruction_suppressed: false,
             quantified_proof_translation_incomplete: false,
+            deep_qe_retry_armed: false,
+            prepass_reachability: PrepassReachability::default(),
             last_lrat_certificate: None,
             last_proof_term_overrides: None,
             proof_problem_assertion_provenance: None,
@@ -536,6 +583,8 @@ impl Executor {
             ematching_proof_records: Vec::new(),
             last_proof_rebuild_originals: Vec::new(),
             last_proof_quality: None,
+            strict_check_invocations: Cell::new(0),
+            strict_check_steps_validated: Cell::new(0),
             last_unknown_reason: None,
             last_unknown_origin: None,
             last_statistics: Statistics::default(),
@@ -601,6 +650,7 @@ impl Executor {
             pending_sat_unknown_reason: None,
             verification_level: VerificationLevel::from_state(false),
             self_check: false,
+            competition_mode: false,
             last_bv_drat_self_cert: false,
             dt_array_injectivity_gate_bypass: false,
             last_degrade_was_datatype_array: false,
@@ -829,6 +879,52 @@ impl Executor {
         self.self_check
     }
 
+    /// Enable or disable competition mode (`--competition` / `AY_COMPETITION=1`,
+    /// #proof-capability B1).
+    ///
+    /// In competition mode a public solve with no explicit proof demand sheds
+    /// the internal proof cycle: `begin_public_solve` leaves the proof tracker
+    /// disabled instead of arming it, so clause tracing, LRAT bookkeeping,
+    /// theory-lemma recording, and post-UNSAT reconstruction never run. Any
+    /// explicit proof demand takes precedence over shedding (see
+    /// [`Self::competition_shedding_active`]); UNSAT publication itself remains
+    /// fail-closed — without a mintable certificate the verdict degrades to
+    /// `unknown`, never to an uncertified `unsat`.
+    pub fn set_competition_mode(&mut self, enabled: bool) {
+        self.competition_mode = enabled;
+    }
+
+    /// Whether competition mode is set on this executor (the raw switch, NOT
+    /// the effective shedding predicate — see
+    /// [`Self::competition_shedding_active`]).
+    #[must_use]
+    pub fn competition_mode(&self) -> bool {
+        self.competition_mode
+    }
+
+    /// Whether this public solve actually sheds the internal proof cycle.
+    ///
+    /// True only when competition mode is on AND no proof demand is in scope.
+    /// The demand list implements PRECEDENCE over shedding (never a CLI
+    /// conflict — `--competition --proof FILE` is documented as "proof wins"):
+    /// - [`Self::is_producing_proofs`]: `--proof` / `--strict-proofs` /
+    ///   `--self-check` CLI sessions (all call `set_produce_proofs(true)`),
+    ///   API `set_produce_proofs` / `set_best_effort_produce_proofs`, and the
+    ///   in-script `(set-option :produce-proofs true)`;
+    /// - `strict_proofs_enabled`: the `(set-option :check-proofs-strict true)`
+    ///   context option, reachable without any artifact request;
+    /// - `self_check`: API `set_self_check(true)` without a paired proof
+    ///   request must still keep the checked-refutation lane armed.
+    ///
+    /// Consulted at every `begin_public_solve`, so an in-script option flip
+    /// re-arms (or re-sheds) the certified lanes on the NEXT public solve.
+    pub(crate) fn competition_shedding_active(&self) -> bool {
+        self.competition_mode
+            && !self.is_producing_proofs()
+            && !self.strict_proofs_enabled()
+            && !self.self_check
+    }
+
     /// Whether the last `check_sat` produced a pure-QF_BV UNSAT under
     /// `--self-check` that emitted a native-checkable bit-blast DRAT to the
     /// self-cert temp files and whose finalized (CNF, DRAT) pair the executor
@@ -943,6 +1039,14 @@ impl Executor {
     /// unaffected — every consumer degrades gracefully on an empty prefix.
     pub fn set_retain_parsed_assertions(&mut self, retain: bool) {
         self.ctx.set_retain_parsed_assertions(retain);
+    }
+
+    /// Lifetime entry counters for the mode-guarded check-sat pre-passes
+    /// (#prepass-reachability). Diagnostic only — see
+    /// [`crate::executor::PrepassReachability`].
+    #[cfg(test)]
+    pub(crate) const fn prepass_reachability(&self) -> PrepassReachability {
+        self.prepass_reachability
     }
 
     /// Check if proof production is enabled

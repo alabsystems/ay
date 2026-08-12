@@ -31,7 +31,11 @@ pub(super) fn declare_const(
     let api_sort = translate_sort(sort)?;
     {
         let mut session = ctx.session();
-        let _ = session.get_or_declare(name.to_string(), name, api_sort);
+        let _ = session
+            .try_get_or_declare(name.to_string(), name, api_sort)
+            .map_err(|error| {
+                ExecuteError::ConstraintExecution(format!("declare_const: {error}"))
+            })?;
     }
 
     Ok(())
@@ -49,7 +53,9 @@ pub(super) fn declare_fun(
         .collect::<Result<Vec<_>, _>>()?;
     let range = translate_sort(return_sort)?;
     let mut session = ctx.session();
-    let _ = session.declare_or_get_fun(name, &domain, range);
+    let _ = session
+        .try_declare_or_get_fun(name, &domain, range)
+        .map_err(|error| ExecuteError::ConstraintExecution(format!("declare_fun: {error}")))?;
     Ok(())
 }
 
@@ -66,7 +72,14 @@ pub(super) fn define_fun(
 
     for (param_name, param_sort) in params {
         let api_sort = translate_sort(param_sort)?;
-        let term = ctx.solver.fresh_var(param_name, api_sort);
+        // `fresh_var` panics when the prefix would enter a reserved namespace;
+        // its fallible twin reports the same condition as a recoverable error.
+        let term = ctx
+            .solver
+            .try_fresh_var(param_name, api_sort)
+            .map_err(|error| {
+                ExecuteError::ConstraintExecution(format!("define_fun parameter: {error}"))
+            })?;
         bound_scope.insert(param_name.clone(), term);
         param_names.push(param_name.clone());
         param_terms.push(term);
@@ -85,7 +98,7 @@ pub(super) fn define_fun(
         .collect();
     let mut session = ctx.session();
     uf::try_define(&mut session, name, &param_refs, range, body_term)
-        .map_err(|e| ExecuteError::ConstraintExecution(e.to_string()))?;
+        .map_err(|error| ExecuteError::ConstraintExecution(format!("define_fun: {error}")))?;
     Ok(())
 }
 
@@ -96,7 +109,9 @@ pub(super) fn declare_var(
 ) -> Result<(), ExecuteError> {
     let api_sort = translate_sort(sort)?;
     let mut session = ctx.session();
-    let _ = session.get_or_declare(name.to_string(), name, api_sort);
+    let _ = session
+        .try_get_or_declare(name.to_string(), name, api_sort)
+        .map_err(|error| ExecuteError::ConstraintExecution(format!("declare_var: {error}")))?;
     Ok(())
 }
 

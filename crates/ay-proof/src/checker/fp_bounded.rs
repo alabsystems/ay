@@ -809,9 +809,26 @@ fn fp_op_arity(name: &str) -> Option<usize> {
     }
 }
 
-/// FP nullary literal symbol names (indexed: `(_ +zero eb sb)`, etc).
-fn is_fp_literal_name(name: &str) -> bool {
-    matches!(name, "+zero" | "-zero" | "+oo" | "-oo" | "NaN")
+/// Whether `symbol` applied to zero arguments at `term` is an FP nullary
+/// special literal `(_ +zero eb sb)` / `(_ NaN eb sb)` / …
+///
+/// The INDEXED form is required, and its indices must be exactly the recorded
+/// `Sort::FloatingPoint(eb, sb)`. This is a re-derivation, not a spelling test:
+/// `ay-frontend` classifies these five names `IndexedOnly`, meaning the bare
+/// `Symbol::Named("NaN")` spelling stays an ordinary user-declarable identity —
+/// so matching on the name alone would hand IEEE semantics to whatever a
+/// problem happens to have declared. (The live frontend mints declared nullary
+/// symbols as `TermData::Var`, and `bundle::validate_named_app_signature`
+/// rejects a bare-named FP literal outright, but neither of those is a fact
+/// this validator can see; requiring the indexed form makes the check local.)
+fn is_fp_literal_symbol(terms: &TermStore, term: TermId, symbol: &Symbol, args: &[TermId]) -> bool {
+    let Symbol::Indexed(name, indices) = symbol else {
+        return false;
+    };
+    if !args.is_empty() || !matches!(name.as_str(), "+zero" | "-zero" | "+oo" | "-oo" | "NaN") {
+        return false;
+    }
+    matches!(terms.sort(term), Sort::FloatingPoint(eb, sb) if indices.as_slice() == [*eb, *sb])
 }
 
 /// Walk `term`, collecting FP-sorted variables (dedup) and flagging whether any
@@ -860,9 +877,11 @@ fn collect_fp_vars(
         }
         TermData::App(sym, args) => {
             let name = sym.name();
+            // FP nullary literal `(_ +zero eb sb)` etc. Decided before the
+            // argument clone so the `Symbol` itself never has to be cloned.
+            let is_fp_literal = is_fp_literal_symbol(terms, term, sym, args);
             let args = args.clone();
-            // FP nullary literal `(_ +zero eb sb)` etc.
-            if args.is_empty() && is_fp_literal_name(name) {
+            if is_fp_literal {
                 Some(())
             } else if name == "fp" && args.len() == 3 {
                 // `(fp signBv expBv sigBv)` — concrete literal; the BV args are
@@ -1059,8 +1078,11 @@ fn eval_fp(terms: &TermStore, term: TermId, env: &Env) -> Option<FpVal> {
             match name {
                 "fp.abs" if args.len() == 1 => Some(eval_fp(terms, args[0], env)?.abs()),
                 "fp.neg" if args.len() == 1 => Some(eval_fp(terms, args[0], env)?.neg()),
-                // FP nullary literals `(_ +zero eb sb)` etc.
-                "+zero" | "-zero" | "+oo" | "-oo" | "NaN" if args.is_empty() => {
+                // FP nullary literals `(_ +zero eb sb)` etc. The INDEXED form
+                // only — see `is_fp_literal_symbol`.
+                "+zero" | "-zero" | "+oo" | "-oo" | "NaN"
+                    if is_fp_literal_symbol(terms, term, sym, args) =>
+                {
                     let (eb, sb) = fp_sort_of(terms, term)?;
                     Some(literal_fpval(name, eb, sb))
                 }

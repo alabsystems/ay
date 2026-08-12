@@ -104,6 +104,22 @@ impl Executor {
                 "false".to_string()
             }),
         );
+        self.publish_strict_check_counters();
+    }
+
+    /// M0(a): dump the per-publication strict-check attribution counters into
+    /// `last_statistics`. Called wherever proof statistics are already being
+    /// recorded AND at command admission, so the final published values also
+    /// cover the mint-time strict re-check (`unsat_cert.rs`) that runs after
+    /// proof-quality stats are populated. Later calls simply overwrite with
+    /// fresher totals — the counters are cumulative within one publication.
+    pub(in crate::executor) fn publish_strict_check_counters(&mut self) {
+        let invocations = self.strict_check_invocations.get();
+        let steps = self.strict_check_steps_validated.get();
+        self.last_statistics
+            .set_int("proof.strict_check_invocations", invocations);
+        self.last_statistics
+            .set_int("proof.strict_check_steps_validated", steps);
     }
 
     /// Datatype constructor registry for strict proof validation:
@@ -1250,6 +1266,14 @@ impl Executor {
         &self,
         proof: &Proof,
     ) -> Result<ProofQuality, ProofCheckError> {
+        // M0(a) attribution counters (the development design notes):
+        // every strict-check entry through this wrapper is counted, including
+        // the finite-enum route below and the mint-time re-check in
+        // `unsat_cert.rs`. Counting only — zero behavior change.
+        self.strict_check_invocations
+            .set(self.strict_check_invocations.get() + 1);
+        self.strict_check_steps_validated
+            .set(self.strict_check_steps_validated.get() + proof.steps.len() as u64);
         if let Some(capability) = self.checked_finite_enum_capability_for_proof(proof) {
             let assumptions: Vec<TermId> = capability.assumptions().collect();
             return self.check_bounded_finite_enum_proof(

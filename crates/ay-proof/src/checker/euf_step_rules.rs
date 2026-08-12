@@ -318,8 +318,23 @@ pub(crate) fn validate_cong(
             reason: "cong conclusion is not an equality".to_string(),
         })?;
 
-    let (f_sym, f_args) = match terms.get(conc_lhs) {
-        TermData::App(sym, args) => (sym.clone(), args.clone()),
+    #[derive(PartialEq, Eq)]
+    enum CongruenceHead {
+        App(Symbol),
+        Ite,
+    }
+    let application = |term| match terms.get(term) {
+        TermData::App(sym, args) => Some((CongruenceHead::App(sym.clone()), args.clone())),
+        // `ite` is represented by a dedicated TermData node rather than an
+        // App, but it is still an ordinary ternary function for congruence.
+        TermData::Ite(condition, then_branch, else_branch) => Some((
+            CongruenceHead::Ite,
+            vec![*condition, *then_branch, *else_branch],
+        )),
+        _ => None,
+    };
+    let (f_sym, f_args) = match application(conc_lhs) {
+        Some(application) => application,
         _ => {
             return Err(ProofCheckError::InvalidBooleanRule {
                 step: step_id,
@@ -328,8 +343,8 @@ pub(crate) fn validate_cong(
             });
         }
     };
-    let (g_sym, g_args) = match terms.get(conc_rhs) {
-        TermData::App(sym, args) => (sym.clone(), args.clone()),
+    let (g_sym, g_args) = match application(conc_rhs) {
+        Some(application) => application,
         _ => {
             return Err(ProofCheckError::InvalidBooleanRule {
                 step: step_id,

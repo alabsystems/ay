@@ -529,6 +529,10 @@ impl Executor {
         &mut self,
         original_assertions: &[TermId],
     ) {
+        // B2 audit: pure proof bookkeeping (freezes the authored-assertion
+        // scope for proof export) — safe to skip when the tracker is off,
+        // including under competition shedding; nothing downstream reads the
+        // provenance unless a proof is being built.
         if !self.produce_proofs_enabled() || self.proof_problem_assertion_provenance.is_some() {
             return;
         }
@@ -588,6 +592,14 @@ impl Executor {
         roots: &mut HashSet<TermId>,
         records: &mut [crate::ematching::ForallInstantiationProvenance],
     ) {
+        // B2 audit: proof bookkeeping — skipping it under competition
+        // shedding (tracker off) is intended cost shedding, but note the
+        // KNOWN MODE DIVERGENCE: on the certified path this pass REWRITES
+        // the instance vector to exact structural forall instances, so a
+        // shedding run E-matches on the simplified instances instead.
+        // Search-behavior divergence between modes, not a soundness issue
+        // (both instance sets are entailed); same divergence class as the
+        // enumerative-instantiation `exact_instances_required` site below.
         if !self.produce_proofs_enabled() || records.is_empty() {
             return;
         }
@@ -631,6 +643,9 @@ impl Executor {
         &mut self,
         records: &[crate::ematching::ForallInstantiationProvenance],
     ) {
+        // B2 audit: pure proof bookkeeping (provenance registration only,
+        // no term or assertion mutation) — safe to skip when the tracker is
+        // off, including under competition shedding.
         if !self.produce_proofs_enabled() || records.is_empty() {
             return;
         }
@@ -2189,6 +2204,12 @@ impl Executor {
                     100,
                 );
                 let mut proof_records = Vec::with_capacity(enum_insts.len());
+                // B2 audit (mode divergence, positive-form twin of
+                // `materialize_exact_ematching_instances`): with the tracker
+                // off — including under competition shedding — enumerative
+                // instantiation asserts the SIMPLIFIED instances instead of
+                // the exact structural ones. Entailed either way; search
+                // behavior may diverge between modes.
                 let exact_instances_required = self.produce_proofs_enabled();
                 for (binding, simplified_instance) in enum_insts {
                     let inst = if exact_instances_required {

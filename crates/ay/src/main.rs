@@ -83,6 +83,7 @@ mod competition_jit_gate;
 mod competition_jit_hot_inputs;
 mod competition_jit_probe;
 mod competition_jit_release;
+mod competition_mode;
 mod dimacs;
 mod explain;
 mod explain_reason;
@@ -182,6 +183,15 @@ pub(crate) static INTERRUPT_HANDLE: std::sync::OnceLock<Arc<AtomicBool>> =
 /// Whether periodic progress lines should be emitted to stderr.
 /// Set by `--progress` CLI flag. Read by SAT, SMT, and CHC solve paths.
 pub(crate) static PROGRESS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Whether competition mode is active (`--competition` or a competition env
+/// signal, including `AY_COMPETITION=1`). Set once in `run_solve` before any
+/// executor exists; read by `new_executor` (run.rs) to call
+/// `Executor::set_competition_mode(true)` so the library sheds the internal
+/// proof cycle when no proof demand is present (#proof-capability B1).
+/// Precedence lives executor-side: any explicit proof demand (`--proof`,
+/// `--strict-proofs`, `--self-check`, in-script `:produce-proofs` /
+/// `:check-proofs-strict`) overrides the shedding, never conflicts with it.
+pub(crate) use competition_mode::{competition_mode, COMPETITION_MODE_ENABLED};
 /// Whether aggressive model minimization is enabled (#8297).
 /// Set by `--minimize-model` CLI flag. Read by executor creation paths.
 pub(crate) static MINIMIZE_MODEL_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -4908,6 +4918,13 @@ fn run_solve(args: &SolveArgs) {
         PROGRESS_ENABLED.store(true, Ordering::SeqCst);
     }
 
+    // Competition mode (#proof-capability B1): latch the process global BEFORE
+    // any solve path constructs an executor, so `new_executor` can never race
+    // it into a certified-mode executor that silently pays the proof cycle.
+    if competition_mode(args) {
+        COMPETITION_MODE_ENABLED.store(true, Ordering::SeqCst);
+    }
+
     // Strict proof mode (#8555, #8759).
     if args.strict_proofs {
         STRICT_PROOFS_ENABLED.store(true, Ordering::SeqCst);
@@ -5243,32 +5260,6 @@ fn run_solve(args: &SolveArgs) {
 
     // Final timeout check
     exit_if_timed_out();
-}
-
-/// Whether an official SAT-competition / benchmark harness signal is present in
-/// the environment. Existing competition wrappers set these (they do not pass
-/// `--competition`), so they must auto-enter competition mode to keep the fast
-/// path — otherwise turning the batteries on by default would regress them.
-///
-/// These are the load-bearing competition signals (kept as env vars on purpose,
-/// they are set by the wrapper/harness, not by end users).
-fn competition_env_active() -> bool {
-    const SIGNALS: &[&str] = &[
-        SAT_COMPETITION_WRAPPER_ENV, // AY_INTERNAL_SATCOMP_WRAPPER
-        "AY_SAT_COMPETITION_PROFILE",
-        "AY_SAT_PROFILE_ID",
-    ];
-    SIGNALS
-        .iter()
-        .any(|name| env::var(name).is_ok_and(|v| !v.trim().is_empty()))
-}
-
-/// Competition / benchmark mode: batteries OFF for raw speed. True when
-/// `--competition` is set or an official competition harness env signal is
-/// present. Turns off the overhead extras (default validation, proof re-check,
-/// default proof emission) — never the capability/soundness defaults.
-pub(crate) fn competition_mode(args: &SolveArgs) -> bool {
-    args.competition || competition_env_active()
 }
 
 /// Resolve an explicit user-requested DRAT proof target `(path, binary)`.

@@ -234,6 +234,43 @@ impl ArrayExtShadow {
     }
 }
 
+/// Lifetime entry counters for check-sat pre-passes that sit behind a mode
+/// guard (#prepass-reachability).
+///
+/// A pre-pass guarded on a predicate that is unconditionally FALSE on the
+/// public path is DEAD, not opted out — and it is dead SILENTLY: every test
+/// still passes the moment the pass has a fail-closed degradation, because the
+/// degradation is exactly what a never-run pass produces. That failure mode has
+/// already cost this codebase twelve passes (see the doc comment on
+/// [`Executor::produce_proofs_enabled`] and the eleventh/twelfth sites in
+/// `check_sat.rs`), and no verdict-level assertion can catch it: the verdict is
+/// identical either way.
+///
+/// The counters below make reachability itself observable, so a regression test
+/// can assert that a pre-pass really executed on the lane that owns it. They are
+/// incremented only at the pre-pass entry point, are never read by solver logic,
+/// and never influence a verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrepassReachability {
+    /// Times the deep-QE pre-pass site was reached with its APPLICABILITY
+    /// condition (quantified assertions present) satisfied. Everything that can
+    /// keep `deep_qe_entered` below this is a mode guard.
+    pub(crate) deep_qe_applicable: u64,
+    /// Times the deep-QE pre-pass actually ran
+    /// (`crate::executor::qe_prepass::deep_qe`).
+    pub(crate) deep_qe_entered: u64,
+    /// Times the INTERNAL proof tracker was recording at the deep-QE site, i.e.
+    /// `produce_proofs_enabled()` was true there. Sampled in situ so the
+    /// regression test can pin the trap as a measured fact rather than as a
+    /// claim about `begin_public_solve` made from somewhere else.
+    pub(crate) deep_qe_internal_tracker_on: u64,
+    /// Times `deep_qe_unknown_retry` cleared every guard AND its probe found a
+    /// real rewrite, so an `Unknown` was re-solved with the pre-pass armed. This
+    /// is the attribution counter: a behaviour change on a query with this at
+    /// zero did not come from the deep-QE lane.
+    pub(crate) deep_qe_unknown_retries: u64,
+}
+
 /// Provenance of one finite-domain quantifier expansion that replaced a
 /// top-level `forall` assertion with its ground instance conjunction
 /// (#quant-expansion-proof).
@@ -319,6 +356,22 @@ pub struct Executor {
     /// proof. Set by the single lowering chokepoint
     /// `create_string_lemma_clauses`; consumed by the post-lemma UNSAT gate.
     pub(crate) string_lemma_kinds_all_valid: bool,
+    /// #boolarg-orphan: `original UF application -> solver-visible twin` for the
+    /// applications `purify_bool_args` rewrote in the CURRENT check-sat.
+    ///
+    /// The purification pass replaces a compound Boolean argument with a fresh
+    /// proxy and substitutes it through every assertion, so the solver registers
+    /// — and a model pins — only `f(proxy)`. `check_sat` then RESTORES the
+    /// original assertions, and every post-solve consumer (the independent model
+    /// gate above all) asks about `f(<compound>)`: an application present in no
+    /// assertion the solver saw, hence pinned by no model, hence "model commits
+    /// no value for this application of `f`" and a fail-closed `unknown` on a
+    /// genuinely satisfiable input.
+    ///
+    /// The index republishes the value the solve ALREADY DECIDED under the
+    /// original id. It is REPLACED (never merged) at every purification, so a
+    /// proxy from an earlier check-sat can never be read back.
+    pub(crate) bool_arg_orphan_index: ay_core::kani_compat::DetHashMap<TermId, TermId>,
     /// QF_AX fixpoint budget multiplier (#qfax-budget-ladder): 1 = standard;
     /// the dispatch retries a degraded-unknown solve once with a raised tier.
     pub(crate) qfax_budget_multiplier: usize,
@@ -584,6 +637,19 @@ pub struct Executor {
     /// may still be mathematically sound, but its trace is not publication
     /// authority; result mapping must use the semantic-only proof firewall.
     quantified_proof_translation_incomplete: bool,
+    /// The deep-QE `Unknown`-fallback lane is active for the solve currently in
+    /// flight (#qe-prepass). Set ONLY by [`Executor::deep_qe_unknown_retry`],
+    /// which owns the one-attempt-per-public-solve contract; it is the sole
+    /// condition under which the deep-QE pre-pass adopts a rewrite, so a
+    /// certificate-bearing authored shape is never erased on a solve that could
+    /// still decide it.
+    deep_qe_retry_armed: bool,
+    /// Lifetime reachability counters for the check-sat pre-passes that carry a
+    /// mode guard (#prepass-reachability).  Monotone across solves and NEVER
+    /// cleared by `invalidate_last_check_result`: their only consumer is the
+    /// reachability regression test, which must be able to observe that a
+    /// guarded pre-pass really executed on an ordinary public solve.
+    prepass_reachability: PrepassReachability,
     /// Last LRAT certificate serialized from the SAT clause trace.
     ///
     /// Populated opportunistically for UNSAT results when the clause trace is
@@ -629,6 +695,19 @@ pub struct Executor {
     pub(crate) last_proof_rebuild_originals: Vec<TermId>,
     /// Quality metrics from last proof validation (#4420)
     last_proof_quality: Option<ay_proof::ProofQuality>,
+    /// M0(a) attribution counter (the development design notes):
+    /// `check_proof_strict_with_datatypes` invocations since the last public
+    /// solve began. Counting only — zero behavior change. `Cell` because the
+    /// wrapper takes `&self` (existing precedent: `dt_egraph_building`).
+    /// Reset with `last_statistics`, dumped through
+    /// `publish_strict_check_counters` as `proof.strict_check_invocations`.
+    pub(in crate::executor) strict_check_invocations: Cell<u64>,
+    /// M0(a) companion counter: total proof steps submitted across those
+    /// strict-check invocations (the strict checker walks every step of an
+    /// accepted proof; a rejected proof stops early, so this is an upper
+    /// bound labelled "submitted", not a claim every step was individually
+    /// accepted). Dumped as `proof.strict_check_steps_validated`.
+    pub(in crate::executor) strict_check_steps_validated: Cell<u64>,
     /// Reason for last Unknown result (for get-info :reason-unknown)
     last_unknown_reason: Option<UnknownReason>,
     /// Exact production boundary that published the last Unknown result.
@@ -1007,6 +1086,21 @@ pub struct Executor {
     /// The principle is soundness-by-self-certification: AY never emits a
     /// `sat`/`unsat` it cannot itself verify. Off by default (completeness-first).
     self_check: bool,
+    /// Competition mode (opt-in via `--competition` / `AY_COMPETITION=1`,
+    /// #proof-capability B1): shed the internal proof cycle when the session
+    /// has no explicit proof demand. `begin_public_solve` then leaves the
+    /// proof tracker DISABLED, so clause tracing, LRAT bookkeeping,
+    /// theory-lemma recording, and Alethe reconstruction are never armed.
+    ///
+    /// PRECEDENCE, not conflict: any explicit proof demand — `--proof` /
+    /// `set_produce_proofs(true)`, in-script `(set-option :produce-proofs
+    /// true)`, `(set-option :check-proofs-strict true)`, or self-check mode —
+    /// defeats shedding and restores the certified lanes
+    /// (`competition_shedding_active`). Publication stays fail-closed: with
+    /// tracking shed, an UNSAT that cannot mint a certificate degrades to
+    /// `unknown` exactly as today (the raw-admission lane is a later,
+    /// separately audited milestone, B3). Off by default (certified-first).
+    competition_mode: bool,
     /// Set by the last `check_sat` when it produced an UNSAT for a top-level
     /// pure-QF_BV query under `--self-check` AND emitted the eager bit-blast CNF
     /// plus its single-invocation DRAT to the self-cert temp files. The inner
@@ -1739,6 +1833,14 @@ mod maxsmt_tests;
 mod diff_logic_tests;
 
 #[cfg(test)]
+#[path = "executor/competition_mode_tests.rs"]
+mod competition_mode_tests;
+
+#[cfg(test)]
+#[path = "executor/proof_gate_census_tests.rs"]
+mod proof_gate_census_tests;
+
+#[cfg(test)]
 #[path = "executor/dl_theory_tests.rs"]
 mod dl_theory_tests;
 
@@ -2390,66 +2492,4 @@ impl Executor {
 }
 
 #[cfg(test)]
-mod pop_underflow_tests {
-    use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    fn assert_scope_underflow(result: Result<Option<String>>) {
-        assert!(
-            matches!(
-                result,
-                Err(ExecutorError::Elaborate(
-                    ay_frontend::ElaborateError::ScopeUnderflow
-                ))
-            ),
-            "expected scope underflow, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn executor_pop_without_push_returns_error_without_unwind() {
-        let mut exec = Executor::new();
-
-        let unwind = catch_unwind(AssertUnwindSafe(|| exec.execute(&Command::Pop(1))));
-
-        assert!(unwind.is_ok(), "empty pop must not panic");
-        assert_scope_underflow(unwind.expect("checked above"));
-
-        exec.execute(&Command::Push(1))
-            .expect("push after failed pop should succeed");
-        exec.execute(&Command::Pop(1))
-            .expect("balanced pop after failed pop should succeed");
-    }
-
-    #[test]
-    fn executor_pop_too_many_returns_error_without_unwind() {
-        let mut exec = Executor::new();
-        exec.execute(&Command::Push(1))
-            .expect("push should succeed");
-
-        let unwind = catch_unwind(AssertUnwindSafe(|| exec.execute(&Command::Pop(2))));
-
-        assert!(unwind.is_ok(), "oversized pop must not panic");
-        assert_scope_underflow(unwind.expect("checked above"));
-
-        exec.execute(&Command::Pop(1))
-            .expect("failed oversized pop should leave the scope available");
-    }
-
-    #[test]
-    fn executor_misaligned_subsystem_pop_returns_error_without_unwind() {
-        let mut exec = Executor::new();
-        exec.execute(&Command::Push(1))
-            .expect("push should succeed");
-
-        IncrementalSubsystem::reset(&mut exec.proof_tracker);
-
-        let unwind = catch_unwind(AssertUnwindSafe(|| exec.execute(&Command::Pop(1))));
-
-        assert!(
-            unwind.is_ok(),
-            "misaligned proof tracker pop must not panic"
-        );
-        assert_scope_underflow(unwind.expect("checked above"));
-    }
-}
+mod pop_underflow_tests;

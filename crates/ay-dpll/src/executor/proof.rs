@@ -2,14 +2,13 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Proof orchestration and API for UNSAT results.
-//!
-//! Proof checking and quality measurement live in `check`. Farkas synthesis
-//! lives in `proof_farkas`. Resolution strategies live in `proof_resolution`.
-//! Surface-syntax rewriting lives in `proof_rewrite`.
+//! UNSAT proof orchestration and API. Checking/quality live in `check`; Farkas synthesis in
+//! `proof_farkas`; resolution in `proof_resolution`; surface rewriting in `proof_rewrite`.
 
 mod authored_array_row1;
 mod authored_array_row_value;
+mod authored_cascade;
+mod authored_collection_subset;
 mod authored_congruence;
 mod authored_datatype;
 mod authored_divisibility;
@@ -23,11 +22,13 @@ mod authored_linear;
 mod authored_store_permutation;
 mod authored_string_length;
 mod authored_string_word_identity;
+mod bvand_commutative_congruence;
 mod check;
 mod collection_axiom_promotion;
 mod contextual_array_row2;
 mod double_negation;
 mod exact_array_row2;
+mod extensionality_surface;
 mod finite_enum;
 mod finite_enum_surface;
 #[cfg(test)]
@@ -52,6 +53,7 @@ use ay_frontend::{Command, CommandResult, OptionValue};
 #[cfg(not(feature = "proof-checker"))]
 use ay_proof::{check_proof_partial, PartialProofCheck};
 use ay_proof::{export_alethe_with_problem_scope_and_overrides, AlethePrintError};
+use bvand_commutative_congruence::add_bvand_commutative_congruence_proof;
 use num_bigint::BigInt;
 
 use crate::executor_types::SolveResult;
@@ -547,11 +549,9 @@ impl Executor {
         // itself carries eq_congruent/eq_transitive/eq_congruent_pred plus an
         // explicit weakening for unused conflict literals. Atomic strict
         // validation prevents partial promotion from masking any other trust.
-        // Pre-promote authenticated array-extensionality leaves first: they are
-        // conservative-extension lemmas, not unrelated trust, and otherwise
-        // make this EUF pass's whole-proof strict gate reject a valid rebuild.
-        // The final extensionality pass below remains after every surgery.
-        self.promote_array_extensionality_axioms(&mut proof);
+        // Authenticated array-extensionality leaves are deferred: the EUF pass
+        // promotes them only on its strict-check clone, while the real proof's
+        // final extensionality pass below remains after every surgery.
         self.promote_certified_generic_euf_leaves(&mut proof);
 
         // Shadowed-store equality expansion: the eager array fixpoint uses the
@@ -622,28 +622,8 @@ impl Executor {
         // committed only after the strict checker validates every step and the
         // premise authorization against that same scope.
         self.replace_with_exact_authored_false_refutation(&mut proof);
-        self.replace_with_exact_authored_conjunct_refutation(&mut proof);
-        self.replace_with_exact_authored_string_length_refutation(&mut proof);
-        self.replace_with_exact_authored_datatype_refutation(&mut proof);
-        self.replace_with_exact_authored_order_ite_refutation(&mut proof);
-        self.replace_with_exact_authored_equality_chain_refutation(&mut proof);
-        self.replace_with_exact_authored_guarded_linear_refutation(&mut proof);
-        self.replace_with_exact_authored_linear_refutation(&mut proof);
-        self.replace_with_exact_authored_divisibility_refutation(&mut proof);
-        self.replace_with_exact_authored_affine_euf_refutation(&mut proof);
-        self.replace_with_exact_authored_bv_refutation(&mut proof);
-        self.replace_with_exact_authored_store_permutation_refutation(&mut proof);
-        self.replace_with_exact_authored_array_row_value_refutation(&mut proof);
-        self.replace_with_exact_authored_congruence_refutation(&mut proof);
-        self.replace_with_exact_authored_string_length_arith_refutation(&mut proof);
-        self.replace_with_exact_authored_ground_substitution_refutation(&mut proof);
-        self.replace_with_exact_authored_word_identity_refutation(&mut proof);
-        self.replace_with_exact_authored_forall_inst_refutation(&mut proof);
-        self.replace_with_exact_authored_forall_inst_equality_refutation(&mut proof);
-        self.replace_with_exact_authored_forall_inst_conflict_refutation(&mut proof);
-        self.replace_with_exact_authored_congruence_value_refutation(&mut proof);
-        self.replace_with_exact_authored_equality_closure_refutation(&mut proof);
-        self.collapse_double_negated_trust_lemma_literals(&mut proof);
+
+        self.run_authored_replacement_cascade(&mut proof);
 
         // Proof validation (#4393): validates all non-Hole steps via partial
         // checker. Replaces the old check_proof + Hole-skip pattern that skipped
@@ -1082,12 +1062,7 @@ impl Executor {
             if let Some(candidate) =
                 build_affine_equality_refutation(&mut self.ctx.terms, root, &leaves)
             {
-                if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
-                    .is_ok()
-                    && Self::proof_derives_empty_clause(&candidate)
-                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-                {
-                    *proof = candidate;
+                if self.commit_if_strictly_checked(proof, candidate, &authored) {
                     return;
                 }
             }
@@ -1165,12 +1140,7 @@ impl Executor {
                 if derivation_failed || !residual.is_empty() {
                     continue;
                 }
-                if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
-                    .is_ok()
-                    && Self::proof_derives_empty_clause(&candidate)
-                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-                {
-                    *proof = candidate;
+                if self.commit_if_strictly_checked(proof, candidate, &authored) {
                     return;
                 }
             }
@@ -2316,9 +2286,8 @@ impl Executor {
     /// Expand exact shadowed two-store equality lemmas into standard Alethe
     /// primitives.
     ///
-    /// The solve-path clause is intentionally compact: it avoids manufacturing
-    /// select-over-store ITEs merely to expose a consequence that follows from
-    /// one fixed witness read.  Proof export must nevertheless justify that
+    /// The compact solve-path clause avoids manufacturing select-over-store
+    /// ITEs for one fixed witness read. Proof export must still justify that
     /// consequence rather than mislabel it as ROW2.  For
     ///
     /// ```text
@@ -2332,10 +2301,8 @@ impl Executor {
     /// resolution chain whose exact result is `C`.  A packed unit `(or ...)`
     /// is reconstructed from the flat clause with standard `or_neg` steps.
     ///
-    /// Fail-safe: recognition requires the exact syntactic store schema and
-    /// exact three-literal conclusion; a whole-proof strict check (including
-    /// datatype registries) must accept the rebuilt proof or every replacement
-    /// is reverted.
+    /// Fail-safe: exact schema recognition and a whole-proof datatype-aware
+    /// strict check are required; any failure reverts every replacement.
     fn split_shadowed_store_equality_lemmas(&mut self, proof: &mut Proof) {
         // Anchors carry forward references the in-order remap cannot resolve.
         if proof
@@ -2404,10 +2371,12 @@ impl Executor {
         });
         proof.steps = new_steps;
         proof.named_steps = remapped_named;
-        if self
-            .check_proof_strict_derivation_with_datatypes(proof)
-            .is_err()
-        {
+        let mut validation = proof.clone();
+        self.promote_array_extensionality_axioms(&mut validation);
+        let valid = self
+            .check_proof_strict_derivation_with_datatypes(&validation)
+            .is_ok();
+        if !valid {
             proof.steps = original;
             proof.named_steps = original_named;
         }
@@ -4397,14 +4366,15 @@ impl Executor {
             let Some((lhs, rhs)) = match_eq_negation(asrt) else {
                 continue;
             };
-            // Faithfully rebuild both sides of the equality the identity fold
-            // erased. `build_bv_pterm` is a 1:1 structural translation of the
-            // frontend AST (symbol→declared TermId, literal→`mk_bitvec`, op→raw
-            // `mk_app`) with a per-node faithfulness guard, so the reconstructed
-            // `assume` matches the real input assertion.
+            // Faithfully rebuild both sides erased by the identity fold. `build_qfbv_pterm`
+            // translates the frontend AST 1:1 (symbol→TermId, literal→`mk_bitvec`, op→raw
+            // constructor) with a per-node faithfulness guard. Its Boolean layer covers BV-valued
+            // `ite` nodes nested below concat/extract in code-generator obligations.
             let (Some(l_id), Some(r_id)) = (
-                build_bv_pterm(&mut self.ctx.terms, lhs),
-                build_bv_pterm(&mut self.ctx.terms, rhs),
+                build_bv_pterm(&mut self.ctx.terms, lhs)
+                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, lhs)),
+                build_bv_pterm(&mut self.ctx.terms, rhs)
+                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, rhs)),
             ) else {
                 continue;
             };
@@ -4418,20 +4388,29 @@ impl Executor {
                 .ctx
                 .terms
                 .mk_app(Symbol::named("="), [l_id, r_id], Sort::Bool);
-            // Gate on the checker's own recognizer: commit only if strict mode
-            // will re-validate this exact lemma by exhaustive bounded evaluation.
-            if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[eq_t]) {
-                continue;
-            }
+            let reflexive = l_id == r_id;
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            let mut candidate = Proof::new();
+            let assume_id = candidate.add_assume(neg_t, None);
+            let lemma_id = if reflexive {
+                candidate.add_rule_step(AletheRule::EqReflexive, vec![eq_t], Vec::new(), Vec::new())
+            } else if let Some(step) = add_bvand_commutative_congruence_proof(
+                &mut self.ctx.terms,
+                &mut candidate,
+                l_id,
+                r_id,
+            ) {
+                step
+            } else if ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[eq_t]) {
+                candidate.add_theory_lemma_with_kind("bv", vec![eq_t], TheoryLemmaKind::BvBitBlast)
+            } else {
+                continue;
+            };
+            candidate.add_resolution(vec![], eq_t, assume_id, lemma_id);
+
             self.record_rebuilt_authored_proof_premise(neg_t);
-            proof.steps.clear();
-            proof.named_steps.clear();
-            let assume_id = proof.add_assume(neg_t, None);
-            let lemma_id =
-                proof.add_theory_lemma_with_kind("bv", vec![eq_t], TheoryLemmaKind::BvBitBlast);
-            proof.add_resolution(vec![], eq_t, assume_id, lemma_id);
+            *proof = candidate;
             return;
         }
     }
@@ -5834,7 +5813,14 @@ impl Executor {
     /// [`Executor::is_producing_proofs`] for that. `begin_public_solve` turns
     /// the tracker on for EVERY public decision (the mandatory UNSAT
     /// certificate does not depend on `:produce-proofs`), so this predicate is
-    /// always true on the public path.
+    /// always true on the public path — with ONE explicit, opt-in carve-out:
+    /// a competition-mode executor with no proof demand
+    /// (`competition_shedding_active`, #proof-capability B1) leaves the
+    /// tracker disabled, so on such sessions this predicate is false on the
+    /// public path. The dead-gate inventory below is written against the
+    /// certified default; under competition shedding those gates go LIVE and
+    /// are audited (and kept dead where unvetted) by the B2 gate census.
+    /// UNSAT publication stays fail-closed either way.
     ///
     /// That matters because a preprocessing or routing pass gated on
     /// `!produce_proofs_enabled()` is therefore DEAD, not opted out. Ten such
@@ -5855,6 +5841,39 @@ impl Executor {
                 self.ctx.get_option("produce-proofs"),
                 Some(OptionValue::Bool(true))
             )
+    }
+
+    /// Whether an UNVETTED no-proof refutation lane may run (#proof-capability
+    /// B2, dormant-lane audit).
+    ///
+    /// Two UNSAT-originating shortcuts gate on this predicate:
+    /// `try_word_eq_constant_propagation` (strings), and
+    /// `try_lia_eager_assume_unsat_probe` (LIA). Both were written
+    /// against the OLD meaning of `!produce_proofs_enabled()` ("the user
+    /// opted out of proofs") and are DEAD on today's certified public path,
+    /// where `begin_public_solve` always arms the tracker. Competition
+    /// shedding (`competition_shedding_active`) turns the tracker off, which
+    /// would have flipped both gates LIVE for the first time under
+    /// public publication — switching ON refutation shortcuts that have
+    /// never been publicly exercised is not cost shedding. The v1 decision
+    /// keeps both exactly as dead as today in every configuration:
+    ///
+    /// - false whenever `produce_proofs_enabled()` — unchanged: these lanes
+    ///   have no proof reconstruction and must not originate an uncertified
+    ///   `Unsat` into a proof-carrying solve;
+    /// - false whenever `competition_shedding_active()` — new: shedding must
+    ///   not activate unvetted refutation lanes.
+    ///
+    /// In every non-competition configuration `competition_shedding_active()`
+    /// is false, so this predicate is exactly `!produce_proofs_enabled()` —
+    /// byte-identical behavior to the gates it replaced. A lane may move off
+    /// this predicate only after it is individually vetted for raw
+    /// publication; it then earns its own named gate and an entry in the
+    /// `proof_gate_census_tests` vetted list (which also inventories every
+    /// call site of THIS predicate, so adding another lane here fails the
+    /// census until it is vetted).
+    pub(in crate::executor) fn unvetted_no_proof_lane_allowed(&self) -> bool {
+        !self.produce_proofs_enabled() && !self.competition_shedding_active()
     }
 
     /// Skip preprocessing variable substitution when proofs are requested
@@ -7846,5 +7865,7 @@ fn build_bool_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
 
 #[cfg(all(test, feature = "proof-checker"))]
 use check::*;
+#[cfg(test)]
+mod shadowed_store_ext_tests;
 #[cfg(test)]
 mod tests;

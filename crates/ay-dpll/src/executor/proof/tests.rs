@@ -1841,6 +1841,93 @@ fn bv_identity_certificate_survives_the_last_resort_hole_rescue() {
 }
 
 #[test]
+fn qf_bv_wide_bvand_commutativity_under_tst_context_is_fully_checked() {
+    // The raw external-codegen TST/NZCV obligation preserves the machine operand order,
+    // so its two packed flag expressions differ at nested `(bvand rm rn)` /
+    // `(bvand rn rm)` leaves. Prove those leaves with the checked wide-BV
+    // producer and lift them through the exact source tree with congruence;
+    // never replace the authored assumption by a normalized one.
+    for (width, msb) in [(32, 31), (64, 63)] {
+        let input = format!(
+            r#"
+            (set-option :produce-proofs true)
+            (set-logic QF_BV)
+            (declare-const rn (_ BitVec {width}))
+            (declare-const rm (_ BitVec {width}))
+            (assert (not (=
+              (concat (concat (concat
+                (ite (= ((_ extract {msb} {msb}) (bvand rm rn)) (_ bv1 1)) (_ bv1 1) (_ bv0 1))
+                (ite (= (bvand rm rn) (_ bv0 {width})) (_ bv1 1) (_ bv0 1)))
+                (ite false (_ bv1 1) (_ bv0 1)))
+                (ite false (_ bv1 1) (_ bv0 1)))
+              (concat (concat (concat
+                (ite (= ((_ extract {msb} {msb}) (bvand rn rm)) (_ bv1 1)) (_ bv1 1) (_ bv0 1))
+                (ite (= (bvand rn rm) (_ bv0 {width})) (_ bv1 1) (_ bv0 1)))
+                (ite false (_ bv1 1) (_ bv0 1)))
+                (ite false (_ bv1 1) (_ bv0 1))))))
+            (check-sat)
+            "#
+        );
+        let commands = parse(&input).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec
+            .execute_all(&commands)
+            .unwrap_or_else(|error| panic!("width {width}: {error:?}\n{input}"));
+        assert_eq!(outputs, ["unsat"], "width {width}: {input}");
+
+        let text = exec.get_proof();
+        assert!(text.contains(":rule aci_simp"), "width {width}: {text}");
+        assert!(text.contains(":rule cong"), "width {width}: {text}");
+        assert!(!text.contains(":rule hole"), "width {width}: {text}");
+        assert!(!text.contains(":rule trust"), "width {width}: {text}");
+
+        let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+        let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)
+            .expect("wide nested bvand-commutativity proof must pass strict replay");
+        assert_eq!(quality.trust_count, 0);
+        assert_eq!(quality.hole_count, 0);
+    }
+}
+
+#[test]
+fn bvand_commutative_congruence_lane_rejects_near_misses() {
+    let mut terms = TermStore::new();
+    let bv32 = Sort::bitvec(32);
+    let a = terms.mk_var("a", bv32.clone());
+    let b = terms.mk_var("b", bv32.clone());
+    let c = terms.mk_var("c", bv32.clone());
+
+    let prove = |terms: &mut TermStore, left, right| {
+        let mut proof = Proof::new();
+        let result = add_bvand_commutative_congruence_proof(terms, &mut proof, left, right);
+        assert!(proof.steps.is_empty(), "failed candidates must roll back");
+        result
+    };
+
+    // A swapped non-commutative operator must never enter the bvand lane.
+    let sub_ab = terms.mk_app(Symbol::named("bvsub"), [a, b], bv32.clone());
+    let sub_ba = terms.mk_app(Symbol::named("bvsub"), [b, a], bv32.clone());
+    assert!(prove(&mut terms, sub_ab, sub_ba).is_none());
+
+    // One wrong operand is not an exact binary swap.
+    let and_ab = terms.mk_app(Symbol::named("bvand"), [a, b], bv32.clone());
+    let and_bc = terms.mk_app(Symbol::named("bvand"), [b, c], bv32.clone());
+    assert!(prove(&mut terms, and_ab, and_bc).is_none());
+
+    // Even with a valid swap in a later branch, different ite conditions stop
+    // congruence before any authority is installed.
+    let and_ba = terms.mk_app(Symbol::named("bvand"), [b, a], bv32.clone());
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let ite_p = terms.mk_ite_raw(p, and_ab, c);
+    let ite_q = terms.mk_ite_raw(q, and_ba, c);
+    assert!(prove(&mut terms, ite_p, ite_q).is_none());
+
+    // Dedicated ite and ordinary applications are different congruence heads.
+    assert!(prove(&mut terms, ite_p, and_ba).is_none());
+}
+
+#[test]
 fn qfbv_proof_rebuilder_accepts_structured_decimal_literal() {
     let mut terms = TermStore::new();
     let parsed = FrontendTerm::IndexedApp(
@@ -2647,6 +2734,49 @@ fn test_get_proof_no_check_sat() {
     let outputs = exec.execute_all(&commands).unwrap();
 
     assert!(outputs[0].contains("no check-sat has been performed"));
+}
+
+/// TrustVC's Ackermann termination gate proves the first lexicographic
+/// component decreases under the `m != 0 && n == 0` path.  The formula is
+/// linear integer arithmetic; a computed UNSAT must have a strict proof rather
+/// than being withheld behind a Generic theory leaf.
+#[test]
+fn deductive_checks_ackermann_lexicographic_termination_is_strict_checkable() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-option :produce-unsat-cores true)
+        (set-logic ALL)
+        (declare-fun ack (Int Int) Int)
+        (declare-const m Int)
+        (declare-const n Int)
+        (assert (! (<= 0 m) :named dn0))
+        (assert (! (<= 0 n) :named dn1))
+        (assert (!
+          (and
+            (< 0 m)
+            (= 0 n)
+            (or
+              (and
+                (or (< (+ m (- 1)) 0) (<= m (+ m (- 1))))
+                (or (not (= m (+ m (- 1)))) (<= n 1)))
+              (< m 0)
+              (< n 0)))
+          :named dn2))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("TrustVC termination formula parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("formula executes");
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "valid lexicographic decrease must carry a strict proof; retained={:#?}",
+        exec.last_proof
+    );
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)
+        .expect("TrustVC termination proof must pass strict checking");
+    assert_eq!(quality.trust_count, 0);
 }
 
 #[test]
@@ -4945,4 +5075,85 @@ fn a_bound_surface_override_respells_a_term_and_never_rewrites_it() {
             "{body_lhs}: the exported proof must anchor on the problem assertion; got:\n{text}"
         );
     }
+}
+
+/// M0(a) (the development design notes): the strict-check attribution
+/// counters count every `check_proof_strict_with_datatypes` entry, survive to
+/// the published statistics, and — with the #strict-verdict-memo in
+/// `build_unsat_proof` — a happy-path certified UNSAT no longer opens one
+/// strict probe per authored-replacement cascade member (~22 of them).
+#[test]
+#[timeout(60000)]
+fn m0_strict_check_counters_publish_and_cascade_memo_collapses_probes() {
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-option :check-proofs-strict true)
+        (set-logic QF_LRA)
+        (declare-const x Real)
+        (assert (< x 0))
+        (assert (> x 0))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs[0], "unsat");
+
+    let invocations = exec.strict_check_invocations.get();
+    let steps = exec.strict_check_steps_validated.get();
+    eprintln!(
+        "M0(a) counters: strict_check_invocations={invocations} \
+         strict_check_steps_validated={steps}"
+    );
+    assert!(
+        invocations >= 1,
+        "certified strict UNSAT must run the strict checker at least once"
+    );
+    assert!(
+        steps >= invocations,
+        "every counted invocation submits a non-empty proof here \
+         (invocations={invocations}, steps={steps})"
+    );
+    // The memo bound: without #strict-verdict-memo this trivial flow ran the
+    // ~22-member cascade's per-member entry probes on an already-valid proof
+    // (>= 25 invocations). With the memo the whole publication needs only the
+    // cascade-start verdict plus the fixed post-cascade validations and the
+    // mint-time authority re-check. The bound is deliberately loose so it
+    // pins the mechanism (no per-member probing), not an exact pass layout.
+    assert!(
+        invocations <= 12,
+        "publication-flow strict checks did not collapse: {invocations} invocations"
+    );
+
+    // The counters must reach the published statistics (dumped at proof
+    // quality population and refreshed at command admission, so the final
+    // values include the mint-time strict re-check).
+    let stats = exec.statistics();
+    let published = stats
+        .get_int("proof.strict_check_invocations")
+        .expect("strict-check invocation statistic must be published");
+    let published_steps = stats
+        .get_int("proof.strict_check_steps_validated")
+        .expect("strict-check steps statistic must be published");
+    assert!(
+        published >= 1 && published <= invocations,
+        "published invocation count must be a snapshot no newer than the live \
+         counter (published={published}, live={invocations})"
+    );
+    assert!(
+        published_steps >= 1 && published_steps <= steps,
+        "published steps count must be a snapshot no newer than the live \
+         counter (published={published_steps}, live={steps})"
+    );
+
+    // Per-publication scoping: a second public solve restarts the counters
+    // instead of accumulating across publications.
+    let commands = parse("(check-sat)").unwrap();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs[0], "unsat");
+    let second = exec.strict_check_invocations.get();
+    assert!(
+        (1..=12).contains(&second),
+        "second publication must re-count from zero, not accumulate: {second}"
+    );
 }

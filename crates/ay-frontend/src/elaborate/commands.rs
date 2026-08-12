@@ -9,9 +9,8 @@ use crate::command::{Command, Term as ParsedTerm};
 use ay_core::{Sort, TermId};
 
 use super::{
-    is_canonical_theory_operator_identity, is_reserved_symbol, CommandResult, Context,
-    ElaborateError, Objective, ObjectiveDirection, OptionValue, Result, ScopeFrame, SoftAssertion,
-    SymbolInfo,
+    is_canonical_theory_operator_identity, CommandResult, Context, ElaborateError, Objective,
+    ObjectiveDirection, OptionValue, Result, ScopeFrame, SoftAssertion, SymbolInfo,
 };
 
 /// Builtin sort names supplied by enabled SMT theories.
@@ -1009,7 +1008,7 @@ impl Context {
         // Reserved structural operators are safe only through their dedicated
         // builders. A textual alias could be intercepted by a specialized
         // elaboration path before ordinary function resolution.
-        if is_reserved_symbol(&surface_name) {
+        if self.is_reserved_symbol_on_this_route(&surface_name) {
             return Err(ElaborateError::ReservedSymbol(surface_name));
         }
         if self.is_datatype_member_name(&surface_name) {
@@ -2245,6 +2244,12 @@ impl Context {
                 .contains(name)
                 .then_some((name.as_str(), constructors.as_slice()))
         })
+    }
+
+    /// Sticky constructor identities for one exact datatype carrier.
+    /// Retained terms may use this after the carrier leaves source scope.
+    pub fn datatype_constructors(&self, name: &str) -> Option<&[String]> {
+        self.datatypes.get(name).map(Vec::as_slice)
     }
 
     /// Whether an exact datatype carrier is currently source-visible.

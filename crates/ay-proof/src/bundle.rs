@@ -625,6 +625,12 @@ fn validate_indexed_bv_signature(
 }
 
 fn requires_named_symbol(name: &str) -> bool {
+    requires_named_core_or_bv_symbol(name)
+        || requires_named_fp_symbol(name)
+        || requires_named_string_or_regex_symbol(name)
+}
+
+fn requires_named_core_or_bv_symbol(name: &str) -> bool {
     matches!(
         name,
         "=" | "distinct"
@@ -665,8 +671,24 @@ fn requires_named_symbol(name: &str) -> bool {
             | "bvsgt"
             | "bvsge"
             | "concat"
-            | "fp"
-            | "fp.abs"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "abs"
+            | "div"
+            | "mod"
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+    )
+}
+
+fn requires_named_fp_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "fp" | "fp.abs"
             | "fp.neg"
             | "fp.isNaN"
             | "fp.isInfinite"
@@ -680,6 +702,63 @@ fn requires_named_symbol(name: &str) -> bool {
             | "fp.leq"
             | "fp.gt"
             | "fp.geq"
+            | "fp.add"
+            | "fp.sub"
+            | "fp.mul"
+            | "fp.div"
+            | "fp.fma"
+            | "fp.sqrt"
+            | "fp.to_real"
+            | "RNE"
+            | "RNA"
+            | "RTP"
+            | "RTN"
+            | "RTZ"
+            | "roundNearestTiesToEven"
+            | "roundNearestTiesToAway"
+            | "roundTowardPositive"
+            | "roundTowardNegative"
+            | "roundTowardZero"
+    )
+}
+
+fn requires_named_string_or_regex_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "str.++"
+            | "str.len"
+            | "str.at"
+            | "str.substr"
+            | "str.contains"
+            | "str.prefixof"
+            | "str.suffixof"
+            | "str.indexof"
+            | "str.replace"
+            | "str.replace_all"
+            | "str.to_code"
+            | "str.from_code"
+            | "str.to_int"
+            | "str.to.int"
+            | "str.from_int"
+            | "str.is_digit"
+            | "str.<"
+            | "str.<="
+            | "str.in_re"
+            | "str.in.re"
+            | "str.to_re"
+            | "str.to.re"
+            | "re.none"
+            | "re.all"
+            | "re.allchar"
+            | "re.range"
+            | "re.++"
+            | "re.union"
+            | "re.inter"
+            | "re.*"
+            | "re.+"
+            | "re.opt"
+            | "re.comp"
+            | "re.diff"
     )
 }
 
@@ -1831,6 +1910,47 @@ mod tests {
         };
         args.pop();
         assert_malformed_bundle(&bad_select, "`select` expects 2 arguments");
+    }
+
+    #[test]
+    fn bundle_preflight_rejects_indexed_named_only_checker_builtins() {
+        let mut string_bundle = ArrayExtBundleFixture::new().bundle();
+        let string = TermId::new(string_bundle.term_entries.len() as u32);
+        string_bundle.term_entries.push((
+            TermData::Const(Constant::String("hello".to_string())),
+            Sort::String,
+        ));
+        string_bundle.term_entries.push((
+            TermData::App(Symbol::indexed("str.len", vec![0]), vec![string]),
+            Sort::Int,
+        ));
+        assert_malformed_bundle(
+            &string_bundle,
+            "builtin `str.len` must be a named symbol without indices",
+        );
+
+        let mut fp_bundle = ArrayExtBundleFixture::new().bundle();
+        let rounding_mode = TermId::new(fp_bundle.term_entries.len() as u32);
+        fp_bundle.term_entries.push((
+            TermData::App(Symbol::named("RNE"), Vec::new()),
+            Sort::Uninterpreted("RoundingMode".to_string()),
+        ));
+        let zero = TermId::new(fp_bundle.term_entries.len() as u32);
+        fp_bundle.term_entries.push((
+            TermData::App(Symbol::indexed("+zero", vec![8, 24]), Vec::new()),
+            Sort::FloatingPoint(8, 24),
+        ));
+        fp_bundle.term_entries.push((
+            TermData::App(
+                Symbol::indexed("fp.add", vec![0]),
+                vec![rounding_mode, zero, zero],
+            ),
+            Sort::FloatingPoint(8, 24),
+        ));
+        assert_malformed_bundle(
+            &fp_bundle,
+            "builtin `fp.add` must be a named symbol without indices",
+        );
     }
 
     #[test]

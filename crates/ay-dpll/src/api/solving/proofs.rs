@@ -18,6 +18,25 @@ impl Solver {
         self.executor.set_produce_proofs(enabled);
     }
 
+    /// Collect a diagnostic proof surface without making successful proof
+    /// translation a prerequisite for publishing an independently certified
+    /// verdict.
+    ///
+    /// This is intentionally distinct from [`Self::set_produce_proofs`]. An
+    /// explicit proof request is an authority demand: if strict validation of
+    /// the requested artifact fails, an otherwise computed UNSAT must remain
+    /// `unknown`. Best-effort collection retains a bounded proof when one can
+    /// be reconstructed, so callers can inspect its non-strict and strict
+    /// quality, while the verdict continues to depend on AY's mandatory
+    /// independent UNSAT-certification funnel.
+    ///
+    /// `step_budget` is a deterministic bound on reconstruction work. Exhausting
+    /// it omits the diagnostic artifact; it never authorizes an uncertified
+    /// `unsat` result.
+    pub fn set_best_effort_produce_proofs(&mut self, step_budget: u64) {
+        self.executor.set_best_effort_produce_proofs(step_budget);
+    }
+
     /// Enable or disable unsat core production.
     ///
     /// When enabled, the solver tracks named assertions during solving.

@@ -3,6 +3,19 @@
 // Licensed under the Apache License, Version 2.0
 
 //! AY-side reducers from ay#9185 native replay artifacts.
+//!
+//! PIN REFRESH 2026-08-12: thirteen `*_fails_closed_without_total_model` pins
+//! became `*_is_decided_sat`. Those pins froze an INCAPABILITY — "AY cannot
+//! yet exhibit a total model for this quantified axiom, so `unknown` is the
+//! sound answer" — and the capability arrived (the constant-interpretation SAT
+//! certificate discharges e.g. `forall s. 0 <= seq_len(s)` with
+//! `seq_len := const 0`). A pin on yesterday's weakness must not outlaw
+//! today's strength: each flipped formula is genuinely satisfiable (z3 agrees
+//! under `(set-logic ALL)` where it can parse; the Seq-sorted ones admit the
+//! constant interpretation by inspection), so `sat` here is CORRECT, not
+//! leniency. The rejecting-direction tests in this file — contradictory
+//! universals that must stay refuted or unconfirmed — are untouched, and they,
+//! not the capability pins, are what guard against a wrong SAT.
 
 use crate::common::{run_executor_smt_with_timeout, SolverOutcome};
 use ntest::timeout;
@@ -94,8 +107,8 @@ fn slice_index_in_bounds_range_inclusive_fails_closed_without_total_model() {
 
 #[test]
 #[timeout(30_000)]
-fn option_constructor_membership_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn option_constructor_membership_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun logic_Some (Int) Int)
@@ -129,8 +142,8 @@ fn option_constructor_membership_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn option_none_some_disjointness_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn option_none_some_disjointness_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun logic_None () Int)
@@ -181,8 +194,8 @@ fn option_none_some_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_symbolic_mod_bucket_index_fails_closed_without_total_model() {
-    expect_unknown(
+fn hashmap_symbolic_mod_bucket_index_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -477,8 +490,8 @@ fn hashmap_invariant_bounded_good_bucket_axiom_is_soundly_unknown_without_model_
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_ix_symbolic_mod_definition_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn hashmap_bucket_ix_symbolic_mod_definition_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -548,8 +561,8 @@ fn hashmap_bucket_ix_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_concat_len_definition_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_concat_len_definition_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_concat ((Seq Int) (Seq Int)) (Seq Int))
@@ -618,8 +631,8 @@ fn seq_concat_len_and_bucket_ix_definitions_are_soundly_unknown_without_joint_mo
 
 #[test]
 #[timeout(30_000)]
-fn seq_contains_push_back_definition_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_contains_push_back_definition_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_push_back ((Seq Int) Int) (Seq Int))
@@ -656,8 +669,8 @@ fn seq_contains_push_back_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_empty_contains_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_empty_contains_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_empty () (Seq Int))
@@ -712,8 +725,8 @@ fn unrelated_quantifier_consumer_trigger_never_certifies_seq_empty_contains_sat(
 
 #[test]
 #[timeout(30_000)]
-fn seq_len_nonnegative_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_len_nonnegative_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_len ((Seq Int)) Int)
@@ -746,8 +759,8 @@ fn seq_len_nonnegative_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_select_bridge_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_select_bridge_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_array ((Seq Int)) (Array Int Int))
@@ -787,8 +800,8 @@ fn seq_select_bridge_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_get_in_bounds_axiom_fails_closed_without_total_model() {
-    expect_unknown(
+fn seq_get_in_bounds_axiom_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-fun seq_get ((Seq Int) Int) Int)
@@ -1063,8 +1076,8 @@ fn ematching_exists_does_not_mask_ground_unsat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_guarded_frame_clause_fails_closed_without_total_model() {
-    expect_unknown(
+fn hashmap_bucket_guarded_frame_clause_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -1124,8 +1137,8 @@ fn hashmap_bucket_guarded_frame_clause_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_bucket_range_guarded_frame_clause_fails_closed_without_total_model() {
-    expect_unknown(
+fn hashmap_bucket_range_guarded_frame_clause_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)
@@ -1335,8 +1348,8 @@ fn positive_symbolic_mod_bounds_discharge_resize_frame_split_with_list_carriers(
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_logic_no_double_binding_invariant_fails_closed_without_total_model() {
-    expect_unknown(
+fn hashmap_logic_no_double_binding_invariant_is_decided_sat() {
+    expect_sat(
         r#"
 (set-logic AUFLIA)
 (declare-sort MyHashMap 0)

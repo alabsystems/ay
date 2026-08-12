@@ -226,6 +226,16 @@ fn validate_bounds_gap(
     clause: &[TermId],
     farkas: Option<&FarkasAnnotation>,
 ) -> Result<(), LiaValidationError> {
+    // A strict inequality over Int rounds to the next integer.  Two bounds on
+    // the same integral linear form can therefore have an EMPTY rounded
+    // interval even when their rational relaxations overlap, e.g.
+    // `0 < m` and `m - 1 < 0` become `m >= 1` and `m <= 0`.  This is the
+    // integer-specific BoundsGap promised by the annotation; it cannot be
+    // delegated to rational Farkas validation.
+    if recognize_rounded_integer_bounds_gap(terms, clause) {
+        return Ok(());
+    }
+
     let farkas = farkas.ok_or(LiaValidationError::MissingFarkas { shape: "BoundsGap" })?;
 
     // Convert blocking clause literals to conflict literals
@@ -240,6 +250,39 @@ fn validate_bounds_gap(
             reason: e.to_string(),
         },
     )
+}
+
+/// Recognize a strict-checkable pair of integer bounds whose rounded lower
+/// endpoint exceeds its rounded upper endpoint.
+///
+/// Both literals must be blocking-clause negations of comparisons over the
+/// SAME all-Int linear form. [`parse_int_bound`] performs the exact integer
+/// rounding and rejects Real/nonlinear/non-integral forms. This function is
+/// the producer-facing inverse of the first arm of [`validate_bounds_gap`].
+#[must_use]
+pub fn recognize_lia_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
+    recognize_rounded_integer_bounds_gap(terms, clause)
+}
+
+fn recognize_rounded_integer_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
+    let [first, second] = clause else {
+        return false;
+    };
+    let Some((first_coeffs, first_upper, first_value)) = parse_int_bound(terms, *first) else {
+        return false;
+    };
+    let Some((second_coeffs, second_upper, second_value)) = parse_int_bound(terms, *second) else {
+        return false;
+    };
+    if first_coeffs != second_coeffs || first_upper == second_upper {
+        return false;
+    }
+    let (lower, upper) = if first_upper {
+        (second_value, first_value)
+    } else {
+        (first_value, second_value)
+    };
+    lower > upper
 }
 
 /// Recognize whether `clause` is a strict-checkable integer-divisibility

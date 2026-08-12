@@ -20,7 +20,10 @@
 //! - `array_soundness`: QF_AX wrong-answer regressions (#4304)
 //! - `qflia_differential_fuzz`: single-shot QF_LIA differential fuzzer
 //!   (seed-236 false-UNSAT family)
+//! - `reserved_name_capture`: end-to-end verdict guards for the reserved-name
+//!   gates (`map[...]` array-map capture, qualified-`(as …)` path spellings)
 
+mod abvfp_flatten;
 mod array_soundness;
 mod bv;
 mod commands;
@@ -44,6 +47,7 @@ mod partition_rescue;
 mod qflia_differential_fuzz;
 mod quantifier;
 mod regression;
+mod reserved_name_capture;
 mod seq;
 mod set;
 mod simplify;

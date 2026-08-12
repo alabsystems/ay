@@ -392,6 +392,65 @@ pub(crate) fn infer_theory_conflict_kind(
     }
 }
 
+/// Record an already-materialized theory LEMMA clause through the central
+/// classifier funnel (#trust->0 C1.iii).
+///
+/// `clause_lits` are the lemma's CLAUSE literals (`value == true` means the
+/// literal is `term` itself; `false` means its negation), i.e. the polarity
+/// convention of `TheoryLemma::clause` / `term_to_literal` — the OPPOSITE of
+/// the conflict convention `build_blocking_clause_terms` consumes.
+///
+/// Polarity is resolved through the negation cache BEFORE classification: a
+/// clause with any unresolvable negation keeps the legacy raw-term fallback
+/// literal and is recorded as bare `Generic` WITHOUT running the funnel.
+/// Classifying a wrong-polarity clause could stamp a typed kind on a
+/// malformed artifact, turning today's deferred-trust discharge into a hard
+/// strict failure (the review-required polarity fix); the unclassified
+/// residual is the same negation-cache miss class as
+/// `build_blocking_clause_terms` (Wave-3, never loosened here).
+pub(crate) fn record_materialized_lemma_clause(
+    tracker: &mut ProofTracker,
+    terms: Option<&TermStore>,
+    negations: &HashMap<TermId, TermId>,
+    clause_lits: &[TheoryLit],
+) -> Option<ProofId> {
+    if !tracker.is_enabled() {
+        return None;
+    }
+    let mut clause = Vec::with_capacity(clause_lits.len());
+    let mut polarity_complete = true;
+    for lit in clause_lits {
+        if lit.value {
+            clause.push(lit.term);
+        } else if let Some(&neg) = negations.get(&lit.term) {
+            clause.push(neg);
+        } else {
+            // Legacy fallback literal (wrong polarity): recorded for parity
+            // with the historical sites, but NEVER classified.
+            polarity_complete = false;
+            clause.push(lit.term);
+        }
+    }
+    let funnel_terms = if polarity_complete { terms } else { None };
+    let Some(terms) = funnel_terms else {
+        return tracker.add_theory_lemma(clause);
+    };
+    let kind = infer_theory_lemma_kind_from_clause_terms(terms, &clause);
+    match kind {
+        TheoryLemmaKind::Generic => tracker.add_theory_lemma(clause),
+        // The funnel classifies these only after the integer gate
+        // (`LiaGeneric`) or a FULL semantic verification of the UNIT
+        // certificate (opaque-atom `LraFarkas`); attach the same unit
+        // coefficients, exactly as `record_theory_conflict_unsat` does. The
+        // strict checker re-decides either way (fail-closed).
+        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas => {
+            let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
+            tracker.add_theory_lemma_with_farkas_and_kind(clause, unit_farkas, kind)
+        }
+        _ => tracker.add_theory_lemma_with_kind(clause, kind),
+    }
+}
+
 /// Record a theory conflict with Farkas coefficients (arithmetic theories).
 pub(crate) fn record_theory_conflict_unsat_with_farkas(
     tracker: &mut ProofTracker,
@@ -404,8 +463,20 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas(
     }
 
     let Some(farkas) = conflict.farkas.clone() else {
-        let clause = build_blocking_clause_terms(negations, &conflict.literals)?;
-        return tracker.add_theory_lemma(clause);
+        // #trust->0 C1.i: no Farkas certificate on the conflict — delegate to
+        // `record_theory_conflict_unsat` so the WHOLE-conflict classifier
+        // (EUF/arith/array/string/FP + combined-theory core decomposition)
+        // runs instead of recording a bare `Generic`/trust lemma.
+        //
+        // Fail-closed nuance preserved: this site historically recorded
+        // NOTHING (`?` early return) when the negation cache cannot express
+        // the blocking clause, while the delegate's fallback records the
+        // UNNEGATED literal terms — a wrong-polarity clause no validator can
+        // accept (the mod.rs `build_blocking_clause_terms` miss class,
+        // Wave-3). Keep the stricter no-record behavior on that residual by
+        // probing the builder first.
+        build_blocking_clause_terms(negations, &conflict.literals)?;
+        return record_theory_conflict_unsat(tracker, terms, negations, &conflict.literals);
     };
 
     let clause = build_blocking_clause_terms(negations, &conflict.literals)?;

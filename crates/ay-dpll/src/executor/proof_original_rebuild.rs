@@ -49,7 +49,7 @@
 //! fails, the original proof is kept unchanged (fail-closed: the output is
 //! never worse, and never a wrong proof step).
 
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{
     AletheRule, Constant, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId,
@@ -64,6 +64,27 @@ use super::proof_surface_syntax::{
 };
 use super::proof_trust_surgery_provenance::OriginalSourceIndex;
 use super::Executor;
+
+fn collect_bounded_bv_lia_roots(
+    terms: &TermStore,
+    authored_roots: &[TermId],
+) -> Option<Vec<TermId>> {
+    let mut seen = HashSet::default();
+    let mut roots = Vec::new();
+    for &root in authored_roots {
+        if terms.entry_stamp(root).is_none() || terms.sort(root) != &Sort::Bool {
+            return None;
+        }
+        if matches!(terms.get(root), TermData::Const(Constant::Bool(true))) || !seen.insert(root) {
+            continue;
+        }
+        if roots.len() == ay_proof::MAX_BV_LIA_QUERY_ROOTS {
+            return None;
+        }
+        roots.push(root);
+    }
+    Some(roots)
+}
 
 /// How a single disjunct of the original disjunction gets eliminated.
 enum DisjunctElimination {
@@ -670,6 +691,102 @@ impl Executor {
         // just those leaves with an `eq_congruent_pred` bridge from the
         // AUTHORED assertion plus the defining equalities. Fail-closed.
         self.try_rebuild_with_substitution_bridge(proof, &originals);
+
+        // Final internal-certificate fallback for exact mixed Bool/Int/BV
+        // source queries.  Run only after every ordinary Alethe reconstruction
+        // above has had first refusal: the pinned external checker cannot parse
+        // `bv2nat`, while AY's bounded source interpreter can independently
+        // re-decide a narrow finite query.  The candidate is still an ordinary
+        // assume + tautology + resolution proof, and both its premise scope and
+        // every step are replayed before replacement.
+        if !authenticated_terms.is_empty() {
+            self.try_rebuild_authenticated_bv_lia_refutation(proof, &authenticated_terms);
+        }
+    }
+
+    /// Replace a still-defective proof with a bounded semantic tautology over
+    /// exact immutable authored roots.
+    fn try_rebuild_authenticated_bv_lia_refutation(
+        &mut self,
+        proof: &mut Proof,
+        authenticated_authored_roots: &[TermId],
+    ) -> bool {
+        // Preserve a proof that an earlier, externally surfaceable rebuild has
+        // already completed.  Scope validation is separate from rule replay:
+        // a syntactically valid proof with a foreign assume is not authoritative.
+        if ay_proof::validate_reachable_assumes_in_problem_scope(
+            proof,
+            authenticated_authored_roots,
+        )
+        .is_ok()
+            && ay_proof::check_proof_strict(proof, &self.ctx.terms)
+                .is_ok_and(|quality| quality.is_complete())
+            && Self::proof_derives_empty_clause(proof)
+        {
+            return false;
+        }
+
+        // `true` contributes nothing to a conjunction and creates an awkward
+        // constant pivot. Deduplicate exact TermIds in linear time and stop as
+        // soon as the independent checker's root bound is exceeded. No
+        // rewritten/generated root is admitted.
+        let Some(roots) =
+            collect_bounded_bv_lia_roots(&self.ctx.terms, authenticated_authored_roots)
+        else {
+            return false;
+        };
+        if roots.is_empty()
+            || ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &roots, None).is_err()
+        {
+            return false;
+        }
+
+        let mut candidate = Proof::new();
+        let assumes: Vec<ProofId> = roots
+            .iter()
+            .map(|&root| candidate.add_assume(root, None))
+            .collect();
+        let mut residual: Vec<TermId> = roots
+            .iter()
+            .map(|&root| self.ctx.terms.mk_not_raw(root))
+            .collect();
+        let mut current = candidate.add_step(ProofStep::TheoryLemma {
+            theory: "BV_LIA".to_string(),
+            clause: residual.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::BvLiaTautology,
+            lia: None,
+        });
+        for (&root, &assume) in roots.iter().zip(assumes.iter()) {
+            let complement = self.ctx.terms.mk_not_raw(root);
+            let before = residual.len();
+            residual.retain(|&literal| literal != complement);
+            if residual.len() + 1 != before {
+                return false;
+            }
+            current = candidate.add_resolution(residual.clone(), root, current, assume);
+        }
+        if !residual.is_empty() {
+            return false;
+        }
+
+        if ay_proof::validate_reachable_assumes_in_problem_scope(
+            &candidate,
+            authenticated_authored_roots,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Ok(quality) = ay_proof::check_proof_strict(&candidate, &self.ctx.terms) else {
+            return false;
+        };
+        if !quality.is_complete() || !Self::proof_derives_empty_clause(&candidate) {
+            return false;
+        }
+
+        *proof = candidate;
+        true
     }
 
     /// Replace a trust-bearing sequence push-back proof with the exact
@@ -4215,3 +4332,7 @@ enum SurfaceCanonicalization {
 #[cfg(test)]
 #[path = "proof_original_rebuild_tests.rs"]
 mod proof_original_rebuild_tests;
+
+#[cfg(test)]
+#[path = "proof_original_rebuild_bv_lia_tests.rs"]
+mod proof_original_rebuild_bv_lia_tests;

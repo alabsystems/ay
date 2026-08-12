@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ay_core::kani_compat::{det_hash_map_new, DetHashMap};
 use ay_core::{FarkasAnnotation, LiaAnnotation, Proof, Sort, TermId, TermStore, TheoryLemmaKind};
 use ay_proof::{
-    check_proof_strict, export_alethe, export_alethe_with_problem_scope,
-    export_alethe_with_problem_scope_and_overrides,
+    check_alethe_document, check_proof_strict, export_alethe, export_alethe_with_problem_scope,
+    export_alethe_with_problem_scope_and_overrides, ProblemScope,
 };
 use num_bigint::BigInt;
 
@@ -325,6 +325,133 @@ fn exports_degenerate_eq_transitive_certificate_that_carcara_accepts() {
         "degenerate eq_transitive must be padded with a reflexive hypothesis:\n{alethe}"
     );
     assert_carcara_accepts("degenerate_eq_transitive", QF_EQ_TRANS_SYMM_UNSAT, &alethe);
+}
+
+const QF_BOOL_RENESTED_AND_UNSAT: &str = r#"
+(set-logic QF_BOOL)
+(declare-const a Bool)
+(declare-const b Bool)
+(declare-const c Bool)
+(assert (and a (and b c)))
+(assert (not c))
+(check-sat)
+"#;
+
+const QF_BOOL_FLATTENED_AND_UNSAT: &str = r#"
+(set-logic QF_BOOL)
+(declare-const a Bool)
+(declare-const b Bool)
+(declare-const c Bool)
+(assert (and a b c))
+(assert (not (and b c)))
+(check-sat)
+"#;
+
+/// A raw-gate `and_pos` over AY's FLAT internal conjunction whose surface
+/// override re-nests the authored grouping `(and a (and b c))`: the indexed
+/// conjunct is a deeper printed operand, bridged by the printed-nesting
+/// navigator. The exported document must be spec-valid Alethe end to end.
+#[test]
+fn exports_renested_surface_and_pos_certificate_that_carcara_accepts() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let source = terms.mk_and(vec![a, b, c]);
+    let gate = terms.mk_not_raw(source);
+    let not_c = terms.mk_not_raw(c);
+
+    let mut proof = Proof::new();
+    let h0 = proof.add_assume(source, None);
+    let t1 = proof.add_rule_step(
+        ay_core::AletheRule::AndPos(2),
+        vec![gate, c],
+        vec![],
+        vec![source],
+    );
+    let t2 = proof.add_resolution(vec![c], source, h0, t1);
+    let h3 = proof.add_assume(not_c, None);
+    proof.add_resolution(vec![], c, t2, h3);
+    check_proof_strict(&proof, &terms).expect("re-nested surface proof should validate strictly");
+
+    let mut overrides: DetHashMap<TermId, String> = det_hash_map_new();
+    overrides.insert(source, "(and a (and b c))".to_string());
+    let alethe = export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[source, not_c],
+        Some(&overrides),
+    );
+    assert!(
+        alethe.contains(
+            "(step t1.g0 (cl (not (and a (and b c))) (and b c)) :rule and_pos :args (1))"
+        ),
+        "expected the navigator hop chain:\n{alethe}"
+    );
+    assert!(!alethe.contains(":rule hole"), "{alethe}");
+    assert!(!alethe.contains(":rule trust"), "{alethe}");
+    // The strict publication gate (`AY_PROOF_SELF_CHECK=strict`) refuses any
+    // document AY's own round-trip checker rejects; a bridge that only
+    // carcara accepts would still fail publication.
+    check_alethe_document(
+        &alethe,
+        &ProblemScope::from_smtlib_source(QF_BOOL_RENESTED_AND_UNSAT),
+    )
+    .expect("AY's native round-trip checker must accept the navigator bridge");
+    assert_carcara_accepts("renested_and_pos", QF_BOOL_RENESTED_AND_UNSAT, &alethe);
+}
+
+/// A raw-gate `and_pos` whose indexed conjunct is an and-term ERASED by
+/// surface flattening (`(and a (and b c))` printed `(and a b c)`): projected
+/// child-by-child off the flat surface and reassembled via `and_neg` +
+/// resolution. The exported document must be spec-valid Alethe end to end.
+#[test]
+fn exports_flattened_conjunct_and_pos_certificate_that_carcara_accepts() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Bool);
+    let b = terms.mk_var("b", Sort::Bool);
+    let c = terms.mk_var("c", Sort::Bool);
+    let inner = terms.mk_app(ay_core::Symbol::named("and"), vec![b, c], Sort::Bool);
+    let source = terms.mk_app(ay_core::Symbol::named("and"), vec![a, inner], Sort::Bool);
+    let gate = terms.mk_not_raw(source);
+    let not_inner = terms.mk_not_raw(inner);
+
+    let mut proof = Proof::new();
+    let h0 = proof.add_assume(source, None);
+    let t1 = proof.add_rule_step(
+        ay_core::AletheRule::AndPos(1),
+        vec![gate, inner],
+        vec![],
+        vec![source],
+    );
+    let t2 = proof.add_resolution(vec![inner], source, h0, t1);
+    let h3 = proof.add_assume(not_inner, None);
+    proof.add_resolution(vec![], inner, t2, h3);
+    check_proof_strict(&proof, &terms).expect("flattened-conjunct proof should validate strictly");
+
+    let mut overrides: DetHashMap<TermId, String> = det_hash_map_new();
+    overrides.insert(source, "(and a b c)".to_string());
+    let alethe = export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[source, not_inner],
+        Some(&overrides),
+    );
+    assert!(
+        alethe.contains("(step t1.fa (cl (and b c) (not b) (not c)) :rule and_neg)"),
+        "expected the and_neg reassembly bridge:\n{alethe}"
+    );
+    assert!(!alethe.contains(":rule hole"), "{alethe}");
+    assert!(!alethe.contains(":rule trust"), "{alethe}");
+    // The strict publication gate (`AY_PROOF_SELF_CHECK=strict`) refuses any
+    // document AY's own round-trip checker rejects; a bridge that only
+    // carcara accepts would still fail publication.
+    check_alethe_document(
+        &alethe,
+        &ProblemScope::from_smtlib_source(QF_BOOL_FLATTENED_AND_UNSAT),
+    )
+    .expect("AY's native round-trip checker must accept the and_neg reassembly bridge");
+    assert_carcara_accepts("flattened_and_pos", QF_BOOL_FLATTENED_AND_UNSAT, &alethe);
 }
 
 fn assert_carcara_accepts(label: &str, problem: &str, proof: &str) {

@@ -14,7 +14,7 @@
 use ay_core::{AletheRule, ProofStep};
 use ay_proof::{
     check_proof_collecting_trust_with_context, check_proof_partial, check_proof_with_quality,
-    PartialProofCheck, ProofCheckError, ProofQuality,
+    AlethePrintError, PartialProofCheck, ProofCheckError, ProofQuality,
 };
 use num_rational::BigRational;
 
@@ -685,13 +685,23 @@ impl super::Solver {
     #[must_use]
     pub fn export_last_unsat_artifact(&self) -> Option<UnsatProofArtifact> {
         let proof = self.executor.last_proof()?;
-        let terms = self.executor.terms();
         let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
-        let alethe = self
-            .executor
-            .try_export_last_proof_alethe_for_problem_scope()?
-            .ok()?;
         let strict_quality = self.executor.check_proof_strict_with_datatypes(proof);
+        let ordinary_surface = self
+            .executor
+            .try_export_last_proof_alethe_for_problem_scope()?;
+        let alethe = match ordinary_surface {
+            Ok(alethe) => alethe,
+            Err(AlethePrintError::UnsupportedArrayExtensionality { id })
+                if strict_quality.is_ok() =>
+            {
+                self.executor
+                    .try_export_extensionality_artifact_surface(id)?
+                    .ok()?
+            }
+            Err(_) => return None,
+        };
+        let terms = self.executor.terms();
         let evaluation = evaluate_proof_artifact_boundary(proof, terms, strict_quality)?;
 
         let restricted_rule_subset_ok =

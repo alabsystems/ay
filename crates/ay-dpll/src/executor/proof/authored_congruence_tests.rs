@@ -125,3 +125,300 @@ fn a_candidate_the_strict_gate_rejects_purges_nothing() {
         "the export table may only change for a proof the strict checker accepted"
     );
 }
+
+// ===========================================================================
+// Authored-surface respelling
+//
+// The purge alone prints every operand from the term the checker accepted —
+// internally consistent, but where elaboration FOLDED the source that is no
+// longer the problem file's syntax, and Carcara matches `assume` against the
+// original premises syntactically. The respelling moves the whole certified
+// reconstruction onto the raw authored terms so both properties hold at once.
+// These tests pin its scope: it fires only on a real fold, it never invents
+// premise authority, and the document it produces has ONE spelling per term.
+// ===========================================================================
+
+/// The `(bvadd p #x00)` fold: `TermStore::mk_bvadd` hash-conses `x + 0` to `x`,
+/// so the authored index and the certified read are one interned term.
+const BVADD_FOLD_FIXTURE: &str = "(set-option :produce-proofs true)\n\
+     (set-logic QF_ABV)\n\
+     (declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))\n\
+     (declare-const p (_ BitVec 8))\n\
+     (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))\n\
+     (assert (= mem2 (store mem (bvadd p #x00) #x10)))\n\
+     (assert (= (select mem2 (bvadd p #x00)) #x20))\n\
+     (check-sat)\n\
+     (get-proof)";
+
+#[test]
+fn a_folded_authored_root_exports_with_the_problem_file_spelling() {
+    let mut executor = Executor::new();
+    let commands = ay_frontend::parse(BVADD_FOLD_FIXTURE).expect("the fold fixture parses");
+    let outputs = executor
+        .execute_all(&commands)
+        .expect("the fold fixture executes");
+    assert_eq!(
+        outputs.first().map(String::as_str),
+        Some("unsat"),
+        "the cell just written with #x10 cannot read back #x20, got {outputs:?}"
+    );
+    let proof = outputs.last().expect("`(get-proof)` produces a document");
+
+    // Carcara matches an `assume` against the original problem premises
+    // SYNTACTICALLY, and it does not fold `(bvadd p #x00)`. Measured on
+    // carcara 1.1.0, the canonical spelling was rejected outright with
+    // "could not match term to any of the original problem premises".
+    assert!(
+        proof.contains("(assume t0 (= mem2 (store mem (bvadd p #b00000000) #b00010000)))"),
+        "the assume must carry the problem file's own index spelling:\n{proof}"
+    );
+    assert!(
+        proof.contains("(assume t7 (= (select mem2 (bvadd p #b00000000)) #b00100000))"),
+        "every authored root must carry it, not just the first:\n{proof}"
+    );
+    // ...and ONE spelling per term: the ROW1 index must agree with the store's
+    // index and with the reflexive congruence hypothesis, or Carcara's
+    // `arrays_idx` / `eq_congruent` reject the very steps the assume unlocked.
+    assert!(
+        proof.contains(
+            "(step t5 (cl (= (select (store mem (bvadd p #b00000000) #b00010000) \
+             (bvadd p #b00000000)) #b00010000)) :rule arrays_idx)"
+        ),
+        "the ROW1 step must read the same index it wrote:\n{proof}"
+    );
+    assert!(
+        !proof.contains("(select mem2 p)"),
+        "no step may fall back to the folded spelling:\n{proof}"
+    );
+}
+
+#[test]
+fn respelling_declines_an_authored_root_elaboration_left_intact() {
+    let mut executor = Executor::new();
+    let commands = ay_frontend::parse(
+        "(declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))\n\
+         (declare-const p (_ BitVec 8))\n\
+         (assert (= (select mem p) #x10))",
+    )
+    .expect("the fold-free fixture parses");
+    executor
+        .execute_all(&commands)
+        .expect("the fold-free fixture executes");
+    let root = executor.ctx.assertions[0];
+
+    let mut candidate = Proof::new();
+    let _ = candidate.add_assume(root, None);
+    assert!(
+        executor
+            .respell_certified_proof_over_authored_surface(&candidate)
+            .is_none(),
+        "a root whose raw re-intern IS the canonical term has nothing to respell, \
+         so the committed proof must stay exactly as the strict checker accepted it"
+    );
+}
+
+/// Two authored roots that BOTH fold to the same canonical literal, plus a
+/// hand-built refutation of them that the strict checker accepts on its own.
+///
+/// This is the smallest fixture on which the respelling actually runs to
+/// completion, so the guards after the rewrite are reachable from a test.
+/// Returns the executor, the canonical roots, their raw re-interns, and the
+/// certified candidate.
+fn folded_complementary_pair_fixture() -> (Executor, [TermId; 2], [TermId; 2], Proof) {
+    let mut executor = Executor::new();
+    let commands = ay_frontend::parse(
+        "(declare-const p (_ BitVec 8))\n\
+         (assert (= (bvadd p #x00) #x10))\n\
+         (assert (not (= (bvadd p #x00) #x10)))",
+    )
+    .expect("the folded complementary fixture parses");
+    executor
+        .execute_all(&commands)
+        .expect("the folded complementary fixture executes");
+
+    let roots = [executor.ctx.assertions[0], executor.ctx.assertions[1]];
+    let raws = {
+        let parsed: Vec<FrontendTerm> = executor.ctx.assertions_parsed()[..2].to_vec();
+        [
+            executor
+                .raw_intern_surface(&parsed[0])
+                .expect("the positive spelling re-interns"),
+            executor
+                .raw_intern_surface(&parsed[1])
+                .expect("the negated spelling re-interns"),
+        ]
+    };
+    assert_ne!(raws[0], roots[0], "the fixture must actually fold");
+    assert_ne!(raws[1], roots[1], "both spellings must fold");
+
+    let mut candidate = Proof::new();
+    let positive = candidate.add_assume(roots[0], None);
+    let negative = candidate.add_assume(roots[1], None);
+    candidate.add_resolution(Vec::new(), roots[0], positive, negative);
+    (executor, roots, raws, candidate)
+}
+
+#[test]
+fn respelling_declines_a_raw_reintern_the_premise_scope_has_not_admitted() {
+    let (mut executor, roots, raws, candidate) = folded_complementary_pair_fixture();
+    // The candidate itself is what the commit gate accepts today.
+    assert!(Executor::proof_derives_empty_clause(&candidate));
+    assert!(executor
+        .check_proof_strict_with_datatypes(&candidate)
+        .is_ok());
+    assert!(
+        ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &roots).is_ok(),
+        "the canonical candidate assumes exactly the authored roots"
+    );
+
+    // The respelling REUSES the grant `rebuild_trust_leaf_proof_from_original_assertions`
+    // records for the raw re-intern of every parsed original; it never mints
+    // one. With no grant on record there is no authored premise to assume, so
+    // it must decline rather than put an unadmitted term behind `assume`.
+    executor.last_proof_rebuild_originals.clear();
+    assert!(
+        executor
+            .respell_certified_proof_over_authored_surface(&candidate)
+            .is_none(),
+        "an unadmitted raw re-intern must never become an `assume`"
+    );
+
+    // Record exactly the grant that pass would have recorded, and the SAME
+    // candidate respells — so the decline above was the authority check, not
+    // an unrelated failure.
+    for raw in raws {
+        executor.record_rebuilt_authored_proof_premise(raw);
+    }
+    let respelled = executor
+        .respell_certified_proof_over_authored_surface(&candidate)
+        .expect("an admitted raw re-intern respells");
+    assert!(
+        matches!(respelled.steps[0], ProofStep::Assume(term) if term == raws[0]),
+        "the respelled document assumes the problem file's own spelling"
+    );
+    assert!(matches!(respelled.steps[1], ProofStep::Assume(term) if term == raws[1]));
+}
+
+#[test]
+fn respelling_refuses_a_rename_another_authored_assume_still_depends_on() {
+    let mut executor = Executor::new();
+    // Only the FIRST assertion folds. Respelling it maps `p` to
+    // `(bvadd p #x00)`, which would rewrite the second assume into
+    // `(not (= (bvadd p #x00) #x10))` — a term the problem file never wrote.
+    let commands = ay_frontend::parse(
+        "(declare-const p (_ BitVec 8))\n\
+         (assert (= (bvadd p #x00) #x10))\n\
+         (assert (not (= p #x10)))",
+    )
+    .expect("the mixed-spelling fixture parses");
+    executor
+        .execute_all(&commands)
+        .expect("the mixed-spelling fixture executes");
+    let roots = [executor.ctx.assertions[0], executor.ctx.assertions[1]];
+    let raws: Vec<TermId> = executor.ctx.assertions_parsed()[..2]
+        .to_vec()
+        .iter()
+        .map(|parsed| {
+            executor
+                .raw_intern_surface(parsed)
+                .expect("both spellings re-intern")
+        })
+        .collect();
+    for &raw in &raws {
+        executor.record_rebuilt_authored_proof_premise(raw);
+    }
+
+    let mut candidate = Proof::new();
+    let positive = candidate.add_assume(roots[0], None);
+    let negative = candidate.add_assume(roots[1], None);
+    candidate.add_resolution(Vec::new(), roots[0], positive, negative);
+    assert!(Executor::proof_derives_empty_clause(&candidate));
+    assert!(executor
+        .check_proof_strict_with_datatypes(&candidate)
+        .is_ok());
+
+    // This is what `bound_override_respells_target` refuses as a PRINTING
+    // decision. Here it is refused for a checkable reason instead: the
+    // respelled proof would assume a non-problem term, and the gate the
+    // respelling is put back through says so.
+    assert!(
+        executor
+            .respell_certified_proof_over_authored_surface(&candidate)
+            .is_none(),
+        "a respelling may not rename a term a second authored assume spells plainly"
+    );
+}
+
+#[test]
+fn alignment_records_the_fold_point_and_refuses_two_spellings_for_one_term() {
+    let mut executor = Executor::new();
+    let commands = ay_frontend::parse(
+        "(declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))\n\
+         (declare-const p (_ BitVec 8))\n\
+         (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))\n\
+         (assert (= mem2 (store mem (bvadd p #x00) #x10)))\n\
+         (assert (= mem2 (store mem (bvsub p #x00) #x10)))",
+    )
+    .expect("the two-spelling fixture parses");
+    executor
+        .execute_all(&commands)
+        .expect("the two-spelling fixture executes");
+
+    let (first_root, second_root) = (executor.ctx.assertions[0], executor.ctx.assertions[1]);
+    let (first_raw, second_raw) = {
+        let first = executor.ctx.assertions_parsed()[0].clone();
+        let second = executor.ctx.assertions_parsed()[1].clone();
+        (
+            executor
+                .raw_intern_surface(&first)
+                .expect("the first spelling re-interns"),
+            executor
+                .raw_intern_surface(&second)
+                .expect("the second spelling re-interns"),
+        )
+    };
+    let p = executor
+        .ctx
+        .terms
+        .lookup("p")
+        .expect("the index variable is interned");
+
+    let mut surface = DetHashMap::default();
+    let mut work = 4096usize;
+    Executor::align_authored_surface_spelling(
+        &executor.ctx.terms,
+        first_root,
+        first_raw,
+        &mut surface,
+        &mut work,
+    )
+    .expect("one authored root aligns with its own raw re-intern");
+    // The lockstep walk descends the equality and the store, and stops exactly
+    // where elaboration folded: the index.
+    assert_eq!(
+        surface.get(&p).copied(),
+        Some(match executor.ctx.terms.get(first_raw) {
+            TermData::App(_, args) => match executor.ctx.terms.get(args[1]) {
+                TermData::App(_, store_args) => store_args[1],
+                _ => panic!("the raw root is an equality over a raw store"),
+            },
+            _ => panic!("the raw root is an equality"),
+        }),
+        "the folded index must map to the authored sum"
+    );
+
+    // A second authored root that folds the SAME term to a DIFFERENT spelling
+    // has no consistent respelling; alignment must fail closed rather than
+    // pick one.
+    assert!(
+        Executor::align_authored_surface_spelling(
+            &executor.ctx.terms,
+            second_root,
+            second_raw,
+            &mut surface,
+            &mut work,
+        )
+        .is_none(),
+        "one term may not acquire two authored spellings"
+    );
+}

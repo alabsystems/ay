@@ -911,6 +911,23 @@ pub(crate) struct ColdState {
     /// consistent with the LRAT proof even when derived clauses/deletions advance
     /// next_clause_id past the original range.
     pub(super) next_original_clause_id: u64,
+    /// Highest clause ID ever issued to an original (non-derived) clause.
+    ///
+    /// Since the late-original allocator jumps `next_original_clause_id` past
+    /// live derived IDs (`allocate_original_clause_id`, b93692341), the range
+    /// `1..=next_original_clause_id-1` may contain derived IDs. Snapshot
+    /// consumers (streaming UNSAT core sizing) read this counter instead: it
+    /// is bumped only when an ID is actually issued to an original clause.
+    pub(super) issued_original_clause_id_max: u64,
+    /// Per-clause-ID original marker, indexed by `clause_id - 1` (IDs are
+    /// 1-based), grown lazily to the highest issued original ID.
+    ///
+    /// `true` iff that ID was issued to an original (non-derived) clause.
+    /// Needed because derived IDs can sit *between* original IDs after the
+    /// late-original jump, so `id <= issued_original_clause_id_max` alone no
+    /// longer implies "original". Used by the streaming UNSAT core to keep
+    /// derived antecedents out of the reported original core.
+    pub(super) original_clause_id_bits: Vec<bool>,
     /// Whether LRAT proof generation is enabled (track resolution chains)
     pub(super) lrat_enabled: bool,
     /// Whether UNSAT results build a `ProofCertificate` via backward LRAT
@@ -1986,6 +2003,8 @@ impl ColdState {
             proof_bookkeeping_budget: None,
             next_clause_id: 1,
             next_original_clause_id: 1,
+            issued_original_clause_id_max: 0,
+            original_clause_id_bits: Vec::new(),
             lrat_enabled,
             unsat_certificate_enabled: true,
             ambient_artifacts_enabled: true,

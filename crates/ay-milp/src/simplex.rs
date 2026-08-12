@@ -2100,13 +2100,53 @@ fn lu_verify_after() -> usize {
 /// saving it bought (47.9s -> 20.8s) was real and irrelevant. Cadence stays
 /// 50; the trigger that IS safely relaxable on this class is the
 /// end-of-solve verify (`lu_verify_after`).
+///
+/// 50 -> 20 (2026-08-11). NOTE THE DIRECTION: the landmine above is about RAISING
+/// the cadence, which lets Forrest-Tomlin error accumulate across more updates.
+/// LOWERING it refactors MORE often and therefore carries STRICTLY LESS FT drift,
+/// so it sits on the safe side of that failure, not near it.
+///
+/// WHY. On qiu the eta UPDATE, not refactorisation, is the cost: `REFAC 1.44s` against
+/// `LUSOLVE update 5.77s` over 460k calls at ~12.5us, with ftran `avg_reach 695` of
+/// 1192 rows -- the basis LU runs 58% DENSE, so every extra eta makes every subsequent
+/// solve dearer. Shortening the eta file attacks the dominant term directly:
+///
+/// ```text
+///   cadence   qiu wall   nodes   LUSOLVE   avg_reach
+///     100      33.259s   4133     6.27s      783
+///      60      41.990s   7563     7.52s      723
+///      50      34.985s   5752     5.81s      695   (old default)
+///      40      27.996s   4155     4.36s      709
+///      20      25.834s   4116     2.96s      622
+/// ```
+///
+/// FULL CORPUS at 20, serial, idle, best-of-3 on misc07:
+///
+/// ```text
+///   qiu    33.693 -> 25.279s  (-8.414s, 1.33x)   nodes 5782 -> 4120
+///   15 of 17 instances keep BYTE-IDENTICAL node counts -- the change is INERT on them
+///   only qiu and misc07 move at all, and misc07's nodes IMPROVE (7415 -> 7308)
+///   every other delta is sub-50ms wall noise on an unchanged tree
+///   TOTAL 93.220 -> 85.099s  (-8.121s, 8.7%)
+/// ```
+///
+/// That inertness is what distinguishes this from the walk-changing knobs this file
+/// has rejected. `AY_MILP_CUT_WARM` also showed a headline gain and was refused because
+/// it moved REAL trees (blend2 3882 -> 5940 nodes, p0201 110 -> 798); Devex was 1.95x
+/// on its target instance and +91.6s over fourteen. This one leaves fifteen trees
+/// bit-for-bit alone.
+///
+/// The cadence sweep is NON-MONOTONE (60 is worse than both 40 and 100), so 20 is not
+/// claimed as an optimum -- it is the best of {20,40,50,60,100} and the lowest value
+/// tried. A finer sweep below 20, and a per-class cadence for the dense-LU regime
+/// (qiu/qnet1/gen/khb05250 are 73.6% of the corpus gap by wall), are both open.
 fn lu_refactor_every() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("AY_MILP_LU_REFACTOR")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50)
+            .unwrap_or(20)
     })
 }
 

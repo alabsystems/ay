@@ -28,7 +28,7 @@
 //! so the independence is at the operator/composition level — exactly where the
 //! historical wrong-`sat` bugs lived.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -107,6 +107,7 @@ struct SharedViewCaches {
     resolved: Rc<RefCell<HashMap<TermId, ModelValue>>>,
     resolved_none: Rc<RefCell<HashSet<TermId>>>,
     def_index: Rc<RefCell<Option<HashMap<TermId, Vec<TermId>>>>>,
+    datatype_guard: Rc<OnceCell<super::rendered_dt_guard::RenderedDatatypeGuard>>,
 }
 
 impl SharedViewCaches {
@@ -115,6 +116,7 @@ impl SharedViewCaches {
             resolved: Rc::new(RefCell::new(HashMap::new())),
             resolved_none: Rc::new(RefCell::new(HashSet::new())),
             def_index: Rc::new(RefCell::new(None)),
+            datatype_guard: Rc::new(OnceCell::new()),
         }
     }
 }
@@ -153,6 +155,9 @@ impl Drop for GateViewCacheSession {
 struct IndependentModelView<'a> {
     exec: &'a Executor,
     model: &'a Model,
+    /// One bounded datatype-schema snapshot and per-sort fragment memo for all
+    /// rendered cells parsed by this fixed gate view.
+    datatype_guard: Rc<OnceCell<super::rendered_dt_guard::RenderedDatatypeGuard>>,
     /// Array variables currently being resolved through their definitional
     /// equality — guards against cyclic/mutual array definitions (e.g.
     /// `(= a b)` with `(= b a)`), which would otherwise recurse forever.
@@ -198,6 +203,11 @@ struct IndependentModelView<'a> {
 
 impl ModelView for IndependentModelView<'_> {
     fn leaf_value(&self, t: TermId) -> Option<ModelValue> {
+        match self.certified_const_interp_value(t) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
         let sort = self.exec.ctx.terms.sort(t).clone();
         match &sort {
             // Array leaves: see `array_leaf` — prefer the array's defining
@@ -267,7 +277,11 @@ impl ModelView for IndependentModelView<'_> {
                 let dt_selector_bearing = self.exec.selector_bearing_datatype(&sort);
                 if dt_selector_bearing {
                     if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
-                        if let Some(v) = self.exec.parse_rendered_dt_value(&rendered, &sort) {
+                        if let Some(v) = self.exec.parse_rendered_dt_value_cached(
+                            &rendered,
+                            &sort,
+                            self.datatype_guard(),
+                        ) {
                             return Some(v);
                         }
                     }
@@ -308,7 +322,11 @@ impl ModelView for IndependentModelView<'_> {
                     if let Sort::Uninterpreted(sort_name) = &sort {
                         if let Some(rendered) = self.exec.resolve_dt_value(sort_name, t, self.model)
                         {
-                            if let Some(v) = self.exec.parse_rendered_dt_value(&rendered, &sort) {
+                            if let Some(v) = self.exec.parse_rendered_dt_value_cached(
+                                &rendered,
+                                &sort,
+                                self.datatype_guard(),
+                            ) {
                                 return Some(v);
                             }
                         }
@@ -397,6 +415,11 @@ impl ModelView for IndependentModelView<'_> {
         if !matches!(self.exec.ctx.terms.get(t), TermData::App(_, _)) {
             return None;
         }
+        match self.certified_const_interp_value(t) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
         // Total-datatype-model construction (#dt-total-model): a
         // datatype-sorted application (e.g. a wrong-constructor selector
         // chain) the construction phase resolved carries its constructed
@@ -425,7 +448,11 @@ impl ModelView for IndependentModelView<'_> {
         // application unpinned as today.
         if self.exec.datatype_sort_name(&sort).is_some() {
             if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
-                if let Some(v) = self.exec.parse_rendered_dt_value(&rendered, &sort) {
+                if let Some(v) = self.exec.parse_rendered_dt_value_cached(
+                    &rendered,
+                    &sort,
+                    self.datatype_guard(),
+                ) {
                     return Some(v);
                 }
             }
@@ -459,26 +486,11 @@ impl ModelView for IndependentModelView<'_> {
             // application exactly as unpinned as before, no value is
             // fabricated, and congruence is still enforced by `uf_graph`.
             if let EvalValue::Element(token) = self.exec.evaluate_term(self.model, t) {
-                if let Some(v) = self.exec.parse_rendered_dt_value(&token, &sort) {
+                if let Some(v) =
+                    self.exec
+                        .parse_rendered_dt_value_cached(&token, &sort, self.datatype_guard())
+                {
                     return Some(v);
-                }
-            }
-            // A selector-bearing datatype application can still be represented
-            // by an abstract EUF class token even though the model printer has
-            // already committed that class to one concrete constructor tree.
-            // Read the printer's existing reconstruction here, just as
-            // `leaf_value` does for datatype constants, so the same published
-            // value cannot enter the congruence graph once as `Datatype` and
-            // once as `Uninterpreted`. This is deliberately restricted to the
-            // exact datatype sort and to a successfully parsed renderer result:
-            // an unresolved class remains unpinned and therefore fails closed.
-            if self.exec.selector_bearing_datatype(&sort) {
-                if let Sort::Uninterpreted(sort_name) = &sort {
-                    if let Some(rendered) = self.exec.resolve_dt_value(sort_name, t, self.model) {
-                        if let Some(value) = self.exec.parse_rendered_dt_value(&rendered, &sort) {
-                            return Some(value);
-                        }
-                    }
                 }
             }
             // For an all-nullary datatype, the exact EUF class may be the only
@@ -522,7 +534,10 @@ impl ModelView for IndependentModelView<'_> {
             // application exactly as unpinned as today) when no unique nullary
             // constructor shares the class.
             if let Some(ctor) = self.exec.dt_euf_class_constructor(self.model, t) {
-                if let Some(v) = self.exec.parse_rendered_dt_value(&ctor, &sort) {
+                if let Some(v) =
+                    self.exec
+                        .parse_rendered_dt_value_cached(&ctor, &sort, self.datatype_guard())
+                {
                     return Some(v);
                 }
             }
@@ -683,6 +698,7 @@ impl<'a> IndependentModelView<'a> {
         IndependentModelView {
             exec,
             model,
+            datatype_guard: caches.datatype_guard,
             resolving: RefCell::new(HashSet::new()),
             resolved: caches.resolved,
             resolved_none: caches.resolved_none,
@@ -694,6 +710,11 @@ impl<'a> IndependentModelView<'a> {
 }
 
 impl IndependentModelView<'_> {
+    fn datatype_guard(&self) -> &super::rendered_dt_guard::RenderedDatatypeGuard {
+        self.datatype_guard
+            .get_or_init(|| super::rendered_dt_guard::RenderedDatatypeGuard::new(self.exec))
+    }
+
     /// Whether every live declaration at a canonical theory-operator identity
     /// is positively owned by the theory layer.
     ///
@@ -715,6 +736,39 @@ impl IndependentModelView<'_> {
                     .effective_declaration_kind(info.declaration_id())
                     != Some(DeclarationKind::Theory)
         })
+    }
+
+    /// Read a model-owned constant-interpretation certificate through the
+    /// independent evaluator.
+    ///
+    /// The ordinary evaluator consults this package before every raw theory or
+    /// completion value.  The gate must do the same: otherwise a certified
+    /// nullary Real such as `a = 3/2` falls through `evaluate_var` on the
+    /// package's intentionally empty base model and is fabricated as `0`, so
+    /// the gate rejects the exact witness the certificate installed.  Values
+    /// are still evaluated here by `ay-model-check`; the solver contributes
+    /// only the stamped, closed value term accepted by
+    /// `install_certified_const_interps`.
+    ///
+    /// `Err(())` is deliberately distinct from `Ok(None)`.  Once a package is
+    /// stale or owns a head with a conflicting signature, falling through to a
+    /// lower-priority raw model would silently change the certified
+    /// interpretation.  Callers therefore fail the leaf/application closed.
+    fn certified_const_interp_value(&self, term: TermId) -> Result<Option<ModelValue>, ()> {
+        let value = self
+            .exec
+            .const_interp_witness_value(self.model, term)
+            .map_err(|_| ())?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value == term || self.exec.ctx.terms.sort(value) != self.exec.ctx.terms.sort(term) {
+            return Err(());
+        }
+        match Evaluator::new(&self.exec.ctx.terms, self).evaluate(value) {
+            EvalOutcome::Value(value) => Ok(Some(value)),
+            EvalOutcome::Unevaluable(_) => Err(()),
+        }
     }
 
     /// Resolve an array-variable leaf.
@@ -1941,28 +1995,19 @@ impl IndependentModelView<'_> {
                 return Some(v);
             }
         }
-        // #dt-element-canon, at the array-cell boundary. A DATATYPE-sorted array
-        // cell reaches the gate as the printer's SMT-LIB text — a constructor
-        // APPLICATION such as `(PbTerm_PbTerm #x00..00)`. The scalar layer below
-        // hands any such text back as an opaque `Element`, which
-        // `model_value_for` can only normalize when it names a NULLARY
-        // constructor; a constructor with fields therefore arrives as
-        // `ModelValue::Uninterpreted("(PbTerm_PbTerm #x00..00)")` while the SAME
-        // value reaching the gate as a datatype LEAF is the structured
-        // `Datatype { ctor, args }`. `value_eq` then reports "equality between
-        // incomparable model values (Datatype vs Uninterpreted)" and a ground
-        // seed `(= seed (select arr #x0..0))` — the shape deductive-checks emits for
-        // every array-argument function — cannot be confirmed even when the
-        // model is right.
-        //
-        // Fixed where the two encodings are produced, never in `value_eq`: parse
-        // the text with the SAME reader the datatype leaf/application paths use,
-        // so one value has one encoding. FAIL-SOFT: text this reader declines
-        // falls through to exactly today's opaque behaviour, and the gate still
-        // re-checks every assertion against whatever it parsed.
-        if self.exec.datatype_sort_name(sort).is_some() {
-            if let Some(v) = self.exec.parse_rendered_dt_value(s, sort) {
-                return Some(v);
+        // A non-nullary datatype cell is stored in ArrayInterpretation as the
+        // printer's constructor text (for example `(PbTerm #x00)`), not as an
+        // EvalValue carrying structure. Parse that exact text back into the
+        // canonical gate value before the generic scalar parser collapses it
+        // to an opaque `Element`. This is representation normalization only:
+        // malformed trees and abstract `@Datatype!n` carriers still fall
+        // through to the existing fail-closed path.
+        if self.datatype_guard().is_exact(sort) {
+            if let Some(value) =
+                self.exec
+                    .parse_rendered_dt_value_guarded(s, sort, self.datatype_guard())
+            {
+                return Some(value);
             }
         }
         let ev = self.exec.parse_model_value_string(s, &Some(sort.clone()));
@@ -2282,6 +2327,41 @@ impl Sexp {
     }
 }
 
+/// Whether an SMT-LIB bitvector literal carries exactly `width` bits without
+/// relying on the generic leaf parser's modulo normalization.
+fn guarded_bitvec_literal_matches_sort(sx: &Sexp, width: u32) -> bool {
+    match sx {
+        Sexp::Atom(atom) => {
+            if let Some(bits) = atom.strip_prefix("#b") {
+                return usize::try_from(width).ok() == Some(bits.len())
+                    && bits.bytes().all(|byte| matches!(byte, b'0' | b'1'));
+            }
+            if let Some(digits) = atom.strip_prefix("#x") {
+                return width.is_multiple_of(4)
+                    && usize::try_from(width / 4).ok() == Some(digits.len())
+                    && digits.bytes().all(|byte| byte.is_ascii_hexdigit());
+            }
+            false
+        }
+        Sexp::List(items) => {
+            let [Sexp::Atom(marker), Sexp::Atom(value), Sexp::Atom(actual_width)] =
+                items.as_slice()
+            else {
+                return false;
+            };
+            let Some(value) = value.strip_prefix("bv") else {
+                return false;
+            };
+            marker == "_"
+                && !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && actual_width.parse::<u32>() == Ok(width)
+                && num_bigint::BigInt::parse_bytes(value.as_bytes(), 10)
+                    .is_some_and(|value| value.bits() <= u64::from(width))
+        }
+    }
+}
+
 /// Parse ONE S-expression off the front of `cur`, advancing `cur` past it (and
 /// past leading whitespace). Returns `None` on malformed input (unbalanced
 /// parens, empty). Never panics.
@@ -2463,24 +2543,59 @@ impl Executor {
     /// gate fails closed (a coverage gap, never a wrong confirmation). The input
     /// is emitted by ay's OWN renderer, so it is well-formed; the parser is
     /// deliberately total and never panics.
+    #[cfg(test)]
     pub(in crate::executor) fn parse_rendered_dt_value(
         &self,
         s: &str,
         sort: &Sort,
     ) -> Option<ModelValue> {
+        if !super::rendered_dt_guard::rendered_sexp_within_limits(s) {
+            return None;
+        }
         let mut cur = s;
         let sx = parse_sexp(&mut cur)?;
-        // Reject trailing garbage after one complete value.
         if !cur.trim_start().is_empty() {
             return None;
         }
         self.sexp_to_model_value(&sx, sort)
     }
 
-    /// Interpret a parsed S-expression as a [`ModelValue`] of the given sort:
-    /// datatype sorts recurse structurally over the constructor's declared field
-    /// sorts; every other (scalar / bitvector / string / …) field is rendered
-    /// back to text and read by the solver's own leaf parser.
+    pub(super) fn parse_rendered_dt_value_guarded(
+        &self,
+        s: &str,
+        sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+    ) -> Option<ModelValue> {
+        if !guard.is_exact(sort) {
+            return None;
+        }
+        self.parse_rendered_dt_value_cached(s, sort, guard)
+    }
+
+    pub(in crate::executor::model) fn parse_rendered_dt_value_cached(
+        &self,
+        s: &str,
+        sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+    ) -> Option<ModelValue> {
+        // Every caller uses this as a top-level datatype parser. An invalid or
+        // oversized registry must not fall through to the generic
+        // uninterpreted-value parser below: that would turn constructor text
+        // into opaque model authority instead of failing closed.
+        guard.datatype_name(sort)?;
+        if !super::rendered_dt_guard::rendered_sexp_within_limits(s) {
+            return None;
+        }
+        let mut cur = s;
+        let sx = parse_sexp(&mut cur)?;
+        // Reject trailing garbage after one complete value.
+        if !cur.trim_start().is_empty() {
+            return None;
+        }
+        self.sexp_to_model_value_guarded(&sx, sort, guard)
+    }
+
+    #[cfg(test)]
     fn sexp_to_model_value(&self, sx: &Sexp, sort: &Sort) -> Option<ModelValue> {
         if self.datatype_sort_name(sort).is_some() {
             return self.sexp_to_dt_value(sx, sort);
@@ -2490,6 +2605,65 @@ impl Executor {
         eval_value_to_model_value(&ev, sort)
     }
 
+    #[cfg(test)]
+    fn sexp_to_dt_value(&self, sx: &Sexp, sort: &Sort) -> Option<ModelValue> {
+        let dt_name = self.datatype_sort_name(sort)?;
+        let (head, arg_sexps): (&str, &[Sexp]) = match sx {
+            Sexp::Atom(atom) => (atom.as_str(), &[]),
+            Sexp::List(items) => {
+                let Some(Sexp::Atom(head)) = items.first() else {
+                    return None;
+                };
+                (head.as_str(), &items[1..])
+            }
+        };
+        let (_, constructors) = self
+            .ctx
+            .datatype_iter()
+            .find(|(name, _)| *name == dt_name)?;
+        let internal = constructors
+            .iter()
+            .find(|constructor| {
+                self.dt_surface(constructor) == head || constructor.as_str() == head
+            })?
+            .clone();
+        let fields = self.ctx.constructor_selector_info(&internal)?;
+        if fields.len() != arg_sexps.len() {
+            return None;
+        }
+        let mut args = Vec::with_capacity(fields.len());
+        for ((_, field_sort), arg) in fields.iter().zip(arg_sexps) {
+            args.push(self.sexp_to_model_value(arg, field_sort)?);
+        }
+        Some(ModelValue::Datatype {
+            ctor: internal,
+            args,
+        })
+    }
+
+    /// Interpret a parsed S-expression as a [`ModelValue`] of the given sort:
+    /// datatype sorts recurse structurally over the constructor's declared field
+    /// sorts; every other (scalar / bitvector / string / …) field is rendered
+    /// back to text and read by the solver's own leaf parser.
+    fn sexp_to_model_value_guarded(
+        &self,
+        sx: &Sexp,
+        sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+    ) -> Option<ModelValue> {
+        if guard.datatype_name(sort).is_some() {
+            return self.sexp_to_dt_value_guarded(sx, sort, guard);
+        }
+        if let Sort::BitVec(bitvec) = sort {
+            if !guarded_bitvec_literal_matches_sort(sx, bitvec.width) {
+                return None;
+            }
+        }
+        let text = sx.render();
+        let ev = self.parse_model_value_string(&text, &Some(sort.clone()));
+        super::dt_construct::eval_to_mv(&ev, sort)
+    }
+
     /// Interpret a parsed S-expression as a datatype [`ModelValue`] of `sort`.
     /// The head token must name a declared constructor of the sort's datatype
     /// (matched by SURFACE name so the printer's rendering round-trips), and the
@@ -2497,8 +2671,12 @@ impl Executor {
     /// recurses on the field's declared sort. The stored `ctor` is the INTERNAL
     /// constructor name, which is the name the gate evaluator's registry
     /// (`dt_registry_lookup`) and its tester/selector matching use.
-    fn sexp_to_dt_value(&self, sx: &Sexp, sort: &Sort) -> Option<ModelValue> {
-        let dt_name = self.datatype_sort_name(sort)?;
+    fn sexp_to_dt_value_guarded(
+        &self,
+        sx: &Sexp,
+        sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+    ) -> Option<ModelValue> {
         let (head, arg_sexps): (&str, &[Sexp]) = match sx {
             Sexp::Atom(a) => (a.as_str(), &[]),
             Sexp::List(items) => {
@@ -2508,21 +2686,16 @@ impl Executor {
                 (h.as_str(), &items[1..])
             }
         };
-        let (_dt, ctor_names) = self.ctx.datatype_iter().find(|(dt, _)| *dt == dt_name)?;
-        let internal = ctor_names
-            .iter()
-            .find(|c| self.dt_surface(c) == head || c.as_str() == head)?
-            .clone();
-        let fields = self.ctx.constructor_selector_info(&internal)?.to_vec();
+        let (internal, fields) = guard.constructor(sort, head)?;
         if fields.len() != arg_sexps.len() {
             return None;
         }
         let mut args = Vec::with_capacity(fields.len());
-        for ((_fname, fsort), asx) in fields.iter().zip(arg_sexps.iter()) {
-            args.push(self.sexp_to_model_value(asx, fsort)?);
+        for (field_sort, arg) in fields.iter().zip(arg_sexps) {
+            args.push(self.sexp_to_model_value_guarded(arg, field_sort, guard)?);
         }
         Some(ModelValue::Datatype {
-            ctor: internal,
+            ctor: internal.to_string(),
             args,
         })
     }
@@ -3099,15 +3272,58 @@ impl Executor {
         if leaves.is_empty() {
             return "(no scalar leaves)".to_string();
         }
+        // Evaluate through the GATE'S OWN view — the same evaluation that
+        // produced the `ModelViolates` verdict — not the executor's evaluator.
+        //
+        // The two can disagree, and when they do, printing the executor's value
+        // makes the banner refute itself. Measured on the CEGQI LRA case: the
+        // gate saw `a = 0` (which genuinely falsifies `(= a (/ 3 2))`) while
+        // the executor's evaluator said `a = 3/2`, so the banner reported
+        // "falsified under model: a = 3/2" — a self-contradiction that sent a
+        // triage toward a phantom rational-arithmetic bug in the gate instead
+        // of the real defect, an invalid model out of the producing lane.
+        //
+        // When they disagree, print BOTH, labelled: the disagreement is not
+        // noise to hide, it IS the diagnostic — two evaluators reading one
+        // model apart means some lane published a value the model does not
+        // actually pin.
+        let view = IndependentModelView::new(self, model);
         let mut parts: Vec<String> = leaves
             .iter()
             .take(16)
             .map(|&leaf| {
-                format!(
-                    "{} = {}",
-                    self.format_term(leaf),
-                    eval_value_display(&self.evaluate_term(model, leaf))
-                )
+                let gate_val = ay_model_check::evaluate_term(&self.ctx.terms, &view, leaf);
+                let exec_shown = eval_value_display(&self.evaluate_term(model, leaf));
+                // Render numerics in the same spelling `eval_value_display`
+                // uses, so agreement compares equal and only a REAL divergence
+                // prints the two-evaluator form.
+                let gate_disp = match &gate_val {
+                    EvalOutcome::Value(ModelValue::Bool(b)) => b.to_string(),
+                    EvalOutcome::Value(ModelValue::Int(i)) => i.to_string(),
+                    EvalOutcome::Value(ModelValue::Real(r)) => {
+                        if r.is_integer() {
+                            r.to_integer().to_string()
+                        } else {
+                            r.to_string()
+                        }
+                    }
+                    EvalOutcome::Value(ModelValue::BitVec { value, width }) => {
+                        format!("(_ bv{value} {width})")
+                    }
+                    EvalOutcome::Value(other) => format!("{other:?}"),
+                    unevaluable => format!("{unevaluable:?}"),
+                };
+                if gate_disp == exec_shown {
+                    format!("{} = {}", self.format_term(leaf), gate_disp)
+                } else {
+                    format!(
+                        "{} = {} per the gate's evaluation (the executor's \
+                         evaluator says {}; the verdict used the former)",
+                        self.format_term(leaf),
+                        gate_disp,
+                        exec_shown
+                    )
+                }
             })
             .collect();
         if leaves.len() > 16 {
@@ -7611,6 +7827,144 @@ mod tests {
             .expect("fixture has a quantified assertion")
     }
 
+    fn checked_binding(
+        exec: &Executor,
+        name: &str,
+        parameter_sorts: Vec<Sort>,
+        result_sort: Sort,
+    ) -> ay_frontend::CheckedProjectionBinding {
+        let info = exec.ctx.symbol_info(name).expect("declared symbol");
+        let identity = exec.ctx.symbol_identity_name(name, info).to_string();
+        exec.ctx
+            .check_projection_declaration(&ay_frontend::ProjectionBindingRequest {
+                symbol: Symbol::named(identity),
+                parameter_sorts,
+                result_sort,
+            })
+            .expect("ordinary declaration binds positively")
+    }
+
+    fn checked_nullary_binding(
+        exec: &Executor,
+        name: &str,
+        result_sort: Sort,
+    ) -> ay_frontend::CheckedProjectionBinding {
+        checked_binding(exec, name, Vec::new(), result_sort)
+    }
+
+    #[test]
+    fn independent_gate_reads_certified_nullary_real_from_model_package() {
+        let mut exec = loaded(
+            r#"
+                (set-logic LRA)
+                (declare-const a Real)
+                (declare-fun f (Real) Real)
+                (assert (= a (/ 3 2)))
+                (assert (= (f 7.0) (/ 3 2)))
+            "#,
+        );
+        let a = exec
+            .ctx
+            .symbol_info("a")
+            .and_then(|info| info.term)
+            .expect("declared constant term");
+        let three_halves = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::new(BigInt::from(3), BigInt::from(2)));
+        let mut model = Model::empty();
+        model
+            .install_certified_const_interps(
+                &exec.ctx,
+                vec![
+                    (
+                        checked_nullary_binding(&exec, "a", Sort::Real),
+                        three_halves,
+                    ),
+                    (
+                        checked_binding(&exec, "f", vec![Sort::Real], Sort::Real),
+                        three_halves,
+                    ),
+                ],
+            )
+            .expect("exact closed Real package installs");
+
+        let f_info = exec.ctx.symbol_info("f").expect("declared function");
+        let f_identity = exec.ctx.symbol_identity_name("f", f_info).to_string();
+        let seven = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::from_integer(BigInt::from(7)));
+        let f_seven = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named(f_identity), [seven], Sort::Real);
+
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            matches!(
+                view.leaf_value(a),
+                Some(ModelValue::Real(value))
+                    if value == BigRational::new(BigInt::from(3), BigInt::from(2))
+            ),
+            "the gate must read the same certified value as the ordinary evaluator"
+        );
+        assert!(
+            matches!(
+                view.uf_app_value(f_seven),
+                Some(ModelValue::Real(value))
+                    if value == BigRational::new(BigInt::from(3), BigInt::from(2))
+            ),
+            "certified non-nullary applications must share the leaf path's interpretation"
+        );
+        assert!(matches!(
+            ay_model_check::confirm_model(&exec.ctx.terms, &view, &exec.ctx.assertions),
+            GateVerdict::ConfirmedSat
+        ));
+    }
+
+    #[test]
+    fn independent_gate_rejects_stale_certified_package_without_raw_fallback() {
+        let mut exec = loaded(
+            r#"
+                (set-logic ALL)
+                (push 1)
+                (declare-const a Real)
+            "#,
+        );
+        let old_a = exec
+            .ctx
+            .symbol_info("a")
+            .and_then(|info| info.term)
+            .expect("scoped constant term");
+        let value = exec
+            .ctx
+            .terms
+            .mk_rational(BigRational::new(BigInt::from(3), BigInt::from(2)));
+        let mut model = Model::empty();
+        model
+            .install_certified_const_interps(
+                &exec.ctx,
+                vec![(checked_nullary_binding(&exec, "a", Sort::Real), value)],
+            )
+            .expect("initial package installs");
+
+        for command in parse("(pop 1) (declare-const a Real)").expect("replacement parses") {
+            exec.execute(&command).expect("replacement executes");
+        }
+        let new_a = exec
+            .ctx
+            .symbol_info("a")
+            .and_then(|info| info.term)
+            .expect("replacement constant term");
+        assert_ne!(old_a, new_a);
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            view.leaf_value(new_a).is_none(),
+            "a stale package must fail closed instead of fabricating Real zero"
+        );
+    }
+
     fn quantified_gate_checked_unsat(exec: &mut Executor, roots: Vec<TermId>) -> bool {
         let Some(QuantifiedGateCheckedGroundDecision { decision, roots }) =
             exec.quantified_gate_checked_ground_solve(roots)
@@ -7999,6 +8353,46 @@ mod tests {
         }
         model.euf_model = Some(euf);
         model
+    }
+
+    #[test]
+    fn datatype_uf_without_model_evidence_has_no_gate_value() {
+        let mut exec = loaded(
+            r#"
+                (declare-datatypes ((D 0)) (((mk-D (field-D Int)))))
+                (declare-fun f (Int) D)
+            "#,
+        );
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let d_sort = Sort::Uninterpreted("D".to_string());
+        let app = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("f"), vec![zero], d_sort.clone());
+        let model = Model::empty();
+
+        assert!(
+            exec.resolve_dt_value("D", app, &model).is_some(),
+            "fixture must expose the legacy canonical-default fallback"
+        );
+        let view = IndependentModelView::new(&exec, &model);
+        assert!(
+            !view.datatype_guard().is_exact(&d_sort),
+            "unbounded Int fields stay outside opaque construction's exact fragment"
+        );
+        assert!(matches!(
+            exec.parse_rendered_dt_value_cached(
+                "(mk-D 0)",
+                &d_sort,
+                view.datatype_guard(),
+            ),
+            Some(ModelValue::Datatype { ref ctor, ref args })
+                if ctor == "mk-D" && args.len() == 1
+        ));
+        assert!(
+            view.uf_app_value(app).is_none(),
+            "the independent gate must not adopt a fabricated datatype default"
+        );
     }
 
     /// A model carrying one exact floating-point leaf assignment.

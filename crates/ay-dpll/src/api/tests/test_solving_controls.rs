@@ -38,7 +38,7 @@ fn native_decision_routes_preserve_parsed_publication_controls() {
         solver.check_sat_interruptible(|| false),
     ] {
         assert!(result.is_sat(), "unexpected native result: {result}");
-        assert_eq!(solver.executor.timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(solver.executor.timeout(), Some(Duration::from_mins(1)));
         assert_eq!(solver.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
         assert_eq!(solver.executor.current_solve_deadline(), None);
     }
@@ -58,7 +58,7 @@ fn native_decision_routes_preserve_parsed_publication_controls() {
 
     let result = optimizer.optimize_check();
     assert!(result.is_sat(), "unexpected optimize result: {result}");
-    assert_eq!(optimizer.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(optimizer.executor.timeout(), Some(Duration::from_mins(1)));
     assert_eq!(optimizer.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
     assert_eq!(optimizer.executor.current_solve_deadline(), None);
 }

@@ -474,6 +474,8 @@ impl cold::ColdState {
             proof_bookkeeping_budget: None,
             next_clause_id: self.next_clause_id,
             next_original_clause_id: self.next_original_clause_id,
+            issued_original_clause_id_max: self.issued_original_clause_id_max,
+            original_clause_id_bits: self.original_clause_id_bits.clone(),
             lrat_enabled: false, // No LRAT in cloned solver
             unsat_certificate_enabled: self.unsat_certificate_enabled,
             ambient_artifacts_enabled: self.ambient_artifacts_enabled,

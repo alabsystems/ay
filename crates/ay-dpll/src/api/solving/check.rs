@@ -932,7 +932,7 @@ mod finish_verified_result_tests {
         assert!(verified.is_unknown());
         solver.restore_solve_controls(controls);
         assert_eq!(solver.executor.current_solve_deadline(), None);
-        assert_eq!(solver.executor.timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(solver.executor.timeout(), Some(Duration::from_mins(1)));
     }
 
     #[test]

@@ -53,6 +53,84 @@ fn test_bounds_gap_missing_farkas_returns_error() {
 }
 
 #[test]
+fn rounded_integer_bounds_gap_accepts_strict_successor_conflict() {
+    // Over Int, 0 < m rounds to m >= 1 while m - 1 < 0 rounds to m <= 0.
+    // Their rational relaxations overlap on 0 < m < 1, so this must exercise
+    // the integer BoundsGap validator rather than Farkas.
+    let mut terms = TermStore::new();
+    let m = terms.mk_var("m", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let positive = terms.mk_lt(zero, m);
+    let predecessor = terms.mk_sub(vec![m, one]);
+    let predecessor_negative = terms.mk_lt(predecessor, zero);
+    let not_positive = terms.mk_not(positive);
+    let not_predecessor_negative = terms.mk_not(predecessor_negative);
+    let clause = vec![not_positive, not_predecessor_negative];
+
+    assert!(super::lia::recognize_lia_bounds_gap(&terms, &clause));
+    assert!(validate_lia_theory_lemma(
+        &terms,
+        ProofId(0),
+        &clause,
+        None,
+        &LiaAnnotation::BoundsGap,
+    )
+    .is_ok());
+}
+
+#[test]
+fn rounded_integer_bounds_gap_rejects_satisfiable_adjacent_interval() {
+    // 0 <= m and m < 1 has the integer solution m=0. Rounded endpoints are
+    // both zero, so accepting this pair would be a meta-false-PROVE.
+    let mut terms = TermStore::new();
+    let m = terms.mk_var("m", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let lower = terms.mk_le(zero, m);
+    let upper = terms.mk_lt(m, one);
+    let not_lower = terms.mk_not(lower);
+    let not_upper = terms.mk_not(upper);
+    let clause = vec![not_lower, not_upper];
+
+    assert!(!super::lia::recognize_lia_bounds_gap(&terms, &clause));
+    assert!(validate_lia_theory_lemma(
+        &terms,
+        ProofId(0),
+        &clause,
+        None,
+        &LiaAnnotation::BoundsGap,
+    )
+    .is_err());
+}
+
+#[test]
+fn rounded_integer_bounds_gap_rejects_real_relaxation() {
+    // The exact TrustVC shape is satisfiable over Real at m=1/2. The sort gate
+    // in the audited linear normalizer must therefore reject it.
+    let mut terms = TermStore::new();
+    let m = terms.mk_var("m", Sort::Real);
+    let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+    let one = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+    let positive = terms.mk_lt(zero, m);
+    let predecessor = terms.mk_sub(vec![m, one]);
+    let predecessor_negative = terms.mk_lt(predecessor, zero);
+    let not_positive = terms.mk_not(positive);
+    let not_predecessor_negative = terms.mk_not(predecessor_negative);
+    let clause = vec![not_positive, not_predecessor_negative];
+
+    assert!(!super::lia::recognize_lia_bounds_gap(&terms, &clause));
+    assert!(validate_lia_theory_lemma(
+        &terms,
+        ProofId(0),
+        &clause,
+        None,
+        &LiaAnnotation::BoundsGap,
+    )
+    .is_err());
+}
+
+#[test]
 fn test_divisibility_rejects_unverified_clause_fail_closed() {
     // META-FALSE-PROVE regression: a Divisibility lemma carries no Farkas
     // certificate, and the GCD reasoning is not implemented. The clause here is

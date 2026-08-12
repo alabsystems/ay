@@ -37,6 +37,19 @@ thread_local! {
     /// recursion; nested certifications use plain strict checking, which
     /// terminates. See [`Executor::discharge_trust_steps_for_certification`].
     static TRUST_DISCHARGE_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// Re-entrancy depth for the closed-sentence certificate's negation
+    /// refutations (#closed-sentence-cert).
+    ///
+    /// Those refutations are full nested solves, and a nested solve can march
+    /// straight back into the certificate: refuting `not A` restores `A`'s own
+    /// quantified roots, whose authority the certificate then tries to
+    /// establish by refuting `not (not A)` — an unbounded mutual recursion
+    /// that manifested as a SIGKILL (memory exhaustion), not a clean error,
+    /// the first time this arm ran without the guard. Depth 0 only, same
+    /// discipline as `TRUST_DISCHARGE_DEPTH` above: the nested solve either
+    /// decides on its own strength or the certificate declines.
+    static CLOSED_SENTENCE_REFUTATION_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Deterministic search allowances for the independent whole-problem
@@ -2017,6 +2030,44 @@ impl Executor {
             )
     }
 
+    /// Publish one of the deliberately narrow, independently checked exact
+    /// semantic certificates.
+    ///
+    /// Keeping the token construction here is an authority invariant: adding a
+    /// new exact theorem requires extending [`UnsatCertificate::checked_exact_semantic_is_current`]
+    /// before this common mint can accept it. The public wrappers below only
+    /// classify their evidence and provide lane-specific diagnostics.
+    fn emit_checked_exact_unsat(
+        &mut self,
+        kind: UnsatCertificateKind,
+        stale_message: &'static str,
+        presentation_message: &'static str,
+        statistic: &'static str,
+    ) -> SolveResult {
+        self.last_unsat_certificate = None;
+        self.last_sat_certificate = None;
+        self.last_model = None;
+        self.last_model_validated = false;
+        self.last_proof = None;
+        self.clear_finite_enum_proof_state();
+
+        let certificate = UnsatCertificate(kind);
+        if !certificate.checked_exact_semantic_is_current(self) {
+            return self.reject_uncertified_verdict_for_publication(stale_message.to_string());
+        }
+        if self.strict_unsat_presentation_required() {
+            return self
+                .reject_uncertified_verdict_for_publication(presentation_message.to_string());
+        }
+
+        self.suppress_unsat_proof_reconstruction();
+        self.last_unknown_reason = None;
+        self.last_statistics.set_int(statistic, 1);
+        self.last_result = Some(SolveResult::unsat());
+        self.last_unsat_certificate = Some(certificate);
+        SolveResult::unsat()
+    }
+
     /// Emit UNSAT from the exact unit-difference existential theorem.
     ///
     /// This is a distinct semantic-certificate lane, not an assertion that the
@@ -2027,34 +2078,12 @@ impl Executor {
         &mut self,
         evidence: CheckedExactExistsUnsat,
     ) -> SolveResult {
-        self.last_unsat_certificate = None;
-        self.last_sat_certificate = None;
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_proof = None;
-        self.clear_finite_enum_proof_state();
-
-        if !self.exact_plain_hard_unsat_scope_is_current() || !evidence.is_current(self) {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact-exists UNSAT evidence was stale at emission".to_string(),
-            );
-        }
-        if self.strict_unsat_presentation_required() {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact-exists UNSAT has no translated authored-scope proof for the requested proof artifact"
-                    .to_string(),
-            );
-        }
-
-        self.suppress_unsat_proof_reconstruction();
-        self.last_unknown_reason = None;
-        self.last_statistics
-            .set_int("verdict_certification.checked_exact_exists", 1);
-        self.last_result = Some(SolveResult::unsat());
-        self.last_unsat_certificate = Some(UnsatCertificate(
+        self.emit_checked_exact_unsat(
             UnsatCertificateKind::CheckedExactExists(evidence),
-        ));
-        SolveResult::unsat()
+            "checked exact-exists UNSAT evidence was stale at emission",
+            "checked exact-exists UNSAT has no translated authored-scope proof for the requested proof artifact",
+            "verdict_certification.checked_exact_exists",
+        )
     }
 
     /// Emit UNSAT from one of the exact source-level `forall`/`exists`
@@ -2064,34 +2093,12 @@ impl Executor {
         &mut self,
         evidence: CheckedExactForallExistsUnsat,
     ) -> SolveResult {
-        self.last_unsat_certificate = None;
-        self.last_sat_certificate = None;
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_proof = None;
-        self.clear_finite_enum_proof_state();
-
-        if !self.exact_plain_hard_unsat_scope_is_current() || !evidence.is_current(self) {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact-forall-exists UNSAT evidence was stale at emission".to_string(),
-            );
-        }
-        if self.strict_unsat_presentation_required() {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact-forall-exists UNSAT has no translated authored-scope proof for the requested proof artifact"
-                    .to_string(),
-            );
-        }
-
-        self.suppress_unsat_proof_reconstruction();
-        self.last_unknown_reason = None;
-        self.last_statistics
-            .set_int("verdict_certification.checked_exact_forall_exists", 1);
-        self.last_result = Some(SolveResult::unsat());
-        self.last_unsat_certificate = Some(UnsatCertificate(
+        self.emit_checked_exact_unsat(
             UnsatCertificateKind::CheckedExactForallExists(evidence),
-        ));
-        SolveResult::unsat()
+            "checked exact-forall-exists UNSAT evidence was stale at emission",
+            "checked exact-forall-exists UNSAT has no translated authored-scope proof for the requested proof artifact",
+            "verdict_certification.checked_exact_forall_exists",
+        )
     }
 
     /// Emit UNSAT from a sealed exact false instance of one authored
@@ -2102,34 +2109,12 @@ impl Executor {
         &mut self,
         evidence: CheckedExactClosedForallUnsat,
     ) -> SolveResult {
-        self.last_unsat_certificate = None;
-        self.last_sat_certificate = None;
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_proof = None;
-        self.clear_finite_enum_proof_state();
-
-        if !self.exact_plain_hard_unsat_scope_is_current() || !evidence.is_current(self) {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact closed-forall UNSAT evidence was stale at emission".to_string(),
-            );
-        }
-        if self.strict_unsat_presentation_required() {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact closed-forall UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact"
-                    .to_string(),
-            );
-        }
-
-        self.suppress_unsat_proof_reconstruction();
-        self.last_unknown_reason = None;
-        self.last_statistics
-            .set_int("verdict_certification.checked_exact_closed_forall", 1);
-        self.last_result = Some(SolveResult::unsat());
-        self.last_unsat_certificate = Some(UnsatCertificate(
+        self.emit_checked_exact_unsat(
             UnsatCertificateKind::CheckedExactClosedForall(evidence),
-        ));
-        SolveResult::unsat()
+            "checked exact closed-forall UNSAT evidence was stale at emission",
+            "checked exact closed-forall UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact",
+            "verdict_certification.checked_exact_closed_forall",
+        )
     }
 
     /// Emit UNSAT from one exact authored Int-forall instance plus its
@@ -2140,35 +2125,12 @@ impl Executor {
         &mut self,
         evidence: CheckedExactForallUfGroundUnsat,
     ) -> SolveResult {
-        self.last_unsat_certificate = None;
-        self.last_sat_certificate = None;
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_proof = None;
-        self.clear_finite_enum_proof_state();
-
-        if !self.exact_plain_hard_unsat_scope_is_current() || !evidence.is_current(self) {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact authored-forall UF-ground UNSAT evidence was stale at emission"
-                    .to_string(),
-            );
-        }
-        if self.strict_unsat_presentation_required() {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact authored-forall UF-ground UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact"
-                    .to_string(),
-            );
-        }
-
-        self.suppress_unsat_proof_reconstruction();
-        self.last_unknown_reason = None;
-        self.last_statistics
-            .set_int("verdict_certification.checked_exact_forall_uf_ground", 1);
-        self.last_result = Some(SolveResult::unsat());
-        self.last_unsat_certificate = Some(UnsatCertificate(
+        self.emit_checked_exact_unsat(
             UnsatCertificateKind::CheckedExactForallUfGround(evidence),
-        ));
-        SolveResult::unsat()
+            "checked exact authored-forall UF-ground UNSAT evidence was stale at emission",
+            "checked exact authored-forall UF-ground UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact",
+            "verdict_certification.checked_exact_forall_uf_ground",
+        )
     }
 
     /// Emit UNSAT from exact canonical finite-BV expansion plus one elementary
@@ -2178,34 +2140,12 @@ impl Executor {
         &mut self,
         evidence: CheckedExactFiniteExpansionUnsat,
     ) -> SolveResult {
-        self.last_unsat_certificate = None;
-        self.last_sat_certificate = None;
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_proof = None;
-        self.clear_finite_enum_proof_state();
-
-        if !self.exact_plain_hard_unsat_scope_is_current() || !evidence.is_current(self) {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact finite-expansion UNSAT evidence was stale at emission".to_string(),
-            );
-        }
-        if self.strict_unsat_presentation_required() {
-            return self.reject_uncertified_verdict_for_publication(
-                "checked exact finite-expansion UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact"
-                    .to_string(),
-            );
-        }
-
-        self.suppress_unsat_proof_reconstruction();
-        self.last_unknown_reason = None;
-        self.last_statistics
-            .set_int("verdict_certification.checked_exact_finite_expansion", 1);
-        self.last_result = Some(SolveResult::unsat());
-        self.last_unsat_certificate = Some(UnsatCertificate(
+        self.emit_checked_exact_unsat(
             UnsatCertificateKind::CheckedExactFiniteExpansion(evidence),
-        ));
-        SolveResult::unsat()
+            "checked exact finite-expansion UNSAT evidence was stale at emission",
+            "checked exact finite-expansion UNSAT has no translated authored-scope forall-inst proof for the requested proof artifact",
+            "verdict_certification.checked_exact_finite_expansion",
+        )
     }
 
     /// Whether an assumption leaf belongs to the authenticated public query.
@@ -2647,21 +2587,21 @@ impl Executor {
                         // for the separate clause-discharge fallback. Explicit
                         // proof and proof-checking modes were excluded above and
                         // must see the original strict rejection.
-                        StrictProofPresentationFailure::Rejected(
-                            error @ (ay_proof::ProofCheckError::TrustStep { .. }
-                            | ay_proof::ProofCheckError::StrictProofModeTrust { .. }
-                            | ay_proof::ProofCheckError::HoleStep { .. }),
-                        ) if !self.strict_unsat_presentation_required() => {
-                            self.discharge_trust_steps_for_certification(&error)?;
-                            CertificationSource::DischargedTrust
-                        }
-                        StrictProofPresentationFailure::Rejected(
-                            error @ ay_proof::ProofCheckError::UnsupportedTheoryLemmaKind {
-                                kind: ay_core::TheoryLemmaKind::Generic,
-                                ..
-                            },
-                        ) if !self.strict_unsat_presentation_required() => {
-                            self.discharge_trust_steps_for_certification(&error)?;
+                        //
+                        // Routed through `is_trust_kind_rejection`, the SAME
+                        // predicate the corroboration screen in
+                        // `reconfirms_unsat_within` accepts on. These two were
+                        // separate enumerations of the same family, and their
+                        // drift is exactly what let the fallback's entry
+                        // condition become its own rejection reason. One
+                        // definition, so the gate that ROUTES a proof here and
+                        // the screen that ACCEPTS its result cannot disagree
+                        // about what "trust-kind" means.
+                        StrictProofPresentationFailure::Rejected(ref error)
+                            if Self::is_trust_kind_rejection(error)
+                                && !self.strict_unsat_presentation_required() =>
+                        {
+                            self.discharge_trust_steps_for_certification(error)?;
                             CertificationSource::DischargedTrust
                         }
                         StrictProofPresentationFailure::Rejected(error) => {
@@ -2864,9 +2804,57 @@ impl Executor {
     /// Re-discharge the whole authored problem for a context-dependent trust
     /// clause in a fresh executor.
     ///
-    /// Repeating the raw `Unsat` verdict is not sufficient: the fresh solve must
-    /// also emit a proof accepted by the plain strict checker. This keeps the
-    /// fallback non-circular when the same wrong-UNSAT engine path is repeatable.
+    /// WHAT IS ACCEPTED. A fresh `Executor`, sharing none of the original
+    /// solve's state and never seeing its proof, independently re-derives
+    /// `unsat` under a deterministic conflict/decision allowance, AND its proof
+    /// survives a STRUCTURAL screen: any rejection other than the trust family
+    /// declines.
+    ///
+    /// The screen is deliberately not "the twin proof must be trust-free". This
+    /// doc used to say exactly that, and it was self-defeating: step (4) is
+    /// reached ONLY because the original proof carries a trust step, and the
+    /// re-solve is the same deterministic engine on the same query, so it
+    /// reproduces one. Demanding its absence demanded precisely the artifact
+    /// whose absence routed us here, and the arm declined every time.
+    ///
+    /// WHAT IS KNOWINGLY TRADED. Because a repeated trust-kind rejection is
+    /// accepted, a wrong UNSAT that is REPEATABLE inside a trust-exported theory
+    /// clause would not be caught *here*. It is still caught upstream by the
+    /// forged-UNSAT guard (a fresh executor re-deciding the authored problem as
+    /// definitive SAT rejects outright) and by full strict validation of every
+    /// non-trust step. That is the same exposure the arm carried before the
+    /// regression, when it accepted a bare `Unsat` with no proof inspection at
+    /// all — the structural screen makes it strictly smaller, not larger.
+    ///
+    /// Exposed to the closed-sentence SAT certificate (#closed-sentence-cert):
+    /// proving a closed, uninterpreted-symbol-free sentence VALID by refuting
+    /// its negation is exactly this primitive's job — fresh executor, no shared
+    /// state, deterministic count bounds, structural proof screen. The
+    /// certificate must not reach for a plain `check_sat` on the negation; a
+    /// bare nested `Unsat` with no proof inspection is the "closing it on
+    /// trust" shape the proof-capability campaign is eliminating, and it is
+    /// what the pre-narrowing form of that certificate was rightly distrusted
+    /// for.
+    pub(in crate::executor) fn reconfirms_negation_refuted_for_closed_sentence(
+        &self,
+        negation: &[TermId],
+    ) -> bool {
+        // Depth 0 only — see `CLOSED_SENTENCE_REFUTATION_DEPTH`. A nested
+        // refutation reaching back here recurses without bound.
+        if CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.get()) > 0 {
+            return false;
+        }
+        CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.set(d.get() + 1));
+        struct DepthDrop;
+        impl Drop for DepthDrop {
+            fn drop(&mut self) {
+                CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _guard = DepthDrop;
+        self.reconfirms_unsat_within(negation, WHOLE_PROBLEM_RECONFIRMATION_LIMITS)
+    }
+
     fn reconfirms_unsat_within(
         &self,
         problem: &[TermId],
@@ -2943,14 +2931,74 @@ impl Executor {
         };
         let strict = exec.check_proof_strict_with_datatypes(proof);
         if trace_rc {
+            // Three arms, not two. With only Ok/Err this printed "DECLINED" and
+            // then ACCEPTED below, so the one diagnostic that localises this
+            // lane actively lied about its own outcome — and this trace is what
+            // identified the defect in the first place.
             match &strict {
                 Ok(_) => eprintln!("c phase-trace reconfirm ACCEPTED"),
+                Err(e) if Self::is_trust_kind_rejection(e) => eprintln!(
+                    "c phase-trace reconfirm ACCEPTED: re-solve proof rejected only for a \
+                     trust-kind step ({e}), which is this fallback's entry condition"
+                ),
                 Err(e) => eprintln!(
                     "c phase-trace reconfirm DECLINED: strict check of re-solve proof failed: {e}"
                 ),
             }
         }
-        strict.is_ok()
+        // STRUCTURAL screen, not a trust-freeness demand.
+        //
+        // Requiring `strict.is_ok()` here made this fallback UNREACHABLE for the
+        // exact class it exists to serve. Step (4) runs only because the
+        // original proof carries a trust/hole step; the re-solve is the SAME
+        // engine on the SAME problem, so it derives the same theorem the same
+        // way and its fresh proof carries the same trust step. Plain strict
+        // rejects that, so the arm declined every time and correct refutations
+        // published as `unknown` — measured on the QF_LIRA `to_int`/`mod`
+        // reducer, where AY computes the refutation z3 agrees with and then
+        // discards it.
+        //
+        // A trust-KIND rejection is therefore this arm's ENTRY CONDITION, not
+        // evidence against it. Every other rejection is a real structural defect
+        // in the fresh proof and still declines.
+        //
+        // WHY THIS IS NOT A WEAKENING. The corroboration's evidence was never
+        // the twin proof's trust-freeness — it is that a FRESH executor, sharing
+        // none of the original solve's state and never seeing its proof,
+        // independently re-derives `unsat` under a deterministic
+        // conflict/decision budget. Before the regression this arm accepted a
+        // bare `Unsat` with NO proof inspection at all, so keeping the
+        // structural screen leaves it strictly STRONGER than the behaviour that
+        // shipped for months, while removing the circularity.
+        //
+        // Everything else in the funnel is untouched: the forged-UNSAT
+        // SAT-redecision guard still runs first, every NON-trust step of the
+        // original proof is still fully strict-validated, the per-clause
+        // standalone-tautology discharge still runs before this, and `unsat`
+        // remains the only accepting verdict.
+        match &strict {
+            Ok(_) => true,
+            Err(error) => Self::is_trust_kind_rejection(error),
+        }
+    }
+
+    /// The trust family the deferred-discharge path is defined over.
+    ///
+    /// Single-sourced deliberately: the eligibility gate that ROUTES a proof
+    /// into deferred discharge and the corroboration screen that ACCEPTS its
+    /// result must agree on what "trust-kind" means. When those two drifted, the
+    /// entry condition of the fallback became its own rejection reason.
+    fn is_trust_kind_rejection(error: &ay_proof::ProofCheckError) -> bool {
+        matches!(
+            error,
+            ay_proof::ProofCheckError::TrustStep { .. }
+                | ay_proof::ProofCheckError::StrictProofModeTrust { .. }
+                | ay_proof::ProofCheckError::HoleStep { .. }
+                | ay_proof::ProofCheckError::UnsupportedTheoryLemmaKind {
+                    kind: ay_core::TheoryLemmaKind::Generic,
+                    ..
+                }
+        )
     }
 
     /// The MINIMAL authored obligation for the step-(4) corroborating re-solve.
@@ -2965,14 +3013,19 @@ impl Executor {
     ///
     /// Measured on the `ext_eq_7956` fixture: 26 assertions, 203_520 decisions,
     /// 5.85s versus 16 assertions, 110_953 decisions, 2.90s — the same `Unsat`,
-    /// half the work. That margin is the whole defect. The nominal
-    /// `WHOLE_PROBLEM_RESOLVE_BUDGET_MS` is not the operative wall:
-    /// `install_quantifier_deadline_backstop` extends the deadline by
-    /// `remaining * (QUANTIFIED_BACKSTOP_FACTOR - 1)`, so the real wall is 4x
-    /// the budget, and a 5.85s re-solve sat at 1.37x margin against it. Any CPU
-    /// contention past ~1.4x flipped a correct `unsat` to `unknown`. Halving the
-    /// work takes the margin to 2.7x; measured 6/6 correct at a load average of
-    /// 18, where the superset scored 0/6.
+    /// half the work.
+    ///
+    /// HISTORICAL, and the reason this arm is now bounded by deterministic
+    /// counts instead of elapsed time: when it still carried a wall-clock
+    /// budget, that nominal figure was not even the operative wall —
+    /// `install_quantifier_deadline_backstop` extended the deadline by
+    /// `remaining * (QUANTIFIED_BACKSTOP_FACTOR - 1)`, so the real ceiling was
+    /// 4x it, and a 5.85s re-solve sat at 1.37x margin. Contention past ~1.4x
+    /// flipped a correct `unsat` to `unknown`, which is how an ACCEPTING
+    /// soundness step came to depend on machine load. Halving the work took the
+    /// margin to 2.7x: 6/6 correct at a load average of 18 where the superset
+    /// scored 0/6. The wall budget is gone now, but halving the work is still
+    /// what keeps this arm inside its deterministic allowance.
     ///
     /// SUBSET-ONLY, and that is the entire soundness argument. If the minimal
     /// scope is not contained in `problem` this returns `problem` unchanged, so
@@ -4865,8 +4918,7 @@ mod tests {
         // of any proof or UNSAT certificate, not reuse of the older exact-
         // exists route's SelfCheckRejected diagnostic.
         let commands = ay_frontend::parse(&format!(
-            "(set-option :produce-proofs true) {} (check-sat) (get-proof)",
-            EXACT_FORALL_UF_GROUND_UNSAT_SCRIPT
+            "(set-option :produce-proofs true) {EXACT_FORALL_UF_GROUND_UNSAT_SCRIPT} (check-sat) (get-proof)"
         ))
         .expect("proof-requesting exact forall/UF fixture must parse");
         let mut executor = Executor::new();
@@ -4885,8 +4937,7 @@ mod tests {
     #[test]
     fn exact_semantic_unsat_explicit_api_proof_request_fails_closed() {
         let commands = ay_frontend::parse(&format!(
-            "{} (check-sat) (get-proof)",
-            EXACT_FORALL_EXISTS_UNSAT_SCRIPT
+            "{EXACT_FORALL_EXISTS_UNSAT_SCRIPT} (check-sat) (get-proof)"
         ))
         .expect("exact semantic API fixture must parse");
         let mut executor = Executor::new();
@@ -4906,7 +4957,7 @@ mod tests {
     #[test]
     fn exact_semantic_unsat_self_check_requires_a_translated_proof() {
         let commands =
-            ay_frontend::parse(&format!("{} (check-sat)", EXACT_FORALL_EXISTS_UNSAT_SCRIPT))
+            ay_frontend::parse(&format!("{EXACT_FORALL_EXISTS_UNSAT_SCRIPT} (check-sat)"))
                 .expect("exact semantic self-check fixture must parse");
         let mut executor = Executor::new();
         executor.set_self_check(true);
@@ -4924,7 +4975,7 @@ mod tests {
 
     #[test]
     fn exact_semantic_unsat_proof_checked_api_requires_a_translated_proof() {
-        let commands = ay_frontend::parse(&format!("{} (check-sat)", EXACT_EXISTS_UNSAT_SCRIPT))
+        let commands = ay_frontend::parse(&format!("{EXACT_EXISTS_UNSAT_SCRIPT} (check-sat)"))
             .expect("exact semantic proof-checked fixture must parse");
         let mut executor = Executor::new();
         executor.set_verification_level(crate::VerificationLevel::ProofChecked);
@@ -4943,8 +4994,7 @@ mod tests {
     #[test]
     fn exact_semantic_unsat_strict_script_mode_requires_a_translated_proof() {
         let commands = ay_frontend::parse(&format!(
-            "(set-option :check-proofs-strict true) {} (check-sat)",
-            EXACT_FORALL_EXISTS_UNSAT_SCRIPT
+            "(set-option :check-proofs-strict true) {EXACT_FORALL_EXISTS_UNSAT_SCRIPT} (check-sat)"
         ))
         .expect("exact semantic strict-proof fixture must parse");
         let mut executor = Executor::new();
@@ -4963,7 +5013,7 @@ mod tests {
     #[test]
     fn exact_semantic_unsat_best_effort_default_is_not_a_proof_requirement() {
         let commands =
-            ay_frontend::parse(&format!("{} (check-sat)", EXACT_FORALL_EXISTS_UNSAT_SCRIPT))
+            ay_frontend::parse(&format!("{EXACT_FORALL_EXISTS_UNSAT_SCRIPT} (check-sat)"))
                 .expect("exact semantic best-effort fixture must parse");
         let mut executor = Executor::new();
         executor.set_best_effort_produce_proofs(100);

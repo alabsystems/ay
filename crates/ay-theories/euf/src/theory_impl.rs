@@ -9,62 +9,26 @@
 //! in `theory_propagate.rs`.
 
 use ay_core::safe_eprintln;
-use ay_core::term::{TermData, TermId};
+use ay_core::term::TermId;
 use ay_core::{
     unwrap_not, DiscoveredEquality, EqualityPropagationResult, TheoryLit, TheoryPropagation,
     TheoryResult, TheorySolver,
 };
 
+use crate::shared_equality::reason_is_self_evidencing_shared_eq;
 use crate::solver::EufSolver;
 use crate::types::{CongruenceTable, EqualityReason, MergeReason, UndoRecord};
 
-/// Detect self-evidencing reason sets for an incoming shared equality (#8742).
-///
-/// When the ONLY reason another theory provides for `lhs = rhs` is the equality
-/// atom itself (`(= lhs rhs) = true` or its argument-swapped form), the reason
-/// is tautological. The arithmetic theory's tight bound on `lhs` was set purely
-/// because SAT assigned the equality atom `true`; there is no independent
-/// arithmetic justification. Accepting the shared equality with this reason
-/// causes the EUF proof-forest `Shared` edge to reconstruct a tautological
-/// explanation (not-T OR not-not-T) during conflict analysis, so SAT never
-/// backtracks the decision that forced the equality atom true. A false-UNSAT
-/// then propagates through the conflict chain when the atom is also forced
-/// false at top level (e.g. via extensionality skolem seeding).
-///
-/// This mirrors `reasons_are_self_evidencing` in the bridge layer
-/// (`crates/ay-dpll/src/combined_solvers/interface_bridge/propagate.rs`);
-/// TL11's guard caught the LIA->bridge path, but other adapter paths
-/// (`adapters/auf_lira.rs`, `adapters/uf_nia.rs`, etc.) reach EUF directly
-/// with the same tautological reason shape. Filtering here is the symmetric
-/// EUF-side sink.
-///
-/// Safety argument: when SAT has assigned `(= lhs rhs) = true`, EUF's
-/// `record_assignment` path queues the merge with `EqualityReason::Direct(term)`
-/// and adds the corresponding propagation. Dropping the redundant `Shared`
-/// edge therefore preserves completeness — the merge still happens, with a
-/// correct (non-tautological) proof justification via the direct equality atom.
-fn reason_is_self_evidencing_shared_eq(
-    terms: &ay_core::TermStore,
-    lhs: TermId,
-    rhs: TermId,
-    reason: &[TheoryLit],
-) -> bool {
-    if reason.len() != 1 {
-        return false;
-    }
-    let lit = &reason[0];
-    if !lit.value {
-        return false;
-    }
-    match terms.get(lit.term) {
-        TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
-            (args[0] == lhs && args[1] == rhs) || (args[0] == rhs && args[1] == lhs)
-        }
-        _ => false,
-    }
-}
-
 impl TheorySolver for EufSolver<'_> {
+    /// #euf-atom-filter: restrict negative-congruence propagation candidates to
+    /// equalities that have a SAT variable. Forwards to the inherent env-gated
+    /// installer. Sound for a STANDALONE EUF solver (pure QF_UF), whose
+    /// propagations reach only the SAT boundary; the array combiner deliberately
+    /// does NOT forward this (its EUF shares interface disequalities).
+    fn set_sat_atom_terms(&mut self, term_to_var: &ay_core::kani_compat::DetHashMap<TermId, u32>) {
+        self.install_sat_atom_filter(term_to_var);
+    }
+
     fn assert_literal(&mut self, literal: TermId, value: bool) {
         let debug = self.debug_euf;
 

@@ -192,6 +192,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
         term_to_var: &'a HashMap<TermId, u32>,
         theory_atoms: &'a [TermId],
         theory_atom_set: &'a HashSet<TermId>,
+        terms: Option<&'a TermStore>,
         cached: &mut super::CachedExtensionData,
     ) -> Self {
         // #8467 capability handshake (#euf-lazy-explain): see new_inner.
@@ -277,7 +278,11 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
 
         Self {
             theory,
-            terms: None,
+            // #trust->0 C1.iii site 17: forward the TermStore so the
+            // persistent-arm iterations > 0 classify NeedLemmas proof entries
+            // like every other construction path instead of hardcoding the
+            // funnel off.
+            terms,
             var_to_term,
             term_to_var,
             theory_atoms,

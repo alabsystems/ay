@@ -225,6 +225,10 @@ impl Executor {
         // consumes it; otherwise text SAT could escape a stop that fired after
         // model certification, and text UNSAT could race its proof funnel.
         let result = self.decline_definite_publication_on_external_stop(result);
+        // M0(a): refresh the strict-check attribution stats so the published
+        // values include the mint-time strict re-check that certification ran
+        // after proof-quality stats were populated. Counting only.
+        self.publish_strict_check_counters();
         self.last_command_unsat_admission = None;
         if result.is_unsat() {
             self.last_sat_certificate = None;

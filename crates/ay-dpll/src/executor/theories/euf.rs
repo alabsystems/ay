@@ -200,24 +200,21 @@ impl Executor {
         }
         self.ctx.assertions.push(axiom);
         if self.produce_proofs_enabled() {
-            // Proof attribution is a semantic boundary, not a diagnostic
-            // convenience.  Only advertise an Alethe ROW rule when the proof
-            // checker's own exact recognizer accepts the generated clause.
-            // All derived array consequences (congruence bridges, disjunctive
-            // store lemmas, finite-domain expansions, and so on) remain honest
-            // `Generic` lemmas until an explicit primitive proof expansion is
-            // available.  In particular, the `site` string must never decide a
-            // proof rule.
+            // Attribution is a semantic boundary: only the checker's exact
+            // array/EUF recognizers may choose a rule. Other consequences stay
+            // `Generic`; the diagnostic `site` string carries no authority.
             let clause = match self.ctx.terms.get(axiom) {
                 TermData::App(sym, args) if sym.name() == "or" => args.clone(),
                 _ => vec![axiom],
             };
-            if let Some(index_eq) = ay_proof::recognize_array_select_store(&self.ctx.terms, &clause)
-            {
-                let _ = self.proof_tracker.add_theory_lemma_with_kind(
-                    vec![axiom],
-                    TheoryLemmaKind::ArraySelectStore { index_eq },
-                );
+            if let Some(kind) = ay_proof::recognize_array_theory_lemma(&self.ctx.terms, &clause) {
+                let _ = self
+                    .proof_tracker
+                    .add_theory_lemma_with_kind(vec![axiom], kind);
+            } else if ay_proof::recognize_euf_congruent(&self.ctx.terms, &clause) {
+                let _ = self
+                    .proof_tracker
+                    .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::EufCongruent);
             } else {
                 let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
             }

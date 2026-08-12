@@ -578,7 +578,7 @@ fn test_maxsmt_executor_error_revokes_model() {
         solver.unknown_reason(),
         Some(crate::UnknownReason::InternalError)
     );
-    assert_eq!(solver.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(solver.executor.timeout(), Some(Duration::from_mins(1)));
     assert_eq!(
         solver.executor.memory_limit(),
         Some(2_048 * 1024 * 1024),
@@ -698,7 +698,7 @@ fn test_maxsmt_late_interrupt_revokes_all_definite_native_results() {
     );
     assert!(optimal.model_for_consumer().is_none());
     assert!(optimal.executor.last_maxsmt_outcome().is_none());
-    assert_eq!(optimal.executor.timeout(), Some(Duration::from_secs(60)));
+    assert_eq!(optimal.executor.timeout(), Some(Duration::from_mins(1)));
     assert_eq!(
         optimal.executor.memory_limit(),
         Some(PARSED_MEMORY_BYTES),

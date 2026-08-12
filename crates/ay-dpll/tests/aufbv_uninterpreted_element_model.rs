@@ -190,6 +190,173 @@ fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
         "two distinct Result-valued UF applications must be distinguishable (concrete \
          datatype model), not unknown"
     );
+    drop(r);
+
+    let model = s
+        .try_get_model_str()
+        .expect("accepted SAT must retain a printable concrete model");
+    assert!(
+        model.contains("Result_Ok") || model.contains("Result_Err"),
+        "model must contain a concrete Result constructor: {model}"
+    );
+    assert!(
+        model.contains("(define-fun eval_terms_saturating"),
+        "model omitted the saturating UF interpretation: {model}"
+    );
+    assert!(
+        model.contains("(define-fun eval_terms_checked"),
+        "model omitted the checked UF interpretation: {model}"
+    );
+    assert!(
+        !model.contains("@Result"),
+        "opaque Result carrier token leaked into the public model: {model}"
+    );
+}
+
+/// SOUNDNESS: applications of one datatype-valued UF must obey congruence.
+/// Equal arguments can never be completed to distinct datatype values.
+#[test]
+fn same_datatype_uf_at_equal_bv_arguments_is_not_false_sat() {
+    assert_ne!(
+        verdict(
+            r#"
+        (set-logic ALL)
+        (declare-datatypes ((D 0)) (((D0) (D1))))
+        (declare-fun f ((_ BitVec 2)) D)
+        (declare-const i (_ BitVec 2))
+        (declare-const j (_ BitVec 2))
+        (assert (= i j))
+        (assert (not (= (f i) (f j))))
+        (check-sat)
+    "#
+        ),
+        "sat",
+        "congruent applications of one UF head cannot be distinguished"
+    );
+}
+
+/// SOUNDNESS: two syntactically different reads at model-equal indices denote
+/// one array cell and cannot be colored independently.
+#[test]
+fn datatype_selects_at_equal_bv_indices_are_not_false_sat() {
+    assert_ne!(
+        verdict(
+            r#"
+        (set-logic ALL)
+        (declare-datatypes ((D 0)) (((D0) (D1))))
+        (declare-const a (Array (_ BitVec 2) D))
+        (declare-const i (_ BitVec 2))
+        (declare-const j (_ BitVec 2))
+        (declare-const x D)
+        (declare-const y D)
+        (assert (= i j))
+        (assert (= x (select a i)))
+        (assert (= y (select a j)))
+        (assert (not (= x y)))
+        (check-sat)
+    "#
+        ),
+        "sat",
+        "equal-index reads from one array cannot be completed independently"
+    );
+}
+
+/// SOUNDNESS: a singleton datatype has exactly one inhabitant even when two
+/// distinct UF heads make its values opaque to the eager BV path.
+#[test]
+fn singleton_datatype_uf_disequality_is_not_false_sat() {
+    assert_ne!(
+        verdict(
+            r#"
+        (set-logic ALL)
+        (declare-datatypes ((Only 0)) (((only))))
+        (declare-fun f ((_ BitVec 1)) Only)
+        (declare-fun g ((_ BitVec 1)) Only)
+        (assert (not (= (f #b0) (g #b0))))
+        (check-sat)
+    "#
+        ),
+        "sat",
+        "completion cannot fabricate two inhabitants of a singleton datatype"
+    );
+}
+
+/// A completion value for a datatype-returning UF is still governed by UF
+/// congruence. Equal arguments make the two applications equal, so a
+/// disequality between them must never be published as SAT.
+#[test]
+fn datatype_valued_congruent_uf_apps_not_false_sat() {
+    let mut s = Solver::new(Logic::All);
+    let dt_name = "CongruenceBox";
+    s.try_declare_datatype(&DatatypeSort::new(
+        dt_name,
+        vec![DatatypeConstructor::new(
+            "CongruenceBox_mk",
+            vec![DatatypeField::new("CongruenceBox_value", Sort::bitvec(8))],
+        )],
+    ))
+    .unwrap();
+
+    let box_sort = Sort::Uninterpreted(dt_name.to_string());
+    let x = s.declare_const("congruence_x", Sort::bitvec(8));
+    let y = s.declare_const("congruence_y", Sort::bitvec(8));
+    let f = s.declare_fun("congruence_box_f", &[Sort::bitvec(8)], box_sort.clone());
+    let fx = s.apply(&f, &[x]);
+    let fy = s.apply(&f, &[y]);
+    let args_equal = s.eq(x, y);
+    s.assert_term(args_equal);
+    let results_equal = s.eq(fx, fy);
+    let results_distinct = s.not(results_equal);
+    s.assert_term(results_distinct);
+
+    let result = s.check_sat();
+    assert_ne!(
+        format!("{:?}", result.result()),
+        "Sat",
+        "datatype completion must preserve congruence for equal UF arguments"
+    );
+}
+
+/// A single-constructor datatype is injective in its observed field. The
+/// completion pass may choose values only for genuinely free fields; it must
+/// not overwrite two equal selector observations to manufacture a UF-result
+/// disequality.
+#[test]
+fn datatype_valued_uf_disequality_with_equal_observed_fields_not_false_sat() {
+    let mut s = Solver::new(Logic::All);
+    let dt_name = "ObservedBox";
+    s.try_declare_datatype(&DatatypeSort::new(
+        dt_name,
+        vec![DatatypeConstructor::new(
+            "ObservedBox_mk",
+            vec![DatatypeField::new("ObservedBox_value", Sort::bitvec(8))],
+        )],
+    ))
+    .unwrap();
+
+    let box_sort = Sort::Uninterpreted(dt_name.to_string());
+    let arg = s.bv_const_u64(0, 8);
+    let f = s.declare_fun("observed_box_f", &[Sort::bitvec(8)], box_sort.clone());
+    let g = s.declare_fun("observed_box_g", &[Sort::bitvec(8)], box_sort);
+    let fx = s.apply(&f, &[arg]);
+    let gx = s.apply(&g, &[arg]);
+    let f_value = s.datatype_selector("ObservedBox_value", fx, Sort::bitvec(8));
+    let g_value = s.datatype_selector("ObservedBox_value", gx, Sort::bitvec(8));
+    let zero = s.bv_const_u64(0, 8);
+    let f_is_zero = s.eq(f_value, zero);
+    let g_is_zero = s.eq(g_value, zero);
+    s.assert_term(f_is_zero);
+    s.assert_term(g_is_zero);
+    let results_equal = s.eq(fx, gx);
+    let results_distinct = s.not(results_equal);
+    s.assert_term(results_distinct);
+
+    let result = s.check_sat();
+    assert_ne!(
+        format!("{:?}", result.result()),
+        "Sat",
+        "datatype completion must not fabricate differences in observed fields"
+    );
 }
 
 /// #array-select-congruence-gate — SOUNDNESS. The general model-based
@@ -247,5 +414,49 @@ fn uninterpreted_element_derived_index_cegar_proves_unsat() {
     assert_eq!(
         v, "unsat",
         "CEGAR must refine the derived-index disequality to a proven unsat"
+    );
+}
+
+/// Datatype cells obey the same derived-index select congruence as scalar and
+/// free-sort cells. Opaque datatype completion must not turn the impossible
+/// disequality into a published SAT witness.
+#[test]
+fn datatype_element_derived_index_select_congruence_not_false_sat() {
+    let v = verdict(
+        r#"
+        (set-logic ALL)
+        (declare-datatype IndexCell ((IndexCell_mk (IndexCell_value (_ BitVec 8)))))
+        (declare-const A (Array (_ BitVec 3) IndexCell))
+        (declare-const i (_ BitVec 3))
+        (declare-const j (_ BitVec 3))
+        (assert (= (bvadd i #b001) (bvadd j #b001)))
+        (assert (not (= (select A i) (select A j))))
+        (check-sat)
+    "#,
+    );
+    assert_ne!(
+        v, "sat",
+        "datatype reads at derived-equal indices must remain congruent"
+    );
+}
+
+/// A field observed through a datatype-valued array read is semantic authority,
+/// not completion slack. The structured array cell must round-trip with that
+/// exact observed field and permit the genuine model.
+#[test]
+fn datatype_array_observed_field_read_is_sat() {
+    assert_eq!(
+        verdict(
+            r#"
+        (set-logic ALL)
+        (declare-datatype ReadCell ((ReadCell_mk (ReadCell_value (_ BitVec 8)))))
+        (declare-const A (Array (_ BitVec 3) ReadCell))
+        (declare-const seed ReadCell)
+        (assert (= seed (select A #b000)))
+        (assert (= (ReadCell_value seed) #x2a))
+        (check-sat)
+    "#,
+        ),
+        "sat"
     );
 }

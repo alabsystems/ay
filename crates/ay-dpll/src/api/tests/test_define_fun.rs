@@ -1166,3 +1166,29 @@ fn native_constant_and_fresh_variable_apis_reject_reserved_identities() {
     assert!(solver.try_declare_const("let", Sort::Int).is_ok());
     assert!(solver.try_fresh_var("select", Sort::Int).is_ok());
 }
+
+#[test]
+fn native_function_definition_apis_reject_reserved_identities() {
+    let mut solver = Solver::try_new(Logic::QfUf).unwrap();
+
+    for name in ["__ay_reserved_definition", "select"] {
+        assert!(matches!(
+            solver.try_define_fun(name, &[], Sort::Int, |solver, _| {
+                Ok(solver.int_const(0))
+            }),
+            Err(SolverError::InvalidArgument {
+                operation: "define_fun",
+                ..
+            })
+        ));
+
+        let body = solver.int_const(0);
+        assert!(matches!(
+            solver.try_define_fun_body(name, &[], Sort::Int, body),
+            Err(SolverError::InvalidArgument {
+                operation: "define_fun",
+                ..
+            })
+        ));
+    }
+}

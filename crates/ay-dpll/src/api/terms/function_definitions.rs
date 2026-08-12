@@ -7,6 +7,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId};
+use ay_frontend::is_reserved_symbol;
 
 use super::super::types::{
     FuncDecl, FuncDeclIdentity, NativeDefinitionIdentity, SolverError, Term,
@@ -74,6 +75,12 @@ impl Solver {
     where
         F: FnOnce(&mut Self, &[Term]) -> Result<Term, SolverError>,
     {
+        if is_reserved_symbol(name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "define_fun",
+                message: format!("function name '{name}' is reserved"),
+            });
+        }
         // Check before invoking the caller's closure: a rejected definition
         // must not consume terms or allow arbitrary closure side effects.
         self.reject_reused_native_function_name(name, "define_fun")?;
@@ -161,6 +168,12 @@ impl Solver {
         return_sort: Sort,
         body: Term,
     ) -> Result<FuncDecl, SolverError> {
+        if is_reserved_symbol(name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "define_fun",
+                message: format!("function name '{name}' is reserved"),
+            });
+        }
         self.reject_reused_native_function_name(name, "define_fun")?;
 
         let param_ids = params

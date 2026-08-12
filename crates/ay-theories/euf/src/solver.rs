@@ -126,6 +126,21 @@ fn cong_neg_adaptive_from_env() -> bool {
     })
 }
 
+/// #euf-atom-filter: whether to restrict the negative-congruence
+/// propagation-candidate list (`eq_terms`) to equalities that are SAT atoms
+/// (have a Boolean variable in the DPLL solver). Default ON; `AY_EUF_ATOM_FILTER=0`
+/// restores the legacy unfiltered behavior (every same-sorted equality in the
+/// TermStore is a propagation candidate, even ones the SAT layer can never
+/// receive). The filter only ever REMOVES provably-inert candidates: a
+/// propagation on an equality with no SAT variable is dropped at the DPLL
+/// boundary, so dropping it up front changes no verdict. `check()` (the
+/// conflict authority) ignores `eq_terms`. Installed only on SAT-boundary solvers (see
+/// `TheorySolver::set_sat_atom_terms`).
+pub(crate) fn atom_filter_from_env() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("AY_EUF_ATOM_FILTER").as_deref(), Ok("0")))
+}
+
 use crate::types::{
     CongruenceTable, ENode, EqualityReason, FuncAppMeta, MergeReason, UndoRecord, UnionFind,
 };
@@ -259,6 +274,14 @@ pub struct EufSolver<'a> {
     pub(crate) eq_terms: Vec<(TermId, TermId, TermId)>,
     /// Whether eq_terms has been initialized
     pub(crate) eq_terms_init: bool,
+    /// #euf-atom-filter: when `Some`, `init_eq_terms` restricts the
+    /// negative-congruence propagation-candidate list to equalities whose
+    /// `TermId` appears in this set — i.e. equalities that are SAT atoms (have
+    /// a Boolean variable the DPLL solver can assign). `None` = unfiltered
+    /// (every same-sorted equality is a candidate, the legacy behavior).
+    /// Installed by SAT-boundary-only executors (pure QF_UF, UF+LIA) via
+    /// `set_sat_atom_terms` BEFORE the first `propagate()`.
+    pub(crate) sat_atom_eq_terms: Option<HashSet<TermId>>,
     // ========================================================================
     // Incremental positive-equality propagation (class_eqs index)
     // ========================================================================
@@ -1235,6 +1258,9 @@ impl<'a> EufSolver<'a> {
             // Pre-indexed equality terms (#2673)
             eq_terms: Vec::new(),
             eq_terms_init: false,
+            // #euf-atom-filter: unfiltered until a SAT-boundary-only executor
+            // installs the SAT-atom set (see set_sat_atom_terms).
+            sat_atom_eq_terms: None,
             class_eqs: HashMap::default(),
             pos_dirty_reps: HashSet::default(),
             pos_full_scan_needed: true,
@@ -1573,32 +1599,6 @@ impl<'a> EufSolver<'a> {
         }
         self.has_theory_func_apps = any_theory_func_app;
         self.func_apps_init = true;
-    }
-
-    /// Initialize the eq_terms cache: pre-index all equality terms in the TermStore.
-    /// Called lazily before first propagate(). Since terms is an immutable borrow,
-    /// the index is stable for the solver's lifetime. (#2673)
-    pub(crate) fn init_eq_terms(&mut self) {
-        if self.eq_terms_init {
-            return;
-        }
-        self.eq_terms.clear();
-        for term_id in self.terms.term_ids() {
-            if let Some((lhs, rhs)) = self.decode_eq(term_id) {
-                // Only same-sorted equalities can ever be congruence-propagated
-                // (EUF never merges terms of different sorts), so a mismatched-sort
-                // `(= a b)` is never propagated here regardless. Filtering once at
-                // build time hoists the sort comparison out of the per-`propagate`
-                // hot loops — `Sort::eq` (a string compare for uninterpreted sorts)
-                // otherwise dominated EUF runtime on QF_UF (~70% of CPU samples on
-                // 2018-Goel-hwbench), because every `propagate` re-scanned every
-                // equality and re-compared sorts.
-                if self.terms.sort(lhs) == self.terms.sort(rhs) {
-                    self.eq_terms.push((term_id, lhs, rhs));
-                }
-            }
-        }
-        self.eq_terms_init = true;
     }
 
     /// Pre-compute ITE term indices (non-Bool only) for fast iteration (#5575).

@@ -6720,3 +6720,70 @@ fn test_quantifier_meta_pattern_depth_as_array() {
         Z3_del_context(ctx);
     }
 }
+
+/// DRIFT GUARD: the FFI's reserved-namespace gate and the core frontend's
+/// gate must be ONE set, decided by ONE table.
+///
+/// History this pins: `reserved_name_error` used to hand-spell `map[...]` and
+/// `!ay.` while `ay-frontend`'s `is_reserved_symbol` knew NEITHER — it only
+/// refused `__ay_` and the theory-operator table. That divergence WAS the
+/// measured false-PROVE channel (`(declare-fun |map[f]| ((Array Int Int))
+/// (Array Int Int))`: pinned z3 5.0.0 `sat`, AY `unsat`), because any SMT-LIB
+/// text reaching the elaborator without passing this C-API gate kept the
+/// capture. `reserved_name_error` now delegates to
+/// `ay_frontend::internal_namespace_of`, so the sets are identical by
+/// construction; this test fails if anyone re-hand-rolls either side.
+#[test]
+fn test_ffi_and_core_internal_namespace_gates_agree() {
+    // Reserved in every namespace the shared table knows, plus deliberate
+    // near-misses that must stay declarable (no over-reservation).
+    let probes = [
+        // (name, expected-reserved)
+        ("map[f]", true),
+        ("map[]", true),
+        ("map[some_long_fn]", true),
+        ("!ay.array-ext!0", true),
+        ("!ay.z3-func!12", true),
+        ("!ay.", true),
+        ("__ay_overload_0", true),
+        ("__ay_", true),
+        // Near-misses: NOT captured by any internal matcher.
+        ("map[f", false),
+        ("mapf]", false),
+        ("map", false),
+        ("amap[f]", false),
+        ("_ay_x", false),
+        ("!ay", false),
+        ("ay.x", false),
+        ("x", false),
+        ("select", false), // a theory op, but not an internal NAMESPACE
+    ];
+
+    for (name, expected) in probes {
+        let ffi = reserved_name_error(name).is_some();
+        let core = ay_frontend::is_internal_namespace_name(name);
+        assert_eq!(
+            ffi, core,
+            "FFI and core internal-namespace gates DISAGREE on `{name}` \
+             (ffi={ffi}, core={core}) — they must read one table"
+        );
+        assert_eq!(
+            ffi, expected,
+            "`{name}` classification changed (got {ffi}, expected {expected})"
+        );
+    }
+
+    // Every namespace in the shared table must be refused by the FFI gate, so
+    // adding a row cannot leave the C API behind.
+    for namespace in ay_frontend::INTERNAL_NAMESPACES {
+        let example = format!("{}probe{}", namespace.prefix, namespace.suffix);
+        assert!(
+            reserved_name_error(&example).is_some(),
+            "FFI gate does not refuse `{example}` from the shared namespace table"
+        );
+        assert!(
+            ay_frontend::is_source_reserved_symbol(&example),
+            "core source-text gate does not refuse `{example}`"
+        );
+    }
+}

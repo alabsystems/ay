@@ -942,10 +942,20 @@ impl Executor {
                     if sym.name() == "=" && args.len() == 2 {
                         for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
                             if let TermData::App(inner, iargs) = self.ctx.terms.get(a).clone() {
-                                if iargs.len() == 1
-                                    && (inner.name() == "str.to_code"
-                                        || inner.name() == "str.to.code")
-                                {
+                                // `str.to_code` ONLY. The dotted `str.to.code`
+                                // spelling used to be accepted here as an
+                                // alias, but `ay-frontend` does not own it:
+                                // it is in neither `RESERVED_OP_NAMES` nor any
+                                // elaborator match arm, and z3 5.0.0 rejects it
+                                // outright ("unknown constant str.to.code"), so
+                                // the ONLY way such an application can exist is
+                                // a user `(declare-fun str.to.code (String) Int)`
+                                // — an ordinary uninterpreted function. Injecting
+                                // the codepoint-injectivity axiom over a UF is
+                                // unsound: it was a confirmed wrong `unsat` on
+                                // `(= (str.to.code x) 97)` + `(not (= x "a"))`,
+                                // which z3 answers `sat`.
+                                if iargs.len() == 1 && inner.name() == "str.to_code" {
                                     if let TermData::Const(Constant::Int(k)) = self.ctx.terms.get(b)
                                     {
                                         if let Ok(kv) = i64::try_from(k) {

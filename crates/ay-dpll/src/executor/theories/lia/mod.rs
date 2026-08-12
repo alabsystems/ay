@@ -457,9 +457,17 @@ impl Executor {
         assumptions: &[TermId],
     ) -> Result<Option<SolveResult>> {
         const MAX_PROBE_ASSUMPTIONS: usize = 8192;
+        // #proof-capability B2 (dormant-lane audit): the proof bail below used
+        // to read `self.produce_proofs_enabled()`, always true on the
+        // certified public path (tracker armed every public solve) — this
+        // UNSAT probe is DEAD there today. Competition shedding disarms the
+        // tracker and would have activated it for the first time under public
+        // publication. `!unvetted_no_proof_lane_allowed()` keeps it exactly
+        // as dead under shedding and is byte-identical to
+        // `produce_proofs_enabled()` in every non-competition configuration.
         if assumptions.is_empty()
             || assumptions.len() > MAX_PROBE_ASSUMPTIONS
-            || self.produce_proofs_enabled()
+            || !self.unvetted_no_proof_lane_allowed()
         {
             return Ok(None);
         }

@@ -49,13 +49,14 @@ if ! cargo build --release -p ay-ffi -p ay-z3-parity; then
 fi
 
 # Locate the freshly-built FFI shared object (.dylib on macOS, .so on Linux).
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 AY_LIB="${1:-}"
 if [ -z "$AY_LIB" ]; then
-    for cand in target/release/libay_ffi.dylib target/release/libay_ffi.so; do
+    for cand in "$TARGET_DIR/release/libay_ffi.dylib" "$TARGET_DIR/release/libay_ffi.so"; do
         [ -f "$cand" ] && AY_LIB="$cand" && break
     done
 fi
-PARITY="${2:-target/release/ay-z3-parity}"
+PARITY="${2:-$TARGET_DIR/release/ay-z3-parity}"
 [ -f "$AY_LIB" ]  || { echo "FATAL: AY lib not found ($AY_LIB)"; exit 2; }
 [ -x "$PARITY" ]  || { echo "FATAL: ay-z3-parity binary not found ($PARITY)"; exit 2; }
 

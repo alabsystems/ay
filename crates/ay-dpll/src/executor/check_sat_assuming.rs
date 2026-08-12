@@ -509,6 +509,11 @@ impl Executor {
         self.last_unknown_reason = None;
         self.last_statistics = Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
+        // M0(a): strict-check attribution counters are per-publication; they
+        // share the statistics reset so a solve's dump never carries counts
+        // from an earlier public query.
+        self.strict_check_invocations.set(0);
+        self.strict_check_steps_validated.set(0);
         // Keep the immutable authority snapshot installed at the public-query
         // boundary. Core minimization and scoped subset re-solves must not
         // promote their temporary assertion windows to authored premises.

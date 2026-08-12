@@ -422,8 +422,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     active_theory_atoms.iter().copied().collect();
                 // Sync only the fresh atoms introduced by prior iterations (#6735).
                 _islp_negations.sync_pending(&mut $self.ctx.terms);
-
                 let mut theory = $create_theory;
+                ay_core::TheorySolver::set_sat_atom_terms(&mut theory, &local_term_to_var);
                 {
                     let $import_theory = &mut theory;
                     let $import_lc = &mut _islp_learned_cuts;

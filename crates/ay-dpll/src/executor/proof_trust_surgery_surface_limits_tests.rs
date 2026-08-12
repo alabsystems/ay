@@ -70,11 +70,11 @@ fn repeated_override_roots_are_charged_per_collection() {
     let root = terms.mk_var("repeated_override_root", Sort::Bool);
     assert!(surface_override_roots_have_bounded_work(
         &terms,
-        std::iter::repeat(root).take(8_192),
+        std::iter::repeat_n(root, 8_192),
     ));
     assert!(!surface_override_roots_have_bounded_work(
         &terms,
-        std::iter::repeat(root).take(8_193),
+        std::iter::repeat_n(root, 8_193),
     ));
 }
 

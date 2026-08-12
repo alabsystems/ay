@@ -26,10 +26,11 @@ use super::{
     proof_artifact::{
         write_sealed_proof_artifact, DigestBytes, ProofArtifactProblem, ProofArtifactTheoryMetadata,
     },
-    stats_output, ProofConfig, ProofFormat, EXPLAIN_ENABLED, EXPLAIN_FORMAT_JSON,
-    EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE, MINIMIZE_MODEL_ENABLED,
-    PROGRESS_ENABLED, PROGRESS_JSON_PATH, SELF_CHECK_ENABLED, START_TIME, STRICT_PROOFS_ENABLED,
-    VERIFY_FIREWALL_ENABLED, VERIFY_PROOF_ENABLED, Z3_MODEL_ENABLED, Z3_MODE_ENABLED,
+    stats_output, ProofConfig, ProofFormat, COMPETITION_MODE_ENABLED, EXPLAIN_ENABLED,
+    EXPLAIN_FORMAT_JSON, EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE,
+    MINIMIZE_MODEL_ENABLED, PROGRESS_ENABLED, PROGRESS_JSON_PATH, SELF_CHECK_ENABLED, START_TIME,
+    STRICT_PROOFS_ENABLED, VERIFY_FIREWALL_ENABLED, VERIFY_PROOF_ENABLED, Z3_MODEL_ENABLED,
+    Z3_MODE_ENABLED,
 };
 use ay::solution_visualization::{render_solution_visualization, VisualizationFormat};
 
@@ -142,6 +143,15 @@ fn new_executor() -> Executor {
     // Wire aggressive model minimization (#8297).
     if MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         executor.set_aggressive_model_minimize(true);
+    }
+    // Competition mode (#proof-capability B1): the executor sheds the internal
+    // proof cycle on public solves with no proof demand. Setting the mode here
+    // is safe alongside the proof wiring below — precedence is evaluated
+    // executor-side at every `begin_public_solve`, so a `set_produce_proofs`
+    // from `--proof`/`--strict-proofs`/`--self-check` (in any order) or a
+    // later in-script `:produce-proofs true` always wins over shedding.
+    if COMPETITION_MODE_ENABLED.load(std::sync::atomic::Ordering::SeqCst) {
+        executor.set_competition_mode(true);
     }
     // Strict-proof mode forces internal Alethe proof generation regardless of
     // `--proof` so that the terminal-trust check has a proof to inspect (#8759).

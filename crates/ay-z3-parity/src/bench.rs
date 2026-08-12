@@ -35,7 +35,7 @@ use ay_bench::{
     ENFORCEMENT_RSS_WATCHDOG_V1,
 };
 
-use crate::diff::{verdicts_of, Verdict};
+use crate::diff::{has_error_response, verdicts_of, Verdict};
 use crate::loader;
 
 /// Minimum wall time (seconds) used when forming AY/z3 ratios, to keep timer
@@ -131,8 +131,9 @@ fn process_peak_rss_bytes() -> Option<u64> {
 /// solver's raw output. The wall time covers exactly the
 /// `Z3_eval_smtlib2_string` call.
 ///
-/// Exit codes: 0 ok, 3 unreadable input, 4 library load failure. Any other
-/// termination (signal, abort) is observed by the parent as a solver crash.
+/// Exit codes: 0 ok, 3 unreadable input, 4 library load failure, 5 solver
+/// parser/API rejection. Any other termination (signal, abort) is observed by
+/// the parent as a solver crash.
 pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
     let lib = match loader::open_local(lib_path) {
         Ok(l) => l,
@@ -166,9 +167,13 @@ pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
     // SAFETY: `api` holds valid function pointers into the library opened
     // above; each is called at its declared signature. The output string is
     // owned by the context and copied out before teardown.
-    let (wall, out) = unsafe {
+    let (wall, out, error_code) = unsafe {
         let cfg = (api.mk_config)();
         let ctx = (api.mk_context)(cfg);
+        // Keep unsupported syntax local to this child. libz3's default error
+        // handler exits the process before we can distinguish a solver error
+        // from a crash or reject any partial verdict text.
+        (api.set_error_handler)(ctx, None);
         let t0 = Instant::now();
         let out_ptr = (api.eval)(ctx, cscript.as_ptr());
         let wall = t0.elapsed();
@@ -179,10 +184,15 @@ pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
                 .to_string_lossy()
                 .into_owned()
         };
+        let error_code = (api.get_error_code)(ctx);
         (api.del_context)(ctx);
         (api.del_config)(cfg);
-        (wall, out)
+        (wall, out, error_code)
     };
+    if error_code != 0 || has_error_response(&out) {
+        eprintln!("bench-one: solver rejected {}", file.display());
+        return 5;
+    }
     let peak_rss = process_peak_rss_bytes();
     let mut stdout = std::io::stdout();
     let _ = writeln!(stdout, "AYZ3_WALL_NS {}", wall.as_nanos());
@@ -551,7 +561,7 @@ pub(crate) fn run_one(
                 }
             }
         }
-        Some(3) | Some(4) => BenchOutcome {
+        Some(3) | Some(4) | Some(5) => BenchOutcome {
             kind: OutcomeKind::InputError(format!("bench-one exited {}", raw.status_str)),
             wall: raw.observed,
             peak_rss: None,

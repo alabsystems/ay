@@ -39,6 +39,8 @@ impl Verdict {
 enum Outcome {
     /// Ordered verdict tokens, one per `(check-sat)`.
     Verdicts(Vec<Verdict>),
+    /// The solver rejected the script. Any partial verdict text is unusable.
+    Error,
     /// The evaluation exceeded the per-file timebox.
     Timeout,
 }
@@ -59,6 +61,9 @@ enum Category {
     Timeout,
     /// Neither solver produced any verdict (e.g. no `(check-sat)`).
     NoVerdict,
+    /// One or both solvers rejected the script. A partial verdict after an
+    /// SMT-LIB error is not an oracle and must never become a disagreement.
+    SolverError,
     /// `sat` vs `unsat` — a SOUNDNESS BUG. Must be zero.
     Disagree,
 }
@@ -75,6 +80,7 @@ impl Category {
             Category::CountMismatch => "COUNT-MISMATCH",
             Category::Timeout => "TIMEOUT",
             Category::NoVerdict => "NO-VERDICT",
+            Category::SolverError => "SOLVER-ERROR",
             Category::Disagree => "DISAGREE",
         }
     }
@@ -118,10 +124,10 @@ pub(crate) fn verdicts_of(output: &str) -> Vec<Verdict> {
 /// copy the output string out, then tear the context down. The output is
 /// copied BEFORE `Z3_del_context` because the returned `Z3_string` is owned by
 /// the context.
-fn run_script(api: SolverApi, script: &str) -> String {
+fn run_script(api: SolverApi, script: &str) -> (String, u32) {
     let Ok(cscript) = CString::new(script) else {
         // Interior NUL byte — cannot be a valid SMT-LIB2 script.
-        return String::new();
+        return (String::new(), 1);
     };
     // SAFETY: `api` holds valid function pointers into a still-loaded Z3-ABI
     // library; each is called at its declared signature and the context is
@@ -129,16 +135,31 @@ fn run_script(api: SolverApi, script: &str) -> String {
     unsafe {
         let cfg = (api.mk_config)();
         let ctx = (api.mk_context)(cfg);
+        // libz3's default handler terminates the process on parser/API errors,
+        // which would prevent this harness from classifying the script as an
+        // unusable oracle. A null handler keeps the error on `ctx` instead.
+        (api.set_error_handler)(ctx, None);
         let out_ptr = (api.eval)(ctx, cscript.as_ptr());
         let out = if out_ptr.is_null() {
             String::new()
         } else {
             CStr::from_ptr(out_ptr).to_string_lossy().into_owned()
         };
+        let error_code = (api.get_error_code)(ctx);
         (api.del_context)(ctx);
         (api.del_config)(cfg);
-        out
+        (out, error_code)
     }
+}
+
+/// Z3's evaluator can return a textual `(error ...)` response followed by a
+/// verdict from later commands. Such a partial verdict does not describe the
+/// original script and is therefore never a valid differential oracle.
+pub(crate) fn has_error_response(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("(error") || line.starts_with("Error:")
+    })
 }
 
 /// Run a script with a hard wall-clock timebox. On timeout the worker thread is
@@ -152,7 +173,8 @@ fn eval_timeboxed(api: SolverApi, script: &str, timeout: Duration) -> Outcome {
         let _ = tx.send(out);
     });
     match rx.recv_timeout(timeout) {
-        Ok(out) => Outcome::Verdicts(verdicts_of(&out)),
+        Ok((out, error_code)) if error_code != 0 || has_error_response(&out) => Outcome::Error,
+        Ok((out, _)) => Outcome::Verdicts(verdicts_of(&out)),
         Err(_) => Outcome::Timeout,
     }
 }
@@ -162,6 +184,7 @@ fn eval_timeboxed(api: SolverApi, script: &str, timeout: Duration) -> Outcome {
 fn categorize(ay: &Outcome, z3: &Outcome) -> Category {
     let (av, zv) = match (ay, z3) {
         (Outcome::Timeout, _) | (_, Outcome::Timeout) => return Category::Timeout,
+        (Outcome::Error, _) | (_, Outcome::Error) => return Category::SolverError,
         (Outcome::Verdicts(a), Outcome::Verdicts(z)) => (a, z),
     };
     if av.is_empty() && zv.is_empty() {
@@ -222,6 +245,7 @@ fn escalate(a: Category, b: Category) -> Category {
             Category::CountMismatch => 3,
             Category::AyIncomplete => 2,
             Category::AyStronger => 1,
+            Category::SolverError => 0,
             _ => 0,
         }
     }
@@ -391,6 +415,7 @@ fn categorize_declared(declared: Option<Verdict>, ay: &Outcome) -> DeclaredCateg
     };
     let av = match ay {
         Outcome::Timeout => return DeclaredCategory::Timeout,
+        Outcome::Error => return DeclaredCategory::NoVerdict,
         Outcome::Verdicts(v) => v,
     };
     if av.is_empty() {
@@ -575,6 +600,7 @@ fn emit_declared(ay_path: &Path, results: &[DeclaredResult], json: bool) -> i32 
 fn outcome_str(o: &Outcome) -> String {
     match o {
         Outcome::Timeout => "timeout".to_string(),
+        Outcome::Error => "error".to_string(),
         Outcome::Verdicts(v) if v.is_empty() => "-".to_string(),
         Outcome::Verdicts(v) => v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(","),
     }
@@ -602,6 +628,10 @@ fn emit(ay_path: &Path, z3_path: &Path, results: &[FileResult], json: bool) -> i
     let no_verdict = results
         .iter()
         .filter(|r| r.category == Category::NoVerdict)
+        .count();
+    let solver_errors = results
+        .iter()
+        .filter(|r| r.category == Category::SolverError)
         .count();
     let disagree_files: Vec<String> = results
         .iter()
@@ -633,6 +663,7 @@ fn emit(ay_path: &Path, z3_path: &Path, results: &[FileResult], json: bool) -> i
             "count_mismatch": count_mismatch,
             "timeouts": timeouts,
             "no_verdict": no_verdict,
+            "solver_errors": solver_errors,
             "disagree": disagree,
             "disagree_files": disagree_files,
             "files": files,
@@ -681,6 +712,9 @@ fn emit(ay_path: &Path, z3_path: &Path, results: &[FileResult], json: bool) -> i
         if no_verdict > 0 {
             println!("no_verdict     = {no_verdict}");
         }
+        if solver_errors > 0 {
+            println!("solver_errors  = {solver_errors}  (not compared; no usable oracle)");
+        }
         println!("disagree       = {disagree}");
         println!();
         if disagree == 0 {
@@ -709,6 +743,15 @@ mod tests {
         assert_eq!(verdicts_of("unsat"), vec![Verdict::Unsat]);
         assert_eq!(verdicts_of("((x 5))\nsat"), vec![Verdict::Sat]);
         assert_eq!(verdicts_of("(error \"boom\")"), Vec::<Verdict>::new());
+    }
+
+    #[test]
+    fn textual_error_invalidates_partial_verdict() {
+        let output = "(error \"unknown constant set.card\")\nsat\n";
+        assert!(has_error_response(output));
+        let ay = Outcome::Verdicts(vec![Verdict::Unsat]);
+        let z3 = Outcome::Error;
+        assert_eq!(categorize(&ay, &z3), Category::SolverError);
     }
 
     #[test]

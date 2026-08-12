@@ -24,6 +24,12 @@ ay-lrat-check.workspace = true
 # checker's ground string/regex evaluator must stay independent of the solver,
 # so this is a dev-dependency and must never become a real dependency.
 ay-strings.workspace = true
+# NAME-AUTHORITY LINT ONLY (checker/name_authority_tests.rs). The lint asserts
+# that every operator spelling a strict validator matches on is a spelling
+# `ay-frontend` guarantees denotes the native theory operator. The checker must
+# stay independent of the frontend, so this is a dev-dependency and must never
+# become a real dependency.
+ay-frontend.workspace = true
 
 [lints]
 workspace = true

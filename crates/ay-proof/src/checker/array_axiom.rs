@@ -277,6 +277,178 @@ pub(crate) fn array_select_store_printer_terms(
     None
 }
 
+/// The exact primitive terms of an `ArrayStorePermutation` clause that the
+/// Alethe printer may lower to Carcara's checked array rules.
+///
+/// Every field is read back off the clause by
+/// [`array_store_permutation_printer_terms`]; nothing is taken on the
+/// producer's word. `left`/`right` list `(index, value)` pairs OUTERMOST-FIRST,
+/// matching [`StoreChain::entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArrayStorePermutationPrinterTerms {
+    /// The positive `(= L R)` literal, and its position in the clause.
+    pub row: TermId,
+    /// Index of `row` in the clause as the printer received it.
+    pub row_position: usize,
+    /// The `L` and `R` store-chain terms, in the orientation `row` spells.
+    pub left_array: TermId,
+    pub right_array: TermId,
+    /// The common innermost non-`store` base array.
+    pub base: TermId,
+    /// `L`'s written pairs, outermost-first.
+    pub left: Vec<(TermId, TermId)>,
+    /// `R`'s written pairs, outermost-first.
+    pub right: Vec<(TermId, TermId)>,
+    /// For every unordered pair of the chains' index terms, the clause literal
+    /// that carries it, together with the exact orientation that literal
+    /// spells: `(literal, position, lhs, rhs)`.
+    pub index_equalities: Vec<(TermId, usize, TermId, TermId)>,
+    /// The array sort's index sort, for the `choice` binder the checker's
+    /// `arrays_ext` rule constructs.
+    pub index_sort: Sort,
+}
+
+/// Largest store-chain length the Alethe lowering will derive.
+///
+/// The derivation is quadratic in the chain length (bubble-sort schedule ×
+/// per-transposition block), and the clause must carry one index-equality
+/// literal per unordered pair, so a longer chain is a printing pathology.
+/// Beyond the cap the lemma stays an honest `hole`; AY's native strict checker
+/// is unaffected.
+pub(crate) const MAX_STORE_PERMUTATION_CHAIN: usize = 8;
+
+/// Return the exact primitive terms of a strict-checkable
+/// `ArrayStorePermutation` clause, or `None` when the clause is outside the
+/// subset the printer can rebuild as checked Alethe.
+///
+/// This is DELIBERATELY narrower than [`validate_array_store_permutation`],
+/// which tolerates extra literals and only asks that SOME positive literal
+/// carry the permutation. The printer has to reproduce the whole clause, so it
+/// additionally requires:
+///
+/// * the clause is flat — a single packed `or` is refused rather than
+///   silently reshaped, exactly as [`array_select_store_printer_terms`] avoids
+///   flattening a unit `or`;
+/// * exactly ONE literal is a permutation equality (an ambiguous clause would
+///   leave the printer choosing which claim to derive);
+/// * the chain length is at most [`MAX_STORE_PERMUTATION_CHAIN`].
+///
+/// Everything else it reports is read straight back out of the clause: the
+/// caller re-derives the permutation from `left`/`right` and discharges each
+/// transposition against the `index_equalities` literal for that exact pair.
+pub(crate) fn array_store_permutation_printer_terms(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<ArrayStorePermutationPrinterTerms> {
+    if clause.len() < 2 {
+        return None;
+    }
+    if clause
+        .iter()
+        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return None;
+    }
+    // A packed unit `or` is refused above by the length check; guard the
+    // remaining reshape risk explicitly so a future clause shape cannot slip
+    // through as a differently-spelled claim.
+    if clause.len() == 1 {
+        return None;
+    }
+
+    let mut found: Option<ArrayStorePermutationPrinterTerms> = None;
+    for (row_position, &row) in clause.iter().enumerate() {
+        let Some((left_array, right_array)) = equality_sides(terms, row) else {
+            continue;
+        };
+        if !matches!(terms.sort(left_array), Sort::Array(_))
+            || terms.sort(left_array) != terms.sort(right_array)
+        {
+            continue;
+        }
+        let Sort::Array(array_sort) = terms.sort(left_array) else {
+            continue;
+        };
+        let index_sort = array_sort.index_sort.clone();
+        let (Some(left), Some(right)) = (
+            parse_store_chain(terms, left_array),
+            parse_store_chain(terms, right_array),
+        ) else {
+            continue;
+        };
+        // (1) same base array, (2) same chain length in 2..=cap.
+        if left.base != right.base || left.entries.len() != right.entries.len() {
+            continue;
+        }
+        let n = left.entries.len();
+        if !(2..=MAX_STORE_PERMUTATION_CHAIN).contains(&n) {
+            continue;
+        }
+        // (3) pairwise distinct index TERMS on the left chain.
+        let indices: Vec<TermId> = left.entries.iter().map(|&(index, _)| index).collect();
+        let distinct: DetHashSet<TermId> = indices.iter().copied().collect();
+        if distinct.len() != n {
+            continue;
+        }
+        // (4) the two chains write the same multiset of (index, value) pairs.
+        let mut left_pairs = left.entries.clone();
+        let mut right_pairs = right.entries.clone();
+        left_pairs.sort_unstable();
+        right_pairs.sort_unstable();
+        if left_pairs != right_pairs {
+            continue;
+        }
+        // (5) one `(= i_p i_q)` literal per unordered index pair, recorded with
+        // the orientation and position the clause actually spells.
+        let mut index_equalities = Vec::new();
+        let mut complete = true;
+        for (position, &first) in indices.iter().enumerate() {
+            for &second in &indices[position + 1..] {
+                let carried = clause.iter().enumerate().find_map(|(at, &literal)| {
+                    // The permutation equality must never double as its own
+                    // side condition, however the sorts happen to line up.
+                    if at == row_position {
+                        return None;
+                    }
+                    let (lhs, rhs) = equality_sides(terms, literal)?;
+                    ((lhs, rhs) == (first, second) || (lhs, rhs) == (second, first))
+                        .then_some((literal, at, lhs, rhs))
+                });
+                match carried {
+                    Some(entry) => index_equalities.push(entry),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                break;
+            }
+        }
+        if !complete {
+            continue;
+        }
+        // An ambiguous clause carrying two permutation equalities is refused:
+        // the printer must not pick which of them to derive.
+        if found.is_some() {
+            return None;
+        }
+        found = Some(ArrayStorePermutationPrinterTerms {
+            row,
+            row_position,
+            left_array,
+            right_array,
+            base: left.base,
+            left: left.entries,
+            right: right.entries,
+            index_equalities,
+            index_sort,
+        });
+    }
+    found
+}
+
 /// One `store` skipped while evaluating a chain at the read index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RowChainSkip {

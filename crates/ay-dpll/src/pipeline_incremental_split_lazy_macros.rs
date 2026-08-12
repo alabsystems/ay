@@ -332,7 +332,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     SatResult::Sat(model) => {
                         _islp_negations.sync_pending(&mut $self.ctx.terms);
                         let mut theory = $create_theory;
-
+                        ay_core::TheorySolver::set_sat_atom_terms(&mut theory, &local_term_to_var);
                         // M-A2 shadow: reset this round's synced-literal buffer.
                         $(
                             #[cfg(debug_assertions)]

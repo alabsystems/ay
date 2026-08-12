@@ -9,7 +9,35 @@ use super::*;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::Symbol;
 use ay_core::{AletheRule, Proof, ProofStep, Sort, TermStore};
+use ay_frontend::command::Term as FrontendTerm;
 use num_bigint::BigInt;
+
+#[test]
+fn native_api_placeholder_never_becomes_a_surface_override() {
+    let mut executor = Executor::new();
+    let left = executor.ctx.terms.mk_var("native_surface_left", Sort::Bool);
+    let right = executor
+        .ctx
+        .terms
+        .mk_var("native_surface_right", Sort::Bool);
+    let root = executor.ctx.terms.mk_and(vec![left, right]);
+    executor.ctx.add_assertion_with_parsed(
+        root,
+        FrontendTerm::Symbol(crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
+    );
+
+    let mut proof = Proof::new();
+    proof.add_assume(root, None);
+    executor.apply_input_syntax_rewrites_to_proof(&mut proof);
+
+    assert!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .is_none_or(|overrides| !overrides.contains_key(&root)),
+        "the native count-alignment placeholder is not authored syntax"
+    );
+}
 
 /// Verify that `rewrite_proof_terms` substitutes canonical `(<= b a)` with
 /// surface `(>= a b)` in all Assume and Step clause positions.

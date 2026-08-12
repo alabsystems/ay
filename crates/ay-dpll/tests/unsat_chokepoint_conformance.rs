@@ -91,11 +91,42 @@ fn token_is_minted_only_after_epoch_and_strict_proof_checks() {
         "the proof-backed UNSAT capability must have one common mint site"
     );
     assert_eq!(
+        source.matches("self.emit_checked_exact_unsat(").count(),
+        5,
+        "every exact semantic theorem wrapper must delegate to the common mint"
+    );
+    assert_eq!(
         source
             .matches("self.last_unsat_certificate = Some(UnsatCertificate(")
             .count(),
-        1,
-        "the narrow prechecked semantic lane must have one direct token mint site"
+        0,
+        "exact theorem wrappers must not construct capabilities directly"
+    );
+    let semantic_mint = source
+        .find("fn emit_checked_exact_unsat(")
+        .expect("common exact-semantic mint must exist");
+    let first_semantic_wrapper = source[semantic_mint..]
+        .find("pub(in crate::executor) fn emit_checked_exact_exists_unsat(")
+        .map(|offset| semantic_mint + offset)
+        .expect("exact-semantic mint must precede its theorem wrappers");
+    let semantic_body = &source[semantic_mint..first_semantic_wrapper];
+    let semantic_capability = semantic_body
+        .find("let certificate = UnsatCertificate(kind);")
+        .expect("common semantic mint must construct the private capability");
+    let semantic_scope = semantic_body
+        .find("certificate.checked_exact_semantic_is_current(self)")
+        .expect("common semantic mint must authenticate the exact theorem scope");
+    let presentation = semantic_body
+        .find("self.strict_unsat_presentation_required()")
+        .expect("common semantic mint must preserve explicit proof authority");
+    let semantic_publish = semantic_body
+        .find("self.last_unsat_certificate = Some(certificate);")
+        .expect("common semantic mint must publish the checked capability");
+    assert!(
+        semantic_capability < semantic_scope
+            && semantic_scope < presentation
+            && presentation < semantic_publish,
+        "exact semantic scope and proof-presentation policy must be checked before publication"
     );
     let mint = source
         .find("fn mint_unsat_certificate(")
@@ -111,7 +142,7 @@ fn token_is_minted_only_after_epoch_and_strict_proof_checks() {
         .find("provenance.original_problem_assertions != epoch.assertions")
         .expect("mint must bind exact authored assertions");
     let proof = body
-        .find("self.check_proof_strict_with_datatypes(proof)")
+        .find(".check_proof_strict_with_datatypes(proof)")
         .expect("mint must invoke the strict proof checker");
     let capability = body
         .find("Ok(UnsatCertificate(kind))")
@@ -132,27 +163,31 @@ fn token_is_minted_only_after_epoch_and_strict_proof_checks() {
         "consumption must revalidate every sealed class against its exact current scope"
     );
     let checked_branch = consume_body
-        .find("UnsatCertificateKind::CheckedSatRefutation(checked) =>")
+        .find("UnsatCertificateKind::CheckedSatRefutation { checked, scope } =>")
         .expect("checked SAT-refutation consumption branch must exist");
     let checked_end = consume_body[checked_branch..]
-        .find("UnsatCertificateKind::CheckedExactExists(evidence) =>")
+        .find("UnsatCertificateKind::CheckedBoolBv(checked) =>")
         .map(|offset| checked_branch + offset)
         .expect("checked SAT-refutation branch must have a bounded source region");
     let checked_body = &consume_body[checked_branch..checked_end];
     assert!(
-        checked_body.contains(".is_same_epoch(&self.query_authority_epoch)")
-            && checked_body
-                .contains("epoch.source_context_stamp == self.ctx.source_context_stamp()")
+        checked_body.contains("scope.is_current(self)")
+            && checked_body.contains("epoch.is_current(self)")
             && checked_body.contains("epoch.declared_extension.is_empty()")
-            && checked_body.contains("bound_assumptions.is_empty()")
-            && checked_body.contains(".is_none_or(|assumptions| assumptions.is_empty())")
+            && checked_body.contains("epoch.declared_extension_entries.is_empty()")
+            && checked_body.contains("epoch.declared_extension_objectives.is_none()")
+            && checked_body.contains("epoch.declared_extension_objective_entries.is_none()")
+            && checked_body.contains("self.last_assumptions.as_deref()")
+            && checked_body.contains("Some(bound_assumptions)")
+            && checked_body
+                .contains("bound_assumptions.is_empty() && self.last_assumptions.is_none()")
             && checked_body.contains("provenance.original_problem_assertions == epoch.assertions")
             && checked_body.contains("&epoch.authority_epoch,")
             && checked_body.contains("&epoch.source_context_stamp,")
             && checked_body.contains("&epoch.assertions,")
             && checked_body.contains("bound_assumptions,"),
         "checked SAT-refutation consumption must reject stale authority/source state, any query \
-         extension or assumptions, mismatched proof roots, and a sidecar from another exact scope"
+         extension, mismatched assumptions or proof roots, and a sidecar from another exact scope"
     );
 
     let funnel = source
@@ -465,9 +500,14 @@ fn deferred_trust_reconfirmation_requires_a_plain_strict_proof() {
     let tighter = unsat
         .find("fn tighter_optional_limit(")
         .expect("deterministic limit composition helper must exist");
+    // Anchored on the next item's doc comment, NOT on the exact blank-line run
+    // before it: a rustfmt pass that drops the blank line is a formatting
+    // change, and it should not read as "the deterministic limit helper has
+    // vanished". It did exactly that, and the resulting panic fired before this
+    // test reached a single one of its real assertions.
     let tighter_end = unsat[tighter..]
-        .find("\n}\n\n/// True while")
-        .map(|offset| tighter + offset + 2)
+        .find("/// True while")
+        .map(|offset| tighter + offset)
         .expect("deterministic limit composition helper must have a bounded source region");
     let tighter_body = &unsat[tighter..tighter_end];
     assert!(
@@ -494,9 +534,23 @@ fn deferred_trust_reconfirmation_requires_a_plain_strict_proof() {
             && reconfirm_body.contains(
                 "exec.set_solve_controls(self.solve_interrupt.clone(), self.solve_deadline.get());"
             )
-            && reconfirm_body.contains("exec.check_proof_strict_with_datatypes(proof).is_ok()"),
+            && reconfirm_body.contains("exec.check_proof_strict_with_datatypes(proof)")
+            && reconfirm_body.contains("Err(error) => Self::is_trust_kind_rejection(error)"),
         "whole-problem trust fallback must compose its deterministic caps with tighter caller \
-         limits, inherit outer solve controls, and must not accept same-engine UNSAT repetition"
+         limits, inherit outer solve controls, and must screen the re-solve's proof for \
+         STRUCTURAL defects"
+    );
+    // The screen must stay a screen. Demanding `is_ok()` here — i.e. demanding
+    // the twin proof be TRUST-FREE — made this arm unreachable for the only
+    // class it serves: step (4) runs BECAUSE the original proof carries a trust
+    // step, and the same engine on the same problem re-derives the same trust
+    // step. A trust-kind rejection is the entry condition, not evidence against
+    // it. Structural defects must still decline, which is what the predicate
+    // above enumerates and this pin protects.
+    assert!(
+        !reconfirm_body.contains("strict.is_ok()\n    }"),
+        "the re-solve proof screen must not demand trust-freeness of the twin proof — that is \
+         this fallback's own entry condition and made it decline every time"
     );
     assert!(
         !reconfirm_body.contains("exec.set_deadline(")

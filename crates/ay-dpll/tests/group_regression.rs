@@ -9,6 +9,8 @@
 
 mod common;
 
+#[path = "group_regression/boolarg_orphan_model_gate_gap.rs"]
+mod boolarg_orphan_model_gate_gap;
 #[path = "group_regression/bv_ite_bool_model_soundness.rs"]
 mod bv_ite_bool_model_soundness;
 #[path = "group_regression/combined_assumption_sat_canaries_6731.rs"]

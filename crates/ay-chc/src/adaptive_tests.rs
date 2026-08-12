@@ -5064,7 +5064,7 @@ fn test_multi_pred_case_split_budget_scales_from_actual_remaining_time() {
         (Duration::from_secs(20), Duration::from_secs(8)),
         (Duration::from_secs(40), Duration::from_secs(10)),
         (Duration::from_secs(65), Duration::from_secs(16)),
-        (Duration::from_secs(120), Duration::from_secs(16)),
+        (Duration::from_mins(2), Duration::from_secs(16)),
     ];
     for (remaining, expected) in cases {
         let budget = AdaptivePortfolio::multi_pred_case_split_budget(Some(remaining));
@@ -6273,14 +6273,14 @@ fn test_array_ghost_pair_preprocess_reconstructs_compacted_model_before_certific
         &original,
         spec,
         raw_ghost_model,
-        Some(Duration::from_secs(60)),
+        Some(Duration::from_mins(1)),
     )
     .expect("reconstructed raw-ghost model must seal on the original clauses");
     assert!(
         recheck_ghost_pair_certificate(
             &original,
             certificate.as_ref(),
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
             false,
         ),
         "sealed certificate must survive a full original-clause recheck"

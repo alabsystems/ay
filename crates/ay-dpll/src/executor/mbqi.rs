@@ -10553,6 +10553,7 @@ impl Executor {
             }
             return None;
         }
+        let mut needs_refutation_evidence: Vec<TermId> = Vec::new();
         for &assertion in snapshot {
             if !self.closed_sentence_without_uninterpreted_symbols(assertion, &declared) {
                 if debug {
@@ -10566,11 +10567,80 @@ impl Executor {
             if !self.is_exact_closed_parity_theorem(assertion)
                 && !self.is_exact_closed_unbounded_above_theorem(assertion)
             {
+                needs_refutation_evidence.push(assertion);
+            }
+        }
+        // ---- GENERAL ARM (#closed-sentence-cert): a closed sentence outside
+        // the two structural recognizers is proven valid by REFUTING ITS
+        // NEGATION through the checked reconfirmation primitive — fresh
+        // executor, deterministic conflict/decision bounds, structural proof
+        // screen. Validity implies satisfiability for a closed sentence
+        // (SMT-LIB sorts are non-empty), and a valid sentence has nothing for
+        // a witness model to pin, which is exactly why the model gate cannot
+        // confirm this class and an authority grant is the right instrument.
+        //
+        // HISTORY, because this arm was here before and was rightly removed.
+        // The pre-2026-08-08 form accepted a bare `Unsat` from a plain
+        // isolated solve of the negation — trust, not evidence — and the
+        // "harden checked solver authority" merge narrowed the certificate to
+        // the two structural families rather than carry that trust forward.
+        // The narrowing was correct about the trust and collateral about the
+        // class: it starved every restored existential (a trivially
+        // satisfiable `exists x. x = 5` published `unknown` with reason
+        // `quantifier-ematching-exists`, twelve pinned tests in
+        // `skolemization_5840` alike). This arm restores the CLASS with the
+        // evidence upgraded to what the funnel itself accepts: the nested
+        // refutation must survive the same structural proof screen the
+        // deferred-trust discharge uses. Bisected to the merge and verified
+        // on both parents; see the a735ef4031 investigation.
+        //
+        // Kill switch AY_CLOSED_SENTENCE_CERT=off|shadow (default on): `off`
+        // declines outright, `shadow` runs the refutations and logs the
+        // would-be grant without granting.
+        if !needs_refutation_evidence.is_empty() {
+            let mode = std::env::var("AY_CLOSED_SENTENCE_CERT").unwrap_or_default();
+            if mode == "off" {
                 if debug {
                     eprintln!(
-                        "CERT/valid-sentence decline: {assertion:?} is not an exact structural theorem"
+                        "CERT/valid-sentence decline: general arm disabled \
+                         (AY_CLOSED_SENTENCE_CERT=off)"
                     );
                 }
+                return None;
+            }
+            // Binder sorts must be INTERPRETED. The symbol partition above
+            // admits a binder over a declared uninterpreted sort (a sort is
+            // not a symbol), and the general arm deliberately does not extend
+            // there: the structural recognizers never accept one, and widening
+            // the class and the evidence in the same change would leave no
+            // clean attribution if the sweep moves.
+            if !needs_refutation_evidence
+                .iter()
+                .all(|&a| self.closed_sentence_binder_sorts_are_interpreted(a))
+            {
+                if debug {
+                    eprintln!("CERT/valid-sentence decline: binder over an uninterpreted sort");
+                }
+                return None;
+            }
+            for &assertion in &needs_refutation_evidence {
+                let negation = self.ctx.terms.mk_not(assertion);
+                if !self.reconfirms_negation_refuted_for_closed_sentence(&[negation]) {
+                    if debug {
+                        eprintln!(
+                            "CERT/valid-sentence decline: {assertion:?} negation not \
+                             refuted under the checked reconfirmation primitive"
+                        );
+                    }
+                    return None;
+                }
+            }
+            if mode == "shadow" {
+                eprintln!(
+                    "CERT/valid-sentence SHADOW: general arm would certify SAT \
+                     ({} checked negation refutations); grant withheld",
+                    needs_refutation_evidence.len()
+                );
                 return None;
             }
         }
@@ -10581,6 +10651,36 @@ impl Executor {
             );
         }
         Some(CheckedExactClosedSentenceSat::for_current(self, snapshot))
+    }
+
+    /// Every quantifier binder reachable from `root` ranges over an
+    /// INTERPRETED sort. Guard for the general closed-sentence arm: the symbol
+    /// partition cannot see sorts, and a closed sentence quantifying over a
+    /// declared uninterpreted sort stays outside the class until it has its
+    /// own measured campaign.
+    fn closed_sentence_binder_sorts_are_interpreted(&self, root: TermId) -> bool {
+        let mut stack = vec![root];
+        while let Some(term) = stack.pop() {
+            match self.ctx.terms.get(term) {
+                TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
+                    if !vars.iter().all(|(_, sort)| {
+                        matches!(sort, Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_))
+                    }) {
+                        return false;
+                    }
+                    stack.push(*body);
+                }
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, t, e) => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Check the exact interpreted identities used by the structural theorem.

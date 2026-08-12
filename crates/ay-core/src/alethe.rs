@@ -264,6 +264,90 @@ pub const UNPROVED_STEP_RULE: &str = "hole";
 ///   else, re-deriving constructor membership from the problem's own
 ///   `declare-datatypes` rather than trusting AY's registry. The two
 ///   validators are therefore independent and shape-aligned.
+///
+/// MEASURED NON-ALIAS: `bv_bitblast`. The checker DOES implement bit-blasting
+/// — `bitblast_add|and|ashr|comp|concat|const|equal|extract|lshr|mult|neg|not|
+/// or|shl|sign_extend|slt|udiv|ult|urem|var|xnor|xor` are all live in the
+/// pinned build — but not as anything a rename could reach. Every one of those
+/// rules concludes `(= <word-level term> (@bbterm b0 .. bn))`, i.e. it pairs a
+/// bit-vector term with an EXPLICIT list of Boolean bit terms, whereas an AY
+/// [`crate::proof::TheoryLemmaKind::BvBitBlast`] clause is a word-level
+/// tautology containing no `@bbterm` at all. Aliasing the coarse kind onto any
+/// per-operator name would therefore be rejected by the checker, and aliasing
+/// it onto a name whose inference it is not would be a false certificate. The
+/// coarse kind stays `hole` here; the sub-families that ARE exactly
+/// reconstructible are DERIVED as multi-step `bitblast_*` sequences by
+/// `ay_proof`'s Alethe printer instead.
+/// DELIBERATELY NOT ALIASED — `ite_same` → `ite_simplify`. The pair is
+/// admissible on paper: `ay_proof::recognize_ite_same` admits EXACTLY the unit
+/// positive equality `(= L R)` where one side is `Ite(c, t, e)` with `t == e`
+/// (same `TermId`) equal to the other side, and carcara's `ite_simplify`
+/// re-derives that in ONE rewrite (patterns 1–3 of its twelve-pattern set all
+/// collapse an identical-branch `ite` to the branch, so the fixed-point loop
+/// hits the goal immediately and cannot cycle). It is not shipped because it
+/// buys nothing measurable: the only reconstruction that emits
+/// [`crate::proof::TheoryLemmaKind::IteSame`] is
+/// `Executor::promote_ite_same_collapse`, whose proof carcara already rejects
+/// at the `assume`, not at the lemma — on `(assert (not (= (ite p a a) a)))`
+/// the source-spelling override prints the value term `a` as `(ite p a a)`, so
+/// the assume reaches the wire as
+/// `(not (= (ite p (ite p a a) (ite p a a)) (ite p a a)))` and carcara answers
+/// "could not match term to any of the original problem premises" => `invalid`
+/// before and after the rename. Renaming the lemma would move an `invalid`
+/// document to a different `invalid` document. Fix the assume expansion first;
+/// until then the honest `hole` is the correct wire name.
+///
+/// # Audited and REJECTED: the strings / regex / arithmetic family
+///
+/// Every candidate below was run against the pinned checker as a bare
+/// theory-lemma step carrying a clause its AY kind is actually allowed to
+/// carry. All twelve stay honest holes; the tests in this module lock that in.
+///
+/// The strings and regex candidates fail for one STRUCTURAL reason, not twelve
+/// separate shape mismatches: a theory lemma prints as
+/// `(step id (cl …) :rule R)` with no `:premises` and no `:args` (see
+/// `ay_proof::AlethePrinter::format_theory_lemma`), while *every* string and
+/// regex rule the checker implements demands at least one of them —
+/// `concat_eq`/`concat_conflict`/`string_decompose` (1 premise + 1 arg),
+/// `concat_unify` (2 + 1), the eight `concat_*split*`/`*prop_*` rules and
+/// `re_inter` (2 premises), `string_length_non_empty` and the five
+/// `re_*unfold*` rules (1 premise), `string_length_pos` (1 arg). The checker
+/// rejects on that count before it ever inspects the clause, so the set of AY
+/// steps any of them would accept is EMPTY. Measured verdicts, e.g.
+/// `re_inter` given `(cl (not (str.in_re x R₁)) (not (str.in_re x R₂)))`:
+/// `expected 2 premises, got 0` → `invalid`, where `hole` gives `holey`.
+///
+/// The two named near-misses resolve as follows.
+///
+/// * `regex_intersect_empty` → `re_inter` is not a near-miss at all once read:
+///   `re_inter` INTRODUCES a positive membership, deriving the unit
+///   `(cl (str.in_re x (re.inter s t)))` from premises `(str.in_re x s)` and
+///   `(str.in_re x t)`. AY's kind states the opposite — a premise-free
+///   two-literal tautology of NEGATED memberships whose jointly denied
+///   languages have empty intersection. Opposite polarity, different arity,
+///   different claim: mapping it would be a false certificate, and it does not
+///   even fail quietly.
+/// * `lia_mod_range` → `mod_simplify`: `mod_simplify` is ground constant
+///   folding — conclusion `(cl (= (mod a b) r))` with `a`, `b` integer
+///   CONSTANTS and `r` the true remainder, hence always in `[0, |b|)`. AY's
+///   kind carries `(cl (not (= (mod x d) r)))` over a SYMBOLIC `x` with `r`
+///   deliberately OUTSIDE that range. The accepted sets are disjoint on
+///   polarity, on groundness and on the range predicate; measured, the negated
+///   form answers `term '(not (= (mod n 4) 7))' is of the wrong form, expected
+///   '(= l r)'`, and even the positive form answers `expected term 'n' to be a
+///   numerical constant`.
+///
+/// The remainder have no counterpart to argue about. `string_ground_eval` has
+/// none because the checker's `evaluate` returns "cannot evaluate" for every
+/// string and regex operator — `(cl (= (str.len "abc") 3))` is rejected — so
+/// it decides no string fact at all. `nra_interval_unsat` and
+/// `nra_univariate_unsat` are nonlinear: `la_generic` needs Farkas `:args`
+/// over a linear conflict, and `la_tautology` given `(cl (not (< 0 (* n n))))`
+/// answers `final disequality is not tautological`. The remaining seven —
+/// `string_containment_identity`, `string_concat_cancellation`,
+/// `string_ground_factor_conflict`, `regex_length_lower_bound`,
+/// `string_length`, `string_length_lemma` and `string_code_inj` — have no rule
+/// of that inference anywhere in the calculus.
 const WIRE_RULE_ALIASES: [(&str, &str); 1] = [("dt_distinct", "dt_clash")];
 
 /// True if the Alethe checker implements `name`, i.e. emitting it produces a
@@ -271,6 +355,121 @@ const WIRE_RULE_ALIASES: [(&str, &str); 1] = [("dt_distinct", "dt_clash")];
 #[must_use]
 pub fn is_checkable_alethe_rule(name: &str) -> bool {
     CHECKABLE_ALETHE_RULES.binary_search(&name).is_ok()
+}
+
+/// Alethe rules the pinned checker accepts ONLY when the step itself carries
+/// premises and/or `:args`.
+///
+/// [`is_checkable_alethe_rule`] answers "does the checker know this NAME"; it
+/// says nothing about whether the step being printed is one the checker can
+/// accept under it. For the rules below the gap is not a matter of clause
+/// shape at all — the checker rejects on the premise/argument COUNT before it
+/// ever inspects the clause, so a step printed with neither is rejected
+/// unconditionally and takes the whole document from `holey` to `invalid`.
+/// That is the failure mode [`wire_rule_name`]'s doc calls out: an unbacked
+/// rule name is not a weaker proof, it is *no* proof.
+///
+/// Membership is a MEASURED property of carcara 1.1.0 `[git master 9a352ee]`,
+/// not a judgement call: it is exactly the set of dispatched rules whose
+/// implementation opens with `assert_num_premises(premises, k)` or
+/// `assert_num_args(args, k)` for a lower bound `k >= 1`. Reproduce with
+///
+/// ```text
+/// grep -n 'assert_num_premises\|assert_num_args' \
+///     carcara/src/checker/rules/*.rs
+/// ```
+///
+/// and map each function back through the dispatch table in
+/// `carcara/src/checker/shared.rs`.
+///
+/// Rules whose required argument count is computed from the conclusion rather
+/// than fixed — `la_generic`, `lia_generic`, `forall_inst`, `bind` — are
+/// deliberately NOT listed. They are unreachable as a bare theory-lemma wire
+/// name: the printer either emits their `:args` (the Farkas path) or refuses
+/// the step outright with `MissingFarkasAnnotation`, and listing them here
+/// would convert that fail-loud into a silent hole.
+const PREMISE_OR_ARG_REQUIRED_ALETHE_RULES: [&str; 65] = [
+    "and",
+    "and_intro",
+    "and_pos",
+    "arrays_ext",
+    "arrays_row",
+    "arrays_row_contra",
+    "bfun_elim",
+    "concat_conflict",
+    "concat_cprop_prefix",
+    "concat_cprop_suffix",
+    "concat_csplit_prefix",
+    "concat_csplit_suffix",
+    "concat_eq",
+    "concat_lprop_prefix",
+    "concat_lprop_suffix",
+    "concat_split_prefix",
+    "concat_split_suffix",
+    "concat_unify",
+    "cong",
+    "contraction",
+    "cp_addition",
+    "cp_division",
+    "cp_literal",
+    "cp_multiplication",
+    "cp_saturation",
+    "equiv1",
+    "equiv2",
+    "ho_cong",
+    "implies",
+    "ite1",
+    "ite2",
+    "not_and",
+    "not_equiv1",
+    "not_equiv2",
+    "not_implies1",
+    "not_implies2",
+    "not_ite1",
+    "not_ite2",
+    "not_or",
+    "not_symm",
+    "not_xor1",
+    "not_xor2",
+    "or",
+    "or_neg",
+    "pbblast_bvand_ith_bit",
+    "pbblast_bvxor_ith_bit",
+    "poly_simp_rel",
+    "re_concat_unfold_pos",
+    "re_inter",
+    "re_kleene_star_unfold_pos",
+    "re_unfold_neg",
+    "re_unfold_neg_concat_fixed_prefix",
+    "re_unfold_neg_concat_fixed_suffix",
+    "reordering",
+    "resolution",
+    "strict_resolution",
+    "string_decompose",
+    "string_length_non_empty",
+    "string_length_pos",
+    "symm",
+    "tautology",
+    "th_resolution",
+    "weakening",
+    "xor1",
+    "xor2",
+];
+
+/// True if the pinned Alethe checker rejects `name` outright on the
+/// premise/argument count, i.e. a step printed with neither premises nor
+/// `:args` can never be an instance of it.
+///
+/// A caller that prints a bare `(step id (cl …) :rule name)` must demote such
+/// a name to [`UNPROVED_STEP_RULE`]: `hole` checks as *holey* and stays
+/// machine-readable as unproved, where the unbacked name would void the
+/// entire certificate. This is the count-side half of the admissibility bar
+/// [`WIRE_RULE_ALIASES`] documents on the shape side.
+#[must_use]
+pub fn alethe_rule_requires_premises_or_args(name: &str) -> bool {
+    PREMISE_OR_ARG_REQUIRED_ALETHE_RULES
+        .binary_search(&name)
+        .is_ok()
 }
 
 /// Map an internal rule name to the name that may be written into a proof.
@@ -778,6 +977,116 @@ mod wire_name_tests {
                 wire_rule_name(name),
                 UNPROVED_STEP_RULE,
                 "{name} must render as an honest hole, never as an unknown rule"
+            );
+        }
+    }
+
+    #[test]
+    fn premise_or_arg_required_table_is_sorted_and_deduped() {
+        // `alethe_rule_requires_premises_or_args` binary-searches it; an
+        // out-of-order entry silently stops matching and the guard goes quiet.
+        for pair in PREMISE_OR_ARG_REQUIRED_ALETHE_RULES.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{} must sort strictly before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for name in PREMISE_OR_ARG_REQUIRED_ALETHE_RULES {
+            assert!(
+                alethe_rule_requires_premises_or_args(name),
+                "{name} is in the table but does not look up"
+            );
+        }
+    }
+
+    /// The trap this guard exists for: a name the checker DOES implement, and
+    /// which `is_checkable_alethe_rule` therefore waves through, that no bare
+    /// step can ever be an instance of.
+    #[test]
+    fn checkable_by_name_is_not_backable_by_a_bare_step() {
+        // Measured on carcara 1.1.0 [git master 9a352ee]. Left column: the
+        // rule. Right: what it demands before it looks at the clause.
+        for (name, demand) in [
+            ("string_decompose", "1 premise + 1 arg"),
+            ("string_length_pos", "1 arg"),
+            ("string_length_non_empty", "1 premise"),
+            ("re_inter", "2 premises"),
+            ("concat_eq", "1 premise + 1 arg"),
+            ("concat_unify", "2 premises + 1 arg"),
+            ("concat_conflict", "1 premise + 1 arg"),
+            ("re_concat_unfold_pos", "1 premise"),
+        ] {
+            assert!(
+                is_checkable_alethe_rule(name),
+                "{name} should still be a rule the checker knows"
+            );
+            assert!(
+                alethe_rule_requires_premises_or_args(name),
+                "{name} needs {demand}; a bare step cannot back it"
+            );
+        }
+    }
+
+    /// The rules a bare theory-lemma step legitimately reaches must NOT be
+    /// demoted — the guard has to stay a scalpel, not a blanket.
+    #[test]
+    fn rules_a_bare_step_can_back_are_left_alone() {
+        for name in [
+            UNPROVED_STEP_RULE,
+            "eq_transitive",
+            "eq_reflexive",
+            "eq_congruent",
+            "eq_congruent_pred",
+            "arrays_idx",
+            "true",
+            "false",
+            // Deliberately absent: their argument count is computed from the
+            // conclusion, and the printer either supplies `:args` or refuses
+            // the step outright. Listing them would mute that fail-loud.
+            "la_generic",
+            "lia_generic",
+        ] {
+            assert!(
+                !alethe_rule_requires_premises_or_args(name),
+                "{name} must not be demoted"
+            );
+        }
+    }
+
+    /// The strings/regex/arithmetic wire-mapping audit, locked down.
+    ///
+    /// Each of these internal names was tested as a candidate
+    /// [`WIRE_RULE_ALIASES`] entry against the pinned checker and failed the
+    /// admissibility bar; every one must stay an honest hole. A future agent
+    /// that maps one of them onto `re_inter`, `mod_simplify`,
+    /// `string_length_pos`, `concat_unify`, … trips this test.
+    #[test]
+    fn audited_string_regex_arithmetic_kinds_stay_honest_holes() {
+        for internal in [
+            "string_length",
+            "string_length_lemma",
+            "string_code_inj",
+            "string_ground_eval",
+            "string_containment_identity",
+            "string_concat_cancellation",
+            "string_ground_factor_conflict",
+            "regex_intersect_empty",
+            "regex_length_lower_bound",
+            "lia_mod_range",
+            "nra_interval_unsat",
+            "nra_univariate_unsat",
+        ] {
+            let wire = wire_rule_name(internal);
+            assert_eq!(
+                wire, UNPROVED_STEP_RULE,
+                "{internal} has no admissible checker counterpart; see the \
+                 WIRE_RULE_ALIASES admissibility bar before mapping it"
+            );
+            assert!(
+                !alethe_rule_requires_premises_or_args(wire),
+                "the hole rendering must itself be backable by a bare step"
             );
         }
     }

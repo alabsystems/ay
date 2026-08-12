@@ -11,12 +11,15 @@ use std::cell::RefCell;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
-use ay_core::{quote_symbol, Sort, TermId, TermStore};
+use ay_core::{quote_symbol, Sort, Symbol, TermId, TermStore};
 use num_rational::BigRational;
 
 use crate::executor_format::{format_default_value_surface, format_sort_surface};
 
+use super::rendered_dt_limits::SchemaSourceBudget;
 use super::{EvalValue, Executor, Model};
+
+const CEGAR_DISTINCT_OPERAND_LIMIT: usize = 256;
 
 thread_local! {
     /// Per-thread override map consulted at the top of [`Executor::evaluate_term`].
@@ -194,6 +197,172 @@ pub(super) fn with_dt_field_overrides_for_test<R>(
 }
 
 impl Executor {
+    /// Whether a canonical theory identity is either unbound (the normal
+    /// builtin representation) or owned by a live theory declaration.
+    ///
+    /// Low-level/native callers can otherwise install an ordinary declaration
+    /// at a canonical spelling. CEGAR lemmas must never reinterpret such an
+    /// application as an SMT theory operator merely because its name and sorts
+    /// happen to match.
+    fn cegar_theory_identity_is_coherent(&self, identity: &str) -> bool {
+        self.ctx
+            .symbol_info_by_identity(identity)
+            .is_none_or(|info| {
+                self.ctx.effective_declaration_kind(info.declaration_id())
+                    == Some(ay_frontend::DeclarationKind::Theory)
+            })
+    }
+
+    /// Bound borrowed sort descriptors before recursive equality checks.
+    fn cegar_sorts_are_bounded<'a>(sorts: impl IntoIterator<Item = &'a Sort>) -> bool {
+        let mut budget = SchemaSourceBudget::new();
+        sorts.into_iter().all(|sort| budget.charge_sort(sort))
+    }
+
+    /// Recognize one exact, live, well-sorted SMT array read.
+    ///
+    /// CEGAR may mint a theory lemma from a recognized read, so matching an
+    /// indexed lookalike by `Symbol::name()` or trusting a caller-supplied
+    /// result sort is not sufficient authority. Every use in the census and
+    /// strict-oracle fallback shares this check with the final lemma builder.
+    pub(in crate::executor) fn exact_cegar_select_parts(
+        &self,
+        term: TermId,
+    ) -> Option<(TermId, TermId)> {
+        self.ctx.terms.entry_stamp(term)?;
+        let TermData::App(Symbol::Named(operator), arguments) = self.ctx.terms.get(term) else {
+            return None;
+        };
+        let [array, index] = arguments.as_slice() else {
+            return None;
+        };
+        if operator != "select"
+            || !self.cegar_theory_identity_is_coherent("select")
+            || self.ctx.terms.entry_stamp(*array).is_none()
+            || self.ctx.terms.entry_stamp(*index).is_none()
+        {
+            return None;
+        }
+        let Sort::Array(array_sort) = self.ctx.terms.sort(*array) else {
+            return None;
+        };
+        let index_sort = self.ctx.terms.sort(*index);
+        let result_sort = self.ctx.terms.sort(term);
+        (Self::cegar_sorts_are_bounded([
+            &array_sort.index_sort,
+            &array_sort.element_sort,
+            index_sort,
+            result_sort,
+        ]) && index_sort == &array_sort.index_sort
+            && result_sort == &array_sort.element_sort)
+            .then_some((*array, *index))
+    }
+
+    /// Recognize one exact, live, well-sorted binary SMT equality.
+    pub(in crate::executor) fn exact_cegar_equality_operands(
+        &self,
+        term: TermId,
+    ) -> Option<(TermId, TermId)> {
+        self.ctx.terms.entry_stamp(term)?;
+        if !matches!(self.ctx.terms.sort(term), Sort::Bool) {
+            return None;
+        }
+        let TermData::App(Symbol::Named(operator), arguments) = self.ctx.terms.get(term) else {
+            return None;
+        };
+        let [left, right] = arguments.as_slice() else {
+            return None;
+        };
+        if self.ctx.terms.entry_stamp(*left).is_none()
+            || self.ctx.terms.entry_stamp(*right).is_none()
+        {
+            return None;
+        }
+        let left_sort = self.ctx.terms.sort(*left);
+        let right_sort = self.ctx.terms.sort(*right);
+        if operator != "="
+            || !self.cegar_theory_identity_is_coherent("=")
+            || !Self::cegar_sorts_are_bounded([left_sort, right_sort])
+            || left_sort != right_sort
+        {
+            return None;
+        }
+        Some((*left, *right))
+    }
+
+    /// Recognize one exact, live, homogeneous SMT `distinct` application.
+    pub(in crate::executor) fn exact_cegar_distinct_operands(
+        &self,
+        term: TermId,
+    ) -> Option<Vec<TermId>> {
+        self.ctx.terms.entry_stamp(term)?;
+        if !matches!(self.ctx.terms.sort(term), Sort::Bool) {
+            return None;
+        }
+        let TermData::App(Symbol::Named(operator), arguments) = self.ctx.terms.get(term) else {
+            return None;
+        };
+        if operator != "distinct"
+            || !self.cegar_theory_identity_is_coherent("distinct")
+            || !(2..=CEGAR_DISTINCT_OPERAND_LIMIT).contains(&arguments.len())
+        {
+            return None;
+        }
+        let first = *arguments.first()?;
+        self.ctx.terms.entry_stamp(first)?;
+        let operand_sort = self.ctx.terms.sort(first);
+        let mut sort_budget = SchemaSourceBudget::new();
+        if !sort_budget.charge_sort(operand_sort) {
+            return None;
+        }
+        if arguments.iter().skip(1).any(|operand| {
+            self.ctx.terms.entry_stamp(*operand).is_none()
+                || !sort_budget.charge_sort(self.ctx.terms.sort(*operand))
+                || self.ctx.terms.sort(*operand) != operand_sort
+        }) {
+            return None;
+        }
+        Some(arguments.clone())
+    }
+
+    /// Recognize one exact, live, well-sorted SMT array update.
+    pub(in crate::executor) fn exact_cegar_store_parts(
+        &self,
+        term: TermId,
+    ) -> Option<(TermId, TermId, TermId)> {
+        self.ctx.terms.entry_stamp(term)?;
+        let TermData::App(Symbol::Named(operator), arguments) = self.ctx.terms.get(term) else {
+            return None;
+        };
+        let [array, index, value] = arguments.as_slice() else {
+            return None;
+        };
+        if operator != "store"
+            || !self.cegar_theory_identity_is_coherent("store")
+            || self.ctx.terms.entry_stamp(*array).is_none()
+            || self.ctx.terms.entry_stamp(*index).is_none()
+            || self.ctx.terms.entry_stamp(*value).is_none()
+        {
+            return None;
+        }
+        let Sort::Array(array_sort) = self.ctx.terms.sort(*array) else {
+            return None;
+        };
+        let index_sort = self.ctx.terms.sort(*index);
+        let value_sort = self.ctx.terms.sort(*value);
+        let result_sort = self.ctx.terms.sort(term);
+        (Self::cegar_sorts_are_bounded([
+            &array_sort.index_sort,
+            &array_sort.element_sort,
+            index_sort,
+            value_sort,
+            result_sort,
+        ]) && index_sort == &array_sort.index_sort
+            && value_sort == &array_sort.element_sort
+            && result_sort == self.ctx.terms.sort(*array))
+        .then_some((*array, *index, *value))
+    }
+
     /// Check whether a symbol is a datatype-internal symbol (constructor, tester,
     /// or selector) that should be excluded from `get-model` output (#5412).
     #[cfg(test)]
@@ -1143,11 +1312,8 @@ impl Executor {
         // index). A select whose index is undecidable fails closed.
         let mut groups: HashMap<(TermId, String), Vec<TermId>> = HashMap::default();
         for &t in &reachable {
-            let (array, index) = match self.ctx.terms.get(t) {
-                TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
-                    (args[0], args[1])
-                }
-                _ => continue,
+            let Some((array, index)) = self.exact_cegar_select_parts(t) else {
+                continue;
             };
             if !is_dt_array(array, self) {
                 continue;
@@ -1220,11 +1386,28 @@ impl Executor {
         // shown to satisfy the disequality -> fail closed.
         for &a in &self.ctx.assertions {
             let operands: Vec<TermId> = match self.ctx.terms.get(a) {
-                TermData::App(sym, args) if sym.name() == "distinct" => args.clone(),
-                TermData::Not(inner) => match self.ctx.terms.get(*inner) {
-                    TermData::App(s2, a2) if s2.name() == "=" && a2.len() == 2 => a2.clone(),
-                    _ => continue,
-                },
+                TermData::App(Symbol::Named(operator), _) if operator == "distinct" => {
+                    let Some(operands) = self.exact_cegar_distinct_operands(a) else {
+                        return false;
+                    };
+                    operands
+                }
+                TermData::Not(inner) => {
+                    if self.ctx.terms.entry_stamp(*inner).is_none() {
+                        return false;
+                    }
+                    if matches!(
+                        self.ctx.terms.get(*inner),
+                        TermData::App(Symbol::Named(operator), _) if operator == "="
+                    ) {
+                        let Some((left, right)) = self.exact_cegar_equality_operands(*inner) else {
+                            return false;
+                        };
+                        vec![left, right]
+                    } else {
+                        continue;
+                    }
+                }
                 _ => continue,
             };
             let dt_operands: Vec<TermId> = operands
@@ -1307,25 +1490,20 @@ impl Executor {
                 uf.insert(rx, ry);
             }
         };
-        for &t in &reachable {
-            if let TermData::App(sym, args) = self.ctx.terms.get(t) {
-                if sym.name() == "="
-                    && args.len() == 2
-                    && matches!(self.ctx.terms.sort(args[0]), Sort::Array(_))
-                    && self.sat_term_assigned_true(model, t)
+        for &term in &reachable {
+            if let Some((left, right)) = self.exact_cegar_equality_operands(term) {
+                if matches!(self.ctx.terms.sort(left), Sort::Array(_))
+                    && self.sat_term_assigned_true(model, term)
                 {
-                    union(&mut uf, args[0], args[1]);
+                    union(&mut uf, left, right);
                 }
             }
         }
         let mut arr_selects: Vec<(TermId, TermId, TermId)> = Vec::new(); // (select, base, index)
-        for &t in &reachable {
-            if let TermData::App(sym, args) = self.ctx.terms.get(t) {
-                if sym.name() == "select"
-                    && args.len() == 2
-                    && matches!(self.ctx.terms.sort(t), Sort::Array(_))
-                {
-                    arr_selects.push((t, args[0], args[1]));
+        for &term in &reachable {
+            if let Some((array, index)) = self.exact_cegar_select_parts(term) {
+                if matches!(self.ctx.terms.sort(term), Sort::Array(_)) {
+                    arr_selects.push((term, array, index));
                 }
             }
         }
@@ -1365,13 +1543,11 @@ impl Executor {
         }
 
         let mut class_cells: HashMap<TermId, Vec<(String, TermId)>> = HashMap::default();
-        for &t in &reachable {
-            if let TermData::App(sym, args) = self.ctx.terms.get(t) {
-                if sym.name() == "select" && args.len() == 2 {
-                    if let Some(k) = self.census_index_key(model, args[1]) {
-                        let cls = Self::census_find(&uf, args[0]);
-                        class_cells.entry(cls).or_default().push((k, t));
-                    }
+        for &term in &reachable {
+            if let Some((array, index)) = self.exact_cegar_select_parts(term) {
+                if let Some(key) = self.census_index_key(model, index) {
+                    let class = Self::census_find(&uf, array);
+                    class_cells.entry(class).or_default().push((key, term));
                 }
             }
         }
@@ -1487,15 +1663,16 @@ impl Executor {
 
     /// Strict-oracle CEGAR distillation (#dt-array-cegar): build the
     /// select-congruence tautology for the read pair of a strict-oracle-rejected
-    /// (dis)equality `(= r1 r2)`. Thin visibility wrapper over
-    /// [`Self::build_select_congruence_lemma`] — `None` unless both operands are
-    /// binary `select`s forming same-sort equalities.
+    /// (dis)equality. Thin visibility wrapper over
+    /// [`Self::build_select_congruence_lemma`] — `None` unless `equality` is an
+    /// exact named, well-sorted binary `=` whose operands are exact named,
+    /// well-sorted array reads.
     pub(in crate::executor) fn strict_oracle_select_congruence_lemma(
         &mut self,
         model: &Model,
-        r1: TermId,
-        r2: TermId,
+        equality: TermId,
     ) -> Option<TermId> {
+        let (r1, r2) = self.exact_cegar_equality_operands(equality)?;
         self.build_select_congruence_lemma(model, r1, r2)
     }
 
@@ -1504,20 +1681,20 @@ impl Executor {
     /// `(=> (and (= A B) (= i j)) (= r1 r2))` (dropping the `(= A B)` conjunct
     /// when `A` and `B` are the same term). `None` if either operand is not a
     /// binary `select` or the equalities are not same-sort.
-    fn build_select_congruence_lemma(
+    pub(super) fn build_select_congruence_lemma(
         &mut self,
         model: &Model,
         r1: TermId,
         r2: TermId,
     ) -> Option<TermId> {
-        let (a, i) = match self.ctx.terms.get(r1) {
-            TermData::App(s, args) if s.name() == "select" && args.len() == 2 => (args[0], args[1]),
-            _ => return None,
-        };
-        let (b, j) = match self.ctx.terms.get(r2) {
-            TermData::App(s, args) if s.name() == "select" && args.len() == 2 => (args[0], args[1]),
-            _ => return None,
-        };
+        if ["=", "and", "or"]
+            .into_iter()
+            .any(|identity| !self.cegar_theory_identity_is_coherent(identity))
+        {
+            return None;
+        }
+        let (a, i) = self.exact_cegar_select_parts(r1)?;
+        let (b, j) = self.exact_cegar_select_parts(r2)?;
         if self.ctx.terms.sort(r1) != self.ctx.terms.sort(r2)
             || self.ctx.terms.sort(i) != self.ctx.terms.sort(j)
         {
@@ -1714,17 +1891,15 @@ impl Executor {
                 self.census_value_key(model, fill, depth - 1)?
             ));
         }
-        if let TermData::App(sym, args) = self.ctx.terms.get(arr) {
-            if sym.name() == "store" && args.len() == 3 {
-                let base = self.census_array_canonical(model, args[0], depth - 1)?;
-                let idx = self.census_index_key(model, args[1])?;
-                let val = self.census_value_key(model, args[2], depth - 1)?;
-                return Some(format!("store({base},{idx},{val})"));
-            }
-            if sym.name() == "select" && args.len() == 2 {
-                let idx = self.census_index_key(model, args[1])?;
-                return Some(format!("sel({},{})", args[0].0, idx));
-            }
+        if let Some((base_term, index, value)) = self.exact_cegar_store_parts(arr) {
+            let base = self.census_array_canonical(model, base_term, depth - 1)?;
+            let idx = self.census_index_key(model, index)?;
+            let val = self.census_value_key(model, value, depth - 1)?;
+            return Some(format!("store({base},{idx},{val})"));
+        }
+        if let Some((base, index)) = self.exact_cegar_select_parts(arr) {
+            let idx = self.census_index_key(model, index)?;
+            return Some(format!("sel({},{idx})", base.0));
         }
         Some(format!("arr#{}", arr.0))
     }
@@ -1953,14 +2128,12 @@ impl Executor {
                 default = Some(fill);
                 break;
             }
-            if let TermData::App(sym, args) = self.ctx.terms.get(cur) {
-                if sym.name() == "store" && args.len() == 3 {
-                    if let Some(k) = self.census_index_key(model, args[1]) {
-                        cells.entry(k).or_insert(args[2]);
-                    }
-                    cur = args[0];
-                    continue;
+            if let Some((base, index, value)) = self.exact_cegar_store_parts(cur) {
+                if let Some(key) = self.census_index_key(model, index) {
+                    cells.entry(key).or_insert(value);
                 }
+                cur = base;
+                continue;
             }
             break;
         }
@@ -2630,12 +2803,33 @@ impl Executor {
         Some(self.format_eval_value(&v, arg))
     }
 
-    /// Find the selector application term `(sel arg)` in the term store.
+    /// Find the exact, well-sorted selector application term `(sel arg)`.
     pub(super) fn find_dt_selector_app(&self, sel: &str, arg: TermId) -> Option<TermId> {
+        self.ctx.terms.entry_stamp(arg)?;
+        if !self
+            .ctx
+            .ctor_selectors_iter()
+            .any(|(_, selectors)| selectors.iter().any(|selector| selector == sel))
+        {
+            return None;
+        }
+        let signature = self.ctx.exact_datatype_member_info(sel)?;
+        let [argument_sort] = signature.arg_sorts.as_slice() else {
+            return None;
+        };
+        if self.ctx.terms.sort(arg) != argument_sort {
+            return None;
+        }
         for idx in 0..self.ctx.terms.len() {
             let tid = TermId(idx as u32);
-            if let TermData::App(sym, args) = self.ctx.terms.get(tid) {
-                if sym.name() == sel && args.len() == 1 && args[0] == arg {
+            if let TermData::App(Symbol::Named(identity), arguments) = self.ctx.terms.get(tid) {
+                let [actual_argument] = arguments.as_slice() else {
+                    continue;
+                };
+                if identity == sel
+                    && *actual_argument == arg
+                    && self.ctx.terms.sort(tid) == &signature.sort
+                {
                     return Some(tid);
                 }
             }

@@ -20,9 +20,22 @@ fn purifies_compound_bool_arg_of_uf() {
     let assertion = terms.mk_eq(fapp, t);
 
     let mut assertions = vec![assertion];
-    let changed = purify_bool_args(&mut terms, &mut assertions);
+    let orphan_index = purify_bool_args(&mut terms, &mut assertions);
 
-    assert!(changed, "pass should fire on a compound Bool UF argument");
+    assert!(
+        !orphan_index.is_empty(),
+        "pass should fire on a compound Bool UF argument"
+    );
+    // The rewritten `f(<compound>)` is indexed to `f(proxy)` — the ONLY term a
+    // model will pin, since the original appears in no assertion the solver sees.
+    assert_eq!(
+        orphan_index.get(&fapp).copied(),
+        Some(match terms.get(assertions[0]) {
+            TermData::App(_, args) => args[0],
+            _ => panic!("assertion should still be the equality"),
+        }),
+        "the rewritten UF application must be indexed to its solver-visible twin"
+    );
     assert_eq!(assertions.len(), 2, "a proxy definition should be appended");
 }
 
@@ -37,8 +50,11 @@ fn leaves_plain_bool_var_arg_untouched() {
     let assertion = terms.mk_eq(fapp, t);
 
     let mut assertions = vec![assertion];
-    let changed = purify_bool_args(&mut terms, &mut assertions);
+    let orphan_index = purify_bool_args(&mut terms, &mut assertions);
 
-    assert!(!changed, "plain Bool-var arguments need no purification");
+    assert!(
+        orphan_index.is_empty(),
+        "plain Bool-var arguments need no purification"
+    );
     assert_eq!(assertions.len(), 1);
 }

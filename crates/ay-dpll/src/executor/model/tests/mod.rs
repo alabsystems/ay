@@ -27,11 +27,17 @@ pub(crate) use super::*;
 
 mod array_completion;
 mod array_witness_soundness;
+mod cegar_array_signature;
+mod cegar_qfax_refinement;
 mod cert_default_row_key;
 mod certificate_pins;
 mod cross_base_witness_defchase;
 mod div_witness_index;
+mod dt_construct_budget;
 mod dt_element_canon_gate;
+mod dt_opaque_completion_scope;
+mod dt_opaque_parser_scope;
+mod dt_opaque_resource_scope;
 mod dt_recursive_model_faithfulness;
 mod eval_term_bitvec_array;
 mod eval_term_bv_compound;

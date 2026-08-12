@@ -200,8 +200,28 @@ impl Executor {
             return None;
         }
         let mut effective = base.cloned().unwrap_or_default();
-        if !audit.merge_into(&mut effective)
-            || !live_proof_rendering_is_static(proof, live, &self.ctx.terms, &effective)
+        if !audit.merge_into(&mut effective) {
+            return None;
+        }
+        // An override that spells its term exactly as the canonical Alethe
+        // renderer would is INERT: it cannot change one byte of any printed
+        // step. Prune those before the static-rendering scans below, which
+        // are deliberately key-presence-conservative (`roots_intersect_overrides`
+        // vetoes a copied step on mere key membership): the surface
+        // collector installs a whole-term identity entry for every assertion,
+        // and without this prune each such entry falsely reads as a rendering
+        // hazard for any copied step whose clause mentions the assertion —
+        // which is what kept the substituted-equality repair from coexisting
+        // with the deferred array leaves it was landed together with
+        // (#array-collapse-promotion). The equality is checked byte-for-byte
+        // against the same renderer the export uses (`validate_effective`
+        // bounds the render work right below), so pruning is observationally
+        // free: printing WITH an identity override and printing without it
+        // produce the same document.
+        effective.retain(|&term, spelling| {
+            *spelling != ay_proof::format_term_alethe(&self.ctx.terms, term)
+        });
+        if !live_proof_rendering_is_static(proof, live, &self.ctx.terms, &effective)
             || !copied_structural_roles_are_static(
                 proof,
                 live,

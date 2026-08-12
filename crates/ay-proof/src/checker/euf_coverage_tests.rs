@@ -341,6 +341,71 @@ fn test_strict_cong_valid_partial_premises() {
 }
 
 #[test]
+fn test_strict_cong_valid_for_dedicated_ite_node() {
+    let mut terms = TermStore::new();
+    let condition = terms.mk_var("p", Sort::Bool);
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let common = terms.mk_var("c", Sort::Int);
+    let left = terms.mk_ite_raw(condition, a, common);
+    let right = terms.mk_ite_raw(condition, b, common);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let eq_conclusion = mk_eq_raw(&mut terms, left, right);
+
+    validate_strict_with_derived(
+        &terms,
+        AletheRule::Cong,
+        vec![eq_conclusion],
+        vec![ProofId(0)],
+        vec![Some(vec![eq_ab])],
+    )
+    .expect("ite is an ordinary ternary application for congruence");
+}
+
+#[test]
+fn test_strict_cong_rejects_ite_condition_change_without_premise() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let then_branch = terms.mk_var("a", Sort::Int);
+    let else_branch = terms.mk_var("b", Sort::Int);
+    let left = terms.mk_ite_raw(p, then_branch, else_branch);
+    let right = terms.mk_ite_raw(q, then_branch, else_branch);
+    let eq_conclusion = mk_eq_raw(&mut terms, left, right);
+
+    let error = validate_strict_with_derived(
+        &terms,
+        AletheRule::Cong,
+        vec![eq_conclusion],
+        vec![],
+        vec![],
+    )
+    .expect_err("a changed ite condition requires an explicit equality premise");
+    assert!(matches!(error, ProofCheckError::InvalidBooleanRule { .. }));
+}
+
+#[test]
+fn test_strict_cong_rejects_ite_and_application_heads() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let ite = terms.mk_ite_raw(p, a, b);
+    let application = mk_fun(&mut terms, "f", vec![a], Sort::Int);
+    let eq_conclusion = mk_eq_raw(&mut terms, ite, application);
+
+    let error = validate_strict_with_derived(
+        &terms,
+        AletheRule::Cong,
+        vec![eq_conclusion],
+        vec![],
+        vec![],
+    )
+    .expect_err("ite and ordinary applications have different congruence heads");
+    assert!(matches!(error, ProofCheckError::InvalidBooleanRule { .. }));
+}
+
+#[test]
 fn test_strict_cong_rejects_different_symbols() {
     let mut terms = TermStore::new();
     let a = terms.mk_var("a", Sort::Int);

@@ -1846,6 +1846,32 @@ impl Executor {
                 audit.protect_operand(&mut self.ctx.terms, plan.array_equality);
                 audit.protect_operand(&mut self.ctx.terms, plan.guard_source);
             }
+            // Deferred trust leaves are copied through verbatim and promoted
+            // IN PLACE by the two downstream array stages: a kind retag on
+            // the SAME clause term
+            // (`promote_generic_theory_lemma_kinds_after_rewrite`), plus —
+            // for the extensionality class — appended clause-free
+            // `array_ext_diff_intro` steps whose args (witness, array_a,
+            // array_b) are subterms of that clause
+            // (`promote_array_extensionality_axioms`). Every term those
+            // stages render therefore lies inside the leaf's clause tree.
+            // Registering the clause RIGID makes the retained override map
+            // provably unable to respell any of it (`validate_effective`
+            // refuses a non-identity override anywhere in a rigid tree): the
+            // audited replacement for the previous blanket veto on the
+            // retained-overrides + deferred-leaf mix, which killed the
+            // #array-collapse-promotion repair (a substituted-equality plan
+            // always retains overrides, and the array backbone around it is
+            // always deferred).
+            for &leaf_idx in &deferred_leaves {
+                let leaf_clause = match &proof.steps[leaf_idx] {
+                    ProofStep::TheoryLemma { clause, .. } => clause.clone(),
+                    _ => return false,
+                };
+                for lit in leaf_clause {
+                    audit.protect_rigid_operand(&mut self.ctx.terms, lit);
+                }
+            }
             Some(audit)
         } else {
             None
@@ -2022,9 +2048,20 @@ impl Executor {
         // Standalone quant repair prepares its complete replacement map before
         // proof mutation.  Retained-surface repair uses a different rendering
         // discipline, so the two remain deliberately exclusive.
+        //
+        // A deferred leaf is UNAUDITED only when no retained-surface audit
+        // exists to hold its registration: `surface_audit` is `Some` exactly
+        // when the audit block above ran, and that block registers every
+        // deferred leaf's full clause tree as RIGID (so `validate_effective`
+        // refuses any override respelling the material the downstream
+        // promotion stages re-tag or introduce). The late
+        // `keeps_surface_overrides` upgrade above (taut/EUF plans discovered
+        // during assume classification) happens after that block, so those
+        // proofs still fail closed here.
+        let has_unaudited_deferred = !deferred_leaves.is_empty() && surface_audit.is_none();
         if !retained_surface_plan_mix_is_safe(
             keeps_surface_overrides,
-            !deferred_leaves.is_empty(),
+            has_unaudited_deferred,
             has_quant_plans,
         ) {
             return false;

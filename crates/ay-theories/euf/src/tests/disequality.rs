@@ -1312,6 +1312,88 @@ fn test_cong_neg_propagation_basic() {
 }
 
 #[test]
+fn test_cong_neg_sat_atom_filter_keeps_only_assignable_candidates() {
+    // The executor's filter is the equality subset of its SAT atom map. Keep
+    // the asserted disequality and the candidate (= a b), but deliberately
+    // omit an unrelated TermStore equality that has no SAT variable.
+    let mut store = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = store.mk_var("a", u.clone());
+    let b = store.mk_var("b", u.clone());
+    let c = store.mk_var("c", u.clone());
+    let d = store.mk_var("d", u.clone());
+    let fa = store.mk_app(Symbol::named("f"), vec![a], u.clone());
+    let fb = store.mk_app(Symbol::named("f"), vec![b], u);
+    let eq_ab = store.mk_eq(a, b);
+    let inert_eq_cd = store.mk_eq(c, d);
+    let diseq_f = store.mk_eq(fa, fb);
+
+    let mut sat_atoms = ay_core::kani_compat::DetHashSet::default();
+    sat_atoms.insert(eq_ab);
+    sat_atoms.insert(diseq_f);
+
+    let mut euf = EufSolver::new(&store);
+    euf.set_sat_atom_eq_terms(sat_atoms);
+    euf.assert_literal(diseq_f, false);
+    let props = euf.propagate();
+
+    assert!(
+        euf.eq_terms.iter().any(|(term, _, _)| *term == eq_ab),
+        "the assignable negative-congruence candidate must remain indexed"
+    );
+    assert!(
+        euf.eq_terms.iter().all(|(term, _, _)| *term != inert_eq_cd),
+        "a TermStore equality with no SAT variable must not remain in the candidate index"
+    );
+    let prop = find_prop(&props, eq_ab).expect("the retained candidate must still propagate");
+    assert!(!prop.literal.value);
+    adversarially_verify_propagation(&store, &euf, &prop);
+}
+
+#[test]
+fn test_cong_neg_sat_atom_filter_does_not_weaken_conflict_checking() {
+    // (= a b) has no SAT variable and is excluded from the propagation index,
+    // but the assigned a=c and c=b equalities derive it transitively. The
+    // asserted f(a)!=f(b) must still conflict: check() is the authority path
+    // and must not depend on the filtered propagation-only index.
+    let mut store = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = store.mk_var("a", u.clone());
+    let b = store.mk_var("b", u.clone());
+    let c = store.mk_var("c", u.clone());
+    let fa = store.mk_app(Symbol::named("f"), vec![a], u.clone());
+    let fb = store.mk_app(Symbol::named("f"), vec![b], u);
+    let eq_ac = store.mk_eq(a, c);
+    let eq_cb = store.mk_eq(c, b);
+    let excluded_eq_ab = store.mk_eq(a, b);
+    let diseq_f = store.mk_eq(fa, fb);
+
+    let mut sat_atoms = ay_core::kani_compat::DetHashSet::default();
+    sat_atoms.insert(eq_ac);
+    sat_atoms.insert(eq_cb);
+    sat_atoms.insert(diseq_f);
+
+    let mut euf = EufSolver::new(&store);
+    euf.set_sat_atom_eq_terms(sat_atoms);
+    euf.assert_literal(eq_ac, true);
+    euf.assert_literal(eq_cb, true);
+    euf.assert_literal(diseq_f, false);
+    let result = euf.check();
+
+    assert!(
+        matches!(result, TheoryResult::Unsat(_)),
+        "filtered propagation candidates must not weaken conflict detection: {result:?}"
+    );
+    euf.init_eq_terms();
+    assert!(
+        euf.eq_terms
+            .iter()
+            .all(|(term, _, _)| *term != excluded_eq_ab),
+        "the derived non-SAT equality should remain excluded from propagation indexing"
+    );
+}
+
+#[test]
 fn test_cong_neg_propagation_with_arg_chain() {
     // f(a, c) != f(b, d) asserted, c = d asserted: atom (= a b) propagates
     // FALSE with the c = d chain in its reason.

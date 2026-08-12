@@ -25,8 +25,10 @@
 use crate::term::TermId;
 use serde::{Deserialize, Serialize};
 
+mod accessors;
 mod annotations;
 mod fp;
+mod theory_lemma_kind;
 
 pub use annotations::{BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation};
 pub use fp::FpOp;
@@ -85,6 +87,19 @@ pub enum TheoryLemmaKind {
     /// certificate renders as an honest `hole` on that wire rather than being
     /// mislabeled as `lia_generic`.
     LiaModRange,
+
+    /// Bounded mixed Bool/Int/BV semantic tautology.
+    ///
+    /// Every clause literal must be the explicit negation of one source-level
+    /// root.  The strict checker reconstructs that conjunction and independently
+    /// proves it UNSAT with the bounded BV/LIA interpreter; the producer's tag
+    /// carries no authority.  This closes proof-presentation gaps for exact
+    /// `bv2nat` obligations while remaining fail-closed outside the checker's
+    /// finite fragment.
+    ///
+    /// The pinned external Alethe checker does not parse SMT-LIB `bv2nat`, so
+    /// this internal certificate renders as an honest `hole` on that wire.
+    BvLiaTautology,
 
     /// Bitvector bit-blasting (legacy, no gate info).
     /// Uses Alethe rule `bv_bitblast`.
@@ -327,6 +342,64 @@ pub enum TheoryLemmaKind {
     /// conjunction over the `map.dom` projection, not this single implication,
     /// so a `map.subset` clause fails closed here.
     SubsetElementInstance,
+
+    /// TRANSITIVITY of one collection subset predicate.
+    ///
+    /// ```text
+    /// (cl (not (X.subset A B)) (not (X.subset B C)) (X.subset A C))
+    /// ```
+    ///
+    /// All three native predicates order their carriers pointwise -- `set` by
+    /// Boolean implication, `multiset` by `<=` on multiplicities, `map` by
+    /// domain containment plus value agreement on the contained keys -- and
+    /// every pointwise order is transitive, so the clause is valid under every
+    /// interpretation with no side condition at all.
+    ///
+    /// The MIDDLE term must be shared: the second premise's subset operand
+    /// must be the first premise's superset operand, and the conclusion must
+    /// join the two free ends. `validate_subset_transitive` re-derives that
+    /// chain from the clause alone, so a triple that does not actually connect
+    /// -- which would licence an arbitrary subset claim -- is rejected
+    /// fail-closed. All three atoms must use the SAME operator at one common
+    /// array sort.
+    ///
+    /// Checkable only by AY's native strict checker; renders as an honest
+    /// `hole` on the external Alethe wire, exactly like the two kinds above.
+    SubsetTransitive,
+
+    /// One collection subset atom DECIDED EXACTLY on ground carriers, under
+    /// the ground bindings the clause itself carries.
+    ///
+    /// ```text
+    /// (cl (not (= s Sg)) (not (= t Tg)) (X.subset s t))
+    /// (cl (not (= s Sg)) (not (= t Tg)) (not (X.subset s t)))
+    /// ```
+    ///
+    /// A binding literal `(not (= v g))` with `g` a GROUND carrier licenses
+    /// substituting `v := g` in the conclusion: any valuation falsifying the
+    /// clause makes that equality TRUE, so congruence preserves the
+    /// conclusion's value under the replacement, and the substituted clause is
+    /// falsifiable exactly when the original is. (The same clause-carried
+    /// binding argument [`Self::FpGroundEval`] uses.)
+    ///
+    /// A ground carrier is `((as const (Array I E)) d)` under a bounded,
+    /// cycle-free chain of `store`s at CONSTANT indices with CONSTANT values --
+    /// the exact shape `(as set.empty ..)` and `set.singleton`/`set.insert`
+    /// elaborate to. `validate_subset_ground_eval` decodes both operands into
+    /// that normal form and decides `A subset B` POINTWISE and exactly; a
+    /// negative conclusion additionally requires an explicit witness index at
+    /// which the containment fails.
+    ///
+    /// An operand may stay UNBOUND only where the decision is universally
+    /// valid without it: a positive claim whose subset operand is everywhere
+    /// the carrier's bottom element holds for every superset. Everything else
+    /// -- a non-ground binding, an unrecognized carrier, an unbound operand
+    /// the decision needs, a mismatched polarity, any extra literal -- fails
+    /// closed.
+    ///
+    /// Checkable only by AY's native strict checker; renders as an honest
+    /// `hole` on the external Alethe wire.
+    SubsetGroundEval,
 
     /// Array extensionality axiom.
     ///
@@ -733,92 +806,6 @@ pub enum TheoryLemmaKind {
     FpGroundEval,
 }
 
-impl TheoryLemmaKind {
-    /// Get the Alethe rule name for this lemma kind
-    #[must_use]
-    pub fn alethe_rule(&self) -> &'static str {
-        match self {
-            Self::EufTransitive => "eq_transitive",
-            Self::EufReflexive => "eq_reflexive",
-            Self::EufCongruent => "eq_congruent",
-            Self::EufCongruentPred => "eq_congruent_pred",
-            Self::LraFarkas => "la_generic",
-            Self::LiaGeneric => "lia_generic",
-            Self::LiaModRange => "lia_mod_range",
-            Self::BvBitBlast | Self::BvBitBlastGate { .. } => "bv_bitblast",
-            Self::ArraySelectStore { index_eq: true } => "read_over_write_pos",
-            Self::ArraySelectStore { index_eq: false } => "read_over_write_neg",
-            Self::ArrayStorePermutation => "store_permutation",
-            Self::ArrayRowChain => "read_over_write_chain",
-            Self::ArrayDefaultConst => "array_default_const",
-            Self::SetCardNonNegative => "set_card_non_negative",
-            Self::SetCardMemberLowerBound => "set_card_member_lower_bound",
-            Self::SetCardEmpty => "set_card_empty",
-            Self::SetCardMemberCount => "set_card_member_count",
-            Self::SetCardEmptyByAssertion => "set_card_empty_by_assertion",
-            Self::SetCardChainRecurrence => "set_card_chain_recurrence",
-            Self::SubsetReflexive => "subset_reflexive",
-            Self::SubsetElementInstance => "subset_element_instance",
-            Self::ArrayExtensionality => "extensionality",
-            Self::FpToBv { .. } => "fp_to_bv",
-            Self::StringLengthAxiom => "string_length",
-            Self::StringLengthLemma => "string_length_lemma",
-            Self::StringContentAxiom => "string_decompose",
-            Self::StringNormalForm => "string_code_inj",
-            Self::StringGroundEval => "string_ground_eval",
-            Self::RegexIntersectEmpty => "regex_intersect_empty",
-            Self::StringContainmentIdentity => "string_containment_identity",
-            Self::StringConcatCancellation => "string_concat_cancellation",
-            Self::StringGroundFactorConflict => "string_ground_factor_conflict",
-            Self::RegexLengthLowerBound => "regex_length_lower_bound",
-            Self::DatatypeDistinct => "dt_distinct",
-            Self::DatatypeEnumPigeonhole => "dt_enum_pigeonhole",
-            Self::DatatypeSelectorProject => "dt_project",
-            Self::DatatypeTesterEval => "dt_tester",
-            Self::OrderIteTautology => "order_ite_tautology",
-            Self::BoolTautology => "bool_tautology",
-            Self::IteSame => "ite_same",
-            Self::FpClassification { .. } => "fp_classification",
-            Self::FpRoundingModeDomain => "fp_rm_domain",
-            Self::FpForwardError => "fp_forward_error",
-            Self::NraIntervalUnsat => "nra_interval_unsat",
-            Self::NraUnivariateUnsat => "nra_univariate_unsat",
-            Self::Generic => "trust",
-            Self::RoundingModeDomain => "fp_rounding_mode_domain",
-            Self::FpGroundEval => "fp_ground_eval",
-        }
-    }
-
-    /// The rule name that may be written into an emitted Alethe proof.
-    ///
-    /// [`Self::alethe_rule`] is the *internal* identity and keeps returning
-    /// `"trust"` for [`Self::Generic`] and the theory-specific names
-    /// (`dt_distinct`, `read_over_write_pos`, `string_length`, …) that AY's
-    /// own classifiers, dedup keys and `#8821` diagnostics match on. This
-    /// method is the *wire* identity: kinds the Alethe checker does not
-    /// implement render as `hole`, which the checker accepts as an honest
-    /// unproved step, instead of an unknown rule name that voids the whole
-    /// certificate.
-    ///
-    /// This does not hide anything from AY's soundness gates, which read the
-    /// proof IR: `terminal_trust` flags `AletheRule::Hole` and
-    /// `TheoryLemmaKind::is_trust()` identically, and `is_trust()` below is
-    /// unchanged.
-    #[must_use]
-    pub fn alethe_wire_rule(&self) -> &str {
-        wire_rule_name(self.alethe_rule())
-    }
-
-    /// True if this theory lemma kind exports as `trust` in Alethe format.
-    ///
-    /// Used by proof quality metrics to count theory lemmas that contribute
-    /// unverified trust steps (#5657).
-    #[must_use]
-    pub fn is_trust(&self) -> bool {
-        matches!(self, Self::Generic)
-    }
-}
-
 /// Proof annotation for a theory lemma clause in the SAT clause trace (#6031 Phase 4).
 ///
 /// Parallel to `ClausificationProof`: when the SAT clause trace contains an
@@ -896,8 +883,8 @@ pub enum ProofStep {
 }
 
 pub use crate::alethe::{
-    is_checkable_alethe_rule, wire_rule_name, AletheRule, CHECKABLE_ALETHE_RULES,
-    UNPROVED_STEP_RULE,
+    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
+    CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 
 /// Proof step identifier
@@ -1121,24 +1108,6 @@ impl Proof {
             kind,
             lia: Some(lia),
         })
-    }
-
-    /// Get a step by ID
-    #[must_use]
-    pub fn get_step(&self, id: ProofId) -> Option<&ProofStep> {
-        self.steps.get(id.0 as usize)
-    }
-
-    /// Get the number of steps
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.steps.len()
-    }
-
-    /// Check if the proof is empty
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
     }
 }
 

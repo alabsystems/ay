@@ -159,12 +159,43 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                             kind,
                         );
                     } else {
-                        // Bound axioms that fail arith kind inference
-                        // still export as Generic/trust. These may be EUF or
-                        // combined-theory axioms that need a dedicated classifier.
-                        proof_ctx
-                            .tracker
-                            .add_theory_lemma_with_kind(clause, TheoryLemmaKind::Generic);
+                        // #trust->0 C1.iii: bound axioms that fail arith kind
+                        // inference run the central classifier funnel before
+                        // conceding Generic/trust (site 24 — the residual may
+                        // be EUF/array/combined shapes the funnel covers).
+                        // Polarity is already exact here: both literals were
+                        // resolved through the negation cache above (a miss
+                        // `continue`s without recording anything).
+                        let kind = self.terms.map_or(TheoryLemmaKind::Generic, |terms| {
+                            crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+                                terms,
+                                &clause,
+                                farkas.as_ref(),
+                            )
+                        });
+                        match kind {
+                            // Attach the certificate the funnel validated (or
+                            // the unit coefficients it verified when the
+                            // extraction produced none); the strict checker
+                            // re-decides either way (fail-closed).
+                            TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas => {
+                                let farkas_cert = farkas
+                                    .unwrap_or_else(|| FarkasAnnotation::from_ints(&[1i64, 1]));
+                                proof_ctx.tracker.add_theory_lemma_with_farkas_and_kind(
+                                    clause,
+                                    farkas_cert,
+                                    kind,
+                                );
+                            }
+                            TheoryLemmaKind::Generic => {
+                                proof_ctx
+                                    .tracker
+                                    .add_theory_lemma_with_kind(clause, TheoryLemmaKind::Generic);
+                            }
+                            _ => {
+                                proof_ctx.tracker.add_theory_lemma_with_kind(clause, kind);
+                            }
+                        }
                     }
                 }
             }
@@ -671,39 +702,21 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                     inline_lemma_clauses.extend(sat_clauses);
                     // Record proof entries for inline lemmas (#6725).
                     // #8106: Infer specific kind instead of Generic/trust.
+                    // #trust->0 C1.iii: the shared helper adds the
+                    // polarity-before-routing contract this site lacked (the
+                    // `.unwrap_or(lit.term)` fallback used to feed the funnel
+                    // wrong-polarity clauses on a negation-cache miss), and
+                    // covers the terms-None arm once `TermStore` is plumbed
+                    // (site 17: the cached-extension constructor now forwards
+                    // it).
                     if let Some(ref mut proof_ctx) = self.proof {
                         for lemma in &lemmas {
-                            let terms: Vec<TermId> = lemma
-                                .clause
-                                .iter()
-                                .map(|lit| {
-                                    if lit.value {
-                                        lit.term
-                                    } else {
-                                        proof_ctx
-                                            .negations
-                                            .get(&lit.term)
-                                            .copied()
-                                            .unwrap_or(lit.term)
-                                    }
-                                })
-                                .collect();
-                            if let Some(term_store) = self.terms {
-                                let kind = crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
-                                    term_store,
-                                    &terms,
-                                );
-                                match kind {
-                                    TheoryLemmaKind::Generic => {
-                                        proof_ctx.tracker.add_theory_lemma(terms);
-                                    }
-                                    _ => {
-                                        proof_ctx.tracker.add_theory_lemma_with_kind(terms, kind);
-                                    }
-                                }
-                            } else {
-                                proof_ctx.tracker.add_theory_lemma(terms);
-                            }
+                            let _ = crate::theory_inference::record_materialized_lemma_clause(
+                                proof_ctx.tracker,
+                                self.terms,
+                                proof_ctx.negations,
+                                &lemma.clause,
+                            );
                         }
                     }
                 } else {

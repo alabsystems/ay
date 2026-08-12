@@ -33,13 +33,56 @@ impl Solver {
             if self.cold.next_clause_id <= candidate {
                 self.cold.next_clause_id = candidate + 1;
             }
+            self.record_issued_original_clause_id(candidate);
             candidate
         } else {
             let id = self.cold.next_clause_id.max(candidate);
             self.cold.next_clause_id = id + 1;
             self.cold.next_original_clause_id = id + 1;
+            self.record_issued_original_clause_id(id);
             id
         }
+    }
+
+    /// Record that `id` was issued to an original (non-derived) clause.
+    ///
+    /// Maintains `issued_original_clause_id_max` and the per-ID original
+    /// marker. Called only at true original mint sites: both branches of
+    /// [`Self::allocate_original_clause_id`] (every original clause add
+    /// routes through it) and the debug-only scope-selector axiom
+    /// registration in `incremental.rs`, which occupies an original-space
+    /// LRAT ID. Derived mints must never call this — the whole point is
+    /// that the derived IDs the late-original allocator jumps over stay
+    /// unmarked, so streaming-core classification can tell them apart.
+    pub(super) fn record_issued_original_clause_id(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        if self.cold.issued_original_clause_id_max < id {
+            self.cold.issued_original_clause_id_max = id;
+        }
+        let idx = (id - 1) as usize;
+        if self.cold.original_clause_id_bits.len() <= idx {
+            self.cold.original_clause_id_bits.resize(idx + 1, false);
+        }
+        self.cold.original_clause_id_bits[idx] = true;
+    }
+
+    /// Whether `id` was issued to an original (non-derived) clause.
+    ///
+    /// Range membership (`id <= num_originals`) is NOT sufficient: since
+    /// b93692341 the late-original allocator jumps past live derived IDs,
+    /// so derived IDs can sit between original IDs. Streaming-core
+    /// classification must use this per-ID bit on top of the range bound.
+    #[inline]
+    pub(super) fn is_original_clause_id(&self, id: u64) -> bool {
+        id != 0
+            && self
+                .cold
+                .original_clause_id_bits
+                .get((id - 1) as usize)
+                .copied()
+                .unwrap_or(false)
     }
 
     #[inline]

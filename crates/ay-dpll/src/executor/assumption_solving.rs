@@ -8,9 +8,6 @@
 //! helper macro. These implement the generic check-sat-assuming engine that takes
 //! (assertions, assumptions, theory_kind) and returns SolveResult with optional
 //! UNSAT core extraction.
-//!
-//! Extracted from `executor.rs` as part of the executor.rs decomposition
-//! design (the development design notes, Split 3).
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -213,7 +210,9 @@ impl Executor {
         // whose Bool argument is a compound term, yielding false-SAT on QF_UF /
         // QF_UFLIA (B-method CLEARSY) benchmarks. Equisatisfiable; a no-op when
         // there are no such arguments.
-        crate::executor::purify_bool_args::purify_bool_args(
+        // #boolarg-orphan: see the field doc — the rewritten applications must
+        // stay resolvable to the twin the solve actually pinned.
+        self.bool_arg_orphan_index = crate::executor::purify_bool_args::purify_bool_args(
             &mut self.ctx.terms,
             &mut preprocessed_assertions,
         );

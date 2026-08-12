@@ -33,6 +33,8 @@ mod egraph;
 mod explain;
 mod merge;
 mod model_extraction;
+mod sat_atom_filter;
+mod shared_equality;
 mod solver;
 mod solver_query;
 mod theory_check;

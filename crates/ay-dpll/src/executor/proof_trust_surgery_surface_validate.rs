@@ -174,7 +174,16 @@ impl ProvenanceSurfaceAudit {
             if self.protected.contains(&term) {
                 match effective.get(&term) {
                     Some(actual) if actual != expected => return false,
-                    None if !self.compatibility_requirements.contains(&term) => return false,
+                    None if !self.compatibility_requirements.contains(&term) => {
+                        // A required spelling that IS the canonical rendering
+                        // is satisfied by the absence of any override: the
+                        // renderer prints exactly the required bytes on its
+                        // own. (The caller prunes such inert identity
+                        // overrides before the static-rendering scans.)
+                        if ay_proof::format_term_alethe(terms, term) != *expected {
+                            return false;
+                        }
+                    }
                     _ => {}
                 }
             }

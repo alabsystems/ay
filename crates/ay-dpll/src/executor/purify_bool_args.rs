@@ -129,16 +129,30 @@ fn collect(
 
 /// Purify compound Boolean arguments to uninterpreted functions in `assertions`.
 ///
-/// Returns `true` if any purification occurred. Appends `(= proxy original)`
-/// definitions to `assertions`. Equisatisfiable.
-pub(crate) fn purify_bool_args(terms: &mut TermStore, assertions: &mut Vec<TermId>) -> bool {
+/// Appends `(= proxy original)` definitions to `assertions`. Equisatisfiable.
+///
+/// RETURNS the ORPHAN INDEX: `original UF application -> rewritten counterpart`
+/// for every uninterpreted-function application this pass rewrote. The solver
+/// only ever sees the rewritten term, so it is the only one a model pins; the
+/// ORIGINAL is what every post-solve consumer (`get-value`, in-loop validation,
+/// and the independent model gate, all of which run against the RESTORED
+/// original assertions) asks about. Without the index those consumers find no
+/// committed value for an application the solve decided, and a genuine `sat`
+/// fails closed to `unknown` (#boolarg-orphan).
+///
+/// Empty when nothing was purified — callers overwrite their stored index
+/// unconditionally so a previous check-sat's proxies can never be read back.
+pub(crate) fn purify_bool_args(
+    terms: &mut TermStore,
+    assertions: &mut Vec<TermId>,
+) -> DetHashMap<TermId, TermId> {
     let mut seen = DetHashSet::default();
     let mut targets = DetHashSet::default();
     for &root in assertions.iter() {
         collect(terms, root, &mut seen, &mut targets);
     }
     if targets.is_empty() {
-        return false;
+        return DetHashMap::default();
     }
 
     // Deterministic order for fresh-var allocation.
@@ -154,11 +168,30 @@ pub(crate) fn purify_bool_args(terms: &mut TermStore, assertions: &mut Vec<TermI
         defs.push(terms.mk_eq(p, b));
     }
 
+    // One shared rewrite cache across every assertion: it accumulates
+    // `original -> rewritten` for each sub-term the walk RECONSTRUCTED, which
+    // is exactly the set of terms the solve orphaned.
+    let mut rewritten: DetHashMap<TermId, TermId> = DetHashMap::default();
     for root in assertions.iter_mut() {
-        *root = terms.substitute_terms(*root, &map);
+        *root = terms.substitute_terms_recording(*root, &map, &mut rewritten);
     }
     assertions.extend(defs);
-    true
+
+    // Keep only genuine UF APPLICATIONS that actually changed. Unchanged
+    // entries (`t -> t`) carry no information, and a rewritten BUILT-IN
+    // connective must NEVER be indexed: the independent model gate computes
+    // `and`/`or`/`not`/`=` from its own leaf reads, and letting it adopt the
+    // solver's value for a rewritten connective instead would replace an
+    // independent computation with the solver's claim — the one thing the gate
+    // exists to avoid.
+    rewritten.retain(|orig, twin| {
+        orig != twin
+            && matches!(
+                terms.get(*orig),
+                TermData::App(Symbol::Named(n), args) if !is_builtin(n) && !args.is_empty()
+            )
+    });
+    rewritten
 }
 
 #[cfg(test)]

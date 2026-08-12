@@ -5,6 +5,8 @@
 use super::*;
 use ay_core::{string_literal, AletheRule, Sort};
 
+#[path = "alethe_printer_bare_step_rule_tests.rs"]
+mod alethe_printer_bare_step_rule_tests;
 #[path = "alethe_printer_resolution_args_tests.rs"]
 mod alethe_printer_resolution_args_tests;
 #[path = "alethe_printer_surface_and_pos_tests.rs"]
@@ -184,6 +186,303 @@ fn test_theory_lemma_with_kind() {
         output.contains(":rule eq_transitive"),
         "Expected eq_transitive rule, got: {output}"
     );
+}
+
+#[test]
+fn bv_bitblast_bvand_commutativity_exports_exact_aci_simp() {
+    use ay_core::{Symbol, TheoryLemmaKind};
+
+    for width in [32, 64] {
+        let mut terms = TermStore::new();
+        let sort = Sort::bitvec(width);
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort.clone());
+        let and_ab = terms.mk_app(Symbol::named("bvand"), [a, b], sort.clone());
+        let and_ba = terms.mk_app(Symbol::named("bvand"), [b, a], sort);
+        let equality = terms.mk_app(Symbol::named("="), [and_ab, and_ba], Sort::Bool);
+        assert!(
+            recognize_bv_bitblast(&terms, &[equality]),
+            "{width}-bit bvand commutativity must have a checked LRAT refutation"
+        );
+
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule aci_simp"), "{output}");
+        assert!(!output.contains(":rule hole"), "{output}");
+    }
+}
+
+#[test]
+fn bv_bitblast_aci_simp_export_fails_closed_on_near_misses_and_surface_drift() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{Symbol, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let bv32 = Sort::bitvec(32);
+    let a = terms.mk_var("a", bv32.clone());
+    let b = terms.mk_var("b", bv32.clone());
+    let c = terms.mk_var("c", bv32.clone());
+    let and_ab = terms.mk_app(Symbol::named("bvand"), [a, b], bv32.clone());
+    let and_ba = terms.mk_app(Symbol::named("bvand"), [b, a], bv32.clone());
+
+    let cases = [
+        // Swapping a non-commutative operator cannot be printed as ACI.
+        (
+            terms.mk_app(Symbol::named("bvsub"), [a, b], bv32.clone()),
+            terms.mk_app(Symbol::named("bvsub"), [b, a], bv32.clone()),
+        ),
+        // A near-swap with one unrelated operand is also outside the lane.
+        (
+            and_ab,
+            terms.mk_app(Symbol::named("bvand"), [b, c], bv32.clone()),
+        ),
+    ];
+    for (left, right) in cases {
+        let equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule hole"), "{output}");
+        assert!(!output.contains(":rule aci_simp"), "{output}");
+    }
+
+    // The lowering is also gated on the exact bytes the external checker sees.
+    // A surface override that breaks the swap must retain the honest hole.
+    let equality = terms.mk_app(Symbol::named("="), [and_ab, and_ba], Sort::Bool);
+    let step = ProofStep::TheoryLemma {
+        theory: "bv".to_string(),
+        clause: vec![equality],
+        farkas: None,
+        kind: TheoryLemmaKind::BvBitBlast,
+        lia: None,
+    };
+    let mut overrides = DetHashMap::default();
+    overrides.insert(and_ab, "(bvand a c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+    let output = printer.format_step(&step, ProofId(0)).unwrap();
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule aci_simp"), "{output}");
+}
+
+/// The endpoint lane (`executor/proof/authored_linear.rs`) closes two
+/// authored equalities that pin one opaque term to two different bit-vector
+/// CONSTANTS with the unit lemma `(cl (not (= c d)))`. Carcara has no rule for
+/// AY's monolithic bit-blasting, but `(= c d)` is a GROUND term its own
+/// `evaluate` reduces to `false`, so the lemma exports as a checked
+/// `evaluate` + `equiv_pos2` + `false` derivation instead of a hole.
+#[test]
+fn bv_bitblast_constant_disequality_exports_checked_evaluate() {
+    use ay_core::{Symbol, TheoryLemmaKind};
+    use num_bigint::BigInt;
+
+    for width in [1_u32, 8, 32] {
+        let mut terms = TermStore::new();
+        // Width 1 has to work too, so the two values are 1 and 0.
+        let one = terms.mk_bitvec(BigInt::from(1), width);
+        let zero = terms.mk_bitvec(BigInt::from(0), width);
+        let equality = terms.mk_app(Symbol::named("="), [one, zero], Sort::Bool);
+        let disequality = terms.mk_not_raw(equality);
+        assert!(
+            recognize_bv_bitblast(&terms, &[disequality]),
+            "{width}-bit constant mismatch must be re-derived by AY's own checker"
+        );
+
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![disequality], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule evaluate"), "{output}");
+        assert!(output.contains(":rule equiv_pos2"), "{output}");
+        assert!(output.contains(":rule false"), "{output}");
+        assert!(!output.contains(":rule hole"), "{output}");
+        assert!(!output.contains(":rule bv_bitblast"), "{output}");
+    }
+}
+
+/// `promote_bv_identity_collapse` reconstructs an authored bit-vector identity
+/// as a `BvBitBlast` unit lemma. For the bit-wise idempotency shapes that
+/// lemma is EXACTLY reconstructible from Carcara's per-operator bit-blasting
+/// suite, so it exports as `bitblast_and`/`bitblast_or` + `bitblast_var` +
+/// per-bit `and_simplify`/`or_simplify` + `cong`/`trans`/`symm`.
+#[test]
+fn bv_bitblast_idempotent_gate_exports_per_operator_bitblast() {
+    use ay_core::{Symbol, TheoryLemmaKind};
+
+    for (operator, simplify) in [("bvand", "and_simplify"), ("bvor", "or_simplify")] {
+        for width in [1_u32, 4, 8] {
+            for reversed in [false, true] {
+                let mut terms = TermStore::new();
+                let sort = Sort::bitvec(width);
+                let a = terms.mk_var("a", sort.clone());
+                let gate = terms.mk_app(Symbol::named(operator), [a, a], sort);
+                let (left, right) = if reversed { (a, gate) } else { (gate, a) };
+                let equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+                assert!(
+                    recognize_bv_bitblast(&terms, &[equality]),
+                    "{width}-bit {operator} idempotency must be re-derived by AY's own checker"
+                );
+
+                let mut proof = Proof::new();
+                proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+                let output = export_alethe(&proof, &terms);
+                let blast_rule = format!(":rule bitblast_{}", &operator[2..]);
+                assert!(output.contains(&blast_rule), "{output}");
+                assert!(output.contains(":rule bitblast_var"), "{output}");
+                assert!(output.contains(&format!(":rule {simplify}")), "{output}");
+                assert!(output.contains(":rule cong"), "{output}");
+                assert!(!output.contains(":rule hole"), "{output}");
+                // Exactly one per-bit discharge per bit, and no extra steps:
+                // a lowering that quietly skipped a bit would still contain
+                // every rule name asserted above.
+                assert_eq!(
+                    output.matches(":rule ").count(),
+                    // bb + var + one simplify per bit + cong + lhs + rhs (+ symm)
+                    6 + width as usize + usize::from(reversed),
+                    "{output}"
+                );
+            }
+        }
+    }
+}
+
+/// The NESTED per-operator case: `(bvnot (bvnot t)) = t` needs `bitblast_not`
+/// twice with a `cong` bridge, because a `bitblast_*` rule relates exactly ONE
+/// word-level operator to a `@bbterm`.
+#[test]
+fn bv_bitblast_double_negation_exports_nested_per_operator_bitblast() {
+    use ay_core::{Symbol, TheoryLemmaKind};
+
+    for width in [1_u32, 2, 8] {
+        for reversed in [false, true] {
+            let mut terms = TermStore::new();
+            let sort = Sort::bitvec(width);
+            let a = terms.mk_var("a", sort.clone());
+            let once = terms.mk_app(Symbol::named("bvnot"), [a], sort.clone());
+            let twice = terms.mk_app(Symbol::named("bvnot"), [once], sort);
+            let (left, right) = if reversed { (a, twice) } else { (twice, a) };
+            let equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+            assert!(
+                recognize_bv_bitblast(&terms, &[equality]),
+                "{width}-bit double negation must be re-derived by AY's own checker"
+            );
+
+            let mut proof = Proof::new();
+            proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+            let output = export_alethe(&proof, &terms);
+            assert_eq!(output.matches(":rule bitblast_not").count(), 2, "{output}");
+            assert!(output.contains(":rule bitblast_var"), "{output}");
+            assert!(output.contains(":rule not_simplify"), "{output}");
+            assert!(!output.contains(":rule hole"), "{output}");
+            assert_eq!(
+                output.matches(":rule ").count(),
+                // in + lift + out + one not_simplify per bit + cong + var + rhs
+                // + trans (+ symm)
+                7 + width as usize + usize::from(reversed),
+                "{output}"
+            );
+        }
+    }
+}
+
+/// Both bit-vector lowerings must decline — keeping the honest `hole` — on
+/// every clause AY may carry under the same coarse kind that is NOT an
+/// instance of the Carcara rules they emit.
+#[test]
+fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{Symbol, TheoryLemmaKind};
+    use num_bigint::BigInt;
+
+    let mut terms = TermStore::new();
+    let bv8 = Sort::bitvec(8);
+    let a = terms.mk_var("a", bv8.clone());
+    let b = terms.mk_var("b", bv8.clone());
+    let one = terms.mk_bitvec(BigInt::from(1), 8);
+    let five = terms.mk_bitvec(BigInt::from(5), 8);
+    let and_aa = terms.mk_app(Symbol::named("bvand"), [a, a], bv8.clone());
+    let or_aa = terms.mk_app(Symbol::named("bvor"), [a, a], bv8.clone());
+    let and_ab = terms.mk_app(Symbol::named("bvand"), [a, b], bv8.clone());
+    let xor_aa = terms.mk_app(Symbol::named("bvxor"), [a, a], bv8.clone());
+    let not_a = terms.mk_app(Symbol::named("bvnot"), [a], bv8.clone());
+    let not_not_a = terms.mk_app(Symbol::named("bvnot"), [not_a], bv8.clone());
+    let neg_a = terms.mk_app(Symbol::named("bvneg"), [a], bv8.clone());
+    let not_neg_a = terms.mk_app(Symbol::named("bvnot"), [neg_a], bv8.clone());
+    let zero = terms.mk_bitvec(BigInt::from(0), 8);
+    let add_a_one = terms.mk_app(Symbol::named("bvadd"), [a, one], bv8.clone());
+    // A width the per-bit expansion refuses to unroll.
+    let bv65 = Sort::bitvec(65);
+    let wide = terms.mk_var("wide", bv65.clone());
+    let and_wide = terms.mk_app(Symbol::named("bvand"), [wide, wide], bv65);
+
+    let equal_constants = terms.mk_app(Symbol::named("="), [five, five], Sort::Bool);
+    let non_constant = terms.mk_app(Symbol::named("="), [add_a_one, five], Sort::Bool);
+    let near_misses = [
+        // Two EQUAL constants: `evaluate` would reduce the equality to `true`.
+        terms.mk_not_raw(equal_constants),
+        // One side is not a constant: outside the ground-evaluation lane.
+        terms.mk_not_raw(non_constant),
+        // Distinct operands: not an idempotency.
+        terms.mk_app(Symbol::named("="), [and_ab, a], Sort::Bool),
+        // Right side is not the repeated operand.
+        terms.mk_app(Symbol::named("="), [or_aa, b], Sort::Bool),
+        // `bvxor` self-cancellation needs `(xor p p) = false`, which no
+        // Carcara rule proves in one step.
+        terms.mk_app(Symbol::named("="), [xor_aa, zero], Sort::Bool),
+        // Over the per-bit unrolling cap.
+        terms.mk_app(Symbol::named("="), [and_wide, wide], Sort::Bool),
+        // A SINGLE `bvnot` is not a double negation.
+        terms.mk_app(Symbol::named("="), [not_a, a], Sort::Bool),
+        // A mixed nest: the inner operator is not the one being cancelled.
+        terms.mk_app(Symbol::named("="), [not_neg_a, a], Sort::Bool),
+        // A double negation of the WRONG operand.
+        terms.mk_app(Symbol::named("="), [not_not_a, b], Sort::Bool),
+    ];
+    for literal in near_misses {
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![literal], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule hole"), "{output}");
+        assert!(!output.contains(":rule evaluate"), "{output}");
+        assert!(!output.contains(":rule bitblast_"), "{output}");
+    }
+
+    // A two-literal clause is not a unit lemma in either lane.
+    let idempotency = terms.mk_app(Symbol::named("="), [and_aa, a], Sort::Bool);
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "bv",
+        vec![idempotency, non_constant],
+        TheoryLemmaKind::BvBitBlast,
+    );
+    let output = export_alethe(&proof, &terms);
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule bitblast_"), "{output}");
+
+    // Both lowerings read the BYTES the external checker parses. A surface
+    // override that breaks the printed operand identity, or that re-spells a
+    // constant as something that is not a bit-vector literal, must decline.
+    let five_ne_one = terms.mk_app(Symbol::named("="), [five, one], Sort::Bool);
+    let constant_disequality = terms.mk_not_raw(five_ne_one);
+    let drift: [(TermId, TermId, &str); 2] = [
+        (idempotency, and_aa, "(bvand a b)"),
+        (constant_disequality, five, "a"),
+    ];
+    for (literal, overridden, spelling) in drift {
+        let step = ProofStep::TheoryLemma {
+            theory: "bv".to_string(),
+            clause: vec![literal],
+            farkas: None,
+            kind: TheoryLemmaKind::BvBitBlast,
+            lia: None,
+        };
+        let mut overrides = DetHashMap::default();
+        overrides.insert(overridden, spelling.to_string());
+        let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+        let output = printer.format_step(&step, ProofId(0)).unwrap();
+        assert!(output.contains(":rule hole"), "{output}");
+        assert!(!output.contains(":rule evaluate"), "{output}");
+        assert!(!output.contains(":rule bitblast_"), "{output}");
+    }
 }
 
 #[test]
@@ -2449,6 +2748,75 @@ fn test_nested_binary_and_gate_is_navigated_not_mis_indexed() {
     );
 }
 
+/// (B') A FLAT printed `and` whose authored operand order diverges from AY's
+/// TermId-sorted internal conjunct vector: the wire index misses, but the
+/// extracted conjunct IS a unique printed operand, so the gate is re-slotted
+/// to the printed index — a pure printing-index correction, exact by
+/// construction.
+#[test]
+fn test_flat_reordered_and_gate_is_reslotted_to_the_printed_index() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // Authored operand order: `p` sits at printed index 1, not 0.
+    overrides.insert(and_term, "(and r p q)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::AndPos(0),
+        clause: vec![demorgan, p],
+        premises: vec![],
+        args: vec![and_term],
+    };
+    let printed = printer.format_step(&step, ProofId(1)).unwrap();
+    assert_eq!(
+        printed,
+        "(step t1 (cl (not (and r p q)) p) :rule and_pos :args (1))"
+    );
+}
+
+/// The flat re-slot declines on a DUPLICATED printed spelling — ambiguity
+/// must never pick an index — and the step still fails loud downstream.
+#[test]
+fn test_flat_reslot_declines_on_duplicate_printed_operand() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p".to_string(), Sort::Bool);
+    let q = terms.mk_var("q".to_string(), Sort::Bool);
+    let r = terms.mk_var("r".to_string(), Sort::Bool);
+    let and_term = terms.mk_and(vec![p, q, r]);
+    let demorgan = terms.mk_not(and_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // `p` occurs twice in the printed spelling: no unique printed index.
+    overrides.insert(and_term, "(and q p p)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::AndPos(0),
+        clause: vec![demorgan, p],
+        premises: vec![],
+        args: vec![and_term],
+    };
+    let err = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a duplicated printed operand must not be re-slotted");
+    assert!(
+        format!("{err}").contains("and_pos"),
+        "unexpected error: {err}"
+    );
+}
+
 /// D1b: a printed NESTED binary `or` gate over a flattened internal or-term.
 /// carcara compares the gate's top-level arity against the clause tail length,
 /// so the re-nested surface spelling must be decomposed the same way.
@@ -3305,4 +3673,296 @@ fn an_ordinary_same_operator_cong_still_renders() {
         output.contains("(step t1 (cl (= (f x) (f y))) :rule cong :premises (t0))"),
         "{output}"
     );
+}
+
+/// Build the store-permutation clause
+/// `(cl (= i j) (= (store (store a i v) j w) (store (store a j w) i v)))`,
+/// optionally with the index equality spelled the other way round.
+fn store_permutation_clause(terms: &mut TermStore, reversed_index_equality: bool) -> Vec<TermId> {
+    use ay_core::{ArraySort, Symbol};
+
+    let array = terms.mk_var(
+        "a",
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int))),
+    );
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let left_inner = terms.mk_store(array, i, v);
+    let left = terms.mk_store(left_inner, j, w);
+    let right_inner = terms.mk_store(array, j, w);
+    let right = terms.mk_store(right_inner, i, v);
+    let index_equality = if reversed_index_equality {
+        terms.mk_app(Symbol::named("="), [j, i], Sort::Bool)
+    } else {
+        terms.mk_app(Symbol::named("="), [i, j], Sort::Bool)
+    };
+    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+    vec![index_equality, array_equality]
+}
+
+fn export_store_permutation(clause: Vec<TermId>, terms: &TermStore) -> String {
+    use ay_core::TheoryLemmaKind;
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("array", clause, TheoryLemmaKind::ArrayStorePermutation);
+    try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("a store-permutation lemma always renders (derived, or as an honest hole)")
+}
+
+/// Carcara has no `store_permutation` rule, so the lemma is DERIVED from its
+/// `arrays_ext` / `arrays_row` / `arrays_idx` / `cong` / `trans` primitives.
+#[test]
+fn test_array_store_permutation_lowers_to_checked_array_rules() {
+    let mut terms = TermStore::new();
+    let clause = store_permutation_clause(&mut terms, false);
+    let output = export_store_permutation(clause, &terms);
+
+    // The unproved placeholder and the unknown internal name are both gone.
+    assert!(!output.contains(":rule hole"), "{output}");
+    assert!(!output.contains("store_permutation"), "{output}");
+    for rule in [
+        ":rule arrays_ext",
+        ":rule arrays_row",
+        ":rule arrays_idx",
+        ":rule cong",
+        ":rule subproof",
+    ] {
+        assert!(output.contains(rule), "missing {rule} in {output}");
+    }
+    // The derivation must conclude EXACTLY the clause AY certified.
+    assert!(
+        output.contains(
+            "(step t0 (cl (= i j) \
+             (= (store (store a i v) j w) (store (store a j w) i v))) :rule resolution"
+        ),
+        "{output}"
+    );
+}
+
+/// The index disequality is the whole side condition, and the derivation has to
+/// discharge it in whichever orientation the clause spells.
+#[test]
+fn test_array_store_permutation_accepts_the_reversed_index_equality() {
+    use ay_core::TheoryLemmaKind;
+
+    let mut terms = TermStore::new();
+    let clause = store_permutation_clause(&mut terms, true);
+    // The classifier assigns the same kind either way round, so the printer is
+    // the only thing that could have been orientation-sensitive.
+    assert_eq!(
+        recognize_array_theory_lemma(&terms, &clause),
+        Some(TheoryLemmaKind::ArrayStorePermutation)
+    );
+    let output = export_store_permutation(clause, &terms);
+
+    assert!(!output.contains(":rule hole"), "{output}");
+    assert!(output.contains(":rule arrays_ext"), "{output}");
+    assert!(
+        output.contains(
+            "(step t0 (cl (= j i) \
+             (= (store (store a i v) j w) (store (store a j w) i v))) :rule resolution"
+        ),
+        "{output}"
+    );
+}
+
+/// NEGATIVE: without the index disequality the clause is simply FALSE — at
+/// `i = j` the two chains are `store(a, i, w)` and `store(a, i, v)`. The printer
+/// must keep the honest `hole` rather than derive it.
+#[test]
+fn test_array_store_permutation_without_the_index_guard_stays_a_hole() {
+    use ay_core::{ArraySort, Symbol};
+
+    let mut terms = TermStore::new();
+    let array = terms.mk_var(
+        "a",
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int))),
+    );
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let left_inner = terms.mk_store(array, i, v);
+    let left = terms.mk_store(left_inner, j, w);
+    let right_inner = terms.mk_store(array, j, w);
+    let right = terms.mk_store(right_inner, i, v);
+    let unrelated = terms.mk_var("p", Sort::Bool);
+    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "array",
+        vec![unrelated, array_equality],
+        TheoryLemmaKind::ArrayStorePermutation,
+    );
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("an unguarded permutation clause still renders");
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule arrays_ext"), "{output}");
+}
+
+/// NEGATIVE: a REPEATED index term writes the same `(index, value)` multiset but
+/// denotes a different array — `store(store(a, i, v), i, w)` is `store(a, i, w)`
+/// while `store(store(a, i, w), i, v)` is `store(a, i, v)`. The derivation must
+/// not be emitted for it.
+#[test]
+fn test_array_store_permutation_with_a_repeated_index_stays_a_hole() {
+    use ay_core::{ArraySort, Symbol};
+
+    let mut terms = TermStore::new();
+    let array = terms.mk_var(
+        "a",
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int))),
+    );
+    let i = terms.mk_var("i", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let left_inner = terms.mk_store(array, i, v);
+    let left = terms.mk_store(left_inner, i, w);
+    let right_inner = terms.mk_store(array, i, w);
+    let right = terms.mk_store(right_inner, i, v);
+    let index_equality = terms.mk_app(Symbol::named("="), [i, i], Sort::Bool);
+    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "array",
+        vec![index_equality, array_equality],
+        TheoryLemmaKind::ArrayStorePermutation,
+    );
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("a repeated-index clause still renders");
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule arrays_ext"), "{output}");
+}
+
+/// NEGATIVE: two chains over DIFFERENT base arrays are unrelated, whatever they
+/// write on top.
+#[test]
+fn test_array_store_permutation_over_two_bases_stays_a_hole() {
+    use ay_core::{ArraySort, Symbol, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+    let a = terms.mk_var("a", sort.clone());
+    let b = terms.mk_var("b", sort);
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let left_inner = terms.mk_store(a, i, v);
+    let left = terms.mk_store(left_inner, j, w);
+    let right_inner = terms.mk_store(b, j, w);
+    let right = terms.mk_store(right_inner, i, v);
+    let index_equality = terms.mk_app(Symbol::named("="), [i, j], Sort::Bool);
+    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "array",
+        vec![index_equality, array_equality],
+        TheoryLemmaKind::ArrayStorePermutation,
+    );
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("a two-base clause still renders");
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule arrays_ext"), "{output}");
+}
+
+/// REGRESSION: the transposition derivation inlines the printed chains into
+/// the scope of the `arrays_ext` witness's `choice` binder, which is
+/// literally `x`. A chain that mentions a user symbol named `x` would have it
+/// CAPTURED by that binder — the exported document would claim a different
+/// term than the one the checker constructs, and come back carcara-`invalid`
+/// where the honest hole is `holey`. The lowering must decline, exactly as
+/// the `arrays_ext` witness installation lane declines, and keep the hole.
+#[test]
+fn test_array_store_permutation_mentioning_the_witness_binder_stays_a_hole() {
+    use ay_core::{ArraySort, Symbol};
+
+    // Once with the colliding symbol as a stored VALUE, once as the BASE.
+    for base_is_x in [false, true] {
+        let mut terms = TermStore::new();
+        let sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+        let array = terms.mk_var(if base_is_x { "x" } else { "a" }, sort);
+        let i = terms.mk_var("i", Sort::Int);
+        let j = terms.mk_var("j", Sort::Int);
+        let v = terms.mk_var(if base_is_x { "v" } else { "x" }, Sort::Int);
+        let w = terms.mk_var("w", Sort::Int);
+        let left_inner = terms.mk_store(array, i, v);
+        let left = terms.mk_store(left_inner, j, w);
+        let right_inner = terms.mk_store(array, j, w);
+        let right = terms.mk_store(right_inner, i, v);
+        let index_equality = terms.mk_app(Symbol::named("="), [i, j], Sort::Bool);
+        let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+
+        let output = export_store_permutation(vec![index_equality, array_equality], &terms);
+        assert!(
+            output.contains(":rule hole"),
+            "base_is_x={base_is_x}: {output}"
+        );
+        assert!(
+            !output.contains(":rule arrays_ext"),
+            "base_is_x={base_is_x}: {output}"
+        );
+        // No witness may be built over the colliding chain at all: any
+        // `(choice ((x ...)` here would capture the clause's own `x`.
+        assert!(
+            !output.contains("(choice ((x "),
+            "base_is_x={base_is_x}: {output}"
+        );
+    }
+}
+
+/// REGRESSION: the collision can also arrive as an application HEAD — a
+/// user FUNCTION named `x` applied to arguments. The printed `(x 0)` is a
+/// parse error inside `(choice ((x S)) …)`, so an unguarded lowering would
+/// regress the document from `holey` to `invalid`. Measured on carcara
+/// 1.1.0: `(x 0)` parses at the top level but not under the binder.
+#[test]
+fn test_array_store_permutation_with_a_function_named_x_stays_a_hole() {
+    use ay_core::{ArraySort, Symbol};
+
+    let mut terms = TermStore::new();
+    let sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+    let array = terms.mk_var("a", sort);
+    let zero = terms.mk_int(0.into());
+    // Index i = (x 0): an application whose HEAD wears the binder's name.
+    let i = terms.mk_app(Symbol::named("x"), [zero], Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let left_inner = terms.mk_store(array, i, v);
+    let left = terms.mk_store(left_inner, j, w);
+    let right_inner = terms.mk_store(array, j, w);
+    let right = terms.mk_store(right_inner, i, v);
+    let index_equality = terms.mk_app(Symbol::named("="), [i, j], Sort::Bool);
+    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+
+    let output = export_store_permutation(vec![index_equality, array_equality], &terms);
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule arrays_ext"), "{output}");
+    assert!(!output.contains("(choice ((x "), "{output}");
 }

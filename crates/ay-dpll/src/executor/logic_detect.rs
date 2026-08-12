@@ -245,6 +245,55 @@ impl Executor {
                 .align_linear_arithmetic_sorts(&assertion_features);
         }
 
+        // SOUNDNESS (#abv-uninterpreted-array-false-model): a BV-family category
+        // dispatches to the eager bit-blasting lane, whose array axiom generator
+        // (`executor::theories::bv_axioms_array`) models `select`/`store` ONLY
+        // for arrays whose index AND element sorts are bit-vectors — every
+        // ROW/extensionality site there bails out on `let Sort::BitVec(..) = ..
+        // else`. An array over an UNINTERPRETED sort therefore reaches the SAT
+        // solver with ZERO array axioms (`array-axioms.after-row=0` in the phase
+        // trace): `select`/`store` are unconstrained atoms, read-over-write is
+        // never enforced, and the search returns a model that FALSIFIES an
+        // authored assertion. Measured on
+        //
+        //   (set-logic QF_ABV) (declare-sort Index 0) (declare-sort Element 0)
+        //   ... arrays over Index/Element ...
+        //
+        // which is UNSAT and which the array+EUF lane decides correctly, but
+        // which the BV lane answered SAT with an invalid model — caught only by
+        // the independent model gate, i.e. fail-closed by luck of the gate
+        // rather than by routing.
+        //
+        // The declared logic is an upper bound, not a licence to drop a theory
+        // (the pure-arithmetic narrowing directly above encodes the same rule).
+        // When the live assertion window carries NO bit-vector terms at all
+        // there is nothing for the BV lane to do, so re-derive the category from
+        // content and let the array+EUF lane — which handles uninterpreted index
+        // and element sorts — decide it.
+        //
+        // Deliberately NOT widened to windows that DO contain bit-vectors: a
+        // mixed array (BV index, uninterpreted element) has the same axiom gap,
+        // but re-routing it would hand genuine BV terms to a lane that does not
+        // bit-blast. That case still fails closed at the model gate and is
+        // recorded as open rather than papered over here.
+        if !assertions.is_empty()
+            && !assertion_has_datatypes
+            && assertion_features.has_arrays
+            && !assertion_features.has_bv
+            && matches!(
+                category,
+                LogicCategory::QfBv
+                    | LogicCategory::QfAbv
+                    | LogicCategory::QfUfbv
+                    | LogicCategory::QfAufbv
+            )
+        {
+            category = LogicCategory::from_logic(assertion_features.infer_logic())
+                .align_linear_arithmetic_sorts(&assertion_features)
+                .widen_with_uf(&features)
+                .with_nonlinear(&features);
+        }
+
         if !features.has_int
             && !features.has_real
             && !features.has_bv

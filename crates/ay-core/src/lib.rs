@@ -73,9 +73,9 @@ pub use memory_pressure::{
     UnknownReason,
 };
 pub use proof::{
-    is_checkable_alethe_rule, wire_rule_name, AletheRule, BvGateType, CuttingPlaneAnnotation,
-    FarkasAnnotation, FpOp, LiaAnnotation, Proof, ProofId, ProofStep, TheoryLemmaKind,
-    TheoryLemmaProof, CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
+    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
+    BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, Proof, ProofId,
+    ProofStep, TheoryLemmaKind, TheoryLemmaProof, CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 pub use smtlib::{
     escape_string_contents, quote_symbol, string_literal, unescape_string_contents,

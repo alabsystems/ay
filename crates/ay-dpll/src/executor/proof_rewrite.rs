@@ -4,10 +4,7 @@
 
 //! Proof term rewriting for surface-syntax preservation.
 //!
-//! AY internally canonicalizes some operators (e.g. `>=` → `<=` with swapped
-//! operands) for hash-consing efficiency. Proof checkers like Carcara match
-//! `assume` steps against the original problem file's assertions, so we must
-//! rewrite canonical terms back to their surface syntax before export.
+//! Canonical operators need authenticated source syntax for external assumes.
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -19,7 +16,6 @@ use super::proof_surface_syntax::{
     surface_override_map_is_bounded,
 };
 use super::Executor;
-
 impl Executor {
     /// Whether an internally valid arithmetic `evaluate` step is outside the
     /// portable Alethe evaluator implemented by Carcara.
@@ -371,10 +367,14 @@ impl Executor {
         let override_pairs: Vec<(TermId, ay_frontend::command::Term)> = pair_specs
             .drain(..)
             .filter_map(|(canonical, index)| {
-                parsed_assertions
-                    .get(index)
-                    .cloned()
-                    .map(|parsed| (canonical, parsed))
+                let parsed = parsed_assertions.get(index)?;
+                // The native API marker aligns counts; it is not surface text.
+                (!matches!(
+                    strip_frontend_annotations(parsed),
+                    ay_frontend::command::Term::Symbol(name)
+                        if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
+                ))
+                .then(|| (canonical, parsed.clone()))
             })
             .collect();
         for (canonical, parsed) in &override_pairs {

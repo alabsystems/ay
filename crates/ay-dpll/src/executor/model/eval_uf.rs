@@ -864,6 +864,39 @@ impl Executor {
         if context_dependent {
             return EvalValue::Unknown;
         }
+        // #boolarg-orphan: this application may be one the Boolean-argument
+        // purification pass REWROTE. `f((or p q))` was substituted to
+        // `f(boolarg_k)` before the solve and the ORIGINAL assertions were
+        // restored after it, so the term reaching us here appears in no
+        // assertion the solver ever registered: no SAT literal, no EUF class, no
+        // function-table row keyed by it (the table row keys the argument by the
+        // TWIN's committed element, while this application's argument key
+        // degrades to the opaque `@?id` of an orphaned term, so no row can ever
+        // match). Every source below is keyed by this TermId and therefore
+        // misses, and the fail-closed model gate reports "model commits no value
+        // for this application of `f`" on a genuinely satisfiable input.
+        //
+        // Resolve through the twin. This PUBLISHES what the solve already
+        // decided — the value is READ from the term the solver reasoned about,
+        // never invented. The proxy is defined by a TOP-LEVEL asserted equality
+        // `(= boolarg_k (or p q))` that the model satisfies, so the twin denotes
+        // the same function point.
+        //
+        // Cannot manufacture a wrong `sat`. The independent gate does not adopt
+        // this as a verdict: it re-keys every UF application by its OWN
+        // independently evaluated ARGUMENT VALUES and enforces single-valuedness
+        // in `uf_graph`, so a value that disagrees with another read at the same
+        // argument point is SURFACED as a violated assertion, not honoured. And
+        // an absent/unevaluable twin leaves the application exactly as unpinned
+        // as it is today.
+        if let Some(&twin) = self.bool_arg_orphan_index.get(&term_id) {
+            if twin != term_id {
+                let v = self.evaluate_term(model, twin);
+                if !matches!(v, EvalValue::Unknown) {
+                    return v;
+                }
+            }
+        }
         // Bool SAT-literal fallback is sound only for true UF predicates.
         // For known theory predicates (e.g., str.contains, str.in_re),
         // taking the SAT literal would bypass semantic validation.

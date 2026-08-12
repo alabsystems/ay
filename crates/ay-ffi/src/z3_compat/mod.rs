@@ -3859,15 +3859,23 @@ pub(crate) fn cache_dt_func_decl_with_symbol(
 /// honest, fail-closed divergence (an error is always sound; the silent
 /// wrong verdict is not). Returns the detailed error message to install, or
 /// `None` when the name is safe.
+///
+/// SINGLE SOURCE OF TRUTH: the namespace shapes are NOT re-spelled here. They
+/// are read from `ay_frontend::INTERNAL_NAMESPACES`, the same table the core
+/// elaborator's declaration gates consult
+/// (`Context::is_reserved_symbol_on_this_route`). Until that table existed the
+/// two sets diverged — this function knew about `map[...]` while the core
+/// frontend did not, which left the measured wrong-verdict channel above WIDE
+/// OPEN for any SMT-LIB text that reached the elaborator by any other route.
+/// Delegating makes a future divergence impossible by construction;
+/// `test_ffi_and_core_internal_namespace_gates_agree` fails if this is ever
+/// re-hand-rolled.
 pub(crate) fn reserved_name_error(name: &str) -> Option<String> {
-    let captured_by_array_map = name.starts_with("map[") && name.ends_with(']');
-    let internal_namespace = name.starts_with("!ay.");
-    (captured_by_array_map || internal_namespace).then(|| {
+    ay_frontend::internal_namespace_of(name).map(|namespace| {
         format!(
             "invalid declaration: symbol name '{name}' is reserved by AY \
-             (names of the form 'map[...]' denote the internal array-map \
-             operator and would silently change the formula's meaning; \
-             '!ay.*' names are internal engine witnesses). Rename the symbol."
+             ({}). Rename the symbol.",
+            namespace.rationale
         )
     })
 }

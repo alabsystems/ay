@@ -356,12 +356,10 @@ impl Context {
         command: &Command,
     ) -> Result<()> {
         match command {
-            Command::DeclareSort(_, _) => {
-                if policy.expansion == ExpansionPolicy::ConstantsOnly {
-                    return logic_violation(logic, "free sort declarations are excluded");
-                }
+            Command::DeclareSort(_, _) if policy.expansion == ExpansionPolicy::ConstantsOnly => {
+                return logic_violation(logic, "free sort declarations are excluded");
             }
-            Command::DeclareSortParameter(_) => {}
+            Command::DeclareSort(_, _) | Command::DeclareSortParameter(_) => {}
             Command::DefineSort(_, parameters, sort) => {
                 self.validate_logic_sort(logic, policy, sort, parameters)?;
             }
@@ -711,10 +709,8 @@ impl Context {
                     }
                 }
             }
-            "**" => {
-                if !policy.arithmetic.permits_integer_power() {
-                    return logic_violation(logic, "integer exponentiation is excluded");
-                }
+            "**" if !policy.arithmetic.permits_integer_power() => {
+                return logic_violation(logic, "integer exponentiation is excluded");
             }
             "/" => {
                 if !policy.arithmetic.has_reals() {
@@ -728,17 +724,16 @@ impl Context {
                     return logic_violation(logic, "division by a variable is excluded");
                 }
             }
-            "div" | "mod" | "rem" | "abs" => {
+            "div" | "mod" | "rem" | "abs"
                 if !policy.arithmetic.has_integers()
-                    || !policy.arithmetic.permits_integer_division_family()
-                {
-                    return logic_violation(logic, "integer div/mod/abs terms are excluded");
-                }
+                    || !policy.arithmetic.permits_integer_division_family() =>
+            {
+                return logic_violation(logic, "integer div/mod/abs terms are excluded");
             }
-            "to_real" | "to_int" | "is_int" => {
-                if !policy.arithmetic.has_integers() || !policy.arithmetic.has_reals() {
-                    return logic_violation(logic, "mixed integer/real coercions are excluded");
-                }
+            "to_real" | "to_int" | "is_int"
+                if !policy.arithmetic.has_integers() || !policy.arithmetic.has_reals() =>
+            {
+                return logic_violation(logic, "mixed integer/real coercions are excluded");
             }
             "<" | "<=" | ">" | ">=" | "="
                 if policy.arithmetic.is_difference()

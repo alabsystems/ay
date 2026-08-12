@@ -386,24 +386,18 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         if all_mapped && !sat_clauses.is_empty() {
             self.eager_stats.inline_lemma_clauses += sat_clauses.len() as u64;
             // Record proof entries for inline lemmas.
+            // #trust->0 C1.iii: route through the classifier funnel (with the
+            // polarity-before-routing contract) instead of recording bare
+            // Generic/trust — this site had the same mechanics as its
+            // propagate() sibling but never ran the funnel (site 15).
             if let Some(ref mut proof_ctx) = self.proof {
                 for lemma in &lemmas {
-                    let terms: Vec<ay_core::TermId> = lemma
-                        .clause
-                        .iter()
-                        .map(|lit| {
-                            if lit.value {
-                                lit.term
-                            } else {
-                                proof_ctx
-                                    .negations
-                                    .get(&lit.term)
-                                    .copied()
-                                    .unwrap_or(lit.term)
-                            }
-                        })
-                        .collect();
-                    proof_ctx.tracker.add_theory_lemma(terms);
+                    let _ = crate::theory_inference::record_materialized_lemma_clause(
+                        proof_ctx.tracker,
+                        self.terms,
+                        proof_ctx.negations,
+                        &lemma.clause,
+                    );
                 }
             }
             ExtCheckResult::AddClauses(sat_clauses)

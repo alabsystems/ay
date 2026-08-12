@@ -133,6 +133,31 @@ pub(crate) fn detect_logic(vars: &[ChcVar], expr: &ChcExpr) -> &'static str {
             || expr_sort_has(expr, sort_contains_array);
     }
 
+    // BITVECTORS MIXED WITH INT/REAL MUST NOT TAKE A BV-ONLY FAMILY NAME.
+    //
+    // Every QF_*BV and _DT_*BV label routes the query to an eager bit-blast
+    // pipeline that carries no integer or real theory.  Let the executor's
+    // content-driven `ALL` route select its conservative BV/arithmetic lane;
+    // it keeps independent BV and arithmetic constraints soundly separated
+    // and fails closed when conversion operators couple the theories.
+    //
+    // Datatypes make this combination stricter: the executor has no combined
+    // DT+BV+arithmetic solver.  Use one of its explicitly recognized,
+    // fail-closed combined tokens so dispatch returns `unknown` instead of
+    // selecting either `_DT_AUFBV` (drops arithmetic) or `_DT_AUFLI*` (drops
+    // bit-vector semantics).  The non-DT case can use content-driven `ALL`,
+    // which selects the existing independent/coupled BV-arithmetic lanes.
+    if has_bv && (has_int || has_real) {
+        if has_dt {
+            return if has_real {
+                "QF_AUFBVLIRA"
+            } else {
+                "QF_AUFBVLIA"
+            };
+        }
+        return "ALL";
+    }
+
     if has_dt {
         return match (has_array, has_bv, has_int, has_real) {
             (_, true, _, _) => "_DT_AUFBV",

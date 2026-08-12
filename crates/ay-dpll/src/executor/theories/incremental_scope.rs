@@ -28,6 +28,28 @@ impl Executor {
     ///
     /// If `assertions` is `Some(new_assertions)`, the executor assertion list
     /// is also temporarily replaced for the duration of the closure.
+    ///
+    /// #c2-tracker-isolation: for every non-`Unsat` exit, the proof tracker is
+    /// isolated like the incremental theory/BV state and every proof step the
+    /// closure recorded is rolled back. A failed
+    /// witness/pivot sub-solve used to leave its steps (including reject-stub
+    /// tagged units such as `StringContentAxiom`) in the shared tracker, and
+    /// the generic-unit alias in `ProofTracker::add_assumption` could later
+    /// bind an assumption of the SAME `TermId` to the stale tagged step,
+    /// pulling it into a published proof cone where strict validation
+    /// hard-fails (C2_STRING_AXIOM_PROBE.md residual vector). Rolling the
+    /// ledger back restores the pre-alias behavior — a later
+    /// `add_assumption` mints a fresh `Assume` — which is total and
+    /// decline-only with respect to publishing: the mint-time strict check
+    /// and assumption authentication in `unsat_cert` are untouched. On
+    /// `Unsat` the steps are KEPT verbatim (no behavior change): callers that
+    /// use the inner refutation as their outer publication candidate need that
+    /// proof. This closes the demonstrated stale-alias vector after a failed
+    /// witness/pivot window; it is not a blanket claim that every speculative
+    /// inner-`Unsat` consumer is isolated. Such callers require an explicit
+    /// outcome-aware commit/rollback contract before this helper can roll their
+    /// ledger back. Terms are never rolled back here, so truncated
+    /// proof steps cannot leave dangling `TermId`s in any escaped artifact.
     pub(in crate::executor) fn with_isolated_incremental_state<F>(
         &mut self,
         assertions: Option<Vec<TermId>>,
@@ -46,6 +68,12 @@ impl Executor {
         // activations (wrong probe verdicts). Take it for the duration; the BV
         // lane lazily creates a fresh state on demand.
         let saved_bv_state = self.incr_bv_state.take();
+        // #c2-tracker-isolation: coherent proof-ledger snapshot (steps + dedup
+        // maps + scope snapshots + ledger epoch). Captured unconditionally:
+        // when the tracker is disabled the ledger is empty and the clone is
+        // free, and a closure that self-enables proof production mid-window
+        // is still rolled back on failure.
+        let proof_window = self.proof_tracker.rollback_checkpoint();
         let saved_assertions = assertions
             .map(|new_assertions| std::mem::replace(&mut self.ctx.assertions, new_assertions));
         let result = catch_unwind(AssertUnwindSafe(|| f(self)));
@@ -54,6 +82,19 @@ impl Executor {
         }
         self.incr_theory_state = saved_state;
         self.incr_bv_state = saved_bv_state;
+        // Keep the ledger only when the inner solve refuted: that proof is the
+        // outer publication's candidate (status quo). Every other outcome —
+        // Sat, Unknown, executor error, panic — discards the window's steps.
+        let keep_proof_window = matches!(&result, Ok(Ok(r)) if r.is_unsat());
+        if !keep_proof_window {
+            // A `false` return means a nested `take_proof`/reset moved the
+            // entry ledger during the window; `rollback_to` then clears the
+            // replacement ledger (every step in it is post-checkpoint). The
+            // moved-out proof is an owned value and is not affected. No term
+            // rollback is paired with this checkpoint, so both outcomes need
+            // no further action (contrast dt.rs, which must retain terms).
+            let _ledger_intact = self.proof_tracker.rollback_to(proof_window);
+        }
         match result {
             Ok(result) => result,
             Err(payload) => resume_unwind(payload),
@@ -217,6 +258,157 @@ mod tests {
                 .as_ref()
                 .map(|state| state.scope_depth),
             Some(2)
+        );
+    }
+
+    /// #c2-tracker-isolation: the C2_STRING_AXIOM_PROBE.md residual-vector
+    /// shape. A failed (non-Unsat) isolated sub-solve records a reject-stub
+    /// tagged unit; before the fix the step survived in the shared tracker and
+    /// `add_assumption` of the SAME TermId aliased to it via the generic-unit
+    /// key, pulling a strict-hard-fail step into a published proof cone. After
+    /// the fix the window is rolled back and a fresh `Assume` is minted (the
+    /// pre-alias behavior).
+    #[test]
+    fn isolated_subsolve_proof_rollback_prevents_stale_tagged_unit_alias() {
+        use ay_core::{ProofStep, TheoryLemmaKind};
+
+        let mut exec = executor_with_assertion();
+        exec.proof_tracker.enable();
+        let term = *exec.ctx.assertions.first().expect("setup asserts one term");
+        let steps_before = exec.proof_tracker.num_steps();
+
+        // Failed witness/pivot sub-solve: records the tagged unit, then exits
+        // without a refutation.
+        let result = exec.with_isolated_incremental_state(None, |this| {
+            let stale = this
+                .proof_tracker
+                .add_theory_lemma_with_kind(vec![term], TheoryLemmaKind::StringContentAxiom);
+            assert!(stale.is_some(), "tagged unit must record inside the window");
+            assert!(this.proof_tracker.num_steps() > steps_before);
+            Ok(SolveResult::Unknown)
+        });
+        assert!(matches!(result, Ok(SolveResult::Unknown)));
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            steps_before,
+            "failed sub-solve must not leave proof steps in the shared tracker"
+        );
+
+        // Re-registering the SAME TermId as an assumption (the SLIA retry
+        // shape) must mint a fresh `Assume`, not alias to the stale step.
+        let id = exec
+            .proof_tracker
+            .add_assumption(term, None)
+            .expect("tracker is enabled");
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            steps_before + 1,
+            "a fresh Assume must be appended (an alias would append nothing)"
+        );
+        let proof = exec.proof_tracker.take_proof();
+        match proof.steps.get(id.0 as usize) {
+            Some(ProofStep::Assume(assumed)) => assert_eq!(*assumed, term),
+            other => panic!("expected a fresh Assume for the re-registered term, got {other:?}"),
+        }
+    }
+
+    /// The publication-relevant path is unchanged: an inner `Unsat` keeps its
+    /// proof window verbatim, and assumption registration still reuses the
+    /// certified unit recorded inside it (the intended dedup alias).
+    #[test]
+    fn isolated_subsolve_unsat_keeps_proof_window() {
+        let mut exec = executor_with_assertion();
+        exec.proof_tracker.enable();
+        let term = *exec.ctx.assertions.first().expect("setup asserts one term");
+        let steps_before = exec.proof_tracker.num_steps();
+
+        let mut recorded_id = None;
+        let result = exec.with_isolated_incremental_state(None, |this| {
+            recorded_id = this.proof_tracker.add_theory_lemma(vec![term]);
+            assert!(recorded_id.is_some());
+            Ok(SolveResult::unsat())
+        });
+        assert!(matches!(result, Ok(SolveResult::Unsat(_))));
+        let steps_after = exec.proof_tracker.num_steps();
+        assert!(
+            steps_after > steps_before,
+            "an inner refutation's proof steps must survive for the outer publication flow"
+        );
+        let id = exec
+            .proof_tracker
+            .add_assumption(term, None)
+            .expect("tracker is enabled");
+        assert_eq!(Some(id), recorded_id, "kept window must still dedup-alias");
+        assert_eq!(exec.proof_tracker.num_steps(), steps_after);
+    }
+
+    /// A panicking sub-solve must also discard its proof window before the
+    /// panic resumes, exactly like the incremental theory/BV state.
+    #[test]
+    fn isolated_subsolve_proof_window_rolled_back_after_panic() {
+        use ay_core::TheoryLemmaKind;
+
+        let mut exec = executor_with_assertion();
+        exec.proof_tracker.enable();
+        let term = *exec.ctx.assertions.first().expect("setup asserts one term");
+        let steps_before = exec.proof_tracker.num_steps();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = exec.with_isolated_incremental_state(None, |this| -> Result<SolveResult> {
+                let _ = this
+                    .proof_tracker
+                    .add_theory_lemma_with_kind(vec![term], TheoryLemmaKind::StringContentAxiom);
+                panic!("sentinel proof-window panic");
+            });
+        }));
+        assert!(panic.is_err(), "test panic should propagate");
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            steps_before,
+            "proof window must be rolled back before unwind"
+        );
+    }
+
+    /// If a nested `take_proof` moves the ledger away inside a FAILED window,
+    /// rollback cannot rebuild the entry prefix; the replacement ledger (all
+    /// post-checkpoint steps) is cleared instead, and later assumption
+    /// registration still mints a fresh `Assume`.
+    #[test]
+    fn isolated_subsolve_proof_rollback_survives_ledger_move_in_window() {
+        use ay_core::{ProofStep, TheoryLemmaKind};
+
+        let mut exec = executor_with_assertion();
+        exec.proof_tracker.enable();
+        let term = *exec.ctx.assertions.first().expect("setup asserts one term");
+
+        let result = exec.with_isolated_incremental_state(None, |this| {
+            let _ = this
+                .proof_tracker
+                .add_theory_lemma_with_kind(vec![term], TheoryLemmaKind::StringContentAxiom);
+            // Nested publication attempt moves the ledger away…
+            let _moved = this.proof_tracker.take_proof();
+            // …and the window records more stale steps into the new ledger.
+            let _ = this
+                .proof_tracker
+                .add_theory_lemma_with_kind(vec![term], TheoryLemmaKind::StringContentAxiom);
+            Ok(SolveResult::Unknown)
+        });
+        assert!(matches!(result, Ok(SolveResult::Unknown)));
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            0,
+            "post-move replacement ledger must be cleared on failed-window exit"
+        );
+
+        let id = exec
+            .proof_tracker
+            .add_assumption(term, None)
+            .expect("tracker is enabled");
+        assert_eq!(exec.proof_tracker.num_steps(), 1);
+        let proof = exec.proof_tracker.take_proof();
+        assert!(
+            matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(t)) if *t == term),
+            "expected a fresh Assume after the moved-ledger rollback"
         );
     }
 

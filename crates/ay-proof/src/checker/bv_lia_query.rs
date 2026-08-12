@@ -18,14 +18,47 @@ use ay_core::{
     TermStore,
 };
 use num_bigint::BigInt;
-use num_traits::{One, Signed, ToPrimitive, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 
-const MAX_QUERY_ROOTS: usize = 256;
+#[path = "bv_lia_query_eval.rs"]
+mod application_evaluation;
+#[path = "bv_lia_query_int.rs"]
+mod integer_evaluation;
+#[path = "bv_lia_query_pins.rs"]
+mod pins;
+#[path = "bv_lia_query_sort.rs"]
+mod sort_validation;
+#[path = "bv_lia_query_tautology.rs"]
+mod tautology;
+
+pub(crate) use tautology::validate_bv_lia_tautology;
+
+/// Maximum number of exact source roots admitted by the bounded BV/LIA lane.
+///
+/// Real model-checker-consumer obligations measured 271–406 roots. Refusing them discards a
+/// computed UNSAT; 1024 covers that range while the independent interpreter's
+/// node, work, memory, and caller-deadline limits remain the real backstops.
+pub const MAX_BV_LIA_QUERY_ROOTS: usize = 1024;
+/// Maximum deterministic interpreter work charged for one BV/LIA tautology.
+pub const MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA: u64 = 100_000_000;
+/// Conservative private-allocation envelope for one BV/LIA tautology.
+///
+/// This covers the shared 8 MiB owned-BigInt payload plus all independently
+/// bounded 100k-node maps, sets, vectors, class/dimension records, evaluation
+/// memo entries, traversal scratch, and depth-bounded temporary BigInts.
+pub const MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA: usize = 128 * 1024 * 1024;
 const MAX_TERM_NODES: usize = 100_000;
 const MAX_TERM_DEPTH: usize = 256;
 const MAX_ENUMERATED_ASSIGNMENTS: u64 = 1 << 16;
 const MAX_PROPAGATION_ROUNDS: usize = 512;
-const MAX_WORK: u64 = 100_000_000;
+const MAX_WORK: u64 = MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA;
+// Keep exact integer evaluation small enough that one multiplication cannot
+// consume unmetered process memory before the logical work budget is checked.
+const MAX_INTEGER_BITS: u64 = 1 << 16;
+// Bounds, dimensions, and one reusable assignment environment all retain owned
+// BigInts. Bound their combined payload independently of the logical work
+// budget so repeated source constants cannot accumulate before we decline.
+const MAX_LIVE_INTEGER_LIMBS: u64 = 1 << 20;
 
 /// Opaque evidence that one exact ordered Bool/Int/BV query is UNSAT.
 #[derive(Debug)]
@@ -110,7 +143,7 @@ impl BvLiaUnsatAuthenticationError {
     /// Treating a budget exhaustion as a rejection instead vetoed the whole
     /// certification, including the deferred-trust discharge that would have run
     /// next. Measured on QF_DT `vlsat3_b83`: 156_823 roots against this lane's
-    /// 256-root cap produced "independent source-level BV/LIA check rejected
+    /// then-256-root cap produced "independent source-level BV/LIA check rejected
     /// query", and a correct `unsat` published as `unknown`.
     ///
     /// `Satisfiable` is deliberately NOT here. That is this lane succeeding at
@@ -140,9 +173,9 @@ pub fn authenticate_bv_lia_unsat_query(
     if roots.is_empty() {
         return Err(BvLiaUnsatAuthenticationError::EmptyQuery);
     }
-    if roots.len() > MAX_QUERY_ROOTS {
+    if roots.len() > MAX_BV_LIA_QUERY_ROOTS {
         return Err(BvLiaUnsatAuthenticationError::TooManyRoots {
-            limit: MAX_QUERY_ROOTS,
+            limit: MAX_BV_LIA_QUERY_ROOTS,
             actual: roots.len(),
         });
     }
@@ -172,7 +205,15 @@ enum Value {
 struct Environment {
     bools: HashMap<TermId, bool>,
     ints: HashMap<TermId, BigInt>,
+    int_limbs: u64,
     bvs: HashMap<TermId, (u64, u32)>,
+}
+
+impl Environment {
+    fn clear_ints(&mut self) {
+        self.ints.clear();
+        self.int_limbs = 0;
+    }
 }
 
 struct CollectedVariables {
@@ -181,7 +222,7 @@ struct CollectedVariables {
     bitvecs: Vec<(TermId, u32)>,
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
 enum Dimension {
     Bool(TermId),
     BitVec {
@@ -203,23 +244,6 @@ impl Dimension {
             Self::IntClass { count, .. } => *count,
         }
     }
-
-    fn assign(&self, digit: u64, env: &mut Environment) {
-        match self {
-            Self::Bool(term) => {
-                env.bools.insert(*term, digit != 0);
-            }
-            Self::BitVec { term, width } => {
-                env.bvs.insert(*term, (digit & bv_mask(*width), *width));
-            }
-            Self::IntClass { members, lower, .. } => {
-                let value = lower + BigInt::from(digit);
-                for &member in members {
-                    env.ints.insert(member, value.clone());
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -235,22 +259,10 @@ struct IntClasses {
 }
 
 impl IntClasses {
-    fn assign(&self, term: TermId, value: BigInt, env: &mut Environment) -> Result<bool, ()> {
-        let Some(&class) = self.class_of.get(&term) else {
-            return Err(());
-        };
-        let mut changed = false;
-        for &member in &self.members[class] {
-            match env.ints.get(&member) {
-                Some(existing) if existing != &value => return Err(()),
-                Some(_) => {}
-                None => {
-                    env.ints.insert(member, value.clone());
-                    changed = true;
-                }
-            }
-        }
-        Ok(changed)
+    fn members_for(&self, term: TermId) -> Option<&[TermId]> {
+        self.class_of
+            .get(&term)
+            .map(|&class| self.members[class].as_slice())
     }
 
     fn semantic_key(&self, term: TermId) -> Option<usize> {
@@ -270,6 +282,7 @@ struct Meter {
 
 impl Meter {
     fn charge(&mut self, amount: u64) -> Result<(), BvLiaUnsatAuthenticationError> {
+        let previous_work = self.work;
         self.work =
             self.work
                 .checked_add(amount)
@@ -281,7 +294,9 @@ impl Meter {
                 resource: "deterministic work budget",
             });
         }
-        if (self.work & 0x3fff) == 0
+        // Bulk limb charges need not land exactly on a sampling boundary.
+        // Compare buckets so crossing one or many boundaries always samples.
+        if (previous_work >> 14) != (self.work >> 14)
             && self
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -309,6 +324,7 @@ impl Meter {
 struct QueryChecker<'a> {
     terms: &'a TermStore,
     meter: Meter,
+    retained_int_limbs: u64,
 }
 
 impl<'a> QueryChecker<'a> {
@@ -316,20 +332,163 @@ impl<'a> QueryChecker<'a> {
         Self {
             terms,
             meter: Meter { work: 0, deadline },
+            retained_int_limbs: 0,
         }
+    }
+
+    fn assign_dimension(
+        &mut self,
+        dimension: &Dimension,
+        digit: u64,
+        env: &mut Environment,
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        match dimension {
+            Dimension::Bool(term) => {
+                self.meter.charge(1)?;
+                env.bools.insert(*term, digit != 0);
+            }
+            Dimension::BitVec { term, width } => {
+                self.meter.charge(1)?;
+                env.bvs.insert(*term, (digit & bv_mask(*width), *width));
+            }
+            Dimension::IntClass { members, lower, .. } => {
+                let value = self.add_bounded_ints(lower, &BigInt::from(digit))?;
+                if self.assign_int_members(members, &value, env)? == EnforceOutcome::Conflict {
+                    return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                        reason: "overlapping integer dimensions assign conflicting values"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assign_int_members(
+        &mut self,
+        members: &[TermId],
+        value: &BigInt,
+        env: &mut Environment,
+    ) -> Result<EnforceOutcome, BvLiaUnsatAuthenticationError> {
+        self.ensure_integer_magnitude(value)?;
+        // This is deliberately two-phase. Charge and validate every existing
+        // member plus the complete clone payload before reserving or inserting,
+        // so conflict/deadline/storage failures leave the reusable env exact.
+        let member_count = u64::try_from(members.len()).map_err(|_| {
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer assignment accounting",
+            }
+        })?;
+        self.meter.charge(member_count.max(1))?;
+
+        let value_limbs = integer_evaluation::integer_limb_units(value);
+        let mut missing_members = HashSet::new();
+        missing_members.try_reserve(members.len()).map_err(|_| {
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer assignment preflight allocation",
+            }
+        })?;
+        for &member in members {
+            if let Some(existing) = env.ints.get(&member) {
+                let comparison_work =
+                    value_limbs.max(integer_evaluation::integer_limb_units(existing));
+                self.meter.charge(comparison_work)?;
+                if existing != value {
+                    return Ok(EnforceOutcome::Conflict);
+                }
+            } else {
+                missing_members.insert(member);
+            }
+        }
+
+        let missing_u64 = u64::try_from(missing_members.len()).map_err(|_| {
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer assignment accounting",
+            }
+        })?;
+        let added_limbs = value_limbs.checked_mul(missing_u64).ok_or(
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer storage accounting",
+            },
+        )?;
+        self.meter.charge(added_limbs.max(1))?;
+        let new_live_limbs = env.int_limbs.checked_add(added_limbs).ok_or(
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer storage accounting",
+            },
+        )?;
+        let total_live_limbs = self.retained_int_limbs.checked_add(new_live_limbs).ok_or(
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer storage accounting",
+            },
+        )?;
+        if total_live_limbs > MAX_LIVE_INTEGER_LIMBS {
+            return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "live integer storage",
+            });
+        }
+        env.ints.try_reserve(missing_members.len()).map_err(|_| {
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer environment allocation",
+            }
+        })?;
+        for member in missing_members {
+            env.ints.insert(member, value.clone());
+        }
+        env.int_limbs = new_live_limbs;
+        Ok(if missing_u64 == 0 {
+            EnforceOutcome::Stable
+        } else {
+            EnforceOutcome::Changed
+        })
     }
 
     fn decide(&mut self, roots: &[TermId]) -> Result<QueryDecision, BvLiaUnsatAuthenticationError> {
         self.meter.check_entry()?;
+        self.validate_fragment_sorting(roots)?;
         let assertions = self.flatten_assertions(roots)?;
+        if assertions
+            .iter()
+            .any(|&assertion| self.terms.sort(assertion) != &Sort::Bool)
+        {
+            return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                reason: "a flattened source assertion is not Boolean".to_string(),
+            });
+        }
         let variables = self.collect_variables(roots)?;
         let classes = self.build_int_classes(&variables.ints, &assertions)?;
+
+        let pinned_bitvectors = self.collect_pinned_bitvectors(&assertions)?;
+        if pinned_bitvectors.contradictory {
+            return Ok(QueryDecision::Unsat);
+        }
 
         if self.has_structural_contradiction(&assertions, &classes)? {
             return Ok(QueryDecision::Unsat);
         }
 
-        let dimensions = self.build_dimensions(&classes, &variables.bools, &variables.bitvecs)?;
+        // Propagate exact authored definitions before sizing the finite search.
+        // A wide BV variable pinned by `(= x #x9c40)` has one possible value,
+        // not 2^16 possibilities; counting it as free made this checker decline
+        // simple source contradictions after hitting its enumeration cap. The
+        // same fail-closed propagator used for every enumerated assignment is
+        // sound on the exact `bv2nat` seed: it assigns only forced equalities or
+        // unit connectives, and leaves every ambiguous term unknown. Seeding
+        // first also propagates aliases of a variable fixed by `bv2nat`.
+        self.meter
+            .charge(u64::try_from(pinned_bitvectors.values.len()).unwrap_or(u64::MAX))?;
+        let mut base_env = Environment {
+            bvs: pinned_bitvectors.values,
+            ..Environment::default()
+        };
+        match self.assignment_satisfies(&assertions, &classes, &mut base_env)? {
+            AssignmentOutcome::Model => return Ok(QueryDecision::Sat),
+            AssignmentOutcome::Refuted => return Ok(QueryDecision::Unsat),
+            AssignmentOutcome::Unknown => {}
+        }
+
+        let dimensions =
+            self.build_dimensions(&classes, &variables.bools, &variables.bitvecs, &base_env)?;
         let total = dimensions.iter().try_fold(1_u64, |total, dimension| {
             total
                 .checked_mul(dimension.count())
@@ -339,13 +498,21 @@ impl<'a> QueryChecker<'a> {
                 })
         })?;
 
+        let mut env = base_env;
         for ordinal in 0..total {
             self.meter.charge(1)?;
-            let mut env = Environment::default();
+            // Propagation may assign otherwise-unbounded Int variables. Those
+            // assignments belong only to this ordinal. Forced base Bool/Int
+            // values are re-derived from the same authored assertions after
+            // clearing. Every non-base Bool is a dimension, and every non-base
+            // BV is a dimension overwritten below, so the retained BV map is
+            // an exact immutable seed rather than leaked ordinal state.
+            env.bools.clear();
+            env.clear_ints();
             let mut remaining = ordinal;
             for dimension in &dimensions {
                 let count = dimension.count();
-                dimension.assign(remaining % count, &mut env);
+                self.assign_dimension(dimension, remaining % count, &mut env)?;
                 remaining /= count;
             }
             match self.assignment_satisfies(&assertions, &classes, &mut env)? {
@@ -362,14 +529,101 @@ impl<'a> QueryChecker<'a> {
         Ok(QueryDecision::Unsat)
     }
 
+    fn validate_fragment_sorting(
+        &mut self,
+        roots: &[TermId],
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        let mut seen = HashSet::new();
+        let mut reachable_edges = 0usize;
+        let mut stack: Vec<(TermId, usize)> = roots.iter().copied().map(|root| (root, 1)).collect();
+        while let Some((term, depth)) = stack.pop() {
+            self.meter.charge(1)?;
+            if depth > MAX_TERM_DEPTH {
+                return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
+                    resource: "sort-validation depth",
+                });
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+            if seen.len() > MAX_TERM_NODES {
+                return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
+                    resource: "sort-validation term nodes",
+                });
+            }
+            if self.terms.entry_stamp(term).is_none() {
+                return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                    reason: "a source term contains a dangling term reference".to_string(),
+                });
+            }
+            let child_count = match self.terms.get(term) {
+                TermData::Const(_) | TermData::Var(..) => 0,
+                TermData::App(_, args) => args.len(),
+                TermData::Let(bindings, _) => bindings.len().saturating_add(1),
+                TermData::Not(_) => 1,
+                TermData::Ite(..) => 3,
+                TermData::Forall(..) | TermData::Exists(..) => 1,
+                _ => {
+                    return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                        reason: "an unsupported term occurs in the source query".to_string(),
+                    });
+                }
+            };
+            reachable_edges = reachable_edges.checked_add(child_count).ok_or(
+                BvLiaUnsatAuthenticationError::ResourceLimit {
+                    resource: "sort-validation term edges",
+                },
+            )?;
+            if reachable_edges > MAX_TERM_NODES {
+                return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
+                    resource: "sort-validation term edges",
+                });
+            }
+            self.meter
+                .charge(u64::try_from(child_count).unwrap_or(u64::MAX))?;
+            let children = self.terms.children(term);
+            if children
+                .iter()
+                .any(|&child| self.terms.entry_stamp(child).is_none())
+            {
+                return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                    reason: "a source term contains a dangling term reference".to_string(),
+                });
+            }
+            if !sort_validation::node_is_well_sorted(self.terms, term) {
+                return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                    reason: "an ill-sorted or unsupported term occurs in the source query"
+                        .to_string(),
+                });
+            }
+            stack.extend(children.into_iter().map(|child| (child, depth + 1)));
+        }
+        Ok(())
+    }
+
     fn flatten_assertions(
         &mut self,
         roots: &[TermId],
     ) -> Result<Vec<TermId>, BvLiaUnsatAuthenticationError> {
         let mut out = Vec::new();
-        let mut stack: Vec<TermId> = roots.iter().rev().copied().collect();
-        while let Some(term) = stack.pop() {
+        let mut active_ands = HashSet::new();
+        let mut stack: Vec<(TermId, bool)> = roots
+            .iter()
+            .rev()
+            .copied()
+            .map(|term| (term, false))
+            .collect();
+        while let Some((term, exiting)) = stack.pop() {
             self.meter.charge(1)?;
+            if exiting {
+                active_ands.remove(&term);
+                continue;
+            }
+            if self.terms.sort(term) != &Sort::Bool {
+                return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                    reason: "a source assertion or Boolean connective is not Boolean".to_string(),
+                });
+            }
             if out.len() + stack.len() > MAX_TERM_NODES {
                 return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
                     resource: "flattened assertion nodes",
@@ -377,7 +631,13 @@ impl<'a> QueryChecker<'a> {
             }
             match self.terms.get(term) {
                 TermData::App(Symbol::Named(name), args) if name == "and" => {
-                    stack.extend(args.iter().rev().copied());
+                    if !active_ands.insert(term) {
+                        return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                            reason: "the source query contains a cyclic conjunction".to_string(),
+                        });
+                    }
+                    stack.push((term, true));
+                    stack.extend(args.iter().rev().copied().map(|arg| (arg, false)));
                 }
                 _ => out.push(term),
             }
@@ -521,8 +781,12 @@ impl<'a> QueryChecker<'a> {
             members,
         };
 
+        let retained_before_bounds = self.retained_int_limbs;
         for &assertion in assertions {
-            self.record_int_bound(assertion, &mut classes)?;
+            if let Err(error) = self.record_int_bound(assertion, &mut classes) {
+                self.retained_int_limbs = retained_before_bounds;
+                return Err(error);
+            }
         }
         Ok(classes)
     }
@@ -543,8 +807,8 @@ impl<'a> QueryChecker<'a> {
         if name == "=" {
             if let Some((var, value)) = var_const_pair(self.terms, args) {
                 if let Some(&class) = classes.class_of.get(&var) {
-                    tighten_lower(&mut classes.bounds[class], value.clone());
-                    tighten_upper(&mut classes.bounds[class], value);
+                    self.tighten_lower_bound_from_ref(&mut classes.bounds[class], value)?;
+                    self.tighten_upper_bound_from_ref(&mut classes.bounds[class], value)?;
                 }
             }
             return Ok(());
@@ -579,12 +843,94 @@ impl<'a> QueryChecker<'a> {
             };
         }
         match name {
-            "<" => tighten_upper(&mut classes.bounds[class], constant - BigInt::one()),
-            "<=" => tighten_upper(&mut classes.bounds[class], constant),
-            ">" => tighten_lower(&mut classes.bounds[class], constant + BigInt::one()),
-            ">=" => tighten_lower(&mut classes.bounds[class], constant),
+            "<" => {
+                let bound = self.subtract_bounded_ints(constant, &BigInt::one())?;
+                self.tighten_upper_bound(&mut classes.bounds[class], bound)?;
+            }
+            "<=" => {
+                self.tighten_upper_bound_from_ref(&mut classes.bounds[class], constant)?;
+            }
+            ">" => {
+                let bound = self.add_bounded_ints(constant, &BigInt::one())?;
+                self.tighten_lower_bound(&mut classes.bounds[class], bound)?;
+            }
+            ">=" => {
+                self.tighten_lower_bound_from_ref(&mut classes.bounds[class], constant)?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn tighten_lower_bound_from_ref(
+        &mut self,
+        bounds: &mut ClassBounds,
+        value: &BigInt,
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        if let Some(existing) = &bounds.lower {
+            self.charge_integer_comparison(existing, value)?;
+            if existing >= value {
+                return Ok(());
+            }
+        }
+        let retained = self.preflight_retained_integer(bounds.lower.as_ref(), value, 0)?;
+        self.meter
+            .charge(integer_evaluation::integer_limb_units(value))?;
+        bounds.lower = Some(value.clone());
+        self.retained_int_limbs = retained;
+        Ok(())
+    }
+
+    fn tighten_upper_bound_from_ref(
+        &mut self,
+        bounds: &mut ClassBounds,
+        value: &BigInt,
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        if let Some(existing) = &bounds.upper {
+            self.charge_integer_comparison(existing, value)?;
+            if existing <= value {
+                return Ok(());
+            }
+        }
+        let retained = self.preflight_retained_integer(bounds.upper.as_ref(), value, 0)?;
+        self.meter
+            .charge(integer_evaluation::integer_limb_units(value))?;
+        bounds.upper = Some(value.clone());
+        self.retained_int_limbs = retained;
+        Ok(())
+    }
+
+    fn tighten_lower_bound(
+        &mut self,
+        bounds: &mut ClassBounds,
+        value: BigInt,
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        if let Some(existing) = &bounds.lower {
+            self.charge_integer_comparison(existing, &value)?;
+            if existing >= &value {
+                return Ok(());
+            }
+        }
+        let retained = self.preflight_retained_integer(bounds.lower.as_ref(), &value, 0)?;
+        bounds.lower = Some(value);
+        self.retained_int_limbs = retained;
+        Ok(())
+    }
+
+    fn tighten_upper_bound(
+        &mut self,
+        bounds: &mut ClassBounds,
+        value: BigInt,
+    ) -> Result<(), BvLiaUnsatAuthenticationError> {
+        if let Some(existing) = &bounds.upper {
+            self.charge_integer_comparison(existing, &value)?;
+            if existing <= &value {
+                return Ok(());
+            }
+        }
+        let retained = self.preflight_retained_integer(bounds.upper.as_ref(), &value, 0)?;
+        bounds.upper = Some(value);
+        self.retained_int_limbs = retained;
         Ok(())
     }
 
@@ -594,8 +940,11 @@ impl<'a> QueryChecker<'a> {
         classes: &IntClasses,
     ) -> Result<bool, BvLiaUnsatAuthenticationError> {
         for bounds in &classes.bounds {
-            if matches!((&bounds.lower, &bounds.upper), (Some(lower), Some(upper)) if lower > upper)
-            {
+            let Some((lower, upper)) = bounds.lower.as_ref().zip(bounds.upper.as_ref()) else {
+                continue;
+            };
+            self.charge_integer_comparison(lower, upper)?;
+            if lower > upper {
                 return Ok(true);
             }
         }
@@ -624,12 +973,22 @@ impl<'a> QueryChecker<'a> {
         if args.len() != 2 || !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
             return Ok(false);
         }
-        let Some((left_low, left_high)) = int_interval(self.terms, args[0], 0) else {
+        let Some((left_low, left_high)) = self.int_interval(args[0], 0)? else {
             return Ok(false);
         };
-        let Some((right_low, right_high)) = int_interval(self.terms, args[1], 0) else {
+        let Some((right_low, right_high)) = self.int_interval(args[1], 0)? else {
             return Ok(false);
         };
+        for (left, right) in [
+            (&left_low, &right_high),
+            (&left_high, &right_low),
+            (&right_high, &left_low),
+            (&left_low, &left_high),
+            (&left_low, &right_low),
+            (&right_low, &right_high),
+        ] {
+            self.charge_integer_comparison(left, right)?;
+        }
         let always_false = match name {
             "<" => left_low >= right_high,
             "<=" => left_low > right_high,
@@ -649,6 +1008,42 @@ impl<'a> QueryChecker<'a> {
         Ok(if desired { always_false } else { always_true })
     }
 
+    fn int_interval(
+        &mut self,
+        term: TermId,
+        depth: usize,
+    ) -> Result<Option<(BigInt, BigInt)>, BvLiaUnsatAuthenticationError> {
+        if depth > MAX_TERM_DEPTH {
+            return Ok(None);
+        }
+        match self.terms.get(term) {
+            TermData::Const(Constant::Int(value)) => {
+                let copy_work = integer_evaluation::integer_limb_units(value)
+                    .checked_mul(2)
+                    .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
+                        resource: "integer interval accounting",
+                    })?;
+                self.ensure_integer_magnitude(value)?;
+                self.meter.charge(copy_work)?;
+                Ok(Some((value.clone(), value.clone())))
+            }
+            TermData::App(Symbol::Named(name), args) if name == "bv2nat" && args.len() == 1 => {
+                let Sort::BitVec(width) = self.terms.sort(args[0]) else {
+                    return Ok(None);
+                };
+                if width.width == 0 || width.width > 64 {
+                    return Ok(None);
+                }
+                self.meter.charge(1)?;
+                Ok(Some((
+                    BigInt::zero(),
+                    (BigInt::one() << width.width) - BigInt::one(),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn residue_identity_proves_false(
         &mut self,
         assertion: TermId,
@@ -664,8 +1059,8 @@ impl<'a> QueryChecker<'a> {
         if args.len() != 2 || !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
             return Ok(false);
         }
-        let left = semantic_int_key(self.terms, args[0], classes);
-        let right = semantic_int_key(self.terms, args[1], classes);
+        let left = self.semantic_int_key(args[0], classes)?;
+        let right = self.semantic_int_key(args[1], classes)?;
         let Some((left, right)) = left.zip(right) else {
             return Ok(false);
         };
@@ -676,29 +1071,95 @@ impl<'a> QueryChecker<'a> {
         Ok(value != desired)
     }
 
+    fn semantic_int_key(
+        &mut self,
+        term: TermId,
+        classes: &IntClasses,
+    ) -> Result<Option<usize>, BvLiaUnsatAuthenticationError> {
+        if let Some(class) = classes.semantic_key(term) {
+            return Ok(Some(class));
+        }
+        let TermData::App(Symbol::Named(name), args) = self.terms.get(term) else {
+            return Ok(None);
+        };
+        if name != "bv2nat" || args.len() != 1 {
+            return Ok(None);
+        }
+        let TermData::App(Symbol::Indexed(name, indices), int_args) = self.terms.get(args[0])
+        else {
+            return Ok(None);
+        };
+        if name != "int2bv" || indices.len() != 1 || int_args.len() != 1 {
+            return Ok(None);
+        }
+        if indices[0] == 0 || indices[0] > 64 {
+            return Ok(None);
+        }
+        let Some(class) = classes.semantic_key(int_args[0]) else {
+            return Ok(None);
+        };
+        let bounds = &classes.bounds[class];
+        let Some((lower, upper)) = bounds.lower.as_ref().zip(bounds.upper.as_ref()) else {
+            return Ok(None);
+        };
+        let comparison_work = integer_evaluation::integer_limb_units(lower)
+            .checked_add(integer_evaluation::integer_limb_units(upper))
+            .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer comparison accounting",
+            })?;
+        self.meter.charge(comparison_work)?;
+        let max = (BigInt::one() << indices[0]) - BigInt::one();
+        Ok((lower >= &BigInt::zero() && upper <= &max).then_some(class))
+    }
+
     fn build_dimensions(
         &mut self,
         classes: &IntClasses,
         bool_vars: &[TermId],
         bv_vars: &[(TermId, u32)],
+        base_env: &Environment,
+    ) -> Result<Vec<Dimension>, BvLiaUnsatAuthenticationError> {
+        let retained_before_dimensions = self.retained_int_limbs;
+        let result = self.build_dimensions_inner(classes, bool_vars, bv_vars, base_env);
+        if result.is_err() {
+            self.retained_int_limbs = retained_before_dimensions;
+        }
+        result
+    }
+
+    fn build_dimensions_inner(
+        &mut self,
+        classes: &IntClasses,
+        bool_vars: &[TermId],
+        bv_vars: &[(TermId, u32)],
+        base_env: &Environment,
     ) -> Result<Vec<Dimension>, BvLiaUnsatAuthenticationError> {
         let mut dimensions = Vec::new();
         for (class, members) in classes.members.iter().enumerate() {
+            if members
+                .first()
+                .is_some_and(|member| base_env.ints.contains_key(member))
+            {
+                continue;
+            }
             let (Some(lower), Some(upper)) = (
                 classes.bounds[class].lower.as_ref(),
                 classes.bounds[class].upper.as_ref(),
             ) else {
                 continue;
             };
+            self.charge_integer_comparison(lower, upper)?;
             if upper < lower {
                 continue;
             }
-            let count = (upper - lower + BigInt::one()).to_u64().ok_or_else(|| {
-                BvLiaUnsatAuthenticationError::UnsupportedFragment {
+            let span = self.subtract_bounded_ints(upper, lower)?;
+            let count = self
+                .add_bounded_ints(&span, &BigInt::one())?
+                .to_u64()
+                .ok_or_else(|| BvLiaUnsatAuthenticationError::UnsupportedFragment {
                     reason: "integer domain does not fit the finite enumeration counter"
                         .to_string(),
-                }
-            })?;
+                })?;
             if count > MAX_ENUMERATED_ASSIGNMENTS {
                 return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
                     reason: format!(
@@ -706,14 +1167,26 @@ impl<'a> QueryChecker<'a> {
                     ),
                 });
             }
+            self.meter
+                .charge(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
+            let lower = self.clone_retained_int(lower, base_env.int_limbs)?;
             dimensions.push(Dimension::IntClass {
                 members: members.clone(),
-                lower: lower.clone(),
+                lower,
                 count,
             });
         }
-        dimensions.extend(bool_vars.iter().copied().map(Dimension::Bool));
+        dimensions.extend(
+            bool_vars
+                .iter()
+                .copied()
+                .filter(|term| !base_env.bools.contains_key(term))
+                .map(Dimension::Bool),
+        );
         for &(term, width) in bv_vars {
+            if base_env.bvs.contains_key(&term) {
+                continue;
+            }
             if width >= 64 {
                 return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
                     reason: "a free 64-bit BV variable exceeds finite enumeration".to_string(),
@@ -779,6 +1252,11 @@ impl<'a> QueryChecker<'a> {
         if depth > MAX_TERM_DEPTH {
             return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
                 resource: "propagation depth",
+            });
+        }
+        if self.terms.sort(term) != &Sort::Bool {
+            return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                reason: "a term used as a Boolean assertion is not Boolean".to_string(),
             });
         }
         if let Some(value) = self.eval_bool(term, env, memo, depth + 1)? {
@@ -910,7 +1388,7 @@ impl<'a> QueryChecker<'a> {
         let left_value = self.eval_value(left, env, memo, depth + 1)?;
         let right_value = self.eval_value(right, env, memo, depth + 1)?;
         match (left_value, right_value) {
-            (Some(left), Some(right)) => Ok(if left == right {
+            (Some(left), Some(right)) => Ok(if self.values_equal(&left, &right)? {
                 EnforceOutcome::Stable
             } else {
                 EnforceOutcome::Conflict
@@ -926,18 +1404,27 @@ impl<'a> QueryChecker<'a> {
     }
 
     fn assign_value(
-        &self,
+        &mut self,
         term: TermId,
         value: Value,
         env: &mut Environment,
         classes: &IntClasses,
     ) -> Result<EnforceOutcome, BvLiaUnsatAuthenticationError> {
+        let sort_matches = match (self.terms.sort(term), &value) {
+            (Sort::Bool, Value::Bool(_)) | (Sort::Int, Value::Int(_)) => true,
+            (Sort::BitVec(expected), Value::BitVec { width, .. }) => expected.width == *width,
+            _ => false,
+        };
+        if !sort_matches {
+            return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                reason: "an equality assigns a value of the wrong sort".to_string(),
+            });
+        }
         let assigned = match value {
             Value::Bool(value) => assign_plain(&mut env.bools, term, value),
-            Value::Int(value) => match classes.assign(term, value, env) {
-                Ok(true) => Ok(EnforceOutcome::Changed),
-                Ok(false) => Ok(EnforceOutcome::Stable),
-                Err(()) => Ok(EnforceOutcome::Conflict),
+            Value::Int(value) => match classes.members_for(term) {
+                Some(members) => self.assign_int_members(members, &value, env),
+                None => Ok(EnforceOutcome::Conflict),
             },
             Value::BitVec { value, width } => assign_plain(&mut env.bvs, term, (value, width)),
         }?;
@@ -970,12 +1457,17 @@ impl<'a> QueryChecker<'a> {
                 resource: "evaluation depth",
             });
         }
-        if let Some(value) = memo.get(&term) {
+        // Integer values own their BigInt payload. Never retain them in the
+        // per-round DAG memo: repeated use is limb-metered instead, while the
+        // cheap fixed-size Bool/BV values still benefit from memoization.
+        if let Some(value @ (Value::Bool(_) | Value::BitVec { .. })) = memo.get(&term) {
             return Ok(Some(value.clone()));
         }
         let value = match self.terms.get(term) {
             TermData::Const(Constant::Bool(value)) => Some(Value::Bool(*value)),
-            TermData::Const(Constant::Int(value)) => Some(Value::Int(value.clone())),
+            TermData::Const(Constant::Int(value)) => {
+                Some(Value::Int(self.clone_bounded_int(value)?))
+            }
             TermData::Const(Constant::BitVec { value, width }) => (*width > 0 && *width <= 64)
                 .then(|| value.to_u64())
                 .flatten()
@@ -985,7 +1477,10 @@ impl<'a> QueryChecker<'a> {
                 }),
             TermData::Var(..) => match self.terms.sort(term) {
                 Sort::Bool => env.bools.get(&term).copied().map(Value::Bool),
-                Sort::Int => env.ints.get(&term).cloned().map(Value::Int),
+                Sort::Int => match env.ints.get(&term) {
+                    Some(value) => Some(Value::Int(self.clone_bounded_int(value)?)),
+                    None => None,
+                },
                 Sort::BitVec(width) => {
                     env.bvs
                         .get(&term)
@@ -1019,101 +1514,10 @@ impl<'a> QueryChecker<'a> {
             },
             _ => None,
         };
-        if let Some(value) = &value {
+        if let Some(value @ (Value::Bool(_) | Value::BitVec { .. })) = &value {
             memo.insert(term, value.clone());
         }
         Ok(value)
-    }
-
-    fn eval_bool_app(
-        &mut self,
-        symbol: &Symbol,
-        args: &[TermId],
-        env: &Environment,
-        memo: &mut HashMap<TermId, Value>,
-        depth: usize,
-    ) -> Result<Option<Value>, BvLiaUnsatAuthenticationError> {
-        let name = symbol.name();
-        let bool_value = match name {
-            "and" => {
-                let mut unknown = false;
-                for &arg in args {
-                    match self.eval_bool(arg, env, memo, depth + 1)? {
-                        Some(false) => return Ok(Some(Value::Bool(false))),
-                        Some(true) => {}
-                        None => unknown = true,
-                    }
-                }
-                (!unknown).then_some(true)
-            }
-            "or" => {
-                let mut unknown = false;
-                for &arg in args {
-                    match self.eval_bool(arg, env, memo, depth + 1)? {
-                        Some(true) => return Ok(Some(Value::Bool(true))),
-                        Some(false) => {}
-                        None => unknown = true,
-                    }
-                }
-                (!unknown).then_some(false)
-            }
-            "not" if args.len() == 1 => self
-                .eval_bool(args[0], env, memo, depth + 1)?
-                .map(|value| !value),
-            "=>" | "implies" if args.len() == 2 => {
-                match (
-                    self.eval_bool(args[0], env, memo, depth + 1)?,
-                    self.eval_bool(args[1], env, memo, depth + 1)?,
-                ) {
-                    (Some(false), _) | (_, Some(true)) => Some(true),
-                    (Some(true), Some(false)) => Some(false),
-                    _ => None,
-                }
-            }
-            "xor" if args.len() == 2 => self
-                .eval_bool(args[0], env, memo, depth + 1)?
-                .zip(self.eval_bool(args[1], env, memo, depth + 1)?)
-                .map(|(left, right)| left ^ right),
-            "=" if args.len() == 2 => self
-                .eval_value(args[0], env, memo, depth + 1)?
-                .zip(self.eval_value(args[1], env, memo, depth + 1)?)
-                .map(|(left, right)| left == right),
-            "distinct" if args.len() == 2 => self
-                .eval_value(args[0], env, memo, depth + 1)?
-                .zip(self.eval_value(args[1], env, memo, depth + 1)?)
-                .map(|(left, right)| left != right),
-            "<" | "<=" | ">" | ">=" if args.len() == 2 => self
-                .eval_int(args[0], env, memo, depth + 1)?
-                .zip(self.eval_int(args[1], env, memo, depth + 1)?)
-                .map(|(left, right)| match name {
-                    "<" => left < right,
-                    "<=" => left <= right,
-                    ">" => left > right,
-                    ">=" => left >= right,
-                    _ => unreachable!(),
-                }),
-            "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
-                if args.len() == 2 =>
-            {
-                self.eval_bv(args[0], env, memo, depth + 1)?
-                    .zip(self.eval_bv(args[1], env, memo, depth + 1)?)
-                    .and_then(|((left, left_width), (right, right_width))| {
-                        (left_width == right_width).then(|| match name {
-                            "bvult" => left < right,
-                            "bvule" => left <= right,
-                            "bvugt" => left > right,
-                            "bvuge" => left >= right,
-                            "bvslt" => signed_bv(left, left_width) < signed_bv(right, right_width),
-                            "bvsle" => signed_bv(left, left_width) <= signed_bv(right, right_width),
-                            "bvsgt" => signed_bv(left, left_width) > signed_bv(right, right_width),
-                            "bvsge" => signed_bv(left, left_width) >= signed_bv(right, right_width),
-                            _ => unreachable!(),
-                        })
-                    })
-            }
-            _ => None,
-        };
-        Ok(bool_value.map(Value::Bool))
     }
 
     fn eval_int(
@@ -1129,79 +1533,6 @@ impl<'a> QueryChecker<'a> {
         })
     }
 
-    fn eval_int_app(
-        &mut self,
-        symbol: &Symbol,
-        args: &[TermId],
-        env: &Environment,
-        memo: &mut HashMap<TermId, Value>,
-        depth: usize,
-    ) -> Result<Option<Value>, BvLiaUnsatAuthenticationError> {
-        let name = symbol.name();
-        let value = match name {
-            "+" => {
-                let mut value = BigInt::zero();
-                for &arg in args {
-                    let Some(arg) = self.eval_int(arg, env, memo, depth + 1)? else {
-                        return Ok(None);
-                    };
-                    value += arg;
-                }
-                Some(value)
-            }
-            "-" => match args {
-                [] => None,
-                [arg] => self
-                    .eval_int(*arg, env, memo, depth + 1)?
-                    .map(|value| -value),
-                [first, rest @ ..] => {
-                    let Some(mut value) = self.eval_int(*first, env, memo, depth + 1)? else {
-                        return Ok(None);
-                    };
-                    for &arg in rest {
-                        let Some(arg) = self.eval_int(arg, env, memo, depth + 1)? else {
-                            return Ok(None);
-                        };
-                        value -= arg;
-                    }
-                    Some(value)
-                }
-            },
-            "*" => {
-                let mut value = BigInt::one();
-                for &arg in args {
-                    let Some(arg) = self.eval_int(arg, env, memo, depth + 1)? else {
-                        return Ok(None);
-                    };
-                    value *= arg;
-                }
-                Some(value)
-            }
-            "mod" if args.len() == 2 => {
-                let dividend = self.eval_int(args[0], env, memo, depth + 1)?;
-                let divisor = self.eval_int(args[1], env, memo, depth + 1)?;
-                match (dividend, divisor) {
-                    (Some(dividend), Some(divisor)) if divisor.is_positive() => {
-                        let mut residue = dividend % &divisor;
-                        if residue.is_negative() {
-                            residue += divisor;
-                        }
-                        Some(residue)
-                    }
-                    _ => None,
-                }
-            }
-            "abs" if args.len() == 1 => self
-                .eval_int(args[0], env, memo, depth + 1)?
-                .map(|value| value.abs()),
-            "bv2nat" if args.len() == 1 => self
-                .eval_bv(args[0], env, memo, depth + 1)?
-                .map(|(value, _)| BigInt::from(value)),
-            _ => None,
-        };
-        Ok(value.map(Value::Int))
-    }
-
     fn eval_bv(
         &mut self,
         term: TermId,
@@ -1213,132 +1544,6 @@ impl<'a> QueryChecker<'a> {
             Some(Value::BitVec { value, width }) => Some((value, width)),
             _ => None,
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn eval_bv_app(
-        &mut self,
-        symbol: &Symbol,
-        args: &[TermId],
-        expected_width: u32,
-        env: &Environment,
-        memo: &mut HashMap<TermId, Value>,
-        depth: usize,
-    ) -> Result<Option<Value>, BvLiaUnsatAuthenticationError> {
-        if let Symbol::Indexed(name, indices) = symbol {
-            if name == "int2bv" && indices.as_slice() == [expected_width] && args.len() == 1 {
-                let value = self.eval_int(args[0], env, memo, depth + 1)?;
-                return Ok(value
-                    .as_ref()
-                    .and_then(|value| bigint_residue_u64(value, expected_width))
-                    .map(|value| Value::BitVec {
-                        value,
-                        width: expected_width,
-                    }));
-            }
-            if args.len() == 1 {
-                let Some((value, width)) = self.eval_bv(args[0], env, memo, depth + 1)? else {
-                    return Ok(None);
-                };
-                let result = match (name.as_str(), indices.as_slice()) {
-                    ("extract", [high, low]) if high >= low && *high < width => {
-                        Some((value >> low, high - low + 1))
-                    }
-                    ("zero_extend", [added])
-                        if width.checked_add(*added) == Some(expected_width) =>
-                    {
-                        Some((value, expected_width))
-                    }
-                    ("sign_extend", [added])
-                        if width.checked_add(*added) == Some(expected_width) =>
-                    {
-                        let signed = signed_bv(value, width);
-                        Some((
-                            (signed as u128 & u128::from(bv_mask(expected_width))) as u64,
-                            expected_width,
-                        ))
-                    }
-                    _ => None,
-                };
-                return Ok(result.map(|(value, width)| Value::BitVec {
-                    value: value & bv_mask(width),
-                    width,
-                }));
-            }
-            return Ok(None);
-        }
-
-        let name = symbol.name();
-        if matches!(name, "bvnot" | "bvneg") && args.len() == 1 {
-            let value = self.eval_bv(args[0], env, memo, depth + 1)?;
-            return Ok(value.map(|(value, width)| Value::BitVec {
-                value: if name == "bvnot" {
-                    !value & bv_mask(width)
-                } else {
-                    0_u64.wrapping_sub(value) & bv_mask(width)
-                },
-                width,
-            }));
-        }
-        if args.len() != 2 {
-            return Ok(None);
-        }
-        let Some((left, left_width)) = self.eval_bv(args[0], env, memo, depth + 1)? else {
-            return Ok(None);
-        };
-        let Some((right, right_width)) = self.eval_bv(args[1], env, memo, depth + 1)? else {
-            return Ok(None);
-        };
-        if name == "concat" {
-            let Some(width) = left_width.checked_add(right_width) else {
-                return Ok(None);
-            };
-            if width != expected_width || width > 64 {
-                return Ok(None);
-            }
-            let value = if right_width == 64 {
-                right
-            } else {
-                (left << right_width) | right
-            };
-            return Ok(Some(Value::BitVec {
-                value: value & bv_mask(width),
-                width,
-            }));
-        }
-        if left_width != right_width || left_width != expected_width {
-            return Ok(None);
-        }
-        let width = left_width;
-        let mask = bv_mask(width);
-        let value = match name {
-            "bvadd" => left.wrapping_add(right) & mask,
-            "bvsub" => left.wrapping_sub(right) & mask,
-            "bvmul" => left.wrapping_mul(right) & mask,
-            "bvand" => left & right,
-            "bvor" => left | right,
-            "bvxor" => left ^ right,
-            "bvnand" => !(left & right) & mask,
-            "bvnor" => !(left | right) & mask,
-            "bvxnor" => !(left ^ right) & mask,
-            "bvshl" => {
-                if right >= u64::from(width) {
-                    0
-                } else {
-                    left.wrapping_shl(right as u32) & mask
-                }
-            }
-            "bvlshr" => {
-                if right >= u64::from(width) {
-                    0
-                } else {
-                    left >> right
-                }
-            }
-            "bvashr" => arithmetic_shift_right(left, right, width),
-            _ => return Ok(None),
-        };
-        Ok(Some(Value::BitVec { value, width }))
     }
 }
 
@@ -1391,14 +1596,14 @@ fn is_int_var(terms: &TermStore, term: TermId) -> bool {
     matches!(terms.get(term), TermData::Var(..)) && *terms.sort(term) == Sort::Int
 }
 
-fn int_constant(terms: &TermStore, term: TermId) -> Option<BigInt> {
+fn int_constant(terms: &TermStore, term: TermId) -> Option<&BigInt> {
     match terms.get(term) {
-        TermData::Const(Constant::Int(value)) => Some(value.clone()),
+        TermData::Const(Constant::Int(value)) => Some(value),
         _ => None,
     }
 }
 
-fn var_const_pair(terms: &TermStore, args: &[TermId]) -> Option<(TermId, BigInt)> {
+fn var_const_pair<'a>(terms: &'a TermStore, args: &[TermId]) -> Option<(TermId, &'a BigInt)> {
     if is_int_var(terms, args[0]) {
         int_constant(terms, args[1]).map(|value| (args[0], value))
     } else if is_int_var(terms, args[1]) {
@@ -1408,93 +1613,12 @@ fn var_const_pair(terms: &TermStore, args: &[TermId]) -> Option<(TermId, BigInt)
     }
 }
 
-fn tighten_lower(bounds: &mut ClassBounds, value: BigInt) {
-    if bounds
-        .lower
-        .as_ref()
-        .is_none_or(|existing| existing < &value)
-    {
-        bounds.lower = Some(value);
-    }
-}
-
-fn tighten_upper(bounds: &mut ClassBounds, value: BigInt) {
-    if bounds
-        .upper
-        .as_ref()
-        .is_none_or(|existing| existing > &value)
-    {
-        bounds.upper = Some(value);
-    }
-}
-
-fn int_interval(terms: &TermStore, term: TermId, depth: usize) -> Option<(BigInt, BigInt)> {
-    if depth > MAX_TERM_DEPTH {
-        return None;
-    }
-    match terms.get(term) {
-        TermData::Const(Constant::Int(value)) => Some((value.clone(), value.clone())),
-        TermData::App(Symbol::Named(name), args) if name == "bv2nat" && args.len() == 1 => {
-            let Sort::BitVec(width) = terms.sort(args[0]) else {
-                return None;
-            };
-            if width.width == 0 || width.width > 64 {
-                return None;
-            }
-            Some((
-                BigInt::zero(),
-                (BigInt::one() << width.width) - BigInt::one(),
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn semantic_int_key(terms: &TermStore, term: TermId, classes: &IntClasses) -> Option<usize> {
-    if let Some(class) = classes.semantic_key(term) {
-        return Some(class);
-    }
-    let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
-        return None;
-    };
-    if name != "bv2nat" || args.len() != 1 {
-        return None;
-    }
-    let TermData::App(Symbol::Indexed(name, indices), int_args) = terms.get(args[0]) else {
-        return None;
-    };
-    if name != "int2bv" || indices.len() != 1 || int_args.len() != 1 {
-        return None;
-    }
-    if indices[0] == 0 || indices[0] > 64 {
-        return None;
-    }
-    let class = classes.semantic_key(int_args[0])?;
-    let bounds = &classes.bounds[class];
-    let lower = bounds.lower.as_ref()?;
-    let upper = bounds.upper.as_ref()?;
-    let max = (BigInt::one() << indices[0]) - BigInt::one();
-    (lower >= &BigInt::zero() && upper <= &max).then_some(class)
-}
-
 fn bv_mask(width: u32) -> u64 {
     if width >= 64 {
         u64::MAX
     } else {
         (1_u64 << width) - 1
     }
-}
-
-fn bigint_residue_u64(value: &BigInt, width: u32) -> Option<u64> {
-    if width == 0 || width > 64 {
-        return None;
-    }
-    let modulus = BigInt::one() << width;
-    let mut residue = value % &modulus;
-    if residue.is_negative() {
-        residue += modulus;
-    }
-    residue.to_u64().map(|value| value & bv_mask(width))
 }
 
 fn signed_bv(value: u64, width: u32) -> i128 {
@@ -1524,122 +1648,9 @@ fn arithmetic_shift_right(value: u64, amount: u64, width: u32) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use ay_core::{Sort, Symbol, TermStore};
-    use num_bigint::BigInt;
+#[path = "bv_lia_query_tests.rs"]
+mod tests;
 
-    use super::{authenticate_bv_lia_unsat_query, BvLiaUnsatAuthenticationError};
-
-    #[test]
-    fn bounded_bv_to_nat_query_authenticates_and_rejects_sat_near_miss() {
-        let mut terms = TermStore::new();
-        let x = terms.mk_var("bridge_x", Sort::bitvec(4));
-        let nat = terms.mk_bv2nat(x);
-        let five = terms.mk_int(5.into());
-        let three_bv = terms.mk_bitvec(BigInt::from(3_u8), 4);
-        let above_five = terms.mk_gt(nat, five);
-        let below_three = terms.mk_bvult(x, three_bv);
-        let roots = [above_five, below_three];
-        let evidence = authenticate_bv_lia_unsat_query(&terms, &roots, None)
-            .expect("finite BV enumeration proves the bridge contradiction");
-        assert!(evidence.is_current_for(&terms, &roots));
-
-        let ten_bv = terms.mk_bitvec(BigInt::from(10_u8), 4);
-        let below_ten = terms.mk_bvult(x, ten_bv);
-        let sat_roots = [above_five, below_ten];
-        let error = authenticate_bv_lia_unsat_query(&terms, &sat_roots, None)
-            .expect_err("x=6 witnesses the near-miss query");
-        assert!(matches!(error, BvLiaUnsatAuthenticationError::Satisfiable));
-    }
-
-    #[test]
-    fn universal_bv2nat_range_rejects_unbounded_source_violation() {
-        let mut terms = TermStore::new();
-        let source = terms.mk_var("bridge_e", Sort::Int);
-        let bv = terms.mk_int2bv(8, source);
-        let nat = terms.mk_bv2nat(bv);
-        let max = terms.mk_int(255.into());
-        let impossible = terms.mk_gt(nat, max);
-        authenticate_bv_lia_unsat_query(&terms, &[impossible], None)
-            .expect("bv2nat is universally bounded by its width");
-    }
-
-    #[test]
-    fn in_range_int2bv_residue_identity_is_symbolically_checked() {
-        let mut terms = TermStore::new();
-        let source = terms.mk_var("bridge_source", Sort::Int);
-        let zero = terms.mk_int(0.into());
-        let modulus = terms.mk_int((1_i64 << 32).into());
-        let nonnegative = terms.mk_ge(source, zero);
-        let below_modulus = terms.mk_lt(source, modulus);
-        let bv = terms.mk_int2bv(32, source);
-        let nat = terms.mk_bv2nat(bv);
-        let impossible = terms.mk_gt(nat, source);
-        authenticate_bv_lia_unsat_query(&terms, &[nonnegative, below_modulus, impossible], None)
-            .expect("in-range int2bv/bv2nat is the identity");
-    }
-
-    #[test]
-    fn evidence_retires_after_term_snapshot_change() {
-        let mut terms = TermStore::new();
-        let x = terms.mk_var("bridge_stale_x", Sort::bitvec(2));
-        let zero = terms.mk_bitvec(BigInt::from(0_u8), 2);
-        let lt_zero = terms.mk_app(Symbol::named("bvult"), [x, zero], Sort::Bool);
-        let evidence = authenticate_bv_lia_unsat_query(&terms, &[lt_zero], None)
-            .expect("unsigned value cannot be below zero");
-        let _late = terms.mk_var("bridge_stale_late", Sort::Bool);
-        assert!(!evidence.term_snapshot_is_current(&terms));
-    }
-
-    #[test]
-    fn malformed_or_oversized_bv_widths_fail_closed() {
-        let mut terms = TermStore::new();
-        let zero_width = terms.mk_bitvec(BigInt::from(0_u8), 0);
-        let signed_lt = terms.mk_app(Symbol::named("bvslt"), [zero_width, zero_width], Sort::Bool);
-        let zero_error = authenticate_bv_lia_unsat_query(&terms, &[signed_lt], None)
-            .expect_err("zero-width signed arithmetic is outside the checked fragment");
-        assert!(matches!(
-            zero_error,
-            BvLiaUnsatAuthenticationError::UnsupportedFragment { .. }
-        ));
-
-        let source = terms.mk_var("bridge_huge_width_source", Sort::Int);
-        let zero = terms.mk_int(BigInt::from(0_u8));
-        let one = terms.mk_int(BigInt::from(1_u8));
-        let lower = terms.mk_ge(source, zero);
-        let upper = terms.mk_le(source, one);
-        let huge_bv = terms.mk_int2bv(u32::MAX, source);
-        let huge_nat = terms.mk_bv2nat(huge_bv);
-        let impossible = terms.mk_gt(huge_nat, source);
-        let huge_error = authenticate_bv_lia_unsat_query(&terms, &[lower, upper, impossible], None)
-            .expect_err("oversized int2bv width must not allocate or certify");
-        assert!(matches!(
-            huge_error,
-            BvLiaUnsatAuthenticationError::UnsupportedFragment { .. }
-        ));
-    }
-
-    #[test]
-    fn long_integer_equality_chain_uses_bounded_stack() {
-        const VARIABLES: usize = 20_000;
-
-        let mut terms = TermStore::new();
-        let vars: Vec<_> = (0..VARIABLES)
-            .map(|index| terms.mk_var(format!("bridge_chain_{index}"), Sort::Int))
-            .collect();
-        let mut conjuncts = Vec::with_capacity(VARIABLES + 1);
-        // This orientation deliberately creates the deepest tree for the
-        // union policy before the final class walk compresses it.
-        for index in 1..VARIABLES {
-            conjuncts.push(terms.mk_eq(vars[index], vars[index - 1]));
-        }
-        let zero = terms.mk_int(BigInt::from(0_u8));
-        let one = terms.mk_int(BigInt::from(1_u8));
-        conjuncts.push(terms.mk_eq(vars[0], zero));
-        conjuncts.push(terms.mk_eq(vars[VARIABLES - 1], one));
-        let root = terms.mk_app(Symbol::named("and"), conjuncts, Sort::Bool);
-
-        authenticate_bv_lia_unsat_query(&terms, &[root], None)
-            .expect("the long equality chain is contradictory without recursive find");
-    }
-}
+#[cfg(test)]
+#[path = "bv_lia_query_resource_tests.rs"]
+mod resource_tests;

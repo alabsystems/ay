@@ -2534,6 +2534,18 @@ impl TheorySolver for TheoryCombiner<'_> {
         }
     }
 
+    /// #euf-atom-filter: forward the SAT-atom filter to the embedded EUF solver
+    /// ONLY when no ARRAY solver participates. With arrays, EUF shares interface
+    /// disequalities (e.g. `select`-over-`store` index disequalities) that are
+    /// NOT SAT atoms; filtering `eq_terms` to SAT atoms drops them and can turn
+    /// a decided array instance `unknown` (measured on QF_AUFLIA `swap`). The
+    /// UF+LIA lane (no arrays) is a verified-safe SAT-boundary-only consumer.
+    fn set_sat_atom_terms(&mut self, term_to_var: &ay_core::kani_compat::DetHashMap<TermId, u32>) {
+        if self.arrays.is_none() {
+            self.euf.install_sat_atom_filter(term_to_var);
+        }
+    }
+
     fn assert_literal(&mut self, literal: TermId, value: bool) {
         self.record_current_assignment(literal, value);
         let direct_array_equality = self.direct_array_equality_assignment(literal, value);

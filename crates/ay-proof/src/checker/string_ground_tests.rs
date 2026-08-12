@@ -217,6 +217,32 @@ fn regex_operator_semantics_match_smtlib() {
 }
 
 #[test]
+fn indexed_named_string_and_regex_builtins_fail_closed() {
+    let mut terms = TermStore::new();
+    let hello = str_const(&mut terms, "hello");
+    let indexed_len = terms.mk_app(Symbol::indexed("str.len", vec![0]), [hello], Sort::Int);
+    let five = terms.mk_int(5.into());
+    let forged_length = terms.mk_app(Symbol::named("="), [indexed_len, five], Sort::Bool);
+    assert!(!recognize_string_ground_eval(&terms, &[forged_length]));
+    validate_string_ground_eval(&terms, ProofId(0), &[forged_length])
+        .expect_err("an indexed identifier named `str.len` is not the named string builtin");
+
+    let a = to_re(&mut terms, "a");
+    let indexed_star = terms.mk_app(Symbol::indexed("re.*", vec![0]), [a], Sort::RegLan);
+    let aaa = str_const(&mut terms, "aaa");
+    let forged_regex = in_re(&mut terms, aaa, indexed_star);
+    validate_string_ground_eval(&terms, ProofId(0), &[forged_regex])
+        .expect_err("an indexed identifier named `re.*` is not the named regex constructor");
+
+    // Control: genuine indexed regex repetition retains its semantics.
+    let power = terms.mk_app(Symbol::indexed("re.^", vec![2]), [a], Sort::RegLan);
+    let aa = str_const(&mut terms, "aa");
+    let genuine_indexed_regex = in_re(&mut terms, aa, power);
+    validate_string_ground_eval(&terms, ProofId(0), &[genuine_indexed_regex])
+        .expect("the genuine indexed `(_ re.^ 2)` constructor must still evaluate");
+}
+
+#[test]
 fn ground_string_operations_evaluate() {
     let mut terms = TermStore::new();
     let hello = str_const(&mut terms, "hello");
@@ -381,4 +407,92 @@ fn multi_literal_clause_certifies_on_its_true_ground_literal() {
     assert!(!recognize_string_ground_eval(&terms, &[not_eq]));
     validate_string_ground_eval(&terms, ProofId(0), &[not_eq])
         .expect_err("a non-ground-only clause must be rejected");
+}
+
+/// A user-declarable SPELLING must never receive native string semantics.
+///
+/// `ay-frontend` owns `str.to_code`: it is in `RESERVED_OP_NAMES`, so
+/// `(declare-fun str.to_code (String) Int)` is rejected at elaboration and a
+/// surviving application always denotes the native operator. It does NOT own
+/// the invented dotted spelling `str.to.code`: that name is in neither
+/// `RESERVED_OP_NAMES` nor `EXCLUDED_DECLARABLE_OP_NAMES`, no elaborator arm
+/// matches it, and `declaration_requires_private_core_identity` leaves an
+/// ordinary declaration holding that exact surface spelling. z3 5.0.0 agrees it
+/// is not an operator — `(assert (= (str.to.code "a") 97))` is
+/// `(error "unknown constant str.to.code")` — and answers `sat` for
+/// `(declare-fun str.to.code (String) Int)` +
+/// `(assert (not (= (str.to.code "a") 97)))`.
+///
+/// This evaluator used to accept four invented spellings (`str.to.code`,
+/// `str.from.code`, `str.from.int`, `str.is.digit`) as aliases of the real
+/// operators, which made `TheoryLemmaKind::StringGroundEval` a forgery oracle:
+/// it certified `(= (str.to.code "a") 97)` as a GROUND TAUTOLOGY about a
+/// function the problem had declared uninterpreted. The alias arms are gone;
+/// an uninterpreted head is "not ground", so the lemma fails closed.
+#[test]
+fn invented_dotted_string_spellings_are_not_given_native_semantics() {
+    // `(= (<head> "a") 97)` — TRUE for the real `str.to_code`, and a claim
+    // about an arbitrary uninterpreted function for the dotted spelling.
+    let build_to_code = |head: &str| {
+        let mut terms = TermStore::new();
+        let argument = str_const(&mut terms, "a");
+        let applied = terms.mk_app(Symbol::named(head), [argument], Sort::Int);
+        let expected = terms.mk_int(BigInt::from(97));
+        let equality = terms.mk_app(Symbol::named("="), [applied, expected], Sort::Bool);
+        (terms, equality)
+    };
+    let (terms, equality) = build_to_code("str.to_code");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality])
+        .expect("the frontend-owned `str.to_code` must still evaluate");
+    let (terms, equality) = build_to_code("str.to.code");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality]).expect_err(
+        "`str.to.code` is an ordinary user-declarable symbol; certifying a \
+         ground tautology about it would launder a wrong `unsat`",
+    );
+
+    // `(= (<head> 97) "a")` — TRUE for the real `str.from_code`.
+    let build_from_code = |head: &str| {
+        let mut terms = TermStore::new();
+        let argument = terms.mk_int(BigInt::from(97));
+        let applied = terms.mk_app(Symbol::named(head), [argument], Sort::String);
+        let expected = str_const(&mut terms, "a");
+        let equality = terms.mk_app(Symbol::named("="), [applied, expected], Sort::Bool);
+        (terms, equality)
+    };
+    let (terms, equality) = build_from_code("str.from_code");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality])
+        .expect("the frontend-owned `str.from_code` must still evaluate");
+    let (terms, equality) = build_from_code("str.from.code");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality])
+        .expect_err("`str.from.code` is an ordinary user-declarable symbol");
+
+    // `(= (<head> 97) "97")` — TRUE for the real `str.from_int`.
+    let build_from_int = |head: &str| {
+        let mut terms = TermStore::new();
+        let argument = terms.mk_int(BigInt::from(97));
+        let applied = terms.mk_app(Symbol::named(head), [argument], Sort::String);
+        let expected = str_const(&mut terms, "97");
+        let equality = terms.mk_app(Symbol::named("="), [applied, expected], Sort::Bool);
+        (terms, equality)
+    };
+    let (terms, equality) = build_from_int("str.from_int");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality])
+        .expect("the frontend-owned `str.from_int` must still evaluate");
+    let (terms, equality) = build_from_int("str.from.int");
+    validate_string_ground_eval(&terms, ProofId(0), &[equality])
+        .expect_err("`str.from.int` is an ordinary user-declarable symbol");
+
+    // `(<head> "9")` — TRUE for the real `str.is_digit`.
+    let build_is_digit = |head: &str| {
+        let mut terms = TermStore::new();
+        let argument = str_const(&mut terms, "9");
+        let applied = terms.mk_app(Symbol::named(head), [argument], Sort::Bool);
+        (terms, applied)
+    };
+    let (terms, applied) = build_is_digit("str.is_digit");
+    validate_string_ground_eval(&terms, ProofId(0), &[applied])
+        .expect("the frontend-owned `str.is_digit` must still evaluate");
+    let (terms, applied) = build_is_digit("str.is.digit");
+    validate_string_ground_eval(&terms, ProofId(0), &[applied])
+        .expect_err("`str.is.digit` is an ordinary user-declarable symbol");
 }

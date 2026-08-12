@@ -45,6 +45,7 @@ use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 use std::time::Duration;
 
+use super::datatype_cell_authority::ExactDatatypeCellCompletions;
 use super::{string_witness, EvalValue, Model};
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
@@ -453,6 +454,10 @@ impl Executor {
         if relevant.is_empty() {
             return (0, false);
         }
+        // Phase 5 has frozen datatype ground values. Index their exact EUF
+        // carrier -> structured-rendering authority once an array actually
+        // needs completion; every later merge lookup is O(1).
+        let exact_dt_cells = self.exact_datatype_cell_completions(model);
         relevant.sort_by_key(|term| term.index());
         relevant.dedup();
         let relevant_set: HashSet<TermId> = relevant.iter().copied().collect();
@@ -589,7 +594,8 @@ impl Executor {
             else {
                 continue;
             };
-            match Self::merge_array_completion_candidate(
+            match self.merge_array_completion_candidate(
+                &exact_dt_cells,
                 original_arrays.array_values.get(&term),
                 candidate,
                 array_sort,
@@ -633,7 +639,8 @@ impl Executor {
                 else {
                     continue;
                 };
-                let candidate = match Self::merge_array_completion_candidate(
+                let candidate = match self.merge_array_completion_candidate(
+                    &exact_dt_cells,
                     original_arrays.array_values.get(&target),
                     candidate,
                     array_sort,
@@ -862,7 +869,8 @@ impl Executor {
                     // Solver-extracted authority (explicit defaults/stores) is
                     // merged exactly as in the first pass; a conflict leaves
                     // the array partial rather than choosing a winner.
-                    let candidate = match Self::merge_array_completion_candidate(
+                    let candidate = match self.merge_array_completion_candidate(
+                        &exact_dt_cells,
                         original_arrays.array_values.get(&term),
                         candidate,
                         array_sort,
@@ -909,7 +917,8 @@ impl Executor {
                         ) else {
                             continue;
                         };
-                        let candidate = match Self::merge_array_completion_candidate(
+                        let candidate = match self.merge_array_completion_candidate(
+                            &exact_dt_cells,
                             original_arrays.array_values.get(&target),
                             candidate,
                             array_sort,
@@ -1137,6 +1146,8 @@ impl Executor {
     /// stores are newest-first, so only their first occurrence for an index is
     /// semantic; a shadowed older duplicate is intentionally ignored.
     fn merge_array_completion_candidate(
+        &self,
+        exact_dt_cells: &ExactDatatypeCellCompletions,
         existing: Option<&ArrayInterpretation>,
         mut candidate: ArrayInterpretation,
         array_sort: &ay_core::ArraySort,
@@ -1184,13 +1195,28 @@ impl Executor {
             }
         }
         for (index, value) in candidate.stores {
-            match merged_stores.iter().find(|(key, _)| key == &index) {
+            match merged_stores.iter_mut().find(|(key, _)| key == &index) {
                 Some((_, authority)) if authority != &value => {
                     if std::env::var_os("AY_DEBUG_COMPLETION_MERGE").is_some() {
                         eprintln!(
                             "[completion-merge] cell conflict idx={index} existing={authority} candidate={value}"
                         );
                     }
+                    // Replace an eager extractor's opaque datatype carrier only
+                    // when Phase 5's immutable exact-class index authorizes this
+                    // same structured candidate. Observed fields stay bound by
+                    // total-DT construction and the downstream strict gates.
+                    let abstract_dt_authority = self.exact_datatype_cell_completion(
+                        exact_dt_cells,
+                        authority,
+                        &value,
+                        &array_sort.element_sort,
+                    );
+                    if abstract_dt_authority {
+                        *authority = value;
+                        continue;
+                    }
+
                     // ABSTRACT-ATOM cells (#qfax-atom-spelling): the extracted
                     // entry is the solver's newest-first authority; the
                     // candidate cell is a completion-time re-derivation whose

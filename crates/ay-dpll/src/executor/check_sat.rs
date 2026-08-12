@@ -542,7 +542,11 @@ impl Executor {
         // in-place pass like the others here; `scope_tracked_assertions` is
         // restored on every exit path, preserving the scope `assertion_count`
         // invariant. Equisatisfiable; a no-op when there are no such arguments.
-        crate::executor::purify_bool_args::purify_bool_args(
+        // #boolarg-orphan: keep the rewrite correspondence. `ctx.assertions` is
+        // restored to the ORIGINALS on every exit path below, so without this
+        // index the applications this pass rewrote reach the model gate as terms
+        // no model ever pinned.
+        self.bool_arg_orphan_index = crate::executor::purify_bool_args::purify_bool_args(
             &mut self.ctx.terms,
             &mut self.ctx.assertions,
         );
@@ -782,18 +786,49 @@ impl Executor {
         // whose snapshot is taken after this point.
         // The QE engines test candidate equivalence by bounded sampling; this
         // neither proves all free-variable valuations nor emits an Alethe
-        // derivation from the authored
-        // quantified root to the replacement.  Mandatory UNSAT publication
-        // therefore cannot let a QE replacement become a free `Assume` in the
-        // proof.  Keep the original quantified formula whenever proof tracking
-        // is active; the downstream instantiation lanes can then derive their
-        // ground instances with `forall_inst`.
-        if has_quantified_assertions && !self.produce_proofs_enabled() {
-            crate::executor::qe_prepass::deep_qe(
+        // derivation from the authored quantified root to the replacement.
+        // Mandatory UNSAT publication therefore cannot let a QE replacement
+        // become a free `Assume` in the proof, and the pass must never displace
+        // a lane that CAN certify the authored shape.
+        //
+        // #prepass-reachability. The guard here used to be
+        // `!self.produce_proofs_enabled()`, which reports the INTERNAL proof
+        // tracker. `begin_public_solve` turns that tracker on for EVERY public
+        // decision (the UNSAT certificate is mandatory and does not depend on
+        // `:produce-proofs`), so the guard was FALSE on every public solve and
+        // this entire pre-pass was DEAD, not opted out — measured, not inferred:
+        // `deep_qe_applicable` counted the site while `deep_qe_entered` stayed at
+        // zero. That is the thirteenth site in a class the doc comment on
+        // `produce_proofs_enabled` already names (ten passes at `d238594eec`,
+        // `cegar_refine_solve`, the nested-array residue rescue).
+        //
+        // The repair is NOT the usual swap to `is_producing_proofs()`. Measured:
+        // with that guard the pass runs before every solve and turns ELEVEN
+        // passing `quantifier::` tests into `unknown`, because eliminating the
+        // quantifier erases the authored shape the exact-semantic UNSAT lanes and
+        // the CEGQI SAT authorities match on. The pass instead runs on the
+        // `Unknown` fallback (`deep_qe_unknown_retry`), where there is by
+        // construction no verdict to lose; `deep_qe_retry_armed` is that lane's
+        // flag and nothing else sets it.
+        self.prepass_reachability.deep_qe_applicable += u64::from(has_quantified_assertions);
+        if has_quantified_assertions && self.produce_proofs_enabled() {
+            self.prepass_reachability.deep_qe_internal_tracker_on += 1;
+        }
+        if has_quantified_assertions && self.deep_qe_retry_armed {
+            self.prepass_reachability.deep_qe_entered += 1;
+            if crate::executor::qe_prepass::deep_qe(
                 &mut self.ctx.terms,
                 &mut self.ctx.assertions,
                 self.solve_interrupt.as_deref(),
-            );
+            ) {
+                // Same fence as `simplify_vacuous_quantifiers` above: the
+                // rewrite is adopted for SOLVING, but no derivation connects the
+                // authored quantified root to the replacement, so the UNSAT
+                // ARTIFACT lane may not treat the rewritten trace as authority.
+                // Result mapping then demands an independently strict
+                // authored-scope proof before it will publish `unsat`.
+                self.quantified_proof_translation_incomplete = true;
+            }
         }
         // Soundness precheck (#quant-ws closed-forall wrong-SAT): a top-level
         // conjunct that is a `(forall vars body)` with a CLOSED, quantifier-free
@@ -1156,7 +1191,24 @@ impl Executor {
         let result = self.try_partition_rescue(result, &pre_dispatch_assertions);
 
         // Map theory-solve result through quantifier/CEGQI semantics and restore assertions.
-        self.set_active_solve_phase("quantifier-result-mapping", "quantifier-result-mapping");
+        //
+        // The phase/cost-centre label must not CLAIM quantifiers on a
+        // quantifier-free problem. This site used to stamp
+        // `quantifier-result-mapping` UNCONDITIONALLY, and because
+        // `record_unknown_diagnostic` inherits the ACTIVE phase for
+        // `Incomplete`/`Unknown`/`Timeout`/`Interrupted`, every unknown that
+        // reached the end without a more specific phase was labelled a
+        // quantifier cost centre. Measured on QF_UFIDL (a quantifier-FREE logic)
+        // 9 of 12 sampled files reported cost centre `quantifier-result-mapping`
+        // with zero `forall`/`exists` in the source, and QF_ABVFP does the same —
+        // pointing every triager at a phantom quantifier bug on two of the
+        // largest divisions in the campaign. Label by what is actually being
+        // mapped. DIAGNOSTIC-ONLY: no verdict path reads the phase string.
+        if features.has_quantifiers {
+            self.set_active_solve_phase("quantifier-result-mapping", "quantifier-result-mapping");
+        } else {
+            self.set_active_solve_phase("ground-result-mapping", "ground-result-mapping");
+        }
         let mapping_started_at = Instant::now();
         let quantifier_loop_restores = qr.original_assertions.is_some();
         let mapped = self.map_quantifier_result(result, qr, category);
@@ -2763,6 +2815,27 @@ impl Executor {
         // reconfirm under proofs and survive unchanged. Fires AT MOST ONCE per
         // check-sat (reentry latch) and only when proofs are off, so proof-mode and
         // proof-consuming callers never pay a second solve.
+        //
+        // #proof-capability B2 decision — KEPT IN v1 UNDER COMPETITION MODE.
+        // This arm gates on `is_producing_proofs()` (the explicit user demand),
+        // NOT on the tracker, and it re-enables proofs ITSELF via
+        // `set_produce_proofs(true)`, so the competition master switch (the
+        // `begin_public_solve` tracker shed) does not and MUST NOT turn it
+        // off. That is deliberate: the non-string sequence theory is not a
+        // complete decision procedure (fail-close territory, P0.1), and in a
+        // shedding run the mandatory certificate that normally backstops a
+        // seq UNSAT is the very thing being shed — this corroboration is then
+        // the ONLY net between an unsound seq refutation and a published
+        // `unsat`. It is also demote-only (reconfirm keeps the verdict;
+        // anything else degrades to `unknown`), so keeping it can never cost
+        // correctness, only time. COST, stated honestly: one full proof-mode
+        // `cegar_refine_solve` re-solve — with clause tracing, LRAT, and
+        // theory-lemma recording armed — per non-string-seq UNSAT, at most
+        // once per check-sat, triggered by the assertions merely MENTIONING a
+        // non-string Seq sort (see the retained-proof note below). In a
+        // competition run that is a real, accepted second-solve cost on seq
+        // instances; shedding it is a B3+ decision that would require a
+        // vetted replacement net, not a gate flip here.
         if result.is_unsat()
             && !self.is_producing_proofs()
             && !self.corroborating_nonstring_seq_unsat
@@ -2891,7 +2964,11 @@ impl Executor {
                     .all(|&a| a == self.ctx.terms.true_term()),
             "BUG: check_sat returned SAT without populating last_model"
         );
-        // Postcondition: UNSAT with proofs enabled must produce a proof
+        // Postcondition: UNSAT with proofs enabled must produce a proof.
+        // B2 audit: under competition shedding the tracker is off, so the
+        // `!produce_proofs_enabled()` disjunct makes this vacuously true —
+        // correct, since no proof is built to assert about; publication still
+        // fail-closes without a certificate.
         debug_assert!(
             !self.last_result.as_ref().is_some_and(SolveResult::is_unsat)
                 || self.last_proof.is_some()
@@ -3312,7 +3389,21 @@ impl Executor {
         // would desynchronize the unsat-proof reconstruction from the user
         // assertion set. Sound either way — without refinement the verdict is a
         // sound Unknown, exactly the pre-CEGAR behavior (assertions untouched).
-        if self.produce_proofs_enabled() {
+        //
+        // `is_producing_proofs`, NOT `produce_proofs_enabled` — this loop was
+        // DEAD, not opted out. `begin_public_solve` turns the tracker on for
+        // every public decision (the mandatory UNSAT certificate does not depend
+        // on `:produce-proofs`), so `produce_proofs_enabled()` is always true on
+        // the public path and this returned before the loop in EVERY mode.
+        //
+        // That is a known regression class, not a judgement call: the doc on
+        // `produce_proofs_enabled` in `proof.rs` already lists TEN passes written
+        // against the old meaning that silently stopped firing when the
+        // certificate became mandatory — two QF_ABV instances regressed
+        // `unsat` -> `unknown` as a direct result — and records that they were
+        // moved to `is_producing_proofs()`, which still means what their comments
+        // say. This was a missed eleventh site.
+        if self.is_producing_proofs() {
             return Ok(result);
         }
         loop {
@@ -3342,11 +3433,162 @@ impl Executor {
                     self.cegar_rounds_remaining, lemma.0
                 );
             }
-            result = self.check_sat_internal()?;
+            // Restore on the ERROR path too. The `?` here would return with the
+            // injected lemmas still in `ctx.assertions`, because the restore
+            // below sits after the loop — leaking solver-derived lemmas into the
+            // user-visible assertion set for the remainder of an incremental
+            // session. That leak was unreachable while the guard above made this
+            // loop dead code; re-enabling the loop makes it reachable, so it is
+            // fixed in the same change rather than left as a new latent bug.
+            result = match self.check_sat_internal() {
+                Ok(next) => next,
+                Err(err) => {
+                    self.ctx.assertions = cegar_snapshot;
+                    return Err(err);
+                }
+            };
         }
         // Drop the injected lemmas from the user-visible assertion set.
-        self.ctx.assertions = cegar_snapshot;
-        Ok(result)
+        self.ctx.assertions = cegar_snapshot.clone();
+        self.deep_qe_unknown_retry(result, &cegar_snapshot)
+    }
+
+    /// #qe-prepass: re-solve an `Unknown` quantified query with the deep-QE
+    /// pre-pass armed.
+    ///
+    /// The pre-pass replaces an authored quantifier with a candidate
+    /// quantifier-free equivalent. That is a SOLVING-ENGINE choice and never
+    /// publication authority: SAT is still re-checked by the mandatory
+    /// independent gate against `independent_gate_query_roots()` (the AUTHORED
+    /// window, captured before any in-place pass), and an UNSAT reached from a
+    /// rewritten premise cannot present a strict proof, because the replacement
+    /// is not in the authored `Assume` scope
+    /// (`complete_problem_assertions_for_strict_proof` is built from captured
+    /// provenance, deliberately not from `ctx.assertions`).
+    ///
+    /// That is measured, not assumed — and the measurement also fixes WHICH
+    /// layer is doing the work. Mutating the eliminator to report the
+    /// maximally-WRONG result (every quantified assertion replaced by `false`,
+    /// so the rewritten query is trivially refutable) over
+    /// `-p ay-dpll --lib -- quantifier::`, 297 tests:
+    ///
+    /// * No PUBLISHED verdict moved. None of the suite's sixteen directional
+    ///   guards ("a valid ∀∃ sentence must never answer unsat", "satisfiable
+    ///   existential refuted", …) fired, and the multiset of published verdicts
+    ///   among failing tests was identical to the unmutated run.
+    /// * The RAW `Executor::check_sat` result did move: two `deferred::` tests
+    ///   that call it directly saw `Unsat` where they require `Sat`/`Unknown`.
+    ///   That entry point is pre-certification by design, and this is the layer
+    ///   the `quantified_proof_translation_incomplete` fence at the pre-pass site
+    ///   does NOT reach once elimination leaves the query ground, because the
+    ///   quantifier loop's result mapping — the fence's only consumer — no longer
+    ///   runs. Mandatory publication certification is what absorbs it.
+    ///
+    /// So: with a broken elimination this lane costs a wasted solve rather than
+    /// an answer, but only because publication is certified. Do not promote a QE
+    /// result past that boundary, and do not read the fence as covering the
+    /// ground path.
+    ///
+    /// It runs HERE, on the `Unknown` fallback, rather than unconditionally in
+    /// `check_sat_internal_preprocess_and_solve`, and that placement is a
+    /// measured requirement, not caution. Adopting the rewrite before every
+    /// solve ERASES the authored quantified shape that the exact-semantic UNSAT
+    /// lanes (`CheckedExactClosedForall` and siblings) and the CEGQI SAT
+    /// authorities match on, so problems those lanes decide today fail closed
+    /// instead: measured on `-p ay-dpll --lib -- quantifier::`, an unconditional
+    /// pre-pass turned ELEVEN passing tests into `unknown`
+    /// (`qe_prepass_ndiv_duality_twin_unsat` — an authored closed `forall` the
+    /// precheck refutes exactly — plus nine CEGQI arithmetic tests and
+    /// `test_forall_infeasible_linear_eq_still_unsat`). On the `Unknown`
+    /// fallback there is by construction no verdict to lose: the retry can only
+    /// replace `Unknown` with a verdict that has itself cleared every mandatory
+    /// gate, and a retry that stays `Unknown` leaves the original answer.
+    ///
+    /// Caller contract: `ctx.assertions` must already be restored to the
+    /// authored snapshot, which is also passed as `authored` so the retry can
+    /// restore it again on every exit path.
+    fn deep_qe_unknown_retry(
+        &mut self,
+        result: SolveResult,
+        authored: &[TermId],
+    ) -> Result<SolveResult> {
+        if !matches!(result, SolveResult::Unknown) {
+            return Ok(result);
+        }
+        // One attempt per public solve: the retry re-enters `check_sat_internal`,
+        // which reaches this same boundary.
+        if self.deep_qe_retry_armed {
+            return Ok(result);
+        }
+        // A caller that asked for a proof ARTIFACT keeps the exact quantified
+        // source: the instantiation lanes must be able to derive their ground
+        // instances from the authored `forall` with `forall_inst`, and a QE
+        // replacement has no such derivation. `cegar_refine_solve` already
+        // returns before reaching here in that mode; stating the condition in
+        // the lane that depends on it keeps the guarantee local, so moving that
+        // early return cannot silently opt proof mode into a rewrite.
+        if self.is_producing_proofs() {
+            return Ok(result);
+        }
+        // Nothing for the pre-pass to eliminate, so nothing to gain: never pay
+        // a second solve on a ground problem.
+        if !authored
+            .iter()
+            .any(|&a| contains_quantifier(&self.ctx.terms, a))
+        {
+            return Ok(result);
+        }
+        // An interrupt/deadline already landed: a second full solve would only
+        // burn the caller's remaining budget to reach the same `Unknown`.
+        if self.should_abort_theory_loop() {
+            return Ok(result);
+        }
+        // Only re-solve when the pre-pass actually produces a DIFFERENT problem.
+        //
+        // Without this the lane is a blanket "solve every undecided query
+        // twice", which is a different and much more expensive feature: it pays
+        // a second full solve on EVERY quantified `Unknown`, including the
+        // overwhelming majority the pre-pass refuses outright (its fragment
+        // screen rejects UF / arrays / nonlinear before any NNF or DNF work).
+        // Probing first makes the lane's cost proportional to its applicability
+        // and makes it do what its name says: re-solve a problem that changed.
+        //
+        // The probe runs on a COPY: the rewrite must not be adopted here.
+        // `check_sat_internal` installs `independent_gate_authored_assertions`
+        // from whatever `ctx.assertions` holds on entry, so handing it a
+        // pre-rewritten vector would point the mandatory SAT gate at the
+        // REWRITTEN roots instead of the authored ones. Adoption therefore stays
+        // at the in-solve pre-pass site, which runs after that capture. Terms the
+        // probe interns are hash-consed and bounded by the pre-pass's own DNF /
+        // elimination caps; the in-solve run re-uses them.
+        //
+        // The probe answers on the AUTHORED vector while the in-solve pre-pass
+        // sees the preprocessed one, so the two can disagree. A probe false
+        // negative keeps today's `Unknown` (identical to the pre-change
+        // behaviour, fail-closed); a false positive costs one extra solve.
+        let mut probe = authored.to_vec();
+        if !crate::executor::qe_prepass::deep_qe(
+            &mut self.ctx.terms,
+            &mut probe,
+            self.solve_interrupt.as_deref(),
+        ) {
+            return Ok(result);
+        }
+        self.prepass_reachability.deep_qe_unknown_retries += 1;
+        self.deep_qe_retry_armed = true;
+        let retry = self.check_sat_internal();
+        self.deep_qe_retry_armed = false;
+        self.ctx.assertions = authored.to_vec();
+        match retry {
+            // A definite verdict has passed the same mandatory certification as
+            // any other; adopt it together with the artifacts it published.
+            Ok(definite @ (SolveResult::Sat | SolveResult::Unsat(_))) => Ok(definite),
+            // The retry failed closed. Its `Unknown` is the published state, so
+            // return it rather than the pre-retry value: both are `Unknown`, and
+            // `Unknown` has already revoked every artifact either solve emitted.
+            Ok(unknown) => Ok(unknown),
+            Err(err) => Err(err),
+        }
     }
 
     // ========================================================================
@@ -3990,6 +4232,9 @@ impl Executor {
                     );
                 }
                 SolveResult::Unsat(_) => {
+                    // B2 audit: vacuously true under competition shedding
+                    // (tracker off) — correct; see the sibling postcondition
+                    // at the outer check_sat boundary.
                     debug_assert!(
                         self.last_proof.is_some()
                             || self.last_unsat_proof_reconstruction_suppressed

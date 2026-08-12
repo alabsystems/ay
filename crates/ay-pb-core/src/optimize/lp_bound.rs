@@ -133,20 +133,24 @@ const CUT_LOOP_MAX_WORK_PROXY: u128 = 2_000_000;
 /// less tight. Keeps a single LP-bound call from monopolizing the solver budget.
 const CUT_LOOP_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// Wall-clock budget for the advisory f64 simplex inside the certified middle
-/// tier ([`LpModel::solve_dual_f64_certified`]). Deliberately TINY: measured on
-/// the i128-overflow corpus, the models this tier wins on converge almost
-/// instantly (hw32, 3.2k vars / 262 rows: certifies the exact tier's floor in
-/// ~20ms under heavy machine load), models at 2^30+ objective scale exit early
-/// but fail certification (~75ms; f64 pricing tolerances are relative, so no
-/// budget can pin a unit-precision bound there), and the degenerate-stalling
-/// families (domset) only drift FURTHER from optimality with more time (their
-/// NS dual estimate at 20s is worse than at 1.5s). So a small budget captures
-/// every win, and its only cost is <=150ms subtracted from the exact tier's
-/// root budget on models where the tier fails closed — measured (3-run A/B of
-/// the exact tier at 4.85s vs 5s) to change those floors only within run-to-run
-/// load jitter (±2 units, both directions). Expiry can never cause a wrong
-/// bound (fail-closed on the convergence check).
-const F64_TIER_SIMPLEX_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+/// tier ([`LpModel::solve_dual_f64_certified`]).
+///
+/// This was 150ms, and the reason recorded for keeping it that small was that
+/// "the degenerate-stalling families (domset) only drift FURTHER from optimality
+/// with more time (their NS dual estimate at 20s is worse than at 1.5s)". That
+/// premise no longer holds: the advisory simplex now crashes a covering LP at a
+/// feasible point and prices with Devex, so `..._mw19_19` (467 vars / 466 rows)
+/// converges to LP* = 138.086 in ~1.7k iterations and the whole certified tier
+/// — simplex plus the exact bigint verification pass — returns the tight floor
+/// 139 in ~280ms. At 150ms it expired mid-solve and failed closed, handing the
+/// model to the BigRational tier, which spent 60s to return 44.
+///
+/// 500ms is sized off that measurement with room to spare, and the downside is
+/// unchanged in kind: this tier is only reached when the exact small tier
+/// already overflowed or stalled, and an expiry still fails closed on the
+/// convergence check, so the cost of a miss is bounded by this budget and the
+/// cost of a wrong f64 dual is zero (the bound is re-derived exactly).
+const F64_TIER_SIMPLEX_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 /// Quality gate of the certified tier: reject (fall back to the exact path) when
 /// the certified exact bound sits more than this RELATIVE slack below the f64
 /// solve's own primal objective estimate — a converged-looking dual whose

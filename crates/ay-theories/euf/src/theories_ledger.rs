@@ -100,7 +100,7 @@ pub const KNOBS: &[Knob] = &[
         name: "AY_DEBUG_ARR_EXTRACT",
         crate_name: "arrays",
         bucket: Bucket::Diagnostic,
-        read_sites: 2,
+        read_sites: 3,
     },
     Knob {
         name: "AY_DEBUG_EUF_INIT",
@@ -117,6 +117,12 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "AY_DT_D1_TRANSFER",
         crate_name: "dt",
+        bucket: Bucket::Tuning,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_EUF_ATOM_FILTER",
+        crate_name: "euf",
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
@@ -274,6 +280,12 @@ pub const KNOBS: &[Knob] = &[
         name: "AY_LRA_WARM_SIMPLEX_STATE",
         crate_name: "lra",
         bucket: Bucket::Diagnostic,
+        read_sites: 1,
+    },
+    Knob {
+        name: "AY_NIA_NO_CLAUSAL_SLS",
+        crate_name: "nia",
+        bucket: Bucket::KillSwitch,
         read_sites: 1,
     },
     Knob {

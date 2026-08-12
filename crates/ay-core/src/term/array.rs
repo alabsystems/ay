@@ -714,6 +714,27 @@ impl TermStore {
         self.substitute_terms_inner(term, map, &mut cache)
     }
 
+    /// [`Self::substitute_terms`] that RECORDS the rewrite correspondence.
+    ///
+    /// `cache` accumulates `original -> rewritten` for every sub-term the walk
+    /// visits, and is reused across calls so one shared cache describes the
+    /// whole assertion set. A caller that rewrites the assertions a solver then
+    /// reasons about needs this to map an ORIGINAL sub-term back to the term
+    /// the solver actually committed a value for; without it the original is
+    /// orphaned — present in no assertion the solver saw, so pinned by no
+    /// model.
+    pub fn substitute_terms_recording(
+        &mut self,
+        term: TermId,
+        map: &crate::kani_compat::DetHashMap<TermId, TermId>,
+        cache: &mut crate::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if map.is_empty() {
+            return term;
+        }
+        self.substitute_terms_inner(term, map, cache)
+    }
+
     fn substitute_terms_inner(
         &mut self,
         term: TermId,

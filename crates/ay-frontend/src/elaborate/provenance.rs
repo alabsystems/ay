@@ -22,6 +22,10 @@ use super::{Context, SymbolInfo};
 /// Maximum number of distinct reachable terms accepted by the source-binding
 /// checker.
 const MAX_PROJECTION_BINDING_TERMS: usize = 10_000_000;
+/// Small post-solve consumers may request a hard preflight before invoking
+/// declaration checks whose legacy lookup walks the live signature table.
+const MAX_BOUNDED_PROJECTION_DECLARATIONS: usize = 16_384;
+const MAX_BOUNDED_PROJECTION_IDENTITY_BYTES: usize = 256;
 
 /// Opaque, stable identity of one source declaration.
 ///
@@ -352,6 +356,28 @@ pub enum ProjectionBindingRejection {
 }
 
 impl Context {
+    /// Whether every live declaration lookup fits the bounded projection
+    /// envelope. Call this before repeated exact-identity authentication in a
+    /// post-solve path that cannot charge arbitrary frontend inventory scans.
+    #[must_use]
+    pub fn bounded_projection_declaration_inventory_size(&self) -> Option<usize> {
+        let mut count = 0usize;
+        for (surface, info) in self
+            .symbol_iter()
+            .take(MAX_BOUNDED_PROJECTION_DECLARATIONS + 1)
+        {
+            count = count.checked_add(1)?;
+            if count > MAX_BOUNDED_PROJECTION_DECLARATIONS
+                || surface.len() > MAX_BOUNDED_PROJECTION_IDENTITY_BYTES
+                || self.symbol_identity_name(surface, info).len()
+                    > MAX_BOUNDED_PROJECTION_IDENTITY_BYTES
+            {
+                return None;
+            }
+        }
+        Some(count)
+    }
+
     /// Capture the current opaque source context/scope stamp.
     #[must_use]
     pub fn source_context_stamp(&self) -> SourceContextStamp {

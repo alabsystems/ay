@@ -3936,3 +3936,428 @@ fn single_shot_query_tracks_scope_and_check_sat_commands() {
         .expect("check-sat-assuming");
     assert!(!ctx.is_single_shot_query());
 }
+
+// ---------------------------------------------------------------------------
+// AY-internal name namespaces (`INTERNAL_NAMESPACES`) — the shared reserved set
+// ---------------------------------------------------------------------------
+
+/// The `map[...]` capture channel, closed at its source.
+///
+/// `TermStore::get_array_map` treats ANY `App` named `map[<f>]` as the array
+/// map of `<f>`, so a user function declared `|map[f]|` silently acquired map
+/// semantics. Pinned oracle z3 5.0.0 answers `sat` on this exact script; AY
+/// answered `unsat` — a false PROVE. The declaration must now be refused by
+/// the CORE elaborator (previously only `ay-ffi` knew about the namespace).
+#[test]
+fn test_array_map_namespace_declaration_is_rejected_by_the_core_elaborator() {
+    let commands = parse(
+        "(declare-fun f (Int) Int)\
+         (declare-fun |map[f]| ((Array Int Int)) (Array Int Int))",
+    )
+    .expect("fixture parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0]).expect("plain f declares");
+    let rejected = ctx
+        .process_command(&commands[1])
+        .expect_err("`map[f]` is captured by TermStore::get_array_map");
+    assert!(
+        matches!(&rejected, ElaborateError::ReservedSymbol(name) if name == "map[f]"),
+        "expected ReservedSymbol(map[f]), got {rejected:?}"
+    );
+}
+
+/// The invariant behind the `map[...]` row, DERIVED from the matcher instead
+/// of pinned to the spelling.
+///
+/// What must hold is not "the name `map[f]` is reserved" but: no USER
+/// declaration may ever produce a term that `TermStore::get_array_map` claims
+/// — because claiming it licenses `select(map[f](a..), i) → f(select(a, i)..)`
+/// on a symbol the user meant as uninterpreted. So elaborate the application
+/// and ask `get_array_map` itself. A future change that keeps the name
+/// declarable but stops the matcher from claiming a user symbol satisfies this
+/// test; a change that merely un-reserves the name does not.
+#[test]
+fn test_no_user_declaration_can_produce_a_term_the_array_map_matcher_claims() {
+    fn claimed_by_array_map(terms: &TermStore, root: TermId) -> bool {
+        if terms.get_array_map(root).is_some() {
+            return true;
+        }
+        match terms.get(root) {
+            TermData::App(_, args) => {
+                let children = args.clone();
+                children
+                    .into_iter()
+                    .any(|arg| claimed_by_array_map(terms, arg))
+            }
+            TermData::Not(inner) => claimed_by_array_map(terms, *inner),
+            _ => false,
+        }
+    }
+
+    let source = "(declare-fun f (Int) Int)\
+                  (declare-fun |map[f]| ((Array Int Int)) (Array Int Int))\
+                  (declare-const a (Array Int Int))\
+                  (declare-const b (Array Int Int))\
+                  (assert (= b (|map[f]| a)))";
+    let commands = parse(source).expect("fixture parses");
+    let mut ctx = Context::new();
+    let outcome = commands
+        .iter()
+        .try_fold((), |(), cmd| ctx.process_command(cmd).map(|_| ()));
+    // Disjunct 1: refused — fail-closed, and what AY does today.
+    if outcome.is_err() {
+        return;
+    }
+    // Disjunct 2: accepted, so the matcher must NOT claim the resulting term.
+    let root = *ctx
+        .assertions
+        .last()
+        .expect("the fixture's assertion elaborated");
+    assert!(
+        !claimed_by_array_map(&ctx.terms, root),
+        "a user `declare-fun` produced a term that `TermStore::get_array_map` \
+         claims as the array map of `f`; the array rewriter will apply \
+         `select(map[f](a..), i) -> f(select(a, i)..)` to the user's \
+         uninterpreted symbol — measured false PROVE (pinned z3 5.0.0 `sat`, \
+         AY computed `unsat`)"
+    );
+}
+
+/// Every declaration form must be gated, not just `declare-fun`: each one
+/// registers a symbol whose applications the array-map matcher would capture.
+#[test]
+fn test_array_map_namespace_is_rejected_in_every_declaration_form() {
+    for source in [
+        "(declare-fun |map[f]| ((Array Int Int)) (Array Int Int))",
+        "(declare-const |map[f]| Int)",
+        "(define-fun |map[f]| ((x Int)) Int x)",
+        "(define-fun-rec |map[f]| ((x Int)) Int x)",
+        "(declare-datatype |map[f]| ((mk)))",
+        "(declare-datatype D ((|map[f]| (fld Int))))",
+        "(declare-datatype D ((mk (|map[f]| Int))))",
+    ] {
+        let commands = parse(source).unwrap_or_else(|e| panic!("`{source}` parses: {e:?}"));
+        let mut ctx = Context::new();
+        let outcome = commands
+            .iter()
+            .try_fold((), |(), cmd| ctx.process_command(cmd).map(|_| ()));
+        assert!(
+            matches!(outcome, Err(ElaborateError::ReservedSymbol(_))),
+            "`{source}` must be refused with ReservedSymbol, got {outcome:?}"
+        );
+    }
+}
+
+/// Do NOT over-reserve. The namespace test is RE-DERIVED from the matcher
+/// (`starts_with("map[") && ends_with(']')`), so spellings the matcher does
+/// not capture stay legal user symbols.
+#[test]
+fn test_names_the_array_map_matcher_cannot_capture_stay_declarable() {
+    for name in ["map[f", "mapf]", "amap[f]", "map_f", "[map]"] {
+        assert!(
+            !is_source_reserved_symbol(name),
+            "`{name}` is not captured by get_array_map and must stay declarable"
+        );
+    }
+    // And the elaborator agrees end-to-end for a quoted near-miss.
+    let commands = parse("(declare-fun |map[f| ((Array Int Int)) (Array Int Int))")
+        .expect("near-miss fixture parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("`map[f` is not an array-map spelling and must stay declarable");
+}
+
+/// The embedder-minted `!ay.*` witness namespace is refused to SMT-LIB SOURCE
+/// TEXT but must stay available to the in-process native API that mints it.
+///
+/// Capture channel: `Z3_mk_ext` mints `!ay.array-ext!<n>` and axiomatizes it
+/// with `a != b => select(a,k) != select(b,k)`. `Solver::try_declare_const` is
+/// idempotent at an identical sort, so source text that declared
+/// `|!ay.array-ext!0|` first would have that axiom attached to ITS constant —
+/// an over-constraint, i.e. a sat→unsat channel.
+#[test]
+fn test_engine_witness_namespace_is_refused_to_source_text_but_not_to_the_native_api() {
+    for witness in [
+        "!ay.array-ext!0",
+        "!ay.z3-func!7",
+        "!ay.z3-const!3",
+        "!ay.char2bv!0",
+        "!ay.finite-set-sort!1",
+    ] {
+        assert!(
+            is_source_reserved_symbol(witness),
+            "source text must not be able to declare engine witness `{witness}`"
+        );
+        assert!(
+            !is_reserved_symbol(witness),
+            "the native API MINTS `{witness}` and must keep declaring it"
+        );
+    }
+
+    // End-to-end: the SMT-LIB text route refuses it …
+    let commands = parse("(declare-const |!ay.array-ext!0| Int)").expect("fixture parses");
+    let mut ctx = Context::new();
+    let rejected = ctx
+        .process_command(&commands[0])
+        .expect_err("source text cannot capture an engine witness");
+    assert!(
+        matches!(&rejected, ElaborateError::ReservedSymbol(name) if name == "!ay.array-ext!0"),
+        "expected ReservedSymbol, got {rejected:?}"
+    );
+
+    // … while the native/embedder route (the one ay-ffi uses) still mints it.
+    let mut ctx = Context::new();
+    ctx.execute_native_global_declaration(&Command::DeclareConst(
+        "!ay.array-ext!0".to_string(),
+        crate::command::Sort::Simple("Int".to_string()),
+    ))
+    .expect("the native API retains minting authority over its own namespace");
+}
+
+/// `__ay_` keeps its pre-existing "refused on every route" status: unlike
+/// `!ay.*`, it is never a DECLARED surface name — the elaborator mints it as a
+/// private core identity — so no route has minting authority over it.
+#[test]
+fn test_elaborator_private_identity_namespace_is_refused_on_every_route() {
+    assert!(is_reserved_symbol("__ay_overload_0"));
+    assert!(is_source_reserved_symbol("__ay_overload_0"));
+    let mut ctx = Context::new();
+    ctx.execute_native_global_declaration(&Command::DeclareConst(
+        "__ay_overload_0".to_string(),
+        crate::command::Sort::Simple("Int".to_string()),
+    ))
+    .expect_err("no route may declare an elaborator private identity");
+}
+
+/// DRIFT GUARD — the anti-regression this change exists to install.
+///
+/// `ay-ffi` used to carry its own hand-spelled copy of the reserved-namespace
+/// test (`reserved_name_error`), and the core frontend's copy was MISSING the
+/// `map[...]` rule entirely; that divergence was the live false-PROVE channel.
+/// Both gates now read `INTERNAL_NAMESPACES`, so this test re-extracts every
+/// `!`-marked internal identity that `ay-ffi` MINTS, straight from its sources,
+/// and fails if any one of them is not covered by the shared table — i.e. if a
+/// future `ay-ffi` change invents a namespace the core would not refuse.
+///
+/// LIMIT (documented deliberately): extraction keys on AY's `!`-marker
+/// convention for engine identities. A brand-new marker character would not be
+/// seen here; the companion `ay-ffi` test pins the two predicates to the same
+/// function so such a namespace would at least be missing from BOTH gates
+/// rather than only one.
+#[test]
+fn test_internal_namespace_table_covers_every_ffi_minted_identity() {
+    use crate::elaborate::internal_namespace_of;
+    use std::path::Path;
+
+    /// Static prefix of a `format!("…")` literal: the text before the first
+    /// `{` placeholder. `format!("!ay.z3-func!{id}")` → `!ay.z3-func!`.
+    fn format_literal_prefixes(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(pos) = rest.find("format!(\"") {
+            let after = &rest[pos + 9..];
+            let Some(end) = after.find('"') else { break };
+            let literal = &after[..end];
+            out.push(literal.split('{').next().unwrap_or("").to_string());
+            rest = &after[end + 1..];
+        }
+        out
+    }
+
+    let ffi_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ay-ffi/src/z3_compat");
+    let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(&ffi_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ffi_dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    sources.sort();
+    assert!(
+        sources.len() >= 5,
+        "ay-ffi source scan found only {} files — extractor broken?",
+        sources.len()
+    );
+
+    let mut minted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for source in &sources {
+        let text = std::fs::read_to_string(source)
+            .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
+        for line in text.lines() {
+            for prefix in format_literal_prefixes(line) {
+                // AY marks engine-minted identities with a leading `!`.
+                if prefix.starts_with('!') {
+                    minted.insert(prefix);
+                }
+            }
+        }
+    }
+
+    // Non-vacuity: the extractor must SEE the known witness families.
+    for must_see in ["!ay.z3-func!", "!ay.array-ext!", "!ay.z3-const!"] {
+        assert!(
+            minted.contains(must_see),
+            "extraction failed to find known engine identity `{must_see}` — extractor broken?"
+        );
+    }
+    assert!(
+        minted.len() >= 6,
+        "extraction looks broken: only {} engine identities found",
+        minted.len()
+    );
+
+    let uncovered: Vec<&String> = minted
+        .iter()
+        // Instantiate the placeholder with a concrete index, exactly as the
+        // engine does, then ask the SHARED table.
+        .filter(|prefix| internal_namespace_of(&format!("{prefix}0")).is_none())
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "ay-ffi mints engine identities in namespaces the core frontend would NOT \
+         refuse to user source text — add each to INTERNAL_NAMESPACES: {uncovered:?}"
+    );
+}
+
+/// The scope column drives the gates — pinned so it cannot become decorative.
+///
+/// `is_source_reserved_symbol` must refuse EVERY row (source text has minting
+/// authority over nothing); `is_reserved_symbol` must refuse exactly the
+/// `EveryRoute` rows. This is checked by iterating the table, so adding a row
+/// or flipping a scope is immediately visible in both predicates rather than
+/// silently applying to one.
+#[test]
+fn test_namespace_scope_column_drives_both_declaration_gates() {
+    use crate::elaborate::{InternalNamespaceScope, INTERNAL_NAMESPACES};
+
+    for namespace in INTERNAL_NAMESPACES {
+        let probe = format!("{}probe{}", namespace.prefix, namespace.suffix);
+        assert!(
+            is_source_reserved_symbol(&probe),
+            "`{probe}` is in the internal-namespace table but untrusted SMT-LIB \
+             source text can still declare it"
+        );
+        assert_eq!(
+            is_reserved_symbol(&probe),
+            namespace.scope == InternalNamespaceScope::EveryRoute,
+            "`{probe}` scope is {:?} but `is_reserved_symbol` (the every-route \
+             gate, which also binds the native `Solver` API) disagrees",
+            namespace.scope
+        );
+    }
+}
+
+/// The internal namespaces are UNCONDITIONAL — no `set-logic` narrows them.
+///
+/// They are AY's OWN minted vocabulary, not a theory's, so no logic makes them
+/// declarable. This guards against a future "reserve only what the active logic
+/// interprets" relaxation quietly sweeping them along: `TermStore::get_array_map`
+/// matches `map[...]` with no logic check at all, and `!ay.*`/`__ay_` are minted
+/// regardless of logic.
+#[test]
+fn test_internal_namespaces_are_not_relaxed_by_any_logic() {
+    for source in [
+        "(set-logic QF_UF)(declare-fun |map[f]| (Int) Int)",
+        "(set-logic QF_UF)(declare-const |!ay.array-ext!0| Int)",
+        "(set-logic QF_UF)(declare-const |__ay_overload_0| Int)",
+        "(set-logic BOOL)(declare-fun |map[f]| (Int) Int)",
+        "(set-logic ALL)(declare-fun |map[f]| (Int) Int)",
+    ] {
+        let commands = parse(source).unwrap_or_else(|e| panic!("`{source}` parses: {e:?}"));
+        let mut ctx = Context::new();
+        let outcome = commands
+            .iter()
+            .try_fold((), |(), cmd| ctx.process_command(cmd).map(|_| ()));
+        assert!(
+            matches!(outcome, Err(ElaborateError::ReservedSymbol(_))),
+            "`{source}` must stay refused regardless of logic, got {outcome:?}"
+        );
+    }
+}
+
+/// A qualified-`(as …)`-path spelling may be un-reserved ONLY together with a
+/// declared-shadowing guard. DERIVED, not pinned by name.
+///
+/// `elaborate_qualified_app` matches the parsed NAME (`seq.empty`, `set.empty`,
+/// `multiset.empty`, `map.empty`) and returns the builtin BEFORE it consults
+/// the declared-symbol table. Of the five qualified-path arms only `const`
+/// guards on `!self.symbols.contains_key("const")`. So the invariant that
+/// actually has to hold is a DISJUNCTION, and this test checks exactly it:
+///
+///   for every intercepted spelling — EITHER the declaration is refused,
+///   OR `(as NAME SORT)` denotes the SAME term as the bare declared `NAME`.
+///
+/// A future change that adds the missing shadowing guards satisfies the second
+/// disjunct and this test keeps passing; a change that merely stops reserving
+/// the names satisfies NEITHER and this test fails. That is the difference
+/// between the good half of commit 786a640881 and the half rejected on
+/// measurement: un-reserving `RESERVED_OP_NAMES` under the Bool-only logics
+/// (`QF_UF`/`UF`/`QF_DT`/`QF_UFDT`/`UFDT`/`BOOL`/`QF_BOOL`) was argued safe
+/// because AY forces theory-spelled declarations onto private core identities —
+/// but these four arms never ask for the symbol at all, so the private identity
+/// is never reached and the uses silently rebind. See
+/// `crates/ay-dpll/src/executor_tests/reserved_name_capture.rs` for the three
+/// measured end-to-end verdict reproducers.
+#[test]
+fn test_qualified_path_spellings_either_refuse_a_declaration_or_defer_to_it() {
+    use ay_core::{Symbol, TermData};
+
+    for logic in [
+        "", // no set-logic
+        "(set-logic BOOL)",
+        "(set-logic QF_BOOL)",
+        "(set-logic QF_UF)",
+        "(set-logic UF)",
+        "(set-logic QF_DT)",
+        "(set-logic QF_UFDT)",
+        "(set-logic UFDT)",
+        "(set-logic ALL)",
+    ] {
+        for (name, sort) in [
+            ("set.empty", "(Array E Bool)"),
+            ("multiset.empty", "(Array E Int)"),
+            ("map.empty", "(Array E Int)"),
+            // `seq.empty`'s arm demands a `(Seq _)` annotation, so give it one:
+            // an Array annotation would be refused by the arm's own sort check
+            // and the fixture would pass for the wrong reason.
+            ("seq.empty", "(Seq Int)"),
+        ] {
+            let source = format!(
+                "{logic}(declare-sort E 0)(declare-fun {name} () {sort})\
+                 (assert (= (as {name} {sort}) {name}))"
+            );
+            let commands = parse(&source).unwrap_or_else(|e| panic!("`{source}` parses: {e:?}"));
+            let mut ctx = Context::new();
+            let outcome = commands
+                .iter()
+                .try_fold((), |(), cmd| ctx.process_command(cmd).map(|_| ()));
+            // Disjunct 1: the declaration (or its use) is refused — fail-closed,
+            // and what AY does today.
+            if outcome.is_err() {
+                continue;
+            }
+            // Disjunct 2: the declaration was accepted, so every `(as NAME …)`
+            // use MUST denote that declared symbol. Compare the two elaborated
+            // operands of the equality by TermId — `TermStore` is hash-consed,
+            // so identical terms are the identical id.
+            let root = *ctx
+                .assertions
+                .last()
+                .expect("the fixture's assertion elaborated");
+            let deferred = match ctx.terms.get(root) {
+                TermData::Const(_) => true, // folded `(= t t)`
+                TermData::App(Symbol::Named(op), args) if op == "=" && args.len() == 2 => {
+                    args[0] == args[1]
+                }
+                other => panic!("unexpected elaborated equality shape for `{name}`: {other:?}"),
+            };
+            assert!(
+                deferred,
+                "`{name}` was accepted as a declaration under `{logic}` but \
+                 `(as {name} {sort})` still elaborates to the BUILTIN, not to the \
+                 declared symbol — `elaborate_qualified_app` matches the name \
+                 before declared-symbol resolution and (unlike `const`) this arm \
+                 has no shadowing guard, so every qualified use of the user's \
+                 symbol is silently rebound"
+            );
+        }
+    }
+}

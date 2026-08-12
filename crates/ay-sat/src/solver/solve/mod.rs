@@ -489,7 +489,10 @@ impl Solver {
         // Sized to cover all original clause IDs (1-based: ID 1..=N).
         // Each conflict analysis marks original antecedent clause IDs,
         // so the core is available immediately at UNSAT.
-        let num_originals = self.cold.next_original_clause_id.saturating_sub(1);
+        // Uses the issued-original max, not next_original_clause_id - 1:
+        // the late-original allocator jumps that counter past derived IDs,
+        // so it is not an original count (b93692341 follow-up).
+        let num_originals = self.cold.issued_original_clause_id_max;
         if self.cold.retain_unsat_certificate && num_originals > 0 {
             self.cold.streaming_core_num_originals = num_originals;
             self.cold.streaming_core = Some(vec![false; num_originals as usize]);

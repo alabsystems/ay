@@ -20,6 +20,16 @@ use crate::executor::model::{debug_model, Executor};
 use crate::executor_types::{ModelValidationError, Result, SolveResult, UnknownReason};
 use crate::features::StaticFeatures;
 
+const QFAX_STORE_WALK_LIMIT: usize = 256;
+const QFAX_CELL_RECURSION_LIMIT: usize = 32;
+const QFAX_CLAUSE_LITERAL_LIMIT: usize = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QfaxCellTerm {
+    Value(TermId),
+    BaseRead { index: TermId },
+}
+
 fn failed_assertion_contains_array(
     terms: &ay_core::term::TermStore,
     failed_assertion: Option<TermId>,
@@ -2071,198 +2081,214 @@ impl Executor {
         }
     }
 
-    /// #qfax-cegar: derive a SOUND blocking clause from an arrays rejection.
-    ///
-    /// When the violated assertion is `not (= chainA chainB)` over SAME-base
-    /// store chains, reduce both chains' cells SYMBOLICALLY under the
-    /// rejected model's index pattern: a cell is the write-value TERM of the
-    /// innermost store whose index matches the probe atom (recursing through
-    /// select-over-same-base-chain values), else the base-read term. If the
-    /// two sides reduce to STRUCTURALLY IDENTICAL terms (TermId equality —
-    /// hash-consing) at every written atom, the chain equality holds under
-    /// this index pattern FOR ALL element values, so the model's pattern can
-    /// never satisfy the negated equality: blocking it excludes no genuine
-    /// model. The clause's literals are the index-equality atoms consulted
-    /// during reduction, at their model values; pairs lacking an atom are
-    /// MINTED (lazy ROW-split atoms) so the dependency set is complete.
-    pub(in crate::executor) fn derive_qfax_refinement_clause(&mut self, violated: TermId) {
-        use ay_core::term::TermData;
-        if self.qfax_refinement_clause.is_some() {
-            return;
-        }
-        // Existence guard only: the reduction closures below re-borrow
-        // `self.last_model` themselves, allowing term interning to mutably
-        // borrow the context later.
-        if self.last_model.is_none() {
-            return;
-        }
-        let inner = match self.ctx.terms.get(violated) {
-            TermData::Not(i) => *i,
-            _ => return, // positive violations: not this shape
-        };
-        let TermData::App(sym, args) = self.ctx.terms.get(inner) else {
-            return;
-        };
-        if sym.name() != "=" || args.len() != 2 {
-            return;
-        }
-        if !matches!(self.ctx.terms.sort(args[0]), ay_core::Sort::Array(_)) {
-            return;
-        }
-        let walk = |terms: &ay_core::TermStore, mut t: TermId| {
-            let mut writes: Vec<(TermId, TermId)> = Vec::new();
-            while let TermData::App(s2, a2) = terms.get(t) {
-                if s2.name() != "store" || a2.len() != 3 {
-                    break;
-                }
-                writes.push((a2[1], a2[2]));
-                t = a2[0];
-            }
-            (writes, t)
-        };
-        let (wa, base_a) = walk(&self.ctx.terms, args[0]);
-        let (wb, base_b) = walk(&self.ctx.terms, args[1]);
-        if base_a != base_b || (wa.is_empty() && wb.is_empty()) {
-            return;
-        }
-        let base = base_a;
-        // Model atom per index term (the pattern).
-        let atom_of = |exec: &Self, t: TermId| -> Option<String> {
-            let m = exec.last_model.as_ref()?;
-            exec.eval_value_to_model_atom(&exec.evaluate_term(m, t))
-        };
-        // Dependency set: ordered index-term pairs consulted.
-        let mut dep_pairs: Vec<(TermId, TermId)> = Vec::new();
-        let mut note = |a: TermId, b: TermId, deps: &mut Vec<(TermId, TermId)>| {
-            let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
-            if a != b && !deps.contains(&key) {
-                deps.push(key);
-            }
-        };
-        // Symbolic cell reduction: returns the reduced value TERM.
-        fn cell_term(
-            exec: &Executor,
-            base: TermId,
-            atom_of_idx: &dyn Fn(TermId) -> Option<String>,
-            deps: &mut Vec<(TermId, TermId)>,
-            note: &mut dyn FnMut(TermId, TermId, &mut Vec<(TermId, TermId)>),
-            writes: &[(TermId, TermId)],
-            probe_idx: TermId,
-            probe_atom: &str,
-            depth: usize,
-        ) -> Option<Option<TermId>> {
-            // Some(Some(t)) = reduced to value term t; Some(None) = reduced
-            // to a base read at probe_atom; None = reduction FAILED (never
-            // treated as equal).
-            use ay_core::term::TermData;
-            if depth > 32 {
+    /// Walk one exact store chain within the QFAX refinement envelope.
+    pub(in crate::executor) fn exact_qfax_store_chain(
+        &self,
+        start: TermId,
+    ) -> Option<(Vec<(TermId, TermId)>, TermId)> {
+        let mut writes = Vec::new();
+        let mut seen = ay_core::kani_compat::DetHashSet::default();
+        let mut term = start;
+        loop {
+            if !seen.insert(term) {
                 return None;
             }
-            for &(i, v) in writes {
-                let ia = atom_of_idx(i)?;
-                note(i, probe_idx, deps);
-                if ia == probe_atom {
-                    // Written here: reduce the value term.
-                    if let TermData::App(vs, va) = exec.ctx.terms.get(v) {
-                        if vs.name() == "select" && va.len() == 2 {
-                            let mut t = va[0];
-                            let mut inner_writes: Vec<(TermId, TermId)> = Vec::new();
-                            while let TermData::App(s2, a2) = exec.ctx.terms.get(t) {
-                                if s2.name() != "store" || a2.len() != 3 {
-                                    break;
-                                }
-                                inner_writes.push((a2[1], a2[2]));
-                                t = a2[0];
-                            }
-                            if t == base {
-                                let pa = atom_of_idx(va[1])?;
-                                return cell_term(
-                                    exec,
-                                    base,
-                                    atom_of_idx,
-                                    deps,
-                                    note,
-                                    &inner_writes,
-                                    va[1],
-                                    &pa,
-                                    depth + 1,
-                                );
-                            }
-                        }
-                    }
-                    return Some(Some(v));
+            let Some((base, index, value)) = self.exact_cegar_store_parts(term) else {
+                return Some((writes, term));
+            };
+            if writes.len() >= QFAX_STORE_WALK_LIMIT {
+                return None;
+            }
+            writes.push((index, value));
+            term = base;
+        }
+    }
+
+    fn qfax_index_atom(&self, term: TermId) -> Option<String> {
+        let model = self.last_model.as_ref()?;
+        self.eval_value_to_model_atom(&self.evaluate_term(model, term))
+    }
+
+    fn note_qfax_dependency(
+        left: TermId,
+        right: TermId,
+        dependencies: &mut Vec<(TermId, TermId)>,
+    ) -> Option<()> {
+        if left == right {
+            return Some(());
+        }
+        let pair = if left.0 <= right.0 {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        if !dependencies.contains(&pair) {
+            if dependencies.len() + 1 >= QFAX_CLAUSE_LITERAL_LIMIT {
+                return None;
+            }
+            dependencies.push(pair);
+        }
+        Some(())
+    }
+
+    fn qfax_reduce_cell(
+        &self,
+        base: TermId,
+        writes: &[(TermId, TermId)],
+        probe_index: TermId,
+        probe_atom: &str,
+        dependencies: &mut Vec<(TermId, TermId)>,
+        depth: usize,
+    ) -> Option<QfaxCellTerm> {
+        if depth > QFAX_CELL_RECURSION_LIMIT {
+            return None;
+        }
+        for &(index, value) in writes {
+            let index_atom = self.qfax_index_atom(index)?;
+            Self::note_qfax_dependency(index, probe_index, dependencies)?;
+            if index_atom != probe_atom {
+                continue;
+            }
+            if let Some((array, nested_index)) = self.exact_cegar_select_parts(value) {
+                let (nested_writes, nested_base) = self.exact_qfax_store_chain(array)?;
+                if nested_base == base {
+                    let nested_atom = self.qfax_index_atom(nested_index)?;
+                    return self.qfax_reduce_cell(
+                        base,
+                        &nested_writes,
+                        nested_index,
+                        &nested_atom,
+                        dependencies,
+                        depth + 1,
+                    );
                 }
             }
-            // Falls through to the base: the cell is select(base, probe) —
-            // represent by the PROBE ATOM identity: two base reads are the
-            // same term iff their index atoms agree, which the pattern
-            // fixes. Encode as the probe index's canonical representative:
-            // find the first index term with this atom (deterministic).
-            let _ = probe_idx;
-            Some(None) // base read at probe_atom
+            return Some(QfaxCellTerm::Value(value));
         }
-        let atom_closure = |t: TermId| atom_of(self, t);
-        // Probe atoms: all written index atoms.
-        let mut atoms: Vec<(TermId, String)> = Vec::new();
-        for &(i, _) in wa.iter().chain(wb.iter()) {
-            if let Some(a) = atom_of(self, i) {
-                if !atoms.iter().any(|(_, x)| *x == a) {
-                    atoms.push((i, a));
-                }
+        Some(QfaxCellTerm::BaseRead { index: probe_index })
+    }
+
+    fn qfax_cells_provably_equal(
+        &self,
+        left: QfaxCellTerm,
+        right: QfaxCellTerm,
+        dependencies: &mut Vec<(TermId, TermId)>,
+    ) -> Option<()> {
+        match (left, right) {
+            (QfaxCellTerm::Value(left), QfaxCellTerm::Value(right)) => {
+                (left == right).then_some(())
             }
+            (QfaxCellTerm::BaseRead { index: left }, QfaxCellTerm::BaseRead { index: right }) => {
+                if self.ctx.terms.sort(left) != self.ctx.terms.sort(right)
+                    || self.qfax_index_atom(left)? != self.qfax_index_atom(right)?
+                {
+                    return None;
+                }
+                Self::note_qfax_dependency(left, right, dependencies)
+            }
+            _ => None,
         }
-        if atoms.is_empty() {
+    }
+
+    fn qfax_blocking_literals(
+        &mut self,
+        dependencies: Vec<(TermId, TermId)>,
+    ) -> Option<Vec<(TermId, bool)>> {
+        if dependencies.is_empty() || dependencies.len() >= QFAX_CLAUSE_LITERAL_LIMIT {
+            return None;
+        }
+        let mut literals = Vec::with_capacity(dependencies.len());
+        for (left, right) in dependencies {
+            if self.ctx.terms.sort(left) != self.ctx.terms.sort(right) {
+                return None;
+            }
+            let left_atom = self.qfax_index_atom(left)?;
+            let right_atom = self.qfax_index_atom(right)?;
+            let equality = self.ctx.terms.mk_eq(left, right);
+            literals.push((equality, left_atom == right_atom));
+        }
+        Some(literals)
+    }
+
+    /// #qfax-cegar: derive a sound blocking clause from an arrays rejection.
+    pub(in crate::executor) fn derive_qfax_refinement_clause(&mut self, violated: TermId) {
+        use ay_core::term::TermData;
+        if self.qfax_refinement_clause.is_some()
+            || self.last_model.is_none()
+            || self.ctx.terms.entry_stamp(violated).is_none()
+        {
             return;
         }
-        for (probe_idx, probe_atom) in &atoms {
-            let ca = cell_term(
-                self,
-                base,
-                &atom_closure,
-                &mut dep_pairs,
-                &mut note,
-                &wa,
-                *probe_idx,
-                probe_atom,
-                0,
-            );
-            let cb = cell_term(
-                self,
-                base,
-                &atom_closure,
-                &mut dep_pairs,
-                &mut note,
-                &wb,
-                *probe_idx,
-                probe_atom,
-                0,
-            );
-            match (ca, cb) {
-                (Some(Some(x)), Some(Some(y))) if x == y => {}
-                (Some(None), Some(None)) => {} // both are base reads at the atom
-                _ => return,                   // failed or not provably equal: no sound clause
-            }
+        let equality = match self.ctx.terms.get(violated) {
+            TermData::Not(inner) => *inner,
+            _ => return,
+        };
+        let Some((left, right)) = self.exact_cegar_equality_operands(equality) else {
+            return;
+        };
+        if !matches!(self.ctx.terms.sort(left), ay_core::Sort::Array(_)) {
+            return;
         }
-        // Chains proven equal under the pattern. Build the blocking clause
-        // over the dependency pairs' equality atoms at their model values.
-        let mut lits: Vec<(TermId, bool)> = Vec::new();
-        for (x, y) in dep_pairs {
-            let (Some(ax), Some(ay_)) = (atom_of(self, x), atom_of(self, y)) else {
+        let (Some((left_writes, left_base)), Some((right_writes, right_base))) = (
+            self.exact_qfax_store_chain(left),
+            self.exact_qfax_store_chain(right),
+        ) else {
+            return;
+        };
+        if left_base != right_base || (left_writes.is_empty() && right_writes.is_empty()) {
+            return;
+        }
+        let mut probe_atoms = Vec::<(TermId, String)>::new();
+        for &(index, _) in left_writes.iter().chain(&right_writes) {
+            let Some(atom) = self.qfax_index_atom(index) else {
                 return;
             };
-            let eq_atom = self.ctx.terms.mk_eq(x, y);
-            lits.push((eq_atom, ax == ay_));
-            if lits.len() >= 48 {
-                return; // clause too wide: skip (bounded)
+            if !probe_atoms.iter().any(|(_, known)| known == &atom) {
+                probe_atoms.push((index, atom));
             }
         }
-        if lits.is_empty() {
+        if probe_atoms.is_empty() {
             return;
         }
-        if std::env::var_os("AY_DEBUG_CEGAR").is_some() {
-            eprintln!("[qfax-cegar] blocking clause with {} literals", lits.len());
+        let mut dependencies = Vec::new();
+        for (probe_index, probe_atom) in probe_atoms {
+            let Some(left_cell) = self.qfax_reduce_cell(
+                left_base,
+                &left_writes,
+                probe_index,
+                &probe_atom,
+                &mut dependencies,
+                0,
+            ) else {
+                return;
+            };
+            let Some(right_cell) = self.qfax_reduce_cell(
+                left_base,
+                &right_writes,
+                probe_index,
+                &probe_atom,
+                &mut dependencies,
+                0,
+            ) else {
+                return;
+            };
+            if self
+                .qfax_cells_provably_equal(left_cell, right_cell, &mut dependencies)
+                .is_none()
+            {
+                return;
+            }
         }
-        self.qfax_refinement_clause = Some(lits);
+        let Some(literals) = self.qfax_blocking_literals(dependencies) else {
+            return;
+        };
+        if std::env::var_os("AY_DEBUG_CEGAR").is_some() {
+            eprintln!(
+                "[qfax-cegar] blocking clause with {} literals",
+                literals.len()
+            );
+        }
+        self.qfax_refinement_clause = Some(literals);
     }
 
     /// Completed-cells witness (#qf-auflia-witness-completion): TRUE when the
@@ -4888,13 +4914,7 @@ impl Executor {
                             TermData::Not(inner) => *inner,
                             _ => assertion,
                         };
-                        let (l, r) = match self.ctx.terms.get(eq) {
-                            TermData::App(s, args) if s.name() == "=" && args.len() == 2 => {
-                                (args[0], args[1])
-                            }
-                            _ => return None,
-                        };
-                        self.strict_oracle_select_congruence_lemma(&model, l, r)
+                        self.strict_oracle_select_congruence_lemma(&model, eq)
                     });
                     if let Some(lemma) = lemma {
                         if !self.cegar_emitted_lemmas.contains(&lemma) {

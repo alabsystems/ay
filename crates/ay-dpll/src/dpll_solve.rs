@@ -9,7 +9,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::{TermId, TheoryLit, TheorySolver};
+use ay_core::{TermId, TheorySolver};
 use ay_sat::{AssumeResult, Literal, SatResult};
 
 use crate::{proof_tracker, DpllError, DpllT};
@@ -243,72 +243,6 @@ impl<T: TheorySolver> DpllT<'_, T> {
         negations: &HashMap<TermId, TermId>,
     ) -> Result<AssumeResult, DpllError> {
         self.solve_with_assumptions_impl(assumptions, Some((tracker, negations)))
-    }
-
-    /// Solve one step, returning either a final result or a split request.
-    ///
-    /// This method is used for LIA where splits may be needed. The executor
-    /// should call this in a loop, handling splits by calling `apply_split`
-    /// and then calling `solve_step` again.
-    ///
-    /// Remains `pub` (not `pub(crate)`) because integration tests exercise
-    /// this directly. No production callers outside ay-dpll. Part of #5793.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use ay_core::{SplitRequest, TermId, TheoryPropagation, TheoryResult, TheorySolver};
-    /// use ay_dpll::{DpllT, SolveStepResult};
-    ///
-    /// # #[derive(Clone, Copy)]
-    /// # struct DummyTheory;
-    /// # impl TheorySolver for DummyTheory {
-    /// #     fn assert_literal(&mut self, _literal: TermId, _value: bool) {}
-    /// #     fn check(&mut self) -> TheoryResult { TheoryResult::Sat }
-    /// #     fn propagate(&mut self) -> Vec<TheoryPropagation> { Vec::new() }
-    /// #     fn push(&mut self) {}
-    /// #     fn pop(&mut self) {}
-    /// #     fn reset(&mut self) {}
-    /// # }
-    /// # fn create_atoms(_split: &SplitRequest) -> (TermId, TermId) { unimplemented!() }
-    ///
-    /// let mut dpll = DpllT::new(10, DummyTheory);
-    ///
-    /// let _result = loop {
-    ///     match dpll.solve_step() {
-    ///         Ok(SolveStepResult::Done(result)) => break result,
-    ///         Ok(SolveStepResult::NeedBoundRefinements(_reqs)) => {
-    ///             unimplemented!("bound refinements")
-    ///         }
-    ///         Ok(SolveStepResult::NeedSplit(split)) => {
-    ///             let (le_atom, ge_atom) = create_atoms(&split);
-    ///             dpll.apply_split(le_atom, ge_atom);
-    ///         }
-    ///         Ok(SolveStepResult::NeedDisequalitySplit(_split)) => {
-    ///             unimplemented!("disequality splits")
-    ///         }
-    ///         Ok(SolveStepResult::NeedExpressionSplit(_split)) => {
-    ///             unimplemented!("expression splits")
-    ///         }
-    ///         Err(err) => panic!("solve_step failed: {err}"),
-    ///         Ok(_) => unimplemented!("future solve step variant"),
-    ///     }
-    /// };
-    /// ```
-    pub(crate) fn theory_clause_to_terms(
-        &self,
-        clause: &[TheoryLit],
-        negations: &HashMap<TermId, TermId>,
-    ) -> Option<Vec<TermId>> {
-        clause
-            .iter()
-            .map(|lit| {
-                if lit.value {
-                    Some(lit.term)
-                } else {
-                    negations.get(&lit.term).copied()
-                }
-            })
-            .collect()
     }
 
     /// Reset the theory solver. Call this before starting a new solve session.

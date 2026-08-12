@@ -452,3 +452,91 @@ fn eq_congruent_rejects_a_surface_argument_denoting_a_different_term() {
         "{error}"
     );
 }
+
+/// A raw-gate `and_pos` whose surface override RE-NESTS the flat internal
+/// conjunction (the authored grouping): the indexed conjunct is a DEEPER
+/// printed operand, so the projection is derived through the printed nesting
+/// (one genuine `and_pos` per hop plus a final resolution) instead of failing
+/// as "absent from its effective source".
+#[test]
+fn flat_surface_and_pos_navigates_renested_surface_conjunct() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("nav_and_a", Sort::Bool);
+    let b = terms.mk_var("nav_and_b", Sort::Bool);
+    let c = terms.mk_var("nav_and_c", Sort::Bool);
+    let source = raw_and(&mut terms, [a, b, c]);
+    let gate = terms.mk_not_raw(source);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(
+        source,
+        "(and nav_and_a (and nav_and_b nav_and_c))".to_string(),
+    );
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let printed = printer
+        .format_step(&and_pos_step(2, gate, c, source), ProofId(9))
+        .expect("re-nested surface conjunct must be navigated");
+    assert_eq!(
+        printed,
+        "(step t9.g0 (cl (not (and nav_and_a (and nav_and_b nav_and_c))) (and nav_and_b nav_and_c)) :rule and_pos :args (1))\n\
+         (step t9.g1 (cl (not (and nav_and_b nav_and_c)) nav_and_c) :rule and_pos :args (1))\n\
+         (step t9 (cl (not (and nav_and_a (and nav_and_b nav_and_c))) nav_and_c) :rule resolution :premises (t9.g0 t9.g1))"
+    );
+}
+
+/// A raw-gate `and_pos` whose indexed conjunct is an and-term ERASED by
+/// surface flattening (`(and A (and B C))` printed as `(and A B C)`): each
+/// printed child is projected off the flat surface and the conjunct is
+/// reassembled via `and_neg` + resolution — never a guessed index, never a
+/// hole.
+#[test]
+fn flat_surface_and_pos_reassembles_conjunct_erased_by_flattening() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("re_and_a", Sort::Bool);
+    let b = terms.mk_var("re_and_b", Sort::Bool);
+    let c = terms.mk_var("re_and_c", Sort::Bool);
+    let inner = raw_and(&mut terms, [b, c]);
+    let source = raw_and(&mut terms, [a, inner]);
+    let gate = terms.mk_not_raw(source);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(source, "(and re_and_a re_and_b re_and_c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let printed = printer
+        .format_step(&and_pos_step(1, gate, inner, source), ProofId(4))
+        .expect("flattened-away conjunct must be reassembled via and_neg");
+    assert_eq!(
+        printed,
+        "(step t4.f0 (cl (not (and re_and_a re_and_b re_and_c)) re_and_b) :rule and_pos :args (1))\n\
+         (step t4.f1 (cl (not (and re_and_a re_and_b re_and_c)) re_and_c) :rule and_pos :args (2))\n\
+         (step t4.fa (cl (and re_and_b re_and_c) (not re_and_b) (not re_and_c)) :rule and_neg)\n\
+         (step t4 (cl (not (and re_and_a re_and_b re_and_c)) (and re_and_b re_and_c)) :rule resolution :premises (t4.fa t4.f0 t4.f1))"
+    );
+}
+
+/// The reassembly bridge declines — and the step still fails loud — when any
+/// printed child of the erased conjunct is NOT a top-level operand of the
+/// flat surface: an unbridgeable spelling must never ship a guessed step.
+#[test]
+fn flat_surface_and_pos_reassembly_declines_on_missing_child() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("miss_and_a", Sort::Bool);
+    let b = terms.mk_var("miss_and_b", Sort::Bool);
+    let c = terms.mk_var("miss_and_c", Sort::Bool);
+    let inner = raw_and(&mut terms, [b, c]);
+    let source = raw_and(&mut terms, [a, inner]);
+    let gate = terms.mk_not_raw(source);
+    let mut overrides = DetHashMap::default();
+    // `miss_and_c` is not a top-level operand of the printed surface.
+    overrides.insert(source, "(and miss_and_a miss_and_b)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let error = printer
+        .format_step(&and_pos_step(1, gate, inner, source), ProofId(5))
+        .expect_err("a child missing from the flat surface must fail closed");
+    assert!(
+        matches!(error, AlethePrintError::InvalidSurfaceStep { ref reason, .. }
+            if reason.contains("absent from its effective source")),
+        "{error}"
+    );
+}

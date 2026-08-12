@@ -11,7 +11,10 @@
 
 use ay_core::{ArraySort, ProofId, Sort, Symbol, TermId, TermStore};
 
-use super::{validate_subset_element_instance, validate_subset_reflexive};
+use super::{
+    validate_subset_element_instance, validate_subset_ground_eval, validate_subset_reflexive,
+    validate_subset_transitive,
+};
 
 const STEP: ProofId = ProofId(0);
 
@@ -324,4 +327,335 @@ fn rejects_a_strict_count_bound() {
     let strict = terms.mk_lt(count_sub, count_sup);
     let not_atom = terms.mk_not(atom);
     assert!(validate_subset_element_instance(&terms, STEP, &[not_atom, strict]).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// SubsetTransitive
+// ---------------------------------------------------------------------------
+
+/// `A ⊆ B`, `B ⊆ C` ⊢ `A ⊆ C` for every native predicate: all three order
+/// their carriers pointwise, and every pointwise order is transitive.
+#[test]
+fn accepts_transitivity_for_every_collection_predicate() {
+    for op in ["set.subset", "map.subset", "multiset.subset"] {
+        let mut terms = TermStore::new();
+        let a = set_var(&mut terms, "a");
+        let b = set_var(&mut terms, "b");
+        let c = set_var(&mut terms, "c");
+        let ab = subset(&mut terms, op, a, b);
+        let bc = subset(&mut terms, op, b, c);
+        let ac = subset(&mut terms, op, a, c);
+        let not_ab = terms.mk_not(ab);
+        let not_bc = terms.mk_not(bc);
+        assert!(
+            validate_subset_transitive(&terms, STEP, &[not_ab, not_bc, ac]).is_ok(),
+            "{op} must accept the transitivity chain"
+        );
+    }
+}
+
+/// Literal order is free — the SAT trace may permute a clause — but the chain
+/// is not.
+#[test]
+fn accepts_transitivity_in_any_literal_order() {
+    let mut terms = TermStore::new();
+    let a = set_var(&mut terms, "a");
+    let b = set_var(&mut terms, "b");
+    let c = set_var(&mut terms, "c");
+    let ab = subset(&mut terms, "set.subset", a, b);
+    let bc = subset(&mut terms, "set.subset", b, c);
+    let ac = subset(&mut terms, "set.subset", a, c);
+    let not_ab = terms.mk_not(ab);
+    let not_bc = terms.mk_not(bc);
+    assert!(validate_subset_transitive(&terms, STEP, &[ac, not_bc, not_ab]).is_ok());
+    assert!(validate_subset_transitive(&terms, STEP, &[not_bc, ac, not_ab]).is_ok());
+}
+
+/// THE FORGING SURFACE. A triple whose premises do not meet at a shared middle
+/// term is falsifiable, and admitting it would licence an arbitrary subset
+/// claim between two unrelated collections.
+#[test]
+fn rejects_a_chain_that_does_not_connect() {
+    let mut terms = TermStore::new();
+    let a = set_var(&mut terms, "a");
+    let b = set_var(&mut terms, "b");
+    let c = set_var(&mut terms, "c");
+    let d = set_var(&mut terms, "d");
+    let ab = subset(&mut terms, "set.subset", a, b);
+    let cd = subset(&mut terms, "set.subset", c, d);
+    let ad = subset(&mut terms, "set.subset", a, d);
+    let not_ab = terms.mk_not(ab);
+    let not_cd = terms.mk_not(cd);
+    assert!(validate_subset_transitive(&terms, STEP, &[not_ab, not_cd, ad]).is_err());
+}
+
+/// The conclusion must join the chain's FREE ENDS: `A ⊆ B`, `B ⊆ C` says
+/// nothing about `C ⊆ A`.
+#[test]
+fn rejects_a_conclusion_that_is_not_the_chain_ends() {
+    let mut terms = TermStore::new();
+    let a = set_var(&mut terms, "a");
+    let b = set_var(&mut terms, "b");
+    let c = set_var(&mut terms, "c");
+    let ab = subset(&mut terms, "set.subset", a, b);
+    let bc = subset(&mut terms, "set.subset", b, c);
+    let ca = subset(&mut terms, "set.subset", c, a);
+    let not_ab = terms.mk_not(ab);
+    let not_bc = terms.mk_not(bc);
+    assert!(validate_subset_transitive(&terms, STEP, &[not_ab, not_bc, ca]).is_err());
+}
+
+/// Mixing predicates is not a chain: `set.subset` and `multiset.subset` order
+/// different carriers, so nothing composes.
+#[test]
+fn rejects_a_chain_across_two_different_predicates() {
+    let mut terms = TermStore::new();
+    let a = set_var(&mut terms, "a");
+    let b = set_var(&mut terms, "b");
+    let c = set_var(&mut terms, "c");
+    let ab = subset(&mut terms, "set.subset", a, b);
+    let bc = subset(&mut terms, "multiset.subset", b, c);
+    let ac = subset(&mut terms, "set.subset", a, c);
+    let not_ab = terms.mk_not(ab);
+    let not_bc = terms.mk_not(bc);
+    assert!(validate_subset_transitive(&terms, STEP, &[not_ab, not_bc, ac]).is_err());
+}
+
+/// Polarity is load-bearing: two POSITIVE premises plus a positive conclusion
+/// is the claim itself, not the axiom.
+#[test]
+fn rejects_transitivity_with_unnegated_premises() {
+    let mut terms = TermStore::new();
+    let a = set_var(&mut terms, "a");
+    let b = set_var(&mut terms, "b");
+    let c = set_var(&mut terms, "c");
+    let ab = subset(&mut terms, "set.subset", a, b);
+    let bc = subset(&mut terms, "set.subset", b, c);
+    let ac = subset(&mut terms, "set.subset", a, c);
+    assert!(validate_subset_transitive(&terms, STEP, &[ab, bc, ac]).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// SubsetGroundEval
+// ---------------------------------------------------------------------------
+
+fn empty_set(terms: &mut TermStore) -> TermId {
+    let bottom = terms.mk_bool(false);
+    terms.mk_const_array(Sort::Int, bottom)
+}
+
+fn full_set(terms: &mut TermStore) -> TermId {
+    let top = terms.mk_bool(true);
+    terms.mk_const_array(Sort::Int, top)
+}
+
+fn singleton(terms: &mut TermStore, element: i64) -> TermId {
+    let base = empty_set(terms);
+    let index = terms.mk_int(element.into());
+    let present = terms.mk_bool(true);
+    terms.mk_store(base, index, present)
+}
+
+fn binding(terms: &mut TermStore, variable: TermId, ground: TermId) -> TermId {
+    let equality = terms.mk_app(Symbol::named("="), [variable, ground], Sort::Bool);
+    terms.mk_not(equality)
+}
+
+/// `s = ∅` licenses `s ⊆ t` for an ARBITRARY `t`: the set order's bottom.
+#[test]
+fn accepts_empty_subset_of_an_unbound_superset() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let empty = empty_set(&mut terms);
+    let bind = binding(&mut terms, s, empty);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim]).is_ok());
+}
+
+/// `t = full` licenses `s ⊆ t` for an ARBITRARY `s`: the set order's top.
+#[test]
+fn accepts_unbound_subset_of_a_full_superset() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let full = full_set(&mut terms);
+    let bind = binding(&mut terms, t, full);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim]).is_ok());
+}
+
+/// `{1} ⊆ {1,2}` is decided pointwise and accepted.
+#[test]
+fn accepts_a_true_ground_containment() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let two_index = terms.mk_int(2.into());
+    let present = terms.mk_bool(true);
+    let one_two = terms.mk_store(one, two_index, present);
+    let bind_s = binding(&mut terms, s, one);
+    let bind_t = binding(&mut terms, t, one_two);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_s, bind_t, claim]).is_ok());
+}
+
+/// `¬({1} ⊆ ∅)` is decided pointwise, with index 1 as the listed witness.
+#[test]
+fn accepts_a_refuted_ground_containment() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let empty = empty_set(&mut terms);
+    let bind_s = binding(&mut terms, s, one);
+    let bind_t = binding(&mut terms, t, empty);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    let not_claim = terms.mk_not(claim);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_s, bind_t, not_claim]).is_ok());
+}
+
+/// THE FORGING SURFACE that matters most: the pointwise decision must AGREE
+/// with the claimed polarity. `{1} ⊆ {1,2}` is true, so its negation must be
+/// refused.
+#[test]
+fn rejects_a_negated_containment_that_actually_holds() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let two_index = terms.mk_int(2.into());
+    let present = terms.mk_bool(true);
+    let one_two = terms.mk_store(one, two_index, present);
+    let bind_s = binding(&mut terms, s, one);
+    let bind_t = binding(&mut terms, t, one_two);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    let not_claim = terms.mk_not(claim);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_s, bind_t, not_claim]).is_err());
+}
+
+/// And the mirror: `{1} ⊄ {2}`, so the POSITIVE claim must be refused.
+#[test]
+fn rejects_a_containment_that_actually_fails() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let two = singleton(&mut terms, 2);
+    let bind_s = binding(&mut terms, s, one);
+    let bind_t = binding(&mut terms, t, two);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_s, bind_t, claim]).is_err());
+}
+
+/// A NON-EMPTY ground subset operand says nothing about an unbound superset:
+/// `t` may be anything, including `∅`.
+#[test]
+fn rejects_a_nonempty_subset_of_an_unbound_superset() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let bind = binding(&mut terms, s, one);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim]).is_err());
+}
+
+/// A negative claim with an unbound operand is never universally valid — the
+/// unbound side can always be chosen to make containment hold.
+#[test]
+fn rejects_a_negative_claim_with_an_unbound_operand() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let one = singleton(&mut terms, 1);
+    let bind = binding(&mut terms, s, one);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    let not_claim = terms.mk_not(claim);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, not_claim]).is_err());
+}
+
+/// A binding must pin an OPERAND of the conclusion. Pinning an unrelated
+/// variable would let the decision be made about a different collection than
+/// the one the conclusion names.
+#[test]
+fn rejects_a_binding_for_an_unrelated_variable() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let stranger = set_var(&mut terms, "stranger");
+    let empty = empty_set(&mut terms);
+    let bind = binding(&mut terms, stranger, empty);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim]).is_err());
+}
+
+/// A binding whose right-hand side is SYMBOLIC decides nothing.
+#[test]
+fn rejects_a_binding_to_a_non_ground_carrier() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let other = set_var(&mut terms, "other");
+    let bind = binding(&mut terms, s, other);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim]).is_err());
+}
+
+/// `map.subset` is NOT the pointwise order of its carrier, so no ground
+/// decision here is about the right relation and it fails closed.
+#[test]
+fn rejects_a_ground_map_subset_decision() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let empty = empty_set(&mut terms);
+    let one = singleton(&mut terms, 1);
+    let bind_s = binding(&mut terms, s, empty);
+    let bind_t = binding(&mut terms, t, one);
+    let claim = subset(&mut terms, "map.subset", s, t);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_s, bind_t, claim]).is_err());
+}
+
+/// An extra literal is not harmless here: it could be an arbitrary claim
+/// riding along on a decided one.
+#[test]
+fn rejects_an_extra_literal() {
+    let mut terms = TermStore::new();
+    let s = set_var(&mut terms, "s");
+    let t = set_var(&mut terms, "t");
+    let empty = empty_set(&mut terms);
+    let bind = binding(&mut terms, s, empty);
+    let claim = subset(&mut terms, "set.subset", s, t);
+    let stranger = terms.mk_var("stranger_bool", Sort::Bool);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind, claim, stranger]).is_err());
+}
+
+/// Multiset multiplicities are decided by `<=` pointwise, including the fills.
+#[test]
+fn decides_ground_multiset_containment_both_ways() {
+    let mut terms = TermStore::new();
+    let m = multiset_var(&mut terms, "m");
+    let n = multiset_var(&mut terms, "n");
+    let zero = terms.mk_int(0.into());
+    let base = terms.mk_const_array(Sort::Int, zero);
+    let index = terms.mk_int(4.into());
+    let one = terms.mk_int(1.into());
+    let two = terms.mk_int(2.into());
+    let low = terms.mk_store(base, index, one);
+    let high = terms.mk_store(base, index, two);
+
+    let bind_low = binding(&mut terms, m, low);
+    let bind_high = binding(&mut terms, n, high);
+    let holds = subset(&mut terms, "multiset.subset", m, n);
+    assert!(validate_subset_ground_eval(&terms, STEP, &[bind_low, bind_high, holds]).is_ok());
+
+    let bind_m_high = binding(&mut terms, m, high);
+    let bind_n_low = binding(&mut terms, n, low);
+    let fails = subset(&mut terms, "multiset.subset", m, n);
+    let not_fails = terms.mk_not(fails);
+    assert!(
+        validate_subset_ground_eval(&terms, STEP, &[bind_m_high, bind_n_low, not_fails]).is_ok()
+    );
 }
